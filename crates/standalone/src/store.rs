@@ -396,14 +396,8 @@ impl StandaloneWorkerStore {
                 LeaseLiveness::Unknown => StandaloneStoreError::LeaseLivenessUnknown(id),
             });
         }
-        if let Some(retained) = crate::subjektiv::prepare_worker_deletion(&self.root, &record)? {
-            // Atomic relocation preserves the original Session, not a permanent duplicate.
-            // The Subject's durable consumer can read it after logical Worker removal.
-            fs::rename(self.worker_dir(id), &retained).map_err(StandaloneStoreError::Io)?;
-            sync_directory(retained.parent().expect("retained Worker parent"))?;
-        } else {
-            fs::remove_dir_all(self.worker_dir(id)).map_err(StandaloneStoreError::Io)?;
-        }
+        crate::subjektiv::prepare_worker_deletion(&self.root, &record)?;
+        fs::remove_dir_all(self.worker_dir(id)).map_err(StandaloneStoreError::Io)?;
         sync_directory(&self.root)
     }
 

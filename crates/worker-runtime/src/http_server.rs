@@ -2102,7 +2102,10 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     {
         return Some("workers:input");
     }
-    if path.ends_with("/stop") || path.ends_with("/cancel") {
+    if path.ends_with("/stop")
+        || path.ends_with("/cancel")
+        || (path == "/v1/subject-release" && *method == Method::POST)
+    {
         return Some("workers:stop");
     }
     if path == runtime_api::RUNTIME_ROUTE_PROTOCOL_WS {

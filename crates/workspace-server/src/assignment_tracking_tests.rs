@@ -474,7 +474,8 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                     (97, "MR notifications and authenticated implementation results".into()),
                     (98, "Assignment-independent implementation reports".into()),
                     (99, "Explicit hosting administrators and self-registration policy".into()),
-                    (100, "Provisional users and scoped passkey activation".into())
+                    (100, "Provisional users and scoped passkey activation".into()),
+                    (101, "Durable explicit Subject body release".into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {

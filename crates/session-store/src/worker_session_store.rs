@@ -762,6 +762,11 @@ impl Store for WorkerSessionStore {
     }
 
     fn list_segments(&self, session_id: SessionId) -> Result<Vec<SegmentId>, StoreError> {
+        // A pending Worker can have metadata before its atomic initial seed.
+        // Absence is queryable without materializing or binding this store.
+        if self.session_id()?.is_none() {
+            return Ok(Vec::new());
+        }
         self.ensure_session(session_id, false)?;
         let mut segments: Vec<SegmentId> = Vec::new();
         for entry in fs::read_dir(self.root.join(SEGMENTS_DIR))? {
@@ -804,6 +809,9 @@ impl Store for WorkerSessionStore {
     }
 
     fn exists(&self, session_id: SessionId, segment_id: SegmentId) -> Result<bool, StoreError> {
+        if self.session_id()?.is_none() {
+            return Ok(false);
+        }
         self.ensure_session(session_id, false)?;
         Ok(self.log_path(segment_id).exists())
     }
@@ -2101,6 +2109,24 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, StoreError::Corrupt { .. }));
+    }
+
+    #[test]
+    fn pending_session_probes_are_empty_without_binding_and_foreign_materialized_session_is_rejected()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = new_session_id();
+        let segment_id = new_segment_id();
+        let store = WorkerSessionStore::new(root.path()).unwrap();
+        assert!(!store.exists(session_id, segment_id).unwrap());
+        assert!(store.list_segments(session_id).unwrap().is_empty());
+        assert_eq!(store.session_id().unwrap(), None);
+        let reopened = WorkerSessionStore::new(root.path()).unwrap();
+        assert_eq!(reopened.session_id().unwrap(), None);
+        store.create_segment(session_id, segment_id, &[]).unwrap();
+        let foreign = new_session_id();
+        assert!(store.exists(foreign, segment_id).is_err());
+        assert!(store.list_segments(foreign).is_err());
     }
 
     #[test]

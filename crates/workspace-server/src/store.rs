@@ -119,7 +119,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 100;
+const LATEST_SCHEMA_VERSION: i64 = 101;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -426,6 +426,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 100,
         name: "Provisional users and scoped passkey activation",
         apply: activation::migrate,
+    },
+    Migration {
+        version: 101,
+        name: "Durable explicit Subject body release",
+        apply: migrate_subject_release_v100_to_v101,
     },
 ];
 
@@ -1954,6 +1959,15 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         singleton_key: &str,
     ) -> Result<Option<WorkerSingletonLease>>;
+    fn retained_worker_singleton_lease(
+        &self,
+        _workspace_id: &str,
+        _worker: &RuntimeWorkerRef,
+    ) -> Result<Option<WorkerSingletonLease>> {
+        Err(Error::Store(
+            "retained singleton lookup is unavailable".into(),
+        ))
+    }
     fn require_current_worker_singleton_owner(
         &self,
         workspace_id: &str,
@@ -3161,6 +3175,156 @@ impl SqliteWorkspaceStore {
                 memory_settings: snapshot,
                 singleton,
             })
+        })
+    }
+
+    /// Retained identity for lifecycle/retention reconciliation only, never execution authority.
+    pub(crate) fn retained_worker_singleton_lease(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<WorkerSingletonLease>> {
+        self.with_conn(|conn| {
+            let row: Option<(Option<String>, Option<i64>)> = conn.query_row(
+                "SELECT singleton_key,singleton_generation FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+                params![workspace_id,worker.runtime_id,worker.worker_id], |r| Ok((r.get(0)?,r.get(1)?)),
+            ).optional()?;
+            match row {
+                Some((Some(key),Some(generation))) => Ok(Some(WorkerSingletonLease {
+                    key, generation: generation.try_into().map_err(|_| Error::Store("invalid singleton generation".into()))?, worker:worker.clone(),
+                })),
+                Some((None,None)) | None => Ok(None),
+                _ => Err(Error::Store("incomplete singleton lease".into())),
+            }
+        })
+    }
+
+    pub(crate) fn retained_subject_release_operation(
+        &self,
+        workspace: &str,
+        lease: &WorkerSingletonLease,
+        binding: &str,
+    ) -> Result<Option<String>> {
+        self.with_conn(|c| Ok(c.query_row("SELECT operation_id FROM subject_worker_releases WHERE workspace_id=?1 AND worker_id=?2 AND runtime_id=?3 AND singleton_generation=?4 AND binding_id=?5 AND cancelled=0",params![workspace,lease.worker.worker_id,lease.worker.runtime_id,lease.generation as i64,binding],|r|r.get(0)).optional()?))
+    }
+
+    pub(crate) fn subject_release_pending(
+        &self,
+        workspace: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<bool> {
+        self.with_conn(|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM subject_worker_releases WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND cancelled=0 AND completed=0)",params![workspace,worker.runtime_id,worker.worker_id],|r|r.get(0))?))
+    }
+
+    pub(crate) fn require_subject_release_intent(
+        &self,
+        workspace: &str,
+        lease: &WorkerSingletonLease,
+        binding: &str,
+        operation: &str,
+    ) -> Result<()> {
+        self.with_conn(|c| {
+            let active: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM subject_worker_releases WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND singleton_key=?4 AND singleton_generation=?5 AND binding_id=?6 AND operation_id=?7 AND cancelled=0)",params![workspace,lease.worker.runtime_id,lease.worker.worker_id,lease.key,lease.generation as i64,binding,operation],|r|r.get(0))?;
+            if !active {return Err(Error::RepositoryConflict("Subject release intent absent, cancelled or mismatched".into()));} Ok(())
+        })
+    }
+
+    pub(crate) fn reserve_subject_release(
+        &self,
+        workspace: &str,
+        lease: &WorkerSingletonLease,
+        binding: &str,
+        operation: &str,
+    ) -> Result<()> {
+        if binding.trim().is_empty()
+            || operation.trim().is_empty()
+            || binding.len() > 512
+            || operation.len() > 512
+        {
+            return Err(Error::InvalidInput(
+                "invalid Subject release identity".into(),
+            ));
+        }
+        self.with_conn_mut(|c| {
+            let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let saved: Option<(String,String,String,u64,String,bool)> = tx.query_row("SELECT runtime_id,worker_id,singleton_key,singleton_generation,binding_id,cancelled FROM subject_worker_releases WHERE workspace_id=?1 AND operation_id=?2",params![workspace,operation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+            if let Some(saved)=saved {
+                if saved != (lease.worker.runtime_id.clone(),lease.worker.worker_id.clone(),lease.key.clone(),lease.generation,binding.into(),false) {return Err(Error::RepositoryConflict("release operation mismatched or terminally cancelled; use a new operation".into()));} return Ok(());
+            }
+            require_current_worker_singleton_lease(&tx,workspace,lease)?;
+            let busy: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM subject_worker_releases WHERE workspace_id=?1 AND worker_id=?2 AND cancelled=0)",params![workspace,lease.worker.worker_id],|r|r.get(0))?;
+            if busy {return Err(Error::RepositoryConflict("another Subject release intent is active".into()));}
+            tx.execute("INSERT INTO subject_worker_releases(workspace_id,runtime_id,worker_id,singleton_key,singleton_generation,binding_id,operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![workspace,lease.worker.runtime_id,lease.worker.worker_id,lease.key,lease.generation as i64,binding,operation])?;
+            tx.commit()?; Ok(())
+        })
+    }
+
+    pub(crate) fn cancel_subject_release(
+        &self,
+        workspace: &str,
+        lease: &WorkerSingletonLease,
+        binding: &str,
+        operation: &str,
+    ) -> Result<()> {
+        self.with_conn(|c| {
+            let changed=c.execute("UPDATE subject_worker_releases SET cancelled=1 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND singleton_generation=?4 AND binding_id=?5 AND operation_id=?6 AND proof IS NULL AND completed=0",params![workspace,lease.worker.runtime_id,lease.worker.worker_id,lease.generation as i64,binding,operation])?;
+            if changed!=1 {return Err(Error::RepositoryConflict("cannot confirm cancellation of different or committed Subject release".into()));} Ok(())
+        })
+    }
+
+    pub(crate) fn subject_release_proven(
+        &self,
+        workspace: &str,
+        lease: &WorkerSingletonLease,
+        binding: &str,
+        operation: &str,
+    ) -> Result<bool> {
+        self.with_conn(|c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM subject_worker_releases WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND singleton_key=?4 AND singleton_generation=?5 AND binding_id=?6 AND operation_id=?7 AND proof IS NOT NULL AND cancelled=0)",params![workspace,lease.worker.runtime_id,lease.worker.worker_id,lease.key,lease.generation as i64,binding,operation],|r|r.get(0))?))
+    }
+
+    pub(crate) fn confirm_subject_release_proof(
+        &self,
+        workspace: &str,
+        lease: &WorkerSingletonLease,
+        binding: &str,
+        operation: &str,
+        erased: bool,
+    ) -> Result<()> {
+        let proof = if erased {
+            "erased"
+        } else {
+            "runtime_disconnected"
+        };
+        self.with_conn(|c| {
+            let changed=c.execute("UPDATE subject_worker_releases SET proof=?8 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND singleton_key=?4 AND singleton_generation=?5 AND binding_id=?6 AND operation_id=?7 AND cancelled=0 AND (proof IS NULL OR proof=?8)",params![workspace,lease.worker.runtime_id,lease.worker.worker_id,lease.key,lease.generation as i64,binding,operation,proof])?;
+            if changed!=1 {return Err(Error::RepositoryConflict("Subject release proof does not match active intent".into()));} Ok(())
+        })
+    }
+
+    pub(crate) fn release_subject_singleton(
+        &self,
+        workspace: &str,
+        lease: &WorkerSingletonLease,
+        binding: &str,
+        operation: &str,
+    ) -> Result<()> {
+        self.require_subject_release_intent(workspace, lease, binding, operation)?;
+        if !lease
+            .key
+            .starts_with(crate::subjektiv::SUBJECT_WORKER_SINGLETON_PREFIX)
+        {
+            return Err(Error::InvalidInput("not a Subject singleton".into()));
+        }
+        self.with_conn_mut(|c| {
+            let tx=c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (proof,completed,cancelled):(Option<String>,bool,bool)=tx.query_row("SELECT proof,completed,cancelled FROM subject_worker_releases WHERE workspace_id=?1 AND operation_id=?2",params![workspace,operation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            if cancelled || proof.is_none() {return Err(Error::RepositoryConflict("Subject release lacks confirmed proof; retain occupancy".into()));}
+            if completed {return Ok(());}
+            require_current_worker_singleton_lease(&tx,workspace,lease)?;
+            tx.execute("UPDATE subject_worker_releases SET completed=1 WHERE workspace_id=?1 AND operation_id=?2 AND cancelled=0",params![workspace,operation])?;
+            let changed=tx.execute("UPDATE worker_create_reservations SET state='removed',updated_at=?6 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND singleton_key=?4 AND singleton_generation=?5 AND state IN ('reserved','created','removed')",params![workspace,lease.worker.runtime_id,lease.worker.worker_id,lease.key,lease.generation as i64,chrono::Utc::now().to_rfc3339()])?;
+            if changed!=1 {return Err(Error::RepositoryConflict("Subject owner changed before release".into()));}
+            tx.commit()?; Ok(())
         })
     }
 
@@ -7929,6 +8093,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         singleton_key: &str,
     ) -> Result<Option<WorkerSingletonLease>> {
         SqliteWorkspaceStore::current_worker_singleton_owner(self, workspace_id, singleton_key)
+    }
+
+    fn retained_worker_singleton_lease(
+        &self,
+        workspace_id: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<WorkerSingletonLease>> {
+        SqliteWorkspaceStore::retained_worker_singleton_lease(self, workspace_id, worker)
     }
 
     fn require_current_worker_singleton_owner(
@@ -14840,6 +15012,22 @@ fn migrate_result_reports_v97_to_v98(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_subject_release_v100_to_v101(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 100 {
+        return Err(Error::Store(
+            "Subject release migration requires schema 100".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(include_str!("subject_release_schema.sql"))?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(101,?1)",
+        ["Durable explicit Subject body release"],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_hosting_policy_v98_to_v99(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 98 {
         return Err(Error::Store(
@@ -15521,7 +15709,10 @@ fn current_worker_singleton_owner(
 ) -> Result<Option<(WorkerSingletonLease, Option<String>)>> {
     let owner = conn
         .query_row(
-            "SELECT owner.runtime_id, owner.worker_id, owner.generation, reservation.state \
+            "SELECT owner.runtime_id, owner.worker_id, owner.generation, \
+                    CASE WHEN substr(owner.singleton_key,1,10)='subjektiv:' AND reservation.state='removed' \
+                      AND NOT EXISTS(SELECT 1 FROM subject_worker_releases r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.completed=1) \
+                    THEN 'created' ELSE reservation.state END \
              FROM worker_singleton_owners owner \
              LEFT JOIN worker_create_reservations reservation \
                ON reservation.workspace_id = owner.workspace_id \
@@ -18547,6 +18738,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:98, name:"Assignment-independent implementation reports".into()},
                 WorkspaceSchemaMigrationStep {version:99, name:"Explicit hosting administrators and self-registration policy".into()},
                 WorkspaceSchemaMigrationStep {version:100, name:"Provisional users and scoped passkey activation".into()},
+                WorkspaceSchemaMigrationStep {version:101, name:"Durable explicit Subject body release".into()},
             ]
         );
 
@@ -18657,6 +18849,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (98, "Assignment-independent implementation reports".to_string()),
 (99, "Explicit hosting administrators and self-registration policy".to_string()),
 (100, "Provisional users and scoped passkey activation".to_string()),
+(101, "Durable explicit Subject body release".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -20734,7 +20927,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .await
                 .unwrap();
         }
-        let key = "subjektiv:主体 id/?!";
+        // Generic singleton lifecycle; Subject-prefixed keys have a separate explicit release contract.
+        let key = "fixture:主体 id/?!";
         let memory_a = store.get_workspace_memory_settings("workspace-a").unwrap();
         let first = store
             .reserve_worker_create(
@@ -20839,6 +21033,175 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .current_worker_singleton_owner("workspace-a", key)
                 .unwrap(),
             Some(replacement_lease)
+        );
+    }
+
+    #[test]
+    fn subject_release_migration_rolls_back_schema_and_marker_then_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("server.db");
+        prepare_retained_schema(&database, 100);
+        let conn = Connection::open(&database).unwrap();
+        configure_sqlite(&conn).unwrap();
+        conn.execute_batch("CREATE TRIGGER interrupt_subject_release_migration BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=101 BEGIN SELECT RAISE(ABORT,'injected Subject release migration interruption'); END;").unwrap();
+        assert!(migrate_subject_release_v100_to_v101(&conn).is_err());
+        assert_eq!(current_schema_version(&conn).unwrap(), 100);
+        assert!(!table_exists(&conn, "subject_worker_releases").unwrap());
+        conn.execute_batch("DROP TRIGGER interrupt_subject_release_migration")
+            .unwrap();
+        migrate_subject_release_v100_to_v101(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 101);
+        assert!(table_exists(&conn, "subject_worker_releases").unwrap());
+        assert!(migrate_subject_release_v100_to_v101(&conn).is_err());
+        drop(conn);
+        let reopened = SqliteWorkspaceStore::open_for_test(database).unwrap();
+        reopened
+            .with_conn(|conn| verify_schema_history(conn, 101))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn subject_generic_removal_retains_occupancy_until_exact_explicit_release_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("server.db");
+        let store = SqliteWorkspaceStore::open_api_fixture(&database).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-a".into(),
+                owner_account_id: "owner-account".into(),
+                display_name: "Workspace A".into(),
+                state: "active".into(),
+                created_at: "2026-10-01T00:00:00Z".into(),
+                updated_at: "2026-10-01T00:00:00Z".into(),
+            })
+            .await
+            .unwrap();
+        let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
+        let key = "subjektiv:subject-a";
+        let first = store
+            .reserve_worker_create(
+                "workspace-a",
+                "runtime-a",
+                "first",
+                "sha256:first",
+                Some(key),
+                &memory,
+            )
+            .unwrap();
+        let lease = first.singleton.unwrap();
+        store
+            .fail_worker_create_reservation(
+                "workspace-a",
+                "runtime-a",
+                first.worker_id,
+                &first.create_fingerprint,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .current_worker_singleton_owner("workspace-a", key)
+                .unwrap(),
+            Some(lease.clone())
+        );
+        assert!(
+            store
+                .reserve_worker_create(
+                    "workspace-a",
+                    "runtime-b",
+                    "early",
+                    "sha256:early",
+                    Some(key),
+                    &memory
+                )
+                .is_err()
+        );
+        store
+            .reserve_subject_release("workspace-a", &lease, "binding-a", "cancelled-first")
+            .unwrap();
+        assert!(
+            store
+                .subject_release_pending("workspace-a", &lease.worker)
+                .unwrap()
+        );
+        store
+            .cancel_subject_release("workspace-a", &lease, "binding-a", "cancelled-first")
+            .unwrap();
+        assert!(
+            !store
+                .subject_release_pending("workspace-a", &lease.worker)
+                .unwrap()
+        );
+        assert!(
+            store
+                .reserve_subject_release("workspace-a", &lease, "binding-a", "cancelled-first")
+                .is_err()
+        );
+        store
+            .reserve_subject_release("workspace-a", &lease, "binding-a", "release-a")
+            .unwrap();
+        drop(store);
+        let reopened = SqliteWorkspaceStore::open_for_test(&database).unwrap();
+        assert_eq!(
+            reopened
+                .current_worker_singleton_owner("workspace-a", key)
+                .unwrap(),
+            Some(lease.clone())
+        );
+        assert!(
+            reopened
+                .reserve_subject_release("workspace-a", &lease, "binding-later", "release-a")
+                .is_err()
+        );
+        // SQL component boundary: the Host's actual Controller and durable writer-revoke proof
+        // are tested at their integration boundaries, not certified by this private SQL helper.
+        assert!(
+            reopened
+                .release_subject_singleton("workspace-a", &lease, "binding-a", "release-a")
+                .is_err()
+        );
+        reopened
+            .confirm_subject_release_proof("workspace-a", &lease, "binding-a", "release-a", false)
+            .unwrap();
+        reopened
+            .release_subject_singleton("workspace-a", &lease, "binding-a", "release-a")
+            .unwrap();
+        assert!(
+            reopened
+                .current_worker_singleton_owner("workspace-a", key)
+                .unwrap()
+                .is_none()
+        );
+        let replacement = reopened
+            .reserve_worker_create(
+                "workspace-a",
+                "runtime-b",
+                "next",
+                "sha256:next",
+                Some(key),
+                &memory,
+            )
+            .unwrap();
+        assert_eq!(
+            replacement.singleton.unwrap().generation,
+            lease.generation + 1
+        );
+        reopened
+            .release_subject_singleton("workspace-a", &lease, "binding-a", "release-a")
+            .unwrap();
+        assert!(
+            reopened
+                .release_subject_singleton(
+                    "workspace-a",
+                    &lease,
+                    "binding-a",
+                    "different-operation"
+                )
+                .is_err()
+        );
+        assert!(
+            reopened
+                .require_current_worker_singleton_owner("workspace-a", &lease.worker)
+                .is_err()
         );
     }
 
@@ -21272,7 +21635,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (97, "MR notifications and authenticated implementation results".into()),
                          (98, "Assignment-independent implementation reports".into()),
                          (99, "Explicit hosting administrators and self-registration policy".into()),
-                         (100, "Provisional users and scoped passkey activation".into())]);
+                         (100, "Provisional users and scoped passkey activation".into()),
+                         (101, "Durable explicit Subject body release".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

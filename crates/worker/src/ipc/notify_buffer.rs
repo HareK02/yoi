@@ -76,9 +76,16 @@ impl PendingNotify {
 pub struct NotifyBuffer {
     inner: Arc<Mutex<VecDeque<PendingNotify>>>,
     wake: Arc<tokio::sync::Notify>,
+    admission: Arc<std::sync::OnceLock<Arc<crate::subject_release::MutationAuthority>>>,
 }
 
 impl NotifyBuffer {
+    pub(crate) fn bind_mutation_authority(
+        &self,
+        authority: Arc<crate::subject_release::MutationAuthority>,
+    ) {
+        let _ = self.admission.set(authority);
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -113,6 +120,18 @@ impl NotifyBuffer {
     }
 
     fn push_entry(&self, entry: PendingNotify) {
+        let _admission = match self
+            .admission
+            .get()
+            .map(|authority| authority.enter())
+            .transpose()
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(%error, "notification rejected by Subject release fence");
+                return;
+            }
+        };
         self.inner
             .lock()
             .expect("notify buffer poisoned")

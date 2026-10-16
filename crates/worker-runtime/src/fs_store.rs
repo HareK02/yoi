@@ -479,6 +479,10 @@ pub(crate) struct OpenedFsRuntimeStore {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PersistedRuntimeState {
+    pub(crate) subject_releases: Vec<(
+        runtime_api::SubjectReleaseRequest,
+        runtime_api::SubjectReleaseState,
+    )>,
     pub(crate) display_name: Option<String>,
     pub(crate) status: RuntimeStatus,
     pub(crate) next_diagnostic_id: u64,
@@ -1915,6 +1919,11 @@ fn migrate_runtime_store_in_place(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RuntimeSnapshot {
+    #[serde(default)]
+    subject_releases: Vec<(
+        runtime_api::SubjectReleaseRequest,
+        runtime_api::SubjectReleaseState,
+    )>,
     schema_version: u32,
     display_name: Option<String>,
     backend: RuntimeBackendKind,
@@ -1946,6 +1955,7 @@ fn record_worker_load_diagnostic(
 impl RuntimeSnapshot {
     fn from_persisted(state: &PersistedRuntimeState) -> Self {
         Self {
+            subject_releases: state.subject_releases.clone(),
             schema_version: SCHEMA_VERSION,
             display_name: state.display_name.clone(),
             backend: RuntimeBackendKind::FsStore,
@@ -1983,6 +1993,7 @@ impl RuntimeSnapshot {
         workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
     ) -> PersistedRuntimeState {
         PersistedRuntimeState {
+            subject_releases: self.subject_releases,
             display_name: self.display_name,
             status: self.status,
             next_diagnostic_id: self.next_diagnostic_id,

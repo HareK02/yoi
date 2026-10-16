@@ -282,6 +282,10 @@ pub struct SubjektivConsolidationGrant {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubjektivJournalGrant {
+    /// Frozen writer generation. Legacy absence preserves its original canonical wire/digest;
+    /// recovery must use only the immutable original Session and still-current body.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub binding_id: String,
     pub subject_id: String,
     pub session_id: String,
     pub journal_id: String,

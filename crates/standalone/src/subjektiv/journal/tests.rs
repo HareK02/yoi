@@ -8,6 +8,7 @@ use session_store::{Store, WorkerMetadataStore};
 use std::sync::atomic::AtomicBool;
 
 mod compaction;
+mod handoff;
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -407,10 +408,19 @@ fn generation_input_stays_frozen_and_next_prefix_includes_last_input() {
         JournalAction::ConfirmUnchanged,
         state.selected_ranges.clone(),
     );
+    let position = save(
+        &adapter,
+        "position",
+        &nochange.state_token,
+        JournalAction::UpdatePosition {
+            current_position: "First prefix checked; last input still pending".into(),
+        },
+        vec![],
+    );
     save(
         &adapter,
         "checkpoint",
-        &nochange.state_token,
+        &position.state_token,
         JournalAction::Checkpoint {
             record_operation_ids: vec!["checked".into()],
         },
@@ -675,6 +685,7 @@ impl agen::llm_client::LlmClient for JournalScript {
 #[derive(Clone, Default)]
 struct DialogAndJournal {
     journal: JournalScript,
+    dialog_requests: Arc<std::sync::Mutex<Vec<agen::llm_client::Request>>>,
     dialog_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 #[async_trait::async_trait]
@@ -730,6 +741,7 @@ impl agen::llm_client::LlmClient for DialogAndJournal {
             };
             return Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))));
         }
+        self.dialog_requests.lock().unwrap().push(request.clone());
         self.dialog_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Box::pin(futures::stream::iter(
             [
@@ -1001,6 +1013,60 @@ async fn real_job_tools_save_and_drain_last_input_without_another_turn() {
 }
 
 #[tokio::test]
+async fn persisted_pre_binding_job_recovers_only_under_original_session_lifetime_and_never_after_release()
+ {
+    let mut fixture = Fixture::new("pre-upgrade pending Journal");
+    fixture.host().admit_journal(&fixture.context).unwrap();
+    let (jobs, modern_id) = fixture.host().next_journal_job().unwrap().unwrap();
+    let saved = jobs.get(&modern_id).unwrap();
+    jobs.cancel(&modern_id).unwrap();
+    let mut request = saved.request;
+    request.job_id = format!("legacy-journal:{}", uuid::Uuid::now_v7());
+    let mut legacy = saved.domain_grant.unwrap();
+    legacy.as_object_mut().unwrap().remove("writer_binding_id");
+    let pending = jobs.request_granted(request, legacy.clone()).unwrap();
+    assert_eq!(
+        jobs.get(&pending.request.job_id).unwrap().domain_grant,
+        Some(legacy)
+    );
+    jobs.start_with_model_client(&pending.request.job_id, JournalScript::default())
+        .await
+        .unwrap();
+    let completed = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        jobs.wait(&pending.request.job_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(completed.state, JobState::Completed);
+    fixture
+        .host()
+        .complete_journal_job(&jobs, &completed)
+        .unwrap();
+    let state = fixture.host().catalog.state_root.clone();
+    let subject = fixture.connection.binding.subject_id.clone();
+    fixture
+        .host()
+        .catalog
+        .store
+        .release_journal_writer(&fixture.host().writer)
+        .unwrap();
+    assert!(fixture.host().journal_grant(&completed).is_err());
+    jobs.shutdown().await.unwrap();
+    fixture.connection.close().unwrap();
+    let mut next = StandaloneSubjects::open_existing(&state)
+        .unwrap()
+        .connect(&subject, protocol::WorkerId::now_v7())
+        .unwrap();
+    assert!(
+        next.host.journal_grant(&completed).is_err(),
+        "missing legacy metadata cannot rebind its original Session to the next body"
+    );
+    next.close().unwrap();
+}
+
+#[tokio::test]
 async fn shutdown_reopen_reconciles_partial_saved_operations_without_duplicate_create() {
     let mut fixture = Fixture::new("proposed, corrected, partially performed, then interrupted");
     let state = fixture.host().catalog.state_root.clone();
@@ -1088,51 +1154,38 @@ async fn shutdown_reopen_reconciles_partial_saved_operations_without_duplicate_c
 }
 
 #[tokio::test]
-async fn stopped_worker_removal_retains_originals_and_the_existing_durable_request() {
+async fn stopped_worker_removal_and_replacement_require_explicit_idle_handoff_even_after_recording()
+{
     let mut fixture = Fixture::new("Unrecorded stopped Worker");
     let state = fixture.host().catalog.state_root.clone();
     let binding = fixture.connection.binding.clone();
     let (worker, workers) = fixture.stop_worker();
-    workers.delete(worker).unwrap();
-    assert!(matches!(
-        workers.load(worker),
-        Err(crate::store::StandaloneStoreError::WorkerNotFound(_))
-    ));
-    let retained = retained_workers_root(&state).join(worker.to_string());
+    assert!(workers.delete(worker).is_err());
+    assert!(workers.load(worker).is_ok());
     assert!(
-        retained
-            .join("sessions")
+        workers
+            .sessions_dir(worker)
             .join(&fixture.context.session_id)
             .is_dir()
     );
-    workers.delete(worker).unwrap();
+    assert!(
+        StandaloneSubjects::open_existing(&state)
+            .unwrap()
+            .connect(&binding.subject_id, protocol::WorkerId::now_v7())
+            .is_err()
+    );
     let mut reopened = StandaloneSubjects::open_existing(&state)
         .unwrap()
-        .connect(&binding.subject_id, protocol::WorkerId::now_v7())
+        .connect(&binding.subject_id, worker)
         .unwrap();
     let jobs = crate::jobs::StandaloneJobs::open(&reopened.jobs_path, fixture._temp.path().into())
         .unwrap();
     reopened.host.bind_jobs(jobs.clone()).unwrap();
-    assert_eq!(
-        jobs.pending().unwrap().len(),
-        1,
-        "repeated deletion must not multiply requests"
-    );
+    reopened
+        .host
+        .reconcile_journal_session(&fixture.context.session_id)
+        .unwrap();
     let (_, id) = reopened.host.next_journal_job().unwrap().unwrap();
-    let snapshot = jobs.get(&id).unwrap();
-    assert!(
-        grant(
-            reopened.host.clone(),
-            &snapshot,
-            Arc::new(TestFence(AtomicBool::new(true)))
-        )
-        .is_ok(),
-        "retained originals remain readable through the real grant path"
-    );
-    assert!(
-        retained.is_dir(),
-        "unfinished generation cannot prune original material"
-    );
     jobs.start_with_model_client(&id, JournalScript::default())
         .await
         .unwrap();
@@ -1146,31 +1199,23 @@ async fn stopped_worker_removal_retains_originals_and_the_existing_durable_reque
         .complete_journal_job(&jobs, &completed)
         .unwrap();
     assert!(
-        !retained.exists(),
-        "only reflected original material may be pruned"
-    );
-    let context = authority(&reopened.host, &fixture.context.session_id).unwrap();
-    let journal = reopened
-        .host
-        .catalog
-        .store
-        .list_journals(&context, None, 1)
-        .unwrap()
-        .items
-        .pop()
-        .unwrap();
-    let (_, open) = reopened
-        .host
-        .catalog
-        .store
-        .journal_resume_state(&context, &journal.id)
-        .unwrap();
-    assert!(
-        open.unwrap().body.contains("Only part performed"),
-        "Journal remains readable without the removed Worker/Session"
+        reopened
+            .host
+            .session_fully_reflected(&fixture.context.session_id)
+            .unwrap()
     );
     jobs.shutdown().await.unwrap();
     reopened.close().unwrap();
+    assert!(
+        workers.delete(worker).is_err(),
+        "recording completion is not actual Controller Idle/release"
+    );
+    assert!(
+        StandaloneSubjects::open_existing(&state)
+            .unwrap()
+            .connect(&binding.subject_id, protocol::WorkerId::now_v7())
+            .is_err()
+    );
 }
 
 #[test]
@@ -1415,8 +1460,12 @@ fn relocated_erasure_fences_old_and_retained_readers_publishers_and_late_pins() 
         .unwrap();
     let descriptor = old_reader.descriptors().next().unwrap().clone();
     let (worker, workers) = fixture.stop_worker();
-    workers.delete(worker).unwrap();
+    assert!(workers.delete(worker).is_err());
+    // Reproduce a T-734 archive already persisted before durable body-release bindings.
+    // New ordinary deletion must not create this state, but its erasure contract remains.
     let retained = retained_workers_root(&state).join(worker.to_string());
+    fs::create_dir_all(retained.parent().unwrap()).unwrap();
+    fs::rename(workers.root().join(worker.to_string()), &retained).unwrap();
     let retained_sessions = retained.join("sessions");
     let retained_store = session_store::FsStore::new_with_retention(
         &retained_sessions,
