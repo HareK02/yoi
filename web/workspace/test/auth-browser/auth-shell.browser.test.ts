@@ -17,8 +17,14 @@ type Harness = {
   go: (path: string, mode?: string) => Promise<void>;
 };
 const login = async (page: Page) => {
-  await page.getByLabel("Account ID (handle)", { exact: true }).fill("alice");
   await page.getByRole("button", { name: "Log in with passkey", exact: true })
+    .click();
+};
+const legacyLogin = async (page: Page) => {
+  await page.getByText("Use an older key with account ID", { exact: true })
+    .click();
+  await page.getByLabel("Account ID (handle)", { exact: true }).fill("alice");
+  await page.getByRole("button", { name: "Log in with older key", exact: true })
     .click();
 };
 const register = async (page: Page) => {
@@ -134,13 +140,17 @@ Deno.test("standalone auth separates login, registration, own account and explic
               await page.evaluate(() => history.length),
               historyBefore + 1,
             );
-            const id = page.getByLabel("Account ID (handle)", { exact: true });
-            await id.waitFor();
+            const button = page.getByRole("button", {
+              name: "Log in with passkey",
+              exact: true,
+            });
+            await button.waitFor();
+            assertEquals(await page.locator("input:visible").count(), 0);
             assertEquals(
               await page.getByLabel("Display name", { exact: true }).count(),
               0,
             );
-            assertEquals(await page.locator("input").count(), 1);
+            assertEquals(await page.locator("details[open]").count(), 0);
             assertEquals(
               await page.getByRole("link", {
                 name: "Create a new account",
@@ -152,12 +162,9 @@ Deno.test("standalone auth separates login, registration, own account and explic
               name: "Activate an account with a code",
               exact: true,
             }).waitFor();
-            await id.fill("alice");
-            await id.press("Tab");
-            const button = page.getByRole("button", {
-              name: "Log in with passkey",
-              exact: true,
-            });
+            await button.focus();
+            await page.keyboard.press("Tab");
+            await page.keyboard.press("Shift+Tab");
             assert(
               await button.evaluate((element) =>
                 element === document.activeElement &&
@@ -166,6 +173,12 @@ Deno.test("standalone auth separates login, registration, own account and explic
             );
             await page.keyboard.press("Enter");
             await at(page, "/account");
+            assertEquals(
+              mutations.find((entry) =>
+                entry.path === "/api/auth/passkeys/login/options"
+              )?.keys,
+              ["browser_origin"],
+            );
             await page.getByRole("button", {
               name: "Add passkey to alice",
               exact: true,
@@ -449,6 +462,105 @@ Deno.test("standalone auth separates login, registration, own account and explic
         }),
     );
     await t.step(
+      "explicit older-key login sends a handle, returns to device approval without approving",
+      () =>
+        isolated(browser!, async ({ page, go, mutations }) => {
+          await go("/login?returnTo=%2Flogin%2Fdevice%3Fuser_code%3DABCD-EFGH");
+          await legacyLogin(page);
+          await at(page, "/login/device?user_code=ABCD-EFGH");
+          await page.getByRole("button", {
+            name: "Approve device login",
+            exact: true,
+          }).waitFor();
+          assertEquals(
+            mutations.find((entry) =>
+              entry.path === "/api/auth/passkeys/login/options"
+            )?.keys,
+            ["browser_origin", "handle"],
+          );
+          assertEquals(count(mutations, "/api/auth/device-login/approve"), 0);
+          await page.getByRole("button", {
+            name: "Approve device login",
+            exact: true,
+          }).click();
+          await page.getByText(
+            "Device login approved. You can return to the CLI.",
+            { exact: true },
+          ).waitFor();
+        }),
+    );
+    await t.step(
+      "explicit compatibility does not require input for a later normal login",
+      () =>
+        isolated(browser!, async ({ page, go, mutations }) => {
+          await go("/login", "login-cancel");
+          await legacyLogin(page);
+          await page.getByRole("alert").waitFor();
+          assertEquals(
+            count(mutations, "/api/auth/passkeys/login/complete"),
+            0,
+          );
+          await login(page);
+          await page.getByRole("alert").waitFor();
+          assertEquals(
+            mutations.filter((entry) =>
+              entry.path === "/api/auth/passkeys/login/options"
+            ).map((entry) => entry.keys),
+            [
+              ["browser_origin", "handle"],
+              ["browser_origin"],
+            ],
+          );
+        }),
+    );
+    await t.step(
+      "pending older-key login blocks both forms and ignores late credentials after unmount",
+      () =>
+        isolated(browser!, async ({ page, go, mutations }) => {
+          await go("/login", "login-pending");
+          await legacyLogin(page);
+          await page.waitForFunction(() =>
+            typeof (window as unknown as { __authFixtureRelease?: unknown })
+              .__authFixtureRelease === "function"
+          );
+          for (const name of ["Log in with passkey", "Log in with older key"]) {
+            assertEquals(
+              await page.getByRole("button", { name, exact: true }).isEnabled(),
+              false,
+            );
+          }
+          await page.locator("form").evaluateAll((forms) => {
+            for (const form of forms) {
+              form.dispatchEvent(
+                new Event("submit", { bubbles: true, cancelable: true }),
+              );
+            }
+          });
+          assertEquals(count(mutations, "/api/auth/passkeys/login/options"), 1);
+          await page.getByRole("link", {
+            name: "Create a new account",
+            exact: true,
+          }).click();
+          await page.getByLabel("Display name", { exact: true }).waitFor();
+          await page.evaluate(() =>
+            (window as unknown as { __authFixtureRelease: () => void })
+              .__authFixtureRelease()
+          );
+          await page.evaluate(() =>
+            new Promise<void>((resolve) =>
+              requestAnimationFrame(() =>
+                requestAnimationFrame(() => resolve())
+              )
+            )
+          );
+          assertEquals(new URL(page.url()).pathname, "/register");
+          assertEquals(
+            count(mutations, "/api/auth/passkeys/login/complete"),
+            0,
+          );
+        }),
+    );
+    await t.step(
       "leaving a pending login never completes or redirects after navigation",
       () =>
         isolated(browser!, async ({ page, go, mutations }) => {
@@ -534,7 +646,15 @@ Deno.test("standalone auth separates login, registration, own account and explic
         : purpose === "addition"
         ? "/account"
         : "/login";
-      for (const failure of ["cancel", "error", "http-error", "expired"]) {
+      for (
+        const failure of [
+          "cancel",
+          "unsupported",
+          "error",
+          "http-error",
+          "expired",
+        ]
+      ) {
         await t.step(
           `${purpose} ${failure} is visible and does not claim successful authentication`,
           () =>
@@ -552,7 +672,8 @@ Deno.test("standalone auth separates login, registration, own account and explic
                 path === route || (purpose === "addition" && path === "/login"),
               );
               if (
-                failure === "cancel" || failure === "error" ||
+                failure === "cancel" || failure === "unsupported" ||
+                failure === "error" ||
                 failure === "http-error"
               ) {
                 assertEquals(

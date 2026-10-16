@@ -24,9 +24,12 @@ const fill = (selector: string, value: string): Interaction => ({
   value,
 });
 const id = 'label:has-text("ID (handle)") input';
-const login = [
+const loginButton = 'button:text-is("Log in with passkey")';
+const login = [click(loginButton)];
+const legacyLogin = [
+  click('summary:text-is("Use an older key with account ID")'),
   fill(id, "alice"),
-  click('button:text-is("Log in with passkey")'),
+  click('button:text-is("Log in with older key")'),
 ];
 const register = [
   fill(id, "alice"),
@@ -53,22 +56,31 @@ const route = (
   capturePoints,
 });
 const routes: RouteScenario[] = [
-  route("login", "/login?fixture=anonymous", `${id}:enabled`, [
+  route("login", "/login?fixture=anonymous", `${loginButton}:enabled`, [
     {
       id: "initial",
-      label: "ID-only login; registration and activation entries",
+      label: "ID-free primary login; explicit older-key disclosure",
       fullPage: true,
     },
     {
       id: "keyboard-focus",
       label: "Login keyboard focus",
       fullPage: true,
-      interaction: [fill(id, "alice"), {
+      interaction: [{ action: "press", selector: loginButton, key: "Tab" }, {
         action: "press",
-        selector: id,
-        key: "Tab",
+        selector: 'summary:text-is("Use an older key with account ID")',
+        key: "Shift+Tab",
       }],
       ready: ready('button:text-is("Log in with passkey"):focus-visible'),
+    },
+    {
+      id: "legacy-expanded",
+      label: "Explicit old-key compatibility and safe migration guidance",
+      fullPage: true,
+      interaction: [
+        click('summary:text-is("Use an older key with account ID")'),
+      ],
+      ready: ready(`${id}:visible`),
     },
   ]),
   route(
@@ -139,7 +151,7 @@ const routes: RouteScenario[] = [
         label: "Dedicated login with device returnTo",
         fullPage: true,
         interaction: [click('a:text-is("Log in to continue")')],
-        ready: ready(`${id}:enabled`),
+        ready: ready(`${loginButton}:enabled`),
       },
       {
         id: "authenticated-unapproved",
@@ -203,7 +215,7 @@ const routes: RouteScenario[] = [
     },
   ]),
   ...["login", "registration", "addition"].flatMap((purpose) =>
-    ["pending", "cancel", "error", "expired"].map((state) => {
+    ["pending", "cancel", "unsupported", "error", "expired"].map((state) => {
       const path = purpose === "registration"
         ? "/register"
         : purpose === "addition"
@@ -219,6 +231,8 @@ const routes: RouteScenario[] = [
         `${path}?fixture=${purpose}-${state}`,
         purpose === "addition"
           ? 'button:text-is("Add passkey to alice")'
+          : purpose === "login"
+          ? `${loginButton}:enabled`
           : `${id}:enabled`,
         [{
           id: "result",
@@ -231,6 +245,23 @@ const routes: RouteScenario[] = [
         }],
       );
     })
+  ),
+  ...["pending", "cancel", "unsupported", "error", "expired"].map((state) =>
+    route(
+      `legacy-login-${state}`,
+      `/login?fixture=login-${state}`,
+      `${loginButton}:enabled`,
+      [{
+        id: "result",
+        label:
+          `Explicit compatibility ${state}; not confirmed login or enrollment`,
+        fullPage: true,
+        interaction: legacyLogin,
+        ready: ready(
+          state === "pending" ? '[role="status"]' : '[role="alert"]',
+        ),
+      }],
+    )
   ),
   route(
     "activation-entry",

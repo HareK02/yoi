@@ -5,7 +5,7 @@ declare const Deno: {
 import {
   addPasskey,
   loadWhoami,
-  loginWithPasskey,
+  loginWithLegacyPasskey,
   readBoundedAuthResponseJson,
   registerPasskey,
 } from "../src/lib/workspace/auth/api.ts";
@@ -13,7 +13,7 @@ import {
 import {
   authUser,
   credentialFixture,
-  loginOptions,
+  legacyLoginOptions as loginOptions,
   registrationOptions,
 } from "../src/lib/workspace/auth/api.test-fixtures.ts";
 
@@ -232,14 +232,14 @@ Deno.test("existing-handle registration rejection never starts WebAuthn or retri
   assertEquals(paths, ["/api/auth/passkeys/registration/options"]);
 });
 
-Deno.test("login requires a nonempty explicit handle before HTTP or WebAuthn", async () => {
+Deno.test("compatibility login requires a nonempty explicit handle before HTTP or WebAuthn", async () => {
   await withBrowserBoundary(() => {
     throw new Error("Unexpected HTTP request");
   }, async (calls) => {
     for (const handle of ["", "  ", "\n\t"]) {
       await assertRejects(
-        loginWithPasskey(handle),
-        "User handle is required for passkey login.",
+        loginWithLegacyPasskey(handle),
+        "User handle is required for legacy passkey login.",
       );
     }
     assertEquals(calls, { create: 0, get: 0 });
@@ -254,7 +254,7 @@ Deno.test("login sends the explicit trimmed handle and serializes the assertion"
       requests.length === 1 ? loginOptions : { user: authUser },
     );
   }, async (calls) => {
-    assertEquals(await loginWithPasskey(" alice "), authUser);
+    assertEquals(await loginWithLegacyPasskey(" alice "), authUser);
     assertEquals(calls, { create: 0, get: 1 });
   });
   assertEquals(requests.map(({ path }) => path), [
