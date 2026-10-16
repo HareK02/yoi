@@ -35,7 +35,7 @@
     {
       "id": "catalog",
       "label": "Create Workspace without a repository",
-      "path": "/",
+      "path": "/dashboard#workspace-create-title",
       "goal": "Reopen a zero-repository Workspace or create a new Workspace without configuring Git.",
       "dataState": "Accessible Workspaces with no repositories and blank creation form.",
       "ready": {

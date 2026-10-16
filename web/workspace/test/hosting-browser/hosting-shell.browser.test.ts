@@ -86,7 +86,7 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
             }
           });
           await page.goto("http://127.0.0.1:15379/?fixture=admin-on");
-          await page.getByRole("heading", { name: "Workspaces", exact: true })
+          await page.getByRole("heading", { name: "Yoi", exact: true })
             .waitFor();
           if (
             await page.getByRole("button", {
@@ -99,15 +99,10 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
               exact: true,
             }).click();
           }
-          const nav = page.getByRole("navigation", { name: "Global pages" });
+          const nav = page.getByRole("navigation", { name: "Your account" });
           await nav.getByRole("link", { name: "Hosting settings", exact: true })
             .waitFor();
           await nav.getByRole("link", { name: "Account", exact: true }).focus();
-          await page.keyboard.press("Tab");
-          assertEquals(
-            await page.locator(":focus").innerText(),
-            "Device Login",
-          );
           await page.keyboard.press("Tab");
           assertEquals(
             await page.locator(":focus").innerText(),

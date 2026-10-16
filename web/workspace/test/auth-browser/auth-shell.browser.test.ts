@@ -303,7 +303,7 @@ Deno.test("standalone auth separates login, registration, own account and explic
             const link = page.locator('a[href^="/login"]').first();
             await link.click();
             await login(page);
-            await at(page, "/");
+            await at(page, "/dashboard");
             await page.goto(`${origin}/account`);
             await page.getByRole("button", {
               name: "Add passkey to alice",
@@ -490,7 +490,7 @@ Deno.test("standalone auth separates login, registration, own account and explic
           await page.getByRole("button", { name: "Retry session", exact: true })
             .click();
           await login(page);
-          await at(page, "/");
+          await at(page, "/dashboard");
         }),
     );
     for (const route of ["login", "register"]) {
@@ -500,9 +500,9 @@ Deno.test("standalone auth separates login, registration, own account and explic
           isolated(browser!, async ({ page, go }) => {
             await go(`/${route}`);
             await (route === "login" ? login(page) : register(page));
-            await at(page, "/");
+            await at(page, "/dashboard");
             await page.reload();
-            assertEquals(new URL(page.url()).pathname, "/");
+            assertEquals(new URL(page.url()).pathname, "/dashboard");
           }),
       );
       for (
@@ -523,7 +523,7 @@ Deno.test("standalone auth separates login, registration, own account and explic
             isolated(browser!, async ({ page, go }) => {
               await go(`/${route}?returnTo=${encodeURIComponent(rejected)}`);
               await (route === "login" ? login(page) : register(page));
-              await at(page, "/");
+              await at(page, "/dashboard");
             }),
         );
       }
@@ -619,7 +619,7 @@ Deno.test("standalone auth separates login, registration, own account and explic
               await page.getByRole("status").filter({
                 hasText: /added|registered/i,
               }).waitFor();
-            } else await at(page, "/");
+            } else await at(page, "/dashboard");
             assertEquals(
               count(mutations, `/api/auth/passkeys/${purpose}/options`),
               1,

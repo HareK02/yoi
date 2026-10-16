@@ -3,7 +3,12 @@
 import { extname, join, resolve } from "@std/path";
 import { setupWebAuthnProjection } from "../hosting-browser/setup-projection.ts";
 
-const [port, build] = Deno.args;
+import {
+  createdWorkspace,
+  creationResponse,
+} from "../../src/lib/workspace/api/workspace-catalog.test-fixtures.ts";
+
+const [port, build, workspaceFixture] = Deno.args;
 if (!port || !build) throw new Error("Expected port and production build root");
 const root = resolve(build);
 const user = {
@@ -51,6 +56,8 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
     sessions.set(id, {
       mode: selected ?? "anonymous",
       signedIn: selected === "account" ||
+        selected?.startsWith("workspace-") === true || selected === "admin" ||
+        selected?.startsWith("creation-") === true ||
         selected?.startsWith("addition-") === true,
       whoamiCalls: 0,
       selfRegistrationEnabled: selected !== "policy-disabled",
@@ -98,17 +105,44 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
     });
   }
   if (path === "/api/auth/registration-policy") {
+    if (mode === "policy-loading") return await new Promise<Response>(() => {});
     if (mode === "policy-error") return new Response(null, { status: 503 });
     return Response.json({
       self_registration_enabled: state.selfRegistrationEnabled,
     });
   }
-  if (path === "/api/hosting/access") return Response.json({ is_admin: false });
+  if (path === "/api/hosting/access") {
+    return Response.json({ is_admin: mode === "admin" });
+  }
   if (path === "/api/workspaces") {
-    // fallbackは現行Workspace選択まで。公開トップ/T760の挙動を新設しない。
-    return state.signedIn
-      ? Response.json([])
-      : new Response(null, { status: 401 });
+    if (!state.signedIn || mode === "workspace-unauthorized") {
+      return new Response(null, { status: 401 });
+    }
+    if (mode === "workspace-error") return new Response(null, { status: 503 });
+    if (mode === "workspace-loading") {
+      return await new Promise<Response>(() => {});
+    }
+    if (request.method === "POST") {
+      if (mode === "creation-denied") {
+        return new Response(null, { status: 403 });
+      }
+      if (mode === "creation-error") return new Response(null, { status: 503 });
+      return Response.json(creationResponse());
+    }
+    const ids = mode === "workspace-one"
+      ? ["home-empty"]
+      : mode === "workspace-many"
+      ? ["home-empty", "home-member", "home-long"]
+      : [];
+    return Response.json(ids.map((workspace_id, i) => ({
+      ...createdWorkspace,
+      workspace_id,
+      display_name: i === 0
+        ? "New Workspace"
+        : i === 1
+        ? "Shared Workspace"
+        : "Workspace with a long name — international documentation and distributed development",
+    })));
   }
   if (path === "/api/auth/logout") {
     state.signedIn = false;
@@ -152,6 +186,30 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
   if (path === "/api/auth/activation/complete") {
     state.signedIn = true;
     return Response.json({ user });
+  }
+  // Workspace画面の既存fixtureを再利用する。認証/登録/作成APIの代わりにはしない。
+  if (workspaceFixture && path.startsWith("/api/w/")) {
+    const target = new URL(path + url.search, workspaceFixture);
+    if (request.headers.get("upgrade") === "websocket") {
+      const { socket, response } = Deno.upgradeWebSocket(request);
+      target.protocol = "ws:";
+      const peer = new WebSocket(target);
+      const pending: string[] = [];
+      socket.onmessage = (event) =>
+        peer.readyState === WebSocket.OPEN
+          ? peer.send(event.data)
+          : pending.push(String(event.data));
+      peer.onopen = () => {
+        for (const frame of pending) peer.send(frame);
+      };
+      peer.onmessage = (event) => {
+        if (socket.readyState === WebSocket.OPEN) socket.send(event.data);
+      };
+      socket.onclose = () => peer.close();
+      peer.onclose = () => socket.close();
+      return response;
+    }
+    return await fetch(new Request(target, request));
   }
   if (path.startsWith("/api/")) return new Response(null, { status: 404 });
   let file: string;

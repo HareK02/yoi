@@ -15,7 +15,8 @@ import { authEntryUrl, loginUrl, safeReturnTo } from "./routes.ts";
 Deno.test("return destination permits known app screens without forwarding arbitrary query or fragment", () => {
   for (
     const [input, expected] of [
-      ["/", "/"],
+      ["/", "/dashboard"],
+      ["/dashboard?query=discard#fragment", "/dashboard"],
       ["/account", "/account"],
       ["/account?returnTo=//evil.invalid#secret", "/account"],
       [
@@ -68,7 +69,7 @@ Deno.test("return destination rejects external, ambiguous encoding and authentic
       "/not-an-app-route",
       "/" + "a".repeat(2049),
     ]
-  ) assertEquals(safeReturnTo(input), "/", String(input));
+  ) assertEquals(safeReturnTo(input), "/dashboard", String(input));
 });
 
 Deno.test("login links encode one validated destination and discard nested auth loops", () => {
@@ -80,5 +81,8 @@ Deno.test("login links encode one validated destination and discard nested auth 
     authEntryUrl("/register", "/account"),
     "/register?returnTo=%2Faccount",
   );
-  assertEquals(loginUrl("/login?returnTo=/login"), "/login?returnTo=%2F");
+  assertEquals(
+    loginUrl("/login?returnTo=/login"),
+    "/login?returnTo=%2Fdashboard",
+  );
 });

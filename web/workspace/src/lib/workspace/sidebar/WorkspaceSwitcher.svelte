@@ -173,7 +173,7 @@
         <span>Workspaces</span>
         <a
           class="workspace-menu-add"
-          href="/#workspace-create-title"
+          href="/dashboard#workspace-create-title"
           role="menuitem"
           aria-label="Create Workspace"
           title="Create Workspace"

@@ -141,7 +141,7 @@ async function submit(name: string) {
 }
 
 test("login asks only for an account ID and links separate registration and code activation", async () => {
-  const { fetcher } = boundary({ policy: false });
+  const { fetcher } = boundary({ policy: true });
   page.url = new URL("https://example.test/login?returnTo=%2Faccount");
   render(Login);
   const handle = await screen.findByLabelText("Account ID (handle)");
@@ -149,9 +149,10 @@ test("login asks only for an account ID and links separate registration and code
   expect(screen.queryByRole("button", { name: "Register new account" }))
     .toBeNull();
   expect(
-    screen.getByRole("link", { name: "Create a new account" }).getAttribute(
-      "href",
-    ),
+    (await screen.findByRole("link", { name: "Create a new account" }))
+      .getAttribute(
+        "href",
+      ),
   )
     .toBe("/register?returnTo=%2Faccount");
   expect(
@@ -168,25 +169,25 @@ test("login asks only for an account ID and links separate registration and code
     .toBe(true);
   await submit("Log in with passkey");
   expect(posted(fetcher)).toEqual([]);
-  expect(apiPaths(fetcher)).not.toContain("/api/auth/registration-policy");
+  expect(apiPaths(fetcher)).toContain("/api/auth/registration-policy");
 });
 
 for (
   const [returnTo, expected] of [
-    [null, "/"],
+    [null, "/dashboard"],
     ["/account", "/account"],
     ["/w/project/tickets?ignored=1#fragment", "/w/project/tickets"],
     [
       "/login/device?code=abcd-EFGH&untrusted=1",
       "/login/device?user_code=abcd-EFGH",
     ],
-    ["https://evil.test/", "/"],
-    ["//evil.test/account", "/"],
-    ["/\\evil.test/account", "/"],
-    ["/%2f%2fevil.test", "/"],
-    ["/login?returnTo=/login", "/"],
-    ["/register", "/"],
-    ["/activate", "/"],
+    ["https://evil.test/", "/dashboard"],
+    ["//evil.test/account", "/dashboard"],
+    ["/\\evil.test/account", "/dashboard"],
+    ["/%2f%2fevil.test", "/dashboard"],
+    ["/login?returnTo=/login", "/dashboard"],
+    ["/register", "/dashboard"],
+    ["/activate", "/dashboard"],
   ] as const
 ) {
   test(`login confirms whoami before navigating safely for returnTo=${returnTo}`, async () => {
@@ -258,7 +259,7 @@ test("register requires a separate ID and display name and uses only new-account
   });
   await submit("Register new account");
   await waitFor(() =>
-    expect(goto).toHaveBeenCalledWith("/", { replaceState: true })
+    expect(goto).toHaveBeenCalledWith("/dashboard", { replaceState: true })
   );
   const requests = posted(fetcher);
   expect(requests.map(({ path }) => path)).toEqual([
@@ -301,7 +302,7 @@ for (const policy of [false, "error", "loading"] as const) {
       screen.getByRole("link", { name: "Log in with an existing account" })
         .getAttribute("href"),
     )
-      .toBe("/login?returnTo=%2F");
+      .toBe("/login?returnTo=%2Fdashboard");
     expect(
       screen.getByRole("link", { name: "Activate an account with a code" })
         .getAttribute("href"),

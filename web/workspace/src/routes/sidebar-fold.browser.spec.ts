@@ -7,7 +7,7 @@ import { logout } from "#lib/workspace/auth/api.ts";
 import { settle } from '#lib/workspace/navigation/deferred.ts';
 import Layout from "./+layout.svelte";
 
-vi.mock("$app/state", () => ({ page: { url: new URL("https://example.test/") } }));
+vi.mock("$app/state", () => ({ page: { url: new URL("https://example.test/w/example") } }));
 const storageKey = "yoi.sidebar.mode.v1";
 const legacyKey = "yoi.sidebar.folded.v1";
 const props = {

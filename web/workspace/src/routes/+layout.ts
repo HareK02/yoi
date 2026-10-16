@@ -7,8 +7,12 @@ export const ssr = false;
 
 export const load = ({ fetch, url }: Parameters<Load>[0]) => ({
   deferredCatalog: settle((async () => {
-    // 認証/hostingの判断はWorkspace catalogを必要としない。
-    if (isAuthPage(url.pathname) || url.pathname.startsWith("/hosting/")) {
+    // 公開入口・認証・hostingの判断はWorkspace catalogを必要としない。
+    // dashboardはactor確認後に自身の一覧を取得する。
+    if (
+      url.pathname === "/" || url.pathname === "/dashboard" ||
+      isAuthPage(url.pathname) || url.pathname.startsWith("/hosting/")
+    ) {
       return { accessibleWorkspaces: [], workspaceCatalogError: null };
     }
     try {

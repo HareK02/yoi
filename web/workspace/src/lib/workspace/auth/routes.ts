@@ -1,6 +1,6 @@
-// T760が公開トップ/Workspace選択を整理するまで、現行の一覧をdashboardへの入口とする。
+// 公開トップではなく明示的なWorkspace選択へ戻す。先頭Workspaceの推測はしない。
 // 戻り先は既知のアプリ画面だけ。認証経路への再帰やdecode段階の差による別originを作らない。
-export const AUTHENTICATED_HOME = "/";
+export const AUTHENTICATED_HOME = "/dashboard";
 
 export function safeReturnTo(value: string | null): string {
   if (
@@ -32,7 +32,7 @@ export function safeReturnTo(value: string | null): string {
     return "/login/device";
   }
   if (
-    url.pathname === "/" || url.pathname === "/account" ||
+    url.pathname === AUTHENTICATED_HOME || url.pathname === "/account" ||
     /^\/w\/[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_/-]*)?$/.test(url.pathname)
   ) {
     return url.pathname;

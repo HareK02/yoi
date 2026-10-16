@@ -18,4 +18,7 @@
 .auth-page dl { display: grid; gap: var(--space-4); margin: 0; }
 .auth-page dl div { display: grid; gap: var(--space-1); min-width: 0; }
 .auth-page dt { color: var(--text-muted); }
+.auth-page a.entry-primary { justify-self: start; padding: var(--space-2) var(--space-4); border: 1px solid var(--line-strong); border-radius: var(--radius-soft); background: var(--text-strong); color: var(--bg); text-decoration: none; }
+.auth-page a.entry-primary:hover { background: var(--interactive-hover); color: var(--text-strong); }
+.auth-page a.entry-primary:active { background: var(--interactive-selected); color: var(--text-strong); }
 .auth-page dd { margin: 0; overflow-wrap: anywhere; }

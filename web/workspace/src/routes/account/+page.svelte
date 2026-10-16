@@ -52,5 +52,5 @@
   {/if}
   {#if auth.status}<p role="status">{auth.status}</p>{/if}
   {#if auth.error}<p role="alert" class="error">{auth.error}</p>{/if}
-  <a href="/">Dashboard / Workspaces</a>
+  <a href="/dashboard">Dashboard / Workspaces</a>
 </div>

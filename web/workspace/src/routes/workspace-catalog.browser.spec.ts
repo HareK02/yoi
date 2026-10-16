@@ -8,7 +8,7 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
 import { goto } from "$app/navigation";
-import Catalog from "./PageContent.svelte";
+import Catalog from "./dashboard/WorkspaceCatalog.svelte";
 import {
   createdWorkspace,
   creationResponse,
@@ -20,15 +20,25 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.clearAllMocks();
 });
-function mount() {
-  return render(Catalog, {
-    props: {
-      data: {
-        workspaces: [{ ...createdWorkspace, repositories: [] }],
-        catalogError: null,
+async function mount() {
+  const mutationFetch = globalThis.fetch;
+  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+    if (init?.method === "POST") return mutationFetch(url, init);
+    return Response.json(
+      url.startsWith("/api/workspaces?") ? [createdWorkspace] : {
+        workspace_id: "home-empty",
+        items: [],
+        source: "workspace-control-plane",
+        diagnostics: [],
       },
-    },
+    );
   });
+  const view = render(Catalog);
+  await screen.findByRole("link", { name: /New Workspace.*No repositories/ });
+  await fireEvent.click(
+    screen.getByText("Create Workspace", { selector: "summary" }),
+  );
+  return view;
 }
 function submit() {
   return fireEvent.submit(
@@ -42,7 +52,7 @@ test("blank repository form creates and opens a Workspace using a null repositor
     Response.json(creationResponse()),
   );
   vi.stubGlobal("fetch", fetcher);
-  mount();
+  await mount();
   expect(
     screen.getByRole("link", { name: /New Workspace.*No repositories/ })
       .getAttribute("href"),
@@ -64,7 +74,7 @@ test("opting into a repository requires an explicit key and source and submits n
     Response.json(creationResponse()),
   );
   vi.stubGlobal("fetch", fetcher);
-  mount();
+  await mount();
   await fireEvent.click(
     screen.getByRole("checkbox", {
       name: "Add an initial repository (optional)",
@@ -98,7 +108,7 @@ test("unchanged empty creation retries reuse the operation key and accept delete
     )
     .mockResolvedValueOnce(Response.json(creationResponse(null, true)));
   vi.stubGlobal("fetch", fetcher);
-  mount();
+  await mount();
   await fireEvent.input(screen.getByLabelText("Workspace display name"), {
     target: { value: "New Workspace" },
   });
@@ -116,7 +126,7 @@ test("opting out ignores retained repository inputs and changes the creation ope
     Response.json({ message: "Temporary failure" }, { status: 503 })
   );
   vi.stubGlobal("fetch", fetcher);
-  mount();
+  await mount();
   const toggle = screen.getByRole("checkbox", {
     name: "Add an initial repository (optional)",
   });

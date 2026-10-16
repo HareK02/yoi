@@ -5,7 +5,8 @@
   import { loginWithPasskey, registerPasskey } from './api.ts';
   import { BrowserAuth } from './browser-session.svelte.ts';
   import { loadRegistrationPolicy } from './hosting.ts';
-  import { authEntryUrl, safeReturnTo } from './routes.ts';
+  import { authEntryUrl, safeReturnTo, AUTHENTICATED_HOME } from './routes.ts';
+  import RegistrationLink from './RegistrationLink.svelte';
   import './auth-page.css';
 
   let { mode }: { mode: 'login' | 'register' } = $props();
@@ -72,7 +73,7 @@
     <button type="button" disabled={auth.busy} onclick={() => auth.refresh()}>Retry session</button>
   {:else if auth.actor}
     <p>Logged in as <strong>{auth.actor.display_name}</strong> <span class="muted">@{auth.actor.handle}</span>.</p>
-    <a href={destination}>Continue to {destination === '/' ? 'dashboard / Workspaces' : 'requested page'}</a>
+    <a href={destination}>Continue to {destination === AUTHENTICATED_HOME ? 'dashboard / Workspaces' : 'requested page'}</a>
     <a href="/account">Open Account</a>
   {:else}
     {#if mode === 'register'}
@@ -103,12 +104,13 @@
   {#if auth.status}<p role="status">{auth.status}</p>{/if}
   {#if auth.error}<p role="alert" class="error">{auth.error}</p>{/if}
   <nav aria-label="Authentication">
-    {#if mode === 'login'}
-      <a href={authEntryUrl('/register', destination)}>Create a new account</a>
-    {:else}
+    {#if mode === 'login' && auth.session.kind === 'ready' && !auth.actor}
+      <RegistrationLink returnTo={destination} />
+    {:else if mode === 'register'}
       <a href={authEntryUrl('/login', destination)}>Log in with an existing account</a>
     {/if}
     <a href="/activate">Activate an account with a code</a>
-    <a href="/">Dashboard / Workspaces</a>
+    <a href={AUTHENTICATED_HOME}>Dashboard / Workspaces</a>
+    <a href="/">Yoi home</a>
   </nav>
 </div>

@@ -4,6 +4,8 @@ import { load, ssr } from "../src/routes/+layout.ts";
 Deno.test("authentication and hosting shells never require Workspace catalog authority", async () => {
   for (
     const path of [
+      "/",
+      "/dashboard",
       "/activate",
       "/login",
       "/register",

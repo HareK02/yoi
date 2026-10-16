@@ -27,8 +27,8 @@
 
   let { children, data }: LayoutProps = $props();
   import { isAuthPage } from '#lib/workspace/auth/routes.ts';
-  // 認証画面はWorkspaceの存在/取得/Sidebarに依存しない。
-  const standalone = $derived(isAuthPage(page.url.pathname) || page.url.pathname.startsWith('/hosting/'));
+  // 公開入口・認証・Workspace選択はWorkspace catalogやSidebarに依存しない。
+  const standalone = $derived(page.url.pathname === '/' || page.url.pathname === '/dashboard' || isAuthPage(page.url.pathname) || page.url.pathname.startsWith('/hosting/'));
   const catalog = observeDeferred(() => data.deferredCatalog, () => 'catalog');
   let sidebar = $state<SidebarSnippet | null>(null);
   const sidebarOverrides = createOverrideStack<SidebarSnippet>((activeSidebar) => {

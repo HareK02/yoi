@@ -51,7 +51,8 @@
   }: Props = $props();
 
   const globalItems = [
-    { href: "/#workspace-create-title", label: "Create Workspace" },
+    { href: "/dashboard", label: "Dashboard / Workspaces" },
+    { href: "/dashboard#workspace-create-title", label: "Create Workspace" },
     { href: "/account", label: "Account" },
     { href: "/login/device", label: "Device Login" },
   ];
