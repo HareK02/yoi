@@ -5,7 +5,8 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
     for runtime_source in [true, false] {
         let directory = tempfile::tempdir().unwrap();
         let (api, _, identity, source, ticket) = tracking_fixture(directory.path()).await;
-        let token = seed_test_api_token(api.store.as_ref(), "assign-replay-owner");
+        let token =
+            seed_test_workspace_owner_token(api.store.as_ref(), "assign-replay-owner").await;
         let request = |method: &str, path: &str, body: Vec<u8>| {
             if runtime_source {
                 runtime_source_request(&identity, Some(&source.worker_id), method, path, body)
@@ -370,7 +371,8 @@ async fn authenticated_account_assign_and_clear_retries_preserve_source_and_reje
 {
     let dir = tempfile::tempdir().unwrap();
     let (api, _, _, _, ticket) = tracking_fixture(dir.path()).await;
-    let owner = seed_test_api_token(api.store.as_ref(), "assignment-account-owner");
+    let owner =
+        seed_test_workspace_owner_token(api.store.as_ref(), "assignment-account-owner").await;
     let other = seed_test_api_token(api.store.as_ref(), "assignment-account-other");
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator");
     let body = serde_json::to_vec(&serde_json::json!({"operation_id":"account-assign", "principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"}})).unwrap();
@@ -393,7 +395,7 @@ async fn authenticated_account_assign_and_clear_retries_preserve_source_and_reje
     let actor = format!(
         "workspace-user:{}",
         serde_json::to_string(&(
-            "account-assignment-account-owner",
+            &format!("account-{TEST_WORKSPACE_ID}"),
             "user-assignment-account-owner"
         ))
         .unwrap()
@@ -411,7 +413,7 @@ async fn authenticated_account_assign_and_clear_retries_preserve_source_and_reje
     tracking_response(
         app.clone(),
         request(&other, "PUT", &path, body),
-        StatusCode::CONFLICT,
+        StatusCode::FORBIDDEN,
     )
     .await;
     let assignment_id = assigned["assignment"]["assignment_id"].as_str().unwrap();
@@ -434,7 +436,7 @@ async fn authenticated_account_assign_and_clear_retries_preserve_source_and_reje
     tracking_response(
         app,
         request(&other, "DELETE", &clear_path, Vec::new()),
-        StatusCode::CONFLICT,
+        StatusCode::FORBIDDEN,
     )
     .await;
     let released = api
@@ -1105,7 +1107,7 @@ async fn assignment_retry_is_idempotent_but_another_authenticated_actor_cannot_r
     let current = assign_tracking(&api, &identity, &source, &ticket).await;
     let replay = assign_tracking(&api, &identity, &source, &ticket).await;
     assert_eq!(replay, current);
-    let token = seed_test_api_token(api.store.as_ref(), "assignment-replay-user");
+    let token = seed_test_workspace_owner_token(api.store.as_ref(), "assignment-replay-user").await;
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator");
     let body = serde_json::to_vec(&serde_json::json!({"operation_id":"assign-tracking", "principal":{"kind":"workspace_agent", "agent_key":"workspace-orchestrator"}})).unwrap();
     tracking_response(
@@ -1226,7 +1228,8 @@ async fn tracking_model_authorship_and_role_fields_are_rejected_and_human_is_not
         )
         .await;
     }
-    let token = seed_test_api_token(api.store.as_ref(), "human-not-tracking-agent");
+    let token =
+        seed_test_workspace_owner_token(api.store.as_ref(), "human-not-tracking-agent").await;
     tracking_response(
         app,
         Request::builder()
@@ -1308,7 +1311,7 @@ async fn assignment_clear_receipt_binds_verified_actor_and_runtime_binding() {
         .await,
         result
     );
-    let token = seed_test_api_token(api.store.as_ref(), "another-clear-actor");
+    let token = seed_test_workspace_owner_token(api.store.as_ref(), "another-clear-actor").await;
     tracking_response(
         app.clone(),
         Request::builder()
@@ -1517,7 +1520,7 @@ async fn public_assignment_answer_authenticates_source_replays_saved_result_and_
     let directory = tempfile::tempdir().unwrap();
     let (api, _, identity, source, ticket) = tracking_fixture(directory.path()).await;
     let current = assign_tracking(&api, &identity, &source, &ticket).await;
-    let token = seed_test_api_token(api.store.as_ref(), "answer-owner");
+    let token = seed_test_workspace_owner_token(api.store.as_ref(), "answer-owner").await;
     let app = build_router(api.clone());
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignment-answer");
     let body = serde_json::json!({"assignment_id":current.assignment_id,"expected_last_event_id":current.last_event_id,"operation_key":"answer-op","body":"Choose the bounded option"});
@@ -1755,7 +1758,7 @@ async fn catalog_assignment_routes_apply_cookie_workspace_auth_and_origin_to_bro
     let directory = tempfile::tempdir().unwrap();
     let (api, _, identity, source, ticket) = tracking_fixture(directory.path()).await;
     let current = assign_tracking(&api, &identity, &source, &ticket).await;
-    seed_test_api_token(api.store.as_ref(), "assignment-cookie");
+    seed_test_workspace_owner_token(api.store.as_ref(), "assignment-cookie").await;
     api.store
         .create_browser_session(&BrowserSessionRecord {
             token_hash: crate::auth::token_hash("assignment-browser-session"),
@@ -1846,7 +1849,7 @@ async fn catalog_assignment_routes_apply_cookie_workspace_auth_and_origin_to_bro
                 .header(ORIGIN, origin)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
-            StatusCode::NOT_FOUND,
+            StatusCode::FORBIDDEN,
         )
         .await;
     }
@@ -1865,7 +1868,7 @@ async fn catalog_assignment_routes_apply_cookie_workspace_auth_and_origin_to_bro
             .author
             .as_deref()
             .unwrap()
-            .contains("account-assignment-cookie")
+            .contains(&format!("account-{TEST_WORKSPACE_ID}"))
     );
 }
 

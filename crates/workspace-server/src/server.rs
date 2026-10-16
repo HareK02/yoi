@@ -3131,6 +3131,20 @@ async fn authorize_scoped_workspace_request(
             ));
         }
     }
+    if mutating || request.headers().contains_key(axum::http::header::UPGRADE) {
+        let workspace = api
+            .store
+            .get_workspace(workspace_id)
+            .await
+            .map_err(server_error_response)?;
+        if !workspace.is_some_and(|workspace| workspace.owner_account_id == actor.account_id) {
+            return Err(repository_api_rejection(
+                &request_path,
+                StatusCode::FORBIDDEN,
+                "Workspace mutations and interactive control require the owner account",
+            ));
+        }
+    }
     request.extensions_mut().insert(actor);
     require_active_scoped_workspace(api, workspace_id, &request_path).await
 }
@@ -3292,8 +3306,23 @@ async fn authorize_workspace_api_request(
             );
         }
     }
+    if !public_server_api
+        && (mutating || request.headers().contains_key(axum::http::header::UPGRADE))
+    {
+        let workspace = match api.store.get_workspace(&workspace_id).await {
+            Ok(workspace) => workspace,
+            Err(error) => return server_error_response(error),
+        };
+        if !workspace.is_some_and(|workspace| workspace.owner_account_id == actor.account_id) {
+            return repository_api_rejection(
+                &request_path,
+                StatusCode::FORBIDDEN,
+                "Workspace mutations and interactive control require the owner account",
+            );
+        }
+    }
     request.extensions_mut().insert(actor);
-    if mutating {
+    if mutating && !public_server_api {
         let workspace = match api.store.get_workspace(&workspace_id).await {
             Ok(workspace) => workspace,
             Err(error) => return server_error_response(error),
@@ -3358,6 +3387,17 @@ async fn dispatch_workspace_request(
     request: Request,
 ) -> Response {
     let path = request.uri().path().to_owned();
+    // Public and authentication shells belong to the Server regardless of the
+    // catalog. Their delivery neither selects a Workspace nor grants API access.
+    if matches!(
+        path.as_str(),
+        "/" | "/dashboard" | "/login" | "/register" | "/account" | "/activate" | "/login/device"
+    ) || path.starts_with("/hosting/")
+        || path.starts_with("/_app/")
+        || path.starts_with("/assets/")
+    {
+        return serve_server_static_shell(&api, &path).await;
+    }
     let workspace_id = scoped_workspace_id(&path);
     // Admission is immediate, shared, and cancellation-safe. No resource or
     // business-operation lock may precede proof validation. The lease covers
@@ -3464,6 +3504,7 @@ async fn dispatch_admitted_workspace_request(
 fn is_server_global_forward(path: &str) -> bool {
     path == "/api/auth"
         || path.starts_with("/api/auth/")
+        || path.starts_with("/api/hosting/")
         || path == "/health"
         || path == "/"
         || path.starts_with("/_app/")
@@ -6778,12 +6819,26 @@ async fn attach_server_request_context(
 fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
     let service = Arc::new(service);
     let origin_context = Router::new()
+        .merge(server_api::server_api_axum::auth_activation_options(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::auth_passkey_registration_options(service.clone()))
         .merge(server_api::server_api_axum::auth_passkey_login_options(
             service.clone(),
         ))
         .layer(middleware::from_fn(attach_server_origin_context));
     let actor_context = Router::new()
+        .merge(server_api::server_api_axum::hosting_account_create(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::hosting_activation_code_reissue(service.clone()))
+        .merge(server_api::server_api_axum::hosting_access(service.clone()))
+        .merge(server_api::server_api_axum::hosting_settings(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::hosting_settings_update(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::auth_passkey_addition_options(
             service.clone(),
         ))
@@ -6800,7 +6855,13 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
         ));
     Router::new()
         .merge(server_api::server_api_axum::auth_config(service.clone()))
+        .merge(server_api::server_api_axum::auth_registration_policy(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::auth_bootstrap_user(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::auth_activation_complete(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::auth_passkey_registration_complete(service.clone()))
@@ -6814,6 +6875,16 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
         .merge(server_api::server_api_axum::auth_device_login_poll(service))
         .merge(origin_context)
         .merge(actor_context)
+        .layer(middleware::map_response(
+            |mut response: Response| async move {
+                // Current role/policy and authentication responses must not be cached
+                // across credential revocation or policy changes.
+                response
+                    .headers_mut()
+                    .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                response
+            },
+        ))
 }
 
 fn generated_workspace_catalog_contract_router(service: ServerApiContractService) -> Router {
@@ -7695,6 +7766,172 @@ impl server_api::ServerApi for ServerApiContractService {
         Ok(auth_public_config(&self.auth_api().config))
     }
 
+    async fn auth_registration_policy(
+        &self,
+    ) -> std::result::Result<server_api::HostingSettings, server_api::RepositoryApiError> {
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                api.store
+                    .hosting_self_registration_enabled()
+                    .map(|self_registration_enabled| server_api::HostingSettings {
+                        self_registration_enabled,
+                    })
+            })
+            .await
+            .map_err(|error| ApiError::from(error).into_repository_api_error())
+    }
+
+    async fn hosting_access(
+        &self,
+        context: server_api::ServerRequestContext,
+    ) -> std::result::Result<server_api::HostingAccess, server_api::RepositoryApiError> {
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let actor = live_hosting_actor(&api, &context, false)?;
+                Ok::<_, ApiError>(server_api::HostingAccess {
+                    is_admin: api.store.is_hosting_admin(&actor.user_id)?,
+                })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn hosting_settings(
+        &self,
+        context: server_api::ServerRequestContext,
+    ) -> std::result::Result<server_api::HostingSettings, server_api::RepositoryApiError> {
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let actor = live_hosting_actor(&api, &context, false)?;
+                require_hosting_admin(&api, &actor)?;
+                Ok::<_, ApiError>(server_api::HostingSettings {
+                    self_registration_enabled: api.store.hosting_self_registration_enabled()?,
+                })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn hosting_settings_update(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::HostingSettings,
+    ) -> std::result::Result<server_api::HostingSettings, server_api::RepositoryApiError> {
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let actor = live_hosting_actor(&api, &context, true)?;
+                api.store.set_hosting_self_registration_enabled(
+                    &actor,
+                    request.self_registration_enabled,
+                )?;
+                Ok::<_, ApiError>(request)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn hosting_account_create(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::ProvisionalAccountRequest,
+    ) -> std::result::Result<server_api::ActivationCodeResponse, server_api::RepositoryApiError>
+    {
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let actor = live_hosting_actor(&api, &context, true)?;
+                let issued = api.store.create_provisional_user(&actor, &request.handle)?;
+                Ok::<_, ApiError>(server_api::ActivationCodeResponse {
+                    user: user_response(issued.user),
+                    code: issued.code,
+                    expires_at: issued.expires_at,
+                })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn hosting_activation_code_reissue(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::ProvisionalAccountRequest,
+    ) -> std::result::Result<server_api::ActivationCodeResponse, server_api::RepositoryApiError>
+    {
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let actor = live_hosting_actor(&api, &context, true)?;
+                let issued = api.store.reissue_activation_code(&actor, &request.handle)?;
+                Ok::<_, ApiError>(server_api::ActivationCodeResponse {
+                    user: user_response(issued.user),
+                    code: issued.code,
+                    expires_at: issued.expires_at,
+                })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_activation_options(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::ActivationOptionsRequest,
+    ) -> std::result::Result<PasskeyRegistrationOptionsResponse, server_api::RepositoryApiError>
+    {
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                // Validate the allowed WebAuthn origin before spending an attempt. Neither
+                // a browser cookie nor a bearer token can select this enrollment target.
+                let origin = request
+                    .browser_origin
+                    .as_deref()
+                    .or(context.origin.as_deref());
+                auth_config_for_origin(&api.config, origin)?;
+                let target = api
+                    .store
+                    .verify_activation_code(&request.handle, &request.code)?;
+                start_passkey_registration(&api, &HeaderMap::new(), origin, target)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_activation_complete(
+        &self,
+        request: PasskeyRegistrationCompleteRequest,
+    ) -> std::result::Result<
+        server_api::server_api_responses::AuthActivationComplete,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.auth_api();
+        let (body, header_set_cookie) = api
+            .store
+            .db_executor()
+            .run(move || {
+                complete_passkey_enrollment(&api, request, EnrollmentCompletion::Activation)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)?;
+        Ok(
+            server_api::server_api_responses::AuthActivationComplete::Status200 {
+                body,
+                header_set_cookie,
+            },
+        )
+    }
+
     async fn auth_bootstrap_user(
         &self,
         request: AuthBootstrapUserRequest,
@@ -7781,7 +8018,9 @@ impl server_api::ServerApi for ServerApiContractService {
         let (body, header_set_cookie) = api
             .store
             .db_executor()
-            .run(move || complete_passkey_enrollment(&api, request, Some(&headers)))
+            .run(move || {
+                complete_passkey_enrollment(&api, request, EnrollmentCompletion::Addition(&headers))
+            })
             .await
             .map_err(ApiError::into_repository_api_error)?;
         Ok(
@@ -29469,6 +29708,7 @@ async fn post_passkey_registration_options(
     api.store
         .db_executor()
         .run(move || {
+            require_self_registration(&api)?;
             let user = allocate_new_user(&api, &request.handle, request.display_name.as_deref())?;
             start_passkey_registration(
                 &api,
@@ -29524,6 +29764,13 @@ fn passkey_addition_authority(
         .get_user(&actor.user_id)?
         .filter(|user| user.account_id == actor.account_id)
         .ok_or_else(|| auth_error("auth_required", "authenticated user no longer exists"))?;
+    if api.store.is_user_pending_activation(&user.user_id)? {
+        return Err(auth_error(
+            "passkey_activation_required",
+            "initial passkey activation is required",
+        )
+        .into());
+    }
     Ok((user, binding))
 }
 
@@ -29534,7 +29781,8 @@ fn start_passkey_registration(
     target: PasskeyRegistrationTarget,
 ) -> ApiResult<PasskeyRegistrationOptionsResponse> {
     let (user, exclude_credentials) = match &target {
-        PasskeyRegistrationTarget::NewAccount { user } => (user, Vec::new()),
+        PasskeyRegistrationTarget::NewAccount { user }
+        | PasskeyRegistrationTarget::Activation { user, .. } => (user, Vec::new()),
         PasskeyRegistrationTarget::Addition { user, .. } => (
             user,
             passkeys_for_user(api, &user.user_id)?
@@ -29559,7 +29807,8 @@ fn start_passkey_registration(
     // target (including its allocated user ID) is inside the purpose-tagged state.
     let user_id = match &target {
         PasskeyRegistrationTarget::NewAccount { .. } => None,
-        PasskeyRegistrationTarget::Addition { user, .. } => Some(user.user_id.clone()),
+        PasskeyRegistrationTarget::Addition { user, .. }
+        | PasskeyRegistrationTarget::Activation { user, .. } => Some(user.user_id.clone()),
     };
     api.store.put_auth_challenge(&AuthChallengeRecord {
         challenge_id: challenge_id.clone(),
@@ -29599,17 +29848,26 @@ fn complete_passkey_registration(
     api: &ServerAuthApi,
     request: PasskeyRegistrationCompleteRequest,
 ) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
-    complete_passkey_enrollment(api, request, None)
+    complete_passkey_enrollment(api, request, EnrollmentCompletion::NewAccount)
+}
+
+/// Completion endpoints select a purpose, not a caller-controlled body field.
+/// Activation authority never satisfies the public registration or addition path.
+enum EnrollmentCompletion<'a> {
+    NewAccount,
+    Addition(&'a HeaderMap),
+    Activation,
 }
 
 fn complete_passkey_enrollment(
     api: &ServerAuthApi,
     request: PasskeyRegistrationCompleteRequest,
-    addition_headers: Option<&HeaderMap>,
+    completion: EnrollmentCompletion<'_>,
 ) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
-    let authority = addition_headers
-        .map(|headers| passkey_addition_authority(api, headers))
-        .transpose()?;
+    let authority = match completion {
+        EnrollmentCompletion::Addition(headers) => Some(passkey_addition_authority(api, headers)?),
+        _ => None,
+    };
     let challenge = api
         .store
         .consume_auth_challenge_by_id(
@@ -29643,10 +29901,13 @@ fn complete_passkey_enrollment(
                 "registration requires purpose-bound state",
             )
         })?;
-    let user = match (&envelope.target, authority) {
-        (PasskeyRegistrationTarget::NewAccount { user }, None)
-            if addition_headers.is_none() && challenge.user_id.is_none() =>
-        {
+    let user = match (&envelope.target, authority, completion) {
+        (
+            PasskeyRegistrationTarget::NewAccount { user },
+            None,
+            EnrollmentCompletion::NewAccount,
+        ) if challenge.user_id.is_none() => {
+            require_self_registration(api)?;
             user.clone()
         }
         (
@@ -29655,12 +29916,22 @@ fn complete_passkey_enrollment(
                 authentication,
             },
             Some((current, binding)),
+            EnrollmentCompletion::Addition(_),
         ) if user.user_id == current.user_id
             && user.account_id == current.account_id
             && *authentication == binding
             && challenge.user_id.as_deref() == Some(user.user_id.as_str()) =>
         {
             current
+        }
+        (
+            PasskeyRegistrationTarget::Activation { user, .. },
+            None,
+            EnrollmentCompletion::Activation,
+        ) if challenge.user_id.as_deref() == Some(user.user_id.as_str()) => {
+            // The verified credential transaction rechecks the live pending row,
+            // issuance, code expiry and attempts before atomically activating it.
+            user.clone()
         }
         _ => {
             return Err(auth_error(
@@ -29714,6 +29985,13 @@ async fn post_passkey_login_options(
                 }
             }
             .ok_or_else(|| auth_error("unknown_auth_user", "no matching user account exists"))?;
+            if api.store.is_user_pending_activation(&user.user_id)? {
+                return Err(auth_error(
+                    "passkey_activation_required",
+                    "initial passkey activation is required",
+                )
+                .into());
+            }
             let passkeys = passkeys_for_user(&api, &user.user_id)?;
             if passkeys.is_empty() {
                 return Err(auth_error(
@@ -30215,6 +30493,54 @@ async fn resolve_actor(
 ) -> ApiResult<Option<RequestActor>> {
     let cookie_name = auth_public_config(&api.config).cookie_name;
     Ok(resolve_request_actor(api.store.clone(), headers, &cookie_name).await?)
+}
+
+// Hosting endpoints re-resolve actual transport credentials, not actor-like headers,
+// JSON or a stale middleware snapshot. The store rechecks live admin authority in
+// the write transaction. Cookie writes require Origin; non-browser bearer calls
+// may omit it, but a supplied foreign Origin never becomes trusted via a bearer.
+fn live_hosting_actor(
+    api: &ServerAuthApi,
+    context: &server_api::ServerRequestContext,
+    mutating: bool,
+) -> ApiResult<RequestActor> {
+    let headers = contract_request_headers(context)
+        .map_err(|error| Error::WorkspacePermissionDenied(error.message))?;
+    let auth = auth_public_config(&api.config);
+    let actor = crate::auth::resolve_request_actor_sync(
+        api.store.as_ref(),
+        crate::auth::parse_bearer(&headers),
+        parse_cookie(&headers, &auth.cookie_name),
+    )?
+    .ok_or_else(|| auth_error("auth_required", "current authentication required"))?;
+    let origin = request_origin(&headers);
+    if mutating
+        && (actor.auth_method == ActorAuthMethod::BrowserSession || origin.is_some())
+        && origin.as_deref() != Some(auth.origin.as_str())
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "hosting mutations require configured Browser origin when supplied, and for cookies"
+                .into(),
+        )
+        .into());
+    }
+    Ok(actor)
+}
+
+fn require_hosting_admin(api: &ServerAuthApi, actor: &RequestActor) -> ApiResult<()> {
+    if !api.store.is_hosting_admin(&actor.user_id)? {
+        return Err(
+            Error::WorkspacePermissionDenied("hosting administrator required".into()).into(),
+        );
+    }
+    Ok(())
+}
+
+fn require_self_registration(api: &ServerAuthApi) -> ApiResult<()> {
+    if !api.store.hosting_self_registration_enabled()? {
+        return Err(Error::WorkspacePermissionDenied("self_registration_disabled".into()).into());
+    }
+    Ok(())
 }
 
 async fn require_actor(api: &ServerAuthApi, headers: &HeaderMap) -> ApiResult<RequestActor> {
@@ -40127,10 +40453,542 @@ mod tests {
             .unwrap();
     }
 
+    /// Router and direct trait admission use real SQLite authority and credentials.
+    /// Only Runtime execution is replaced by the shared isolated test_api fixture.
+    /// These tests run in the ordinary workspace-server library suite.
+    mod hosting_authorization_tests {
+        use super::*;
+        use api_macros::HttpError;
+        use server_api::ServerApi;
+
+        async fn response(app: Router, request: Request<Body>) -> (StatusCode, HeaderMap, Value) {
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, headers, body)
+        }
+
+        fn settings_request(token: Option<&str>, method: &str) -> Request<Body> {
+            let mut request = Request::builder()
+                .method(method)
+                .uri("/api/hosting/settings");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            request
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"self_registration_enabled":true}"#))
+                .unwrap()
+        }
+
+        fn context(
+            token: Option<&str>,
+            actor: Option<RequestActor>,
+        ) -> server_api::ServerRequestContext {
+            let mut headers = HeaderMap::new();
+            if let Some(token) = token {
+                headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+            }
+            server_request_context(actor, None, None, None, &headers)
+        }
+
+        #[tokio::test]
+        async fn entry_shells_are_server_scoped_with_zero_one_or_multiple_workspaces() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = test_server_config(dir.path());
+            let assets = dir.path().join("static");
+            fs::create_dir_all(&assets).unwrap();
+            fs::write(
+                assets.join("index.html"),
+                "<!doctype html><title>Hosting shell</title>",
+            )
+            .unwrap();
+            config.static_assets_dir = Some(assets);
+            let store = Arc::new(SqliteWorkspaceStore::in_memory_for_test().unwrap());
+            let app =
+                workspace_server_router(WorkspaceServerApi::new(config.clone(), store.clone()));
+            for count in 0..=2 {
+                if count > 0 {
+                    config.workspace_id = Uuid::now_v7().to_string();
+                    seed_test_registered_workspace(store.as_ref(), &config)
+                        .await
+                        .unwrap();
+                }
+                for path in [
+                    "/",
+                    "/dashboard",
+                    "/login",
+                    "/register",
+                    "/account",
+                    "/activate",
+                    "/login/device?user_code=ABCD-EFGH",
+                    "/hosting/settings",
+                    "/hosting/setup",
+                ] {
+                    let response = app
+                        .clone()
+                        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK, "{count}: {path}");
+                    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                    assert!(String::from_utf8_lossy(&body).contains("Hosting shell"));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn public_registration_policy_is_noncacheable_boolean_and_tracks_persisted_setting() {
+            let dir = tempfile::tempdir().unwrap();
+            let api = test_api(dir.path()).await;
+            let app = build_router(api.clone());
+            let public = || {
+                Request::builder()
+                    .uri("/api/auth/registration-policy")
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let (status, headers, body) = response(app.clone(), public()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, json!({"self_registration_enabled":false}));
+            assert_eq!(headers.get(CACHE_CONTROL).unwrap(), "no-store");
+            let admin = api
+                .config_store
+                .setup_hosting_admin("policy-admin", true)
+                .unwrap();
+            let token = admin.initial_bearer.unwrap().access_token;
+            let (status, _, body) =
+                response(app.clone(), settings_request(Some(&token), "PUT")).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, json!({"self_registration_enabled":true}));
+            let reopened = SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap();
+            assert!(reopened.hosting_self_registration_enabled().unwrap());
+            let (status, headers, body) = response(app, public()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(headers.get(CACHE_CONTROL).unwrap(), "no-store");
+            // Exact public shape excludes administrator identities, bearer and setup secrets.
+            assert_eq!(body, json!({"self_registration_enabled":true}));
+        }
+
+        #[tokio::test]
+        async fn hosting_router_rejects_anonymous_ordinary_and_forged_roles_and_rechecks_admin_revocation()
+         {
+            let dir = tempfile::tempdir().unwrap();
+            let api = test_api(dir.path()).await;
+            let ordinary = seed_test_api_token(api.store.as_ref(), "hosting-ordinary");
+            let admin = api
+                .config_store
+                .setup_hosting_admin("hosting-admin", true)
+                .unwrap();
+            let token = admin.initial_bearer.unwrap().access_token;
+            let app = build_router(api.clone());
+            for token in [None, Some(ordinary.as_str())] {
+                for method in ["GET", "PUT"] {
+                    let mut request = settings_request(token, method);
+                    request
+                        .headers_mut()
+                        .insert("x-yoi-role", "hosting-admin".parse().unwrap());
+                    request
+                        .headers_mut()
+                        .insert("x-yoi-user-id", admin.user.user_id.parse().unwrap());
+                    request
+                        .headers_mut()
+                        .insert("x-yoi-hosting-admin", "true".parse().unwrap());
+                    assert_eq!(
+                        response(app.clone(), request).await.0,
+                        StatusCode::FORBIDDEN
+                    );
+                }
+            }
+            let forged = Request::builder().method("PUT").uri("/api/hosting/settings")
+                .header("authorization", format!("Bearer {ordinary}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"self_registration_enabled":true,"role":"hosting-admin","actor":admin.user,"is_admin":true}).to_string())).unwrap();
+            // Public JSON cannot select an actor or add a role.
+            assert_eq!(
+                response(app.clone(), forged).await.0,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+            assert!(!api.store.hosting_self_registration_enabled().unwrap());
+            for (token, is_admin) in [(&ordinary, false), (&token, true)] {
+                let request = Request::builder()
+                    .uri("/api/hosting/access")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap();
+                let (status, _, body) = response(app.clone(), request).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body, json!({"is_admin":is_admin}));
+            }
+            assert_eq!(
+                response(app.clone(), settings_request(Some(&token), "PUT"))
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+            api.config_store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "DELETE FROM hosting_administrators WHERE user_id=?1",
+                        [&admin.user.user_id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            for method in ["GET", "PUT"] {
+                assert_eq!(
+                    response(app.clone(), settings_request(Some(&token), method))
+                        .await
+                        .0,
+                    StatusCode::FORBIDDEN
+                );
+            }
+            assert!(api.store.hosting_self_registration_enabled().unwrap());
+        }
+
+        #[tokio::test]
+        async fn direct_hosting_trait_uses_live_transport_not_forged_or_stale_actor_context() {
+            let dir = tempfile::tempdir().unwrap();
+            let api = test_api(dir.path()).await;
+            let ordinary = seed_test_api_token(api.store.as_ref(), "direct-hosting-ordinary");
+            let admin = api
+                .config_store
+                .setup_hosting_admin("direct-hosting-admin", true)
+                .unwrap();
+            let token = admin.initial_bearer.unwrap().access_token;
+            let admin_actor = RequestActor {
+                user_id: admin.user.user_id.clone(),
+                account_id: admin.user.account_id.clone(),
+                handle: admin.user.handle.clone(),
+                display_name: admin.user.display_name.clone(),
+                auth_method: ActorAuthMethod::ApiToken,
+            };
+            let service = ServerApiContractService::Workspace(api.clone());
+            let update = || server_api::HostingSettings {
+                self_registration_enabled: true,
+            };
+            for input in [
+                context(None, Some(admin_actor.clone())),
+                context(Some(&ordinary), Some(admin_actor.clone())),
+            ] {
+                assert_eq!(
+                    service
+                        .hosting_settings(input.clone())
+                        .await
+                        .unwrap_err()
+                        .status_code(),
+                    403
+                );
+                assert_eq!(
+                    service
+                        .hosting_settings_update(input, update())
+                        .await
+                        .unwrap_err()
+                        .status_code(),
+                    403
+                );
+            }
+            assert!(!api.store.hosting_self_registration_enabled().unwrap());
+            // Conversely, a bogus cached actor cannot replace a valid current credential.
+            let live = context(Some(&token), Some(test_owner_actor()));
+            assert!(service.hosting_access(live.clone()).await.unwrap().is_admin);
+            service
+                .hosting_settings_update(live.clone(), update())
+                .await
+                .unwrap();
+            api.config_store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE api_tokens SET revoked_at='2026-01-02T00:00:00Z' WHERE user_id=?1",
+                        [&admin.user.user_id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                service
+                    .hosting_access(live.clone())
+                    .await
+                    .unwrap_err()
+                    .status_code(),
+                403
+            );
+            assert_eq!(
+                service
+                    .hosting_settings_update(
+                        live,
+                        server_api::HostingSettings {
+                            self_registration_enabled: false
+                        }
+                    )
+                    .await
+                    .unwrap_err()
+                    .status_code(),
+                403
+            );
+            assert!(api.store.hosting_self_registration_enabled().unwrap());
+        }
+
+        #[tokio::test]
+        async fn direct_hosting_cookie_write_requires_actual_origin_and_current_session() {
+            let dir = tempfile::tempdir().unwrap();
+            let api = test_api(dir.path()).await;
+            let admin = api
+                .config_store
+                .setup_hosting_admin("cookie-hosting-admin", true)
+                .unwrap();
+            api.store
+                .create_browser_session(&BrowserSessionRecord {
+                    token_hash: crate::auth::token_hash("hosting-browser-session"),
+                    session_id: "hosting-browser-session-id".into(),
+                    user_id: admin.user.user_id.clone(),
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    expires_at: "2099-01-01T00:00:00Z".into(),
+                    revoked_at: None,
+                })
+                .unwrap();
+            let AuthConfig::Passkey {
+                origin,
+                cookie_name,
+                ..
+            } = &api.config.auth;
+            let cookie_context = |actual_origin: Option<&str>| {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    axum::http::header::COOKIE,
+                    format!("{cookie_name}=hosting-browser-session")
+                        .parse()
+                        .unwrap(),
+                );
+                if let Some(origin) = actual_origin {
+                    headers.insert(ORIGIN, origin.parse().unwrap());
+                }
+                // The apparently trusted origin field must not bypass the retained transport header.
+                server_request_context(None, None, None, Some(origin.clone()), &headers)
+            };
+            let service = ServerApiContractService::Workspace(api.clone());
+            assert!(
+                service
+                    .hosting_access(cookie_context(None))
+                    .await
+                    .unwrap()
+                    .is_admin
+            );
+            for origin in [None, Some("https://attacker.invalid")] {
+                assert_eq!(
+                    service
+                        .hosting_settings_update(
+                            cookie_context(origin),
+                            server_api::HostingSettings {
+                                self_registration_enabled: true
+                            }
+                        )
+                        .await
+                        .unwrap_err()
+                        .status_code(),
+                    403
+                );
+                assert!(!api.store.hosting_self_registration_enabled().unwrap());
+            }
+            service
+                .hosting_settings_update(
+                    cookie_context(Some(origin)),
+                    server_api::HostingSettings {
+                        self_registration_enabled: true,
+                    },
+                )
+                .await
+                .unwrap();
+            api.config_store.with_conn(|conn| {
+                conn.execute("UPDATE browser_sessions SET revoked_at='2026-01-02T00:00:00Z' WHERE session_id='hosting-browser-session-id'", [])?;
+                Ok(())
+            }).unwrap();
+            assert_eq!(
+                service
+                    .hosting_settings_update(
+                        cookie_context(Some(origin)),
+                        server_api::HostingSettings {
+                            self_registration_enabled: false
+                        }
+                    )
+                    .await
+                    .unwrap_err()
+                    .status_code(),
+                403
+            );
+            assert!(api.store.hosting_self_registration_enabled().unwrap());
+        }
+
+        #[tokio::test]
+        async fn workspace_owner_mutations_and_upgrade_guards_do_not_expand_for_hosting_admins() {
+            let dir = tempfile::tempdir().unwrap();
+            let api = test_api(dir.path()).await;
+            let owner =
+                seed_test_workspace_owner_token(api.store.as_ref(), "hosting-workspace-owner")
+                    .await;
+            let foreign = seed_test_api_token(api.store.as_ref(), "hosting-workspace-foreign");
+            let admin = api
+                .config_store
+                .setup_hosting_admin("workspace-foreign-admin", true)
+                .unwrap();
+            let admin = admin.initial_bearer.unwrap().access_token;
+            let backend = browser_ticket_backend(&api).unwrap();
+            let ticket = backend
+                .create(ticket::NewTicket::new("Owner-only case changes"))
+                .unwrap();
+            let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+            catalog
+                .apis
+                .lock()
+                .await
+                .insert(TEST_WORKSPACE_ID.into(), api.clone());
+            catalog
+                .routers
+                .lock()
+                .await
+                .insert(TEST_WORKSPACE_ID.into(), build_inner_router(api.clone()));
+            for (router_name, app) in [
+                ("local", build_router(api.clone())),
+                ("catalog", workspace_server_router(catalog)),
+            ] {
+                for prefix in [
+                    format!("/api/w/{TEST_WORKSPACE_ID}"),
+                    format!("/workspaces/{TEST_WORKSPACE_ID}"),
+                ] {
+                    let path = format!(
+                        "{prefix}/tickets/{}/assignment-tracking/assignments",
+                        ticket.id
+                    );
+                    for (token, owns_workspace) in
+                        [(&owner, true), (&foreign, false), (&admin, false)]
+                    {
+                        let request = |upgrade: bool| {
+                            let mut request = Request::builder()
+                                .uri(&path)
+                                .header("authorization", format!("Bearer {token}"));
+                            if upgrade {
+                                request = request.header(axum::http::header::UPGRADE, "websocket");
+                            }
+                            request.body(Body::empty()).unwrap()
+                        };
+                        // Existing authenticated read-only projections remain accessible.
+                        assert_eq!(
+                            response(app.clone(), request(false)).await.0,
+                            StatusCode::OK
+                        );
+                        assert_eq!(
+                            response(app.clone(), request(true)).await.0,
+                            if owns_workspace {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::FORBIDDEN
+                            }
+                        );
+                        let websocket = Request::builder()
+                            .uri(format!("/api/w/{TEST_WORKSPACE_ID}/protocol/ws"))
+                            .header("authorization", format!("Bearer {token}"))
+                            .header("connection", "upgrade")
+                            .header("upgrade", "websocket")
+                            .header("sec-websocket-version", "13")
+                            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                            .body(Body::empty())
+                            .unwrap();
+                        let ws_status = response(app.clone(), websocket).await.0;
+                        if owns_workspace {
+                            assert_eq!(
+                                ws_status,
+                                StatusCode::UPGRADE_REQUIRED,
+                                "in-process router has no Hyper upgrade state, but owner passes admission"
+                            );
+                        } else {
+                            assert_eq!(ws_status, StatusCode::FORBIDDEN);
+                        }
+                        let before = backend.show(ticket.id.clone().into()).unwrap();
+                        let action = if before.meta.workflow_state == ticket::TicketState::Open {
+                            ticket::TicketCaseAction::Close {
+                                reason: ticket::TicketClosureReason::Completed,
+                            }
+                        } else {
+                            ticket::TicketCaseAction::Reopen
+                        };
+                        let input = case_test_request(
+                            &before,
+                            &format!("{router_name}-{prefix}-{owns_workspace}"),
+                            action,
+                        );
+                        let mut input = serde_json::to_value(input).unwrap();
+                        input.as_object_mut().unwrap().remove("author");
+                        let (mutation_path, input) = if prefix.starts_with("/api") {
+                            (
+                                format!("{prefix}/ticket-tags"),
+                                json!({"operation_key":router_name,"action":{"kind":"create","name":format!("owner-{router_name}")}}),
+                            )
+                        } else {
+                            (format!("{prefix}/tickets/{}/case", ticket.id), input)
+                        };
+                        let mutation = Request::builder()
+                            .method("POST")
+                            .uri(mutation_path)
+                            .header("authorization", format!("Bearer {token}"))
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(input.to_string()))
+                            .unwrap();
+                        assert_eq!(
+                            response(app.clone(), mutation).await.0,
+                            if owns_workspace {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::FORBIDDEN
+                            }
+                        );
+                    }
+                }
+            }
+            let saved = backend.show(ticket.id.into()).unwrap();
+            assert_eq!(
+                saved.case_history.len(),
+                2,
+                "only owner canonical mutations persist"
+            );
+            let tags = backend
+                .list_workspace_tags(ticket::TagListRequest::default())
+                .unwrap();
+            assert_eq!(tags.len(), 2, "only owner browser mutations persist");
+            assert!(
+                !api.store
+                    .is_hosting_admin("user-hosting-workspace-owner")
+                    .unwrap()
+            );
+            api.config_store
+                .setup_hosting_admin("user-hosting-workspace-owner", false)
+                .unwrap();
+            request_json_authenticated(build_router(api.clone()), "POST", &format!("/api/w/{TEST_WORKSPACE_ID}/ticket-tags"), Some(json!({"operation_key":"admin-own-workspace","action":{"kind":"create","name":"admin-owned"}})), &owner, StatusCode::OK).await;
+            assert_eq!(
+                backend
+                    .list_workspace_tags(ticket::TagListRequest::default())
+                    .unwrap()
+                    .len(),
+                3
+            );
+        }
+    }
+
+    async fn seed_test_workspace_owner_token(
+        store: &dyn ControlPlaneStore,
+        suffix: &str,
+    ) -> String {
+        let owner = store
+            .get_workspace(TEST_WORKSPACE_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        seed_test_api_token_for_account(store, suffix, owner.owner_account_id)
+    }
+
     fn seed_test_api_token(store: &dyn ControlPlaneStore, suffix: &str) -> String {
         let account_id = format!("account-{suffix}");
-        let user_id = format!("user-{suffix}");
-        let token = format!("api-token-{suffix}");
         store
             .upsert_account(&AccountRecord {
                 account_id: account_id.clone(),
@@ -40141,6 +40999,16 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_owned(),
             })
             .unwrap();
+        seed_test_api_token_for_account(store, suffix, account_id)
+    }
+
+    fn seed_test_api_token_for_account(
+        store: &dyn ControlPlaneStore,
+        suffix: &str,
+        account_id: String,
+    ) -> String {
+        let user_id = format!("user-{suffix}");
+        let token = format!("api-token-{suffix}");
         store
             .upsert_user(&UserRecord {
                 user_id: user_id.clone(),
@@ -50830,6 +51698,8 @@ mod tests {
         use super::*;
         use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
 
+        include!("server_activation_tests.rs");
+
         const ORIGIN_URL: &str = "https://workspace.test";
         type Authenticator = WebauthnAuthenticator<SoftPasskey>;
 
@@ -50843,6 +51713,7 @@ mod tests {
             async fn new() -> Self {
                 let root = tempfile::tempdir().unwrap();
                 let mut api = test_api(root.path()).await;
+                enable_test_self_registration(&api);
                 let AuthConfig::Passkey {
                     rp_id,
                     origin,
@@ -52314,6 +53185,7 @@ mod tests {
 
         let workspace = tempfile::tempdir().unwrap();
         let mut api = test_api(workspace.path()).await;
+        enable_test_self_registration(&api);
         let AuthConfig::Passkey {
             rp_id,
             origin,
@@ -56707,6 +57579,27 @@ mod tests {
             .unwrap()
     }
 
+    // These registration verifier suites explicitly opt in. Their fixture does
+    // not redefine fresh-install defaults or make the public registrant an admin.
+    fn enable_test_self_registration(api: &WorkspaceApi) {
+        let setup = api
+            .config_store
+            .setup_hosting_admin("test-policy-admin", true)
+            .unwrap();
+        api.store
+            .set_hosting_self_registration_enabled(
+                &RequestActor {
+                    user_id: setup.user.user_id,
+                    account_id: setup.user.account_id,
+                    handle: setup.user.handle,
+                    display_name: setup.user.display_name,
+                    auth_method: ActorAuthMethod::ApiToken,
+                },
+                true,
+            )
+            .unwrap();
+    }
+
     fn test_owner_actor() -> RequestActor {
         RequestActor {
             user_id: "owner-user".to_string(),
@@ -58334,7 +59227,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let token = seed_test_api_token(api.store.as_ref(), "workdir-removal");
+        let token = seed_test_workspace_owner_token(api.store.as_ref(), "workdir-removal").await;
         let workdir_id = "account-occupied-workdir";
         seed_cleanup_workdir_for_runtime(
             &api,
@@ -58369,12 +59262,15 @@ mod tests {
             .find_workdir_removal_operation_by_intent(
                 TEST_WORKSPACE_ID,
                 workdir_id,
-                "account:account-workdir-removal",
+                &format!("account:account-{TEST_WORKSPACE_ID}"),
                 reason,
             )
             .unwrap()
             .unwrap();
-        assert_eq!(operation.source_actor, "account:account-workdir-removal");
+        assert_eq!(
+            operation.source_actor,
+            format!("account:account-{TEST_WORKSPACE_ID}")
+        );
         assert_eq!(
             operation.disposition,
             Some(WorkdirRemovalDisposition::Retained)
@@ -61880,7 +62776,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
-        let token = seed_test_api_token(api.store.as_ref(), "explicit-runtime-no-fallback");
+        let token =
+            seed_test_workspace_owner_token(api.store.as_ref(), "explicit-runtime-no-fallback")
+                .await;
         set_test_default_runtime(&api, EMBEDDED_WORKER_RUNTIME_ID);
         let operation_id = "workdir-create-explicit-runtime";
 
@@ -61925,7 +62823,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
-        let token = seed_test_api_token(api.store.as_ref(), "migrated-workdir-create-replay");
+        let token =
+            seed_test_workspace_owner_token(api.store.as_ref(), "migrated-workdir-create-replay")
+                .await;
         let operation_id = "migrated-workdir-create";
         // Schema-86 hash of (test-repository, frozen-selector, None,
         // Original Name, sha256:frozen-source), followed by source ordinal 9.
@@ -62046,7 +62946,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
-        let token = seed_test_api_token(api.store.as_ref(), "stale-workdir-create-json");
+        let token =
+            seed_test_workspace_owner_token(api.store.as_ref(), "stale-workdir-create-json").await;
 
         let response = request_json_authenticated(
             build_router(api.clone()),
@@ -62082,7 +62983,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
-        let token = seed_test_api_token(api.store.as_ref(), "missing-workdir-repository");
+        let token =
+            seed_test_workspace_owner_token(api.store.as_ref(), "missing-workdir-repository").await;
 
         let response = request_json_authenticated(
             build_router(api.clone()),
@@ -62117,7 +63019,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
-        let token = seed_test_api_token(api.store.as_ref(), "failed-default-resolution");
+        let token =
+            seed_test_workspace_owner_token(api.store.as_ref(), "failed-default-resolution").await;
         set_test_default_runtime(&api, EMBEDDED_WORKER_RUNTIME_ID);
         let original_projection_digest = api
             .config_store
@@ -65813,7 +66716,9 @@ mod tests {
     #[tokio::test]
     async fn passkey_registration_rejects_unverified_credential_response() {
         let dir = tempfile::tempdir().unwrap();
-        let app = test_app(dir.path()).await;
+        let api = test_api(dir.path()).await;
+        enable_test_self_registration(&api);
+        let app = build_inner_router(api);
 
         let registration_options = post_json(
             app.clone(),

@@ -61,7 +61,7 @@ Deno.test("production empty Workspace supports optional Git validation, reopenin
               creationBodies.push(route.request().postDataJSON());
               await route.fulfill({ json: creationResponse() });
             });
-            await page.goto(scenario.baseUrl!);
+            await page.goto(scenario.baseUrl! + "/dashboard#workspace-create-title");
             const name = page.getByLabel("Workspace display name");
             await name.fill("New Workspace");
             const toggle = page.getByRole("checkbox", {
@@ -119,7 +119,7 @@ Deno.test("production empty Workspace supports optional Git validation, reopenin
             await page.locator("[data-feed-ready=home-active]").waitFor();
             assertEquals(await page.locator("main [role=alert]").count(), 0);
             // Reopening is based on Workspace identity, not a repository record.
-            await page.goto(scenario.baseUrl!);
+            await page.goto(scenario.baseUrl! + "/dashboard");
             await page.locator('a.workspace-catalog-card[href="/w/home-empty"]')
               .click();
             await page.waitForURL("**/w/home-empty");

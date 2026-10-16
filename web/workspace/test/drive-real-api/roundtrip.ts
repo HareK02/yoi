@@ -24,6 +24,7 @@ interface Fixture {
   workspace_id: string;
   owner_token: string;
   second_token: string;
+  foreign_token: string;
   worker_entry: DriveEntry;
 }
 function assert(value: unknown, message: string): asserts value {
@@ -164,14 +165,14 @@ try {
       "revoke must be durably visible",
     );
   }
-  globalThis.fetch = authenticatedFetch(fixture.origin, fixture.second_token);
+  globalThis.fetch = authenticatedFetch(fixture.origin, fixture.foreign_token);
   try {
     await listDriveGrants(ws);
-    throw new Error("member must not manage grants");
+    throw new Error("foreign Account must not manage grants");
   } catch (error) {
     assert(
       error instanceof DriveGrantError && error.outcome === "not_committed",
-      "member grant read must be a real authorized rejection",
+      "foreign Account grant read must be a real authorized rejection",
     );
   }
 } finally {
@@ -318,7 +319,7 @@ const secondRead = await second.readText(ws, updated.entry);
 equal(
   secondRead.entry.last_mutation_id,
   updated.last_mutation_id,
-  "second actor must observe same last_mutation_id",
+  "second owner client must observe same last_mutation_id",
 );
 const drafts = ["# actor A draft\n", "# actor B draft\n"];
 const race = await Promise.allSettled(
@@ -335,7 +336,7 @@ const race = await Promise.allSettled(
 equal(
   race.filter((result) => result.status === "fulfilled").length,
   1,
-  "same-last_mutation_id two-actor CAS must have exactly one winner",
+  "same-last_mutation_id two-client CAS must have exactly one winner",
 );
 const loser = race.find((result) => result.status === "rejected");
 assert(
@@ -348,7 +349,7 @@ const latest = await owner.readText(ws, updated.entry);
 equal(
   latest.text,
   drafts[winnerIndex],
-  "durable content must be the winning actor's draft",
+  "durable content must be the winning client's draft",
 );
 // This API boundary proves no automatic retry/overwrite. UI dirty-draft
 // retention is deliberately verified by the separate browser fixture.

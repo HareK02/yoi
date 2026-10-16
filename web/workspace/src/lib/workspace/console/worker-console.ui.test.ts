@@ -72,8 +72,8 @@ Deno.test("workspace feature css is owned outside app css", async () => {
     workspaceLayout.includes("#lib/workspace/styles/workspace-pages.css") &&
       workspaceLayout.includes("#lib/workspace/styles/workers.css") &&
       settingsLayout.includes("#lib/workspace/styles/settings.css") &&
-      accountPage.includes("#lib/workspace/styles/settings.css") &&
-      deviceLoginPage.includes("#lib/workspace/styles/settings.css"),
+      accountPage.includes("#lib/workspace/auth/auth-page.css") &&
+      deviceLoginPage.includes("#lib/workspace/auth/auth-page.css"),
     "feature-owned CSS should be imported by the layouts/pages that need it",
   );
 });
@@ -1277,13 +1277,7 @@ Deno.test("Worker Console route resolves logical Worker authority before Runtime
   );
 });
 
-Deno.test("Account UI owns browser passkey session state without workspace authorization", async () => {
-  const accountPage = await Deno.readTextFile(
-    new URL("./../../../routes/account/+page.svelte", import.meta.url),
-  );
-  const devicePage = await Deno.readTextFile(
-    new URL("./../../../routes/login/device/+page.svelte", import.meta.url),
-  );
+Deno.test("Root chrome owns global navigation and scoped override slots", async () => {
   const rootLayout = await Deno.readTextFile(
     new URL("./../../../routes/+layout.svelte", import.meta.url),
   );
@@ -1321,21 +1315,6 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
   );
 
-  assert(
-    accountPage.includes("registerPasskey") &&
-      accountPage.includes("loginWithPasskey") &&
-      accountPage.includes("logout") &&
-      accountPage.includes("loadWhoami") &&
-      accountPage.includes("Current user"),
-    "Account page should expose registration, login, logout, and current-session inspection",
-  );
-  assert(
-    devicePage.includes("approveDeviceLogin") &&
-      devicePage.includes("loginWithPasskey") &&
-      devicePage.includes("user_code") &&
-      devicePage.includes("Approve device login"),
-    "Device login page should approve CLI login without DevTools console",
-  );
   assert(
     rootLayout.includes("SIDEBAR_CONTEXT") &&
       rootLayout.includes("GlobalSidebar") &&

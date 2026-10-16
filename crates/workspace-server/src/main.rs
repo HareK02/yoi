@@ -22,6 +22,7 @@ enum Command {
     Serve(ServeOptions),
     Migrate(MigrateOptions),
     BootstrapAuth(BootstrapAuthOptions),
+    HostingAdmin(HostingAdminOptions),
     Skills(SkillsCommand),
     Help,
 }
@@ -44,6 +45,13 @@ struct BootstrapAuthOptions {
     handle: String,
     display_name: Option<String>,
     label: Option<String>,
+}
+
+#[derive(Debug)]
+struct HostingAdminOptions {
+    handle: String,
+    create_user: bool,
+    database: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -86,6 +94,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Serve(options) => run_serve(options).await,
         Command::Migrate(options) => run_migrate(options),
         Command::BootstrapAuth(options) => run_bootstrap_auth(options),
+        Command::HostingAdmin(options) => run_hosting_admin(options),
         Command::Skills(command) => run_skills(command),
         Command::Help => Ok(()),
     }
@@ -100,6 +109,13 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
     match command.as_str() {
         "migrate" => parse_migrate_options(rest).map(Command::Migrate),
         "bootstrap-auth" => parse_bootstrap_auth_options(rest).map(Command::BootstrapAuth),
+        "hosting-admin" => {
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                print_hosting_admin_help();
+                return Ok(Command::Help);
+            }
+            parse_hosting_admin_options(rest).map(Command::HostingAdmin)
+        }
         "skills" => parse_skills_command(rest),
         "serve" => {
             if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -113,7 +129,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Help)
         }
         other => Err(CliError(format!(
-            "unknown command `{other}`; expected `bootstrap-auth`, `migrate`, `skills`, or `serve`"
+            "unknown command `{other}`; expected `hosting-admin`, `bootstrap-auth`, `migrate`, `skills`, or `serve`"
         ))),
     }
 }
@@ -222,6 +238,85 @@ fn run_migrate(options: MigrateOptions) -> Result<(), Box<dyn std::error::Error>
         }
     );
     Ok(())
+}
+
+fn run_hosting_admin(options: HostingAdminOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let database_path = options
+        .database
+        .unwrap_or_else(ServerConfig::default_server_database_path);
+    if let Some(parent) = database_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let store = SqliteWorkspaceStore::open(&database_path)?;
+    let setup = store.setup_hosting_admin(&options.handle, options.create_user)?;
+    let mut output = serde_json::json!({
+        "user": {
+            "user_id": setup.user.user_id,
+            "account_id": setup.user.account_id,
+            "handle": setup.user.handle,
+            "display_name": setup.user.display_name,
+        },
+        "hosting_admin": true,
+    });
+    if let Some(bearer) = setup.initial_bearer {
+        output["access_token"] = bearer.access_token.into();
+        output["expires_at"] = bearer.expires_at.into();
+        output["token_type"] = "bearer".into();
+    }
+    // Explicit trusted host setup is the only place this secret is printed.
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
+
+fn parse_hosting_admin_options(args: &[String]) -> Result<HostingAdminOptions, CliError> {
+    let mut handle = None;
+    let mut database = None;
+    let mut create_user = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--create-user" {
+            if create_user {
+                return Err(CliError("--create-user must be provided only once".into()));
+            }
+            create_user = true;
+            index += 1;
+            continue;
+        }
+        let (name, inline) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(name, value)| (name, Some(value)));
+        let target = match name {
+            "--handle" => &mut handle,
+            "--database" => &mut database,
+            other => return Err(CliError(format!("unknown hosting-admin option {other}"))),
+        };
+        let value = match inline {
+            Some(value) => value.to_string(),
+            None => {
+                index += 1;
+                args.get(index)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or_else(|| CliError(format!("{name} requires a value")))?
+                    .clone()
+            }
+        };
+        if value.is_empty() {
+            return Err(CliError(format!("{name} requires a value")));
+        }
+        if target.replace(value).is_some() {
+            return Err(CliError(format!("{name} must be provided only once")));
+        }
+        index += 1;
+    }
+    Ok(HostingAdminOptions {
+        handle: handle.ok_or_else(|| CliError("hosting-admin requires --handle".into()))?,
+        create_user,
+        database: database.map(PathBuf::from),
+    })
 }
 
 fn run_bootstrap_auth(options: BootstrapAuthOptions) -> Result<(), Box<dyn std::error::Error>> {
@@ -643,7 +738,13 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-server\n\nUsage:\n  yoi-server bootstrap-auth --handle <HANDLE> [--display-name <NAME>] [--label <LABEL>]\n  yoi-server migrate [--dry-run] [--database <PATH>]\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-server\n\nUsage:\n  yoi-server hosting-admin --handle <HANDLE> [--create-user] [--database <PATH>]\n  yoi-server bootstrap-auth --handle <HANDLE> [--display-name <NAME>] [--label <LABEL>]\n  yoi-server migrate [--dry-run] [--database <PATH>]\n  yoi-server skills <COMMAND> [OPTIONS]\n  yoi-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+    );
+}
+
+fn print_hosting_admin_help() {
+    println!(
+        "yoi-server hosting-admin\n\nUsage:\n  yoi-server hosting-admin --handle <HANDLE> [--create-user] [--database <PATH>]\n\nDescription:\n  Trusted host-only explicit administrator setup. By default selects an existing known user and grants hosting authority without issuing credentials. --create-user requires a new handle and atomically creates the user, grant and initial bearer (15-minute expiry), printed once to private stdout for passkey addition. Open /hosting/setup on this Server's trusted HTTPS origin (or localhost), enter the token, add a passkey, then explicitly sign in with that key before opening /hosting/settings. Repeating creation fails, never refreshing credentials. Neither mode enables public self-registration. Existing Workspace permissions are unchanged.\n\nOptions:\n      --handle <HANDLE>  Known user handle, or new handle with --create-user\n      --create-user      Explicitly create a new user and print its initial bearer\n      --database <PATH>  Server DB path (default: canonical Yoi server DB)\n  -h, --help             Print help"
     );
 }
 
@@ -700,6 +801,51 @@ mod tests {
 
         let error = parse_bootstrap_auth_options(&[]).unwrap_err();
         assert_eq!(error.to_string(), "bootstrap-auth requires --handle");
+    }
+
+    #[test]
+    fn hosting_admin_cli_requires_explicit_creation_and_selects_database() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        let Command::HostingAdmin(existing) =
+            parse_command(&args(&["hosting-admin", "--handle", "known-user"])).unwrap()
+        else {
+            panic!("expected hosting admin")
+        };
+        assert!(!existing.create_user);
+        assert!(existing.database.is_none());
+        let Command::HostingAdmin(new) = parse_command(&args(&[
+            "hosting-admin",
+            "--handle=new-admin",
+            "--create-user",
+            "--database=/tmp/isolated.db",
+        ]))
+        .unwrap() else {
+            panic!("expected hosting admin")
+        };
+        assert!(new.create_user);
+        assert_eq!(new.handle, "new-admin");
+        assert_eq!(new.database, Some(PathBuf::from("/tmp/isolated.db")));
+        for invalid in [
+            vec![],
+            vec!["--create-user"],
+            vec!["--handle"],
+            vec!["--handle="],
+            vec!["--handle", "a", "--handle=b"],
+            vec!["--handle", "a", "--database"],
+            vec!["--handle", "a", "--database=first", "--database=second"],
+            vec!["--handle", "a", "--create-user", "--create-user"],
+            vec!["--handle", "a", "--token", "secret"],
+        ] {
+            assert!(
+                parse_hosting_admin_options(&args(&invalid)).is_err(),
+                "{invalid:?}"
+            );
+        }
     }
 
     #[test]
@@ -832,7 +978,7 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 format!(
-                    "unknown command `{command}`; expected `bootstrap-auth`, `migrate`, `skills`, or `serve`"
+                    "unknown command `{command}`; expected `hosting-admin`, `bootstrap-auth`, `migrate`, `skills`, or `serve`"
                 )
             );
         }

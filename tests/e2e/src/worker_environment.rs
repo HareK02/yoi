@@ -309,6 +309,47 @@ impl WorkerE2eEnvironment {
     pub fn start_empty_backend(&mut self) -> Result<()> {
         assert_absent_or_empty(&self.server_data_dir, "Server data directory")?;
         assert_absent_or_empty(&self.runtime_data_dir, "Runtime data directory")?;
+        self.start_server_process()
+    }
+
+    /// 同じ隔離DB・設定でBackendを再起動する。Runtime付きfixtureには使わない。
+    pub fn restart_backend(&mut self) -> Result<()> {
+        if self.runtime.is_some() || self.server.is_none() {
+            return Err(HarnessError::Protocol(
+                "Backend-only restart requires a running Server and no Runtime".to_string(),
+            ));
+        }
+        if let Some(mut server) = self.server.take() {
+            server.shutdown(EXIT_WAIT)?;
+        }
+        self.server_url = None;
+        self.start_server_process()
+    }
+
+    /// host CLIだけで管理者を明示設定する。初回bearerはartifactへ保存しない。
+    pub fn setup_hosting_admin(&self, handle: &str, create_user: bool) -> Result<Value> {
+        let binary = self.binaries.binary("yoi-server")?;
+        let mut args = vec!["hosting-admin", "--handle", handle];
+        if create_user {
+            args.push("--create-user");
+        }
+        let output = self.run_command(&binary, &args, true)?;
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
+    /// 旧host bootstrap CLIは一般userを作る。認証情報はartifactへ保存しない。
+    pub fn bootstrap_auth_user(&self, handle: &str) -> Result<Value> {
+        let binary = self.binaries.binary("yoi-server")?;
+        let output = self.run_command(&binary, &["bootstrap-auth", "--handle", handle], true)?;
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
+    fn start_server_process(&mut self) -> Result<()> {
+        if self.server.is_some() {
+            return Err(HarnessError::Protocol(
+                "Server is already running".to_string(),
+            ));
+        }
         let server_binary = self.binaries.binary("yoi-server")?;
         let mut command = self.isolated_command(&server_binary);
         command.args([

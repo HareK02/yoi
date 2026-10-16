@@ -170,6 +170,11 @@ macro_rules! impl_openapi_schema {
 impl_openapi_schema!(
     AuthBootstrapUserRequest,
     AuthPublicConfig,
+    HostingSettings,
+    HostingAccess,
+    ProvisionalAccountRequest,
+    ActivationCodeResponse,
+    ActivationOptionsRequest,
     AuthUserResponse,
     DeviceLoginApproveRequest,
     DeviceLoginApproveResponse,
@@ -514,6 +519,60 @@ pub trait ServerApi {
 
     #[get("/api/auth/config", status = 200, error_status = 400)]
     async fn auth_config(&self) -> Result<AuthPublicConfig, RepositoryApiError>;
+
+    #[get("/api/auth/registration-policy", status = 200, error_status = 400)]
+    async fn auth_registration_policy(&self) -> Result<HostingSettings, RepositoryApiError>;
+
+    #[get("/api/hosting/access", status = 200, error_status = 403, additional_error_statuses = [400, 500], bearer_auth = true, browser_auth = true)]
+    async fn hosting_access(
+        &self,
+        #[extension] context: ServerRequestContext,
+    ) -> Result<HostingAccess, RepositoryApiError>;
+
+    #[get("/api/hosting/settings", status = 200, error_status = 403, additional_error_statuses = [400, 500], bearer_auth = true, browser_auth = true)]
+    async fn hosting_settings(
+        &self,
+        #[extension] context: ServerRequestContext,
+    ) -> Result<HostingSettings, RepositoryApiError>;
+
+    #[put("/api/hosting/settings", status = 200, error_status = 403, additional_error_statuses = [400, 500], bearer_auth = true, browser_auth = true)]
+    async fn hosting_settings_update(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: HostingSettings,
+    ) -> Result<HostingSettings, RepositoryApiError>;
+
+    #[post("/api/hosting/accounts", status = 200, error_status = 400, additional_error_statuses = [403, 500], bearer_auth = true, browser_auth = true)]
+    async fn hosting_account_create(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: ProvisionalAccountRequest,
+    ) -> Result<ActivationCodeResponse, RepositoryApiError>;
+
+    #[post("/api/hosting/accounts/activation-code", status = 200, error_status = 400, additional_error_statuses = [403, 500], bearer_auth = true, browser_auth = true)]
+    async fn hosting_activation_code_reissue(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: ProvisionalAccountRequest,
+    ) -> Result<ActivationCodeResponse, RepositoryApiError>;
+
+    #[post("/api/auth/activation/options", status = 200, error_status = 400, additional_error_statuses = [500])]
+    async fn auth_activation_options(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: ActivationOptionsRequest,
+    ) -> Result<PasskeyRegistrationOptionsResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/auth/activation/complete",
+        responses = [(status = 200, body = AuthUserResponse, headers = [("set-cookie", SetCookieHeader)])],
+        error_status = 400,
+        additional_error_statuses = [500]
+    )]
+    async fn auth_activation_complete(
+        &self,
+        #[body] request: PasskeyRegistrationCompleteRequest,
+    ) -> Result<server_api_responses::AuthActivationComplete, RepositoryApiError>;
 
     #[post(
         "/api/auth/bootstrap-user",
@@ -3844,6 +3903,76 @@ pub struct AuthPublicConfig {
     pub origin: String,
     pub public_base_url: String,
     pub cookie_name: String,
+}
+
+/// The only public registration policy. No administrator identities or host secrets are exposed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct HostingSettings {
+    pub self_registration_enabled: bool,
+}
+
+/// Hosting authority for the current authenticated human, not Workspace permissions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct HostingAccess {
+    pub is_admin: bool,
+}
+
+/// A hosting administrator reserves the same normalized ID used by passkey login.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionalAccountRequest {
+    pub handle: String,
+}
+
+/// The only response allowed to disclose an activation code. Clients must keep it
+/// out of URLs, persistent browser storage and diagnostics. A lost response is
+/// recovered by reissuing, which invalidates the previous code and its ceremonies.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ActivationCodeResponse {
+    pub user: AuthenticatedUser,
+    pub code: String,
+    pub expires_at: String,
+}
+
+impl std::fmt::Debug for ActivationCodeResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActivationCodeResponse")
+            .field("user", &self.user)
+            .field("code", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Proof for a pending account's initial passkey ceremony, never a bearer token
+/// or browser session. No caller-selected account ID or enrollment purpose is accepted.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ActivationOptionsRequest {
+    pub handle: String,
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_origin: Option<String>,
+}
+
+impl std::fmt::Debug for ActivationOptionsRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActivationOptionsRequest")
+            .field("handle", &self.handle)
+            .field("code", &"[REDACTED]")
+            .field("browser_origin", &self.browser_origin)
+            .finish()
+    }
 }
 
 /// Authentication method that established the current request actor.
@@ -11395,6 +11524,11 @@ pub fn auth_api_typescript() -> String {
     let config = ts_rs::Config::default();
     let declarations = [
         AuthPublicConfig::decl(&config),
+        HostingSettings::decl(&config),
+        HostingAccess::decl(&config),
+        ProvisionalAccountRequest::decl(&config),
+        ActivationCodeResponse::decl(&config),
+        ActivationOptionsRequest::decl(&config),
         ActorAuthMethod::decl(&config),
         AuthenticatedUser::decl(&config),
         RequestActor::decl(&config),
@@ -14380,6 +14514,9 @@ mod openapi_artifact_tests {
         const PUBLIC_UNAUTHENTICATED: &[&str] = &[
             "health",
             "auth_config",
+            "auth_registration_policy",
+            "auth_activation_options",
+            "auth_activation_complete",
             "auth_bootstrap_user",
             "auth_passkey_registration_options",
             "auth_passkey_registration_complete",
@@ -14800,5 +14937,49 @@ mod workdir_error_diagnostic_tests {
         let schema = serde_json::to_value(schemars::schema_for!(WorkdirOperationApiError)).unwrap();
         assert!(schema["properties"].get("workdir_log").is_none());
         assert!(schema["properties"].get("denial_reason").is_none());
+    }
+}
+
+#[cfg(test)]
+mod activation_contract_tests {
+    use super::*;
+
+    #[test]
+    fn activation_inputs_reject_caller_selected_authority_and_debug_redacts_codes() {
+        for field in [
+            "account_id",
+            "user_id",
+            "purpose",
+            "is_admin",
+            "authentication",
+        ] {
+            let mut body = serde_json::json!({"handle":"new-user","code":"activation-secret"});
+            body[field] = serde_json::json!("caller-controlled");
+            assert!(serde_json::from_value::<ActivationOptionsRequest>(body).is_err());
+            let mut body = serde_json::json!({"handle":"new-user"});
+            body[field] = serde_json::json!("caller-controlled");
+            assert!(serde_json::from_value::<ProvisionalAccountRequest>(body).is_err());
+        }
+        let request = ActivationOptionsRequest {
+            handle: "new-user".into(),
+            code: "activation-secret".into(),
+            browser_origin: None,
+        };
+        assert!(!format!("{request:?}").contains(&request.code));
+        let response = ActivationCodeResponse {
+            user: AuthenticatedUser {
+                user_id: "u".into(),
+                account_id: "a".into(),
+                handle: "new-user".into(),
+                display_name: "new-user".into(),
+            },
+            code: "activation-secret".into(),
+            expires_at: "2030-01-01T00:00:00Z".into(),
+        };
+        assert!(!format!("{response:?}").contains(&response.code));
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["code"],
+            "activation-secret"
+        );
     }
 }

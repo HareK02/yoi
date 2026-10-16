@@ -15,6 +15,38 @@
 //! migration before it starts. Updating only the new schema would diverge from existing DBs;
 //! both creation paths must maintain the same contract.
 //!
+//! # Hosting administrator setup
+//!
+//! Fresh and migrated databases have no hosting administrators and disable public
+//! self-registration. Users, Workspace owners and holders of the legacy bootstrap token
+//! are not promoted automatically. Hosting grants are separate from Workspace permissions.
+//!
+//! On the trusted Server host, run `yoi-server hosting-admin --database <PATH> --handle
+//! <NEW_HANDLE> --create-user` for a fresh installation. This atomically creates a user
+//! and explicit hosting grant, and intentionally prints one bearer token, valid for
+//! fifteen minutes. Keep stdout private: the token is a full user bearer, not a scoped
+//! activation code. Start the Server with its normal Web static assets and configured
+//! WebAuthn origin (HTTPS, or localhost). Open `/hosting/setup` on that trusted origin,
+//! enter the host-issued token in its password field, and choose Add administrator
+//! passkey. The page uses actor-derived addition, not public registration; it never
+//! stores the token or puts it in URLs. After enrollment choose Sign in with new
+//! passkey, then Open hosting settings. No Workspace or public registration is needed.
+//! The initial bearer expires automatically; never put it in URLs, docs or shared logs.
+//!
+//! For an existing installation, back up the DB and run migrations, then explicitly
+//! select a known user with `yoi-server hosting-admin --database <PATH> --handle
+//! <EXISTING_HANDLE>` without `--create-user`. Verify the handle belongs to the intended
+//! person first. This grants authority without minting or replacing login credentials;
+//! that person uses their existing passkey. `bootstrap-auth` retains its old host-user
+//! setup behavior but grants no hosting authority.
+//!
+//! Repeated creation refuses an existing handle and never refreshes a token. If the
+//! initial token is lost or expires before enrollment, a trusted host operator can
+//! explicitly create a different administrator handle and enroll it, then remove the
+//! unused user's grant and tokens through trusted DB maintenance after a backup.
+//! Selecting an existing user is not a credential recovery mechanism; no public
+//! bootstrap or unauthenticated administrator recovery endpoint exists.
+//!
 //! # Resource state and operation records
 //!
 //! Workspace bootstrap commits resources and creation receipts in one transaction. Jobs and
@@ -60,6 +92,9 @@ use crate::backend_job::{
 use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
+#[path = "activation.rs"]
+mod activation;
+pub use activation::ActivationCodeIssue;
 #[path = "assignment_delivery.rs"]
 mod assignment_delivery;
 #[path = "notification_diagnostics.rs"]
@@ -84,7 +119,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 98;
+const LATEST_SCHEMA_VERSION: i64 = 100;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -382,6 +417,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "Assignment-independent implementation reports",
         apply: migrate_result_reports_v97_to_v98,
     },
+    Migration {
+        version: 99,
+        name: "Explicit hosting administrators and self-registration policy",
+        apply: migrate_hosting_policy_v98_to_v99,
+    },
+    Migration {
+        version: 100,
+        name: "Provisional users and scoped passkey activation",
+        apply: activation::migrate,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -673,6 +718,10 @@ pub struct UserRecord {
 pub enum PasskeyRegistrationTarget {
     NewAccount {
         user: UserRecord,
+    },
+    Activation {
+        user: UserRecord,
+        issuance_id: String,
     },
     Addition {
         user: UserRecord,
@@ -1222,6 +1271,17 @@ impl WorkspaceResourceKind {
     }
 }
 
+/// Result of an explicitly trusted host setup. Secrets deliberately have no Debug output.
+pub struct HostingAdminSetup {
+    pub user: UserRecord,
+    pub initial_bearer: Option<HostingAdminInitialBearer>,
+}
+
+pub struct HostingAdminInitialBearer {
+    pub access_token: String,
+    pub expires_at: String,
+}
+
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     /// Bounded owner for whole synchronous operations from async callers. Move owned inputs
@@ -1615,6 +1675,28 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>>;
     fn get_user_by_handle(&self, handle: &str) -> Result<Option<UserRecord>>;
     fn any_user(&self) -> Result<Option<UserRecord>>;
+    fn create_provisional_user(
+        &self,
+        actor: &server_api::RequestActor,
+        handle: &str,
+    ) -> Result<ActivationCodeIssue>;
+    fn reissue_activation_code(
+        &self,
+        actor: &server_api::RequestActor,
+        handle: &str,
+    ) -> Result<ActivationCodeIssue>;
+    fn verify_activation_code(&self, handle: &str, code: &str)
+    -> Result<PasskeyRegistrationTarget>;
+    fn is_user_pending_activation(&self, user_id: &str) -> Result<bool>;
+    /// Checks an explicit grant for a currently existing user, not Workspace ownership.
+    fn is_hosting_admin(&self, user_id: &str) -> Result<bool>;
+    fn hosting_self_registration_enabled(&self) -> Result<bool>;
+    /// Rechecks the actor's live user/account and hosting grant in the write transaction.
+    fn set_hosting_self_registration_enabled(
+        &self,
+        actor: &server_api::RequestActor,
+        enabled: bool,
+    ) -> Result<()>;
     /// Atomically creates a new account/user/credential, or inserts a credential
     /// for a still-authenticated existing target. Never overwrites a credential.
     fn register_verified_passkey(
@@ -2605,6 +2687,64 @@ impl SqliteWorkspaceStore {
             let value = f(&tx)?;
             tx.commit()?;
             Ok(value)
+        })
+    }
+
+    /// Host-only setup; never expose this operation through a public bootstrap route.
+    /// Creating a user, granting hosting authority and issuing its short-lived initial
+    /// bearer are atomic. Selecting an existing user never issues credentials. A repeat
+    /// create is refused, including after output loss; it cannot mint another bearer.
+    pub fn setup_hosting_admin(
+        &self,
+        handle: &str,
+        create_user: bool,
+    ) -> Result<HostingAdminSetup> {
+        let handle = crate::auth::normalize_handle(handle)?;
+        self.with_immediate_transaction(|tx| {
+            let existing = tx.query_row(
+                user_select_sql("WHERE handle = ?1").as_str(),
+                [&handle], read_user_record,
+            ).optional()?;
+            let now = chrono::Utc::now();
+            let created_at = now.to_rfc3339();
+            let (user, initial_bearer) = match (existing, create_user) {
+                (Some(_), true) => return Err(Error::Store("hosting-admin --create-user requires a new handle; no credentials issued".into())),
+                (None, false) => return Err(Error::Store("hosting-admin requires an existing user; use --create-user explicitly for a new user".into())),
+                (Some(user), false) => {
+                    activation::require_active(tx, &user.user_id)?;
+                    (user, None)
+                },
+                (None, true) => {
+                    let user = UserRecord {
+                        user_id: crate::auth::new_id("user"),
+                        account_id: crate::auth::new_id("acct-user"),
+                        handle: handle.clone(),
+                        display_name: handle.clone(),
+                        created_at: created_at.clone(),
+                        updated_at: created_at.clone(),
+                    };
+                    tx.execute(
+                        "INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) VALUES(?1,'user',?2,?3,?4,?4)",
+                        params![user.account_id, user.handle, user.display_name, created_at],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO users(user_id,account_id,handle,display_name,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5)",
+                        params![user.user_id, user.account_id, user.handle, user.display_name, created_at],
+                    )?;
+                    let access_token = crate::auth::mint_secret("yoi_api");
+                    let expires_at = (now + chrono::Duration::minutes(15)).to_rfc3339();
+                    tx.execute(
+                        "INSERT INTO api_tokens(token_id,token_hash,user_id,label,created_at,expires_at) VALUES(?1,?2,?3,'initial hosting administrator passkey setup',?4,?5)",
+                        params![crate::auth::new_id("api-token"), crate::auth::token_hash(&access_token), user.user_id, created_at, expires_at],
+                    )?;
+                    (user, Some(HostingAdminInitialBearer { access_token, expires_at }))
+                }
+            };
+            tx.execute(
+                "INSERT INTO hosting_administrators(user_id,created_at) VALUES(?1,?2) ON CONFLICT(user_id) DO NOTHING",
+                params![user.user_id, created_at],
+            )?;
+            Ok(HostingAdminSetup { user, initial_bearer })
         })
     }
 
@@ -4314,6 +4454,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                             |row| row.get::<_, String>(0),
                         )
                         .optional()?;
+                    activation::require_active_account(&tx, &record.owner_account_id)?;
                     if owner_kind.as_deref() != Some("user") {
                         return Err(Error::Store(format!(
                             "Workspace owner `{}` must reference an existing User Account",
@@ -4495,6 +4636,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
+            activation::require_active_account(&tx, &record.workspace.owner_account_id)?;
             if owner_kind.as_deref() != Some("user") {
                 return Err(Error::Store(format!(
                     "Workspace owner `{}` must reference an existing User Account",
@@ -6447,6 +6589,83 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn create_provisional_user(
+        &self,
+        actor: &server_api::RequestActor,
+        handle: &str,
+    ) -> Result<ActivationCodeIssue> {
+        activation::create(self, actor, handle)
+    }
+
+    fn reissue_activation_code(
+        &self,
+        actor: &server_api::RequestActor,
+        handle: &str,
+    ) -> Result<ActivationCodeIssue> {
+        activation::reissue(self, actor, handle)
+    }
+
+    fn verify_activation_code(
+        &self,
+        handle: &str,
+        code: &str,
+    ) -> Result<PasskeyRegistrationTarget> {
+        activation::verify(self, handle, code)
+    }
+
+    fn is_user_pending_activation(&self, user_id: &str) -> Result<bool> {
+        self.with_conn(|conn| activation::pending(conn, user_id))
+    }
+
+    fn is_hosting_admin(&self, user_id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            if activation::pending(conn, user_id)? {
+                return Ok(false);
+            }
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hosting_administrators h JOIN users u ON u.user_id = h.user_id WHERE u.user_id = ?1)",
+                [user_id], |row| row.get(0),
+            ).map_err(Error::from)
+        })
+    }
+
+    fn hosting_self_registration_enabled(&self) -> Result<bool> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT self_registration_enabled FROM hosting_settings WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })
+    }
+
+    fn set_hosting_self_registration_enabled(
+        &self,
+        actor: &server_api::RequestActor,
+        enabled: bool,
+    ) -> Result<()> {
+        self.with_immediate_transaction(|tx| {
+            activation::require_active(tx, &actor.user_id)?;
+            let allowed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM hosting_administrators h JOIN users u ON u.user_id = h.user_id WHERE u.user_id = ?1 AND u.account_id = ?2)",
+                params![actor.user_id, actor.account_id], |row| row.get(0),
+            )?;
+            if !allowed {
+                return Err(Error::WorkspacePermissionDenied(
+                    "hosting_admin_required: a live hosting administrator is required".into(),
+                ));
+            }
+            if tx.execute(
+                "UPDATE hosting_settings SET self_registration_enabled = ?1 WHERE singleton = 1",
+                [enabled],
+            )? != 1 {
+                return Err(Error::Store("hosting settings singleton is missing".into()));
+            }
+            Ok(())
+        })
+    }
+
     fn register_verified_passkey(
         &self,
         target: &PasskeyRegistrationTarget,
@@ -6455,6 +6674,15 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_immediate_transaction(|tx| {
             let user = match target {
                 PasskeyRegistrationTarget::NewAccount { user } => {
+                    let enabled: bool = tx.query_row(
+                        "SELECT self_registration_enabled FROM hosting_settings WHERE singleton = 1",
+                        [], |row| row.get(0),
+                    )?;
+                    if !enabled {
+                        return Err(Error::WorkspacePermissionDenied(
+                            "self_registration_disabled: hosting self-registration is disabled".into(),
+                        ));
+                    }
                     let occupied: bool = tx.query_row(
                         "SELECT EXISTS(SELECT 1 FROM accounts WHERE kind = 'user' AND handle = ?1) OR EXISTS(SELECT 1 FROM users WHERE handle = ?1)",
                         params![user.handle], |row| row.get(0),
@@ -6472,7 +6700,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     )?;
                     user
                 }
+                PasskeyRegistrationTarget::Activation { user, issuance_id } => {
+                    activation::require_pending_target(tx, user, Some(issuance_id))?;
+                    user
+                }
                 PasskeyRegistrationTarget::Addition { user, authentication } => {
+                    activation::require_active(tx, &user.user_id)?;
                     let current = tx.query_row(
                         user_select_sql("WHERE user_id = ?1 AND account_id = ?2").as_str(),
                         params![user.user_id, user.account_id], read_user_record,
@@ -6503,12 +6736,18 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "INSERT INTO passkey_credentials (credential_id, user_id, public_key_cose, transports_json, sign_count, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![credential.credential_id, credential.user_id, credential.public_key_cose, credential.transports_json, credential.sign_count, credential.created_at, credential.last_used_at],
             )?;
+            if let PasskeyRegistrationTarget::Activation { user, issuance_id } = target {
+                if tx.execute("DELETE FROM user_activations WHERE user_id=?1 AND issuance_id=?2", params![user.user_id, issuance_id])? != 1 {
+                    return Err(crate::auth::auth_error("activation_code_invalid", "activation issuance no longer exists"));
+                }
+            }
             Ok(())
         })
     }
 
     fn upsert_passkey_credential(&self, record: &PasskeyCredentialRecord) -> Result<()> {
-        self.with_conn(|conn| {
+        self.with_immediate_transaction(|conn| {
+            activation::require_active(conn, &record.user_id)?;
             conn.execute(
                 r#"INSERT INTO passkey_credentials (credential_id, user_id, public_key_cose, transports_json, sign_count, created_at, last_used_at)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -6618,7 +6857,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     }
 
     fn create_browser_session(&self, record: &BrowserSessionRecord) -> Result<()> {
-        self.with_conn(|conn| {
+        self.with_immediate_transaction(|conn| {
+            activation::require_active(conn, &record.user_id)?;
             conn.execute(
                 r#"INSERT INTO browser_sessions (session_id, token_hash, user_id, created_at, expires_at, revoked_at)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
@@ -6631,7 +6871,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn resolve_browser_session(&self, token_hash: &str) -> Result<Option<BrowserSessionRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
-                browser_session_select_sql("WHERE token_hash = ?1 AND revoked_at IS NULL").as_str(),
+                browser_session_select_sql("WHERE token_hash = ?1 AND revoked_at IS NULL AND NOT EXISTS (SELECT 1 FROM user_activations p WHERE p.user_id=browser_sessions.user_id)").as_str(),
                 params![token_hash],
                 read_browser_session_record,
             )
@@ -6651,7 +6891,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     }
 
     fn create_api_token(&self, record: &ApiTokenRecord) -> Result<()> {
-        self.with_conn(|conn| {
+        self.with_immediate_transaction(|conn| {
+            activation::require_active(conn, &record.user_id)?;
             conn.execute(
                 r#"INSERT INTO api_tokens (token_id, token_hash, user_id, label, created_at, expires_at, revoked_at, last_used_at)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
@@ -6664,7 +6905,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn resolve_api_token(&self, token_hash: &str) -> Result<Option<ApiTokenRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
-                api_token_select_sql("WHERE token_hash = ?1 AND revoked_at IS NULL").as_str(),
+                api_token_select_sql("WHERE token_hash = ?1 AND revoked_at IS NULL AND NOT EXISTS (SELECT 1 FROM user_activations p WHERE p.user_id=api_tokens.user_id)").as_str(),
                 params![token_hash],
                 read_api_token_record,
             )
@@ -6684,7 +6925,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     }
 
     fn try_create_device_login_flow(&self, record: &DeviceLoginFlowRecord) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.with_immediate_transaction(|conn| {
+            if let Some(user_id) = &record.user_id { activation::require_active(conn, user_id)?; }
             let changed = conn.execute(
                 r#"INSERT INTO device_login_flows (device_code, user_code, verification_uri, client_name, user_id, api_token_id, issued_access_token, created_at, expires_at, approved_at, consumed_at)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -6733,7 +6975,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         issued_access_token: &str,
         approved_at: &str,
     ) -> Result<bool> {
-        self.with_conn(|conn| {
+        self.with_immediate_transaction(|conn| {
+            activation::require_active(conn, user_id)?;
             let changed = conn.execute(
                 r#"UPDATE device_login_flows
                    SET user_id = ?2, api_token_id = ?3, issued_access_token = ?4, approved_at = ?5
@@ -6755,8 +6998,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         device_code: &str,
         consumed_at: &str,
     ) -> Result<Option<DeviceLoginFlowRecord>> {
-        self.with_conn(|conn| {
-            let record = conn.query_row(device_login_select_sql("WHERE device_code = ?1 AND approved_at IS NOT NULL AND consumed_at IS NULL").as_str(), params![device_code], read_device_login_flow_record).optional()?;
+        self.with_immediate_transaction(|conn| {
+            let record = conn.query_row(device_login_select_sql("WHERE device_code = ?1 AND approved_at IS NOT NULL AND consumed_at IS NULL AND NOT EXISTS(SELECT 1 FROM user_activations p WHERE p.user_id=device_login_flows.user_id)").as_str(), params![device_code], read_device_login_flow_record).optional()?;
             if record.is_some() {
                 conn.execute("UPDATE device_login_flows SET consumed_at = ?2, issued_access_token = NULL WHERE device_code = ?1", params![device_code, consumed_at])?;
             }
@@ -14597,6 +14840,33 @@ fn migrate_result_reports_v97_to_v98(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_hosting_policy_v98_to_v99(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 98 {
+        return Err(Error::Store(
+            "Hosting policy migration requires schema 98".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE hosting_administrators (
+            user_id TEXT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE hosting_settings (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            self_registration_enabled INTEGER NOT NULL DEFAULT 0 CHECK (self_registration_enabled IN (0, 1))
+        );
+        INSERT INTO hosting_settings(singleton, self_registration_enabled) VALUES(1, 0);",
+    )?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(99,?1)",
+        ["Explicit hosting administrators and self-registration policy"],
+    )?;
+    verify_workspace_resource_constraints(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure(conn)?;
     assignment_delivery::install(conn)?;
@@ -14615,7 +14885,9 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
 // Fresh composition uses the posts contract. Retained fixtures pass frozen host
 // and component DDL to the shared cross-domain constraint composition below.
 fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
-    create_workspace_schema_structure_from_sql(conn, include_str!("latest_schema.sql"), true)
+    create_workspace_schema_structure_from_sql(conn, include_str!("latest_schema.sql"), true)?;
+    conn.execute_batch(include_str!("activation_schema.sql"))?;
+    Ok(())
 }
 
 fn create_workspace_schema_structure_from_sql(
@@ -17501,6 +17773,369 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         Ok(())
     }
 
+    fn hosting_user(handle: &str) -> UserRecord {
+        UserRecord {
+            user_id: format!("user-{handle}"),
+            account_id: format!("account-{handle}"),
+            handle: handle.into(),
+            display_name: handle.into(),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+        }
+    }
+
+    fn hosting_seed_user(store: &SqliteWorkspaceStore, handle: &str) -> UserRecord {
+        let user = hosting_user(handle);
+        store
+            .upsert_account(&AccountRecord {
+                account_id: user.account_id.clone(),
+                kind: "user".into(),
+                handle: user.handle.clone(),
+                display_name: user.display_name.clone(),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .unwrap();
+        store.upsert_user(&user).unwrap();
+        user
+    }
+
+    fn hosting_actor(user: &UserRecord) -> server_api::RequestActor {
+        server_api::RequestActor {
+            user_id: user.user_id.clone(),
+            account_id: user.account_id.clone(),
+            handle: user.handle.clone(),
+            display_name: user.display_name.clone(),
+            auth_method: server_api::ActorAuthMethod::ApiToken,
+        }
+    }
+
+    fn hosting_credential(user: &UserRecord, id: &str) -> PasskeyCredentialRecord {
+        PasskeyCredentialRecord {
+            credential_id: id.into(),
+            user_id: user.user_id.clone(),
+            public_key_cose: "verified-key".into(),
+            transports_json: None,
+            sign_count: 0,
+            created_at: "1".into(),
+            last_used_at: None,
+        }
+    }
+
+    #[test]
+    fn hosting_policy_migrates_oldest_and_previous_databases_without_promoting_users() {
+        for baseline in [50, 98] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("server.db");
+            if baseline == 50 {
+                prepare_schema_v50(&path, None);
+            } else {
+                prepare_retained_schema(&path, baseline);
+            }
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("INSERT OR IGNORE INTO accounts VALUES('old-account','user','old-user','Old','1','1');
+                INSERT INTO users VALUES('old-user','old-account','old-user','Old','1','1');").unwrap();
+            drop(conn);
+            let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+            assert!(!store.hosting_self_registration_enabled().unwrap());
+            assert!(!store.is_hosting_admin("old-user").unwrap());
+            assert_eq!(
+                store.get_user("old-user").unwrap().unwrap().display_name,
+                "Old"
+            );
+            let fresh = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+            for table in ["hosting_settings", "hosting_administrators"] {
+                let schema = |store: &SqliteWorkspaceStore| {
+                    store
+                        .with_conn(|conn| {
+                            let ddl: String = conn.query_row(
+                                "SELECT sql FROM sqlite_schema WHERE name=?1",
+                                [table],
+                                |r| r.get(0),
+                            )?;
+                            Ok(ddl
+                                .chars()
+                                .filter(|c| !c.is_whitespace())
+                                .collect::<String>())
+                        })
+                        .unwrap()
+                };
+                assert_eq!(schema(&store), schema(&fresh));
+            }
+            store
+                .with_conn(|conn| {
+                    assert!(
+                        conn.execute(
+                            "INSERT INTO hosting_administrators VALUES('missing','1')",
+                            []
+                        )
+                        .is_err()
+                    );
+                    assert!(
+                        conn.execute(
+                            "UPDATE hosting_settings SET self_registration_enabled=2",
+                            []
+                        )
+                        .is_err()
+                    );
+                    assert!(
+                        conn.execute("INSERT INTO hosting_settings VALUES(2,0)", [])
+                            .is_err()
+                    );
+                    assert_eq!(
+                        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+                            .get::<_, i64>(0))?,
+                        0
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn hosting_policy_migration_failure_rolls_back_new_tables_and_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        prepare_retained_schema(&path, 98);
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        // A conflicting second DDL statement fails after the first table was created.
+        conn.execute_batch("CREATE TABLE hosting_settings(original TEXT); INSERT INTO hosting_settings VALUES('retained');").unwrap();
+        assert!(migrate_hosting_policy_v98_to_v99(&conn).is_err());
+        assert_eq!(current_schema_version(&conn).unwrap(), 98);
+        assert!(!table_exists(&conn, "hosting_administrators").unwrap());
+        assert_eq!(
+            conn.query_row("SELECT original FROM hosting_settings", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "retained"
+        );
+        conn.execute_batch("DROP TABLE hosting_settings").unwrap();
+        drop(conn);
+        let store = SqliteWorkspaceStore::open_for_test(path).unwrap();
+        assert!(!store.hosting_self_registration_enabled().unwrap());
+    }
+
+    #[tokio::test]
+    async fn hosting_policy_requires_explicit_live_admin_and_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let owner = hosting_seed_user(&store, "owner");
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace".into(),
+                owner_account_id: owner.account_id.clone(),
+                display_name: "Workspace".into(),
+                state: "active".into(),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!store.is_hosting_admin(&owner.user_id).unwrap());
+        assert!(matches!(
+            store.set_hosting_self_registration_enabled(&hosting_actor(&owner), true),
+            Err(Error::WorkspacePermissionDenied(_))
+        ));
+        assert!(!store.hosting_self_registration_enabled().unwrap());
+        let setup = store.setup_hosting_admin("owner", false).unwrap();
+        assert!(setup.initial_bearer.is_none());
+        let mut forged = hosting_actor(&owner);
+        forged.account_id = "another-account".into();
+        assert!(matches!(
+            store.set_hosting_self_registration_enabled(&forged, true),
+            Err(Error::WorkspacePermissionDenied(_))
+        ));
+        store
+            .set_hosting_self_registration_enabled(&hosting_actor(&owner), true)
+            .unwrap();
+        drop(store);
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        assert!(store.hosting_self_registration_enabled().unwrap());
+        store
+            .with_conn(|conn| {
+                conn.execute("DELETE FROM hosting_administrators", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            store.set_hosting_self_registration_enabled(&hosting_actor(&owner), false),
+            Err(Error::WorkspacePermissionDenied(_))
+        ));
+        assert!(store.hosting_self_registration_enabled().unwrap());
+    }
+
+    #[test]
+    fn hosting_setup_creates_finite_bearer_once_and_existing_selection_mints_nothing() {
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+        assert!(!store.hosting_self_registration_enabled().unwrap());
+        assert!(store.setup_hosting_admin("unknown", false).is_err());
+        let setup = store.setup_hosting_admin("new-admin", true).unwrap();
+        assert!(store.is_hosting_admin(&setup.user.user_id).unwrap());
+        let bearer = setup.initial_bearer.unwrap();
+        let token = store
+            .resolve_api_token(&crate::auth::token_hash(&bearer.access_token))
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.user_id, setup.user.user_id);
+        assert_eq!(
+            token.expires_at.as_deref(),
+            Some(bearer.expires_at.as_str())
+        );
+        let lifetime = chrono::DateTime::parse_from_rfc3339(&bearer.expires_at).unwrap()
+            - chrono::DateTime::parse_from_rfc3339(&token.created_at).unwrap();
+        assert_eq!(lifetime.num_seconds(), 15 * 60);
+        assert!(store.setup_hosting_admin("new-admin", true).is_err());
+        assert!(
+            store
+                .setup_hosting_admin("new-admin", false)
+                .unwrap()
+                .initial_bearer
+                .is_none()
+        );
+        let existing = hosting_seed_user(&store, "existing");
+        assert!(!store.is_hosting_admin(&existing.user_id).unwrap());
+        assert!(
+            store
+                .setup_hosting_admin("existing", false)
+                .unwrap()
+                .initial_bearer
+                .is_none()
+        );
+        store
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT count(*) FROM api_tokens", [], |r| r
+                        .get::<_, i64>(0))?,
+                    1
+                );
+                conn.execute("DELETE FROM users WHERE user_id=?1", [&setup.user.user_id])?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!store.is_hosting_admin(&setup.user.user_id).unwrap());
+        assert!(matches!(
+            store.set_hosting_self_registration_enabled(&hosting_actor(&setup.user), true),
+            Err(Error::WorkspacePermissionDenied(_))
+        ));
+        assert!(!store.hosting_self_registration_enabled().unwrap());
+    }
+
+    #[test]
+    fn hosting_setup_failure_rolls_back_account_user_token_and_grant() {
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+        store.with_conn(|conn| { conn.execute_batch("CREATE TRIGGER reject_admin BEFORE INSERT ON hosting_administrators BEGIN SELECT RAISE(ABORT,'injected grant failure'); END;")?; Ok(()) }).unwrap();
+        assert!(store.setup_hosting_admin("admin", true).is_err());
+        store
+            .with_conn(|conn| {
+                for table in ["accounts", "users", "api_tokens", "hosting_administrators"] {
+                    assert_eq!(
+                        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                            .get::<_, i64>(0))?,
+                        0
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(!store.hosting_self_registration_enabled().unwrap());
+    }
+
+    #[test]
+    fn hosting_registration_rechecks_policy_but_allows_authenticated_addition() {
+        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+        let admin = store.setup_hosting_admin("admin", true).unwrap();
+        let new_user = hosting_user("visitor");
+        let target = PasskeyRegistrationTarget::NewAccount {
+            user: new_user.clone(),
+        };
+        let credential = hosting_credential(&new_user, "visitor-key");
+        let assert_denied = || {
+            let error = store
+                .register_verified_passkey(&target, &credential)
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::WorkspacePermissionDenied(ref message) if message.contains("self_registration_disabled"))
+            );
+            assert!(store.get_user(&new_user.user_id).unwrap().is_none());
+            assert!(store.get_account(&new_user.account_id).unwrap().is_none());
+            assert!(
+                store
+                    .get_passkey_credential("visitor-key")
+                    .unwrap()
+                    .is_none()
+            );
+        };
+        assert_denied();
+        store
+            .set_hosting_self_registration_enabled(&hosting_actor(&admin.user), true)
+            .unwrap();
+        // Simulate an enrollment allocated while enabled, then stopped before completion.
+        store
+            .set_hosting_self_registration_enabled(&hosting_actor(&admin.user), false)
+            .unwrap();
+        assert_denied();
+        let token_hash = crate::auth::token_hash(&admin.initial_bearer.unwrap().access_token);
+        let addition = PasskeyRegistrationTarget::Addition {
+            user: admin.user.clone(),
+            authentication: PasskeyAuthenticationBinding::ApiToken(token_hash.clone()),
+        };
+        store
+            .register_verified_passkey(&addition, &hosting_credential(&admin.user, "admin-key"))
+            .unwrap();
+        assert!(store.get_passkey_credential("admin-key").unwrap().is_some());
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE api_tokens SET revoked_at=?1 WHERE token_hash=?2",
+                    params![crate::auth::now_rfc3339(), token_hash],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .register_verified_passkey(
+                    &addition,
+                    &hosting_credential(&admin.user, "revoked-key")
+                )
+                .is_err()
+        );
+        store
+            .set_hosting_self_registration_enabled(&hosting_actor(&admin.user), true)
+            .unwrap();
+        store
+            .register_verified_passkey(&target, &credential)
+            .unwrap();
+        assert_eq!(
+            store.get_user(&new_user.user_id).unwrap(),
+            Some(new_user.clone())
+        );
+        assert!(!store.is_hosting_admin(&new_user.user_id).unwrap());
+        // A duplicate credential fails after account/user insertion and must roll both back.
+        let failed_user = hosting_user("failed");
+        assert!(
+            store
+                .register_verified_passkey(
+                    &PasskeyRegistrationTarget::NewAccount {
+                        user: failed_user.clone()
+                    },
+                    &hosting_credential(&failed_user, "visitor-key")
+                )
+                .is_err()
+        );
+        assert!(store.get_user(&failed_user.user_id).unwrap().is_none());
+        assert!(
+            store
+                .get_account(&failed_user.account_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    include!("activation_tests.rs");
     include!("schema_equivalence_tests.rs");
     include!("ticket_tag_upgrade_tests.rs");
     include!("ticket_post_upgrade_tests.rs");
@@ -17910,6 +18545,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:96, name:"Backend Job common notification routing".into()},
                 WorkspaceSchemaMigrationStep {version:97, name:"MR notifications and authenticated implementation results".into()},
                 WorkspaceSchemaMigrationStep {version:98, name:"Assignment-independent implementation reports".into()},
+                WorkspaceSchemaMigrationStep {version:99, name:"Explicit hosting administrators and self-registration policy".into()},
+                WorkspaceSchemaMigrationStep {version:100, name:"Provisional users and scoped passkey activation".into()},
             ]
         );
 
@@ -18018,6 +18655,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (96, "Backend Job common notification routing".to_string()),
 (97, "MR notifications and authenticated implementation results".to_string()),
 (98, "Assignment-independent implementation reports".to_string()),
+(99, "Explicit hosting administrators and self-registration policy".to_string()),
+(100, "Provisional users and scoped passkey activation".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -20631,7 +21270,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (95, "Common notification routing and durable Worker delivery".into()),
                          (96, "Backend Job common notification routing".into()),
                          (97, "MR notifications and authenticated implementation results".into()),
-                         (98, "Assignment-independent implementation reports".into())]);
+                         (98, "Assignment-independent implementation reports".into()),
+                         (99, "Explicit hosting administrators and self-registration policy".into()),
+                         (100, "Provisional users and scoped passkey activation".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

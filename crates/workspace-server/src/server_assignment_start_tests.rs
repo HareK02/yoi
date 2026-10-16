@@ -195,7 +195,8 @@ async fn unfinished_dependencies_allow_manual_and_orchestrator_resource_free_sta
             } else {
                 None
             };
-            let token = seed_test_api_token(api.store.as_ref(), "partial-start-owner");
+            let token =
+                seed_test_workspace_owner_token(api.store.as_ref(), "partial-start-owner").await;
             let ticket = browser_ticket_backend(&api)
                 .unwrap()
                 .create(ticket::NewTicket::new(
@@ -349,7 +350,8 @@ async fn unfinished_dependencies_allow_read_only_start_and_assign_without_write_
                 assign_test_orchestrator(api, &fixture.ticket_id);
             }
             let delegation = observed_start_delegation(api, &fixture.ticket_id, source.as_ref());
-            let token = seed_test_api_token(api.store.as_ref(), "read-only-start-owner");
+            let token =
+                seed_test_workspace_owner_token(api.store.as_ref(), "read-only-start-owner").await;
             let worker = if existing {
                 // Drop the unrelated checkout so the entire attachment set is reference-only.
                 let main = api
@@ -482,7 +484,7 @@ async fn unfinished_dependencies_do_not_bypass_http_auth_closed_or_resource_bind
     let fixture = manual_worker_assignment_fixture().await;
     let api = &fixture.api;
     add_unfinished_start_dependency(api, &fixture.ticket_id);
-    let token = seed_test_api_token(api.store.as_ref(), "guard-start-owner");
+    let token = seed_test_workspace_owner_token(api.store.as_ref(), "guard-start-owner").await;
     let path = format!(
         "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/worker",
         fixture.ticket_id
@@ -544,7 +546,8 @@ async fn orchestrator_start_and_assign_reject_missing_stale_cleared_or_reissued_
             let runtime = WorkdirlessFixtureRuntime::default();
             api.runtime.register_or_replace(runtime.clone());
             let source = start_source(&mut api, &runtime).await;
-            let token = seed_test_api_token(api.store.as_ref(), "delegation-owner");
+            let token =
+                seed_test_workspace_owner_token(api.store.as_ref(), "delegation-owner").await;
             let ticket = browser_ticket_backend(&api)
                 .unwrap()
                 .create(ticket::NewTicket::new("Observed delegation start"))
@@ -665,7 +668,8 @@ async fn replaced_orchestrator_cannot_start_or_assign_under_retained_current_del
         let runtime = WorkdirlessFixtureRuntime::default();
         api.runtime.register_or_replace(runtime.clone());
         let source = start_source(&mut api, &runtime).await;
-        let token = seed_test_api_token(api.store.as_ref(), "obsolete-worker-owner");
+        let token =
+            seed_test_workspace_owner_token(api.store.as_ref(), "obsolete-worker-owner").await;
         let ticket = browser_ticket_backend(&api)
             .unwrap()
             .create(ticket::NewTicket::new(

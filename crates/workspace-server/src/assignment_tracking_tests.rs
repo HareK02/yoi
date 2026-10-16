@@ -472,7 +472,9 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                     ),
                     (96,"Backend Job common notification routing".into()),
                     (97, "MR notifications and authenticated implementation results".into()),
-                    (98, "Assignment-independent implementation reports".into())
+                    (98, "Assignment-independent implementation reports".into()),
+                    (99, "Explicit hosting administrators and self-registration policy".into()),
+                    (100, "Provisional users and scoped passkey activation".into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {

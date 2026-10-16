@@ -1,0 +1,372 @@
+{
+  "schemaVersion": 1,
+  "id": "public-entry-light",
+  "title": "Public entry and authenticated Workspace selection",
+  "baseUrl": "http://127.0.0.1:15413",
+  "colorScheme": "light",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Synthetic HTTP projection; not a real authentication session",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 900
+    }
+  ],
+  "routes": [
+    {
+      "id": "anonymous",
+      "label": "anonymous",
+      "path": "/?fixture=anonymous",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Known anonymous; policy allowed; Workspace API would reject",
+      "ready": {
+        "kind": "selector",
+        "selector": "a.entry-primary"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "policy-disabled",
+      "label": "policy-disabled",
+      "path": "/?fixture=policy-disabled",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Policy disabled; login retained",
+      "ready": {
+        "kind": "selector",
+        "selector": "section p:has-text(\"registration is disabled\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "policy-error",
+      "label": "policy-error",
+      "path": "/?fixture=policy-error",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Intentional public policy HTTP503; login retained, no registration link",
+      "ready": {
+        "kind": "selector",
+        "selector": "section p:has-text(\"availability is unknown\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "policy-loading",
+      "label": "policy-loading",
+      "path": "/?fixture=policy-loading",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Public policy held pending; login retained",
+      "ready": {
+        "kind": "selector",
+        "selector": "[role=status]:has-text(\"Checking registration\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "session-loading",
+      "label": "session-loading",
+      "path": "/?fixture=session-loading",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Whoami held pending; no anonymous or actor actions",
+      "ready": {
+        "kind": "selector",
+        "selector": "[role=status]:has-text(\"Loading session\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "session-error",
+      "label": "session-error",
+      "path": "/?fixture=session-error",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Intentional whoami HTTP503; unknown, not logged out",
+      "ready": {
+        "kind": "selector",
+        "selector": "[role=alert]"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "account",
+      "label": "account",
+      "path": "/?fixture=account",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Confirmed ordinary actor; no Workspace fetch or automatic navigation",
+      "ready": {
+        "kind": "selector",
+        "selector": "a.entry-primary"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "admin",
+      "label": "admin",
+      "path": "/?fixture=admin",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Confirmed hosting admin grant independent of Workspace ownership",
+      "ready": {
+        "kind": "selector",
+        "selector": "a[href=\"/hosting/settings\"]"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "dashboard-zero",
+      "label": "dashboard-zero",
+      "path": "/dashboard?fixture=account",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Confirmed actor; zero Workspaces",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-empty-state"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "dashboard-one",
+      "label": "dashboard-one",
+      "path": "/dashboard?fixture=workspace-one",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "One Workspace requires explicit selection",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-catalog-card"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "dashboard-many",
+      "label": "dashboard-many",
+      "path": "/dashboard?fixture=workspace-many",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Three Workspaces, long display name, explicit selection",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-catalog-card:nth-child(3)"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "dashboard-error",
+      "label": "dashboard-error",
+      "path": "/dashboard?fixture=workspace-error",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Intentional catalog HTTP503; not empty; account retained",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-catalog-alert"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "dashboard-loading",
+      "label": "dashboard-loading",
+      "path": "/dashboard?fixture=workspace-loading",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Catalog held pending; account remains available",
+      "ready": {
+        "kind": "selector",
+        "selector": "[role=status]:has-text(\"Loading Workspaces\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "dashboard-anonymous",
+      "label": "dashboard-anonymous",
+      "path": "/dashboard?fixture=anonymous",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Known anonymous; login returnTo dashboard, no catalog fetch",
+      "ready": {
+        "kind": "selector",
+        "selector": "a.entry-primary"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "create-denied",
+      "label": "create-denied",
+      "path": "/dashboard?fixture=creation-denied#workspace-create-title",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Intentional creation HTTP403; exact retry, no resources created",
+      "ready": {
+        "kind": "selector",
+        "selector": ".workspace-empty-state"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Creation denied",
+          "fullPage": true,
+          "interaction": [
+            {
+              "action": "fill",
+              "selector": "input[autocomplete=off]",
+              "value": "New Workspace"
+            },
+            {
+              "action": "click",
+              "selector": "button[type=submit]"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": ".workspace-catalog-alert"
+          }
+        }
+      ]
+    },
+    {
+      "id": "login-disabled",
+      "label": "login-disabled",
+      "path": "/login?fixture=policy-disabled",
+      "goal": "Verify entry, session and Workspace authority remain distinct with reachable actions",
+      "dataState": "Login remains usable while registration is disabled",
+      "ready": {
+        "kind": "selector",
+        "selector": "nav p:has-text(\"registration is disabled\")"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Initial state",
+          "fullPage": true
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "workspace-fixture",
+      "command": "deno",
+      "cwd": "../../..",
+      "args": [
+        "run",
+        "--allow-read",
+        "--allow-net",
+        "tools/web-ux/browser-tests/workspace_home_fixture_server.ts",
+        "15414",
+        "web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15414/health"
+    },
+    {
+      "id": "entry-fixture",
+      "command": "deno",
+      "cwd": "../../..",
+      "args": [
+        "run",
+        "--config",
+        "tools/web-ux/deno.json",
+        "--allow-read",
+        "--allow-net",
+        "web/workspace/test/auth-browser/fixture-server.ts",
+        "15413",
+        "web/workspace/build",
+        "http://127.0.0.1:15414"
+      ],
+      "readyUrl": "http://127.0.0.1:15413/health"
+    }
+  ]
+}

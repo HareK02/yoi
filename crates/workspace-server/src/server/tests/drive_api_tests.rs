@@ -506,7 +506,7 @@ impl Drop for AbortServer {
 async fn drive_generated_client_roundtrips_binary_and_declared_headers_over_real_http() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api(temp.path()).await;
-    seed_test_api_token(api.store.as_ref(), "drive-client");
+    seed_test_workspace_owner_token(api.store.as_ref(), "drive-client").await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let app = build_router(api);

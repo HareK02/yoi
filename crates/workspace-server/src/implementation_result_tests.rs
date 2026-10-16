@@ -54,7 +54,7 @@ async fn implementation_result_without_any_assignment_is_authenticated_and_never
     let before = store.with_conn(|conn| {
         // Retention holds are not reporting permissions.
         conn.execute("UPDATE worker_registry SET retention_state='pinned' WHERE workspace_id='w' AND worker_id='replacement'", [])?;
-        assert_eq!(current_schema_version(conn)?, 98);
+        assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
         assert_eq!(conn.query_row("SELECT count(*) FROM ticket_worker_assignments", [], |r| r.get::<_, i64>(0))?, 0);
         assert_eq!(conn.query_row("SELECT count(*) FROM pragma_table_info('ticket_implementation_results') WHERE name IN ('assignment_id','orchestrator_assignment_id')", [], |r| r.get::<_, i64>(0))?, 0);
         assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='implementation_delegation_capture'", [], |r| r.get::<_, i64>(0))?, 0);
@@ -372,7 +372,7 @@ async fn implementation_result_v97_to_v98_preserves_legacy_bytes_receipts_and_no
     let (dir, store) = tracking_store_fixture().await;
     tracking_store_assign(&store, "delegation", "assign");
     let worker = routing_worker_assign(&store, "implementation").worker;
-    // Reconstruct schema97 from a fresh schema98 fixture, including its historical capture.
+    // Reconstruct schema97 from a fresh current-schema fixture, including its historical capture.
     store.with_conn(|conn| {
         conn.execute_batch("DROP TRIGGER notification_mr_event;
             DROP TRIGGER notification_mr_source;
@@ -381,6 +381,10 @@ async fn implementation_result_v97_to_v98_preserves_legacy_bytes_receipts_and_no
             DROP TABLE ticket_implementation_results;
             DROP TABLE ticket_implementation_delegations;
             DROP TABLE merge_request_source_observations;
+            DROP TABLE user_activations;
+            UPDATE __yoi_schema_migrations SET version=99 WHERE version=100;
+            DROP TABLE hosting_administrators; DROP TABLE hosting_settings;
+            UPDATE __yoi_schema_migrations SET version=98 WHERE version=99;
             UPDATE __yoi_schema_migrations SET version=96 WHERE version=98;")?;
         migrate_business_notifications_v96_to_v97(conn)?;
         assert_eq!(current_schema_version(conn)?, 97);
@@ -509,6 +513,10 @@ async fn mr_notification_upgrade_recovers_events_not_comments_and_retains_unknow
         // Reconstruct the prior composition before its new business capture existed.
         conn.execute_batch("DROP TRIGGER notification_mr_event; DROP TRIGGER notification_mr_source; DROP TRIGGER notification_implementation_result; DROP TRIGGER IF EXISTS implementation_delegation_capture;
             DROP TABLE ticket_implementation_results; DROP TABLE ticket_implementation_delegations; DROP TABLE merge_request_source_observations;
+            DROP TABLE user_activations;
+            UPDATE __yoi_schema_migrations SET version=99 WHERE version=100;
+            DROP TABLE hosting_administrators; DROP TABLE hosting_settings;
+            UPDATE __yoi_schema_migrations SET version=98 WHERE version=99;
             UPDATE __yoi_schema_migrations SET version=96 WHERE version=98;")?;
         conn.execute_batch("INSERT INTO merge_requests VALUES('w','historical-mr','main','open','refs/heads/work','refs/heads/main','3','3');
             INSERT INTO merge_request_ticket_relations VALUES('w','historical-mr','tracking','implements','3');
@@ -663,7 +671,11 @@ async fn mr_event_actors_preserve_self_suppression_in_capture_and_backfill() {
             if historical {
                 conn.execute_batch("DROP TRIGGER notification_mr_event; DROP TRIGGER notification_mr_source; DROP TRIGGER notification_implementation_result; DROP TRIGGER IF EXISTS implementation_delegation_capture;
                     DROP TABLE ticket_implementation_results; DROP TABLE ticket_implementation_delegations; DROP TABLE merge_request_source_observations;
-                    UPDATE __yoi_schema_migrations SET version=96 WHERE version=98;")?;
+                    DROP TABLE user_activations;
+            UPDATE __yoi_schema_migrations SET version=99 WHERE version=100;
+            DROP TABLE hosting_administrators; DROP TABLE hosting_settings;
+            UPDATE __yoi_schema_migrations SET version=98 WHERE version=99;
+            UPDATE __yoi_schema_migrations SET version=96 WHERE version=98;")?;
             }
             conn.execute_batch("INSERT INTO merge_requests VALUES('w','actor-mr','main','open','work','main','3','3');
                 INSERT INTO merge_request_ticket_relations VALUES('w','actor-mr','tracking','implements','3');")?;
