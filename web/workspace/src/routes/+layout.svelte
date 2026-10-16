@@ -96,13 +96,12 @@
   });
 </script>
 
-<WorkspaceAlerts />
-
 {#if standalone}
   <main class="standalone-main">
     {@render children()}
   </main>
 {:else}
+<WorkspaceAlerts />
 <div class="app-shell" class:sidebar-open={sidebarOpen} class:sidebar-hover-mode={sidebarMode === 'hover'}>
   <SidebarFrame
     mode={sidebarMode}

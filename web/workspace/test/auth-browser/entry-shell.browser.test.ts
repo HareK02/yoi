@@ -146,6 +146,191 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
               },
             );
           }
+          await step(
+            "Workspace notifications do not cross logout into the public entry",
+            async (page) => {
+              page.setDefaultTimeout(5000);
+              await page.routeWebSocket(/\/protocol\/ws/, (socket) => {
+                socket.onMessage((message) => {
+                  const frame = JSON.parse(String(message));
+                  if (frame.message?.method !== "subscribe_events") return;
+                  socket.send(JSON.stringify({
+                    protocol_version: 2,
+                    frame: "response",
+                    message: {
+                      result: "subscribed",
+                      payload: {
+                        request_id: frame.message.params.request_id,
+                        subscription_id: "fixture-private-alert",
+                        selector: { topic: "workspace_workers" },
+                        snapshot: {
+                          topic: "workers",
+                          data: {
+                            workers: [{
+                              worker_id: "private-worker",
+                              runtime_id: "fixture-runtime",
+                              resource_key: "W-1",
+                              availability: "observed",
+                              state: "idle",
+                              has_running_internal_workers: false,
+                              display_name: "Private Workspace Orion",
+                              workdir_attachments: [],
+                            }],
+                          },
+                        },
+                      },
+                    },
+                  }));
+                });
+              });
+              await page.route(
+                "**/api/w/home-owner/runtimes/fixture-runtime/workers/private-worker/stop",
+                (route) =>
+                  route.fulfill({
+                    json: {
+                      state: "accepted",
+                      runtime_id: "fixture-runtime",
+                      worker_id: "private-worker",
+                      diagnostics: [],
+                    },
+                  }),
+              );
+              await page.goto(`${origin}/w/home-owner?fixture=workspace-one`);
+              if (width === 390) {
+                await page.getByRole("button", { name: "Show sidebar" })
+                  .click();
+              }
+              const actions = page.getByRole("button", {
+                name: "Actions for Private Workspace Orion",
+              });
+              await actions.focus();
+              await actions.press("Enter");
+              await page.getByRole("menuitem", { name: "Stop", exact: true })
+                .click();
+              await page.getByText("Private Workspace Orion stopped", {
+                exact: true,
+              }).waitFor();
+              if (width === 390) {
+                const hideSidebar = page.getByRole("button", {
+                  name: "Hide sidebar",
+                });
+                await hideSidebar.focus();
+                await hideSidebar.press("Enter");
+              }
+              const accountLink = page.getByRole("link", {
+                name: "Open Account",
+                exact: true,
+              });
+              await accountLink.focus();
+              await accountLink.press("Enter");
+              await page.getByRole("button", { name: "Log out", exact: true })
+                .waitFor();
+              const retainedCounts = [
+                await page.locator(".workspace-alert").count(),
+              ];
+              await page.getByRole("button", { name: "Log out", exact: true })
+                .click();
+              await page.getByRole("button", { name: "Log in with passkey" })
+                .waitFor();
+              retainedCounts.push(
+                await page.locator(".workspace-alert").count(),
+              );
+              await page.getByRole("link", {
+                name: "Dashboard / Workspaces",
+                exact: true,
+              }).click();
+              await ready(page, "Log in");
+              retainedCounts.push(
+                await page.locator(".workspace-alert").count(),
+              );
+              await page.getByRole("link", { name: "Log in", exact: true })
+                .click();
+              await page.getByRole("button", { name: "Log in with passkey" })
+                .waitFor();
+              retainedCounts.push(
+                await page.locator(".workspace-alert").count(),
+              );
+              await page.getByRole("link", { name: "Yoi home", exact: true })
+                .click();
+              await ready(page, "Log in");
+              const folder =
+                `${root}/target/web-ux/entry-browser/private-alerts-${colorScheme}-${width}`;
+              await Deno.mkdir(folder, { recursive: true });
+              const bytes = await page.screenshot({
+                path: folder + "/viewport.png",
+                fullPage: true,
+              });
+              const source = await new Deno.Command("git", {
+                cwd: root,
+                args: ["rev-parse", "HEAD"],
+                stdout: "piped",
+              }).output();
+              const dirty = await new Deno.Command("git", {
+                cwd: root,
+                args: ["status", "--porcelain"],
+                stdout: "piped",
+              }).output();
+              const hash = Array.from(
+                new Uint8Array(
+                  await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes)),
+                ),
+              )
+                .map((v) => v.toString(16).padStart(2, "0")).join("");
+              await Deno.writeTextFile(
+                folder + "/review-context.json",
+                JSON.stringify(
+                  {
+                    scenario:
+                      "Workspace Stop notification → Account logout → dashboard/login → public home (SPA)",
+                    boundary:
+                      "synthetic HTTP and Worker subscription; production UI/router/store",
+                    path: new URL(page.url()).pathname,
+                    source: {
+                      commitSha: new TextDecoder().decode(source.stdout).trim(),
+                      dirty:
+                        new TextDecoder().decode(dirty.stdout).trim() !== "",
+                    },
+                    screenshot: { path: "viewport.png", sha256: hash },
+                    standaloneNotificationCounts: retainedCounts,
+                    colorScheme,
+                    viewport: { width, height: 900 },
+                    visibleNotifications: await page.locator(".workspace-alert")
+                      .allTextContents(),
+                    accessibility: await page.locator("body").ariaSnapshot(),
+                  },
+                  null,
+                  2,
+                ),
+              );
+              assertEquals(retainedCounts, [0, 0, 0, 0]);
+              assertEquals(await page.locator(".workspace-alert").count(), 0);
+              let release!: () => void;
+              const recheck = new Promise<void>((resolve) => {
+                release = resolve;
+              });
+              await page.route("**/api/auth/whoami", async (route) => {
+                await recheck;
+                await route.fulfill({
+                  status: 503,
+                  body: "synthetic unavailable session",
+                });
+              });
+              await page.evaluate(() =>
+                window.dispatchEvent(new Event("focus"))
+              );
+              await page.getByText("Loading session…").waitFor();
+              assertEquals(await page.locator(".workspace-alert").count(), 0);
+              release();
+              await page.getByText(/Login status is unknown/).waitFor();
+              assertEquals(await page.locator(".workspace-alert").count(), 0);
+              assertEquals(
+                await page.getByText("Private Workspace Orion stopped", {
+                  exact: true,
+                }).count(),
+                0,
+              );
+            },
+          );
           for (const mode of ["session-error", "session-loading"]) {
             await step(
               `public ${mode} is not anonymous or authenticated`,
@@ -452,7 +637,9 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
                 fullPage: true,
               });
               const hash = Array.from(
-                new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes))),
+                new Uint8Array(
+                  await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes)),
+                ),
               ).map((v) => v.toString(16).padStart(2, "0")).join("");
               const source = await new Deno.Command("git", {
                 cwd: root,

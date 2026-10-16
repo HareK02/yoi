@@ -4,6 +4,8 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createRawSnippet, tick } from "svelte";
 import { logout } from "#lib/workspace/auth/api.ts";
+import { clearWorkspaceAlerts, pushWorkspaceAlert } from '#lib/workspace/alerts/store.ts';
+import { page } from '$app/state';
 import { settle } from '#lib/workspace/navigation/deferred.ts';
 import Layout from "./+layout.svelte";
 
@@ -22,13 +24,40 @@ const enter = () => fireEvent.pointerEnter(hoverRegion(), { pointerType: "mouse"
 const leave = () => fireEvent.pointerLeave(hoverRegion(), { pointerType: "mouse" });
 const delay = () => vi.advanceTimersByTimeAsync(200);
 
-beforeEach(() => { localStorage.clear(); vi.useFakeTimers(); });
+beforeEach(() => {
+  localStorage.clear();
+  clearWorkspaceAlerts();
+  vi.stubGlobal('fetch', vi.fn(async (input) => {
+    if (String(input) === '/api/auth/whoami') return Response.json({ actor: null });
+    throw new Error(`Unexpected request ${input}`);
+  }));
+  page.url = new URL('https://example.test/w/example');
+  vi.useFakeTimers();
+});
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   localStorage.clear();
+});
+
+test.each(['/', '/dashboard', '/login', '/register', '/account', '/hosting/settings'])(
+  'standalone %s never displays retained private Workspace notifications',
+  (path) => {
+    pushWorkspaceAlert('error', 'Private Workspace Orion: worker deletion failed');
+    page.url = new URL(path, 'https://example.test');
+    render(Layout, { props });
+    expect(screen.getByText('Page content')).toBeTruthy();
+    expect(screen.queryByText('Private Workspace Orion: worker deletion failed')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  },
+);
+
+test('Workspace shell continues displaying Workspace action notifications', () => {
+  pushWorkspaceAlert('error', 'Worker deletion failed');
+  render(Layout, { props });
+  expect(screen.getByRole('alert').textContent).toContain('Worker deletion failed');
 });
 
 test("Workspace catalog failure uses the shared alert without rendering diagnostics in the sidebar", async () => {
