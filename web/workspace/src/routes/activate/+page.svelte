@@ -29,12 +29,12 @@
       notifySessionChanged();
     } catch {
       if (current !== generation) return;
-      error = 'Registration completion could not be confirmed. If you completed the Passkey prompt, check Passkey login from Account first. Otherwise re-enter the ID and code to restart. Ask your administrator to reissue if the code expired, was locked or was replaced.';
+      error = 'Registration completion could not be confirmed. If you completed the Passkey prompt, check the Passkey login page first. Otherwise re-enter the ID and code to restart. Ask your administrator to reissue if the code expired, was locked or was replaced.';
     } finally { if (current === generation) { code = ''; busy = false; controller = null; } }
   }
   function cancel() {
     ++generation; controller?.abort(); controller = null; code = ''; busy = false;
-    error = 'Registration stopped; completion is not confirmed. If you completed the Passkey prompt, check Passkey login from Account first. Otherwise re-enter the ID and code to restart.';
+    error = 'Registration stopped; completion is not confirmed. If you completed the Passkey prompt, check the Passkey login page first. Otherwise re-enter the ID and code to restart.';
   }
   onMount(() => {
     const clear = () => { ++generation; controller?.abort(); code = ''; busy = false; };
@@ -66,7 +66,7 @@
     </form>
     {#if busy}<p role="status">Passkey registration pending. Account activation has not been confirmed.</p>{/if}
     {#if error}<p role="alert" class="error">{error}</p>{/if}
-    <a href="/account">Already registered or completion uncertain? Check Passkey login from Account</a>
+    <a href="/login">Already registered or completion uncertain? Log in with a Passkey</a>
     <details><summary>Restart or get a new code</summary><p>Allow the browser’s Passkey prompt and save a Passkey. Only a confirmed completion signs you in; checking the code alone gives no normal session, Workspace access or device approval. After cancellation or reload, enter the ID and code again. A correct code is not consumed by starting the prompt. If a request lost its response, try Passkey login before restarting. If no Passkey works, ask your administrator to reissue for the pending ID; reissue invalidates the old code and prompt. This works even when self-registration is disabled.</p></details>
   {/if}
 </div>

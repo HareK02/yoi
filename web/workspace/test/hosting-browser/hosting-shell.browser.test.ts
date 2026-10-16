@@ -4,7 +4,10 @@
 import { assert, assertEquals } from "@std/assert";
 import { resolve } from "@std/path";
 import { chromium, type Page } from "playwright";
-import { startOwnedProcesses, stopOwnedProcesses } from "../../../../tools/web-ux/src/processes.ts";
+import {
+  startOwnedProcesses,
+  stopOwnedProcesses,
+} from "../../../../tools/web-ux/src/processes.ts";
 const root = resolve(import.meta.dirname!, "../../../..");
 const evidence = `${root}/target/web-ux/hosting/interactions`;
 async function noOverflow(page: Page) {
@@ -63,7 +66,9 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
           });
           page.on("response", (response) => {
             if (response.status() >= 400) {
-              httpErrors.push(`${response.status()} ${new URL(response.url()).pathname}`);
+              httpErrors.push(
+                `${response.status()} ${new URL(response.url()).pathname}`,
+              );
             }
           });
           page.on(
@@ -80,18 +85,34 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
               settingsRequests.push(request.method());
             }
           });
-          await page.goto("http://127.0.0.1:15379/account?fixture=admin-on");
-          await page.getByRole("button", { name: "Add passkey to alice" }).waitFor();
+          await page.goto("http://127.0.0.1:15379/?fixture=admin-on");
+          await page.getByRole("heading", { name: "Workspaces", exact: true })
+            .waitFor();
           if (
-            await page.getByRole("button", { name: "Show sidebar", exact: true }).isVisible()
-          ) await page.getByRole("button", { name: "Show sidebar", exact: true }).click();
+            await page.getByRole("button", {
+              name: "Show sidebar",
+              exact: true,
+            }).isVisible()
+          ) {
+            await page.getByRole("button", {
+              name: "Show sidebar",
+              exact: true,
+            }).click();
+          }
           const nav = page.getByRole("navigation", { name: "Global pages" });
-          await nav.getByRole("link", { name: "Hosting settings", exact: true }).waitFor();
+          await nav.getByRole("link", { name: "Hosting settings", exact: true })
+            .waitFor();
           await nav.getByRole("link", { name: "Account", exact: true }).focus();
           await page.keyboard.press("Tab");
-          assertEquals(await page.locator(":focus").innerText(), "Device Login");
+          assertEquals(
+            await page.locator(":focus").innerText(),
+            "Device Login",
+          );
           await page.keyboard.press("Tab");
-          assertEquals(await page.locator(":focus").innerText(), "Hosting settings");
+          assertEquals(
+            await page.locator(":focus").innerText(),
+            "Hosting settings",
+          );
           assertEquals(
             await page.locator(":focus").evaluate((element) =>
               getComputedStyle(element).outlineStyle !== "none"
@@ -99,42 +120,80 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
             true,
           );
           await page.keyboard.press("Enter");
-          const edit = page.getByRole("button", { name: "Edit registration policy" });
+          const edit = page.getByRole("button", {
+            name: "Edit registration policy",
+          });
           await edit.waitFor();
           // Globalの入口からhostingへ進んだ後はWorkspace shellを離れる。
           // Workspace未作成でも管理できることと整合させる。
           assertEquals(await nav.count(), 0);
-          await page.getByRole("heading", { name: "Hosting settings", exact: true }).waitFor();
+          await page.getByRole("heading", {
+            name: "Hosting settings",
+            exact: true,
+          }).waitFor();
           if (
-            await page.getByRole("button", { name: "Hide sidebar", exact: true }).isVisible() &&
+            await page.getByRole("button", {
+              name: "Hide sidebar",
+              exact: true,
+            }).isVisible() &&
             width < 768
-          ) await page.getByRole("button", { name: "Hide sidebar", exact: true }).click();
+          ) {
+            await page.getByRole("button", {
+              name: "Hide sidebar",
+              exact: true,
+            }).click();
+          }
           await noOverflow(page);
           await edit.focus();
           await page.keyboard.press("Enter");
-          const checkbox = page.getByRole("checkbox", { name: "Allow new account registration" });
+          const checkbox = page.getByRole("checkbox", {
+            name: "Allow new account registration",
+          });
           assertEquals(
-            await checkbox.evaluate((element) => element === document.activeElement),
+            await checkbox.evaluate((element) =>
+              element === document.activeElement
+            ),
             true,
           );
           assertEquals(await checkbox.isChecked(), true);
           await page.keyboard.press("Space");
-          await page.getByRole("button", { name: "Cancel", exact: true }).click();
-          assertEquals(await edit.evaluate((element) => element === document.activeElement), true);
+          await page.getByRole("button", { name: "Cancel", exact: true })
+            .click();
+          assertEquals(
+            await edit.evaluate((element) =>
+              element === document.activeElement
+            ),
+            true,
+          );
           await page.keyboard.press("Enter");
           assertEquals(await checkbox.isChecked(), true);
           await page.keyboard.press("Space");
           await page.keyboard.press("Tab");
-          assertEquals(await page.locator(":focus").innerText(), "Save settings");
+          assertEquals(
+            await page.locator(":focus").innerText(),
+            "Save settings",
+          );
           await page.keyboard.press("Enter");
-          await page.getByRole("status").filter({ hasText: "Hosting settings saved." }).waitFor();
-          assertEquals(await edit.evaluate((element) => element === document.activeElement), true);
+          await page.getByRole("status").filter({
+            hasText: "Hosting settings saved.",
+          }).waitFor();
+          assertEquals(
+            await edit.evaluate((element) =>
+              element === document.activeElement
+            ),
+            true,
+          );
           await page.getByText("Disabled", { exact: true }).waitFor();
-          assertEquals(settingsRequests.filter((method) => method === "PUT").length, 1);
+          assertEquals(
+            settingsRequests.filter((method) => method === "PUT").length,
+            1,
+          );
           await noOverflow(page);
           for (const mode of ["ordinary", "anonymous"]) {
             settingsRequests.length = 0;
-            await page.goto(`http://127.0.0.1:15379/hosting/settings?fixture=${mode}`);
+            await page.goto(
+              `http://127.0.0.1:15379/hosting/settings?fixture=${mode}`,
+            );
             await page.getByText(
               mode === "ordinary"
                 ? "Hosting administrator access is required."
@@ -144,41 +203,62 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
             assertEquals(await edit.count(), 0);
             assertEquals(await checkbox.count(), 0);
             assertEquals(
-              await nav.getByRole("link", { name: "Hosting settings", exact: true }).count(),
+              await nav.getByRole("link", {
+                name: "Hosting settings",
+                exact: true,
+              }).count(),
               0,
             );
             assertEquals(settingsRequests, []);
             await noOverflow(page);
           }
-          await page.goto("http://127.0.0.1:15379/account?fixture=account-off");
+          await page.goto(
+            "http://127.0.0.1:15379/register?fixture=account-off",
+          );
           await page.getByText(
             "New account registration is disabled. Existing users can still log in.",
           ).waitFor();
-          assertEquals(await page.getByRole("button", { name: "Register new account" }).count(), 0);
           assertEquals(
-            await page.getByRole("button", { name: "Log in with passkey" }).isEnabled(),
-            true,
+            await page.getByRole("button", { name: "Register new account" })
+              .count(),
+            0,
           );
+          await page.getByRole("link", {
+            name: "Log in with an existing account",
+          }).waitFor();
           await noOverflow(page);
-          await page.goto("http://127.0.0.1:15379/account?fixture=ordinary-account-off");
-          await page.getByRole("button", { name: "Add passkey to alice" }).waitFor();
+          await page.goto(
+            "http://127.0.0.1:15379/account?fixture=ordinary-account-off",
+          );
+          await page.getByRole("button", { name: "Add passkey to alice" })
+            .waitFor();
           assertEquals(
-            await page.getByRole("button", { name: "Add passkey to alice" }).isEnabled(),
+            await page.getByRole("button", { name: "Add passkey to alice" })
+              .isEnabled(),
             true,
           );
-          await page.goto("http://127.0.0.1:15379/hosting/settings?fixture=admin-save-error");
+          await page.goto(
+            "http://127.0.0.1:15379/hosting/settings?fixture=admin-save-error",
+          );
           await edit.click();
           await checkbox.press("Space");
-          await page.getByRole("button", { name: "Save settings", exact: true }).click();
+          await page.getByRole("button", { name: "Save settings", exact: true })
+            .click();
           await page.getByRole("alert").waitFor();
           assertEquals(await checkbox.isChecked(), false);
           assertEquals(await checkbox.isDisabled(), true);
           assertEquals(
-            await page.getByRole("button", { name: "Save settings", exact: true }).isDisabled(),
+            await page.getByRole("button", {
+              name: "Save settings",
+              exact: true,
+            }).isDisabled(),
             true,
           );
           await noOverflow(page);
-          await page.getByRole("button", { name: "Reload settings", exact: true }).click();
+          await page.getByRole("button", {
+            name: "Reload settings",
+            exact: true,
+          }).click();
           await edit.waitFor();
           assertEquals(await page.getByRole("alert").count(), 0);
           assertEquals(await edit.isEnabled(), true);
@@ -189,7 +269,11 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
                 "/hosting/settings",
                 'button:has-text("Retry loading settings")',
               ],
-              ["account-error", "/account", 'button:has-text("Retry registration availability")'],
+              [
+                "account-error",
+                "/register",
+                'button:has-text("Retry registration availability")',
+              ],
               [
                 "admin-loading",
                 "/hosting/settings",
@@ -197,7 +281,7 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
               ],
               [
                 "account-loading",
-                "/account",
+                "/register",
                 '[role="status"]:has-text("Checking registration availability")',
               ],
             ]
@@ -242,7 +326,10 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
         }
       }
     }
-    await Deno.writeTextFile(`${evidence}/results.json`, JSON.stringify(results, null, 2));
+    await Deno.writeTextFile(
+      `${evidence}/results.json`,
+      JSON.stringify(results, null, 2),
+    );
   } finally {
     await browser.close();
     await stopOwnedProcesses(processes);

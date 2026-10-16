@@ -20,6 +20,12 @@ import {
   type WhoamiResponse,
 } from "#lib/workspace/auth/model.ts";
 
+export class AuthRequestError extends Error {
+  constructor(readonly status: number) {
+    super(`Auth request failed (${status}).`);
+  }
+}
+
 const MAX_AUTH_RESPONSE_BYTES = 256 * 1024;
 
 export async function readBoundedAuthResponseJson(
@@ -80,6 +86,9 @@ export async function readBoundedAuthResponseJson(
 async function requestJson(path: string, init?: RequestInit): Promise<unknown> {
   const response = await fetch(path, {
     credentials: "same-origin",
+    mode: "same-origin",
+    redirect: "error",
+    cache: "no-store",
     ...init,
     headers: {
       "content-type": "application/json",
@@ -88,20 +97,23 @@ async function requestJson(path: string, init?: RequestInit): Promise<unknown> {
   });
   if (!response.ok) {
     await response.body?.cancel();
-    throw new Error(`Auth request failed (${response.status}).`);
+    throw new AuthRequestError(response.status);
   }
   return await readBoundedAuthResponseJson(response);
 }
 
-export async function loadWhoami(): Promise<WhoamiResponse> {
-  return parseWhoamiResponse(await requestJson("/api/auth/whoami"));
+export async function loadWhoami(
+  signal?: AbortSignal,
+): Promise<WhoamiResponse> {
+  return parseWhoamiResponse(await requestJson("/api/auth/whoami", { signal }));
 }
 
-export async function logout(): Promise<void> {
+export async function logout(signal?: AbortSignal): Promise<void> {
   parseLogoutResponse(
     await requestJson("/api/auth/logout", {
       method: "POST",
       body: "{}",
+      signal,
     }),
   );
 }
@@ -109,20 +121,21 @@ export async function logout(): Promise<void> {
 export async function registerPasskey(
   handle: string,
   displayName?: string,
+  signal?: AbortSignal,
 ): Promise<AuthUser> {
   const optionsRequest: PasskeyRegistrationOptionsRequest = {
     handle,
     display_name: displayName ?? null,
     browser_origin: window.location.origin,
   };
-  return await createPasskey("registration", optionsRequest);
+  return await createPasskey("registration", optionsRequest, signal);
 }
 
-export async function addPasskey(): Promise<AuthUser> {
+export async function addPasskey(signal?: AbortSignal): Promise<AuthUser> {
   const optionsRequest: PasskeyAdditionOptionsRequest = {
     browser_origin: window.location.origin,
   };
-  return await createPasskey("addition", optionsRequest);
+  return await createPasskey("addition", optionsRequest, signal);
 }
 
 async function createPasskey(
@@ -130,10 +143,12 @@ async function createPasskey(
   optionsRequest:
     | PasskeyRegistrationOptionsRequest
     | PasskeyAdditionOptionsRequest,
+  signal?: AbortSignal,
 ): Promise<AuthUser> {
   const options = await requestJson(`/api/auth/passkeys/${purpose}/options`, {
     method: "POST",
     body: JSON.stringify(optionsRequest),
+    signal,
   });
   const optionsRecord = typeof options === "object" && options !== null
     ? options as Record<string, unknown>
@@ -144,11 +159,16 @@ async function createPasskey(
       "Invalid auth payload: registration_options.challenge_id is required.",
     );
   }
+  signal?.throwIfAborted();
   const credential = await navigator.credentials.create({
+    signal,
     publicKey: prepareRegistrationOptions(options),
   });
-  if (!credential) throw new Error("Passkey registration was cancelled");
+  if (!credential) {
+    throw new DOMException("Passkey cancelled", "NotAllowedError");
+  }
 
+  signal?.throwIfAborted();
   const completeRequest: PasskeyRegistrationCompleteRequest = {
     challenge_id: challengeId,
     credential: registrationCredentialToJson(credential),
@@ -157,12 +177,16 @@ async function createPasskey(
     await requestJson(`/api/auth/passkeys/${purpose}/complete`, {
       method: "POST",
       body: JSON.stringify(completeRequest),
+      signal,
     }),
   );
   return result.user;
 }
 
-export async function loginWithPasskey(handle: string): Promise<AuthUser> {
+export async function loginWithPasskey(
+  handle: string,
+  signal?: AbortSignal,
+): Promise<AuthUser> {
   const loginHandle = handle.trim();
   if (!loginHandle) {
     throw new Error("User handle is required for passkey login.");
@@ -174,6 +198,7 @@ export async function loginWithPasskey(handle: string): Promise<AuthUser> {
   const options = await requestJson("/api/auth/passkeys/login/options", {
     method: "POST",
     body: JSON.stringify(optionsRequest),
+    signal,
   });
   const optionsRecord = typeof options === "object" && options !== null
     ? options as Record<string, unknown>
@@ -184,11 +209,16 @@ export async function loginWithPasskey(handle: string): Promise<AuthUser> {
       "Invalid auth payload: login_options.challenge_id is required.",
     );
   }
+  signal?.throwIfAborted();
   const credential = await navigator.credentials.get({
+    signal,
     publicKey: prepareLoginOptions(options),
   });
-  if (!credential) throw new Error("Passkey login was cancelled");
+  if (!credential) {
+    throw new DOMException("Passkey cancelled", "NotAllowedError");
+  }
 
+  signal?.throwIfAborted();
   const completeRequest: PasskeyLoginCompleteRequest = {
     challenge_id: challengeId,
     credential: authenticationCredentialToJson(credential),
@@ -197,6 +227,7 @@ export async function loginWithPasskey(handle: string): Promise<AuthUser> {
     await requestJson("/api/auth/passkeys/login/complete", {
       method: "POST",
       body: JSON.stringify(completeRequest),
+      signal,
     }),
   );
   return result.user;
@@ -204,12 +235,14 @@ export async function loginWithPasskey(handle: string): Promise<AuthUser> {
 
 export async function approveDeviceLogin(
   userCode: string,
+  signal?: AbortSignal,
 ): Promise<DeviceApprovalResponse> {
   const request: DeviceLoginApproveRequest = { user_code: userCode };
   return parseDeviceApprovalResponse(
     await requestJson("/api/auth/device-login/approve", {
       method: "POST",
       body: JSON.stringify(request),
+      signal,
     }),
   );
 }

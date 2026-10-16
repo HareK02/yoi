@@ -18,8 +18,9 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use server_api::{
-    AuthUserResponse, AuthenticatedUser, PasskeyLoginCompleteRequest, PasskeyLoginOptionsResponse,
-    PasskeyRegistrationCompleteRequest, PasskeyRegistrationOptionsResponse,
+    ActorAuthMethod, AuthUserResponse, AuthenticatedUser, PasskeyLoginCompleteRequest,
+    PasskeyLoginOptionsResponse, PasskeyRegistrationCompleteRequest,
+    PasskeyRegistrationOptionsResponse, WhoamiResponse,
 };
 use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
 use yoi_e2e::WorkerE2eEnvironment;
@@ -211,6 +212,26 @@ fn access(client: &Client, base: &str, artifacts: &Path, cookie: &str, is_admin:
     Ok(())
 }
 
+fn browser_identity(
+    client: &Client,
+    base: &str,
+    artifacts: &Path,
+    cookie: &str,
+    user: &AuthenticatedUser,
+) -> Result {
+    let whoami: WhoamiResponse = decode(send(
+        client
+            .get(format!("{base}/api/auth/whoami"))
+            .header(COOKIE, cookie),
+        "browser session rereads its own identity",
+        artifacts,
+    )?)?;
+    let actor = whoami.actor.ok_or("browser session is anonymous")?;
+    assert_eq!(actor.user(), *user);
+    assert_eq!(actor.auth_method, ActorAuthMethod::BrowserSession);
+    Ok(())
+}
+
 fn logout(client: &Client, base: &str, artifacts: &Path, cookie: &str) -> Result {
     let response = success(send(
         client
@@ -357,14 +378,15 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
     )?;
 
     let mut original_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
-    let (registered, _, user_handle) = register(
+    let (registered, registration_cookie, user_handle) = register(
         &client,
         base,
         artifacts,
         &environment.account_handle,
         &mut original_key,
     )?;
-    // registrationのcookieは使わず、実assertionで得たlogin cookieを次の変更操作に使う。
+    // 登録sessionを失効させ、実assertionで得たlogin cookieだけで本人追加へ進む。
+    logout(&client, base, artifacts, &registration_cookie)?;
     let (logged_in, cookie) = login(
         &client,
         base,
@@ -373,14 +395,7 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
         &mut original_key,
     )?;
     assert_eq!(logged_in.user, registered.user);
-    let whoami: Value = decode(send(
-        client
-            .get(format!("{base}/api/auth/whoami"))
-            .header(COOKIE, &cookie),
-        "logged-in whoami",
-        artifacts,
-    )?)?;
-    assert_eq!(whoami["actor"]["account_id"], registered.user.account_id);
+    browser_identity(&client, base, artifacts, &cookie, &registered.user)?;
     let workspaces: Value = decode(send(
         client
             .get(format!("{base}/api/workspaces"))
@@ -534,7 +549,7 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
             "unknown field",
         )?;
     }
-    let (added, _) = session(send(
+    let (added, added_cookie) = session(send(
         client
             .post(format!("{base}/api/auth/passkeys/addition/complete"))
             .header(COOKIE, &cookie)
@@ -544,6 +559,7 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
         artifacts,
     )?)?;
     assert_eq!(added.user, registered.user);
+    browser_identity(&client, base, artifacts, &added_cookie, &registered.user)?;
     rejected(
         send(
             client
@@ -558,6 +574,24 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
         "invalid_passkey_challenge",
     )?;
 
+    // cookieを消すだけでなく、追加前後のsessionがServerでも失効したことを確かめる。
+    logout(&client, base, artifacts, &cookie)?;
+    logout(&client, base, artifacts, &added_cookie)?;
+    for revoked_cookie in [&cookie, &added_cookie] {
+        rejected(
+            send(
+                client
+                    .post(format!("{base}/api/auth/passkeys/addition/options"))
+                    .header(COOKIE, revoked_cookie)
+                    .header(ORIGIN, BROWSER_ORIGIN)
+                    .json(&json!({"browser_origin": BROWSER_ORIGIN})),
+                "logout prevents further self addition with the old cookie",
+                artifacts,
+            )?,
+            StatusCode::FORBIDDEN,
+            "auth_required",
+        )?;
+    }
     let (new_login, new_cookie) = login(
         &client,
         base,
@@ -566,7 +600,8 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
         &mut added_key,
     )?;
     assert_eq!(new_login.user, registered.user);
-    let (old_login, _) = login(
+    browser_identity(&client, base, artifacts, &new_cookie, &registered.user)?;
+    let (old_login, old_cookie) = login(
         &client,
         base,
         artifacts,
@@ -577,6 +612,7 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
         old_login.user, registered.user,
         "adding a key must preserve the original key"
     );
+    logout(&client, base, artifacts, &old_cookie)?;
     let created: Value = decode(send(
         client
             .post(format!("{base}/api/workspaces"))
@@ -640,18 +676,32 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
         "owner",
     )?;
 
+    logout(&client, base, artifacts, &new_cookie)?;
     let report = environment.cleanup()?;
     assert!(report.cleanup_success);
     assert!(!report.fixture_root_exists_after);
     Ok(())
 }
 
-fn ordinary_device_login_does_not_grant_hosting_authority(
+fn device_login_pending(client: &Client, base: &str, artifacts: &Path, flow: &Value) -> Result {
+    let pending: Value = decode(send(
+        client
+            .post(format!("{base}/api/auth/device-login/poll"))
+            .json(&json!({"device_code": flow["device_code"]})),
+        "device flow remains pending without explicit approval",
+        artifacts,
+    )?)?;
+    assert_eq!(pending["status"], "pending");
+    assert!(pending.get("access_token").is_none_or(Value::is_null));
+    Ok(())
+}
+
+fn ordinary_device_login_requires_explicit_approval_and_does_not_grant_hosting_authority(
     client: &Client,
     base: &str,
     artifacts: &Path,
     user: &AuthUserResponse,
-    cookie: &str,
+    key: &mut WebauthnAuthenticator<SoftPasskey>,
 ) -> Result {
     let flow: Value = decode(send(
         client
@@ -673,10 +723,16 @@ fn ordinary_device_login_does_not_grant_hosting_authority(
         StatusCode::UNAUTHORIZED,
         "request requires",
     )?;
+    device_login_pending(client, base, artifacts, &flow)?;
+    // login APIの完了では認証だけが成立し、CLIへの権限付与はまだない。
+    let (logged_in, cookie) = login(client, base, artifacts, &user.user.handle, key)?;
+    assert_eq!(logged_in.user, user.user);
+    browser_identity(client, base, artifacts, &cookie, &user.user)?;
+    device_login_pending(client, base, artifacts, &flow)?;
     for origin in [None, Some("http://localhost:5174")] {
         let mut request = client
             .post(format!("{base}/api/auth/device-login/approve"))
-            .header(COOKIE, cookie)
+            .header(COOKIE, &cookie)
             .json(&approval);
         if let Some(origin) = origin {
             request = request.header(ORIGIN, origin);
@@ -691,10 +747,11 @@ fn ordinary_device_login_does_not_grant_hosting_authority(
             "origin",
         )?;
     }
+    device_login_pending(client, base, artifacts, &flow)?;
     let approved: Value = decode(send(
         client
             .post(format!("{base}/api/auth/device-login/approve"))
-            .header(COOKIE, cookie)
+            .header(COOKIE, &cookie)
             .header(ORIGIN, BROWSER_ORIGIN)
             .json(&approval),
         "existing ordinary user approves device login while registration disabled",
@@ -713,6 +770,16 @@ fn ordinary_device_login_does_not_grant_hosting_authority(
     let token = issued["access_token"]
         .as_str()
         .ok_or("device poll omitted bearer")?;
+    let whoami: WhoamiResponse = decode(send(
+        client
+            .get(format!("{base}/api/auth/whoami"))
+            .bearer_auth(token),
+        "explicit device approval issues the logged-in user's bearer",
+        artifacts,
+    )?)?;
+    let actor = whoami.actor.ok_or("approved device bearer is anonymous")?;
+    assert_eq!(actor.user(), user.user);
+    assert_eq!(actor.auth_method, ActorAuthMethod::ApiToken);
     let access: Value = decode(send(
         client
             .get(format!("{base}/api/hosting/access"))
@@ -743,6 +810,7 @@ fn ordinary_device_login_does_not_grant_hosting_authority(
     )?)?;
     assert_eq!(consumed["status"], "consumed");
     assert!(consumed.get("access_token").is_none_or(Value::is_null));
+    logout(client, base, artifacts, &cookie)?;
     policy(client, base, artifacts, false)
 }
 
@@ -974,17 +1042,12 @@ fn hosting_policy_rejects_spoofing_inflight_registration_and_survives_restart() 
         StatusCode::FORBIDDEN,
         "self_registration_disabled",
     )?;
-    let (logged_in, cookie) = login(
+    ordinary_device_login_requires_explicit_approval_and_does_not_grant_hosting_authority(
         &client,
         &base,
         &artifacts,
-        &ordinary.user.handle,
+        &ordinary,
         &mut ordinary_key,
-    )?;
-    assert_eq!(logged_in.user, ordinary.user);
-    access(&client, &base, &artifacts, &cookie, false)?;
-    ordinary_device_login_does_not_grant_hosting_authority(
-        &client, &base, &artifacts, &logged_in, &cookie,
     )?;
     let (_, cookie) = login(
         &client,
@@ -1528,6 +1591,18 @@ fn activation_codes_challenges_and_unverified_state_cannot_cross_account_or_purp
         artifacts,
     )?)?;
     for bearer in [None, Some(issue.code.as_str()), Some(challenge_id.as_str())] {
+        let mut request = client.get(format!("{base}/api/auth/whoami"));
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(bearer);
+        }
+        let response = activation_success(send(
+            request,
+            "activation code and challenge leave whoami anonymous",
+            artifacts,
+        )?)?;
+        assert!(response.headers().get(SET_COOKIE).is_none());
+        let whoami: WhoamiResponse = response.json()?;
+        assert!(whoami.actor.is_none());
         let requests = [
             client.get(format!("{base}/api/hosting/settings")),
             client.post(format!("{base}/api/workspaces")).header(ORIGIN, BROWSER_ORIGIN)
@@ -1550,15 +1625,7 @@ fn activation_codes_challenges_and_unverified_state_cannot_cross_account_or_purp
             )?)?;
         }
     }
-    let polled: Value = decode(send(
-        client
-            .post(format!("{base}/api/auth/device-login/poll"))
-            .json(&json!({"device_code": flow["device_code"]})),
-        "failed pending-user approvals did not authorize device",
-        artifacts,
-    )?)?;
-    assert_eq!(polled["status"], "pending");
-    assert!(polled.get("access_token").is_none_or(Value::is_null));
+    device_login_pending(&client, base, artifacts, &flow)?;
 
     // completionはchallengeのtargetを使い、本文で別accountへ切り替えられない。
     for field in ["handle", "account_id", "user_id"] {

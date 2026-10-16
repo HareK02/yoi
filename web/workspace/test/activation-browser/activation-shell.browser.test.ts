@@ -172,7 +172,7 @@ Deno.test("activation standalone shell supports issuance, reissue, denial, resta
           await checkLink(
             page.getByRole("link", {
               name:
-                "Already registered or completion uncertain? Check Passkey login from Account",
+                "Already registered or completion uncertain? Log in with a Passkey",
             }),
           );
           await fillActivation();

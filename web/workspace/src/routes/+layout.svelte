@@ -26,8 +26,9 @@
   import { observeDeferred } from '#lib/workspace/navigation/observe-deferred.svelte.ts';
 
   let { children, data }: LayoutProps = $props();
-  // Hostingと初回登録はWorkspaceに依存しない。login全体の分離はここで扱わない。
-  const standalone = $derived(page.url.pathname === '/activate' || page.url.pathname.startsWith('/hosting/'));
+  import { isAuthPage } from '#lib/workspace/auth/routes.ts';
+  // 認証画面はWorkspaceの存在/取得/Sidebarに依存しない。
+  const standalone = $derived(isAuthPage(page.url.pathname) || page.url.pathname.startsWith('/hosting/'));
   const catalog = observeDeferred(() => data.deferredCatalog, () => 'catalog');
   let sidebar = $state<SidebarSnippet | null>(null);
   const sidebarOverrides = createOverrideStack<SidebarSnippet>((activeSidebar) => {

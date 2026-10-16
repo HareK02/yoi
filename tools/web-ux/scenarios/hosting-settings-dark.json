@@ -275,29 +275,11 @@
       ]
     },
     {
-      "id": "account-on",
-      "label": "account-on",
-      "path": "/account?fixture=account-on",
-      "goal": "Verify production shell UI projection, not server authorization.",
-      "dataState": "Anonymous policy on; registration and login available.",
-      "ready": {
-        "kind": "selector",
-        "selector": "button:has-text(\"Register new account\"):enabled"
-      },
-      "capturePoints": [
-        {
-          "id": "initial",
-          "label": "Initial state",
-          "fullPage": true
-        }
-      ]
-    },
-    {
       "id": "account-off",
       "label": "account-off",
-      "path": "/account?fixture=account-off",
+      "path": "/register?fixture=account-off",
       "goal": "Verify production shell UI projection, not server authorization.",
-      "dataState": "Anonymous policy off; no registration action, login available.",
+      "dataState": "Anonymous policy off; registration disabled and existing login link available.",
       "ready": {
         "kind": "selector",
         "selector": "p:has-text(\"New account registration is disabled.\")"
@@ -315,7 +297,7 @@
       "label": "admin-account",
       "path": "/account?fixture=admin-account",
       "goal": "Verify production shell UI projection, not server authorization.",
-      "dataState": "Authenticated admin; own passkey addition and global settings link.",
+      "dataState": "Authenticated own account; addition available independently of registration policy. Global navigation remains on Workspace shell.",
       "ready": {
         "kind": "selector",
         "selector": "button:has-text(\"Add passkey to alice\")"
@@ -333,7 +315,7 @@
       "label": "ordinary-account-off",
       "path": "/account?fixture=ordinary-account-off",
       "goal": "Verify production shell UI projection, not server authorization.",
-      "dataState": "Authenticated ordinary user with policy off; own passkey addition available without admin nav.",
+      "dataState": "Authenticated own account; addition available independently of registration policy. Global navigation remains on Workspace shell.",
       "ready": {
         "kind": "selector",
         "selector": "button:has-text(\"Add passkey to alice\")"
@@ -349,7 +331,7 @@
     {
       "id": "account-error",
       "label": "account-error",
-      "path": "/account?fixture=account-error",
+      "path": "/register?fixture=account-error",
       "goal": "Verify production shell UI projection, not server authorization.",
       "dataState": "Intentional policy HTTP503; expected console resource error and visible alert; login retained.",
       "ready": {
@@ -367,7 +349,7 @@
     {
       "id": "account-loading",
       "label": "account-loading",
-      "path": "/account?fixture=account-loading",
+      "path": "/register?fixture=account-loading",
       "goal": "Verify production shell UI projection, not server authorization.",
       "dataState": "Policy request held pending; login remains available after session loads.",
       "ready": {

@@ -1,10 +1,14 @@
 import { assertEquals } from "jsr:@std/assert";
 import { load, ssr } from "../src/routes/+layout.ts";
 
-Deno.test("activation and hosting shells never require Workspace catalog authority", async () => {
+Deno.test("authentication and hosting shells never require Workspace catalog authority", async () => {
   for (
     const path of [
       "/activate",
+      "/login",
+      "/register",
+      "/account",
+      "/login/device",
       "/hosting/accounts",
       "/hosting/settings",
       "/hosting/setup",
