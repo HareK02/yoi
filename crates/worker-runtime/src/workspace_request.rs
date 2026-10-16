@@ -262,12 +262,14 @@ impl RuntimeWorkspaceRequestClient {
         request: RuntimeWorkspaceRequest,
     ) -> Result<RuntimeWorkspaceResponse, RuntimeWorkspaceRequestError> {
         let client = self.clone();
-        std::thread::spawn(move || client.execute_blocking_inner(request, true))
-            .join()
-            .map_err(|_| RuntimeWorkspaceRequestError::Transport {
-                message: "Workspace request thread panicked".to_string(),
-                timeout: false,
-            })?
+        std::thread::spawn(move || {
+            client.execute_blocking_inner(request, true, reqwest::blocking::Client::builder())
+        })
+        .join()
+        .map_err(|_| RuntimeWorkspaceRequestError::Transport {
+            message: "Workspace request thread panicked".to_string(),
+            timeout: false,
+        })?
     }
 
     /// Binary requests must retain their exact target and never follow redirects.
@@ -276,18 +278,21 @@ impl RuntimeWorkspaceRequestClient {
         request: RuntimeWorkspaceRequest,
     ) -> Result<RuntimeWorkspaceResponse, RuntimeWorkspaceRequestError> {
         let client = self.clone();
-        std::thread::spawn(move || client.execute_blocking_inner(request, false))
-            .join()
-            .map_err(|_| RuntimeWorkspaceRequestError::Transport {
-                message: "Workspace binary request thread panicked".to_string(),
-                timeout: false,
-            })?
+        std::thread::spawn(move || {
+            client.execute_blocking_inner(request, false, reqwest::blocking::Client::builder())
+        })
+        .join()
+        .map_err(|_| RuntimeWorkspaceRequestError::Transport {
+            message: "Workspace binary request thread panicked".to_string(),
+            timeout: false,
+        })?
     }
 
     fn execute_blocking_inner(
         &self,
         request: RuntimeWorkspaceRequest,
         follow_redirects: bool,
+        client_builder: reqwest::blocking::ClientBuilder,
     ) -> Result<RuntimeWorkspaceResponse, RuntimeWorkspaceRequestError> {
         let prepared = self.prepare(&request)?;
         if !follow_redirects {
@@ -304,7 +309,7 @@ impl RuntimeWorkspaceRequestClient {
         }
         // The blocking client defaults to 30 seconds. Apply None explicitly so
         // provider-owned command waits are not cut short by an HTTP deadline.
-        let mut client_builder = reqwest::blocking::Client::builder().timeout(request.timeout);
+        let mut client_builder = client_builder.timeout(request.timeout);
         if !follow_redirects {
             client_builder = client_builder.redirect(reqwest::redirect::Policy::none());
         }
@@ -424,6 +429,68 @@ fn unix_now_seconds() -> i64 {
 mod tests {
     use super::*;
     use crate::auth::decode_runtime_request_source_claims;
+
+    // Component boundary: production request preparation, timeout policy and HTTP execution;
+    // only the initial client deadline and remote Workspace are supplied by the fixture.
+    #[tokio::test]
+    async fn blocking_workspace_client_clears_initial_request_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let initial_timeout = Duration::from_millis(20);
+            let mut request = tokio::task::spawn_blocking(move || {
+                let builder = reqwest::blocking::Client::builder()
+                    .no_proxy()
+                    .timeout(initial_timeout);
+                RuntimeWorkspaceRequestClient::new("workspace-a", format!("http://{address}"), "runtime-a")
+                    .execute_blocking_inner(
+                        RuntimeWorkspaceRequest {
+                            method: reqwest::Method::GET,
+                            path_and_query: "/api/test".into(),
+                            body: Vec::new(),
+                            headers: HeaderMap::new(),
+                            permission: "test".into(),
+                            worker_id: None,
+                            timeout: None,
+                            max_response_bytes: 1024,
+                        },
+                        true,
+                        builder,
+                    )
+            });
+
+            let receive_and_cross_deadline = async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(stream.read_u8().await.unwrap());
+                    assert!(headers.len() <= 8192, "unbounded request headers");
+                }
+                // Deliberately cross the inherited deadline after request arrival.
+                // This timer supplies the fault stimulus, not a completion signal.
+                tokio::time::sleep(initial_timeout * 2).await;
+                stream
+            };
+            let mut stream = tokio::select! {
+                result = &mut request => panic!("request ended before response: {result:?}"),
+                stream = receive_and_cross_deadline => stream,
+            };
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
+                .await
+                .unwrap();
+            drop(stream);
+            let response = request.await.unwrap().unwrap();
+            assert_eq!(response.status, reqwest::StatusCode::OK);
+            assert_eq!(response.body, br#"{"ok":true}"#);
+        })
+        .await
+        .expect("loopback request did not complete");
+    }
 
     #[test]
     fn route_issues_workspace_scoped_request_proof() {

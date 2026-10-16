@@ -1313,6 +1313,7 @@ mod tests {
                 priority: "normal".into(),
                 labels: vec![],
                 created_at: None,
+                created_by: None,
                 updated_at: None,
                 assignee: None,
                 readiness: None,
@@ -1448,6 +1449,7 @@ mod tests {
             Ok(current.clone())
         }
         unused_backend_methods! {
+            fn edit_post_with_snapshots(&self, id: TicketIdOrSlug, edit: ticket::TicketPostEdit) -> ticket::Result<(ticket::Ticket, ticket::Ticket)>;
             fn list_workspace_tags(&self, request: ticket::TagListRequest) -> ticket::Result<Vec<ticket::WorkspaceTag>>;
             fn mutate_workspace_tag(&self, request: ticket::WorkspaceTagMutation) -> ticket::Result<ticket::WorkspaceTag>;
             fn set_ticket_tags(&self, id: TicketIdOrSlug, request: ticket::TicketTagSetRequest) -> ticket::Result<Vec<ticket::WorkspaceTag>>;

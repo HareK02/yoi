@@ -1,6 +1,15 @@
 use super::*;
 
+// Keep the short transport/session-lock liveness bounds separate from full
+// lifecycle cleanup. The 10s output/Close deadlines below are asserted exactly
+// with paused time; these wall-clock limits are deadlock watchdogs, not the
+// normal-suite performance budget.
 const PROTOCOL_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+// Stop also runs Host admission, Runtime persistence and linked-Workdir storage
+// publication. The parallel normal run exceeded 2s there after transport had
+// already terminated. Check lock release separately at 2s, but allow this real
+// lifecycle path scheduling/I/O headroom without replacing it with a stub.
+const LIFECYCLE_CLEANUP_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(15);
 
 // Completion replies are produced synchronously by the actual attached execution.
 // Unlike flooding the fixture's 32-entry broadcast bus, this reaches the Server's
@@ -289,8 +298,13 @@ async fn browser_method_queue_overflow_fails_fast_and_does_not_pin_session_clean
     );
     assert_eq!(receiver.len(), WORKER_PROTOCOL_METHOD_CAPACITY - 1);
 
+    let session_lock = current_worker_session_lock(&api, &identity);
+    let guard = tokio::time::timeout(PROTOCOL_TEST_TIMEOUT, session_lock.lock())
+        .await
+        .expect("full method queue retained the session guard");
+    drop(guard);
     let stopped = tokio::time::timeout(
-        PROTOCOL_TEST_TIMEOUT,
+        LIFECYCLE_CLEANUP_WATCHDOG,
         worker.stop(
             &WorkerOperationContext::Backend,
             WorkerLifecycleRequest {
@@ -636,6 +650,7 @@ fn assert_bounded_unknown_delivery_close(messages: &[WsMessage]) {
 }
 
 async fn assert_same_worker_reconnect_and_stop(
+    api: &WorkspaceApi,
     worker: &WorkspaceWorker,
     context: &WorkerOperationContext,
 ) {
@@ -649,8 +664,13 @@ async fn assert_same_worker_reconnect_and_stop(
             .expect("same Worker reconnect did not deliver a fresh snapshot"),
         Some(protocol::Event::Snapshot { .. })
     ));
+    let session_lock = current_worker_session_lock(api, worker.identity());
+    let guard = tokio::time::timeout(PROTOCOL_TEST_TIMEOUT, session_lock.lock())
+        .await
+        .expect("terminated transport retained same Worker's session guard");
+    drop(guard);
     let stopped = tokio::time::timeout(
-        PROTOCOL_TEST_TIMEOUT,
+        LIFECYCLE_CLEANUP_WATCHDOG,
         worker.stop(
             &WorkerOperationContext::Backend,
             WorkerLifecycleRequest {
@@ -780,7 +800,7 @@ async fn assert_stalled_browser_output_reclaimed(explicit_termination: bool) {
     // SQLite jobs run on external threads; paused Tokio time cannot observe their
     // progress and may auto-advance a reconnect timeout before SQL completes.
     tokio::time::resume();
-    assert_same_worker_reconnect_and_stop(&worker, &context).await;
+    assert_same_worker_reconnect_and_stop(&api, &worker, &context).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -930,5 +950,5 @@ async fn stalled_remote_bridge_browser_cancel_overflow_reclaims_wire_and_allows_
         ));
     }
     assert!(execution.protocol_methods().is_empty());
-    assert_same_worker_reconnect_and_stop(&worker, &context).await;
+    assert_same_worker_reconnect_and_stop(&api, &worker, &context).await;
 }

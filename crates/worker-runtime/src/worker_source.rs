@@ -1816,10 +1816,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_owned_workspace_client_has_no_fixed_request_timeout() {
-        // This must exceed reqwest::blocking::Client's default 30-second timeout.
-        // A short delay only checks our Option field, not the effective HTTP deadline.
-        let (base_url, server) = delayed_workspace_response(Duration::from_secs(31));
+    fn runtime_owned_workspace_client_returns_successful_response_without_request_timeout() {
+        // Effective deadline clearing is exercised with a short inherited deadline in
+        // workspace_request::tests::blocking_workspace_client_clears_initial_request_timeout.
+        let (base_url, server) = binary_loopback(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".to_vec(),
+        );
         let client =
             RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a");
         assert_eq!(client.request_timeout, None);

@@ -1223,6 +1223,7 @@ pub(super) mod tests {
     }
 
     fn sized_fixture(
+        repo: &Path,
         size: u64,
     ) -> (
         tempfile::TempDir,
@@ -1230,7 +1231,9 @@ pub(super) mod tests {
         WorkingDirectoryBinding,
         BodyWatch,
     ) {
-        let (runtime, materializer, binding) = fixture();
+        let runtime = tempfile::tempdir().unwrap();
+        let materializer = RuntimeGitMaterializer::new(runtime.path());
+        let binding = materializer.create(&request(repo)).unwrap();
         fs::write(binding.root.join(".git/info/exclude"), "target/\n").unwrap();
         fs::create_dir(binding.root.join("target")).unwrap();
         // Entry count remains constant, including .git and many ignored files.
@@ -1256,10 +1259,14 @@ pub(super) mod tests {
     #[test]
     fn actual_cleanup_and_restart_retry_never_open_bodies_when_only_file_sizes_grow() {
         use io_observation::observe;
+        // Vary only file sizes, not Git object names/layout. Separate commits
+        // can have different object-prefix directory counts as timestamps change.
+        // Each case still owns an independent materialized checkout and Runtime.
+        let repo = create_clean_repo();
         for failure in [None, Some(0), Some(10)] {
             let mut small_counts = None;
             for size in [256, 128 * 1024 * 1024] {
-                let (runtime, materializer, binding, mut watch) = sized_fixture(size);
+                let (runtime, materializer, binding, mut watch) = sized_fixture(repo.path(), size);
                 let id = &binding.working_directory.id;
                 let (first, first_io) =
                     observe(failure, || materializer.cleanup_working_directory(id));

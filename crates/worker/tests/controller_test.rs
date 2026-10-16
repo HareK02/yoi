@@ -1017,14 +1017,45 @@ async fn journal_backend_grant_installs_bound_tools_and_seals_saved_finish_befor
             })
             .unwrap();
         let handle = spawn_controller(worker).await;
+        let mut events = handle.subscribe();
+        let submission_request_id = protocol::new_submission_request_id();
         handle
             .send(Method::submit_text(
-                protocol::new_submission_request_id(),
+                submission_request_id.clone(),
                 "Record only admitted public input.",
             ))
             .await
             .unwrap();
-        wait_for_status(&handle, WorkerStatus::Idle).await;
+        // Initial Idle (or the first captured model request) does not prove the
+        // submitted tool loop completed. The exact Submit teardown fence follows
+        // persist_turn, so coverage and the sealed result retry are committed.
+        // This is a deadlock watchdog, not a turn-latency performance assertion.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut saw_run_end = false;
+            loop {
+                match events
+                    .recv()
+                    .await
+                    .expect("Journal controller event stream closed")
+                {
+                    Event::RunEnd { result } => {
+                        assert_eq!(result, protocol::RunResult::Finished);
+                        saw_run_end = true;
+                    }
+                    Event::WorkerState { snapshot }
+                        if saw_run_end
+                            && snapshot.catalog_status() == WorkerStatus::Idle
+                            && snapshot.last_finished_submission_request_id.as_deref()
+                                == Some(submission_request_id.as_str()) =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("Journal Submit did not finish and commit its history");
         let request = wait_for_captured_request(&captured).await;
         let tools = request_tool_names(&request);
         assert_eq!(

@@ -155,8 +155,17 @@ async fn orchestrator_attention_barrier_callers_share_unsent_reservation() {
 
 #[tokio::test]
 async fn orchestrator_attention_input_rechecks_reserved_noop_before_and_after_comparison() {
+    // This handshake holds a reservation across the real guarded Restore path
+    // (including durable intent/config/Runtime writes). Its release deadline is
+    // a deadlock watchdog, not a 5s Restore performance contract: the parallel
+    // normal run exceeded that old bound before it could release the caller.
+    let restore_watchdog = std::time::Duration::from_secs(15);
     for pause_before_comparison in [true, false] {
-        let (_dir, api, execution) = attention_test_api().await;
+        // This case only needs assigned Ticket metadata, not a checkout. Keep
+        // the real API/storage and configured target, but skip Git init/commit.
+        let _dir = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(_dir.path()).await;
+        attention_assign_ticket(&api, "Attention backlog");
         let started = start_attention_test_orchestrator(&api).await;
         let worker = RuntimeWorkerRef::new(
             EMBEDDED_WORKER_RUNTIME_ID,
@@ -192,8 +201,8 @@ async fn orchestrator_attention_input_rechecks_reserved_noop_before_and_after_co
                         if checks == 0 && pause_before_comparison {
                             entered_tx.send(()).unwrap();
                             release_rx
-                                .recv_timeout(std::time::Duration::from_secs(5))
-                                .unwrap();
+                                .recv_timeout(restore_watchdog)
+                                .expect("guarded Restore did not release the reserved no-op");
                         }
                         check_orchestrator_assignment_attention(
                             &api_for_caller,
@@ -210,8 +219,8 @@ async fn orchestrator_attention_input_rechecks_reserved_noop_before_and_after_co
                             );
                             entered_tx.send(()).unwrap();
                             release_rx
-                                .recv_timeout(std::time::Duration::from_secs(5))
-                                .unwrap();
+                                .recv_timeout(restore_watchdog)
+                                .expect("guarded Restore did not release the reserved no-op");
                         }
                         checks += 1;
                         assert!(attention_pending(&api_for_caller).is_empty());
