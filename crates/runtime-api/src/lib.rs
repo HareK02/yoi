@@ -1104,8 +1104,50 @@ pub enum WorkerSessionAvailability {
     },
 }
 
+/// Host-owned Subject release operation. A reservation has no timeout: uncertainty retains
+/// occupancy and mutation exclusion until the same operation is explicitly reconciled.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectReleaseRequest {
+    pub workspace_id: String,
+    pub worker_id: WorkerId,
+    pub binding_id: String,
+    pub operation_id: String,
+    pub action: SubjectReleaseAction,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectReleaseAction {
+    Reserve,
+    Disconnect,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectReleaseState {
+    Reserved,
+    Disconnected,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectReleaseResponse {
+    pub operation_id: String,
+    pub binding_id: String,
+    pub state: SubjectReleaseState,
+}
+
 #[api(reqwest, axum)]
 pub trait RuntimeApi {
+    #[post("/v1/subject-release", status = 200, error_status = 400)]
+    async fn subject_release(
+        &self,
+        #[body] request: SubjectReleaseRequest,
+    ) -> Result<SubjectReleaseResponse, RuntimeApiError>;
+
     #[get("/v1/ping", status = 200, error_status = 400)]
     async fn ping(
         &self,
@@ -1633,6 +1675,13 @@ mod tests {
         ) -> Result<SessionMaterialPinResponse, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn subject_release(
+            &self,
+            _request: SubjectReleaseRequest,
+        ) -> Result<SubjectReleaseResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+
         async fn session_material_release(
             &self,
             _request: SessionMaterialPinRequest,

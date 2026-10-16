@@ -386,6 +386,7 @@ pub fn finish(
             return Ok(serde_json::from_str(&saved)?);
         }
         super::store::job(store, tx, context, true)?;
+        super::binding::require_saved_position(tx, &generation.id)?;
         let last = generation
             .selected_ranges
             .last()

@@ -25,6 +25,8 @@ mod session_capture;
 mod session_history;
 pub mod shared_state;
 mod shutdown_after_idle;
+mod subject_release;
+pub use subject_release::SubjectReleaseReservation;
 pub mod skill;
 pub mod spawn;
 pub mod subjektiv;

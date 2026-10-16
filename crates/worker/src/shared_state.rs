@@ -50,6 +50,7 @@ pub struct WorkerSharedState {
     fs_view: OnceLock<WorkerFsView>,
     feature_invocations: RwLock<crate::feature::FeatureInvocationRegistry>,
     flow_transition_enabled: AtomicBool,
+    pub(crate) subject_release: OnceLock<std::sync::Arc<crate::subject_release::ReleaseControl>>,
 }
 
 impl WorkerSharedState {
@@ -69,6 +70,7 @@ impl WorkerSharedState {
             fs_view: OnceLock::new(),
             feature_invocations: RwLock::new(crate::feature::FeatureInvocationRegistry::default()),
             flow_transition_enabled: AtomicBool::new(false),
+            subject_release: OnceLock::new(),
         }
     }
 

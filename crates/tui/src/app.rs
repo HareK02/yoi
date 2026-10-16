@@ -3034,6 +3034,7 @@ impl App {
             session_store::SystemItem::FeatureInvocationResult { body, .. }
             | session_store::SystemItem::FileAttachment { body, .. }
             | session_store::SystemItem::SkillActivation { body, .. }
+            | session_store::SystemItem::JournalStartup { body, .. }
             | session_store::SystemItem::ResidentSummaryRefresh { body, .. }
             | session_store::SystemItem::SubjectBehaviorRefresh { body, .. }
             | session_store::SystemItem::Interrupt { body, .. } => {

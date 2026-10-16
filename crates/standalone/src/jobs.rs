@@ -66,6 +66,15 @@ struct Executions {
     jobs: HashMap<String, Execution>,
 }
 
+pub(crate) struct QuiescentJobClosure<'a> {
+    executions: std::sync::MutexGuard<'a, Executions>,
+}
+impl QuiescentJobClosure<'_> {
+    pub(crate) fn commit(&mut self) {
+        self.executions.closed = true;
+    }
+}
+
 /// Cloneable Feature-facing access to a Host-owned service. Cloning this handle
 /// neither extends the Host's authority nor permits opening/recovering its store.
 #[derive(Clone)]
@@ -79,6 +88,27 @@ pub struct StandaloneJobs {
 }
 
 impl StandaloneJobs {
+    /// Excludes request/start/result acknowledgement while a Subject Host checks its final
+    /// saved obligations and releases ownership. Accepted results alone are insufficient:
+    /// every spawned execution must have actually finished successful cleanup.
+    pub(crate) fn reserve_quiescent_closure(
+        &self,
+    ) -> Result<QuiescentJobClosure<'_>, JobServiceError> {
+        let executions = self.executions.lock().expect("Job executions poisoned");
+        if executions.closed {
+            return Err(JobServiceError::Closed);
+        }
+        if executions.jobs.values().any(|execution| {
+            !execution.task.is_finished()
+                || !matches!(execution.complete.borrow().as_ref(), Some(Ok(())))
+        }) {
+            return Err(JobServiceError::Cleanup(
+                "delegated Job execution/cleanup remains running or unconfirmed".into(),
+            ));
+        }
+        Ok(QuiescentJobClosure { executions })
+    }
+
     pub(crate) fn open(path: &Path, cwd: PathBuf) -> Result<Self, JobServiceError> {
         Ok(Self {
             store: Arc::new(Mutex::new(Some(JobStore::open(path)?))),

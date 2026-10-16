@@ -23,6 +23,7 @@ http-server = ["dep:axum", "dep:tower", "dep:reqwest"]
 ws-server = ["http-server", "axum/ws", "dep:futures", "tokio/sync"]
 
 [dependencies]
+agen.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 axum = { workspace = true, optional = true }

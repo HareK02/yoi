@@ -141,6 +141,7 @@ pub(super) fn check_host(
             return Err(JournalError::PermissionDenied("Subject is retired".into()));
         }
         check_session_host(store, tx, host)?;
+        super::binding::check_writer(tx, host)?;
     }
     Ok(())
 }
@@ -373,7 +374,10 @@ pub(super) fn job(
     ctx: &JournalJobContext,
     active: bool,
 ) -> JournalResult<JournalGeneration> {
-    check_host(store, tx, &ctx.host, true)?;
+    // Recovery can inspect the original generation and exact saved receipts after release;
+    // only a new mutation requires the still-current writer lifetime.
+    check_host(store, tx, &ctx.host, active)?;
+    check_session_host(store, tx, &ctx.host)?;
     let (g, is_active) = generation(tx, &ctx.host, &ctx.generation_id)?;
     if g.job != ctx.binding {
         return Err(JournalError::PermissionDenied(
@@ -629,6 +633,13 @@ impl SubjektivStore {
             if operation.expected_state!=j.state_token {return Err(conflict("stored Journal content changed; reread before applying"));}
             in_snapshot(&g,&operation.covered_ranges)?;
             if !operation.covered_ranges.is_empty() {check_ranges(tx,&j,&operation.covered_ranges,true)?;}
+            // A fully checkpointed selection has no pending source to recover another
+            // activity write if the Job subsequently fails. Receipts and position repair
+            // remain available, but new activity belongs to the next selected prefix.
+            if matches!(operation.action, JournalAction::Create {..}|JournalAction::Rewrite {..}|JournalAction::Fix {..}|JournalAction::ConfirmUnchanged)
+                && (j.process_order,j.process_byte)==prefix(&g.initial_journal,&g.selected_ranges)? {
+                return Err(conflict("generation activity is already fully checkpointed; finish this Job before recording new input"));
+            }
             let mut entry_id=None;
             match &operation.action {
                 JournalAction::Create {title,body,ongoing,state,source_end,correction_refs}=> {
@@ -680,6 +691,9 @@ impl SubjektivStore {
                         if !contains(&merged,r.bytes) {return Err(invalid("checkpoint has input with no durable record correspondence"));}
                         tx.execute("UPDATE journal_sources SET reflected_bytes=?3 WHERE journal_id=?1 AND source_order=?2",params![j.id,r.source.order,r.bytes.end])?;
                     }
+                    // Advancing reflection without position would strand a terminal failed
+                    // Job: source selection would see no pending bytes to repair that memo.
+                    super::binding::require_saved_position(tx,&g.id)?;
                     j.process_order=order;j.process_byte=byte;
                 }
             }

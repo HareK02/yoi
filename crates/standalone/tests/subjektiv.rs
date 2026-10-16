@@ -1,5 +1,7 @@
-//! T-709: real standalone Hosts and test-owned processes, with scripted models.
-//! These tests do not create a Workspace or contact a model provider.
+//! Integration of real standalone Subject lifecycle, dialog, Journal and Memory services.
+//! Only model streams are scripted; temporary storage and test-owned subprocesses isolate
+//! persistence and kernel leases. Run with `cargo test -p standalone --test subjektiv`.
+//! No Workspace or live model provider is used; this is not a continuity meaning evaluation.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
@@ -354,17 +356,16 @@ impl LlmClient for ScriptedClient {
         request: Request,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
     {
-        // This suite observes Memory and dialog requests. Journal's independent model
-        // boundary fails explicitly rather than consuming their script or using live transport;
-        // the Journal adapter suite exercises its successful sequential tool execution.
+        // Journal is a separate scripted model boundary. Successful production recording
+        // is required before these Memory scenarios may hand the Subject to a new body.
         if request
             .tools
             .iter()
             .any(|tool| tool.name == "ReadJournalState")
         {
-            return Err(ClientError::Config(
-                "Journal model is outside this Memory suite".into(),
-            ));
+            return Ok(Box::pin(stream::iter(
+                journal_response(&request).into_iter().map(Ok),
+            )));
         }
         // Lifecycle-triggered consolidation uses a separate Internal Worker. It
         // must not consume the dialog script or silently become a live request.
@@ -421,6 +422,134 @@ impl LlmClient for ScriptedClient {
     fn clone_boxed(&self) -> Box<dyn LlmClient> {
         Box::new(self.clone())
     }
+}
+
+// The outer model script is not a continuity meaning evaluation. Persistence, complete
+// source delivery and the handoff gate remain the production implementations.
+fn journal_response(request: &Request) -> Vec<LlmEvent> {
+    let result = |id: &str| -> Option<Value> {
+        request.items.iter().find_map(|item| match item {
+            Item::ToolResult {
+                call_id,
+                content,
+                is_error,
+                summary,
+                ..
+            } if call_id == id => {
+                assert!(!is_error, "{id}: {summary}; {content:?}");
+                Some(
+                    content
+                        .as_deref()
+                        .map(|v| serde_json::from_str(v).unwrap())
+                        .unwrap_or(Value::Null),
+                )
+            }
+            _ => None,
+        })
+    };
+    if result("journal-submit").is_some() {
+        return prose();
+    }
+    if result("journal-checkpoint").is_some() {
+        return tool("journal-submit", "SubmitJobResult", json!({"result":{}}));
+    }
+    let Some(state) = result("journal-state") else {
+        return tool("journal-state", "ReadJournalState", json!({}));
+    };
+    let state = &state["value"];
+    let generation = state["generation_id"].as_str().unwrap();
+    if let Some(position) = result("journal-position") {
+        return tool(
+            "journal-checkpoint",
+            "CheckpointJournal",
+            json!({
+                "request_id":format!("checkpoint:{generation}"), "expected_state":position["value"]["state_token"],
+                "action":{"action":"checkpoint","record_operation_ids":[format!("record:{generation}")]},
+                "covered_ranges":state["selected_ranges"]
+            }),
+        );
+    }
+    if let Some(record) = result("journal-record") {
+        return tool(
+            "journal-position",
+            "UpdateJournalPosition",
+            json!({
+                "request_id":format!("position:{generation}"), "expected_state":record["value"]["state_token"],
+                "action":{"action":"update_position","current_position":"Memory scenario recorded; represented work may remain unfinished"}, "covered_ranges":[]
+            }),
+        );
+    }
+    for (index, range) in state["selected_ranges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let mut offset = range["bytes"]["start"].as_u64().unwrap();
+        let mut token = Value::Null;
+        loop {
+            let id = format!("journal-source-{index}-{offset}");
+            match result(&id) {
+                Some(page) => match page["value"]["next_byte"].as_u64() {
+                    Some(next) => {
+                        assert!(next > offset);
+                        offset = next;
+                        token = page["value"]["content_token"].clone();
+                    }
+                    None => break,
+                },
+                None => {
+                    return tool(
+                        &id,
+                        "ReadJournalText",
+                        json!({
+                            "target":{"target":"source","pointer":range["source"]["pointer"]},
+                            "offset":offset,"limit":subjektiv::journal::MAX_JOURNAL_READ_BYTES,"content_token":token
+                        }),
+                    );
+                }
+            }
+        }
+    }
+    let (name, action) = if state["current_open"].is_null() {
+        (
+            "CreateJournalEntry",
+            json!({"action":"create","title":"Memory conversation","body":"Conversation recorded by the scripted model fixture","ongoing":"Unfinished work is not declared complete","state":"open","source_end":null,"correction_refs":[]}),
+        )
+    } else {
+        (
+            "RewriteJournalEntry",
+            json!({"action":"rewrite","entry_id":state["current_open"]["id"],"title":"Memory conversation","body":"Further conversation recorded by the scripted model fixture","ongoing":"Unfinished work is not declared complete"}),
+        )
+    };
+    tool(
+        "journal-record",
+        name,
+        json!({
+            "request_id":format!("record:{generation}"), "expected_state":state["current_journal"]["state_token"],
+            "action":action,"covered_ranges":state["selected_ranges"]
+        }),
+    )
+}
+
+async fn disconnect_recorded(host: &mut StandaloneHost) {
+    let mut last_error = None;
+    let completed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match host.disconnect_subject().await {
+                Ok(()) => return,
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        completed.is_ok(),
+        "actual Idle/Journal completion is required before Memory scenario handoff: {last_error:?}"
+    );
 }
 
 fn prose() -> Vec<LlmEvent> {
@@ -762,7 +891,7 @@ async fn explicit_remember_is_committed_staging_and_sessions_follow_subject_acro
         tool("query-restored", "SubjektivMemoryQuery", json!({})),
         prose(),
     ]);
-    let restored =
+    let mut restored =
         StandaloneHost::restore_with_model_client(state.clone(), worker_id, restored_model.clone())
             .await
             .unwrap();
@@ -773,6 +902,7 @@ async fn explicit_remember_is_committed_staging_and_sessions_follow_subject_acro
     assert!(results["recall"].to_string().contains(claim));
     assert_eq!(results["query-restored"]["items"], json!([]));
     assert!(format!("{:?}", restored_model.requests()[0].items).contains("Remember this lesson"));
+    disconnect_recorded(&mut restored).await;
     restored.shutdown().await.unwrap();
 
     let second_model = ScriptedClient::new(vec![
@@ -992,7 +1122,7 @@ async fn kernel_subject_lease_excludes_other_processes_and_recovers_after_abnorm
     let independent = catalog.create("independent", None).unwrap();
     drop(catalog);
     let ready = temp.path().join("ready");
-    let parent = StandaloneHost::start_with_model_client(
+    let mut parent = StandaloneHost::start_with_model_client(
         launch(&parent_cwd, &state, &subject.id, "parent-owner"),
         ScriptedClient::new(Vec::new()),
     )
@@ -1014,6 +1144,7 @@ async fn kernel_subject_lease_excludes_other_processes_and_recovers_after_abnorm
     .await
     .unwrap();
     independent_host.shutdown().await.unwrap();
+    disconnect_recorded(&mut parent).await;
     parent.shutdown().await.unwrap();
 
     let mut owner = OwnedChild(
@@ -1082,7 +1213,7 @@ async fn automatic_generic_consolidation_applies_candidate_publishes_surface_and
     drop(catalog);
     let claim = "Validate the immutable result before reporting success";
     let model = ScriptedClient::consolidating(remember_script(claim), false);
-    let host = StandaloneHost::start_with_model_client(
+    let mut host = StandaloneHost::start_with_model_client(
         launch(temp.path(), &state, &subject.id, "consolidation-body"),
         model.clone(),
     )
@@ -1157,6 +1288,7 @@ async fn automatic_generic_consolidation_applies_candidate_publishes_surface_and
             .exists(),
         "selected Subject owns the shared generic Job ledger"
     );
+    disconnect_recorded(&mut host).await;
     host.shutdown().await.unwrap();
     let memory = inspect_store(&state, |store| {
         assert!(
@@ -1236,7 +1368,7 @@ async fn transport_loss_after_candidate_apply_preserves_memory_and_later_job_onl
     drop(catalog);
     let claim = "Candidate receipts survive transport failure";
     let losing = ScriptedClient::consolidating(remember_script(claim), true);
-    let host = StandaloneHost::start_with_model_client(
+    let mut host = StandaloneHost::start_with_model_client(
         launch(temp.path(), &state, &subject.id, "losing-body"),
         losing.clone(),
     )
@@ -1261,6 +1393,7 @@ async fn transport_loss_after_candidate_apply_preserves_memory_and_later_job_onl
         failed.result.is_none(),
         "partial apply is not an accepted Job result"
     );
+    disconnect_recorded(&mut host).await;
     host.shutdown().await.unwrap();
     let original = inspect_store(&state, |store| {
         assert!(
