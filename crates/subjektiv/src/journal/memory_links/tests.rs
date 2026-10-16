@@ -405,6 +405,64 @@ fn original_source_metadata_failure_keeps_saved_journal_readable_and_does_not_cl
 }
 
 #[test]
+fn legacy_segment_entry_links_reuse_saved_session_for_presence_without_mutating_provenance() {
+    let mut f = Fixture::new();
+    let mut candidate = f.candidate("legacy-presence", &[0, 1]);
+    for source in &mut candidate.source_refs {
+        source.session_id = None;
+    }
+    let candidate = f.store().stage_candidate(candidate).unwrap();
+    let selector = f.apply(&candidate);
+    let entry = f.fixed("first", 1, vec![]);
+    f.links(&selector, true);
+    let before = f.snapshot();
+    f.reopen();
+    for request in [
+        MemoryJournalRequest::Links {
+            selector: selector.clone(),
+        },
+        MemoryJournalRequest::Read {
+            selector: selector.clone(),
+            source_index: 1,
+            journal_id: f.journal_id.clone(),
+            entry_id: entry.clone(),
+            expected_token: None,
+            byte_offset: 0,
+            max_bytes: 4096,
+        },
+    ] {
+        let mut calls = Vec::new();
+        let response = f
+            .store()
+            .execute_memory_journal_with_source_presence(&f.host, request, |session| {
+                calls.push(session.to_owned());
+                Some(false)
+            })
+            .unwrap();
+        assert_eq!(calls, ["session"]);
+        match response {
+            MemoryJournalResponse::Links(page) => {
+                assert_eq!(page.sources.len(), 2);
+                assert!(
+                    page.sources
+                        .iter()
+                        .all(|s| s.original_source == OriginalSourceAvailability::Missing)
+                );
+            }
+            MemoryJournalResponse::Read(read) => {
+                assert_eq!(
+                    read.source.original_source,
+                    OriginalSourceAvailability::Missing
+                );
+                assert_eq!(read.page.unwrap().text, "Journal context for first");
+            }
+            _ => panic!("saved provenance result required"),
+        }
+        assert_eq!(f.snapshot(), before);
+    }
+}
+
+#[test]
 fn multiple_segment_anchors_map_to_fixed_intervals_and_subject_crossing_is_denied() {
     let f = Fixture::new();
     let selector = f.apply(&f.stage("multi", &[0, 1, 2, 3]));

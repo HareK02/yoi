@@ -7,6 +7,7 @@ use super::memory_links::{
     MemoryJournalRequest, MemoryJournalResponse, OriginalSourceAvailability,
 };
 use super::{JournalHostContext, JournalResult, SubjektivStore};
+use rusqlite::{OptionalExtension, params};
 
 impl SubjektivStore {
     /// Executes the saved-reference operation first, then annotates original-source absence using
@@ -39,7 +40,20 @@ impl SubjektivStore {
                 let source = candidate
                     .as_ref()
                     .and_then(|c| c.source_refs.get(link.source_index));
-                let session = source.and_then(|s| s.session_id.as_deref());
+                // Legacy anchors may lack a Session ID. A connected edge already resolved it
+                // from immutable attribution and stable Segment/entry identity; reuse that saved
+                // identity rather than fetching history or modifying the original candidate.
+                let saved_session: Option<String> = self.database.try_with_connection(|tx| {
+                    Ok::<_, super::JournalError>(tx.query_row(
+                        "SELECT source_session_id FROM memory_journal_links
+                         WHERE subject_id=?1 AND candidate_id=?2 AND source_index=?3 AND reason='linked'",
+                        params![host.subject_id, selector.candidate_id, link.source_index],
+                        |row| row.get(0),
+                    ).optional()?)
+                })?;
+                let session = saved_session
+                    .as_deref()
+                    .or_else(|| source.and_then(|s| s.session_id.as_deref()));
                 let observed = if let Some(session) = session {
                     if let Some(value) = observations.get(session) {
                         *value
