@@ -10,6 +10,7 @@ pub use crate::feature::builtin::memory_surface_lifecycle::SubjektivSurfaceLifec
 pub use crate::feature::builtin::journal::{
     JournalJobFinalizer, JournalJobHost, JournalJobToolsFeature, JournalRecordingFeature,
 };
+pub use subjektiv::journal::memory_links::{MemoryJournalRequest, MemoryJournalResponse};
 pub use subjektiv::journal::transport;
 use transport::{JournalRecordingReason, JournalRecordingRequest, JournalRecordingResponse};
 
@@ -77,6 +78,17 @@ pub trait SubjektivHost: Send + Sync + 'static {
     ) -> Result<JournalRecordingResponse, SubjektivHostError> {
         Err(SubjektivHostError::Unavailable(
             "Journal recording not granted".into(),
+        ))
+    }
+    /// Additive provenance links and direct Journal reads, separate from recording/Memory mutation.
+    /// Restricted Job Hosts inherit denial rather than the main Subject reader capability.
+    fn memory_journal(
+        &self,
+        _context: &SubjektivHostContext,
+        _request: MemoryJournalRequest,
+    ) -> Result<MemoryJournalResponse, SubjektivHostError> {
+        Err(SubjektivHostError::Unavailable(
+            "Memory Journal references not granted".into(),
         ))
     }
     /// Separate explicit grant for decision/surface execution; Profile policy
@@ -207,6 +219,22 @@ fn decode<T: serde::de::DeserializeOwned>(
 }
 
 impl SubjektivHost for BackendSubjektivHost {
+    fn memory_journal(
+        &self,
+        _context: &SubjektivHostContext,
+        request: MemoryJournalRequest,
+    ) -> Result<MemoryJournalResponse, SubjektivHostError> {
+        decode(
+            self.client
+                .execute(WorkspaceRequest::json(
+                    WorkspaceRequestMethod::Post,
+                    format!("/api/w/{}/subjektiv/journal/memory", self.workspace_id),
+                    serde_json::to_string(&request)
+                        .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?,
+                ))
+                .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?,
+        )
+    }
     fn journal_recording_granted(&self) -> bool {
         // This adapter exists only for explicitly enabled, authenticated Host connections.
         // The Backend still verifies the main Worker/Subject binding on every request.
@@ -437,6 +465,12 @@ impl SubjektivHostConnection {
             ));
         }
         Ok(Self { host, context })
+    }
+    pub fn memory_journal(
+        &self,
+        request: MemoryJournalRequest,
+    ) -> Result<MemoryJournalResponse, SubjektivHostError> {
+        self.host.memory_journal(&self.context, request)
     }
     pub fn memory(
         &self,

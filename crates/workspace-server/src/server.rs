@@ -28,6 +28,7 @@ use subjektiv::api::*;
 mod backend_job_profile;
 mod subjektiv_job;
 mod subjektiv_journal;
+mod subjektiv_memory_journal;
 mod worker_operations;
 mod worker_protocol;
 pub(crate) use worker_operations::{
@@ -13123,6 +13124,7 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         post(scoped_submit_backend_job_result),
     )
     .route("/api/w/{workspace_id}/subjektiv/journal/recording", post(subjektiv_journal::recording_route))
+    .route("/api/w/{workspace_id}/subjektiv/journal/memory", post(subjektiv_memory_journal::route))
     .route("/api/w/{workspace_id}/subjektiv/journal/job", post(subjektiv_journal::job_route))
     .route("/api/w/{workspace_id}/subjektiv/journal/job/finish", post(subjektiv_journal::finish_route))
     .fallback(get(static_or_spa_fallback))
@@ -36928,6 +36930,7 @@ mod tests {
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod subjektiv_journal_tests;
+    mod subjektiv_memory_journal_tests;
     mod ticket_evidence_tests;
     mod ticket_worker_claim_tests;
     mod ticket_worker_launch_tests;

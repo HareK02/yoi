@@ -1,5 +1,14 @@
 [
   {
+    "path": "crates/subjektiv/src/journal/memory_links/tests.rs",
+    "kind": "saved_data",
+    "reason": "最古対応v1 schemaの保存済Subject JSONとSQLをそのまま作成し、最新migrationが元出典を保持する検証に必要な固定綴り。現行writerや状態判断には使わない。",
+    "lines": [
+      { "sha256": "e30d8ddbb500aa10a4a23c52a1f34abbf1b6a8f3692501bb3b74084b63db911c", "count": 1 },
+      { "sha256": "ed4d9edc0c05bf5ab788da52e8b1e44f4543c57d13b9a002144dbdc4430b5837", "count": 1 }
+    ]
+  },
+  {
     "path": "crates/manifest/src/lib.rs",
     "kind": "saved_data",
     "reason": "read_persisted_worker_manifest_snapshot の無version・schema 2/3 readerが旧Memory設定keyを検証してschema 4へ変換するための綴りとそのfixture。削除するとWorkspace identity・language・実行設定を持つ既存Worker manifestを復元できず、部分設定やmixed authorityの拒否検証も失う。現行manifestのwriterは旧keyを出さない。",

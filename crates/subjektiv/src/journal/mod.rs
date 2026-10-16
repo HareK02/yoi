@@ -38,9 +38,11 @@
 //! traversing already reflected pages. Receipt/entry keysets remain append-stable.
 
 mod lifecycle;
+pub mod memory_links;
 pub(crate) use lifecycle::migrate as migrate_lifecycle;
 pub mod recording;
 pub mod service;
+mod source_status;
 mod store;
 #[cfg(test)]
 mod tests;

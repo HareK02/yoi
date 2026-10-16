@@ -233,7 +233,7 @@ pub(crate) fn prepare_worker_deletion(
         .map_err(|error| crate::store::StandaloneStoreError::JournalRetention(error.to_string()))
 }
 
-fn journal_error(error: JournalError) -> SubjektivHostError {
+pub(super) fn journal_error(error: JournalError) -> SubjektivHostError {
     match error {
         JournalError::Conflict(message) => SubjektivHostError::Conflict {
             code: "journal_conflict".into(),

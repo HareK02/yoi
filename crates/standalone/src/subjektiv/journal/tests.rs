@@ -8,6 +8,7 @@ use session_store::{Store, WorkerMetadataStore};
 use std::sync::atomic::AtomicBool;
 
 mod compaction;
+mod memory_links;
 
 struct Fixture {
     _temp: tempfile::TempDir,

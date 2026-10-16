@@ -698,6 +698,30 @@ impl LocalSubjectHost {
     }
 }
 impl SubjektivHost for LocalSubjectHost {
+    fn memory_journal(
+        &self,
+        context: &SubjektivHostContext,
+        request: subjektiv::journal::memory_links::MemoryJournalRequest,
+    ) -> Result<subjektiv::journal::memory_links::MemoryJournalResponse, SubjektivHostError> {
+        self.body(context)?;
+        let reader = subjektiv::journal::JournalHostContext::validated_reader(
+            &self.catalog.store,
+            &self.binding.subject_id,
+        )
+        .map_err(journal::journal_error)?;
+        self.catalog
+            .store
+            .execute_memory_journal_with_source_presence(&reader, request, |session| {
+                crate::subjektiv_sessions::original_session_presence(
+                    &self.catalog.state_root,
+                    &self.binding.scope_id,
+                    &self.binding.subject_id,
+                    &self.catalog.store,
+                    session,
+                )
+            })
+            .map_err(journal::journal_error)
+    }
     fn journal_recording_granted(&self) -> bool {
         self.live.load(Ordering::Acquire)
     }
