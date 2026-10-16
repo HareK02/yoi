@@ -747,7 +747,7 @@ mod tests {
             WorkspaceRecord,
         };
         let store = std::sync::Arc::new(
-            SqliteWorkspaceStore::in_memory_for_test()
+            SqliteWorkspaceStore::in_memory_fixture()
                 .unwrap()
                 .with_db_executor(crate::db_executor::DbExecutor::new(Default::default()).unwrap()),
         );

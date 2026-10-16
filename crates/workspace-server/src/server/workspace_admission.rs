@@ -52,6 +52,28 @@ impl WorkspaceAdmission {
         })
     }
 
+    // Observe parent cleanup without releasing a callback held by the test.
+    // A reply can arrive before the DB/Host job drops its retained request lease.
+    #[cfg(test)]
+    pub(super) async fn wait_for_parent_requests_to_drain(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.state.lock().expect("Workspace admission poisoned");
+                assert!(
+                    state.deleting,
+                    "parent drain observation requires a deletion fence"
+                );
+                if state.requests == 0 {
+                    return;
+                }
+            }
+            changed.await;
+        }
+    }
+
     pub(super) async fn lock_deletion(self: &Arc<Self>) -> DeletionLease {
         let serial = self.deletion.clone().lock_owned().await;
         self.state
@@ -133,5 +155,45 @@ impl Drop for DeletionLease {
             .lock()
             .expect("Workspace admission poisoned")
             .deleting = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db_executor::DbOperationLifetime;
+
+    #[tokio::test]
+    async fn parent_drain_waits_for_retained_job_cleanup_without_waiting_for_callbacks() {
+        let gate = Arc::new(WorkspaceAdmission::default());
+        let parent = gate.admit(false).unwrap();
+        let retained_job = parent.retain();
+        let mut deletion = Box::pin(gate.lock_deletion());
+        assert!(futures::poll!(&mut deletion).is_pending());
+        let callback = gate.admit(true).unwrap();
+        drop(parent);
+        let mut parents_drained = Box::pin(gate.wait_for_parent_requests_to_drain());
+        assert!(futures::poll!(&mut parents_drained).is_pending());
+        assert!(
+            gate.admit(true).is_some(),
+            "retained parent may still need callbacks"
+        );
+        drop(retained_job);
+        tokio::time::timeout(std::time::Duration::from_secs(5), parents_drained)
+            .await
+            .expect("parent cleanup did not notify the drain observer");
+        assert!(gate.admit(true).is_none());
+        assert!(gate.admit(false).is_none());
+        assert!(
+            futures::poll!(&mut deletion).is_pending(),
+            "callback still owns its lease"
+        );
+        drop(callback);
+        let deletion = tokio::time::timeout(std::time::Duration::from_secs(5), deletion)
+            .await
+            .expect("callback cleanup did not finish deletion drain");
+        assert!(gate.admit(true).is_none());
+        drop(deletion);
+        assert!(gate.admit(false).is_some());
     }
 }

@@ -286,6 +286,94 @@ pub(crate) fn render_result(acceptance: &BackendJobResultAcceptance) -> Result<S
     Ok(content)
 }
 
+// Supplied model outputs exercise host validation/rendering, not LLM judgment.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) struct FakeTicketCheckerModel;
+
+    impl FakeTicketCheckerModel {
+        pub(crate) fn respond(request: &BackendJobRequest) -> Value {
+            let input = parse_input(&request.input).unwrap();
+            assert!(request.instruction.contains("writer_scope"));
+            assert!(request.instruction.contains("internal_inconsistency"));
+            assert!(request.instruction.contains("ambiguous_boundary"));
+            assert!(
+                request
+                    .instruction
+                    .contains("Production deployment requires approval")
+            );
+            assert!(request.instruction.contains("background, quotations"));
+            if input
+                .body
+                .contains("This time I only create the Ticket; I will not implement it.")
+                && !input.body.starts_with("Background bug example:")
+            {
+                serde_json::json!({"findings": [{
+                    "category": "writer_scope",
+                    "quote": "I will not implement it",
+                    "reason": "The active requirement records the writer's own implementation boundary.",
+                    "suggestion": "Remove the writer-specific action boundary."
+                }]})
+            } else if input.body.contains("The rollout region is undecided.")
+                && input.body.contains("The rollout region is us-east-1.")
+            {
+                serde_json::json!({"findings": [{
+                    "category": "internal_inconsistency",
+                    "quote": "The rollout region is undecided.",
+                    "reason": "The same active text also settles the rollout region as us-east-1.",
+                    "suggestion": "Choose either the unresolved or settled rollout-region statement."
+                }]})
+            } else if input.body == "Implementation stops after Ticket creation." {
+                serde_json::json!({"findings": [{
+                    "category": "ambiguous_boundary",
+                    "quote": "Implementation stops after Ticket creation.",
+                    "reason": "The text alone does not establish whether this is a delivery constraint or the writer's current action boundary.",
+                    "suggestion": "Confirm whether this limits the product workflow or only the current writer."
+                }]})
+            } else {
+                serde_json::json!({"findings": []})
+            }
+        }
+    }
+
+    pub(crate) struct Case {
+        pub(crate) name: &'static str,
+        pub(crate) body: &'static str,
+        pub(crate) advisory_quote: Option<&'static str>,
+    }
+    pub(crate) fn cases() -> Vec<Case> {
+        vec![
+            Case {
+                name: "writer-scope-positive",
+                body: "This time I only create the Ticket; I will not implement it.",
+                advisory_quote: Some("I will not implement it"),
+            },
+            Case {
+                name: "production-approval-negative",
+                body: "Production deployment requires approval.",
+                advisory_quote: None,
+            },
+            Case {
+                name: "quoted-background-negative",
+                body: "Background bug example: a generated Ticket once said “I will not implement it.” Do not reproduce that sentence in generated requirements.",
+                advisory_quote: None,
+            },
+            Case {
+                name: "unresolved-versus-settled-positive",
+                body: "The rollout region is undecided. The rollout region is us-east-1.",
+                advisory_quote: Some("The rollout region is undecided."),
+            },
+            Case {
+                name: "ambiguous-boundary-confirmation",
+                body: "Implementation stops after Ticket creation.",
+                advisory_quote: Some("Implementation stops after Ticket creation."),
+            },
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,16 +389,144 @@ mod tests {
         })
     }
 
+    fn ticket_fixture() -> ticket::Ticket {
+        ticket::Ticket {
+            meta: ticket::TicketMeta {
+                id: "ticket-internal".into(),
+                resource_key: Some("T-42".into()),
+                slug: "check-this-content".into(),
+                title: "Check this content".into(),
+                status: ticket::ExtensibleTicketStatus::Open,
+                kind: "task".into(),
+                priority: "P2".into(),
+                labels: vec![],
+                created_at: None,
+                created_by: None,
+                updated_at: None,
+                assignee: None,
+                readiness: None,
+                risk_flags: vec![],
+                workflow_state: ticket::TicketState::Open,
+                workflow_state_explicit: true,
+                queued_by: None,
+                queued_at: None,
+                targets: vec![],
+                raw: Default::default(),
+            },
+            document: ticket::TicketDocument {
+                body: ticket::MarkdownText::new("Check the saved content."),
+                raw_frontmatter: Default::default(),
+            },
+            tags: vec![],
+            events: vec![],
+            artifacts: vec![],
+            relations: Default::default(),
+            resolution: None,
+            closure_operation_key: None,
+            current_closure: None,
+            case_history: vec![],
+            legacy_workflow_snapshot: None,
+        }
+    }
+
+    fn completed_acceptance(
+        request: BackendJobRequest,
+        result: Value,
+    ) -> BackendJobResultAcceptance {
+        use crate::backend_job::{
+            BackendJobAttemptRecord, BackendJobAttemptState, BackendJobRecord, BackendJobState,
+        };
+        let digest = crate::backend_job::result_digest(&result, request.limits.max_result_bytes)
+            .unwrap()
+            .0;
+        let attempt = BackendJobAttemptRecord {
+            workspace_id: "checker-unit".into(),
+            job_id: request.job_id.clone(),
+            attempt_id: "checker-attempt".into(),
+            attempt: 1,
+            input_digest: request.input_digest().unwrap(),
+            state: BackendJobAttemptState::Completed,
+            worker: Some(RuntimeWorkerRef::new("runtime", "checker")),
+            runtime_run_id: Some("run".into()),
+            dispatched_at: Some("1".into()),
+            deadline_at: "3".into(),
+            result: Some(result.clone()),
+            result_digest: Some(digest.clone()),
+            failure_category: None,
+            failure_detail: None,
+            worker_cleanup_state: None,
+            worker_cleanup_failure_category: None,
+            worker_cleanup_failure_detail: None,
+            worker_cleanup_updated_at: None,
+            worker_cleanup_completed_at: None,
+            created_at: "1".into(),
+            updated_at: "2".into(),
+            completed_at: Some("2".into()),
+        };
+        BackendJobResultAcceptance {
+            job: BackendJobRecord {
+                workspace_id: "checker-unit".into(),
+                intent_fingerprint: request.fingerprint().unwrap(),
+                request,
+                state: BackendJobState::Completed,
+                current_attempt: 1,
+                result: Some(result),
+                result_digest: Some(digest),
+                failure_category: None,
+                failure_detail: None,
+                created_at: "1".into(),
+                updated_at: "2".into(),
+                completed_at: Some("2".into()),
+            },
+            attempt,
+            replayed: false,
+        }
+    }
+
+    #[test]
+    fn supplied_model_classifications_validate_and_render_advisories_or_no_findings() {
+        let instruction = worker::PromptCatalog::builtins_only()
+            .unwrap()
+            .ticket_item_checker()
+            .unwrap();
+        for case in test_support::cases() {
+            let mut ticket = ticket_fixture();
+            ticket.meta.title = format!("Boundary case: {}", case.name);
+            ticket.document.body = ticket::MarkdownText::new(case.body);
+            let request = request(
+                &ticket,
+                TicketItemCheckEdit::Create,
+                RuntimeWorkerRef::new("runtime", "source"),
+                instruction.clone(),
+            )
+            .unwrap();
+            let result = test_support::FakeTicketCheckerModel::respond(&request);
+            let checked = validate_result(&request.input, &result).unwrap();
+            let acceptance = completed_acceptance(request, result);
+            match (
+                case.advisory_quote,
+                result_facts(&acceptance, &ticket).unwrap(),
+            ) {
+                (Some(quote), TicketItemCheckFacts::Findings(advisory)) => {
+                    assert_eq!(checked.findings.len(), 1, "{}", case.name);
+                    assert!(
+                        advisory.contains("[Ticket item checker advisory]"),
+                        "{}",
+                        case.name
+                    );
+                    assert!(advisory.contains(quote), "{}", case.name);
+                }
+                (None, TicketItemCheckFacts::NoFindings) => {
+                    assert!(checked.findings.is_empty(), "{}", case.name);
+                }
+                (_, actual) => panic!("{}: unexpected classification {actual:?}", case.name),
+            }
+        }
+    }
+
     #[test]
     fn checker_job_identity_reuses_exact_intent_but_separates_edits_and_sources() {
-        use ticket::TicketBackend;
-
-        let dir = tempfile::tempdir().unwrap();
-        let backend =
-            ticket::SqliteTicketBackend::open(dir.path().join("tickets.db"), "space").unwrap();
-        let (_, ticket) = backend
-            .create_with_snapshot(ticket::NewTicket::new("Check this content"))
-            .unwrap();
+        let ticket = ticket_fixture();
         let source = RuntimeWorkerRef {
             runtime_id: "runtime".into(),
             worker_id: "source".into(),

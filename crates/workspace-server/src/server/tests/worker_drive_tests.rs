@@ -730,13 +730,31 @@ async fn unsafe_names_and_oversized_text_cannot_publish_and_reads_truncate_at_ut
 #[tokio::test]
 async fn omitted_discovery_limits_use_backend_maximum_pages_in_tools_and_native_wip() {
     let f = Fixture::new(["read_write", "read_only"]).await;
-    let mut expected = std::collections::BTreeSet::new();
-    for index in 0..201 {
-        let created = f
-            .create(&format!("default-page-{index:03}.md"), "bounded")
-            .await;
-        expected.insert(entry(&created)["node_id"].as_str().unwrap().to_owned());
-    }
+    // This case owns discovery defaults, not repeated mutation routing. Seed through
+    // the real Drive owner (including blobs/receipts); reads below retain signed tools/WIP.
+    let drive = f.api.drive().await.unwrap();
+    let expected = tokio::task::spawn_blocking(move || {
+        let root = drive.root().unwrap().id;
+        let mut expected = std::collections::BTreeSet::new();
+        for index in 0..201 {
+            let created = drive
+                .mutate(
+                    &format!("default-page-seed-{index:03}"),
+                    "pagination-fixture",
+                    workspace_drive::Mutation::CreateFile {
+                        parent: root,
+                        name: format!("default-page-{index:03}.md"),
+                        content_type: "text/markdown".into(),
+                        bytes: b"bounded".to_vec(),
+                    },
+                )
+                .unwrap();
+            expected.insert(String::from(created.node.id));
+        }
+        expected
+    })
+    .await
+    .unwrap();
     let native = native_tools(&f.features[1]);
     let root = value(
         native_tool(&native, "Inspect", json!({"path":"/drive","refresh":true}))

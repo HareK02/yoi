@@ -6681,7 +6681,7 @@ mod tests {
         })
         .unwrap();
         let store = Arc::new(
-            SqliteWorkspaceStore::in_memory_for_test()
+            SqliteWorkspaceStore::in_memory_fixture()
                 .unwrap()
                 .with_db_executor(executor.clone()),
         );

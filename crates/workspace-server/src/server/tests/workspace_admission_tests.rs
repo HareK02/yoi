@@ -401,6 +401,11 @@ async fn deletion_fences_new_requests_then_drains_without_callback_starvation() 
     let callback = gate.admit(true).expect("parent may still need callback");
     reply.send(Ok(read_result())).unwrap();
     assert_json(long.await.unwrap(), StatusCode::OK).await;
+    // HTTP completion may precede cleanup of retained DB/Host request leases.
+    // Keep the callback alive while observing the real parent-drain condition.
+    tokio::time::timeout(BOUND, gate.wait_for_parent_requests_to_drain())
+        .await
+        .expect("completed HTTP request retained its admission through the drain deadline");
     // No new callbacks may prolong the drain once all parents have left.
     assert!(gate.admit(true).is_none());
     assert!(futures::poll!(&mut deletion).is_pending());

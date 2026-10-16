@@ -939,7 +939,7 @@ mod tests {
     }
 
     async fn seeded_store() -> (SqliteWorkspaceStore, WorkdirRegistryRecord) {
-        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
         store
             .upsert_account(&AccountRecord {
                 account_id: "account-a".to_string(),

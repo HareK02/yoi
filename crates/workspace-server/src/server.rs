@@ -3635,6 +3635,38 @@ fn embedded_runtime_request_audience(config: &ServerConfig) -> crate::Result<Str
         })
 }
 
+#[derive(Clone, Copy)]
+enum WorkspaceDatabasePreparation {
+    Startup,
+    #[cfg(test)]
+    PreparedFixture,
+}
+
+impl WorkspaceDatabasePreparation {
+    fn open_store(self, path: &Path) -> Result<crate::SqliteWorkspaceStore> {
+        match self {
+            Self::Startup => crate::SqliteWorkspaceStore::open(path),
+            #[cfg(test)]
+            Self::PreparedFixture => crate::SqliteWorkspaceStore::connect_prepared_fixture(path),
+        }
+    }
+
+    fn open_authority(
+        self,
+        path: PathBuf,
+        workspace_id: String,
+    ) -> Result<SqliteWorkspaceAuthority> {
+        match self {
+            Self::Startup => SqliteWorkspaceAuthority::new(path, workspace_id),
+            #[cfg(test)]
+            Self::PreparedFixture => {
+                let store = self.open_store(&path)?;
+                SqliteWorkspaceAuthority::from_fixture_store(path, workspace_id, store)
+            }
+        }
+    }
+}
+
 impl WorkspaceApi {
     /// Trusted Workspace-scoped Drive access for backend adapters. This is not
     /// model authorization; callers must authorize requests before using it.
@@ -3856,7 +3888,57 @@ impl WorkspaceApi {
         .await
     }
 
+    #[cfg(test)]
+    async fn new_api_fixture(
+        config: ServerConfig,
+        execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
+    ) -> Result<Self> {
+        // Only a newly copied pristine fixture skips repeated Workspace schema
+        // checks. Restart/recovery fixtures retain the complete startup path.
+        let preparation = if config.database_path.exists() {
+            WorkspaceDatabasePreparation::Startup
+        } else {
+            WorkspaceDatabasePreparation::PreparedFixture
+        };
+        let store = Arc::new(crate::SqliteWorkspaceStore::open_api_fixture(
+            &config.database_path,
+        )?);
+        seed_test_registered_workspace(store.as_ref(), &config).await?;
+        Self::new_with_database_preparation(
+            config,
+            store,
+            execution_backend,
+            BackendResourceBroker::default(),
+            HostExecutors::default(),
+            None,
+            preparation,
+        )
+        .await
+    }
+
     async fn new_with_execution_backend_and_broker(
+        config: ServerConfig,
+        store: Arc<dyn ControlPlaneStore>,
+        execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
+        resource_broker: BackendResourceBroker,
+        host_executors: HostExecutors,
+        worker_remove_dispatcher: Option<
+            Arc<crate::worker_source::EmbeddedServerWorkerMutationDispatcher>,
+        >,
+    ) -> Result<Self> {
+        Self::new_with_database_preparation(
+            config,
+            store,
+            execution_backend,
+            resource_broker,
+            host_executors,
+            worker_remove_dispatcher,
+            WorkspaceDatabasePreparation::Startup,
+        )
+        .await
+    }
+
+    async fn new_with_database_preparation(
         mut config: ServerConfig,
         store: Arc<dyn ControlPlaneStore>,
         execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
@@ -3865,6 +3947,7 @@ impl WorkspaceApi {
         worker_remove_dispatcher: Option<
             Arc<crate::worker_source::EmbeddedServerWorkerMutationDispatcher>,
         >,
+        database_preparation: WorkspaceDatabasePreparation,
     ) -> Result<Self> {
         if store.get_workspace(&config.workspace_id).await?.is_none() {
             return Err(crate::Error::Config(format!(
@@ -3904,7 +3987,8 @@ impl WorkspaceApi {
         let (config_store, repository_secrets) = executor
             .run(move || {
                 let config_store = Arc::new(
-                    crate::SqliteWorkspaceStore::open(database_path.clone())?
+                    database_preparation
+                        .open_store(&database_path)?
                         .with_db_executor(config_executor),
                 );
                 let repository_secrets = Arc::new(RepositorySecretService::open(
@@ -4005,7 +4089,7 @@ impl WorkspaceApi {
                     .map_err(|error| {
                         Error::Store(format!("failed to register subjektiv storage: {error}"))
                     })?;
-                let authority = SqliteWorkspaceAuthority::new(database_path, workspace_id)?;
+                let authority = database_preparation.open_authority(database_path, workspace_id)?;
                 Ok::<_, Error>((feature_storage, registration, authority))
             })
             .await?;
@@ -28226,6 +28310,29 @@ async fn set_worker_retention(
     ))
 }
 
+fn cleanup_workdir_decision(
+    file_status: CleanupWorkdirFileStatus,
+    cleanliness: CleanupWorkdirCleanliness,
+    running_linked: bool,
+    pinned_linked: bool,
+) -> (CleanupTargetKind, Option<String>) {
+    let action = if cleanup_workdir_file_status_is_record_only(file_status) {
+        CleanupTargetKind::WorkdirRecordDelete
+    } else if !matches!(cleanliness, CleanupWorkdirCleanliness::Dirty) {
+        CleanupTargetKind::WorkdirCleanCleanup
+    } else {
+        CleanupTargetKind::WorkdirDirtyDiscard
+    };
+    let blocking_reason = if running_linked {
+        Some("workdir is linked to a running Worker".to_string())
+    } else if pinned_linked {
+        Some("workdir is linked to a pinned Worker/history".to_string())
+    } else {
+        None
+    };
+    (action, blocking_reason)
+}
+
 fn build_runtime_cleanup_plan(
     api: &WorkspaceApi,
     runtime_id: &str,
@@ -28371,20 +28478,8 @@ fn build_runtime_cleanup_plan(
             .get(record.workdir_id.as_str())
             .map(|summary| cleanup_workdir_cleanliness_from_runtime(summary.cleanliness.as_deref()))
             .unwrap_or_else(|| cleanup_workdir_cleanliness_from_registry(&record.cleanliness));
-        let action = if cleanup_workdir_file_status_is_record_only(file_status) {
-            CleanupTargetKind::WorkdirRecordDelete
-        } else if !matches!(cleanliness, CleanupWorkdirCleanliness::Dirty) {
-            CleanupTargetKind::WorkdirCleanCleanup
-        } else {
-            CleanupTargetKind::WorkdirDirtyDiscard
-        };
-        let blocking_reason = if running_linked {
-            Some("workdir is linked to a running Worker".to_string())
-        } else if pinned_linked {
-            Some("workdir is linked to a pinned Worker/history".to_string())
-        } else {
-            None
-        };
+        let (action, blocking_reason) =
+            cleanup_workdir_decision(file_status, cleanliness, running_linked, pinned_linked);
         let repository_key = api
             .store
             .get_repository(&api.config.workspace_id, repository_id)?
@@ -47647,132 +47742,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_checker_fake_model_regressions_preserve_classification_boundaries() {
-        struct FakeTicketCheckerModel;
-
-        impl FakeTicketCheckerModel {
-            fn respond(request: &BackendJobRequest) -> Value {
-                let input = ticket_item_checker::parse_input(&request.input).unwrap();
-                assert!(request.instruction.contains("writer_scope"));
-                assert!(request.instruction.contains("internal_inconsistency"));
-                assert!(request.instruction.contains("ambiguous_boundary"));
-                assert!(
-                    request
-                        .instruction
-                        .contains("Production deployment requires approval")
-                );
-                assert!(request.instruction.contains("background, quotations"));
-                if input
-                    .body
-                    .contains("This time I only create the Ticket; I will not implement it.")
-                    && !input.body.starts_with("Background bug example:")
-                {
-                    serde_json::json!({"findings": [{
-                        "category": "writer_scope",
-                        "quote": "I will not implement it",
-                        "reason": "The active requirement records the writer's own implementation boundary.",
-                        "suggestion": "Remove the writer-specific action boundary."
-                    }]})
-                } else if input.body.contains("The rollout region is undecided.")
-                    && input.body.contains("The rollout region is us-east-1.")
-                {
-                    serde_json::json!({"findings": [{
-                        "category": "internal_inconsistency",
-                        "quote": "The rollout region is undecided.",
-                        "reason": "The same active text also settles the rollout region as us-east-1.",
-                        "suggestion": "Choose either the unresolved or settled rollout-region statement."
-                    }]})
-                } else if input.body == "Implementation stops after Ticket creation." {
-                    serde_json::json!({"findings": [{
-                        "category": "ambiguous_boundary",
-                        "quote": "Implementation stops after Ticket creation.",
-                        "reason": "The text alone does not establish whether this is a delivery constraint or the writer's current action boundary.",
-                        "suggestion": "Confirm whether this limits the product workflow or only the current writer."
-                    }]})
-                } else {
-                    serde_json::json!({"findings": []})
-                }
-            }
-        }
-
-        struct Case {
-            name: &'static str,
-            body: &'static str,
-            advisory_quote: Option<&'static str>,
-        }
-        let cases = vec![
-            Case {
-                name: "writer-scope-positive",
-                body: "This time I only create the Ticket; I will not implement it.",
-                advisory_quote: Some("I will not implement it"),
-            },
-            Case {
-                name: "production-approval-negative",
-                body: "Production deployment requires approval.",
-                advisory_quote: None,
-            },
-            Case {
-                name: "quoted-background-negative",
-                body: "Background bug example: a generated Ticket once said “I will not implement it.” Do not reproduce that sentence in generated requirements.",
-                advisory_quote: None,
-            },
-            Case {
-                name: "unresolved-versus-settled-positive",
-                body: "The rollout region is undecided. The rollout region is us-east-1.",
-                advisory_quote: Some("The rollout region is undecided."),
-            },
-            Case {
-                name: "ambiguous-boundary-confirmation",
-                body: "Implementation stops after Ticket creation.",
-                advisory_quote: Some("Implementation stops after Ticket creation."),
-            },
-        ];
-
+    async fn ticket_checker_routes_model_advisory_after_authenticated_save() {
+        let case = ticket_item_checker::test_support::cases()
+            .into_iter()
+            .find(|case| case.name == "writer-scope-positive")
+            .unwrap();
         let temp = tempfile::tempdir().unwrap();
         let (api, execution) = test_api_with_recording_backend(temp.path()).await;
         let source = spawn_ticket_check_source(&api, "ticket-check-boundary-author");
-        for case in cases {
-            let mut input = ticket::NewTicket::new(format!("Boundary case: {}", case.name));
-            input.body = MarkdownText::new(case.body);
-            let Json(TicketBackendOperationResult::TicketRef(reference)) =
-                execute_worker_ticket_test_operation(
-                    State(api.clone()),
-                    AxumPath(ScopedWorkspacePath {
-                        workspace_id: TEST_WORKSPACE_ID.to_string(),
-                    }),
-                    ticket_check_headers(&source),
-                    Json(TicketBackendOperation::Create { input }),
-                )
-                .await
-                .unwrap()
-            else {
-                panic!("{}: unexpected Ticket create result", case.name);
-            };
-            let job = ticket_check_job(&api, &reference.id);
-            let attempt = wait_for_ticket_check_attempt(&api, &job).await;
-            execution.take_inputs();
-            api.accept_backend_job_result(
-                attempt.worker.as_ref().unwrap(),
-                &BackendJobResultSubmission {
-                    job_id: job.request.job_id.clone(),
-                    attempt_id: attempt.attempt_id,
-                    input_digest: job.request.input_digest().unwrap(),
-                    result: FakeTicketCheckerModel::respond(&job.request),
-                },
+        let mut input = ticket::NewTicket::new(format!("Boundary case: {}", case.name));
+        input.body = MarkdownText::new(case.body);
+        let Json(TicketBackendOperationResult::TicketRef(reference)) =
+            execute_worker_ticket_test_operation(
+                State(api.clone()),
+                AxumPath(ScopedWorkspacePath {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                }),
+                ticket_check_headers(&source),
+                Json(TicketBackendOperation::Create { input }),
             )
-            .unwrap_or_else(|error| panic!("{}: {error}", case.name));
-            let notifications = execution.take_inputs();
-            let advisories = notifications
-                .iter()
-                .filter(|(_, content)| content.contains("[Ticket item checker advisory]"))
-                .collect::<Vec<_>>();
-            match case.advisory_quote {
-                Some(quote) => {
-                    assert_eq!(advisories.len(), 1, "{}", case.name);
-                    assert!(advisories[0].1.contains(quote), "{}", case.name);
-                }
-                None => assert!(advisories.is_empty(), "{}", case.name),
+            .await
+            .unwrap()
+        else {
+            panic!("{}: unexpected Ticket create result", case.name);
+        };
+        let job = ticket_check_job(&api, &reference.id);
+        let attempt = wait_for_ticket_check_attempt(&api, &job).await;
+        execution.take_inputs();
+        api.accept_backend_job_result(
+            attempt.worker.as_ref().unwrap(),
+            &BackendJobResultSubmission {
+                job_id: job.request.job_id.clone(),
+                attempt_id: attempt.attempt_id,
+                input_digest: job.request.input_digest().unwrap(),
+                result: ticket_item_checker::test_support::FakeTicketCheckerModel::respond(
+                    &job.request,
+                ),
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+        let notifications = execution.take_inputs();
+        let advisories = notifications
+            .iter()
+            .filter(|(_, content)| content.contains("[Ticket item checker advisory]"))
+            .collect::<Vec<_>>();
+        match case.advisory_quote {
+            Some(quote) => {
+                assert_eq!(advisories.len(), 1, "{}", case.name);
+                assert!(advisories[0].1.contains(quote), "{}", case.name);
             }
+            None => assert!(advisories.is_empty(), "{}", case.name),
         }
     }
 
@@ -56591,16 +56610,56 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn api_startup_revalidates_workspace_schema_after_store_was_opened() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_server_config(temp.path());
+        let store =
+            Arc::new(SqliteWorkspaceStore::open_api_fixture(&config.database_path).unwrap());
+        seed_test_registered_workspace(store.as_ref(), &config)
+            .await
+            .unwrap();
+        // Do not hold a live API/Runtime while testing startup of the same store:
+        // its exclusive Runtime store lease would reject before schema validation.
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER ticket_assignment_ticket_parent_tombstone;")?;
+                Ok(())
+            })
+            .unwrap();
+        let error = WorkspaceApi::new_for_test(config.clone(), store)
+            .await
+            .err()
+            .expect("API startup must revalidate an already opened store");
+        assert!(
+            error
+                .to_string()
+                .contains("ticket_assignment_ticket_parent_tombstone"),
+            "expected missing-trigger refusal from API startup, got {error:?}"
+        );
+        let error = WorkspaceApi::new_api_fixture(
+            config,
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .err()
+        .expect("existing fixture DBs must use production startup");
+        assert!(
+            error
+                .to_string()
+                .contains("ticket_assignment_ticket_parent_tombstone"),
+            "expected missing-trigger refusal reopening fixture, got {error:?}"
+        );
+    }
+
     async fn test_api_with_recording_backend(
         workspace_root: impl Into<PathBuf>,
     ) -> (WorkspaceApi, Arc<DeterministicExecutionBackend>) {
         let config = test_server_config(workspace_root);
-        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
         let execution = Arc::new(DeterministicExecutionBackend::default());
-        let api =
-            WorkspaceApi::new_with_execution_backend(config, Arc::new(store), execution.clone())
-                .await
-                .unwrap();
+        let api = WorkspaceApi::new_api_fixture(config, execution.clone())
+            .await
+            .unwrap();
         (api, execution)
     }
 
@@ -56619,14 +56678,9 @@ mod tests {
         config.repositories[0].source = source;
         config.repositories[0].path = None;
         config.repositories[0].default_selector = Some("develop".to_string());
-        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
-        WorkspaceApi::new_with_execution_backend(
-            config,
-            Arc::new(store),
-            Arc::new(DeterministicExecutionBackend::default()),
-        )
-        .await
-        .unwrap()
+        WorkspaceApi::new_api_fixture(config, Arc::new(DeterministicExecutionBackend::default()))
+            .await
+            .unwrap()
     }
 
     async fn test_api_with_docs_repository(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {
@@ -56648,14 +56702,9 @@ mod tests {
         docs.path = Some(docs_root);
         docs.default_selector = Some("develop".to_string());
         config.repositories.push(docs);
-        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
-        WorkspaceApi::new_with_execution_backend(
-            config,
-            Arc::new(store),
-            Arc::new(DeterministicExecutionBackend::default()),
-        )
-        .await
-        .unwrap()
+        WorkspaceApi::new_api_fixture(config, Arc::new(DeterministicExecutionBackend::default()))
+            .await
+            .unwrap()
     }
 
     fn test_owner_actor() -> RequestActor {
@@ -59899,22 +59948,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn cleanup_plan_offers_normal_revalidation_for_prior_failure_and_unknown() {
-        let workspace = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(workspace.path());
-        let api = test_api(workspace.path()).await;
-        for (id, state) in [
-            ("pending-retry", "pending"),
-            ("unknown-retry", "unknown"),
-            ("corrupt-retry", "corrupted"),
-        ] {
-            seed_cleanup_workdir(&api, id, state, "unknown");
-        }
-        let plan = build_runtime_cleanup_plan(&api, "runtime-test").unwrap();
-        for candidate in plan.workdirs {
-            assert_eq!(candidate.action, CleanupTargetKind::WorkdirCleanCleanup);
-            assert!(candidate.blocking_reason.is_none());
+    #[test]
+    fn cleanup_plan_offers_normal_revalidation_for_prior_failure_and_unknown() {
+        for state in ["pending", "unknown", "corrupted"] {
+            let (action, blocking_reason) = cleanup_workdir_decision(
+                cleanup_workdir_file_status_from_registry(state),
+                cleanup_workdir_cleanliness_from_registry("unknown"),
+                false,
+                false,
+            );
+            assert_eq!(action, CleanupTargetKind::WorkdirCleanCleanup, "{state}");
+            assert!(blocking_reason.is_none(), "{state}");
         }
     }
 

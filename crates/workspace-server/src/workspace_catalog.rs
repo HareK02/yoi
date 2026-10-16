@@ -302,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_is_atomic_and_exact_retries_converge() {
-        let store = Arc::new(SqliteWorkspaceStore::in_memory_for_test().unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::in_memory_fixture().unwrap());
         let service = WorkspaceCatalogService::new(
             store.clone(),
             Arc::new(
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn create_rejects_noncanonical_repository_keys_without_persisting_a_workspace() {
-        let store = Arc::new(SqliteWorkspaceStore::in_memory_for_test().unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::in_memory_fixture().unwrap());
         let service = WorkspaceCatalogService::new(
             store.clone(),
             Arc::new(
@@ -517,7 +517,7 @@ mod tests {
 
     #[tokio::test]
     async fn idempotency_key_reuse_with_different_payload_is_rejected() {
-        let store = Arc::new(SqliteWorkspaceStore::in_memory_for_test().unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::in_memory_fixture().unwrap());
         let owner_account_id = owner_account(store.as_ref());
         let service = WorkspaceCatalogService::new(
             store,
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn repository_free_create_initializes_authority_and_concurrent_retries_converge() {
-        let store = Arc::new(SqliteWorkspaceStore::in_memory_for_test().unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::in_memory_fixture().unwrap());
         let owner = owner_account(store.as_ref());
         let service = WorkspaceCatalogService::new(
             store.clone(),
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn replay_reads_current_repository_at_initial_key_and_never_recreates_it() {
-        let store = Arc::new(SqliteWorkspaceStore::in_memory_for_test().unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::in_memory_fixture().unwrap());
         let owner = owner_account(store.as_ref());
         let service = WorkspaceCatalogService::new(
             store.clone(),
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn create_rejects_non_user_account_owners() {
-        let store = Arc::new(SqliteWorkspaceStore::in_memory_for_test().unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::in_memory_fixture().unwrap());
         store
             .upsert_account(&AccountRecord {
                 account_id: "organization-owner".to_string(),
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn catalog_list_is_scoped_to_the_required_owner_account() {
-        let store = Arc::new(SqliteWorkspaceStore::in_memory_for_test().unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::in_memory_fixture().unwrap());
         let owner_a = owner_account(store.as_ref());
         let owner_b = "account-owner-b".to_string();
         store
@@ -862,7 +862,7 @@ mod tests {
 
     #[test]
     fn remote_repository_creation_persists_typed_source_without_auth_metadata() {
-        let store = Arc::new(SqliteWorkspaceStore::in_memory_for_test().unwrap());
+        let store = Arc::new(SqliteWorkspaceStore::in_memory_fixture().unwrap());
         let owner_account_id = owner_account(store.as_ref());
         let service = WorkspaceCatalogService::new(
             store.clone(),

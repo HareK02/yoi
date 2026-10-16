@@ -91,6 +91,16 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Keep the real SQLite engine in schema/transaction tests without paying for
+# an unoptimized C interpreter on every statement. Rust test assertions stay enabled.
+[profile.test.package.libsqlite3-sys]
+opt-level = 2
+
+# Schema/authority integration tests execute substantial parsing and validation.
+# Optimize that code without disabling test/debug assertions or overflow checks.
+[profile.test.package.yoi-workspace-server]
+opt-level = 1
+
 [workspace.dependencies]
 # Internal crates
 client = { path = "crates/client" }

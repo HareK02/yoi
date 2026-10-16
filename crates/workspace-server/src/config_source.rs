@@ -795,7 +795,7 @@ mod tests {
     }
 
     async fn open_store() -> SqliteWorkspaceStore {
-        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
         store
     }
@@ -1321,26 +1321,28 @@ mod tests {
         assert!(main_config_has_schema_assertion(DEFAULT_MAIN_CONFIG_SOURCE));
     }
 
-    #[tokio::test]
-    async fn candidate_normalizes_main_and_formats_changed_decodal_sources() {
-        let store = open_store().await;
-        let current = store.load_workspace_config("w-config").unwrap().unwrap();
-        let candidate = store
-            .evaluate_workspace_config_candidate(
-                "w-config",
-                &commit_request(
-                    &current,
-                    vec![
-                        update_main(&current, "{}"),
-                        ConfigTreeChange::Create {
-                            path: path("module.dcdl"),
-                            content_type: ConfigContentType::Decodal,
-                            content: "{}".into(),
-                        },
-                    ],
-                ),
-            )
-            .unwrap();
+    #[test]
+    fn candidate_normalizes_main_and_formats_changed_decodal_sources() {
+        let current = initial_state().unwrap();
+        let changes = [
+            update_main(&current, "{}"),
+            ConfigTreeChange::Create {
+                path: path("module.dcdl"),
+                content_type: ConfigContentType::Decodal,
+                content: "{}".into(),
+            },
+        ];
+        let identity = (
+            current.contract.fingerprint.clone(),
+            current.projection_digest.clone(),
+        );
+        let candidate = evaluate_candidate(
+            current,
+            identity,
+            &changes,
+            WorkspaceConfigSchemaBundle::empty(),
+        )
+        .unwrap();
 
         assert_eq!(
             candidate
@@ -1414,34 +1416,44 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn required_main_entrypoint_cannot_be_deleted_or_renamed() {
-        let store = open_store().await;
-        let current = store.load_workspace_config("w-config").unwrap().unwrap();
-        let main = current.snapshot.get(&path(MAIN_CONFIG_ENTRYPOINT)).unwrap();
+    #[test]
+    fn required_main_entrypoint_cannot_be_deleted_or_renamed() {
         for change in [
             ConfigTreeChange::Delete {
                 path: path(MAIN_CONFIG_ENTRYPOINT),
-                expected_digest: main.content_digest.clone(),
+                expected_digest: "sha256:current".into(),
             },
             ConfigTreeChange::Rename {
                 from: path(MAIN_CONFIG_ENTRYPOINT),
                 to: path("other.dcdl"),
-                expected_digest: main.content_digest.clone(),
+                expected_digest: "sha256:current".into(),
+            },
+            ConfigTreeChange::Rename {
+                from: path("other.dcdl"),
+                to: path(MAIN_CONFIG_ENTRYPOINT),
+                expected_digest: "sha256:current".into(),
             },
         ] {
-            let error = store
-                .evaluate_workspace_config_candidate(
-                    "w-config",
-                    &commit_request(&current, vec![change]),
-                )
-                .unwrap_err();
+            let error = reject_main_entrypoint_mutation(&[change]).unwrap_err();
             assert!(error.to_string().contains("cannot be"));
         }
     }
 
+    #[test]
+    fn entrypoint_request_requires_exactly_the_server_owned_main() {
+        for entrypoints in [
+            vec![],
+            vec![path("other.dcdl")],
+            vec![path(MAIN_CONFIG_ENTRYPOINT), path("other.dcdl")],
+        ] {
+            let error = validate_entrypoint_request(&entrypoints).unwrap_err();
+            assert!(error.to_string().contains("must be exactly [main.dcdl]"));
+        }
+        validate_entrypoint_request(&[path(MAIN_CONFIG_ENTRYPOINT)]).unwrap();
+    }
+
     #[tokio::test]
-    async fn browser_cannot_replace_server_owned_entrypoint_contract() {
+    async fn candidate_store_rejects_entrypoint_override_and_main_deletion_without_mutation() {
         let store = open_store().await;
         let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let mut request = commit_request(&current, Vec::new());
@@ -1450,11 +1462,33 @@ mod tests {
             .evaluate_workspace_config_candidate("w-config", &request)
             .unwrap_err();
         assert!(error.to_string().contains("must be exactly [main.dcdl]"));
+        let main = current.snapshot.get(&path(MAIN_CONFIG_ENTRYPOINT)).unwrap();
+        let error = store
+            .evaluate_workspace_config_candidate(
+                "w-config",
+                &commit_request(
+                    &current,
+                    vec![ConfigTreeChange::Delete {
+                        path: path(MAIN_CONFIG_ENTRYPOINT),
+                        expected_digest: main.content_digest.clone(),
+                    }],
+                ),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot be deleted"));
+        assert_eq!(
+            store
+                .load_workspace_config("w-config")
+                .unwrap()
+                .unwrap()
+                .snapshot,
+            current.snapshot
+        );
     }
 
     #[tokio::test]
     async fn invalid_candidate_is_never_persisted() {
-        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
         let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let main = current.snapshot.get(&path(MAIN_CONFIG_ENTRYPOINT)).unwrap();
@@ -1478,7 +1512,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_candidate_commits_snapshot_content_and_provenance_atomically() {
-        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
         let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let committed = store
@@ -1496,7 +1530,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_cas_cannot_overwrite_newer_tree() {
-        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
         let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let request = commit_request(&current, vec![update_main(&current, "{ answer = 42; }")]);
@@ -1514,7 +1548,7 @@ mod tests {
 
     #[tokio::test]
     async fn committed_content_remains_retrievable_after_later_commit() {
-        let store = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
         store.upsert_workspace(&workspace()).await.unwrap();
         let current = store.load_workspace_config("w-config").unwrap().unwrap();
         let first = store

@@ -2341,6 +2341,7 @@ pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
     pending_restores: Mutex<HashMap<WorkerRef, Arc<PendingRuntimeRestore>>>,
     worker_locks: Mutex<HashMap<WorkerRef, Arc<Mutex<()>>>>,
     spawn_restore_timeout: Duration,
+    shutdown_admission_timeout: Duration,
 }
 
 impl<F> WorkerRuntimeExecutionBackend<F>
@@ -2362,6 +2363,7 @@ where
             pending_restores: Mutex::new(HashMap::new()),
             worker_locks: Mutex::new(HashMap::new()),
             spawn_restore_timeout: SPAWN_RESTORE_TASK_TIMEOUT,
+            shutdown_admission_timeout: Duration::from_secs(5),
         })
     }
 
@@ -2881,9 +2883,10 @@ where
         let shutdown_requested = Arc::clone(shutdown_requested);
         let shutdown = shutdown.clone();
         let tasks_for_join = tasks.clone();
+        let admission_timeout = self.shutdown_admission_timeout;
         let cleanup = self.run_joined_on_adapter_runtime(async move {
             tasks_for_join
-                .request_shutdown(&handle, &shutdown_requested, Duration::from_secs(5))
+                .request_shutdown(&handle, &shutdown_requested, admission_timeout)
                 .await?;
             tasks_for_join.confirm_shutdown_and_join(&shutdown).await
         });
@@ -3170,9 +3173,10 @@ where
         let shutdown_requested = execution.shutdown_requested.clone();
         let shutdown = execution.shutdown.clone();
         let tasks = execution.tasks.clone();
+        let admission_timeout = self.shutdown_admission_timeout;
         let cleanup = self.run_joined_on_adapter_runtime(async move {
             tasks
-                .request_shutdown(&handle, &shutdown_requested, Duration::from_secs(5))
+                .request_shutdown(&handle, &shutdown_requested, admission_timeout)
                 .await?;
             tasks.confirm_shutdown_and_join(&shutdown).await?;
             handle.delete_uncommitted_uploaded_files().map_err(|error| {
@@ -4871,15 +4875,11 @@ mod tests {
 
     const SAVED_SUBJEKTIV_SYSTEM_PROMPT: &str = "Committed saved Subject Worker system prompt";
 
-    async fn saved_subjektiv_restore_fixture(
+    fn saved_subjektiv_policy(
         root: &Path,
-        materialize_head: bool,
-    ) -> WorkerExecutionRestoreRequest {
-        let worker_ref = WorkerRef::new(WorkerId::now_v7());
-        let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
-        let aggregate_dir = root.join("workers").join(worker_ref.worker_id.to_string());
-        let session_store = WorkerSessionStore::new(aggregate_dir.join("session")).unwrap();
-        let store = WorkerAggregateStore::new(&aggregate_dir, &worker_name).unwrap();
+        worker_ref: &WorkerRef,
+    ) -> (WorkerManifest, CreateWorkerRequest) {
+        let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(worker_ref);
         let mut saved = WorkerManifest::from_toml(&format!(
             r#"
             [worker]
@@ -4920,6 +4920,19 @@ mod tests {
             language: "English".to_string(),
         });
         bind_workspace_memory_settings(&mut saved, &request).unwrap();
+        (saved, request)
+    }
+
+    async fn saved_subjektiv_restore_fixture(
+        root: &Path,
+        materialize_head: bool,
+    ) -> WorkerExecutionRestoreRequest {
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
+        let aggregate_dir = root.join("workers").join(worker_ref.worker_id.to_string());
+        let session_store = WorkerSessionStore::new(aggregate_dir.join("session")).unwrap();
+        let store = WorkerAggregateStore::new(&aggregate_dir, &worker_name).unwrap();
+        let (saved, request) = saved_subjektiv_policy(root, &worker_ref);
         let client = MockClient::new(Vec::new());
         let mut engine =
             Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
@@ -5785,7 +5798,12 @@ mod tests {
     fn duplicate_connect_timeout_retains_candidate_waiter_and_no_false_stop() {
         let root = tempfile::tempdir().unwrap();
         let candidate_root = tempfile::tempdir().unwrap();
-        let (backend, request) = profile_stop_fixture(root.path());
+        let (mut backend, request) = profile_stop_fixture(root.path());
+        // Only admission's deadline is shortened. The real Controller, receipt
+        // correlation, retained candidate and completion/join barriers stay live.
+        // The candidate send is gated below, so timeout is not a scheduler race.
+        let normal_admission_timeout = backend.shutdown_admission_timeout;
+        backend.shutdown_admission_timeout = Duration::from_millis(100);
         let primary = backend
             .workers
             .lock()
@@ -5864,6 +5882,7 @@ mod tests {
                 .unwrap()
                 .contains_key(&request.worker_ref)
         );
+        backend.shutdown_admission_timeout = normal_admission_timeout;
         release.send(()).unwrap();
         let rejected = backend.stop_worker(&request.worker_ref);
         assert!(!rejected.is_accepted());
@@ -5878,21 +5897,16 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(worker_allocation)]
     fn pending_restore_join_failure_never_becomes_absence_on_stop_retry() {
         let root = tempfile::tempdir().unwrap();
-        let runtime_store = root.path().join("runtime");
         let backend = WorkerRuntimeExecutionBackend::new(
             ProfileRuntimeWorkerFactory::new(root.path())
-                .with_runtime_store_dir(&runtime_store)
-                .with_runtime_id("runtime-subjektiv-test"),
+                .with_runtime_store_dir(root.path().join("runtime")),
         )
         .unwrap();
-        let request = backend
-            .run_on_adapter_runtime(async move {
-                Ok(saved_subjektiv_restore_fixture(&runtime_store, true).await)
-            })
-            .unwrap();
+        // No Controller was ever published: this is the pending-task ownership
+        // rule, not saved-Session restore. Do not boot a Worker to manufacture it.
+        let request = direct_restore_request(WorkerRef::new(WorkerId::now_v7()));
         let failed = backend
             .spawn_on_adapter_runtime(async {
                 panic!("factory scope failed before publishing result")
@@ -6295,6 +6309,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn saved_manifest_policy_rejects_mismatched_or_missing_trusted_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let (saved, request) = saved_subjektiv_policy(root.path(), &worker_ref);
+        let mut metadata = WorkerMetadata::new(&saved.worker.name, None);
+        metadata.resolved_manifest_snapshot =
+            Some(manifest::write_persisted_worker_manifest_snapshot(&saved).unwrap());
+        let (restored, _) =
+            ProfileRuntimeWorkerFactory::manifest_for_restore(&metadata, &request).unwrap();
+        assert_eq!(
+            manifest::write_persisted_worker_manifest_snapshot(&restored).unwrap(),
+            metadata.resolved_manifest_snapshot.clone().unwrap()
+        );
+        let mut wrong_settings = request.clone();
+        wrong_settings.memory_settings.as_mut().unwrap().language = "different language".into();
+        let mut detached = request.clone();
+        detached.subjektiv_attached = false;
+        let mut missing_settings = request.clone();
+        missing_settings.memory_settings = None;
+        for (invalid, expected) in [
+            (wrong_settings, "subjektiv settings snapshot mismatch"),
+            (detached, "unauthorized subjektiv attachment"),
+            (missing_settings, "missing its trusted settings snapshot"),
+        ] {
+            let error = ProfileRuntimeWorkerFactory::manifest_for_restore(&metadata, &invalid)
+                .err()
+                .expect("invalid saved policy must be rejected");
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    // Integration: real Worker startup writes the saved Manifest/Session, then
+    // both factory entry points reject it before allocating any live resources.
+    // The local input matrix belongs to saved_manifest_policy_* above.
     #[tokio::test]
     #[serial_test::serial(worker_allocation)]
     async fn profile_factory_saved_manifest_mismatch_rejected_before_live_work() {
@@ -6312,28 +6361,27 @@ mod tests {
             .as_mut()
             .unwrap()
             .language = "different language".into();
-        let mut detached = request.clone();
-        detached.request.subjektiv_attached = false;
-        let mut missing_settings = request.clone();
-        missing_settings.request.memory_settings = None;
-        for (invalid, expected) in [
-            (wrong_settings, "subjektiv settings snapshot mismatch"),
-            (detached, "unauthorized subjektiv attachment"),
-            (missing_settings, "missing its trusted settings snapshot"),
-        ] {
-            let error = factory.preflight_restore(&invalid).await.unwrap_err();
-            assert!(error.contains(expected), "{error}");
-            let error = match factory.restore_controller(invalid).await {
-                Ok(controller) => {
-                    shutdown_profile_controller(controller).await;
-                    panic!("invalid restore started a Controller")
-                }
-                Err(error) => error,
-            };
-            assert!(error.contains(expected), "{error}");
-            assert_eq!(persisted_files(&runtime_store), before);
-            assert!(factory.observation_hub.workers.lock().unwrap().is_empty());
-        }
+        let error = factory
+            .preflight_restore(&wrong_settings)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("subjektiv settings snapshot mismatch"),
+            "{error}"
+        );
+        let error = match factory.restore_controller(wrong_settings).await {
+            Ok(controller) => {
+                shutdown_profile_controller(controller).await;
+                panic!("invalid restore started a Controller")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("subjektiv settings snapshot mismatch"),
+            "{error}"
+        );
+        assert_eq!(persisted_files(&runtime_store), before);
+        assert!(factory.observation_hub.workers.lock().unwrap().is_empty());
         let run_dir = factory
             .worker_aggregate_dir(&request.worker_ref)
             .unwrap()
@@ -6770,7 +6818,7 @@ mod tests {
         assert!(scope.tasks.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn execution_scope_timeout_retains_exact_task_until_completion_is_proven() {
         let release = Arc::new(tokio::sync::Notify::new());
         let task_release = Arc::clone(&release);
@@ -7075,29 +7123,35 @@ mod tests {
         );
     }
 
-    struct DelayedFactory {
-        completed: Arc<AtomicBool>,
-        delay: Duration,
+    struct PendingCreateFactory {
+        started: mpsc::Sender<()>,
+        dropped: mpsc::Sender<()>,
+    }
+
+    struct FactoryFutureDrop(mpsc::Sender<()>);
+
+    impl Drop for FactoryFutureDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
     }
 
     #[async_trait]
-    impl RuntimeWorkerFactory for DelayedFactory {
+    impl RuntimeWorkerFactory for PendingCreateFactory {
         async fn spawn_controller(
             &self,
             _request: WorkerExecutionSpawnRequest,
         ) -> Result<RuntimeWorkerController, String> {
-            tokio::time::sleep(self.delay).await;
-            self.completed.store(true, Ordering::SeqCst);
-            Err("delayed factory completed".to_string())
+            let _drop = FactoryFutureDrop(self.dropped.clone());
+            self.started.send(()).unwrap();
+            std::future::pending().await
         }
 
         async fn restore_controller(
             &self,
             _request: WorkerExecutionRestoreRequest,
         ) -> Result<RuntimeWorkerController, String> {
-            tokio::time::sleep(self.delay).await;
-            self.completed.store(true, Ordering::SeqCst);
-            Err("delayed factory completed".to_string())
+            panic!("create timeout must not restore a Worker")
         }
     }
 
@@ -7105,11 +7159,12 @@ mod tests {
     fn create_timeout_cancels_factory_and_removes_persisted_worker() {
         let root = tempfile::tempdir().unwrap();
         let runtime_store_dir = root.path().join("runtime");
-        let completed = Arc::new(AtomicBool::new(false));
+        let (started_tx, started) = mpsc::channel();
+        let (dropped_tx, dropped) = mpsc::channel();
         let backend = Arc::new(
-            WorkerRuntimeExecutionBackend::new(DelayedFactory {
-                completed: completed.clone(),
-                delay: Duration::from_millis(200),
+            WorkerRuntimeExecutionBackend::new(PendingCreateFactory {
+                started: started_tx,
+                dropped: dropped_tx,
             })
             .unwrap()
             .with_spawn_restore_timeout(Duration::from_millis(20)),
@@ -7128,7 +7183,9 @@ mod tests {
         let worker_id = request.worker_id;
         let create_runtime = runtime.clone();
         let create = std::thread::spawn(move || create_runtime.create_worker(request));
-        std::thread::sleep(Duration::from_millis(5));
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("factory must start before observing concurrent deletion");
 
         let delete_error = runtime
             .delete_worker(&crate::identity::WorkerRef::new(worker_id))
@@ -7140,11 +7197,9 @@ mod tests {
             crate::error::RuntimeError::WorkerNotFound { worker_id: missing } if missing == worker_id
         ));
         assert!(error.to_string().contains("was cancelled"));
-        std::thread::sleep(Duration::from_millis(250));
-        assert!(
-            !completed.load(Ordering::SeqCst),
-            "timed out factory future must not resume after create returns"
-        );
+        dropped
+            .try_recv()
+            .expect("cancelled factory future must be dropped before create returns");
         assert!(runtime.list_workers().unwrap().is_empty());
         assert!(backend.workers.lock().unwrap().is_empty());
         assert!(

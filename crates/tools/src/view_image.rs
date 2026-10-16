@@ -360,10 +360,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_binary_read_accepts_arbitrary_bytes_at_caller_limit_and_rejects_larger_files()
-    {
+    async fn bounded_binary_read_accepts_caller_limits_above_the_image_tool_limit() {
+        // The caller's limit is a reader policy, not a LocalWorkdir storage contract.
+        // Supply immutable chunks here; the separate component case exercises the
+        // real provider across a chunk boundary without repeatedly hashing 16 MiB.
         let dir = TempDir::new().unwrap();
         let bytes = vec![0xff; 16 * 1024 * 1024];
+        let hash = Sha256::digest(&bytes).into();
+        let responses = bytes
+            .chunks(IMAGE_READ_CHUNK_BYTES)
+            .enumerate()
+            .map(|(index, bytes)| {
+                chunk(
+                    bytes,
+                    (index * IMAGE_READ_CHUNK_BYTES) as u64,
+                    16 * 1024 * 1024,
+                    hash,
+                )
+            })
+            .collect();
+        let session = binary_session(&dir, responses);
+        let path = WorkdirPath::new("artifact.bin").unwrap();
+        assert_eq!(
+            read_workdir_bytes(&session, path.clone(), bytes.len())
+                .await
+                .unwrap(),
+            bytes
+        );
+        let session = binary_session(
+            &dir,
+            vec![chunk(
+                &bytes[..IMAGE_READ_CHUNK_BYTES],
+                0,
+                bytes.len() as u64,
+                hash,
+            )],
+        );
+        assert!(matches!(
+            read_workdir_bytes(&session, path, bytes.len() - 1).await,
+            Err(WorkdirError::InvalidArgument(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_binary_read_reassembles_provider_chunks_and_enforces_the_caller_limit() {
+        let dir = TempDir::new().unwrap();
+        let bytes = vec![0xff; IMAGE_READ_CHUNK_BYTES + 1];
         std::fs::write(dir.path().join("artifact.bin"), &bytes).unwrap();
         let session =
             LocalWorkdirSession::new(Scope::writable(dir.path()).unwrap(), dir.path().into());

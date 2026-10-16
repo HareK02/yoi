@@ -1,3 +1,6 @@
+//! Check the shipped templates against the real PDK and WIT for the guest target.
+//! Each check owns its source and lockfile; Cargo alone shares and validates artifacts.
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -135,34 +138,84 @@ fn embedded_service_template_cargo_checks_for_wasm_target() {
 
 fn cargo_check_template(template: &str) {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let template_dir = crate_dir.join(format!("../../resources/plugin/templates/{template}"));
-    let manifest_path = template_dir.join("Cargo.toml");
-    let lock_path = template_dir.join("Cargo.lock");
-    let _ = fs::remove_file(&lock_path);
+    let templates_dir = crate_dir.join("../../resources/plugin/templates");
+    let template_dir = templates_dir.join(template);
 
-    let target_dir = tempfile::tempdir().expect("temporary cargo target dir");
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let output = Command::new(cargo)
+    // A sibling fixture preserves the shipped relative PDK and WIT paths verbatim.
+    // Never create or remove a lockfile in the shipped template: another invocation
+    // may be checking it at the same time, or a developer may own that lockfile.
+    let fixture = tempfile::Builder::new()
+        .prefix(".cargo-check-")
+        .tempdir_in(&templates_dir)
+        .expect("temporary template fixture");
+    copy_template_tree(&template_dir, fixture.path(), true);
+
+    // Both templates share the PDK dependencies. A separate persistent target
+    // reuses those artifacts without sharing source or the outer Cargo build lock.
+    // Cargo fingerprints and its target lock handle changes and concurrent checks.
+    let executable = std::env::current_exe().expect("current test executable");
+    let target_dir = executable
+        .parent()
+        .and_then(|deps| deps.parent())
+        .expect("test executable has a profile directory")
+        .join("compile-tests/plugin-pdk-templates");
+    let output = Command::new(env!("CARGO"))
         .arg("check")
         .arg("--manifest-path")
-        .arg(&manifest_path)
+        .arg(fixture.path().join("Cargo.toml"))
         .arg("--target")
         .arg("wasm32-unknown-unknown")
         .arg("--offline")
         .arg("--target-dir")
-        .arg(target_dir.path())
+        .arg(target_dir)
+        .current_dir(fixture.path())
         .env("CARGO_TERM_COLOR", "never")
         .output()
         .expect("spawn cargo check for embedded template");
 
-    let _ = fs::remove_file(&lock_path);
     assert!(
         output.status.success(),
-        "template cargo check failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        "template {template} cargo check failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn copy_template_tree(source: &Path, destination: &Path, is_root: bool) {
+    let metadata = fs::symlink_metadata(source).expect("read template directory metadata");
+    assert!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "template input must be a real directory: {}",
+        source.display()
+    );
+    for entry in fs::read_dir(source).expect("read template directory") {
+        let entry = entry.expect("read template entry");
+        let path = entry.path();
+        let kind = entry.file_type().expect("read template entry type");
+        assert!(
+            !kind.is_symlink() && (kind.is_dir() || kind.is_file()),
+            "unsupported template input (including symlinks): {}",
+            path.display()
+        );
+
+        let name = entry.file_name();
+        // Preserve all compiler inputs, including build scripts and nested assets.
+        // Only omit the root build output and lockfile: each isolated consumer must
+        // resolve its own lockfile, as the original unlocked template check did.
+        if is_root
+            && ((kind.is_dir() && name == "target") || (kind.is_file() && name == "Cargo.lock"))
+        {
+            continue;
+        }
+        let copied = destination.join(name);
+        if kind.is_dir() {
+            fs::create_dir(&copied).expect("create template fixture directory");
+            copy_template_tree(&path, &copied, false);
+        } else {
+            fs::copy(&path, &copied).expect("copy unmodified template input");
+        }
+    }
 }
 
 #[test]

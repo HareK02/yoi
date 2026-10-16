@@ -237,6 +237,25 @@ impl SqliteWorkspaceAuthority {
         let database_path = database_path.into();
         let workspace_id = workspace_id.into();
         let store = SqliteWorkspaceStore::open(&database_path)?;
+        Self::from_store(database_path, workspace_id, store)
+    }
+
+    // Normal API fixtures retain real Ticket/MR stores, but the Workspace schema
+    // was verified when their pristine DB was prepared. Startup still uses new().
+    #[cfg(test)]
+    pub(crate) fn from_fixture_store(
+        database_path: PathBuf,
+        workspace_id: String,
+        store: SqliteWorkspaceStore,
+    ) -> Result<Self> {
+        Self::from_store(database_path, workspace_id, store)
+    }
+
+    fn from_store(
+        database_path: PathBuf,
+        workspace_id: String,
+        store: SqliteWorkspaceStore,
+    ) -> Result<Self> {
         let merge_request_source = Arc::new(AuthorityMergeRequestSource {
             store: store.clone(),
         });
