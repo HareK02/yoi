@@ -1,9 +1,11 @@
 //! 隔離した実yoi-serverのhost CLI・HTTP APIで、管理者初期設定、登録可否の永続化、
-//! 明示handle login、本人の鍵追加、限定activation、Workspace所有境界を検証する。DB・認証・routerは本番実装を使い、
+//! 明示handle login、本人の鍵追加、限定activation、Workspace所有・catalog選択境界を検証する。DB・認証・routerは本番実装を使い、
 //! authenticatorだけをSoftPasskeyに置換する（browser UI／OS authenticatorは対象外）。
 //! `cargo test -p yoi-e2e --features e2e --test auth_passkeys`で明示選択する。
 //! binary供給、HOME/XDG/DB/動的port、readiness、ログ、RAII回収は共有harnessが所有する。
 //! HTTPはproxy／redirect／cookie storeなし、各要求にtimeoutを設ける。
+//! `/`・`/login`・`/dashboard`のstatic shellは対象外。実Server CLIにはstatic assets設定経路がなく、
+//! shell表示／browser遷移は本番routerのin-process検証やbrowser側の合成HTTP検証と区別する。
 
 use std::error::Error;
 use std::fs::OpenOptions;
@@ -677,6 +679,184 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
     )?;
 
     logout(&client, base, artifacts, &new_cookie)?;
+    let report = environment.cleanup()?;
+    assert!(report.cleanup_success);
+    assert!(!report.fixture_root_exists_after);
+    Ok(())
+}
+
+#[test]
+fn workspace_catalog_zero_one_multiple_preserves_explicit_selection_and_actor_ownership() -> Result
+{
+    let mut environment = WorkerE2eEnvironment::new()?;
+    eprintln!(
+        "Workspace catalog E2E artifacts: {}",
+        environment.artifacts_dir.display()
+    );
+    environment.start_empty_backend()?;
+    assert!(environment.workspace_id.is_none());
+    assert!(environment.runtime_pid().is_none());
+    let base = environment
+        .server_url
+        .as_deref()
+        .ok_or("missing server URL")?;
+    let artifacts = &environment.artifacts_dir;
+    let client = http_client()?;
+    let empty: Value = decode(send(
+        client.get(format!("{base}/api/workspaces")),
+        "fresh empty Server exposes an empty anonymous catalog",
+        artifacts,
+    )?)?;
+    assert_eq!(empty, json!([]));
+
+    let request = json!({
+        "operation_key": format!("catalog-e2e-{}-first", environment.runtime_id),
+        "display_name": "Explicit first Workspace"
+    });
+    rejected(
+        send(
+            client
+                .post(format!("{base}/api/workspaces"))
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .json(&request),
+            "anonymous create cannot bootstrap an owner",
+            artifacts,
+        )?,
+        StatusCode::FORBIDDEN,
+        "authenticated owner",
+    )?;
+    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (_, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
+    set_policy(&client, base, artifacts, &admin_cookie, true)?;
+    let mut key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let (registered, registration_cookie, _) = register(
+        &client,
+        base,
+        artifacts,
+        &environment.account_handle,
+        &mut key,
+    )?;
+    logout(&client, base, artifacts, &registration_cookie)?;
+    let (logged_in, cookie) = login(
+        &client,
+        base,
+        artifacts,
+        &environment.account_handle,
+        &mut key,
+    )?;
+    assert_eq!(logged_in.user, registered.user);
+    browser_identity(&client, base, artifacts, &cookie, &registered.user)?;
+    let empty: Value = decode(send(
+        client
+            .get(format!("{base}/api/workspaces"))
+            .header(COOKIE, &cookie),
+        "registration and explicit passkey login do not implicitly create a Workspace",
+        artifacts,
+    )?)?;
+    assert_eq!(empty, json!([]));
+
+    let mut expected = Vec::new();
+    for (index, display_name) in ["Explicit first Workspace", "Explicit second Workspace"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut request = request.clone();
+        if index == 1 {
+            request["operation_key"] =
+                json!(format!("catalog-e2e-{}-second", environment.runtime_id));
+            request["display_name"] = json!(display_name);
+        }
+        let response = send(
+            client
+                .post(format!("{base}/api/workspaces"))
+                .header(COOKIE, &cookie)
+                .header(ORIGIN, BROWSER_ORIGIN)
+                .json(&request),
+            "authenticated actor explicitly creates a Workspace without a Repository",
+            artifacts,
+        )?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created: Value = decode(response)?;
+        assert_eq!(
+            created["workspace"]["owner_account_id"],
+            registered.user.account_id
+        );
+        assert_eq!(created["workspace"]["display_name"], display_name);
+        assert_eq!(created["replayed"], false);
+        assert!(created["repository"].is_null());
+        let id = created["workspace"]["workspace_id"]
+            .as_str()
+            .ok_or("missing Workspace ID")?
+            .to_owned();
+        assert!(!expected.iter().any(|(previous, _)| previous == &id));
+        expected.push((id, display_name));
+
+        let listed: Value = decode(send(
+            client
+                .get(format!("{base}/api/workspaces"))
+                .header(COOKIE, &cookie),
+            "catalog rereads all explicitly created Workspaces without selecting one",
+            artifacts,
+        )?)?;
+        let items = listed.as_array().ok_or("catalog is not an array")?;
+        assert_eq!(items.len(), expected.len());
+        // catalog順序に依存せず、返された各IDで独立したWorkspace contextを選択する。
+        for (id, name) in &expected {
+            let item = items
+                .iter()
+                .find(|item| item["workspace_id"] == *id)
+                .ok_or("created Workspace is absent from catalog")?;
+            assert_eq!(item["display_name"], *name);
+            assert_eq!(item["owner_account_id"], registered.user.account_id);
+            let selected: Value = decode(send(
+                client
+                    .get(format!("{base}/api/w/{id}/workspace"))
+                    .header(COOKIE, &cookie),
+                "explicit catalog ID selects the matching Workspace context",
+                artifacts,
+            )?)?;
+            assert_eq!(selected["workspace_id"], *id);
+            assert_eq!(selected["display_name"], *name);
+            assert_eq!(selected["record_authority"], "server_db");
+            assert_eq!(selected["permissions"]["manage_repositories"], true);
+            let anonymous = send(
+                client.get(format!("{base}/api/w/{id}/workspace")),
+                "explicit Workspace ID alone does not authenticate an anonymous reader",
+                artifacts,
+            )?;
+            assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+            let body = anonymous.text()?;
+            assert!(!body.contains(id));
+            assert!(!body.contains(name));
+        }
+        rejected(
+            send(
+                client.get(format!("{base}/api/workspaces")),
+                "nonempty catalog is not exposed to anonymous visitors",
+                artifacts,
+            )?,
+            StatusCode::UNAUTHORIZED,
+            "authentication required",
+        )?;
+        let admin_catalog: Value = decode(send(
+            client
+                .get(format!("{base}/api/workspaces"))
+                .header(COOKIE, &admin_cookie),
+            "hosting administrator catalog does not include another actor's Workspaces",
+            artifacts,
+        )?)?;
+        assert_eq!(admin_catalog, json!([]));
+    }
+    let unscoped = send(
+        client
+            .get(format!("{base}/api/workspace"))
+            .header(COOKIE, &cookie),
+        "multiple Workspaces cannot silently select the first unscoped API context",
+        artifacts,
+    )?;
+    assert_eq!(unscoped.status(), StatusCode::NOT_FOUND);
+    browser_identity(&client, base, artifacts, &cookie, &registered.user)?;
+    logout(&client, base, artifacts, &cookie)?;
     let report = environment.cleanup()?;
     assert!(report.cleanup_success);
     assert!(!report.fixture_root_exists_after);

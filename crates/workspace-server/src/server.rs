@@ -3387,9 +3387,15 @@ async fn dispatch_workspace_request(
     request: Request,
 ) -> Response {
     let path = request.uri().path().to_owned();
-    // Hosting setup/settings belong to the Server, including zero or multiple
-    // Workspaces. Serving their public shell does not grant their API authority.
-    if path.starts_with("/hosting/") || path == "/activate" {
+    // Public and authentication shells belong to the Server regardless of the
+    // catalog. Their delivery neither selects a Workspace nor grants API access.
+    if matches!(
+        path.as_str(),
+        "/" | "/dashboard" | "/login" | "/register" | "/account" | "/activate" | "/login/device"
+    ) || path.starts_with("/hosting/")
+        || path.starts_with("/_app/")
+        || path.starts_with("/assets/")
+    {
         return serve_server_static_shell(&api, &path).await;
     }
     let workspace_id = scoped_workspace_id(&path);
@@ -40394,7 +40400,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn hosting_shell_is_server_scoped_with_zero_one_or_multiple_workspaces() {
+        async fn entry_shells_are_server_scoped_with_zero_one_or_multiple_workspaces() {
             let dir = tempfile::tempdir().unwrap();
             let mut config = test_server_config(dir.path());
             let assets = dir.path().join("static");
@@ -40415,7 +40421,17 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                for path in ["/hosting/settings", "/hosting/setup"] {
+                for path in [
+                    "/",
+                    "/dashboard",
+                    "/login",
+                    "/register",
+                    "/account",
+                    "/activate",
+                    "/login/device?user_code=ABCD-EFGH",
+                    "/hosting/settings",
+                    "/hosting/setup",
+                ] {
                     let response = app
                         .clone()
                         .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
