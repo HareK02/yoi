@@ -1,5 +1,9 @@
-//! Read-only, bounded Journal context for a new body Session. Selection and text projection
-//! share one storage transaction; no source history, Job, admission or checkpoint is consulted.
+//! Read-only, bounded Journal context at body startup and compaction boundaries.
+//! Selection, text projection, references and processing checkpoints share one storage
+//! transaction. Reads neither consult source history/Job liveness nor mutate recording.
+//! Startup prefers the Host-retained predecessor; compaction requires a live body writer
+//! and prefers its current Session, without waiting for Idle or recording completion.
+//! Both supplement only from the same Subject under the same independent budgets.
 //! This is derived reference material, never a new observation or an execution capability.
 
 use super::*;
@@ -75,6 +79,8 @@ impl SubjektivStore {
         self.context_snapshot(host, previous_session, false)
     }
 
+    /// Read the saved current-Session Journal without reconciling or advancing it.
+    /// The active writer check fences released body lifetimes, not non-Idle execution.
     pub fn journal_compaction_snapshot(
         &self,
         host: &JournalHostContext,
