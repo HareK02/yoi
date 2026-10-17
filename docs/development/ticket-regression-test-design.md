@@ -2,6 +2,8 @@
 
 T-744の設計判断。公開入口で観測した値を次の操作へ渡せることを優先し、保存・配送の既存保証を一巡E2Eで再実装しない。一般則は[テスト設計](rust-testing-strategy.md)・[検証](validation.md)に従う。
 
+以下の提案・未確認・試行値は設計時点の記録であり、現在の実装完了を表さない。恒久化したTools/WIP適合は `crates/workspace-server/src/server_ticket_tools_backend_tests.rs`、Web bytes適合の実行選択と代替境界は [Ticket実応答のWeb適合](../../web/workspace/test/ticket-real-api/README.md) が所有する。lifecycleと移行後公開readは下記の既存suite内で強化し、実session配送のsuiteは重複させない。
+
 ## 対象sourceと判断の前提
 
 - 調査・実行source: `main@develop` の `10d200d9ba8bc313bb7f72eabafc279c9def3cf5`、tree `546e6b517b1a82dd90f2e48f758b1364147dd6e3`。cleanな専用checkoutから `work/T-744-ticket-test-design` を作成した。
@@ -55,7 +57,7 @@ T-744の設計判断。公開入口で観測した値を次の操作へ渡せる
 
 ### B: assignment/MR不要の返却ToolのBackend適合だけ足す（P1）
 
-- **配置・準備/入口:** Aと同suiteに別test `implementation_result_tool_and_wip_keep_host_owned_retry_identity`（提案）。同じ実DB/署名adapter、実装assignmentもMRも持たない登録Worker1件。通知先のOrchestrator委任も不要な状態から開始する。通常ToolとWIP Invokeから `TicketImplementationResult` → Query。kind/bodyだけをモデル入力にし、operation keyは同一 `ToolExecutionContext` のsession/tool_call_idで固定する。
+- **配置・準備/入口:** Aと同suiteに別test `implementation_result_tool_and_wip_keep_host_owned_retry_identity`（提案）。同じ実DB/署名adapter、実装assignmentもMRも持たない登録Worker1件。通知先のOrchestrator委任も不要な状態から開始する。通常ToolとWIP Invokeから `TicketImplementationResult` → Query。kind/bodyだけをモデル入力にし、operation keyは現行 `ToolExecutionContext.call_id` とTicket参照から固定する。contextにsession fieldはなく、`batch_id`/`call_index`は冪等性keyに使わない。Backend側でWorkspaceと認証Workerに束縛するため、session単位の冪等性保証とは称さない。
 - **fault/読取り/assertion:** commit後responseを一度落として同じcontext＋全入力で明示retry。公開エラーがunknownを成功へ変換せず、実storeの結果・notification sourceが各1件、同result_id/receipt、Query本文一致、case/handling/assignments不変、sourceはno_recipientの抑止で後のAssignへ遡及配送されない。後者の局所保存規則は既存 `implementation_result_without_any_assignment_is_authenticated_and_never_retargeted` が実DB・再open・no_recipient/pendingなしを確認済みで、その表を再実装せず公開入口の代表だけ追加する。異contextは別報告、同contextの異bodyは衝突。Host key生成と実Backendのoperation key/actor bindingのずれを検出する。source insert失敗rollbackは既存store試験を再実装しない。
 - **本番/fake・残る不足:** 通常Tools/WIP・Host key生成・署名router・実storeは本番、Runtimeはrecordingでよい。session到達は既存signed HTTP試験が担当。Tool試験だけから実session到達と称さず、両証拠を組にする。この追加は未試行。既存 `implementation_result_transport_key_uses_only_trusted_invocation_identity`・`implementation_result_wip_and_native_dispatch_preserve_trusted_call_context` は固定Transportの局所証拠として維持する。
 - **実行/コスト:** 通常、Aと同target/filter。1 DB fixtureの数秒程度を推定、実Worker startup9秒級を再度増やさない。保守点はHost contextと本番認証bindingの更新に限定する。
