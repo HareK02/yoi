@@ -1,4 +1,5 @@
 import { extname, join, normalize } from "jsr:@std/path@1.1.4";
+import { journalBrowserFixture } from "./journal_browser_fixture.ts";
 
 const port = Number(Deno.args[0]);
 const buildRoot = Deno.args[1];
@@ -491,6 +492,9 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     const foundSubject = subjects.find((item) => item.id === subjectId);
     if (!foundSubject) return json({}, 404);
 
+    if (parts.length === 2 && parts[1] === "journal-browser") {
+      return await journalBrowserFixture(request, subjectId);
+    }
     if (parts.length === 2 && parts[1] === "behavior" && request.method === "PATCH") {
       const payload = await request.json().catch(() => null) as {
         expected_behavior_md?: unknown;

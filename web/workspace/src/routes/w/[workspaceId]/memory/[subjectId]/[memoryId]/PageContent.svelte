@@ -1,6 +1,8 @@
 <script lang="ts">
   // current／historicalはchange_idとcurrent_change_idの一致で区別する。
   // 本文・evidenceの続きも同じimmutable changeへ固定し、現在版の内容を混ぜない。
+  import OriginalSource from '#lib/workspace/memory/OriginalSource.svelte';
+  import { journalHref } from '#lib/workspace/memory/journal-api.ts';
   import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
   import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';
   import type {
@@ -62,6 +64,13 @@
       evidence_cursor: memory.evidence_next_cursor,
     });
     return `${memoryPath()}?${query}`;
+  }
+
+  function journalPage(values: Record<string, string | null>): string {
+    const query = new URLSearchParams(data.journalQuery ?? '');
+    if (memory) query.set('change_id', memory.change_id);
+    for (const [key, value] of Object.entries(values)) value == null ? query.delete(key) : query.set(key, value);
+    return `${memoryPath()}?${query}#related-journal`;
   }
 
   function label(value: string): string {
@@ -144,6 +153,51 @@
           <a href={bodyContinuationHref() ?? undefined}>View next body segment</a>
         </div>
       {/if}
+    </section>
+
+    <section id="related-journal" class="detail-section" aria-labelledby="related-journal-heading">
+      <h2 id="related-journal-heading">関連するJournal</h2>
+      {#if data.journalSources}
+        {#if data.journalSources.length === 0}<p class="empty-copy">{memory.evidence_has_more ? 'この根拠ページにJournal参照はありません。' : 'この根拠ページでは対応するJournalは未接続です。'}</p>{/if}
+        {#each data.journalSources as group (group.candidateId)}
+          {#if group.result.data}
+            {#if group.result.data.sources.length === 0}<p class="empty-copy">{group.result.data.total_sources === 0 ? '対応するJournalは未接続です。' : 'このページに参照はありません。参照一覧の先頭へ戻ってください。'}</p>{/if}
+            <ul class="journal-link-list">
+              {#each group.result.data.sources as source (source.link.source_index)}
+                <li>
+                  {#if source.link.connection.state === 'linked' && source.entry}
+                    <a href={journalHref(data.workspaceId, data.subjectId, { journal: source.entry.journal_id, entry: source.entry.id })}>{formatDate(source.entry.created_at)} · {source.entry.title} →</a>
+                    {#if source.link.connection.reconsideration}<p class="staleness">訂正あり・このMemoryの再検討が必要</p>{/if}
+                  {:else if source.link.connection.state === 'unconnected'}
+                    <p class="empty-copy">対応するJournalは未接続{source.link.connection.reason === 'journal_not_fixed' ? '（Journalの確定前）' : ''}</p>
+                  {:else}<p class="empty-copy">関連Journalは{source.link.connection.target === 'erased' ? '消去済み' : '取得不能'}です。</p>{/if}
+                </li>
+              {/each}
+            </ul>
+            {#if group.result.data.next_source_index !== null}
+              <a href={journalPage({ journal_candidate: group.candidateId, journal_source_offset: String(group.result.data.next_source_index) })}>すべて見る（関連Journalの続き） →</a>
+            {/if}
+          {:else}<div class="memory-state is-error" role="alert"><p>Journal参照を取得できません。{group.result.error}</p></div>{/if}
+        {/each}
+        {#if data.journalCandidateNext != null}<a href={journalPage({ journal_candidate_offset: String(data.journalCandidateNext), journal_candidate: null, journal_source_offset: null })}>すべて見る（次の根拠候補の関連Journal） →</a>{/if}
+        {#if new URLSearchParams(data.journalQuery ?? '').has('journal_candidate') || new URLSearchParams(data.journalQuery ?? '').has('journal_candidate_offset')}
+          <a href={journalPage({ journal_candidate: null, journal_source_offset: null, journal_candidate_offset: null })}>Journal参照一覧の先頭へ</a>
+        {/if}
+        {#if memory.evidence_has_more && evidenceContinuationHref()}<a href={evidenceContinuationHref() ?? undefined}>次の根拠ページの関連Journalを見る →</a>{/if}
+      {:else}<p class="empty-copy">Journal参照を取得できません。</p>{/if}
+    </section>
+
+    <section class="detail-section" aria-label="原資料">
+      <h2>原資料</h2>
+      {#if data.journalSources?.length}
+        {#each data.journalSources as group (group.candidateId)}
+          {#if group.result.data}
+            {#each group.result.data.sources as source (source.link.source_index)}
+              <div><span class="empty-copy">原資料 {source.link.source_index + 1}</span><OriginalSource source={source.original_source} /></div>
+            {/each}
+          {:else}<p class="empty-copy">原資料の状態を取得できません。</p>{/if}
+        {/each}
+      {:else}<p class="empty-copy">この根拠ページに原資料の状態はありません。</p>{/if}
     </section>
 
     <section class="detail-section provenance-section" aria-labelledby="provenance-heading">
@@ -287,6 +341,9 @@
 </section>
 
 <style>
+  .journal-link-list { display: grid; gap: var(--space-3); padding: 0; margin: 0; list-style: none; }
+  .journal-link-list a { overflow-wrap: anywhere; }
+
   .memory-page {
     display: grid;
     flex: 0 0 auto;

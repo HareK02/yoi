@@ -70,7 +70,10 @@ fn page_limit(limit: usize) -> JournalResult<usize> {
     }
     Ok(limit)
 }
-fn fit_page<T: Serialize>(rows: Vec<(String, T)>, mut more: bool) -> JournalResult<JournalPage<T>> {
+pub(super) fn fit_page<T: Serialize>(
+    rows: Vec<(String, T)>,
+    mut more: bool,
+) -> JournalResult<JournalPage<T>> {
     let mut page = JournalPage {
         items: Vec::new(),
         next: None,
@@ -162,7 +165,7 @@ pub(super) fn journal(
     }
     Ok(j)
 }
-fn entry(tx: &Connection, journal_id: &str, id: &str) -> JournalResult<JournalEntry> {
+pub(super) fn entry(tx: &Connection, journal_id: &str, id: &str) -> JournalResult<JournalEntry> {
     let row = tx.query_row("SELECT id, journal_id, position, state, title, body, ongoing, source_end_json, created_at, updated_at, fixed_at FROM journal_entries WHERE journal_id=?1 AND id=?2", params![journal_id, id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?,r.get::<_,Option<String>>(10)?))).optional()?.ok_or_else(|| JournalError::NotFound(id.into()))?;
     let mut stmt = tx.prepare(
         "SELECT target_id FROM journal_corrections WHERE entry_id=?1 ORDER BY target_id",
