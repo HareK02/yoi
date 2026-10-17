@@ -36926,6 +36926,9 @@ mod db_execution_tests;
 mod tests {
     mod assignment_delivery_tests {
         include!("server_assignment_delivery_tests.rs");
+        mod ticket_web_roundtrip_tests {
+            include!("server_ticket_web_roundtrip_tests.rs");
+        }
     }
 
     mod assignment_start_tests {
@@ -36933,6 +36936,10 @@ mod tests {
     }
     mod assignment_tracking_tests {
         include!("server_assignment_tracking_tests.rs");
+        mod tools_backend_tests {
+            use super::*;
+            include!("server_ticket_tools_backend_tests.rs");
+        }
     }
 
     mod ticket_case_signed_tests {

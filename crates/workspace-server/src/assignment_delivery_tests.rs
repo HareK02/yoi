@@ -619,11 +619,34 @@ async fn assignment_delivery_rendered_content_is_immutable_across_restart_and_co
 
 #[test]
 fn assignment_delivery_schema92_upgrade_uses_reconciled_migration_evidence_not_legacy_history() {
+    use crate::authority::{SqliteWorkspaceAuthority, TicketAuthority};
+    use server_api::{TicketQueryRequest, TicketShowRequest};
+    use ticket::{SqliteTicketBackend, TicketBackend, TicketIdOrSlug};
+
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("schema92.db");
     // A genuine retained Ticket-10/Workspace-91 fixture goes through its actual
     // applied tracking migration; no current DB markers or columns are lowered.
     let conn = tracking_schema91_fixture(&path);
+    // Public browse needs the resource-key rows a real old Workspace already
+    // stored. Seed that old input before migration, never patch its projection.
+    let ids: Vec<String> = conn
+        .prepare("SELECT ticket_id FROM typed_tickets ORDER BY ticket_id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    for id in ids {
+        allocate_resource_key(
+            &conn,
+            "w",
+            WorkspaceResourceKind::Ticket,
+            &id,
+            "2026-10-10T00:00:00Z",
+        )
+        .unwrap();
+    }
     migrate_ticket_tracking_v91_to_v92(&conn).unwrap();
     assert_eq!(current_schema_version(&conn).unwrap(), 92);
     let assignments = stored_fixture_rows(&conn, "ticket_worker_assignments");
@@ -668,6 +691,176 @@ fn assignment_delivery_schema92_upgrade_uses_reconciled_migration_evidence_not_l
             Ok(())
         })
         .unwrap();
+    drop(store);
+    let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+    let authority = SqliteWorkspaceAuthority::new(&path, "w").unwrap();
+    let backend = SqliteTicketBackend::open_verified(&path, "w").unwrap();
+    let principal = ticket::TicketAssignmentPrincipalSnapshot::WorkspaceAgent {
+        agent_key: "workspace-orchestrator".into(),
+    };
+    for (id, status, legacy_state) in [
+        (
+            "pending",
+            Some(TicketAssignmentTrackingStatus::Waiting),
+            "queued",
+        ),
+        (
+            "progress",
+            Some(TicketAssignmentTrackingStatus::Inprogress),
+            "inprogress",
+        ),
+        ("closed-reopen", None, "queued"),
+        ("historical-done", None, "done"),
+    ] {
+        let stored = reopened
+            .get_ticket_assignment_tracking("w", id, &format!("a-{id}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.tracking.as_ref().map(|t| t.status), status, "{id}");
+        assert_eq!(stored.principal, principal, "{id}");
+        assert!(stored.current, "{id}");
+        assert!(stored.last_event_id.is_some(), "{id}");
+        assert!(stored.migration_diagnostic.is_some(), "{id}");
+        let detail = authority.ticket(id).unwrap();
+        assert_eq!(detail.assignment_tracking, vec![stored], "{id}");
+        assert_eq!(
+            authority.ticket_assignment_tracking(id).unwrap(),
+            detail.assignment_tracking,
+            "{id}"
+        );
+        let shown = authority
+            .show_ticket(id, TicketShowRequest::default())
+            .unwrap();
+        assert_eq!(
+            shown.assignment_tracking, detail.assignment_tracking,
+            "{id}"
+        );
+        let saved_ticket = backend.show(TicketIdOrSlug::Id(id.into())).unwrap();
+        assert_eq!(
+            detail.state.as_str(),
+            saved_ticket.meta.workflow_state.as_str(),
+            "{id}"
+        );
+        assert_eq!(detail.closure_history, saved_ticket.case_history, "{id}");
+        assert_eq!(
+            detail.legacy_handoff, saved_ticket.legacy_workflow_snapshot,
+            "{id}"
+        );
+        assert_eq!(
+            detail.legacy_handoff.as_ref().unwrap().workflow_state,
+            legacy_state,
+            "{id}"
+        );
+        assert_eq!(shown.closure_history, detail.closure_history, "{id}");
+        assert_eq!(shown.legacy_handoff, detail.legacy_handoff, "{id}");
+        assert_eq!(
+            detail.state.as_str(),
+            if id == "historical-done" {
+                "closed"
+            } else {
+                "open"
+            },
+            "{id}"
+        );
+        if id == "closed-reopen" {
+            assert_eq!(detail.closure_history.len(), 2);
+            assert_eq!(
+                detail.closure_history[0].action,
+                ticket::TicketCaseAction::Close {
+                    reason: ticket::TicketClosureReason::Unknown
+                }
+            );
+            assert_eq!(
+                detail.closure_history[1].action,
+                ticket::TicketCaseAction::Reopen
+            );
+        }
+    }
+    let assigned = authority
+        .query_tickets(TicketQueryRequest {
+            assigned_principal: Some(principal.clone()),
+            limit: Some(100),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut assigned_ids = assigned
+        .items
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<Vec<_>>();
+    assigned_ids.sort_unstable();
+    assert_eq!(
+        assigned_ids,
+        vec![
+            "closed-reopen",
+            "historical-done",
+            "invalid-fence",
+            "no-snapshot",
+            "pending",
+            "progress",
+            "replaced"
+        ]
+    );
+    assert!(!assigned.page.has_more);
+    for item in &assigned.items {
+        assert_eq!(
+            item.assignment_tracking,
+            reopened
+                .list_current_ticket_assignment_tracking("w", &item.id)
+                .unwrap(),
+            "{}",
+            item.id
+        );
+        let detail = authority.ticket(&item.id).unwrap();
+        assert_eq!(item.legacy_handoff, detail.legacy_handoff, "{}", item.id);
+        assert_eq!(item.state, detail.state, "{}", item.id);
+    }
+    for (status, expected) in [
+        (TicketAssignmentTrackingStatus::Waiting, vec!["pending"]),
+        (TicketAssignmentTrackingStatus::Inprogress, vec!["progress"]),
+        (TicketAssignmentTrackingStatus::Done, vec![]),
+    ] {
+        let filtered = authority
+            .query_tickets(TicketQueryRequest {
+                assigned_principal: Some(principal.clone()),
+                handling_status: Some(status),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            filtered
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{status:?}"
+        );
+        assert!(!filtered.page.has_more, "{status:?}");
+        assert!(filtered.page.next_cursor.is_none(), "{status:?}");
+    }
+    assert!(
+        authority
+            .query_tickets(TicketQueryRequest {
+                assigned_principal: Some(
+                    ticket::TicketAssignmentPrincipalSnapshot::WorkspaceAgent {
+                        agent_key: "other-agent".into(),
+                    }
+                ),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert_eq!(
+        reopened
+            .list_pending_ticket_assignment_deliveries("w", 100)
+            .unwrap(),
+        pending
+    );
 }
 
 #[tokio::test]

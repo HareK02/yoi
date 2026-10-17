@@ -319,6 +319,39 @@ async fn assignment_waiting_self_report_does_not_loop_but_external_answer_is_del
     delivery_stop(&api, &worker);
 }
 
+async fn delivery_public_assignment_snapshot(
+    api: &WorkspaceApi,
+    ticket: &str,
+    assignment: &str,
+) -> (Value, Value, Value) {
+    let root = format!("/workspaces/{TEST_WORKSPACE_ID}/tickets/{ticket}");
+    let detail = delivery_http(
+        api,
+        "GET",
+        &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}"),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    let retained = delivery_http(
+        api,
+        "GET",
+        &format!("{root}/assignment-tracking?assignment_id={assignment}"),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    let history = delivery_http(
+        api,
+        "GET",
+        &format!("{root}/assignment-tracking/history?assignment_id={assignment}&limit=100"),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    (detail, retained, history)
+}
+
 #[tokio::test]
 async fn assignment_done_historical_inputs_do_not_restart_work_but_reissue_is_new_delegation() {
     let dir = tempfile::tempdir().unwrap();
@@ -331,6 +364,25 @@ async fn assignment_done_historical_inputs_do_not_restart_work_but_reissue_is_ne
     let initial = delivery_tracking(&api, &ticket.id, assignment);
     delivery_self_report(&api, &identity, &worker, &initial, "done", "return-options").await;
     let done = delivery_tracking(&api, &ticket.id, assignment);
+    let (done_detail, done_public, done_history) =
+        delivery_public_assignment_snapshot(&api, &ticket.id, assignment).await;
+    let expected_done = serde_json::to_value(&done).unwrap();
+    assert_eq!(
+        expected_done["tracking"]["result"],
+        "Returned options without closing"
+    );
+    assert_eq!(done_detail["state"], "open");
+    assert_eq!(done_detail["assignment_tracking"], json!([expected_done]));
+    assert_eq!(done_public, done_detail["assignment_tracking"]);
+    let history_items = done_history["items"].as_array().unwrap();
+    assert_eq!(history_items.len(), 2, "initial waiting and reported done");
+    assert_eq!(history_items[0]["tracking"]["status"], "waiting");
+    assert_eq!(
+        history_items[1]["event_id"],
+        done.last_event_id.as_deref().unwrap()
+    );
+    assert_eq!(history_items[1]["tracking"], expected_done["tracking"]);
+    assert!(done_history["next_event_id"].is_null());
     assert_eq!(
         api.authority.ticket(&ticket.id).unwrap().state.as_str(),
         "open"
@@ -373,6 +425,29 @@ async fn assignment_done_historical_inputs_do_not_restart_work_but_reissue_is_ne
             "case history must not revive done delegation"
         );
         assert_eq!(delivery_tracking(&api, &ticket.id, assignment), done);
+        let (detail, public, history) =
+            delivery_public_assignment_snapshot(&api, &ticket.id, assignment).await;
+        assert_eq!(
+            detail["state"],
+            if key == "close-return" {
+                "closed"
+            } else {
+                "open"
+            }
+        );
+        assert_eq!(
+            detail["closure_history"].as_array().unwrap().len(),
+            if key == "close-return" { 1 } else { 2 }
+        );
+        assert_eq!(
+            detail["assignment_tracking"],
+            done_detail["assignment_tracking"]
+        );
+        assert_eq!(public, done_public, "case decision rewrote public handling");
+        assert_eq!(
+            history, done_history,
+            "case decision rewrote handling history"
+        );
     }
     let reassigned = delivery_assign(&api, &ticket.id, "reissue-return").await;
     let new_assignment = reassigned["assignment"]["assignment_id"].as_str().unwrap();
@@ -395,6 +470,69 @@ async fn assignment_done_historical_inputs_do_not_restart_work_but_reissue_is_ne
             .status,
         ticket::TicketAssignmentTrackingStatus::Waiting
     );
+    let (detail, old_public, old_history) =
+        delivery_public_assignment_snapshot(&api, &ticket.id, assignment).await;
+    let (_, new_public, new_history) =
+        delivery_public_assignment_snapshot(&api, &ticket.id, new_assignment).await;
+    assert_eq!(detail["state"], "open");
+    assert_eq!(detail["closure_history"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        old_public,
+        json!([serde_json::to_value(&retained).unwrap()])
+    );
+    assert_eq!(old_public[0]["tracking"], expected_done["tracking"]);
+    assert_eq!(
+        old_public[0]["last_event_id"],
+        expected_done["last_event_id"]
+    );
+    assert_eq!(old_public[0]["release"]["action"], "replaced");
+    assert_eq!(
+        old_public[0]["release"]["replacement_assignment_id"],
+        new_assignment
+    );
+    assert_eq!(old_public[0]["release"]["operation_key"], "reissue-return");
+    assert_eq!(old_history, done_history, "reissue changed old history");
+    assert_eq!(detail["assignment_tracking"], new_public);
+    assert_eq!(new_public[0]["assignment_id"], new_assignment);
+    assert_eq!(new_public[0]["current"], true);
+    assert_eq!(new_public[0]["tracking"]["status"], "waiting");
+    assert!(new_public[0]["tracking"]["result"].is_null());
+    assert!(new_public[0]["release"].is_null());
+    assert_eq!(new_history["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        new_history["items"][0]["event_id"],
+        new_public[0]["last_event_id"]
+    );
+    // Follow the public cursor rather than assuming current-first ordering.
+    let page_root = format!(
+        "/workspaces/{TEST_WORKSPACE_ID}/tickets/{}/assignment-tracking/assignments",
+        ticket.id
+    );
+    let first = delivery_http(
+        &api,
+        "GET",
+        &format!("{page_root}?limit=1"),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    let cursor = first["next_assignment_id"]
+        .as_str()
+        .expect("two assignments need a cursor");
+    let second = delivery_http(
+        &api,
+        "GET",
+        &format!("{page_root}?limit=1&after_assignment_id={cursor}"),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(second["next_assignment_id"].is_null());
+    assert_eq!(first["items"].as_array().unwrap().len(), 1);
+    assert_eq!(second["items"].as_array().unwrap().len(), 1);
+    let rows = [&first["items"][0], &second["items"][0]];
+    assert!(rows.contains(&&old_public[0]));
+    assert!(rows.contains(&&new_public[0]));
     // An exact old Assign retry returns its receipt, never revives old work.
     assert_eq!(
         delivery_assign(&api, &ticket.id, "assign-return").await,
