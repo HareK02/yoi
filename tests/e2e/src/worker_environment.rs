@@ -974,10 +974,18 @@ impl ManagedProcess {
     fn wait_for_address(&self, marker: &str, timeout: Duration) -> Result<String> {
         let start = Instant::now();
         loop {
-            let output = self.output();
-            if let Some(address) = parse_address_after(&output, marker) {
+            // stdout/stderrの結合で補った改行をready記録と誤認しない。
+            // readerが受信した各streamの完全な行だけを判定する。
+            let address = [&self.stdout, &self.stderr]
+                .into_iter()
+                .find_map(|capture| {
+                    let bytes = capture.lock().ok()?;
+                    parse_address_after(&String::from_utf8_lossy(&bytes), marker)
+                });
+            if let Some(address) = address {
                 return Ok(address);
             }
+            let output = self.output();
             if start.elapsed() >= timeout {
                 return Err(HarnessError::Protocol(format!(
                     "timed out waiting for {} address after {marker:?}; bounded output: {}",
@@ -1106,14 +1114,22 @@ fn capture_stream(
 }
 
 fn parse_address_after(output: &str, marker: &str) -> Option<String> {
-    let rest = output.split(marker).nth(1)?;
-    let address = rest
-        .trim_start()
-        .split(|character: char| character.is_whitespace() || character == ';' || character == '`')
-        .next()?
-        .trim_start_matches("http://")
-        .trim_end_matches('/');
-    (!address.is_empty()).then(|| address.to_string())
+    output
+        .split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+        .find_map(|line| {
+            let rest = line.split_once(marker)?.1;
+            let address = rest
+                .trim_start()
+                .split(|character: char| {
+                    character.is_whitespace() || character == ';' || character == '`'
+                })
+                .next()?
+                .trim_start_matches("http://")
+                .trim_end_matches('/');
+            let socket: std::net::SocketAddr = address.parse().ok()?;
+            (socket.port() != 0).then(|| address.to_string())
+        })
 }
 
 fn assert_absent_or_empty(path: &Path, label: &str) -> Result<()> {
@@ -1155,4 +1171,37 @@ fn bounded_text(bytes: &[u8], limit: usize) -> String {
 
 fn io_error(operation: &str, error: std::io::Error) -> HarnessError {
     HarnessError::Protocol(format!("{operation}: {error}"))
+}
+
+#[cfg(test)]
+mod startup_address_tests {
+    use super::parse_address_after;
+
+    #[test]
+    fn startup_address_waits_for_complete_valid_socket_record() {
+        let record = "yoi-server listening on http://127.0.0.1:49123\n";
+        for boundary in 0..record.len() {
+            assert_eq!(parse_address_after(&record[..boundary], "on http://"), None);
+        }
+        assert_eq!(
+            parse_address_after(record, "on http://").as_deref(),
+            Some("127.0.0.1:49123")
+        );
+        assert_eq!(
+            parse_address_after("on http://[::1]:12345\n", "on http://").as_deref(),
+            Some("[::1]:12345")
+        );
+        for invalid in [
+            "127",
+            "127.0.0.1",
+            "127.0.0.1:0",
+            "hostname:123",
+            "127.0.0.1:99999",
+        ] {
+            assert_eq!(
+                parse_address_after(&format!("on http://{invalid}\n"), "on http://"),
+                None
+            );
+        }
+    }
 }

@@ -8,7 +8,10 @@ pub mod store;
 pub mod subjektiv;
 mod subjektiv_sessions;
 
-pub use host::{StandaloneHost, StandaloneShutdownError, StandaloneStartupError};
+pub use host::{
+    StandaloneHost, StandaloneShutdownError, StandaloneStartupError,
+    StandaloneSubjectDisconnectError,
+};
 pub use launch::{ResolvedStandaloneLaunch, StandaloneLaunchConfig, StandaloneLaunchError};
 pub use protocol::WorkerId;
 pub use store::{

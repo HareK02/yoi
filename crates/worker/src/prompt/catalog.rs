@@ -102,6 +102,7 @@ pub enum WorkerPrompt {
     ResidentMemorySummarySection,
     ResidentMemoryRestoreSection,
     SubjektivResidentContext,
+    SubjektivJournalStartup,
     WorkerOrchestrationGuidanceSection,
     SubWorkerSpawnToolDescription,
 }
@@ -126,6 +127,7 @@ impl WorkerPrompt {
             Self::AgentsMdSection => "internal.agents_md_section",
             Self::ResidentMemorySummarySection => "internal.resident_memory_summary_section",
             Self::ResidentMemoryRestoreSection => "internal.resident_memory_restore_section",
+            Self::SubjektivJournalStartup => "internal.subjektiv_journal_startup",
             Self::SubjektivResidentContext => "internal.subjektiv_resident_context",
             Self::WorkerOrchestrationGuidanceSection => {
                 "internal.worker_orchestration_guidance_section"
@@ -151,6 +153,7 @@ impl WorkerPrompt {
         WorkerPrompt::ResidentMemorySummarySection,
         WorkerPrompt::ResidentMemoryRestoreSection,
         WorkerPrompt::SubjektivResidentContext,
+        WorkerPrompt::SubjektivJournalStartup,
         WorkerPrompt::WorkerOrchestrationGuidanceSection,
         WorkerPrompt::SubWorkerSpawnToolDescription,
     ];
@@ -537,6 +540,14 @@ impl PromptCatalog {
             minijinja::context! {
                 surface_ready => surface_ready,
                 summary => summary.unwrap_or_default(),
+            },
+        )
+    }
+    pub fn subjektiv_journal_startup(&self, snapshot_json: &str) -> Result<String, CatalogError> {
+        self.render(
+            WorkerPrompt::SubjektivJournalStartup,
+            minijinja::context! {
+                snapshot_json => snapshot_json,
             },
         )
     }

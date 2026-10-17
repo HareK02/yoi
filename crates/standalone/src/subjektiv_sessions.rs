@@ -178,6 +178,58 @@ pub(crate) fn authorized_sessions_path(
     .map_err(|error: Failure| SubjektivHostError::Unavailable(error.message))
 }
 
+/// Checks only saved ownership and filesystem metadata, never Session bytes or a Worker restore.
+/// Inaccessible/corrupt storage stays unknown rather than being reported as absent.
+pub(crate) fn original_session_presence(
+    state_root: &Path,
+    scope_id: &str,
+    subject_id: &str,
+    store: &SubjektivStore,
+    session_id: &str,
+) -> Option<bool> {
+    let attribution = store.session_attribution(session_id).ok()??;
+    if store.scope_id() != scope_id
+        || attribution.subject_id != subject_id
+        || attribution.runtime_id != scope_id
+    {
+        return None;
+    }
+    let worker: WorkerId = attribution.worker_id.parse().ok()?;
+    let session: SessionId = session_id.parse().ok()?;
+    let active = StandaloneWorkerStore::open_existing(state_root).ok()?;
+    let (workers, record) = match active.load(worker) {
+        Ok(record) => (active, record),
+        Err(StandaloneStoreError::WorkerNotFound(_)) => {
+            let root = state_root.join("subjektiv").join("retained-workers");
+            match std::fs::metadata(&root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+                Err(_) => return None,
+                Ok(_) => {}
+            }
+            let retained = StandaloneWorkerStore::open_existing(root).ok()?;
+            match retained.load(worker) {
+                Ok(record) => (retained, record),
+                Err(StandaloneStoreError::WorkerNotFound(_)) => return Some(false),
+                Err(_) => return None,
+            }
+        }
+        Err(_) => return None,
+    };
+    if record.worker_id != worker
+        || !record
+            .subject
+            .as_ref()
+            .is_some_and(|binding| binding.scope_id == scope_id && binding.subject_id == subject_id)
+    {
+        return None;
+    }
+    match std::fs::metadata(workers.sessions_dir(worker).join(session.to_string())) {
+        Ok(metadata) if metadata.is_dir() => Some(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        _ => None,
+    }
+}
+
 fn authorized_index_with_reader(
     state_root: &Path,
     scope_id: &str,

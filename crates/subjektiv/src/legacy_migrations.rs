@@ -953,11 +953,12 @@ mod tests {
             store.session_attribution("session-1").unwrap().unwrap(),
             stored_attribution
         );
-        let host = crate::journal::JournalHostContext::validated_session(
-            &store,
-            stored_attribution.clone(),
-        )
-        .unwrap();
+        let binding = store
+            .claim_journal_writer(&subject_id, "runtime-1", "worker-1")
+            .unwrap();
+        let host = store
+            .bind_journal_session(&binding, stored_attribution.clone())
+            .unwrap();
         let range = crate::journal::JournalSourceRange {
             source: crate::journal::JournalSource {
                 session_id: stored_attribution.session_id.clone(),

@@ -356,6 +356,109 @@ impl Drop for WorkerOperationLease {
 }
 
 impl Runtime {
+    /// Reserves the actual Controller while the Host reconciles final saved Journal material.
+    /// A Runtime restart loses proof of a reservation, never reconstructs it from Worker status.
+    pub fn subject_release_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        request: runtime_api::SubjectReleaseRequest,
+    ) -> Result<runtime_api::SubjectReleaseResponse, RuntimeError> {
+        use runtime_api::SubjectReleaseAction as Action;
+        if request.workspace_id != scope.workspace_id
+            || request.binding_id.trim().is_empty()
+            || request.operation_id.trim().is_empty()
+            || request.binding_id.len() > 512
+            || request.operation_id.len() > 512
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "invalid Subject release identity".into(),
+            ));
+        }
+        let worker_ref = WorkerRef::new(request.worker_id);
+        let lease = self.worker_operation_lock(request.worker_id)?;
+        let _operation = lease.lock().map_err(|_| RuntimeError::StatePoisoned)?;
+        self.ensure_worker_in_workspace(scope, &worker_ref)?;
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            let worker = state.worker(&worker_ref)?;
+            if worker.has_pending_lifecycle_operation() {
+                return Err(RuntimeError::InvalidRequest(
+                    "Subject lifecycle is unresolved".into(),
+                ));
+            }
+            if let Some((saved, _)) = state
+                .subject_release_operations
+                .get(&(request.worker_id, request.operation_id.clone()))
+            {
+                if saved.operation_id != request.operation_id
+                    || saved.binding_id != request.binding_id
+                    || saved.workspace_id != request.workspace_id
+                {
+                    return Err(RuntimeError::InvalidRequest(
+                        "different Subject release is retained".into(),
+                    ));
+                }
+            } else if request.action != Action::Reserve {
+                return Err(RuntimeError::InvalidRequest(
+                    "Subject reservation is absent or lost; retain occupancy".into(),
+                ));
+            } else {
+                state.ensure_subject_not_reserved(&worker_ref, false)?;
+            }
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::InvalidRequest("actual Controller reservation is unavailable".into())
+            })?
+        };
+        let key = (request.worker_id, request.operation_id.clone());
+        {
+            let mut state = self.lock()?;
+            if let Some((_, saved)) = state.subject_release_operations.get(&key) {
+                if *saved == runtime_api::SubjectReleaseState::Cancelled {
+                    if request.action != Action::Cancel {
+                        return Err(RuntimeError::InvalidRequest(
+                            "cancelled release cannot be rearmed; use a new operation".into(),
+                        ));
+                    }
+                    return Ok(runtime_api::SubjectReleaseResponse {
+                        operation_id: request.operation_id,
+                        binding_id: request.binding_id,
+                        state: *saved,
+                    });
+                }
+            } else {
+                // Persist admission exclusion before any Controller ACK, under the Worker op
+                // lock. Restart retains this fence without manufacturing disconnect proof.
+                state.subject_release_operations.insert(
+                    key.clone(),
+                    (request.clone(), runtime_api::SubjectReleaseState::Reserved),
+                );
+            }
+            state.persist_runtime_snapshot()?;
+        }
+        let response = backend
+            .subject_release(&request)
+            .map_err(RuntimeError::InvalidRequest)?;
+        if response.binding_id != request.binding_id
+            || response.operation_id != request.operation_id
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "Subject release acknowledgment mismatch".into(),
+            ));
+        }
+        let mut state = self.lock()?;
+        let before = state
+            .subject_release_operations
+            .insert(key.clone(), (request.clone(), response.state));
+        if let Err(error) = state.persist_runtime_snapshot() {
+            if let Some(before) = before {
+                state.subject_release_operations.insert(key, before);
+            }
+            return Err(error);
+        }
+        Ok(response)
+    }
+
     fn reserve_workdir_use<'a>(
         &self,
         ids: impl IntoIterator<Item = &'a str>,
@@ -1961,6 +2064,8 @@ impl Runtime {
         let _operation_guard = operation_lock
             .lock()
             .map_err(|_| RuntimeError::StatePoisoned)?;
+        self.lock()?
+            .ensure_subject_not_reserved(worker_ref, false)?;
         if let Some(scope) = scope {
             let mut state = self.lock()?;
             if !state
@@ -2332,6 +2437,8 @@ impl Runtime {
         mode: WorkerRestoreMode,
         preparation_authorized: bool,
     ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
+        self.lock()?
+            .ensure_subject_not_reserved(worker_ref, false)?;
         let owner = {
             let state = self.lock()?;
             let worker = state.worker(worker_ref)?;
@@ -2586,6 +2693,8 @@ impl Runtime {
         worker_ref: &WorkerRef,
         mode: WorkerRestoreMode,
     ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
+        self.lock()?
+            .ensure_subject_not_reserved(worker_ref, false)?;
         let fresh_operation_id = {
             let state = self.lock()?;
             let worker = state.worker(worker_ref)?;
@@ -3007,6 +3116,7 @@ impl Runtime {
 
     fn ensure_worker_operation_settled(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
         let state = self.lock()?;
+        state.ensure_subject_not_reserved(worker_ref, false)?;
         let worker = state.worker(worker_ref)?;
         if let Some(operation) = worker.pending_lifecycle_operation_name() {
             return Err(RuntimeError::WorkerExecutionUnavailable {
@@ -3803,6 +3913,7 @@ impl Runtime {
             self.ensure_worker_in_workspace(scope, worker_ref)?;
         }
 
+        self.lock()?.ensure_subject_not_reserved(worker_ref, true)?;
         let (backend, pending_stop, pending_restore, status) = {
             let state = self.lock()?;
             state.ensure_running()?;
@@ -3980,6 +4091,7 @@ impl Runtime {
             let state = self.lock()?;
             state.ensure_running()?;
             state.ensure_worker_ref(worker_ref)?;
+            state.ensure_subject_not_reserved(worker_ref, true)?;
             let worker = state.worker(worker_ref)?;
             if let Some(operation) = worker.pending_lifecycle_operation_name() {
                 return Err(RuntimeError::InvalidRequest(format!(
@@ -4270,7 +4382,10 @@ impl Runtime {
                 .workers
                 .values()
                 .filter(|worker| {
-                    worker.restore_guard.active_request_id.is_none()
+                    state
+                        .ensure_subject_not_reserved(&worker.worker_ref, false)
+                        .is_ok()
+                        && worker.restore_guard.active_request_id.is_none()
                         && worker.pending_restore.is_none()
                         && worker.pending_stop.is_none()
                         && worker.execution_bound
@@ -4313,7 +4428,12 @@ impl Runtime {
                 state
                     .workers
                     .values()
-                    .filter(|worker| worker.pending_stop.is_none())
+                    .filter(|worker| {
+                        worker.pending_stop.is_none()
+                            && state
+                                .ensure_subject_not_reserved(&worker.worker_ref, false)
+                                .is_ok()
+                    })
                     .filter_map(|worker| {
                         worker
                             .pending_restore
@@ -5362,6 +5482,13 @@ struct RuntimeState {
     #[cfg(feature = "fs-store")]
     next_diagnostic_id: u64,
     workers: BTreeMap<WorkerId, WorkerRecord>,
+    subject_release_operations: BTreeMap<
+        (WorkerId, String),
+        (
+            runtime_api::SubjectReleaseRequest,
+            runtime_api::SubjectReleaseState,
+        ),
+    >,
     workdir_operations: BTreeMap<String, WorkdirOperation>,
     workspace_owners: BTreeMap<String, String>,
     config_bundles: BTreeMap<String, ConfigBundle>,
@@ -5392,6 +5519,7 @@ impl RuntimeState {
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
+            subject_release_operations: BTreeMap::new(),
             workdir_operations: BTreeMap::new(),
             workspace_owners: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
@@ -5423,6 +5551,7 @@ impl RuntimeState {
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
+            subject_release_operations: BTreeMap::new(),
             workdir_operations: BTreeMap::new(),
             workspace_owners: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
@@ -5568,6 +5697,16 @@ impl RuntimeState {
             workspace_backend_resource_clients: BTreeMap::new(),
             next_diagnostic_id,
             workers,
+            subject_release_operations: persisted
+                .subject_releases
+                .into_iter()
+                .map(|(request, state)| {
+                    (
+                        (request.worker_id, request.operation_id.clone()),
+                        (request, state),
+                    )
+                })
+                .collect(),
             workdir_operations: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
             workspace_config_latest: BTreeMap::new(),
@@ -5588,6 +5727,7 @@ impl RuntimeState {
     #[cfg(feature = "fs-store")]
     fn persisted_state(&self) -> PersistedRuntimeState {
         PersistedRuntimeState {
+            subject_releases: self.subject_release_operations.values().cloned().collect(),
             display_name: self.display_name.clone(),
             status: self.status,
             next_diagnostic_id: self.next_diagnostic_id,
@@ -5728,6 +5868,28 @@ impl RuntimeState {
         &self,
         _request: &CreateWorkerRequest,
     ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    fn ensure_subject_not_reserved(
+        &self,
+        worker: &WorkerRef,
+        allow_disconnected: bool,
+    ) -> Result<(), RuntimeError> {
+        use runtime_api::SubjectReleaseState as State;
+        if self
+            .subject_release_operations
+            .iter()
+            .any(|((id, _), (_, state))| {
+                *id == worker.worker_id
+                    && (*state == State::Reserved
+                        || (!allow_disconnected && *state == State::Disconnected))
+            })
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "Subject Controller is reserved for release or disconnected".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -6777,8 +6939,7 @@ fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), R
             .validate()
             .map_err(|message| RuntimeError::InvalidRequest(message.into()))?;
         if request.workspace_api.is_none()
-            || ((binding.subjektiv_consolidation || binding.subjektiv_journal)
-                && !request.subjektiv_attached)
+            || (binding.subjektiv_consolidation && !request.subjektiv_attached)
         {
             return Err(RuntimeError::InvalidRequest("Backend Job capability requires Workspace authority and consolidation requires trusted subject attachment".into()));
         }
@@ -8206,6 +8367,21 @@ mod tests {
     }
 
     impl WorkerExecutionBackend for TestExecutionBackend {
+        fn subject_release(
+            &self,
+            request: &runtime_api::SubjectReleaseRequest,
+        ) -> Result<runtime_api::SubjectReleaseResponse, String> {
+            use runtime_api::{SubjectReleaseAction as A, SubjectReleaseState as S};
+            Ok(runtime_api::SubjectReleaseResponse {
+                operation_id: request.operation_id.clone(),
+                binding_id: request.binding_id.clone(),
+                state: match request.action {
+                    A::Reserve => S::Reserved,
+                    A::Cancel => S::Cancelled,
+                    A::Disconnect => S::Disconnected,
+                },
+            })
+        }
         fn cleanup_working_directory(
             &self,
             _id: &str,
@@ -13104,6 +13280,83 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // Persistence component test; real Controller reservation has separate coverage.
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn subject_release_fence_survives_reopen_without_automatic_or_explicit_restore() {
+        let root = tempfile::tempdir().unwrap();
+        let options = crate::fs_store::FsRuntimeStoreOptions::new(root.path())
+            .with_runtime_id("test-runtime");
+        let scoped = scope("workspace-a", "server-a");
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            options.clone(),
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker_scoped(
+                &scoped,
+                scoped_task_request("release durable", "workspace-a"),
+            )
+            .unwrap();
+        let mut request = runtime_api::SubjectReleaseRequest {
+            workspace_id: "workspace-a".into(),
+            worker_id: worker.worker_id,
+            binding_id: "writer-1".into(),
+            operation_id: "release-1".into(),
+            action: runtime_api::SubjectReleaseAction::Reserve,
+        };
+        runtime
+            .subject_release_scoped(&scoped, request.clone())
+            .unwrap();
+        drop(runtime);
+        let backend = Arc::new(TestExecutionBackend::default());
+        let reopened =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        assert!(
+            reopened
+                .send_input(&worker.worker_ref, WorkerInput::user("must remain fenced"))
+                .is_err()
+        );
+        assert!(
+            reopened
+                .restore_worker(
+                    &worker.worker_ref,
+                    reopened.test_restore_request(&worker.worker_ref)
+                )
+                .is_err()
+        );
+        request.action = runtime_api::SubjectReleaseAction::Cancel;
+        assert_eq!(
+            reopened
+                .subject_release_scoped(&scoped, request.clone())
+                .unwrap()
+                .state,
+            runtime_api::SubjectReleaseState::Cancelled
+        );
+        request.action = runtime_api::SubjectReleaseAction::Reserve;
+        assert!(
+            reopened
+                .subject_release_scoped(&scoped, request.clone())
+                .is_err(),
+            "cancelled identity must never rearm"
+        );
+        drop(reopened);
+        let reopened = Runtime::with_fs_store_and_execution_backend(
+            options,
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        assert!(
+            reopened
+                .subject_release_scoped(&scoped, request.clone())
+                .is_err(),
+            "terminal cancellation survives restart"
+        );
     }
 
     #[cfg(feature = "fs-store")]

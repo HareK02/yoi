@@ -68,6 +68,11 @@ Deno.test("prepareRegistrationOptions decodes binary public key fields", () => {
           displayName: "Local User",
         },
         pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        authenticatorSelection: {
+          residentKey: "required",
+          requireResidentKey: true,
+          userVerification: "required",
+        },
         excludeCredentials: [{
           type: "public-key",
           id: "BwgJ" as unknown as BufferSource,
@@ -77,6 +82,11 @@ Deno.test("prepareRegistrationOptions decodes binary public key fields", () => {
   });
 
   assertEquals(bytes(options.challenge), [1, 2, 3]);
+  assertEquals(options.authenticatorSelection, {
+    residentKey: "required",
+    requireResidentKey: true,
+    userVerification: "required",
+  });
   assertEquals(bytes(options.user.id), [4, 5, 6]);
   assertEquals(bytes(options.excludeCredentials?.[0].id as BufferSource), [
     7,

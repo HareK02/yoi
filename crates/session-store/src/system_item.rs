@@ -92,6 +92,14 @@ pub struct PromptRenderProvenance {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SystemItem {
+    /// One-time derived Journal reference context. The bounded Host snapshot is
+    /// retained as JSON independently of its rendered body and prompt projection.
+    JournalStartup {
+        body: String,
+        snapshot: serde_json::Value,
+        snapshot_sha256: String,
+        prompt_provenance: PromptRenderProvenance,
+    },
     /// Free-form notification sent in by an external caller via
     /// `Method::Notify`. `message` is the raw caller-supplied text;
     /// `body` is the wrapped LLM-context form (Worker renders it via
@@ -194,6 +202,7 @@ impl SystemItem {
     /// for this item. Returns the variant's stored `body` verbatim.
     pub fn history_text(&self) -> String {
         match self {
+            SystemItem::JournalStartup { body, .. } => body.clone(),
             SystemItem::Notification { body, .. } => body.clone(),
             SystemItem::WorkerEvent { body, .. } => body.clone(),
             SystemItem::FeatureInvocationResult { body, .. } => body.clone(),
@@ -220,6 +229,7 @@ impl SystemItem {
     /// wire — keep flexible.
     pub fn kind_label(&self) -> &'static str {
         match self {
+            SystemItem::JournalStartup { .. } => "journal_startup",
             SystemItem::Notification { .. } => "notification",
             SystemItem::WorkerEvent { .. } => "worker_event",
             SystemItem::FeatureInvocationResult { .. } => "feature_invocation_result",

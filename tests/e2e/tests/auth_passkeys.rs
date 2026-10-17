@@ -1,6 +1,6 @@
 //! 隔離した実yoi-serverのhost CLI・HTTP APIで、管理者初期設定、登録可否の永続化、
-//! 明示handle login、本人の鍵追加、限定activation、Workspace所有・catalog選択境界を検証する。DB・認証・routerは本番実装を使い、
-//! authenticatorだけをSoftPasskeyに置換する（browser UI／OS authenticatorは対象外）。
+//! ID不要login、本人の鍵追加、限定activation、Workspace所有・catalog選択境界を検証する。DB・認証・routerは本番実装を使い、
+//! authenticatorはresident store/選択を持つsoftware model、署名エンジンのみSoftPasskeyとする（browser UI／OS認証器は対象外）。
 //! `cargo test -p yoi-e2e --features e2e --test auth_passkeys`で明示選択する。
 //! binary供給、HOME/XDG/DB/動的port、readiness、ログ、RAII回収は共有harnessが所有する。
 //! HTTPはproxy／redirect／cookie storeなし、各要求にtimeoutを設ける。
@@ -24,7 +24,9 @@ use server_api::{
     PasskeyLoginOptionsResponse, PasskeyRegistrationCompleteRequest,
     PasskeyRegistrationOptionsResponse, WhoamiResponse,
 };
-use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
+#[path = "../src/resident_authenticator.rs"]
+mod resident_model;
+use resident_model::ResidentAuthenticator;
 use yoi_e2e::WorkerE2eEnvironment;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
@@ -99,7 +101,7 @@ fn register(
     base: &str,
     artifacts: &Path,
     handle: &str,
-    authenticator: &mut WebauthnAuthenticator<SoftPasskey>,
+    authenticator: &mut ResidentAuthenticator,
 ) -> Result<(AuthUserResponse, String, Value)> {
     let options: PasskeyRegistrationOptionsResponse = decode(send(
         client.post(format!("{base}/api/auth/passkeys/registration/options"))
@@ -130,19 +132,19 @@ fn login(
     base: &str,
     artifacts: &Path,
     handle: &str,
-    authenticator: &mut WebauthnAuthenticator<SoftPasskey>,
+    authenticator: &mut ResidentAuthenticator,
 ) -> Result<(AuthUserResponse, String)> {
     let options: PasskeyLoginOptionsResponse = decode(send(
         client
             .post(format!("{base}/api/auth/passkeys/login/options"))
             .header(ORIGIN, BROWSER_ORIGIN)
-            .json(&json!({"handle": handle, "browser_origin": BROWSER_ORIGIN})),
-        "explicit handle login options",
+            .json(&json!({"browser_origin": BROWSER_ORIGIN})),
+        "discoverable login options",
         artifacts,
     )?)?;
     let credential =
         authenticator.do_authentication(BROWSER_ORIGIN.parse()?, options.public_key)?;
-    session(send(
+    let result = session(send(
         client
             .post(format!("{base}/api/auth/passkeys/login/complete"))
             .header(ORIGIN, BROWSER_ORIGIN)
@@ -152,7 +154,9 @@ fn login(
             }),
         "verified login complete",
         artifacts,
-    )?)
+    )?)?;
+    assert_eq!(result.0.user.handle, handle);
+    Ok(result)
 }
 
 fn http_client() -> Result<Client> {
@@ -265,7 +269,7 @@ fn logout(client: &Client, base: &str, artifacts: &Path, cookie: &str) -> Result
 fn host_admin_login(
     environment: &WorkerE2eEnvironment,
     client: &Client,
-    key: &mut WebauthnAuthenticator<SoftPasskey>,
+    key: &mut ResidentAuthenticator,
 ) -> Result<(AuthUserResponse, String)> {
     let base = environment
         .server_url
@@ -338,7 +342,7 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
     let artifacts = &environment.artifacts_dir;
     let client = http_client()?;
     policy(&client, base, artifacts, false)?;
-    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut admin_key = ResidentAuthenticator::new(true);
     let (admin, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
     policy(&client, base, artifacts, false)?;
     set_policy(&client, base, artifacts, &admin_cookie, true)?;
@@ -379,7 +383,7 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
         "auth_required",
     )?;
 
-    let mut original_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut original_key = ResidentAuthenticator::new(true);
     let (registered, registration_cookie, user_handle) = register(
         &client,
         base,
@@ -418,7 +422,7 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
     )?, StatusCode::BAD_REQUEST, "auth_handle_exists")?;
 
     // 2 usersを実登録し、handle省略が最古userへfallbackしないことを検証する。
-    let mut other_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut other_key = ResidentAuthenticator::new(true);
     let other_handle = format!("{}-other", environment.account_handle);
     let (other, _, other_user_handle) =
         register(&client, base, artifacts, &other_handle, &mut other_key)?;
@@ -427,18 +431,15 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
     access(&client, base, artifacts, &cookie, false)?;
     set_policy(&client, base, artifacts, &admin_cookie, false)?;
     // 以下の本人鍵追加と両方の鍵によるloginは、自己登録停止中にも必要。
-    rejected(
-        send(
-            client
-                .post(format!("{base}/api/auth/passkeys/login/options"))
-                .header(ORIGIN, BROWSER_ORIGIN)
-                .json(&json!({"browser_origin": BROWSER_ORIGIN})),
-            "omitted handle cannot select first account",
-            artifacts,
-        )?,
-        StatusCode::BAD_REQUEST,
-        "passkey_handle_required",
-    )?;
+    let options: PasskeyLoginOptionsResponse = decode(send(
+        client
+            .post(format!("{base}/api/auth/passkeys/login/options"))
+            .header(ORIGIN, BROWSER_ORIGIN)
+            .json(&json!({"browser_origin": BROWSER_ORIGIN})),
+        "normal login has no account inventory",
+        artifacts,
+    )?)?;
+    assert!(options.public_key.public_key.allow_credentials.is_empty());
 
     for (field, value) in [
         ("handle", &other.user.handle),
@@ -494,7 +495,7 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
         user_handle,
         "same account must retain its WebAuthn user handle"
     );
-    let mut added_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut added_key = ResidentAuthenticator::new(true);
     let credential = added_key.do_registration(BROWSER_ORIGIN.parse()?, options.public_key)?;
     let complete = PasskeyRegistrationCompleteRequest {
         challenge_id: options.challenge_id,
@@ -725,10 +726,10 @@ fn workspace_catalog_zero_one_multiple_preserves_explicit_selection_and_actor_ow
         StatusCode::FORBIDDEN,
         "authenticated owner",
     )?;
-    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut admin_key = ResidentAuthenticator::new(true);
     let (_, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
     set_policy(&client, base, artifacts, &admin_cookie, true)?;
-    let mut key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut key = ResidentAuthenticator::new(true);
     let (registered, registration_cookie, _) = register(
         &client,
         base,
@@ -881,7 +882,7 @@ fn ordinary_device_login_requires_explicit_approval_and_does_not_grant_hosting_a
     base: &str,
     artifacts: &Path,
     user: &AuthUserResponse,
-    key: &mut WebauthnAuthenticator<SoftPasskey>,
+    key: &mut ResidentAuthenticator,
 ) -> Result {
     let flow: Value = decode(send(
         client
@@ -1007,7 +1008,7 @@ fn hosting_policy_rejects_spoofing_inflight_registration_and_survives_restart() 
     let artifacts = environment.artifacts_dir.clone();
     policy(&client, &base, &artifacts, false)?;
 
-    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut admin_key = ResidentAuthenticator::new(true);
     let (admin, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
     policy(&client, &base, &artifacts, false)?;
     for path in ["/api/hosting/access", "/api/hosting/settings"] {
@@ -1102,7 +1103,7 @@ fn hosting_policy_rejects_spoofing_inflight_registration_and_survives_restart() 
     access(&client, &base, &artifacts, &admin_cookie, true)?;
 
     // 拒否されたhandleも予約されておらず、許可後には通常の新規登録ができる。
-    let mut ordinary_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut ordinary_key = ResidentAuthenticator::new(true);
     let (ordinary, ordinary_cookie, _) = register(
         &client,
         &base,
@@ -1172,7 +1173,7 @@ fn hosting_policy_rejects_spoofing_inflight_registration_and_survives_restart() 
         "registration starts while enabled",
         &artifacts,
     )?)?;
-    let mut pending_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut pending_key = ResidentAuthenticator::new(true);
     let credential = pending_key.do_registration(BROWSER_ORIGIN.parse()?, options.public_key)?;
     let complete = PasskeyRegistrationCompleteRequest {
         challenge_id: options.challenge_id,
@@ -1396,7 +1397,7 @@ fn activation_options(
 
 fn activation_credential(
     options: PasskeyRegistrationOptionsResponse,
-    key: &mut WebauthnAuthenticator<SoftPasskey>,
+    key: &mut ResidentAuthenticator,
 ) -> Result<PasskeyRegistrationCompleteRequest> {
     Ok(PasskeyRegistrationCompleteRequest {
         challenge_id: options.challenge_id,
@@ -1461,7 +1462,7 @@ fn activation_with_disabled_self_registration_survives_reopen_and_enables_only_p
     let client = http_client()?;
     let artifacts = environment.artifacts_dir.clone();
     let mut base = environment.server_url.clone().ok_or("missing server URL")?;
-    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut admin_key = ResidentAuthenticator::new(true);
     let (_, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
     policy(&client, &base, &artifacts, false)?;
     let issue = create_pending(
@@ -1496,7 +1497,7 @@ fn activation_with_disabled_self_registration_survives_reopen_and_enables_only_p
         .ok_or("missing restarted server URL")?;
     policy(&client, &base, &artifacts, false)?;
     let options = activation_options(&client, &base, &artifacts, &issue)?;
-    let mut key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut key = ResidentAuthenticator::new(true);
     let complete = activation_credential(options, &mut key)?;
     let (activated, cookie) = session(activation_success(send(
         activation_complete_request(&client, &base, &complete),
@@ -1558,7 +1559,7 @@ fn activation_issuance_requires_live_admin_and_cookie_origin_not_identity_claims
         .server_url
         .as_deref()
         .ok_or("missing server URL")?;
-    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut admin_key = ResidentAuthenticator::new(true);
     let (admin, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
     let ordinary = create_pending(
         &client,
@@ -1567,7 +1568,7 @@ fn activation_issuance_requires_live_admin_and_cookie_origin_not_identity_claims
         &admin_cookie,
         &environment.account_handle,
     )?;
-    let mut ordinary_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut ordinary_key = ResidentAuthenticator::new(true);
     let complete = activation_credential(
         activation_options(&client, base, artifacts, &ordinary)?,
         &mut ordinary_key,
@@ -1721,7 +1722,7 @@ fn activation_codes_challenges_and_unverified_state_cannot_cross_account_or_purp
         .as_deref()
         .ok_or("missing server URL")?;
     let artifacts = &environment.artifacts_dir;
-    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut admin_key = ResidentAuthenticator::new(true);
     let (_, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
     let issue = create_pending(
         &client,
@@ -1759,7 +1760,7 @@ fn activation_codes_challenges_and_unverified_state_cannot_cross_account_or_purp
     )?)?;
     let options = activation_options(&client, base, artifacts, &issue)?;
     let challenge_id = options.challenge_id.clone();
-    let mut key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut key = ResidentAuthenticator::new(true);
     let complete = activation_credential(options, &mut key)?;
 
     // code／限定challenge IDのどちらも通常tokenではない。通常API、Workspace、device approvalに流用しない。
@@ -1860,7 +1861,7 @@ fn activation_codes_challenges_and_unverified_state_cannot_cross_account_or_purp
     )?)?;
     // 別IDに対する誤ったcode入力が元のaccountを消費していない。
     let _ = activation_options(&client, base, artifacts, &other)?;
-    let mut replacement_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut replacement_key = ResidentAuthenticator::new(true);
     let replacement_complete = activation_credential(
         activation_options(&client, base, artifacts, &replacement)?,
         &mut replacement_key,
@@ -1884,7 +1885,7 @@ fn activation_codes_challenges_and_unverified_state_cannot_cross_account_or_purp
         "start distinct public registration ceremony",
         artifacts,
     )?)?;
-    let mut public_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut public_key = ResidentAuthenticator::new(true);
     let public_complete = activation_credential(public_options, &mut public_key)?;
     activation_denied(send(
         activation_complete_request(&client, base, &public_complete),
@@ -1900,7 +1901,7 @@ fn activation_codes_challenges_and_unverified_state_cannot_cross_account_or_purp
         "start distinct authenticated self-addition ceremony",
         artifacts,
     )?)?;
-    let mut addition_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut addition_key = ResidentAuthenticator::new(true);
     let addition_complete = activation_credential(addition_options, &mut addition_key)?;
     activation_denied(send(
         activation_complete_request(&client, base, &addition_complete),
@@ -1932,7 +1933,7 @@ fn activation_bad_attestation_stays_pending_and_concurrent_ceremonies_store_only
         .server_url
         .as_deref()
         .ok_or("missing server URL")?;
-    let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut admin_key = ResidentAuthenticator::new(true);
     let (_, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
     let issue = create_pending(
         &client,
@@ -1941,7 +1942,7 @@ fn activation_bad_attestation_stays_pending_and_concurrent_ceremonies_store_only
         &admin_cookie,
         &environment.account_handle,
     )?;
-    let mut bad_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut bad_key = ResidentAuthenticator::new(true);
     let bad_complete = activation_credential(
         activation_options(&client, base, artifacts, &issue)?,
         &mut bad_key,
@@ -1965,12 +1966,12 @@ fn activation_bad_attestation_stays_pending_and_concurrent_ceremonies_store_only
         "failed verifier did not activate or save a credential",
         artifacts,
     )?)?;
-    let mut first_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut first_key = ResidentAuthenticator::new(true);
     let first = activation_credential(
         activation_options(&client, base, artifacts, &issue)?,
         &mut first_key,
     )?;
-    let mut second_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+    let mut second_key = ResidentAuthenticator::new(true);
     let second = activation_credential(
         activation_options(&client, base, artifacts, &issue)?,
         &mut second_key,

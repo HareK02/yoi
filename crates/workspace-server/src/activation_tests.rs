@@ -529,7 +529,7 @@ fn activation_oldest_and_previous_schema_migrate_with_same_constraints_and_prese
         assert!(!store.is_user_pending_activation("old-user").unwrap());
         store.with_conn(|conn| {
             assert_eq!(schema(conn), expected);
-            assert_eq!(current_schema_version(conn)?, 100);
+            assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
             assert!(conn.execute("INSERT INTO user_activations VALUES('missing','issue','hash','future',0)", []).is_err());
             for attempts in [-1, 6] { assert!(conn.execute("INSERT INTO user_activations VALUES('old-user','issue','hash','future',?1)", [attempts]).is_err()); }
             Ok(())

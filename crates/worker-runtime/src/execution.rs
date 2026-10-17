@@ -567,6 +567,14 @@ impl fmt::Debug for WorkerProtocolTransport {
 pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn backend_id(&self) -> &str;
 
+    /// Must reserve the actual Controller, not infer Idle from a catalog snapshot.
+    fn subject_release(
+        &self,
+        _request: &runtime_api::SubjectReleaseRequest,
+    ) -> Result<runtime_api::SubjectReleaseResponse, String> {
+        Err("execution backend cannot reserve the actual Subject Controller".into())
+    }
+
     fn fetch_workspace_config(
         &self,
         _request: WorkspaceConfigFetchRequest,
@@ -829,6 +837,13 @@ impl WorkerExecutionBackendRef {
         request: WorkspaceConfigFetchRequest,
     ) -> Result<WorkspaceConfigFetchResult, String> {
         self.backend.fetch_workspace_config(request)
+    }
+
+    pub(crate) fn subject_release(
+        &self,
+        request: &runtime_api::SubjectReleaseRequest,
+    ) -> Result<runtime_api::SubjectReleaseResponse, String> {
+        self.backend.subject_release(request)
     }
 
     pub(crate) fn worker_session(

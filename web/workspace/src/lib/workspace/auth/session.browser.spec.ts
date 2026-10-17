@@ -175,7 +175,7 @@ test("busy login rejects duplicate operations and refresh until its post-complet
   const run = auth.run(
     "Waiting",
     "Logged in",
-    (signal) => loginWithPasskey("alice", signal),
+    (signal) => loginWithPasskey(signal),
   );
   expect(auth.busy).toBe(true);
   expect(auth.status).toBe("Waiting");
@@ -234,7 +234,14 @@ for (const status of [400, 401, 410]) {
   });
 }
 
-for (const name of ["NotAllowedError", "AbortError", "Error"] as const) {
+for (
+  const name of [
+    "NotAllowedError",
+    "NotSupportedError",
+    "AbortError",
+    "Error",
+  ] as const
+) {
   test(`credential ${name} is sanitized, never completed, and leaves explicit retry possible`, async () => {
     const { fetcher, get } = boundary();
     const auth = session();
@@ -248,12 +255,14 @@ for (const name of ["NotAllowedError", "AbortError", "Error"] as const) {
       await auth.run(
         "Waiting",
         "Logged in",
-        (signal) => loginWithPasskey("alice", signal),
+        (signal) => loginWithPasskey(signal),
       ),
     ).toBe(false);
     expect(auth.error).toMatch(
       name === "NotAllowedError"
         ? /cancelled or timed out/
+        : name === "NotSupportedError"
+        ? /Completion is not confirmed/
         : name === "AbortError"
         ? /Completion is not confirmed/
         : /Authentication could not be confirmed/,
@@ -271,7 +280,7 @@ for (const name of ["NotAllowedError", "AbortError", "Error"] as const) {
       await auth.run(
         "Waiting",
         "Logged in",
-        (signal) => loginWithPasskey("alice", signal),
+        (signal) => loginWithPasskey(signal),
       ),
     ).toBe(true);
     expect(auth.error).toBe("");
@@ -298,7 +307,7 @@ test("completion does not confirm authentication when the subsequent whoami fail
     await auth.run(
       "Waiting",
       "Logged in",
-      (signal) => loginWithPasskey("alice", signal),
+      (signal) => loginWithPasskey(signal),
     ),
   ).toBe(false);
   expect(auth.session).toEqual({ kind: "error" });
@@ -343,7 +352,7 @@ test("dispose aborts WebAuthn and ignores a late credential without completion, 
   const run = auth.run(
     "Waiting",
     "Logged in",
-    (signal) => loginWithPasskey("alice", signal),
+    (signal) => loginWithPasskey(signal),
   );
   const signal = await started.promise;
   expect(signal.aborted).toBe(false);
@@ -386,7 +395,7 @@ test("dispose ignores a completion response even when the HTTP boundary does not
   const run = auth.run(
     "Waiting",
     "Logged in",
-    (signal) => loginWithPasskey("alice", signal),
+    (signal) => loginWithPasskey(signal),
   );
   const signal = await started.promise;
   auth.dispose();
@@ -431,7 +440,7 @@ test("dispose during the post-operation whoami prevents its late actor from beco
   const run = auth.run(
     "Waiting",
     "Logged in",
-    (signal) => loginWithPasskey("alice", signal),
+    (signal) => loginWithPasskey(signal),
   );
   await started.promise;
   expect(auth.session.kind).toBe("loading");
@@ -454,9 +463,7 @@ for (const purpose of ["login", "addition"] as const) {
         "Waiting",
         "Confirmed",
         (signal) =>
-          purpose === "login"
-            ? loginWithPasskey("alice", signal)
-            : addPasskey(signal),
+          purpose === "login" ? loginWithPasskey(signal) : addPasskey(signal),
       ),
     ).toBe(false);
     expect(auth.error).toMatch(/cancelled or timed out/);

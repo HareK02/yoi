@@ -613,6 +613,16 @@ static MIGRATIONS: &[FeatureMigration] = &[
         "fence erased journal Sessions and permit explicit content erasure",
         journal::migrate_lifecycle,
     ),
+    FeatureMigration::new(
+        10,
+        "fence journal writers by explicit body binding lifetime",
+        journal::migrate_binding,
+    ),
+    FeatureMigration::new(
+        11,
+        "add immutable candidate Journal context links",
+        journal::memory_links::migrate,
+    ),
 ];
 
 pub const REGISTRATION: FeatureRegistration =

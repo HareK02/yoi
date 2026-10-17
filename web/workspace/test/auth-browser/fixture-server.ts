@@ -34,14 +34,25 @@ const mime: Record<string, string> = {
   ".png": "image/png",
   ".ico": "image/x-icon",
 };
-const options = (login: boolean) => ({
+const options = (login: boolean, legacy = false) => ({
   challenge_id: "synthetic-challenge-only",
-  public_key: login ? { challenge: "dWk" } : {
-    challenge: "dWk",
-    rp: { name: "UI projection" },
-    user: { id: "dWk", name: "alice", displayName: "Alice" },
-    pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-  },
+  public_key: login
+    ? {
+      challenge: "dWk",
+      allowCredentials: legacy ? [{ type: "public-key", id: "dWk" }] : [],
+      userVerification: "required",
+    }
+    : {
+      challenge: "dWk",
+      rp: { name: "UI projection" },
+      user: { id: "dWk", name: "alice", displayName: "Alice" },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+      authenticatorSelection: {
+        residentKey: "required",
+        requireResidentKey: true,
+        userVerification: "required",
+      },
+    },
 });
 
 Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
@@ -70,6 +81,9 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
     if (mode.endsWith("-cancel")) {
       extra =
         `for (const method of ['get','create']) Object.defineProperty(navigator.credentials,method,{configurable:true,value:async()=>{throw new DOMException('Passkey cancelled','NotAllowedError')}});`;
+    } else if (mode.endsWith("-unsupported")) {
+      extra =
+        `for (const method of ['get','create']) Object.defineProperty(navigator.credentials,method,{configurable:true,value:async()=>{throw new DOMException('Synthetic unsupported key','NotSupportedError')}});`;
     } else if (mode.endsWith("-error")) {
       extra =
         `for (const method of ['get','create']) Object.defineProperty(navigator.credentials,method,{configurable:true,value:async()=>{throw new DOMException('Synthetic authenticator failure','UnknownError')}});`;
@@ -176,7 +190,12 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
       if (purpose === "addition") state.signedIn = false;
       return new Response(null, { status: 401 });
     }
-    if (stage === "options") return Response.json(options(purpose === "login"));
+    if (stage === "options") {
+      const body = await request.json();
+      return Response.json(
+        options(purpose === "login", typeof body.handle === "string"),
+      );
+    }
     state.signedIn = true;
     return Response.json({ user });
   }

@@ -40,6 +40,7 @@
     </dl>
     <section aria-label="Your Passkeys">
       <h2>Passkeys</h2>
+      <p class="muted">Add a discoverable passkey for login without an account ID. Use a device or key that can save passkeys and verify you with a PIN or biometrics. Existing keys are preserved; do not remove them before confirming the new key works.</p>
       <button type="button" disabled={auth.busy} onclick={add}>Add passkey to {auth.actor.handle}</button>
     </section>
     <div class="actions">

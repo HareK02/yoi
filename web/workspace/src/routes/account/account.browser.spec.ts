@@ -126,6 +126,10 @@ function apiPaths(fetcher: ReturnType<typeof boundary>["fetcher"]) {
 }
 
 async function enterIdentity(registering = false) {
+  if (!registering) {
+    await screen.findByRole("button", { name: "Log in with passkey" });
+    return;
+  }
   await fireEvent.input(await screen.findByLabelText("Account ID (handle)"), {
     target: { value: " alice " },
   });
@@ -140,11 +144,16 @@ async function submit(name: string) {
   await fireEvent.submit(screen.getByRole("button", { name }).closest("form")!);
 }
 
-test("login asks only for an account ID and links separate registration and code activation", async () => {
+test("normal login needs no account ID and links separate registration and code activation", async () => {
   const { fetcher } = boundary({ policy: true });
   page.url = new URL("https://example.test/login?returnTo=%2Faccount");
   render(Login);
-  const handle = await screen.findByLabelText("Account ID (handle)");
+  await screen.findByRole("button", { name: "Log in with passkey" });
+  expect(
+    (screen.getByText("Use an older key with account ID").closest(
+      "details",
+    ) as HTMLDetailsElement).open,
+  ).toBe(false);
   expect(screen.queryByLabelText("Display name")).toBeNull();
   expect(screen.queryByRole("button", { name: "Register new account" }))
     .toBeNull();
@@ -160,15 +169,17 @@ test("login asks only for an account ID and links separate registration and code
       .getAttribute("href"),
   )
     .toBe("/activate");
-  await fireEvent.input(handle, { target: { value: "  " } });
   expect(
     (screen.getByRole("button", {
       name: "Log in with passkey",
     }) as HTMLButtonElement).disabled,
   )
-    .toBe(true);
+    .toBe(false);
   await submit("Log in with passkey");
-  expect(posted(fetcher)).toEqual([]);
+  await waitFor(() => expect(posted(fetcher)).toHaveLength(2));
+  expect(posted(fetcher)[0].body).toEqual({
+    browser_origin: window.location.origin,
+  });
   expect(apiPaths(fetcher)).toContain("/api/auth/registration-policy");
 });
 
@@ -206,7 +217,6 @@ for (
       "/api/auth/passkeys/login/complete",
     ]);
     expect(requests[0].body).toEqual({
-      handle: "alice",
       browser_origin: window.location.origin,
     });
     expect(requests[1].body.challenge_id).toBe(loginOptions.challenge_id);
@@ -530,7 +540,7 @@ test("WebAuthn cancellation is visible, sends no completion, and allows an expli
   await enterIdentity();
   await submit("Log in with passkey");
   await screen.findByText(
-    "Passkey operation was cancelled or timed out. You can try again.",
+    "Passkey operation was cancelled or timed out, or no matching key was found. Completion is not confirmed. Use a supported device and try again.",
   );
   await waitFor(() =>
     expect(
@@ -676,3 +686,47 @@ for (const status of [401, 410]) {
     expect(goto).not.toHaveBeenCalled();
   });
 }
+
+test("explicit older-key login alone sends the trimmed account ID", async () => {
+  const { fetcher } = boundary();
+  render(Login);
+  await screen.findByRole("button", { name: "Log in with passkey" });
+  await fireEvent.click(screen.getByText("Use an older key with account ID"));
+  await fireEvent.input(screen.getByLabelText("Account ID (handle)"), {
+    target: { value: " alice " },
+  });
+  await submit("Log in with older key");
+  await waitFor(() => expect(goto).toHaveBeenCalled());
+  expect(posted(fetcher)[0].body).toEqual({
+    handle: "alice",
+    browser_origin: window.location.origin,
+  });
+});
+
+test("compatibility login keeps its selected form and ID after cancellation and session refresh", async () => {
+  const { fetcher, get } = boundary();
+  get.mockRejectedValueOnce(new DOMException("cancelled", "NotAllowedError"));
+  render(Login);
+  await screen.findByRole("button", { name: "Log in with passkey" });
+  const disclosure = screen.getByText("Use an older key with account ID")
+    .closest("details") as HTMLDetailsElement;
+  disclosure.open = true;
+  await fireEvent(disclosure, new Event("toggle"));
+  await fireEvent.input(screen.getByLabelText("Account ID (handle)"), {
+    target: { value: "alice" },
+  });
+  await submit("Log in with older key");
+  await screen.findByText(/cancelled or timed out/);
+  await screen.findByText("Use an older key with account ID");
+  expect(
+    (screen.getByText("Use an older key with account ID").closest(
+      "details",
+    ) as HTMLDetailsElement).open,
+  ).toBe(true);
+  expect(
+    (screen.getByLabelText("Account ID (handle)") as HTMLInputElement).value,
+  ).toBe("alice");
+  expect(posted(fetcher).map(({ path }) => path)).toEqual([
+    "/api/auth/passkeys/login/options",
+  ]);
+});

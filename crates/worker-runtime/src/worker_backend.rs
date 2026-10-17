@@ -492,8 +492,12 @@ pub(crate) fn open_session_public_material_reader(
     Ok(reader)
 }
 
+type SpawnModelClientFactory =
+    Arc<dyn Fn() -> Box<dyn agen::llm_client::client::LlmClient> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct ProfileRuntimeWorkerFactory {
+    spawn_model_client_factory: Option<SpawnModelClientFactory>,
     observation_hub: Arc<RuntimeWorkerObservationHub>,
     profile_base_dir: PathBuf,
     worker_aggregate_root: Option<PathBuf>,
@@ -521,6 +525,7 @@ impl ProfileRuntimeWorkerFactory {
     pub fn new(profile_base_dir: impl Into<PathBuf>) -> Self {
         let profile_base_dir = profile_base_dir.into();
         Self {
+            spawn_model_client_factory: None,
             observation_hub: Arc::new(RuntimeWorkerObservationHub::default()),
             profile_base_dir,
             worker_aggregate_root: None,
@@ -533,6 +538,17 @@ impl ProfileRuntimeWorkerFactory {
             controller_transport: WorkerControllerTransport::InProcess,
             failed_restore_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Supply the external model boundary for newly spawned Controllers. The factory is
+    /// process-owned, never persisted into a Profile or restored as execution authority.
+    /// Restores continue to use their saved model configuration.
+    pub fn with_spawn_model_client_factory(
+        mut self,
+        factory: impl Fn() -> Box<dyn agen::llm_client::client::LlmClient> + Send + Sync + 'static,
+    ) -> Self {
+        self.spawn_model_client_factory = Some(Arc::new(factory));
+        self
     }
 
     pub fn with_runtime_id(mut self, runtime_id: impl Into<String>) -> Self {
@@ -1502,7 +1518,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
 
         let run_dir = self.worker_run_dir(&request.worker_ref)?;
         let bash_output_dir = bash_output_dir_for_worker_id(&request.worker_ref.worker_id);
-        let mut prepared = WorkerBootstrap::new(
+        let bootstrap = WorkerBootstrap::new(
             manifest,
             store,
             loader,
@@ -1513,10 +1529,12 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 bash_output_dir,
             },
             self.controller_transport,
-        )
-        .prepare()
-        .await
-        .map_err(|error| match error {
+        );
+        let bootstrap = match &self.spawn_model_client_factory {
+            Some(factory) => bootstrap.with_model_client(factory()),
+            None => bootstrap,
+        };
+        let mut prepared = bootstrap.prepare().await.map_err(|error| match error {
             WorkerBootstrapError::Worker(source) => {
                 format!("failed to create Worker from profile: {source}")
             }
@@ -2331,6 +2349,12 @@ impl PendingRuntimeRestore {
     }
 }
 
+struct SubjectControllerReservation {
+    request: runtime_api::SubjectReleaseRequest,
+    guard: Option<worker::SubjectReleaseReservation>,
+    state: runtime_api::SubjectReleaseState,
+}
+
 /// Worker execution backend backed by real worker crate Workers.
 pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
     backend_id: String,
@@ -2341,6 +2365,7 @@ pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
     pending_restores: Mutex<HashMap<WorkerRef, Arc<PendingRuntimeRestore>>>,
     worker_locks: Mutex<HashMap<WorkerRef, Arc<Mutex<()>>>>,
     spawn_restore_timeout: Duration,
+    subject_reservations: Mutex<HashMap<(WorkerRef, String), SubjectControllerReservation>>,
     shutdown_admission_timeout: Duration,
 }
 
@@ -2363,6 +2388,7 @@ where
             pending_restores: Mutex::new(HashMap::new()),
             worker_locks: Mutex::new(HashMap::new()),
             spawn_restore_timeout: SPAWN_RESTORE_TASK_TIMEOUT,
+            subject_reservations: Mutex::new(HashMap::new()),
             shutdown_admission_timeout: Duration::from_secs(5),
         })
     }
@@ -3341,6 +3367,119 @@ where
 {
     fn backend_id(&self) -> &str {
         &self.backend_id
+    }
+
+    fn subject_release(
+        &self,
+        request: &runtime_api::SubjectReleaseRequest,
+    ) -> Result<runtime_api::SubjectReleaseResponse, String> {
+        use runtime_api::{SubjectReleaseAction as Action, SubjectReleaseState as State};
+        let worker_ref = WorkerRef::new(request.worker_id);
+        let lock = self.worker_lock(&worker_ref)?;
+        let _operation = lock.lock().map_err(|_| "worker operation lock poisoned")?;
+        let mut reservations = self
+            .subject_reservations
+            .lock()
+            .map_err(|_| "Subject reservation registry poisoned")?;
+        let key = (worker_ref.clone(), request.operation_id.clone());
+        if let Some(saved) = reservations.get(&key) {
+            if saved.request.operation_id != request.operation_id
+                || saved.request.binding_id != request.binding_id
+                || saved.request.workspace_id != request.workspace_id
+            {
+                return Err("Worker has another retained Subject release operation".into());
+            }
+        } else {
+            if request.action == Action::Cancel {
+                // Runtime has a durable admission intent, but no Controller reservation may
+                // have been acquired (or this is a new process). Under the same Worker op
+                // lock there is no late local Reserve left to publish. Retain a terminal
+                // cancellation receipt so an old Reserve can never rearm this identity.
+                reservations.insert(
+                    key,
+                    SubjectControllerReservation {
+                        request: request.clone(),
+                        guard: None,
+                        state: State::Cancelled,
+                    },
+                );
+                return Ok(runtime_api::SubjectReleaseResponse {
+                    operation_id: request.operation_id.clone(),
+                    binding_id: request.binding_id.clone(),
+                    state: State::Cancelled,
+                });
+            }
+            if request.action != Action::Reserve {
+                return Err(
+                    "Subject reservation is missing; no status-based recovery is allowed".into(),
+                );
+            }
+            if reservations.iter().any(|((worker, _), saved)| {
+                *worker == worker_ref && saved.state != State::Cancelled
+            }) {
+                return Err("Worker has another active Subject reservation".into());
+            }
+            if self
+                .pending_restores
+                .lock()
+                .map_err(|_| "restore registry poisoned")?
+                .contains_key(&worker_ref)
+            {
+                return Err("Subject Controller restore is unresolved".into());
+            }
+            let workers = self
+                .workers
+                .lock()
+                .map_err(|_| "worker registry poisoned")?;
+            let execution = workers
+                .get(&worker_ref)
+                .ok_or("Subject Controller is unavailable")?;
+            if execution.workspace_id.as_deref() != Some(request.workspace_id.as_str())
+                || execution.shutdown_requested.load(Ordering::Acquire)
+                || execution.handle.protocol_is_closed()
+            {
+                return Err("Subject Controller is unavailable or Workspace mismatched".into());
+            }
+            let handle = execution.handle.clone();
+            drop(workers);
+            let guard =
+                self.run_on_adapter_runtime(async move { handle.reserve_subject_release().await })?;
+            reservations.insert(
+                key.clone(),
+                SubjectControllerReservation {
+                    request: request.clone(),
+                    guard: Some(guard),
+                    state: State::Reserved,
+                },
+            );
+        }
+        let saved = reservations.get_mut(&key).expect("reservation inserted");
+        match (request.action, saved.state) {
+            (Action::Reserve, State::Reserved | State::Disconnected) => {}
+            (Action::Disconnect, State::Reserved) => {
+                saved
+                    .guard
+                    .as_mut()
+                    .ok_or("Controller reservation missing")?
+                    .commit_disconnect()?;
+                saved.state = State::Disconnected;
+            }
+            (Action::Disconnect, State::Disconnected) | (Action::Cancel, State::Cancelled) => {}
+            (Action::Cancel, State::Reserved) => {
+                saved.guard.take();
+                saved.state = State::Cancelled;
+            }
+            _ => {
+                return Err(
+                    "Subject release operation already reached a different terminal state".into(),
+                );
+            }
+        }
+        Ok(runtime_api::SubjectReleaseResponse {
+            operation_id: request.operation_id.clone(),
+            binding_id: request.binding_id.clone(),
+            state: saved.state,
+        })
     }
 
     fn fetch_workspace_config(
@@ -4932,7 +5071,7 @@ mod tests {
         let aggregate_dir = root.join("workers").join(worker_ref.worker_id.to_string());
         let session_store = WorkerSessionStore::new(aggregate_dir.join("session")).unwrap();
         let store = WorkerAggregateStore::new(&aggregate_dir, &worker_name).unwrap();
-        let (saved, request) = saved_subjektiv_policy(root, &worker_ref);
+        let (saved, mut request) = saved_subjektiv_policy(root, &worker_ref);
         let client = MockClient::new(Vec::new());
         let mut engine =
             Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
@@ -4979,11 +5118,7 @@ mod tests {
                 Some(SAVED_SUBJEKTIV_SYSTEM_PROMPT)
             );
         } else {
-            assert!(matches!(
-                session_store.exists(session_id, segment_id),
-                Err(session_store::StoreError::Corrupt { message, .. })
-                    if message.contains("no materialized Session")
-            ));
+            assert!(!session_store.exists(session_id, segment_id).unwrap());
         }
         assert_eq!(client.call_count.load(Ordering::SeqCst), 0);
         drop(worker);
@@ -5007,8 +5142,46 @@ mod tests {
             metadata.workspace_id.as_deref(),
             Some("workspace-saved-subjektiv")
         );
-        // Attribution already committed before restart; the real restore needs
-        // no network fixture or replacement current Profile.
+        // Attribution history is already committed. Each new Controller must still
+        // obtain current publication authority, even for a Confirmed Session.
+        // This is a transport fixture for restore/stop component tests, not an
+        // assertion that a real Backend authorized a released Subject body.
+        #[cfg(feature = "http-server")]
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            request.workspace_api.as_mut().unwrap().base_url =
+                format!("http://{}", listener.local_addr().unwrap());
+            let app = axum::Router::new().route(
+                "/api/w/workspace-saved-subjektiv/subjektiv/sessions",
+                axum::routing::post(
+                    move |axum::Json(input): axum::Json<
+                        server_api::SubjektivRecordSessionRequest,
+                    >| async move {
+                        assert!(
+                            !input.create_if_missing,
+                            "publication must not rewrite attribution"
+                        );
+                        assert_eq!(input.session_id, session_id.to_string());
+                        axum::Json(server_api::SubjektivRecordSessionResponse {
+                            session_id: input.session_id,
+                            subject_id: "saved-subject".into(),
+                        })
+                    },
+                ),
+            );
+            let app = app.route(
+                "/api/w/workspace-saved-subjektiv/subjektiv/journal/startup",
+                axum::routing::get(move || async move {
+                    assert!(!materialize_head, "normal restore must not refetch startup");
+                    axum::Json(serde_json::json!({
+                        "subject_id": "saved-subject", "journals": [], "omitted": false,
+                    }))
+                }),
+            );
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+        }
         metadata.subjektiv_session_attribution =
             Some(session_store::SubjektivSessionAttributionState::Confirmed {
                 session_id,
@@ -6077,7 +6250,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(worker_allocation)]
     async fn profile_factory_saved_subjektiv_manifest_survives_restart_and_explicit_restore() {
         let root = tempfile::tempdir().unwrap();
@@ -6147,7 +6320,7 @@ mod tests {
         assert!(!root.path().join("nonexistent-current-profiles").exists());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(worker_allocation)]
     async fn profile_factory_pending_subjektiv_restore_requires_operation_owned_launch_material() {
         let root = tempfile::tempdir().unwrap();
@@ -9679,6 +9852,158 @@ mod tests {
             .send_input(&detail.worker_ref, input("stopped-input"))
             .unwrap_err();
         assert!(error.to_string().contains("WorkerNotify"), "{error}");
+    }
+
+    #[test]
+    fn subject_release_reserves_real_controller_and_excludes_runtime_lifecycle() {
+        use runtime_api::{SubjectReleaseAction as Action, SubjectReleaseState as State};
+        let runtime_base = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            WorkerRuntimeExecutionBackend::new(MockFactory {
+                client: MockClient::new(simple_text_events()),
+                runtime_base: runtime_base.path().to_path_buf(),
+                cwd: cwd.path().to_path_buf(),
+                store_dir: store.path().join("sessions"),
+                worker_metadata_dir: store.path().join("workers"),
+                observed_cwds: Arc::new(Mutex::new(Vec::new())),
+                observed_workspace_clients: Arc::new(Mutex::new(Vec::new())),
+            })
+            .unwrap(),
+        );
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), backend.clone())
+                .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let mut create = create_request("subject-release");
+        create.workspace_api = Some(crate::catalog::WorkspaceApiRef {
+            workspace_id: "ws-test".into(),
+            base_url: "http://127.0.0.1:3999".into(),
+        });
+        create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "ws-test".into(),
+            language: "English".into(),
+        });
+        let scope = crate::runtime::RuntimeWorkspaceScope::new("ws-test", "embedded-backend");
+        let detail = runtime.create_worker_scoped(&scope, create).unwrap();
+        let mut release = runtime_api::SubjectReleaseRequest {
+            workspace_id: "ws-test".into(),
+            worker_id: detail.worker_ref.worker_id,
+            binding_id: "original-binding".into(),
+            operation_id: "subject-release-1".into(),
+            action: Action::Reserve,
+        };
+        let reserved = runtime
+            .subject_release_scoped(&scope, release.clone())
+            .unwrap();
+        assert_eq!(reserved.state, State::Reserved);
+        assert_eq!(
+            runtime
+                .subject_release_scoped(&scope, release.clone())
+                .unwrap(),
+            reserved
+        );
+        let before = backend
+            .workers
+            .lock()
+            .unwrap()
+            .get(&detail.worker_ref)
+            .unwrap()
+            .handle
+            .committed_entries();
+        let blocked = runtime
+            .send_input(
+                &detail.worker_ref,
+                WorkerInput::user("must not enter history"),
+            )
+            .unwrap_err();
+        assert!(blocked.to_string().contains("Subject"));
+        assert!(
+            runtime
+                .stop_worker(&detail.worker_ref, None)
+                .unwrap_err()
+                .to_string()
+                .contains("Subject")
+        );
+        assert!(
+            runtime
+                .delete_worker(&detail.worker_ref)
+                .unwrap_err()
+                .to_string()
+                .contains("Subject")
+        );
+        assert!(
+            runtime
+                .restore_worker(
+                    &detail.worker_ref,
+                    runtime.test_restore_request(&detail.worker_ref)
+                )
+                .is_err()
+        );
+        let after = backend
+            .workers
+            .lock()
+            .unwrap()
+            .get(&detail.worker_ref)
+            .unwrap()
+            .handle
+            .committed_entries();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        let mut conflicting = release.clone();
+        conflicting.binding_id = "later-binding".into();
+        assert!(runtime.subject_release_scoped(&scope, conflicting).is_err());
+        release.action = Action::Cancel;
+        assert_eq!(
+            runtime
+                .subject_release_scoped(&scope, release.clone())
+                .unwrap()
+                .state,
+            State::Cancelled
+        );
+        release.operation_id = "subject-release-2".into();
+        release.action = Action::Reserve;
+        assert_eq!(
+            runtime
+                .subject_release_scoped(&scope, release.clone())
+                .unwrap()
+                .state,
+            State::Reserved
+        );
+        release.action = Action::Disconnect;
+        assert_eq!(
+            runtime
+                .subject_release_scoped(&scope, release.clone())
+                .unwrap()
+                .state,
+            State::Disconnected
+        );
+        assert_eq!(
+            runtime
+                .subject_release_scoped(&scope, release.clone())
+                .unwrap()
+                .state,
+            State::Disconnected
+        );
+        release.action = Action::Cancel;
+        assert!(runtime.subject_release_scoped(&scope, release).is_err());
+        assert!(
+            runtime
+                .send_input(&detail.worker_ref, WorkerInput::user("after disconnect"))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .restore_worker(
+                    &detail.worker_ref,
+                    runtime.test_restore_request(&detail.worker_ref)
+                )
+                .is_err()
+        );
+        runtime.stop_worker(&detail.worker_ref, None).unwrap();
     }
 
     #[test]

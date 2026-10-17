@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
-  import { loginWithPasskey, registerPasskey } from './api.ts';
+  import { loginWithLegacyPasskey, loginWithPasskey, registerPasskey } from './api.ts';
   import { BrowserAuth } from './browser-session.svelte.ts';
   import { loadRegistrationPolicy } from './hosting.ts';
   import { authEntryUrl, safeReturnTo, AUTHENTICATED_HOME } from './routes.ts';
@@ -13,6 +13,7 @@
   const auth = new BrowserAuth();
   let handle = $state('');
   let displayName = $state('');
+  let legacyOpen = $state(false);
   let policy = $state<boolean | null>(null);
   let policyLoading = $state(true);
   let policyError = $state('');
@@ -33,16 +34,18 @@
     }
   }
 
-  async function submit() {
-    if (auth.busy || auth.session.kind !== 'ready' || auth.actor || !handle.trim() ||
-        (mode === 'register' && (policy !== true || !displayName.trim()))) return;
+  async function submit(legacy = false) {
     const registering = mode === 'register';
+    if (auth.busy || auth.session.kind !== 'ready' || auth.actor ||
+        ((registering || legacy) && !handle.trim()) ||
+        (registering && (policy !== true || !displayName.trim()))) return;
     const id = handle.trim();
     const name = displayName.trim();
     const confirmed = await auth.run(
       registering ? 'Waiting for new account registration…' : 'Waiting for passkey login…',
       registering ? 'New account registered.' : 'Logged in.',
-      (signal) => registering ? registerPasskey(id, name, signal) : loginWithPasskey(id, signal),
+      (signal) => registering ? registerPasskey(id, name, signal)
+        : legacy ? loginWithLegacyPasskey(id, signal) : loginWithPasskey(signal),
     );
     if (confirmed && auth.actor) {
       await goto(destination, { replaceState: true });
@@ -86,18 +89,33 @@
         <p>New account registration is disabled. Existing users can still log in.</p>
       {/if}
     {/if}
-    {#if mode === 'login' || policy === true}
+    {#if mode === 'login'}
+      <form onsubmit={(event) => { event.preventDefault(); void submit(); }}>
+        <button class="primary" type="submit" disabled={auth.busy}>Log in with passkey</button>
+        <p class="muted">Choose a passkey and verify with your device. No account ID is needed.</p>
+      </form>
+      <details class="legacy-login" bind:open={legacyOpen}>
+        <summary>Use an older key with account ID</summary>
+        <form onsubmit={(event) => { event.preventDefault(); void submit(true); }}>
+          <p class="muted">If an older key is not listed or cannot sign in above, use compatibility login. After login, open <a href="/account">Account</a> and add a discoverable passkey for ID-free login. Your existing keys are preserved.</p>
+          <label>Account ID (handle)
+            <input bind:value={handle} required maxlength="128" autocomplete="username" autocapitalize="off" spellcheck="false" disabled={auth.busy} aria-describedby="legacy-id-help" />
+          </label>
+          <p id="legacy-id-help" class="muted">Use your account ID, not your display name. This only signs in with an existing key; it does not register one.</p>
+          <button type="submit" disabled={auth.busy || !handle.trim()}>Log in with older key</button>
+        </form>
+      </details>
+    {:else if policy === true}
       <form onsubmit={(event) => { event.preventDefault(); void submit(); }}>
         <label>Account ID (handle)
-          <input bind:value={handle} required maxlength="128" autocomplete="username webauthn" autocapitalize="off" spellcheck="false" disabled={auth.busy} aria-describedby="id-help" />
+          <input bind:value={handle} required maxlength="128" autocomplete="username" autocapitalize="off" spellcheck="false" disabled={auth.busy} aria-describedby="id-help" />
         </label>
-        <p id="id-help" class="muted">{mode === 'login' ? 'Use your account ID, not your display name.' : 'Your unique sign-in ID. This is separate from your display name.'}</p>
-        {#if mode === 'register'}
-          <label>Display name
-            <input bind:value={displayName} required maxlength="128" autocomplete="name" disabled={auth.busy} />
-          </label>
-        {/if}
-        <button class="primary" type="submit" disabled={auth.busy || !handle.trim() || (mode === 'register' && !displayName.trim())}>{mode === 'login' ? 'Log in with passkey' : 'Register new account'}</button>
+        <p id="id-help" class="muted">Your unique account ID, separate from your display name. It is not needed for normal passkey login.</p>
+        <label>Display name
+          <input bind:value={displayName} required maxlength="128" autocomplete="name" disabled={auth.busy} />
+        </label>
+        <p class="muted">Requires a device or security key that can save a discoverable passkey and verify you with a PIN or biometrics.</p>
+        <button class="primary" type="submit" disabled={auth.busy || !handle.trim() || !displayName.trim()}>Register new account</button>
       </form>
     {/if}
   {/if}

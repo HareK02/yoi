@@ -160,6 +160,9 @@ async function createPasskey(
     );
   }
   signal?.throwIfAborted();
+  if (typeof navigator.credentials?.create !== "function") {
+    throw new DOMException("Passkeys unavailable", "NotSupportedError");
+  }
   const credential = await navigator.credentials.create({
     signal,
     publicKey: prepareRegistrationOptions(options),
@@ -184,17 +187,31 @@ async function createPasskey(
 }
 
 export async function loginWithPasskey(
+  signal?: AbortSignal,
+): Promise<AuthUser> {
+  return await authenticateWithPasskey({
+    browser_origin: window.location.origin,
+  }, signal);
+}
+
+export async function loginWithLegacyPasskey(
   handle: string,
   signal?: AbortSignal,
 ): Promise<AuthUser> {
   const loginHandle = handle.trim();
   if (!loginHandle) {
-    throw new Error("User handle is required for passkey login.");
+    throw new Error("User handle is required for legacy passkey login.");
   }
-  const optionsRequest: PasskeyLoginOptionsRequest = {
+  return await authenticateWithPasskey({
     handle: loginHandle,
     browser_origin: window.location.origin,
-  };
+  }, signal);
+}
+
+async function authenticateWithPasskey(
+  optionsRequest: PasskeyLoginOptionsRequest,
+  signal?: AbortSignal,
+): Promise<AuthUser> {
   const options = await requestJson("/api/auth/passkeys/login/options", {
     method: "POST",
     body: JSON.stringify(optionsRequest),
@@ -210,6 +227,9 @@ export async function loginWithPasskey(
     );
   }
   signal?.throwIfAborted();
+  if (typeof navigator.credentials?.get !== "function") {
+    throw new DOMException("Passkeys unavailable", "NotSupportedError");
+  }
   const credential = await navigator.credentials.get({
     signal,
     publicKey: prepareLoginOptions(options),

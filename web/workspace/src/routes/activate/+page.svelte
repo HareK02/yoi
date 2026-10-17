@@ -49,10 +49,10 @@
   <h1>Activate account</h1>
   {#if user}
     <p role="status">Passkey registration and activation confirmed for {user.handle}. You are signed in.</p>
-    <p>Use your Passkey for future logins. The activation code can no longer be used.</p>
+    <p>Choose your saved Passkey for future logins; no account ID is needed. The activation code can no longer be used.</p>
     <a href="/account">Open Account</a>
   {:else}
-    <p>Enter the ID and one-time code provided by your hosting administrator. You must register a Passkey before this account can be used.</p>
+    <p>Enter the ID and one-time code provided by your hosting administrator. You must register a discoverable Passkey before this account can be used. Use a device or key that can save passkeys and verify you with a PIN or biometrics. If unsupported or cancelled, the account stays pending; retry with a supported device.</p>
     <form onsubmit={(event) => { event.preventDefault(); void activate(); }} autocomplete="off">
       <label for="activation-handle">Account ID (handle)</label>
       <input id="activation-handle" bind:value={handle} required maxlength="128" autocomplete="off" autocapitalize="off" spellcheck="false" disabled={busy} />

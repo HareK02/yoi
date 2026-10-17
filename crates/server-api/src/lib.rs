@@ -4088,10 +4088,11 @@ pub struct PasskeyRegistrationCompleteRequest {
     pub credential: RegisterPublicKeyCredential,
 }
 
-/// Identified-account login. Missing handles are rejected, not resolved to an implicit user.
-///
-/// The nullable wire field permits an explicit authentication error for old callers; it does not
-/// advertise a discoverable-login ceremony.
+/// Normal discoverable login omits the handle: the authenticator selects a credential.
+/// An explicit handle selects legacy identified-account login, for non-resident keys or
+/// keys registered with an old random WebAuthn user handle. This never adds a key or
+/// falls back to another identity. Authenticate first, then enroll an RK from Account.
+/// Existing challenge states are short-lived and are not migrated to the new ceremony.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]

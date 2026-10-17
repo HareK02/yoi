@@ -46,7 +46,7 @@
     busy = true;
     error = '';
     try {
-      const signedIn = await loginWithPasskey(expected.handle);
+      const signedIn = await loginWithPasskey(controller.signal);
       if (!active) return;
       if (signedIn.user_id !== expected.user_id || signedIn.account_id !== expected.account_id || !await verifySession(expected)) {
         throw new Error('Login or hosting access not verified');
@@ -89,7 +89,7 @@
     <a href="/account">Already have a passkey? Open Account</a>
   {:else if !verifiedLogin}
     <p role="status">Passkey added for {user.handle}. Enrollment is not a passkey login.</p>
-    <p>Sign in with the new passkey to verify it before opening hosting settings.</p>
+    <p>Choose the new passkey for {user.handle} and verify with your device. No account ID is needed; only this administrator account will pass the access check.</p>
     <button class="primary" type="button" disabled={busy} onclick={login}>{busy ? 'Signing in…' : 'Sign in with new passkey'}</button>
   {:else}
     <p role="status">Passkey login and hosting administrator access verified.</p>

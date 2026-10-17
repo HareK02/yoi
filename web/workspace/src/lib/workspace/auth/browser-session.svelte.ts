@@ -17,14 +17,17 @@ export function authErrorMessage(error: unknown): string {
     }
     return error.message;
   }
+  if (error instanceof DOMException && error.name === "NotSupportedError") {
+    return "This browser or key cannot complete this passkey operation. Use a supported device or key with saved passkeys and PIN or biometric verification. Completion is not confirmed.";
+  }
   if (error instanceof DOMException && error.name === "NotAllowedError") {
-    return "Passkey operation was cancelled or timed out. You can try again.";
+    return "Passkey operation was cancelled or timed out, or no matching key was found. Completion is not confirmed. Use a supported device and try again.";
   }
   if (error instanceof DOMException && error.name === "AbortError") {
     return "Operation stopped. Completion is not confirmed; check your session before retrying.";
   }
   // Browser/transport例外の本文を表示せず、credentialや外部応答を診断へ複写しない。
-  return "Authentication could not be confirmed. Check your session or try Passkey login before retrying registration.";
+  return "Authentication could not be confirmed. Check your session before retrying the operation.";
 }
 
 export class BrowserAuth {

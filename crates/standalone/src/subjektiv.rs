@@ -5,9 +5,11 @@
 //! non-private nodes; delegates schema/migration to `subjektiv` and connection policy to `feature-storage`.
 //!
 //! The Host holds each selected Subject's exclusive kernel lease through body execution and
-//! confirmed delegated Job cleanup. Process death releases kernel locks; uncertain in-process
-//! cleanup retains leases. Restore validates saved Subject/storage bindings and reacquires the
-//! same Subject. Launches without a selected Subject do not implicitly connect this store.
+//! confirmed delegated Job cleanup. Kernel lock release never clears durable body ownership:
+//! shutdown/process death permits only the same body to restore, not a replacement to start.
+//! Explicit disconnection requires actual Controller quiescence and final Journal completion;
+//! storage then revokes that writer lifetime before the lease is released. Uncertain cleanup
+//! retains leases. Launches without a selected Subject do not implicitly connect this store.
 //!
 //! The selected Subject's Job store is shared across Workers; the generic Jobs service owns execution
 //! and cleanup. Consolidation grants allow only immutable candidate batches and limited operations,
@@ -48,6 +50,8 @@ pub enum SubjectError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Domain(#[from] subjektiv::SubjektivError),
+    #[error(transparent)]
+    Journal(#[from] subjektiv::journal::JournalError),
     #[error(transparent)]
     Storage(#[from] feature_storage::FeatureStorageError),
     #[error("local Subject storage metadata: {0}")]
@@ -223,7 +227,49 @@ impl StandaloneSubjects {
             scope_id: self.scope_id.clone(),
             subject_id: subject_id.to_string(),
         };
+        if self.store.journal_worker_was_released(
+            subject_id,
+            &self.scope_id,
+            &worker_id.to_string(),
+        )? {
+            return Err(SubjectError::InvalidScope("this body's Subject binding was released; start a new Worker/Session rather than restore its old authority".into()));
+        }
+        // Before writer lifetimes existed, a saved body record was the only durable
+        // attachment evidence. Never interpret its stopped status as a release on upgrade.
+        let workers = crate::store::StandaloneWorkerStore::open_existing(&self.state_root)
+            .map_err(|error| SubjectError::InvalidScope(error.to_string()))?;
+        for entry in fs::read_dir(&self.state_root)? {
+            let entry = entry?;
+            let Ok(prior_id) = entry
+                .file_name()
+                .to_string_lossy()
+                .parse::<protocol::WorkerId>()
+            else {
+                continue;
+            };
+            if prior_id == worker_id {
+                continue;
+            }
+            let prior = match workers.load(prior_id) {
+                Ok(prior) => prior,
+                Err(crate::store::StandaloneStoreError::WorkerNotFound(_)) => continue,
+                Err(error) => return Err(SubjectError::InvalidScope(error.to_string())),
+            };
+            if prior.subject.as_ref() == Some(&binding)
+                && !self.store.journal_worker_was_released(
+                    subject_id,
+                    &self.scope_id,
+                    &prior_id.to_string(),
+                )?
+            {
+                return Err(SubjectError::InvalidScope("saved Subject body has no explicit release; restore it and complete the Idle/Journal handoff, rather than treating inactive storage as unoccupied".into()));
+            }
+        }
+        let writer =
+            self.store
+                .claim_journal_writer(subject_id, &self.scope_id, &worker_id.to_string())?;
         let host = Arc::new_cyclic(|weak| LocalSubjectHost {
+            writer,
             self_weak: weak.clone(),
             journal_dispatch: Mutex::new(false),
             language: self.memory_language.clone(),
@@ -252,6 +298,37 @@ pub(crate) struct SubjectConnection {
     armed: bool,
 }
 impl SubjectConnection {
+    /// Construction failed before any Controller or mandatory startup context was published.
+    /// This is cancellation of an unpublished reservation, not Idle inferred from a stopped body.
+    pub(crate) fn abort_unpublished_start(&mut self) -> Result<(), SubjectError> {
+        self.host
+            .catalog
+            .store
+            .release_journal_writer(&self.host.writer)?;
+        self.close()
+    }
+
+    pub(crate) fn writer_released_or_unknown(&self) -> bool {
+        self.host
+            .catalog
+            .store
+            .journal_writer_active(&self.host.writer)
+            .map(|active| !active)
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn release_for_handoff(
+        &mut self,
+        record: &crate::store::StandaloneWorkerRecord,
+        reservation: &mut worker::SubjectReleaseReservation,
+    ) -> Result<(), String> {
+        if let Err(error) = self.host.release_for_handoff(record, reservation) {
+            self.host.wake_journals();
+            return Err(error.to_string());
+        }
+        reservation.commit_disconnect()
+    }
+
     pub fn arm(&mut self) {
         self.armed = true;
     }
@@ -282,6 +359,7 @@ impl Drop for SubjectConnection {
 }
 
 pub(crate) struct LocalSubjectHost {
+    writer: subjektiv::journal::JournalWriterBinding,
     self_weak: std::sync::Weak<Self>,
     journal_dispatch: Mutex<bool>,
     catalog: StandaloneSubjects,
@@ -298,6 +376,16 @@ impl LocalSubjectHost {
         if !self.live.load(Ordering::Acquire) {
             return Err(SubjektivHostError::Unavailable(
                 "local Subject Host is closed".into(),
+            ));
+        }
+        if !self
+            .catalog
+            .store
+            .journal_writer_active(&self.writer)
+            .map_err(journal::journal_error)?
+        {
+            return Err(SubjektivHostError::Unavailable(
+                "Subject writer binding was released".into(),
             ));
         }
         Ok(())
@@ -339,6 +427,9 @@ impl LocalSubjectHost {
                     "Session does not belong to this local Subject/Worker scope".into(),
                 ));
             }
+            store
+                .bind_journal_session(&self.writer, record.clone())
+                .map_err(journal::journal_error)?;
             return Ok(record);
         }
         if !create {
@@ -355,9 +446,13 @@ impl LocalSubjectHost {
             &context.session_id,
         )
         .map_err(domain_error)?;
-        store
+        let record = store
             .record_session_attribution(record)
-            .map_err(domain_error)
+            .map_err(domain_error)?;
+        store
+            .bind_journal_session(&self.writer, record.clone())
+            .map_err(journal::journal_error)?;
+        Ok(record)
     }
 }
 
@@ -698,6 +793,53 @@ impl LocalSubjectHost {
     }
 }
 impl SubjektivHost for LocalSubjectHost {
+    fn memory_journal(
+        &self,
+        context: &SubjektivHostContext,
+        request: subjektiv::journal::memory_links::MemoryJournalRequest,
+    ) -> Result<subjektiv::journal::memory_links::MemoryJournalResponse, SubjektivHostError> {
+        self.body(context)?;
+        let reader = subjektiv::journal::JournalHostContext::validated_reader(
+            &self.catalog.store,
+            &self.binding.subject_id,
+        )
+        .map_err(journal::journal_error)?;
+        self.catalog
+            .store
+            .execute_memory_journal_with_source_presence(&reader, request, |session| {
+                crate::subjektiv_sessions::original_session_presence(
+                    &self.catalog.state_root,
+                    &self.binding.scope_id,
+                    &self.binding.subject_id,
+                    &self.catalog.store,
+                    session,
+                )
+            })
+            .map_err(journal::journal_error)
+    }
+    fn journal_startup_granted(&self) -> bool {
+        self.live.load(Ordering::Acquire)
+    }
+    fn journal_startup_context(
+        &self,
+        context: &SubjektivHostContext,
+    ) -> Result<subjektiv::journal::startup::JournalStartupSnapshot, SubjektivHostError> {
+        self.body(context)?;
+        let reader = subjektiv::journal::JournalHostContext::validated_reader(
+            &self.catalog.store,
+            &self.binding.subject_id,
+        )
+        .map_err(journal::journal_error)?;
+        let predecessor = self
+            .catalog
+            .store
+            .journal_predecessor_session(&self.writer)
+            .map_err(journal::journal_error)?;
+        self.catalog
+            .store
+            .journal_startup_snapshot(&reader, predecessor.as_deref())
+            .map_err(journal::journal_error)
+    }
     fn journal_recording_granted(&self) -> bool {
         self.live.load(Ordering::Acquire)
     }

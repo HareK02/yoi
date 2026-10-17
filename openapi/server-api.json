@@ -6661,7 +6661,7 @@
       },
       "PasskeyLoginOptionsRequest": {
         "additionalProperties": false,
-        "description": "Identified-account login. Missing handles are rejected, not resolved to an implicit user.\n\nThe nullable wire field permits an explicit authentication error for old callers; it does not\nadvertise a discoverable-login ceremony.",
+        "description": "Normal discoverable login omits the handle: the authenticator selects a credential.\nAn explicit handle selects legacy identified-account login, for non-resident keys or\nkeys registered with an old random WebAuthn user handle. This never adds a key or\nfalls back to another identity. Authenticate first, then enroll an RK from Account.\nExisting challenge states are short-lived and are not migrated to the new ceremony.",
         "properties": {
           "browser_origin": {
             "type": [
@@ -17831,7 +17831,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:d6241af8f70efb7be45195dc27c01e36517d13484cd38f71490ce5d253dd84e8"
+    "x-yoi-source-digest": "sha256:4e01d7dd0dab015ba3204045da33d7b87c9edc166b7dad464a8ab0d61e0f0e6d"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -28,6 +28,7 @@ use subjektiv::api::*;
 mod backend_job_profile;
 mod subjektiv_job;
 mod subjektiv_journal;
+mod subjektiv_memory_journal;
 mod worker_operations;
 mod worker_protocol;
 pub(crate) use worker_operations::{
@@ -1654,6 +1655,7 @@ pub struct WorkspaceApi {
         Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<Mutex<OrchestratorAttentionState>>>>>,
     notification_delivery_lifecycle: Arc<notification_delivery::NotificationDeliveryLifecycle>,
     backend_job_drain_requests: Arc<AtomicU64>,
+    journal_lifecycle: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     journal_dispatch_owner: Option<Arc<WorkspaceApi>>,
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
@@ -3379,6 +3381,7 @@ fn workspace_request_is_callback(method: &Method, path: &str, workspace_id: &str
             || path == format!("/api/runtime/v1/workspaces/{workspace_id}/resources/fetch")))
         || (*method == Method::GET
             && (path == format!("/api/w/{workspace_id}/runtime-config")
+                || path == format!("/api/w/{workspace_id}/subjektiv/journal/startup")
                 || path == format!("/api/w/{workspace_id}/worker-discovery/workers")))
 }
 
@@ -4160,6 +4163,7 @@ impl WorkspaceApi {
             notification_delivery_lifecycle: Arc::new(Default::default()),
             orchestrator_attention: Arc::new(Mutex::new(HashMap::new())),
             backend_job_drain_requests: Arc::new(AtomicU64::new(0)),
+            journal_lifecycle: Arc::new(Mutex::new(HashMap::new())),
             journal_dispatch_owner: None,
             observation_proxy,
             runtime_subscription_broker,
@@ -4362,8 +4366,9 @@ impl WorkspaceApi {
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
                 resolved_memory_settings: None,
-                resolved_subjektiv_attached: request.grants.subjektiv_consolidation.is_some()
-                    || request.grants.subjektiv_journal.is_some(),
+                // Journal Jobs use their independent frozen Job Host grant, not the
+                // main-Subject/Memory attachment or its resident/extraction policy.
+                resolved_subjektiv_attached: request.grants.subjektiv_consolidation.is_some(),
                 resolved_control_operation: Some(control_operation),
             },
         ) {
@@ -5468,6 +5473,22 @@ impl WorkspaceApi {
                     .map(|assignment| assignment.operation_id.clone())
             })
             .unwrap_or_else(|| format!("manual:{}", WorkerId::now_v7()));
+        let subject = singleton_key
+            .as_deref()
+            .and_then(|key| key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX));
+        let subject_gate = subject
+            .map(|s| subjektiv_journal::lifecycle_lock(self, s))
+            .transpose()?;
+        let subject_guard = subject_gate
+            .as_ref()
+            .map(|gate| {
+                gate.lock()
+                    .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))
+            })
+            .transpose()?;
+        if let Some(subject) = subject {
+            subjektiv_journal::check_start_allowed(self, subject)?;
+        }
         let reservation = match self.config_store.reserve_worker_create(
             &self.config.workspace_id,
             runtime_id,
@@ -5490,6 +5511,7 @@ impl WorkspaceApi {
                 return Err(ApiError::with_diagnostics(error, diagnostics));
             }
         };
+        drop(subject_guard);
         let worker_id = reservation.worker_id;
         if let Some(assignment) = request.ticket_assignment.as_ref() {
             self.store.bind_ticket_assignment_operation_worker(
@@ -5802,6 +5824,9 @@ impl WorkspaceApi {
                 Error::Config(error.to_string()),
                 diagnostics,
             ));
+        }
+        if let Err(error) = subjektiv_journal::reconcile_created_worker(self, &worker_ref) {
+            tracing::warn!(%error, worker_id=%worker_ref.worker_id, "Journal first-run reconciliation remains recoverable; saved history retained");
         }
         Ok(result)
     }
@@ -13122,7 +13147,10 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         "/api/w/{workspace_id}/workers/self/backend-job-result",
         post(scoped_submit_backend_job_result),
     )
+    .route("/api/w/{workspace_id}/subjektiv/journal/release", post(subjektiv_journal::release_route))
+    .route("/api/w/{workspace_id}/subjektiv/journal/startup", get(subjektiv_journal::startup_route))
     .route("/api/w/{workspace_id}/subjektiv/journal/recording", post(subjektiv_journal::recording_route))
+    .route("/api/w/{workspace_id}/subjektiv/journal/memory", post(subjektiv_memory_journal::route))
     .route("/api/w/{workspace_id}/subjektiv/journal/job", post(subjektiv_journal::job_route))
     .route("/api/w/{workspace_id}/subjektiv/journal/job/finish", post(subjektiv_journal::finish_route))
     .fallback(get(static_or_spa_fallback))
@@ -22351,6 +22379,7 @@ async fn scoped_record_subjektiv_session(
                     &request.session_id,
                 )?
             };
+            subjektiv_journal::bind_host_session(&api, attribution.clone())?;
             Ok(Json(server_api::SubjektivRecordSessionResponse {
                 subject_id: attribution.subject_id,
                 session_id: attribution.session_id,
@@ -29670,11 +29699,13 @@ struct PasskeyRegistrationEnvelope {
 }
 
 /// An account gets one stable WebAuthn user handle, without storing a new schema
-/// field. Migration leaves all existing credentials, their random registration
-/// handles and key material unchanged. Credential-ID-scoped authentication must
-/// accept signed assertions both without userHandle and with the original random
-/// or newly registered stable userHandle; it is not discoverable-handle lookup.
-/// The real-verifier compatibility tests exercise each representation explicitly.
+/// field. Legacy identified-account login accepts original random handles or no
+/// returned handle, always requiring the saved credential's signature. Normal
+/// discoverable login additionally requires the saved owner's stable handle.
+/// Random registration handles were never stored, so they cannot be recovered
+/// or safely mapped by trusting the unsigned assertion. Preserve these keys and
+/// use explicit legacy login to authenticate before adding a stable-handle RK.
+/// Merely having a stable handle does not prove the old key is discoverable.
 fn passkey_user_handle(account_id: &str) -> Uuid {
     let digest = Sha256::digest(account_id.as_bytes());
     Uuid::from_bytes(
@@ -29778,7 +29809,7 @@ fn start_passkey_registration(
     let header_origin = request_origin(headers);
     let auth = auth_config_for_origin(&api.config, browser_origin.or(header_origin.as_deref()))?;
     let webauthn = webauthn_for_auth(&auth)?;
-    let (public_key, verifier) = webauthn
+    let (mut public_key, verifier) = webauthn
         .start_passkey_registration(
             passkey_user_handle(&user.account_id),
             &user.handle,
@@ -29786,6 +29817,21 @@ fn start_passkey_registration(
             Some(exclude_credentials),
         )
         .map_err(|error| auth_error("webauthn_registration_options_failed", &error.to_string()))?;
+    // webauthn-rs passkeys require UV but do not request residency by default.
+    // These public protocol fields request an RK on conforming clients; residency
+    // itself is not remotely attestable. Keep the library's UV/verifier state.
+    let selection = public_key
+        .public_key
+        .authenticator_selection
+        .as_mut()
+        .ok_or_else(|| {
+            auth_error(
+                "webauthn_registration_options_failed",
+                "authenticator selection is missing",
+            )
+        })?;
+    selection.resident_key = Some(webauthn_rs_proto::ResidentKeyRequirement::Required);
+    selection.require_resident_key = true;
     let challenge_id = new_id("webauthn-registration");
     // New users do not exist yet, so the nullable FK remains empty. The complete
     // target (including its allocated user ID) is inside the purpose-tagged state.
@@ -29950,6 +29996,18 @@ fn complete_passkey_enrollment(
     issue_browser_session(api, user)
 }
 
+/// Normal login has no preselected identity. Explicit handle requests are the
+/// legacy migration path, not an automatic fallback. Non-resident keys and keys
+/// with old random user handles can authenticate there, then add an RK from the
+/// live account. No saved key or owner is rewritten. Existing stable-handle RKs
+/// can already use normal login; discoverability cannot be inferred from storage.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "mode", content = "verifier", rename_all = "snake_case")]
+enum PasskeyLoginState {
+    Discoverable(webauthn_rs::prelude::DiscoverableAuthentication),
+    Legacy(PasskeyAuthentication),
+}
+
 async fn post_passkey_login_options(
     State(api): State<ServerAuthApi>,
     headers: HeaderMap,
@@ -29958,48 +30016,66 @@ async fn post_passkey_login_options(
     api.store
         .db_executor()
         .run(move || {
-            let user = match request.handle.as_deref() {
-                Some(handle) => api.store.get_user_by_handle(&normalize_handle(handle)?)?,
-                None => {
-                    return Err(auth_error(
-                        "passkey_handle_required",
-                        "login requires an explicit handle",
-                    )
-                    .into());
-                }
-            }
-            .ok_or_else(|| auth_error("unknown_auth_user", "no matching user account exists"))?;
-            if api.store.is_user_pending_activation(&user.user_id)? {
-                return Err(auth_error(
-                    "passkey_activation_required",
-                    "initial passkey activation is required",
-                )
-                .into());
-            }
-            let passkeys = passkeys_for_user(&api, &user.user_id)?;
-            if passkeys.is_empty() {
-                return Err(auth_error(
-                    "passkey_not_registered",
-                    "user has no registered passkey credentials",
-                )
-                .into());
-            }
             let header_origin = request_origin(&headers);
-            let requested_origin = request
-                .browser_origin
-                .as_deref()
-                .or(header_origin.as_deref());
-            let auth = auth_config_for_origin(&api.config, requested_origin)?;
+            let auth = auth_config_for_origin(
+                &api.config,
+                request
+                    .browser_origin
+                    .as_deref()
+                    .or(header_origin.as_deref()),
+            )?;
             let webauthn = webauthn_for_auth(&auth)?;
-            let (public_key, state) = webauthn
-                .start_passkey_authentication(&passkeys)
-                .map_err(|error| auth_error("webauthn_login_options_failed", &error.to_string()))?;
+            let (public_key, state, user_id) =
+                if let Some(handle) = request.handle.as_deref() {
+                    let user = api
+                        .store
+                        .get_user_by_handle(&normalize_handle(handle)?)?
+                        .ok_or_else(|| {
+                            auth_error("unknown_auth_user", "no matching user account exists")
+                        })?;
+                    if api.store.is_user_pending_activation(&user.user_id)? {
+                        return Err(auth_error(
+                            "passkey_activation_required",
+                            "initial passkey activation is required",
+                        )
+                        .into());
+                    }
+                    let passkeys = passkeys_for_user(&api, &user.user_id)?;
+                    if passkeys.is_empty() {
+                        return Err(auth_error(
+                            "passkey_not_registered",
+                            "user has no registered passkey credentials",
+                        )
+                        .into());
+                    }
+                    let (options, state) = webauthn
+                        .start_passkey_authentication(&passkeys)
+                        .map_err(|error| {
+                            auth_error("webauthn_login_options_failed", &error.to_string())
+                        })?;
+                    (
+                        options,
+                        PasskeyLoginState::Legacy(state),
+                        Some(user.user_id),
+                    )
+                } else {
+                    let (mut options, state) = webauthn
+                        .start_discoverable_authentication()
+                        .map_err(|error| {
+                            auth_error("webauthn_login_options_failed", &error.to_string())
+                        })?;
+                    // The feature exposes a conditional-UI builder. Use its empty allow
+                    // list and required UV verifier with an explicit user gesture, not
+                    // conditional/autofill mediation. No account inventory is returned.
+                    options.mediation = None;
+                    (options, PasskeyLoginState::Discoverable(state), None)
+                };
             let challenge_id = new_id("webauthn-login");
             api.store.put_auth_challenge(&AuthChallengeRecord {
                 challenge_id: challenge_id.clone(),
-                ceremony: "passkey_login".to_string(),
+                ceremony: "passkey_login".into(),
                 challenge: challenge_id.clone(),
-                user_id: Some(user.user_id),
+                user_id,
                 rp_id: auth.rp_id,
                 origin: auth.origin,
                 state_json: Some(serde_json::to_string(&state).map_err(|error| {
@@ -30041,64 +30117,114 @@ fn complete_passkey_login(
         )
         .into());
     }
-    let user_id = challenge.user_id.clone().ok_or_else(|| {
-        auth_error(
-            "invalid_passkey_challenge",
-            "passkey login challenge is not bound to a user",
-        )
-    })?;
-    let user = api
-        .store
-        .get_user(&user_id)?
-        .ok_or_else(|| auth_error("unknown_auth_user", "passkey user does not exist"))?;
-    let state_json = challenge.state_json.clone().ok_or_else(|| {
-        auth_error(
-            "missing_webauthn_state",
-            "passkey login state was not persisted",
-        )
-    })?;
-    let state: PasskeyAuthentication = serde_json::from_str(&state_json)
-        .map_err(|error| auth_error("webauthn_state_deserialize_failed", &error.to_string()))?;
-    let webauthn = webauthn_for_challenge(&api.config, &challenge)?;
-    let auth_result = webauthn
-        .finish_passkey_authentication(&request.credential, &state)
-        .map_err(|error| auth_error("webauthn_login_verification_failed", &error.to_string()))?;
-    let credential_id = serde_json::to_value(auth_result.cred_id())
-        .ok()
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .ok_or_else(|| {
+    let state: PasskeyLoginState =
+        serde_json::from_str(challenge.state_json.as_deref().ok_or_else(|| {
             auth_error(
-                "invalid_webauthn_credential_id",
-                "verified credential id was not serializable",
+                "missing_webauthn_state",
+                "passkey login state was not persisted",
             )
-        })?;
+        })?)
+        .map_err(|error| auth_error("webauthn_state_deserialize_failed", &error.to_string()))?;
+    let credential_id = serde_json::to_value(webauthn_rs::prelude::Base64UrlSafeData::from(
+        request.credential.get_credential_id().to_vec(),
+    ))
+    .ok()
+    .and_then(|value| value.as_str().map(ToOwned::to_owned))
+    .ok_or_else(|| auth_error("invalid_webauthn_credential_id", "credential id is invalid"))?;
     let stored = api
         .store
         .get_passkey_credential(&credential_id)?
         .ok_or_else(|| {
             auth_error(
                 "unknown_passkey_credential",
-                "verified passkey credential is not registered",
+                "passkey credential is not registered",
             )
         })?;
-    if stored.user_id != user.user_id {
+    let user = api
+        .store
+        .get_user(&stored.user_id)?
+        .ok_or_else(|| auth_error("unknown_auth_user", "passkey user does not exist"))?;
+    if api.store.is_user_pending_activation(&user.user_id)? {
         return Err(auth_error(
-            "passkey_user_mismatch",
-            "verified passkey credential does not belong to the challenged user",
+            "passkey_activation_required",
+            "initial passkey activation is required",
         )
         .into());
     }
+    let mut passkey: Passkey = serde_json::from_str(&stored.public_key_cose)
+        .map_err(|error| auth_error("webauthn_passkey_deserialize_failed", &error.to_string()))?;
+    if passkey_credential_id(&passkey)? != credential_id {
+        return Err(auth_error(
+            "passkey_user_mismatch",
+            "stored credential id does not match key material",
+        )
+        .into());
+    }
+    let webauthn = webauthn_for_challenge(&api.config, &challenge)?;
+    let auth_result = match state {
+        PasskeyLoginState::Discoverable(state) => {
+            // userHandle is unsigned routing data, never identity authority. The
+            // candidate owner comes only from the exact saved credential ID;
+            // its stable handle must agree, and the saved key must verify below.
+            if challenge.user_id.is_some()
+                || request.credential.get_user_unique_id()
+                    != Some(passkey_user_handle(&user.account_id).as_bytes().as_slice())
+            {
+                return Err(auth_error(
+                    "passkey_user_mismatch",
+                    "credential owner/user handle mismatch; use explicit legacy login for old keys",
+                )
+                .into());
+            }
+            webauthn.finish_discoverable_authentication(
+                &request.credential,
+                state,
+                &[passkey.clone().into()],
+            )
+        }
+        PasskeyLoginState::Legacy(state) => {
+            if challenge.user_id.as_deref() != Some(user.user_id.as_str()) {
+                return Err(auth_error(
+                    "passkey_user_mismatch",
+                    "credential does not belong to the challenged user",
+                )
+                .into());
+            }
+            webauthn.finish_passkey_authentication(&request.credential, &state)
+        }
+    }
+    .map_err(|error| auth_error("webauthn_login_verification_failed", &error.to_string()))?;
+    if auth_result.cred_id().as_slice() != request.credential.get_credential_id() {
+        return Err(auth_error(
+            "passkey_user_mismatch",
+            "verified credential differs from saved credential",
+        )
+        .into());
+    }
+    if stored.sign_count > 0
+        && auth_result.counter() > 0
+        && u64::from(auth_result.counter()) <= stored.sign_count
+    {
+        return Err(auth_error(
+            "webauthn_login_verification_failed",
+            "credential counter did not advance",
+        )
+        .into());
+    }
+    passkey.update_credential(&auth_result);
+    let public_key_cose = serde_json::to_string(&passkey)
+        .map_err(|error| auth_error("webauthn_state_serialize_failed", &error.to_string()))?;
     api.store
         .upsert_passkey_credential(&PasskeyCredentialRecord {
             credential_id,
             user_id: user.user_id.clone(),
-            public_key_cose: stored.public_key_cose,
+            public_key_cose,
             transports_json: stored.transports_json,
             sign_count: u64::from(auth_result.counter()),
             created_at: stored.created_at,
             last_used_at: Some(crate::auth::now_rfc3339()),
         })?;
-    issue_browser_session(&api, user)
+    issue_browser_session(api, user)
 }
 
 fn issue_browser_session(
@@ -36815,6 +36941,7 @@ mod tests {
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod subjektiv_journal_tests;
+    mod subjektiv_memory_journal_tests;
     mod ticket_evidence_tests;
     mod ticket_worker_claim_tests;
     mod ticket_worker_launch_tests;
@@ -46462,8 +46589,8 @@ mod tests {
         let runtime = WorkdirlessFixtureRuntime::default();
         api.runtime.register_or_replace(runtime.clone());
         let request = |operation_id: &str| WorkerSpawnRequest {
-            requested_worker_name: Some("Subject Worker".to_string()),
-            singleton_key: Some("subjektiv:subject-retry".to_string()),
+            requested_worker_name: Some("Generic singleton Worker".to_string()),
+            singleton_key: Some("fixture:subject-retry".to_string()),
             intent: WorkerSpawnIntent::WorkspaceCompanion,
             acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                 expected_segments: 0,
@@ -46500,7 +46627,7 @@ mod tests {
         // Runtime dispatch. The restarted request receives a fresh manual allocation key, yet its
         // identical singleton intent replays the reserved Worker and dispatches that generation.
         let mut restart_request = request("ignored-manual-operation");
-        restart_request.singleton_key = Some("subjektiv:restart-retry".to_string());
+        restart_request.singleton_key = Some("fixture:restart-retry".to_string());
         restart_request.resolved_control_operation = None;
         let restart_fingerprint = worker_spawn_create_fingerprint(&restart_request).unwrap();
         let memory = api
@@ -46547,7 +46674,7 @@ mod tests {
         assert_eq!(rejected.state, InternalWorkerOperationState::Rejected);
         assert!(
             api.store
-                .current_worker_singleton_owner(&api.config.workspace_id, "subjektiv:subject-retry")
+                .current_worker_singleton_owner(&api.config.workspace_id, "fixture:subject-retry")
                 .unwrap()
                 .is_none()
         );
@@ -46561,14 +46688,14 @@ mod tests {
         let worker = created.worker.unwrap();
         let current_owner = api
             .store
-            .current_worker_singleton_owner(&api.config.workspace_id, "subjektiv:subject-retry")
+            .current_worker_singleton_owner(&api.config.workspace_id, "fixture:subject-retry")
             .unwrap()
             .unwrap();
         assert_eq!(current_owner.worker, worker.worker);
         assert_eq!(current_owner.generation, 3);
         assert_eq!(
             worker.singleton_key,
-            Some("subjektiv:subject-retry".to_string())
+            Some("fixture:subject-retry".to_string())
         );
 
         // Idle and paused Runtime metadata never releases Backend ownership, and a conflict is
@@ -46598,7 +46725,7 @@ mod tests {
         assert_eq!(restored.state, server_api::WorkerRestoreState::Accepted);
         assert_eq!(
             restored.worker.unwrap().singleton_key.as_deref(),
-            Some("subjektiv:subject-retry")
+            Some("fixture:subject-retry")
         );
 
         // Replacing the connected Runtime with an empty instance models an unavailable/restarted
@@ -46618,10 +46745,7 @@ mod tests {
         );
         assert_eq!(
             api.store
-                .current_worker_singleton_owner(
-                    &api.config.workspace_id,
-                    "subjektiv:subject-retry",
-                )
+                .current_worker_singleton_owner(&api.config.workspace_id, "fixture:subject-retry",)
                 .unwrap()
                 .unwrap()
                 .worker,
@@ -46698,10 +46822,7 @@ mod tests {
         ));
         assert_eq!(
             api.store
-                .current_worker_singleton_owner(
-                    &api.config.workspace_id,
-                    "subjektiv:subject-retry",
-                )
+                .current_worker_singleton_owner(&api.config.workspace_id, "fixture:subject-retry",)
                 .unwrap()
                 .unwrap()
                 .worker,
@@ -51676,16 +51797,20 @@ mod tests {
     }
 
     /// Generated HTTP admission, real SQLite and WebAuthn verification are connected
-    /// here. Only the physical authenticator is replaced with SoftPasskey; all
+    /// here. The authenticator is a resident software model with a SoftPasskey signing engine; all
     /// identities used for addition come from cookies/tokens issued by real login.
     mod passkey_security {
         use super::*;
-        use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
+        mod resident_model {
+            include!("../../../tests/e2e/src/resident_authenticator.rs");
+        }
+        use resident_model::ResidentAuthenticator;
 
         include!("server_activation_tests.rs");
+        include!("server_discoverable_tests.rs");
 
         const ORIGIN_URL: &str = "https://workspace.test";
-        type Authenticator = WebauthnAuthenticator<SoftPasskey>;
+        type Authenticator = ResidentAuthenticator;
 
         struct Fixture {
             _root: tempfile::TempDir,
@@ -52013,7 +52138,7 @@ mod tests {
         }
 
         fn authenticator() -> Authenticator {
-            WebauthnAuthenticator::new(SoftPasskey::new(true))
+            ResidentAuthenticator::new(true)
         }
 
         fn rejected(result: (StatusCode, HeaderMap, Value), status: StatusCode, code: &str) {
@@ -52204,17 +52329,17 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
-            rejected(
-                f.post(
+            let (status, _, options) = f
+                .post(
                     "/api/auth/passkeys/login/options",
                     None,
                     Some(ORIGIN_URL),
                     serde_json::json!({}),
                 )
-                .await,
-                StatusCode::BAD_REQUEST,
-                "passkey_handle_required",
-            );
+                .await;
+            assert_eq!(status, StatusCode::OK, "{options}");
+            let options: PasskeyLoginOptionsResponse = serde_json::from_value(options).unwrap();
+            assert!(options.public_key.public_key.allow_credentials.is_empty());
             assert_eq!(f.credentials(&user), originals);
         }
 
@@ -53059,113 +53184,152 @@ mod tests {
         #[tokio::test]
         async fn legacy_random_user_handle_credential_authenticates_before_and_after_stable_handle_addition()
          {
-            let f = Fixture::new().await;
-            let api = ServerAuthApi::from(&f.api);
-            let user = allocate_new_user(&api, "legacy", None).unwrap();
-            let random_handle = Uuid::now_v7();
-            assert_ne!(random_handle, passkey_user_handle(&user.account_id));
-            let webauthn = webauthn_for_auth(&auth_public_config(&api.config)).unwrap();
-            let (options, state) = webauthn
-                .start_passkey_registration(random_handle, &user.handle, &user.display_name, None)
-                .unwrap();
-            let legacy_user_handle = options.public_key.user.id.clone();
-            assert_eq!(legacy_user_handle.as_slice(), random_handle.as_bytes());
-            let mut legacy_authenticator = authenticator();
-            let credential = legacy_authenticator
-                .do_registration(Url::parse(ORIGIN_URL).unwrap(), options)
-                .unwrap();
-            let passkey = webauthn
-                .finish_passkey_registration(&credential, &state)
-                .unwrap();
-            let record = PasskeyCredentialRecord {
-                credential_id: passkey_credential_id(&passkey).unwrap(),
-                user_id: user.user_id.clone(),
-                public_key_cose: serde_json::to_string(&passkey).unwrap(),
-                transports_json: None,
-                sign_count: 0,
-                created_at: crate::auth::now_rfc3339(),
-                last_used_at: None,
-            };
-            f.api
-                .store
-                .register_verified_passkey(
-                    &PasskeyRegistrationTarget::NewAccount { user: user.clone() },
-                    &record,
-                )
-                .unwrap();
-            let expected = user_response(user.clone());
-            for returned_handle in [None, Some(legacy_user_handle.as_slice())] {
-                let (_, logged_in) = f
-                    .login_session_with_user_handle(
-                        "legacy",
-                        &mut legacy_authenticator,
-                        returned_handle,
+            for resident in [false, true] {
+                let f = Fixture::new().await;
+                let api = ServerAuthApi::from(&f.api);
+                let user = allocate_new_user(&api, "legacy", None).unwrap();
+                let random_handle = Uuid::now_v7();
+                assert_ne!(random_handle, passkey_user_handle(&user.account_id));
+                let webauthn = webauthn_for_auth(&auth_public_config(&api.config)).unwrap();
+                let (mut options, state) = webauthn
+                    .start_passkey_registration(
+                        random_handle,
+                        &user.handle,
+                        &user.display_name,
+                        None,
                     )
-                    .await;
-                assert_eq!(logged_in, expected);
-            }
-            let (cookie, _) = f
-                .login_session_with_user_handle(
-                    "legacy",
-                    &mut legacy_authenticator,
-                    Some(legacy_user_handle.as_slice()),
-                )
-                .await;
-            let before_add = f.credentials(&expected);
-            let mut added = authenticator();
-            let options = f.options("addition", Some(&cookie), "").await;
-            let stable_user_handle = options.public_key.public_key.user.id.clone();
-            assert_eq!(
-                stable_user_handle.as_slice(),
-                passkey_user_handle(&user.account_id).as_bytes()
-            );
-            assert_ne!(stable_user_handle, legacy_user_handle);
-            let request = Fixture::credential(options, &mut added);
-            let (status, _, body) = f
-                .post(
-                    "/api/auth/passkeys/addition/complete",
-                    Some(&cookie),
-                    Some(ORIGIN_URL),
-                    request,
-                )
-                .await;
-            assert_eq!(status, StatusCode::OK, "{body}");
-            assert_eq!(
-                serde_json::from_value::<AuthUserResponse>(body)
-                    .unwrap()
-                    .user,
-                expected
-            );
-            assert_eq!(
+                    .unwrap();
+                if resident {
+                    let selection = options.public_key.authenticator_selection.as_mut().unwrap();
+                    selection.require_resident_key = true;
+                    selection.resident_key =
+                        Some(webauthn_rs_proto::ResidentKeyRequirement::Required);
+                }
+                let legacy_user_handle = options.public_key.user.id.clone();
+                assert_eq!(legacy_user_handle.as_slice(), random_handle.as_bytes());
+                let mut legacy_authenticator = authenticator();
+                let credential = legacy_authenticator
+                    .do_registration(Url::parse(ORIGIN_URL).unwrap(), options)
+                    .unwrap();
+                let passkey = webauthn
+                    .finish_passkey_registration(&credential, &state)
+                    .unwrap();
+                let record = PasskeyCredentialRecord {
+                    credential_id: passkey_credential_id(&passkey).unwrap(),
+                    user_id: user.user_id.clone(),
+                    public_key_cose: serde_json::to_string(&passkey).unwrap(),
+                    transports_json: None,
+                    sign_count: 0,
+                    created_at: crate::auth::now_rfc3339(),
+                    last_used_at: None,
+                };
                 f.api
                     .store
-                    .get_passkey_credential(&record.credential_id)
-                    .unwrap()
-                    .as_ref(),
-                Some(&before_add[0])
-            );
-            for returned_handle in [None, Some(legacy_user_handle.as_slice())] {
-                let (_, logged_in) = f
+                    .register_verified_passkey(
+                        &PasskeyRegistrationTarget::NewAccount { user: user.clone() },
+                        &record,
+                    )
+                    .unwrap();
+                let expected = user_response(user.clone());
+                if resident {
+                    let normal = f.discoverable_request(&mut legacy_authenticator).await;
+                    rejected(
+                        f.post(
+                            "/api/auth/passkeys/login/complete",
+                            None,
+                            Some(ORIGIN_URL),
+                            serde_json::to_value(normal).unwrap(),
+                        )
+                        .await,
+                        StatusCode::BAD_REQUEST,
+                        "passkey_user_mismatch",
+                    );
+                } else {
+                    let normal = f.discoverable_options().await;
+                    assert!(
+                        legacy_authenticator
+                            .do_authentication(Url::parse(ORIGIN_URL).unwrap(), normal.public_key)
+                            .is_err(),
+                        "a non-resident key cannot be discovered without an allow list"
+                    );
+                }
+                for returned_handle in [None, Some(legacy_user_handle.as_slice())] {
+                    let (_, logged_in) = f
+                        .login_session_with_user_handle(
+                            "legacy",
+                            &mut legacy_authenticator,
+                            returned_handle,
+                        )
+                        .await;
+                    assert_eq!(logged_in, expected);
+                }
+                let (cookie, _) = f
                     .login_session_with_user_handle(
                         "legacy",
                         &mut legacy_authenticator,
-                        returned_handle,
+                        Some(legacy_user_handle.as_slice()),
                     )
                     .await;
-                assert_eq!(logged_in, expected);
-            }
-            for returned_handle in [None, Some(stable_user_handle.as_slice())] {
-                let (_, logged_in) = f
-                    .login_session_with_user_handle("legacy", &mut added, returned_handle)
+                let before_add = f.credentials(&expected);
+                let mut added = authenticator();
+                let options = f.options("addition", Some(&cookie), "").await;
+                let stable_user_handle = options.public_key.public_key.user.id.clone();
+                assert_eq!(
+                    stable_user_handle.as_slice(),
+                    passkey_user_handle(&user.account_id).as_bytes()
+                );
+                assert_ne!(stable_user_handle, legacy_user_handle);
+                let request = Fixture::credential(options, &mut added);
+                let (status, _, body) = f
+                    .post(
+                        "/api/auth/passkeys/addition/complete",
+                        Some(&cookie),
+                        Some(ORIGIN_URL),
+                        request,
+                    )
                     .await;
-                assert_eq!(logged_in, expected);
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(
+                    serde_json::from_value::<AuthUserResponse>(body)
+                        .unwrap()
+                        .user,
+                    expected
+                );
+                assert_eq!(
+                    f.api
+                        .store
+                        .get_passkey_credential(&record.credential_id)
+                        .unwrap()
+                        .as_ref(),
+                    Some(&before_add[0])
+                );
+                for returned_handle in [None, Some(legacy_user_handle.as_slice())] {
+                    let (_, logged_in) = f
+                        .login_session_with_user_handle(
+                            "legacy",
+                            &mut legacy_authenticator,
+                            returned_handle,
+                        )
+                        .await;
+                    assert_eq!(logged_in, expected);
+                }
+                for returned_handle in [None, Some(stable_user_handle.as_slice())] {
+                    let (_, logged_in) = f
+                        .login_session_with_user_handle("legacy", &mut added, returned_handle)
+                        .await;
+                    assert_eq!(logged_in, expected);
+                }
+                assert_eq!(f.discoverable_login(&mut added).await, expected);
             }
         }
     }
 
     #[tokio::test]
     async fn generated_passkey_routes_complete_registration_login_and_logout_cookie_lifecycle() {
-        use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
+        mod resident_model {
+            include!("../../../tests/e2e/src/resident_authenticator.rs");
+        }
+        use resident_model::ResidentAuthenticator;
 
         let workspace = tempfile::tempdir().unwrap();
         let mut api = test_api(workspace.path()).await;
@@ -53182,7 +53346,7 @@ mod tests {
         let origin = origin.clone();
         let cookie_name = cookie_name.clone();
         let app = generated_auth_contract_router(ServerApiContractService::Workspace(api));
-        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let mut authenticator = ResidentAuthenticator::new(true);
         let authenticator_origin = url::Url::parse(&origin).unwrap();
 
         let registration_options_response = app

@@ -14,6 +14,11 @@ export const registrationOptions = {
       rp: { id: "localhost", name: "Yoi" },
       user: { id: "BAUG", name: "alice", displayName: "Alice" },
       pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+      authenticatorSelection: {
+        residentKey: "required",
+        requireResidentKey: true,
+        userVerification: "required",
+      },
     },
   },
 };
@@ -22,6 +27,16 @@ export const loginOptions = {
   public_key: {
     publicKey: {
       challenge: "AQID",
+      allowCredentials: [],
+      userVerification: "required",
+    },
+  },
+};
+export const legacyLoginOptions = {
+  ...loginOptions,
+  public_key: {
+    publicKey: {
+      ...loginOptions.public_key.publicKey,
       allowCredentials: [{ type: "public-key", id: "BwgJ" }],
     },
   },

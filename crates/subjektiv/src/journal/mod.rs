@@ -37,10 +37,16 @@
 //! Hosts resuming at the processing cursor can use a bounded source point lookup instead of
 //! traversing already reflected pages. Receipt/entry keysets remain append-stable.
 
+pub mod binding;
+pub use binding::JournalWriterBinding;
+pub(crate) use binding::migrate as migrate_binding;
 mod lifecycle;
+pub mod memory_links;
 pub(crate) use lifecycle::migrate as migrate_lifecycle;
 pub mod recording;
 pub mod service;
+mod source_status;
+pub mod startup;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -110,8 +116,14 @@ pub struct JournalHostContext {
     scope_id: String,
     subject_id: String,
     attribution: Option<SubjectSessionAttribution>,
+    writer_binding_id: Option<String>,
 }
 impl JournalHostContext {
+    /// Evidence for a retained Job grant, not permission to mint or renew a binding.
+    pub fn writer_binding_id(&self) -> Option<&str> {
+        self.writer_binding_id.as_deref()
+    }
+
     pub fn validated_reader(store: &SubjektivStore, subject_id: &str) -> JournalResult<Self> {
         store
             .subject(subject_id)?
@@ -120,6 +132,7 @@ impl JournalHostContext {
             scope_id: store.scope_id().into(),
             subject_id: subject_id.into(),
             attribution: None,
+            writer_binding_id: None,
         })
     }
     /// External authentication, public-history validation and execution authority are Host duties.
@@ -133,6 +146,17 @@ impl JournalHostContext {
             ));
         }
         let mut context = Self::validated_reader(store, &attribution.subject_id)?;
+        use rusqlite::OptionalExtension;
+        context.writer_binding_id = store.database.try_with_connection(|tx| {
+            Ok::<_, JournalError>(
+                tx.query_row(
+                    "SELECT binding_id FROM journal_session_bindings WHERE session_id=?1",
+                    [&attribution.session_id],
+                    |r| r.get(0),
+                )
+                .optional()?,
+            )
+        })?;
         context.attribution = Some(attribution);
         Ok(context)
     }

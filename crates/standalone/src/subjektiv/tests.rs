@@ -37,9 +37,8 @@ fn subject_kernel_lease_is_not_worker_or_profile_scoped() {
     let catalog = StandaloneSubjects::open(temp.path().join("state")).unwrap();
     let a = catalog.create("a", None).unwrap();
     let b = catalog.create("b", None).unwrap();
-    let mut first = catalog
-        .connect(&a.id, protocol::WorkerId::now_v7())
-        .unwrap();
+    let first_id = protocol::WorkerId::now_v7();
+    let mut first = catalog.connect(&a.id, first_id).unwrap();
     assert!(matches!(
         StandaloneSubjects::open_existing(&temp.path().join("state"))
             .unwrap()
@@ -51,11 +50,18 @@ fn subject_kernel_lease_is_not_worker_or_profile_scoped() {
         .connect(&b.id, protocol::WorkerId::now_v7())
         .unwrap();
     first.close().unwrap();
-    let mut replacement = StandaloneSubjects::open_existing(&temp.path().join("state"))
+    assert!(
+        StandaloneSubjects::open_existing(&temp.path().join("state"))
+            .unwrap()
+            .connect(&a.id, protocol::WorkerId::now_v7())
+            .is_err(),
+        "kernel lease release is not durable body release"
+    );
+    let mut resumed = StandaloneSubjects::open_existing(&temp.path().join("state"))
         .unwrap()
-        .connect(&a.id, protocol::WorkerId::now_v7())
+        .connect(&a.id, first_id)
         .unwrap();
-    replacement.close().unwrap();
+    resumed.close().unwrap();
     second.close().unwrap();
 }
 
