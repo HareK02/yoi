@@ -1,0 +1,8 @@
+{
+  "nodeModulesDir": "none",
+  "lock": false,
+  "fmt": { "proseWrap": "never" },
+  "imports": {
+    "#lib/": "../../src/lib/"
+  }
+}

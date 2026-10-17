@@ -21,10 +21,10 @@ function assigned(status: "waiting" | "done" = "waiting"): TicketDetail {
     action_eligibility: { ...fixtureDetail("T-1").action_eligibility, can_assign_orchestrator: true },
   };
 }
-function installFetch(handle: (path: string, init?: RequestInit) => Response | Promise<Response> = () => { throw new Error("Unexpected request"); }) {
+function installFetch(handle: (path: string, init?: RequestInit) => Response | Promise<Response> = () => { throw new Error("Unexpected request"); }, emptyAssignments = true) {
   const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input);
-    if (path === assignmentsPath) return Response.json({ items: [], next_assignment_id: null });
+    if (emptyAssignments && path === assignmentsPath) return Response.json({ items: [], next_assignment_id: null });
     return await handle(path, init);
   });
   vi.stubGlobal("fetch", fetcher);
@@ -102,5 +102,142 @@ test("uncertain assignment reconciliation only refreshes the projection and assi
   });
   expect(view.refresh).toHaveBeenCalledTimes(1);
   expect(view.queryByRole("alert")).toBeNull();
+  expectNoDiagnostics(fetcher, view);
+});
+
+const trackingRoot = "/workspaces/team/tickets/internal-T-1/assignment-tracking";
+function historicalDone(action: "replaced" | "unassigned" = "replaced"): TicketAssignmentTrackingProjection {
+  const row = assigned("done").assignment_tracking[0];
+  return { ...row, current: false, release: {
+    action, actor: "Mika", at: "2026-10-13T10:00:00Z", event_id: "release-1",
+    replacement_assignment_id: action === "replaced" ? "assignment-2" : null,
+    last_tracking: row.tracking,
+  } };
+}
+
+test("paged retained done history preserves its result and replacement while Answer uses only current waiting observation", async () => {
+  const old = historicalDone();
+  const current = { ...assigned().assignment_tracking[0], assignment_id: "assignment-2", last_event_id: "handling-2",
+    assigned_at: "2026-10-13T10:00:00Z", tracking: { status: "waiting" as const, waiting_reason: "Choose the new policy" } };
+  const ticket = { ...assigned(), assignment_tracking: [current], assignments: [{ ...assigned().assignments[0], assignment_id: current.assignment_id }] };
+  const historyEntry = (event_id: string, tracking: TicketAssignmentTrackingProjection["tracking"]) => ({
+    event_id, tracking, at: "2026-10-13T09:00:00Z", operation_key: event_id, source_context: { kind: "workspace_agent", agent_key: "workspace-orchestrator" },
+  });
+  const fetcher = installFetch((path, init) => {
+    if (path === assignmentsPath) return Response.json({ items: [old], next_assignment_id: old.assignment_id });
+    if (path === `${assignmentsPath}&after_assignment_id=assignment-1`) return Response.json({ items: [current], next_assignment_id: null });
+    if (path === `${trackingRoot}?assignment_id=assignment-1`) return Response.json([old]);
+    if (path === `${trackingRoot}/history?assignment_id=assignment-1&limit=20`) return Response.json({
+      items: [historyEntry("old-waiting", { status: "waiting", waiting_reason: "Old question" })], next_event_id: "old-waiting",
+    });
+    if (path === `${trackingRoot}/history?assignment_id=assignment-1&limit=20&after_event_id=old-waiting`) return Response.json({
+      items: [historyEntry("handling-1", old.tracking)], next_event_id: null,
+    });
+    if (path === `${trackingRoot}?assignment_id=assignment-2`) return Response.json([current]);
+    if (path === `${trackingRoot}/history?assignment_id=assignment-2&limit=20`) return Response.json({
+      items: [historyEntry("handling-2", current.tracking)], next_event_id: null,
+    });
+    expect(path).toBe(answerPath);
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({ assignment_id: "assignment-2", expected_last_event_id: "handling-2", operation_key: expect.any(String), body: "Use the new policy" });
+    return Response.json({ assignment_id: "assignment-2", input_event_id: "new-input", event_index: 1 });
+  }, false);
+  const view = mount(ticket);
+  await fireEvent.click(view.getByText("Past assignment and release history"));
+  await waitFor(() => expect(view.getByRole("button", { name: "More assignments" })).toBeTruthy());
+  await fireEvent.click(view.getByRole("button", { name: "More assignments" }));
+  await waitFor(() => expect(view.queryByRole("button", { name: "More assignments" })).toBeNull());
+  expect(view.getByRole("button", { name: /Current · waiting/ })).toBeTruthy();
+  expect(view.getByText(/Comparison delivered/)).toBeTruthy();
+  await fireEvent.click(view.getByRole("button", { name: /Past · done/ }));
+  await waitFor(() => expect(view.getByText("Previous result: Comparison delivered")).toBeTruthy());
+  expect(view.getByText(/replaced by Mika/)).toBeTruthy();
+  await waitFor(() => expect(view.getByRole("button", { name: "More handling history" })).toBeTruthy());
+  await fireEvent.click(view.getByRole("button", { name: "More handling history" }));
+  await waitFor(() => expect(view.getByText("Result: Comparison delivered")).toBeTruthy());
+  expect(view.getByText("Waiting reason: Old question")).toBeTruthy();
+  expect(view.queryByRole("button", { name: "More handling history" })).toBeNull();
+  expect(view.getByText("Self-reported handling: waiting")).toBeTruthy();
+  await fireEvent.input(view.getByRole("textbox", { name: "Answer / continue this handling" }), { target: { value: "Use the new policy" } });
+  await fireEvent.click(view.getByRole("button", { name: "Send answer to this assignment" }));
+  await waitFor(() => expect(view.getByText(/^Answer saved to assignment assignment-2/)).toBeTruthy());
+  expect(view.refresh).toHaveBeenCalledTimes(1);
+  await fireEvent.click(view.getByRole("button", { name: "Read replacement assignment" }));
+  await waitFor(() => {
+    expect(view.getByText(/· current · last handling waiting/)).toBeTruthy();
+    expect(view.queryByText("Previous result: Comparison delivered")).toBeNull();
+    expect(view.queryByText("Result: Comparison delivered")).toBeNull();
+  });
+  expectNoDiagnostics(fetcher, view);
+});
+
+test("released done is retained as past result without current Answer or implicit request", async () => {
+  const old = historicalDone("unassigned");
+  const ticket = { ...assigned(), assignment_tracking: [], assignments: [] };
+  const fetcher = installFetch((path) => {
+    if (path === assignmentsPath) return Response.json({ items: [old], next_assignment_id: null });
+    if (path === `${trackingRoot}?assignment_id=assignment-1`) return Response.json([old]);
+    expect(path).toBe(`${trackingRoot}/history?assignment_id=assignment-1&limit=20`);
+    return Response.json({ items: [], next_event_id: null });
+  }, false);
+  const view = mount(ticket);
+  await fireEvent.click(view.getByText("Past assignment and release history"));
+  await waitFor(() => expect(view.getByRole("button", { name: /Past · done/ })).toBeTruthy());
+  await fireEvent.click(view.getByRole("button", { name: /Past · done/ }));
+  await waitFor(() => expect(view.getByText(/unassigned by Mika/)).toBeTruthy());
+  expect(view.getByText("Previous result: Comparison delivered")).toBeTruthy();
+  expect(view.getByText("No current Orchestrator assignment.")).toBeTruthy();
+  expect(view.queryByRole("textbox", { name: "Answer / continue this handling" })).toBeNull();
+  expect(view.queryByRole("button", { name: "Read replacement assignment" })).toBeNull();
+  expect(view.getByRole("button", { name: "Request Orchestrator" })).toBeTruthy();
+  expect(fetcher.mock.calls.every(([, init]) => !init?.method || init.method === "GET")).toBe(true);
+  expectNoDiagnostics(fetcher, view);
+});
+
+test("case close and reopen keep done result non-actionable and require an explicit new assignment", async () => {
+  const fetcher = installFetch();
+  const ticket = assigned("done");
+  const view = mount(ticket);
+  await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+  for (const state of ["closed", "open"] as const) {
+    await view.rerender({ workspaceId: "team", ticket: { ...ticket, state }, orchestrator: null, refresh: view.refresh });
+    expect(view.getByText(`This handling was returned. Ticket ${state} is unchanged.`)).toBeTruthy();
+    expect(view.getByText("Comparison delivered")).toBeTruthy();
+    expect(view.queryByRole("textbox", { name: "Answer / continue this handling" })).toBeNull();
+    expect(view.getByRole("button", { name: "Request again (new assignment)" })).toBeTruthy();
+  }
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(view.refresh).not.toHaveBeenCalled();
+  expectNoDiagnostics(fetcher, view);
+});
+
+test("releasing responsibility while reading an old result uses current assignment rather than retained identity", async () => {
+  const old = historicalDone();
+  const ticket = assigned();
+  ticket.assignment_tracking[0] = { ...ticket.assignment_tracking[0], assignment_id: "assignment-2", last_event_id: "handling-2" };
+  ticket.assignments[0] = { ...ticket.assignments[0], assignment_id: "assignment-2" };
+  ticket.action_eligibility.can_unassign_orchestrator = true;
+  vi.stubGlobal("confirm", vi.fn(() => true));
+  const fetcher = installFetch((path, init) => {
+    if (path === assignmentsPath) return Response.json({ items: [old], next_assignment_id: null });
+    if (path === `${trackingRoot}?assignment_id=assignment-1`) return Response.json([old]);
+    if (path === `${trackingRoot}/history?assignment_id=assignment-1&limit=20`) return Response.json({ items: [], next_event_id: null });
+    const url = new URL(path, "http://fixture.invalid");
+    expect(url.pathname).toBe(assignmentPath);
+    expect(init?.method).toBe("DELETE");
+    expect(url.searchParams.get("assignment_id")).toBe("assignment-2");
+    expect(url.searchParams.get("operation_id")).toBeTruthy();
+    return Response.json({ workspace_id: "team", ticket_id: "internal-T-1", assignment: null });
+  }, false);
+  const view = mount(ticket);
+  await fireEvent.click(view.getByText("Past assignment and release history"));
+  await waitFor(() => expect(view.getByRole("button", { name: /Past · done/ })).toBeTruthy());
+  await fireEvent.click(view.getByRole("button", { name: /Past · done/ }));
+  await waitFor(() => expect(view.getByText("Previous result: Comparison delivered")).toBeTruthy());
+  await fireEvent.click(view.getByRole("button", { name: "Release assignment" }));
+  await waitFor(() => expect(view.getByText("Assignment operation saved: released.")).toBeTruthy());
+  expect(view.refresh).toHaveBeenCalledTimes(1);
+  expect(view.getByText("Previous result: Comparison delivered")).toBeTruthy();
+  expect(fetcher.mock.calls.filter(([, init]) => init?.method === "DELETE")).toHaveLength(1);
   expectNoDiagnostics(fetcher, view);
 });
