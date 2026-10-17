@@ -13148,6 +13148,7 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         post(scoped_submit_backend_job_result),
     )
     .route("/api/w/{workspace_id}/subjektiv/journal/release", post(subjektiv_journal::release_route))
+    .route("/api/w/{workspace_id}/subjektiv/journal/compaction", post(subjektiv_journal::compaction_route))
     .route("/api/w/{workspace_id}/subjektiv/journal/startup", get(subjektiv_journal::startup_route))
     .route("/api/w/{workspace_id}/subjektiv/journal/recording", post(subjektiv_journal::recording_route))
     .route("/api/w/{workspace_id}/subjektiv/journal/memory", post(subjektiv_memory_journal::route))

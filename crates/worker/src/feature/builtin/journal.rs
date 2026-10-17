@@ -3,6 +3,12 @@
 //! Hooks request Host reconciliation, never infer source ranges from in-memory history.
 //! Hosts retain exact operation inputs/receipts and validate live Job authority on every
 //! operation. Successful operations are never rolled back by Job finalization.
+//!
+//! Compaction freezes a read-only Host snapshot independently of admission/Job progress.
+//! Its rendered reference is shared by mandatory compactor input and the replacement seed;
+//! no restore/turn hook refreshes it. Previous references are only historical compactor
+//! material so fallback can recover information intentionally omitted from an earlier
+//! complementary summary, without accumulating stale references in the next segment.
 
 use crate::feature::{
     FeatureDescriptor, FeatureHookPoint, FeatureInstallContext, FeatureInstallError, FeatureModule,
@@ -77,6 +83,60 @@ impl crate::worker::InitialContextSource for JournalStartupContextSource {
             },
         }])
     }
+}
+
+/// Read once without waiting for recording. The returned body is immutable mandatory
+/// compactor input and the exact replacement-segment reference, including fallback status.
+/// Selection and authorization belong to the Host, not the core compaction engine.
+pub(crate) fn freeze_compaction_journal(
+    connection: std::io::Result<Option<SubjektivHostConnection>>,
+    prompts: &crate::prompt::catalog::PromptCatalog,
+) -> Result<String, crate::prompt::catalog::CatalogError> {
+    let workspace_id = connection.as_ref().ok().and_then(|connection| {
+        connection
+            .as_ref()
+            .and_then(|connection| connection.host.workspace_id())
+    });
+    let read = match connection {
+        Ok(Some(connection)) if connection.host.journal_compaction_granted() => {
+            Some(connection.journal_compaction_context().map_err(|_| ()))
+        }
+        Ok(_) => None,
+        Err(_) => Some(Err(())),
+    };
+    let (status, json) = match read {
+        None => ("disabled", String::new()),
+        Some(Ok(snapshot)) => {
+            let status = if snapshot.journals.is_empty() {
+                "absent"
+            } else {
+                "available"
+            };
+            match serde_json::to_string(&snapshot) {
+                Ok(json) if json.len() <= subjektiv::journal::startup::STARTUP_MAX_BYTES => {
+                    (status, json)
+                }
+                _ => ("unavailable", String::new()),
+            }
+        }
+        Some(Err(())) => ("unavailable", String::new()),
+    };
+    if status == "unavailable" {
+        tracing::warn!("Journal compaction snapshot unavailable; continuing without Journal");
+    }
+    use sha2::{Digest, Sha256};
+    let snapshot_sha256: Option<String> = (!json.is_empty()).then(|| {
+        Sha256::digest(json.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    });
+    prompts.subjektiv_journal_compaction(
+        status,
+        &json,
+        snapshot_sha256.as_deref(),
+        workspace_id.as_deref(),
+    )
 }
 
 #[derive(Clone)]

@@ -72,10 +72,29 @@ impl SubjektivStore {
         host: &JournalHostContext,
         previous_session: Option<&str>,
     ) -> JournalResult<JournalStartupSnapshot> {
+        self.context_snapshot(host, previous_session, false)
+    }
+
+    pub fn journal_compaction_snapshot(
+        &self,
+        host: &JournalHostContext,
+    ) -> JournalResult<JournalStartupSnapshot> {
+        let session = host.attribution.as_ref().ok_or_else(|| {
+            JournalError::PermissionDenied("compaction requires a Host-bound body Session".into())
+        })?;
+        self.context_snapshot(host, Some(&session.session_id), true)
+    }
+
+    fn context_snapshot(
+        &self,
+        host: &JournalHostContext,
+        preferred_session: Option<&str>,
+        require_current_writer: bool,
+    ) -> JournalResult<JournalStartupSnapshot> {
         self.database.try_transaction(|tx| {
-            super::store::check_host(self, tx, host, false)?;
+            super::store::check_host(self, tx, host, require_current_writer)?;
             let mut ids = Vec::new();
-            if let Some(session) = previous_session {
+            if let Some(session) = preferred_session {
                 let previous: Option<(String, String)> = tx.query_row(
                     "SELECT id,subject_id FROM journals WHERE source_session_id=?1",
                     [session], |r| Ok((r.get(0)?, r.get(1)?)),

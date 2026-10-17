@@ -6918,6 +6918,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // within `retained_tokens`. Item-granular, turn boundaries ignored.
         let cut = self.split_for_retained(retained_tokens);
 
+        // Freeze one Host-owned read before starting the compactor. Background recording
+        // remains independent; never re-read when building the replacement segment.
+        let journal_context = crate::feature::builtin::journal::freeze_compaction_journal(
+            self.subjektiv_host_connection(),
+            &self.prompts.load_full(),
+        )
+        .map_err(WorkerError::PromptCatalog)?;
         let history_entries = self.session.history().entries();
         let retain_from = cut.index.min(history_entries.len());
         let initial_summary = initial_compaction_summary(history_entries)?;
@@ -6926,7 +6933,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // it as well would duplicate inherited context on every compact.
         let retained_history_entries = history_entries[retain_from..]
             .iter()
-            .filter(|entry| entry.annotation.origin != WorkerHistoryProvenance::CompactionSummary)
+            .filter(|entry| {
+                !matches!(
+                    entry.annotation.origin,
+                    WorkerHistoryProvenance::CompactionSummary
+                        | WorkerHistoryProvenance::JournalContext
+                )
+            })
             .cloned()
             .collect::<Vec<_>>();
         let mut retained_items = retained_history_entries
@@ -6943,7 +6956,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // never needs durable image bodies; relevant images are nominated with add_reference.
         let mut entries_to_summarise = history_entries[..retain_from]
             .iter()
-            .filter(|entry| entry.annotation.origin != WorkerHistoryProvenance::CompactionSummary)
+            .filter(|entry| {
+                !matches!(
+                    entry.annotation.origin,
+                    WorkerHistoryProvenance::CompactionSummary
+                        | WorkerHistoryProvenance::JournalContext
+                )
+            })
             .cloned()
             .collect::<Vec<_>>();
         project_compactor_capture_attachments(&mut entries_to_summarise);
@@ -7013,7 +7032,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // The full Host summary is mandatory input, separate from the bounded
         // prefix overview and current TaskStore snapshot.
         let task_snapshot_text = self.task_feature.snapshot_text();
-        let summary_input = build_summary_input(
+        let mut summary_input = build_summary_input(
             &items_to_summarise,
             initial_summary.as_deref(),
             &default_refs,
@@ -7025,6 +7044,28 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 summary_target_tokens,
             },
         );
+        // Previous references are historical source material, not additional latest
+        // Journals. In particular, a failed/empty read must not silently lose context
+        // that the previous summary intentionally delegated to its injected Journal.
+        // Carry them only into the compactor, never alongside the new reference seed.
+        for entry in history_entries
+            .iter()
+            .filter(|entry| entry.annotation.origin == WorkerHistoryProvenance::JournalContext)
+        {
+            if let Some(body) = entry.item.as_text() {
+                summary_input.text.push_str(
+                    "\n\n## Previous Journal reference (historical, not automatically retained)\n",
+                );
+                summary_input.text.push_str(body);
+                summary_input
+                    .text
+                    .push_str("\n## End previous Journal reference\n");
+            }
+        }
+        // Mandatory context, outside overview truncation. The internal Worker's normal
+        // request budget checks include this exact body and the full previous summary.
+        summary_input.text.push_str("\n\n");
+        summary_input.text.push_str(&journal_context);
         if summary_input.warning_exceeded {
             self.alert(
                 AlertLevel::Warn,
@@ -7340,6 +7381,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             crate::session_history::COMPACTION_SUMMARY_HEADER
         ));
         compact_introduced_system_messages.push(summary_message.clone());
+        let journal_message = Item::system_message(journal_context);
+        compact_introduced_system_messages.push(journal_message.clone());
         compact_introduced_system_messages.extend(auto_read_messages.iter().cloned());
         if let Some(msg) = reference_message.as_ref() {
             compact_introduced_system_messages.push(msg.clone());
@@ -7352,6 +7395,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         compact_introduced_system_messages.push(task_snapshot_message.clone());
 
         new_history.push(summary_message);
+        new_history.push(journal_message);
         new_history.extend(auto_read_messages);
         if let Some(msg) = reference_message {
             new_history.push(msg);
@@ -7402,6 +7446,16 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                         item,
                         new_history_metadata(
                             WorkerHistoryProvenance::CompactionSummary,
+                            Some(SessionHistoryDerivation {
+                                sources: derived_sources.clone(),
+                            }),
+                        ),
+                    )
+                } else if index == 1 {
+                    HistoryEntry::new(
+                        item,
+                        new_history_metadata(
+                            WorkerHistoryProvenance::JournalContext,
                             Some(SessionHistoryDerivation {
                                 sources: derived_sources.clone(),
                             }),
@@ -16732,7 +16786,7 @@ permission = "write"
             assert_eq!(replay[0].item.as_text(), Some("PRIOR_JOURNAL_REFERENCE"));
             assert_eq!(
                 replay[0].annotation.origin,
-                WorkerHistoryProvenance::DerivedSummary
+                WorkerHistoryProvenance::JournalContext
             );
             let view =
                 crate::session_capture::SessionCapture::from_history_entries("startup", replay);

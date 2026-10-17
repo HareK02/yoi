@@ -543,6 +543,14 @@ fn reasoning_proves_rollback_safety_but_private_and_derived_items_are_not_materi
     let segment = crate::new_segment_id();
     let mut derived = message("derived", LoggedRole::User, "summary");
     derived.metadata.origin = LoggedSessionHistoryOrigin::DerivedSummary;
+    let mut journal = message("journal", LoggedRole::User, "frozen Journal reference");
+    journal.metadata.origin = LoggedSessionHistoryOrigin::JournalContext;
+    let mut summary = message(
+        "compaction-summary",
+        LoggedRole::User,
+        "complementary summary",
+    );
+    summary.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
     let reasoning = entry(
         "reasoning",
         LoggedItem::Reasoning {
@@ -559,7 +567,12 @@ fn reasoning_proves_rollback_safety_but_private_and_derived_items_are_not_materi
             &[
                 seed(
                     session,
-                    vec![derived, message("system", LoggedRole::System, "secret")],
+                    vec![
+                        derived,
+                        journal,
+                        summary,
+                        message("system", LoggedRole::System, "secret"),
+                    ],
                 ),
                 LogEntry::AnnotatedSystemItem {
                     ts: 1,

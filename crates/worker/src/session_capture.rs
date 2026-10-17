@@ -736,9 +736,9 @@ fn public_provenance(origin: &WorkerHistoryProvenance) -> SessionEntryProvenance
         }
         WorkerHistoryProvenance::ModelOutput { .. } => SessionEntryProvenance::ModelOutput,
         WorkerHistoryProvenance::ToolOutput { .. } => SessionEntryProvenance::ToolOutput,
-        WorkerHistoryProvenance::CompactionSummary | WorkerHistoryProvenance::DerivedSummary => {
-            SessionEntryProvenance::DerivedSummary
-        }
+        WorkerHistoryProvenance::CompactionSummary
+        | WorkerHistoryProvenance::DerivedSummary
+        | WorkerHistoryProvenance::JournalContext => SessionEntryProvenance::DerivedSummary,
         WorkerHistoryProvenance::LegacyUnknown => SessionEntryProvenance::LegacyUnknown,
     }
 }

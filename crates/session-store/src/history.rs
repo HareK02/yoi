@@ -69,6 +69,8 @@ pub enum LoggedSessionHistoryOrigin {
     },
     /// Host-produced opening context summary; not auto-read or TaskStore material.
     CompactionSummary,
+    /// Frozen Host Journal reference, never independent observation evidence.
+    JournalContext,
     DerivedSummary,
     LegacyUnknown,
 }
