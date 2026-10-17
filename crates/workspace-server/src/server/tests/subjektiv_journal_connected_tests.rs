@@ -619,5 +619,220 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         )
     );
     drop(requests);
+    let connection = connected_host_reader(&api, &next, &next_attr.session_id);
+    let before = store
+        .journal_resume_state(
+            &JournalHostContext::validated_session(&store, next_attr.clone()).unwrap(),
+            &store
+                .journal_for_session(
+                    &JournalHostContext::validated_session(&store, next_attr.clone()).unwrap(),
+                )
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    let (startup, compacted) = tokio::task::spawn_blocking(move || {
+        (
+            connection.journal_startup_context().unwrap(),
+            connection.journal_compaction_context().unwrap(),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(startup.journals[0].source_session_id, old_attr.session_id);
+    assert_eq!(
+        compacted.journals[0].source_session_id,
+        next_attr.session_id
+    );
+    assert_eq!(compacted.journals[0].state_token, before.0.state_token);
+    assert_eq!(compacted.journals[0].process_order, before.0.process_order);
+    assert_eq!(compacted.journals[0].process_byte, before.0.process_byte);
+    assert_eq!(
+        store
+            .journal_resume_state(
+                &JournalHostContext::validated_session(&store, next_attr.clone()).unwrap(),
+                &before.0.id
+            )
+            .unwrap(),
+        before
+    );
+    for (worker, session) in [
+        (&old, old_attr.session_id.as_str()),
+        (&next, old_attr.session_id.as_str()),
+        (&next, "unattributed-session"),
+    ] {
+        let connection = connected_host_reader(&api, worker, session);
+        assert!(
+            tokio::task::spawn_blocking(move || connection.journal_compaction_context())
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
     server.abort();
+}
+
+#[tokio::test]
+async fn signed_compaction_read_does_not_contact_runtime_or_wait_for_active_generation_and_rejects_jobs()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let mut api = test_api(dir.path()).await;
+    let identity = worker_runtime::auth::RuntimeIdentityMaterial::generate("runtime-test").unwrap();
+    configure_runtime_request_auth(&mut api, &identity, "runtime-test");
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(crate::subjektiv::SubjectRole::new("snapshot").unwrap())
+        .unwrap();
+    let settings = api
+        .config_store
+        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+        .unwrap();
+    let reserve = |key: String, operation: &str| {
+        api.config_store
+            .reserve_worker_create(
+                TEST_WORKSPACE_ID,
+                "runtime-test",
+                operation,
+                &"f".repeat(64),
+                Some(&key),
+                &settings,
+            )
+            .unwrap()
+            .worker_id
+            .to_string()
+    };
+    let body = reserve(
+        crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap(),
+        "body",
+    );
+    let job = reserve(
+        format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{}", subject.id),
+        "job",
+    );
+    let attr = store
+        .record_session_attribution(
+            crate::subjektiv::SubjectSessionAttribution::new(
+                &subject.id,
+                "runtime-test",
+                &body,
+                "committed-session",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let host = bind_fixture_session(&store, attr);
+    let range = JournalSourceRange {
+        source: JournalSource {
+            session_id: "committed-session".into(),
+            pointer: JournalSourcePointer {
+                segment_id: uuid::Uuid::now_v7(),
+                entry_ref: "E0".into(),
+            },
+            order: 0,
+            content_sha256: "f".repeat(64),
+            total_bytes: 10,
+        },
+        bytes: JournalByteRange { start: 0, end: 10 },
+    };
+    let id = store
+        .accept_journal_sources(&host, "pending", &[range.clone()])
+        .unwrap();
+    let generation = store
+        .prepare_journal_generation(
+            &host,
+            &id,
+            subjektiv::api::JobAttemptBinding {
+                job_id: "active-job".into(),
+                attempt_id: "attempt".into(),
+            },
+            vec![range],
+        )
+        .unwrap();
+    let expected = store.journal_compaction_snapshot(&host).unwrap();
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/journal/compaction");
+    let app = build_router(api.clone());
+    for (worker, session, status) in [
+        (&body, "committed-session", StatusCode::OK),
+        (&job, "committed-session", StatusCode::FORBIDDEN),
+        (&body, "foreign-session", StatusCode::FORBIDDEN),
+    ] {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.clone().oneshot(runtime_source_request(
+                &identity,
+                Some(worker),
+                "POST",
+                &path,
+                serde_json::to_vec(&JournalCompactionRequest {
+                    session_id: session.into(),
+                })
+                .unwrap(),
+            )),
+        )
+        .await
+        .expect("snapshot must not wait for an unavailable Runtime or active generation")
+        .unwrap();
+        assert_eq!(response.status(), status);
+        if status == StatusCode::OK {
+            let snapshot: subjektiv::journal::startup::JournalStartupSnapshot =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(snapshot, expected);
+        }
+    }
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(&path)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&JournalCompactionRequest {
+                        session_id: "committed-session".into(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(store.journal_compaction_snapshot(&host).unwrap(), expected);
+    assert_eq!(
+        store.active_journal_generation(&host, &id).unwrap(),
+        Some(generation)
+    );
+}
+
+fn connected_host_reader(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    session: &str,
+) -> worker::subjektiv::SubjektivHostConnection {
+    let audience = embedded_runtime_request_audience(&api.config).unwrap();
+    let client = worker_runtime::worker_source::RuntimeOwnedWorkspaceClient::new(
+        TEST_WORKSPACE_ID,
+        api.config.backend_base_url.as_ref().unwrap(),
+        &worker.runtime_id,
+        &worker.worker_id,
+    )
+    .with_runtime_request_source(&EMBEDDED_RUNTIME_REQUEST_IDENTITY, audience);
+    let mut config = manifest::ResolvedSubjektivFeatureConfig::default();
+    config.profile.enabled = true;
+    config
+        .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            language: "English".into(),
+        })
+        .unwrap();
+    worker::subjektiv::SubjektivHostConnection::new(
+        worker::subjektiv::BackendSubjektivHost::from_resolved_config(&config, Arc::new(client))
+            .unwrap()
+            .unwrap(),
+        worker::subjektiv::SubjektivHostContext {
+            worker_id: worker.worker_id.clone(),
+            session_id: session.into(),
+        },
+    )
+    .unwrap()
 }

@@ -2086,6 +2086,27 @@ struct SummaryInputFixture {
 
 impl SummaryInputFixture {
     async fn new(manifest_toml: &str, client: MockClient) -> Self {
+        Self::with_manifest(
+            worker::WorkerManifest::from_toml(manifest_toml).unwrap(),
+            client,
+        )
+        .await
+    }
+
+    async fn with_journal(
+        manifest_toml: &str,
+        client: MockClient,
+        host: Arc<CompactionJournalHost>,
+    ) -> Self {
+        let mut manifest = worker::WorkerManifest::from_toml(manifest_toml).unwrap();
+        manifest.feature.subjektiv.profile.enabled = true;
+        manifest.feature.subjektiv.profile.extraction.enabled = false;
+        let mut fixture = Self::with_manifest(manifest, client).await;
+        fixture.worker.bind_subjektiv_host(Some(host));
+        fixture
+    }
+
+    async fn with_manifest(manifest: worker::WorkerManifest, client: MockClient) -> Self {
         let store_dir = tempfile::tempdir().unwrap();
         let store = CombinedStore::new(
             FsStore::new(store_dir.path()).unwrap(),
@@ -2096,7 +2117,7 @@ impl SummaryInputFixture {
                 client,
             );
         let mut worker = Worker::new(
-            worker::WorkerManifest::from_toml(manifest_toml).unwrap(),
+            manifest,
             engine,
             store,
             worker::WorkerWorkspaceContext::no_workspace(),
@@ -2120,6 +2141,16 @@ impl SummaryInputFixture {
         &mut self,
         history: Vec<session_store::LoggedHistoryEntry>,
         compacted: bool,
+    ) {
+        self.restore_seed_with_system(history, compacted, vec![])
+            .await;
+    }
+
+    async fn restore_seed_with_system(
+        &mut self,
+        history: Vec<session_store::LoggedHistoryEntry>,
+        compacted: bool,
+        systems: Vec<session_store::LoggedSystemHistoryEntry>,
     ) {
         self.worker
             .run_text("fixture rewind boundary")
@@ -2150,6 +2181,16 @@ impl SummaryInputFixture {
             }
             _ => unreachable!(),
         }
+        records.splice(
+            1..1,
+            systems
+                .into_iter()
+                .map(|entry| LogEntry::AnnotatedSystemItem {
+                    ts: 1,
+                    entry,
+                    extensions: vec![],
+                }),
+        );
         self.worker
             .store()
             .create_segment(session_id, segment_id, &records)
@@ -2800,4 +2841,738 @@ async fn budget_warning_is_durable_and_keeps_full_summary_in_first_model_request
             .any(|event| matches!(event, Event::Alert(alert)
         if alert.message.contains("compact worker context budget is low")))
     );
+}
+
+const COMPACTION_HOST_WORKSPACE_ID: &str = "journal-transport-host-workspace";
+
+// Public compact/rewind -> real internal Worker, prompt catalog, and FsStore.
+// Only the authenticated Host and LLM provider are replaced. This does not test
+// Host authorization/selection or live-model semantic continuation quality.
+struct CompactionJournalHost {
+    granted: bool,
+    unavailable: bool,
+    snapshot: Mutex<subjektiv::journal::startup::JournalStartupSnapshot>,
+    reads: Mutex<Vec<worker::subjektiv::SubjektivHostContext>>,
+    startup_reads: AtomicUsize,
+}
+
+impl CompactionJournalHost {
+    fn new(snapshot: subjektiv::journal::startup::JournalStartupSnapshot) -> Self {
+        Self {
+            granted: true,
+            unavailable: false,
+            snapshot: Mutex::new(snapshot),
+            reads: Mutex::new(vec![]),
+            startup_reads: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl worker::subjektiv::SubjektivHost for CompactionJournalHost {
+    fn settings(&self) -> worker::subjektiv::SubjektivHostSettings {
+        worker::subjektiv::SubjektivHostSettings {
+            language: "English".into(),
+        }
+    }
+
+    fn workspace_id(&self) -> Option<String> {
+        Some(COMPACTION_HOST_WORKSPACE_ID.into())
+    }
+
+    fn journal_compaction_granted(&self) -> bool {
+        self.granted
+    }
+
+    fn journal_compaction_context(
+        &self,
+        context: &worker::subjektiv::SubjektivHostContext,
+    ) -> Result<
+        subjektiv::journal::startup::JournalStartupSnapshot,
+        worker::subjektiv::SubjektivHostError,
+    > {
+        self.reads.lock().unwrap().push(context.clone());
+        if self.unavailable {
+            return Err(worker::subjektiv::SubjektivHostError::Unavailable(
+                "injected Journal read failure".into(),
+            ));
+        }
+        Ok(self.snapshot.lock().unwrap().clone())
+    }
+
+    fn journal_startup_granted(&self) -> bool {
+        true
+    }
+
+    fn journal_startup_context(
+        &self,
+        _: &worker::subjektiv::SubjektivHostContext,
+    ) -> Result<
+        subjektiv::journal::startup::JournalStartupSnapshot,
+        worker::subjektiv::SubjektivHostError,
+    > {
+        self.startup_reads.fetch_add(1, Ordering::SeqCst);
+        Err(worker::subjektiv::SubjektivHostError::Unavailable(
+            "startup must not be read during compaction/rewind/normal turns".into(),
+        ))
+    }
+
+    fn memory(
+        &self,
+        _: &worker::subjektiv::SubjektivHostContext,
+        _: server_api::SubjektivMemoryBackendOperation,
+    ) -> Result<server_api::SubjektivMemoryBackendResponse, worker::subjektiv::SubjektivHostError>
+    {
+        Err(worker::subjektiv::SubjektivHostError::Unavailable(
+            "not used".into(),
+        ))
+    }
+    fn session(
+        &self,
+        _: &worker::subjektiv::SubjektivHostContext,
+        _: server_api::SubjektivSessionBackendOperation,
+    ) -> Result<server_api::SubjektivSessionBackendResponse, worker::subjektiv::SubjektivHostError>
+    {
+        Err(worker::subjektiv::SubjektivHostError::Unavailable(
+            "not used".into(),
+        ))
+    }
+    fn stage_candidate(
+        &self,
+        _: &worker::subjektiv::SubjektivHostContext,
+        _: memory::backend::MemoryStageCandidateOperation,
+    ) -> Result<server_api::SubjektivStageCandidateResponse, worker::subjektiv::SubjektivHostError>
+    {
+        Err(worker::subjektiv::SubjektivHostError::Unavailable(
+            "not used".into(),
+        ))
+    }
+    fn record_session(
+        &self,
+        _: &worker::subjektiv::SubjektivHostContext,
+        _: bool,
+    ) -> Result<server_api::SubjektivRecordSessionResponse, worker::subjektiv::SubjektivHostError>
+    {
+        Err(worker::subjektiv::SubjektivHostError::Unavailable(
+            "not used".into(),
+        ))
+    }
+    fn request_consolidation(
+        &self,
+        _: &worker::subjektiv::SubjektivHostContext,
+        _: memory::backend::MemoryConsolidateStagingOperation,
+    ) -> Result<memory::backend::MemoryConsolidationOutput, worker::subjektiv::SubjektivHostError>
+    {
+        Err(worker::subjektiv::SubjektivHostError::Unavailable(
+            "not used".into(),
+        ))
+    }
+}
+
+fn compaction_snapshot(generation: usize) -> subjektiv::journal::startup::JournalStartupSnapshot {
+    use subjektiv::journal::startup::{JournalStartupSnapshot, StartupEntry, StartupJournal};
+    JournalStartupSnapshot {
+        subject_id: "compaction-subject".into(),
+        omitted: true,
+        journals: vec![StartupJournal {
+            journal_id: format!("journal-reference-{generation}"),
+            source_session_id: "current-source-session".into(),
+            state_token: format!("state-token-{generation}"),
+            process_order: 7 + generation as u64,
+            process_byte: 23 + generation as u64,
+            current_position: format!(
+                "JOURNAL_POSITION_{generation}: work ongoing, result not verified\nExact JSON bytes: 日本語, \"quoted\", \\path"
+            ),
+            entries: vec![StartupEntry {
+                entry_id: format!("fixed-event-reference-{generation}"),
+                position: 2,
+                state: subjektiv::journal::JournalEntryState::Fixed,
+                title: "An event ended, not the entire conversation".into(),
+                body: format!("JOURNAL_BODY_{generation}"),
+                ongoing: "User instructions after the checkpoint are not recorded".into(),
+                source_end: Some(subjektiv::journal::JournalSourcePointer {
+                    segment_id: session_store::new_segment_id(),
+                    entry_ref: "E3".into(),
+                }),
+                correction_refs: vec![format!("correction-reference-{generation}")],
+                omitted: false,
+            }],
+            omitted: true,
+        }],
+    }
+}
+
+fn journal_body(worker: &Worker<MockClient, TestStore>) -> String {
+    let seed = replacement_seed(worker);
+    assert_eq!(
+        seed[1].metadata.origin,
+        session_store::LoggedSessionHistoryOrigin::JournalContext
+    );
+    let item = Item::from(seed[1].item.clone());
+    assert!(matches!(
+        item,
+        Item::Message {
+            role: agen::Role::System,
+            ..
+        }
+    ));
+    assert_eq!(
+        seed.iter()
+            .filter(|entry| entry.metadata.origin
+                == session_store::LoggedSessionHistoryOrigin::JournalContext)
+            .count(),
+        1
+    );
+    item.as_text().unwrap().to_string()
+}
+
+fn journal_source_records(
+    store: &TestStore,
+    session: session_store::SessionId,
+    segment: session_store::SegmentId,
+) -> serde_json::Value {
+    // Compaction appends telemetry; the source material and typed startup
+    // records must remain equivalent, not rewritten or removed.
+    let records = store
+        .read_all(session, segment)
+        .unwrap()
+        .into_iter()
+        .filter(
+            |record| !matches!(record, LogEntry::Extension { domain, .. } if domain == "metrics"),
+        )
+        .collect::<Vec<_>>();
+    serde_json::to_value(records).unwrap()
+}
+
+fn assert_frozen_journal_transport(input: &str, body: &str) {
+    assert!(
+        input.ends_with(body),
+        "the actual compactor user input ends with the frozen reference"
+    );
+    assert_eq!(input.matches(body).count(), 1);
+}
+
+fn assert_journal_provenance(
+    body: &str,
+    expected_json: Option<&str>,
+    catalog: &worker::PromptCatalog,
+    workspace_id: Option<&str>,
+) {
+    use sha2::{Digest, Sha256};
+    let projection = catalog.projection();
+    assert!(body.contains(&format!(
+        "Prompt provenance: `internal.subjektiv_journal_compaction`, source `{}`, projection `{}`.",
+        projection.source_digest, projection.catalog_digest,
+    )));
+    if let Some(workspace_id) = workspace_id {
+        assert!(body.contains(&format!("Host Workspace: `{workspace_id}`.")));
+    } else {
+        assert!(!body.contains("Host Workspace:"));
+    }
+    if let Some(expected_json) = expected_json {
+        // Hash the actual rendered JSON, including escapes and UTF-8 bytes,
+        // not a parsed/re-serialized or pretty-printed approximation.
+        let rendered_json = body.lines().rfind(|line| !line.is_empty()).unwrap();
+        assert_eq!(rendered_json.as_bytes(), expected_json.as_bytes());
+        let expected_hash = Sha256::digest(rendered_json.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let declared_hash = body
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Snapshot SHA-256 (the exact JSON bytes below): `")
+                    .and_then(|value| value.strip_suffix("`."))
+            })
+            .expect("snapshot SHA-256 must be persisted in the same rendered body");
+        assert_eq!(declared_hash, expected_hash);
+    } else {
+        assert!(
+            !body.contains("Snapshot SHA-256"),
+            "failed/disabled reads must not invent a snapshot hash"
+        );
+    }
+}
+
+#[tokio::test]
+async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tail_tasks_and_source()
+{
+    use session_store::LoggedSessionHistoryOrigin::{
+        CompactionSummary, DerivedSummary, JournalContext,
+    };
+    let initial = long_summary("journal-initial");
+    let summaries = (0..3)
+        .map(|index| long_summary(&format!("journal-next-{index}")))
+        .collect::<Vec<_>>();
+    let mut responses = vec![single_text_events("fixture")];
+    for (index, summary) in summaries.iter().enumerate() {
+        responses.push(single_text_events(&format!("TAIL_ASSISTANT_{index}")));
+        responses.push(write_summary_tool_use_events(
+            &format!("journal-summary-{index}"),
+            summary,
+        ));
+        responses.push(single_text_events("done"));
+    }
+    responses.extend([
+        single_text_events("normal after compact"),
+        single_text_events("after rewind"),
+    ]);
+    let client = MockClient::new(responses);
+    let observed = client.clone();
+    let host = Arc::new(CompactionJournalHost::new(compaction_snapshot(0)));
+    let mut fixture =
+        SummaryInputFixture::with_journal(MANUAL_ONLY_MANIFEST_TOML, client, host.clone()).await;
+    // A resolved nonempty source digest distinguishes provenance forwarding
+    // from silently substituting the built-in catalog's empty source digest.
+    let mut projection = fixture.worker.prompts().load_full().projection().clone();
+    projection.source_digest = "a".repeat(64);
+    let initial_catalog = Arc::new(worker::PromptCatalog::from_projection(projection).unwrap());
+    fixture.worker.prompts().store(initial_catalog.clone());
+    let legacy_startup = session_store::LoggedSystemHistoryEntry {
+        item: session_store::SystemItem::JournalStartup {
+            body: "OLD_TYPED_STARTUP_JOURNAL".into(),
+            snapshot: serde_json::json!({"journals": []}),
+            snapshot_sha256: "legacy-startup-digest".into(),
+            prompt_provenance: session_store::PromptRenderProvenance {
+                workspace_id: None,
+                source_digest: "legacy-source".into(),
+                projection_digest: "legacy-projection".into(),
+                logical_name: "internal.subjektiv_journal_startup".into(),
+            },
+        },
+        metadata: summary_entry(Item::system_message(""), DerivedSummary).metadata,
+    };
+    let legacy_id = legacy_startup.metadata.entry_id.clone();
+    fixture
+        .restore_seed_with_system(
+            vec![
+                summary_entry(
+                    Item::system_message(format!("{SUMMARY_MARKER}{initial}")),
+                    CompactionSummary,
+                ),
+                summary_entry(
+                    Item::system_message("OLD_COMPACTION_JOURNAL"),
+                    JournalContext,
+                ),
+                annotated(Item::tool_call(
+                    "seed-task",
+                    "TaskCreate",
+                    r#"{"subject":"JOURNAL_TASK","description":"Keep the unfinished task"}"#,
+                )),
+                annotated(Item::tool_result("seed-task", "created")),
+            ],
+            true,
+            vec![legacy_startup],
+        )
+        .await;
+    assert_eq!(
+        fixture
+            .worker
+            .session_history()
+            .entries()
+            .iter()
+            .find(|entry| entry.annotation.entry_id == legacy_id)
+            .unwrap()
+            .annotation
+            .origin,
+        JournalContext
+    );
+    let session = fixture.worker.session_id();
+    let original_segment = fixture.worker.segment_id();
+    let mut historical_sources = Vec::new();
+    let mut old_bodies = vec![
+        "OLD_TYPED_STARTUP_JOURNAL".to_string(),
+        "OLD_COMPACTION_JOURNAL".to_string(),
+    ];
+    for (index, retained) in [0, 1_000_000, 100].into_iter().enumerate() {
+        let directive = format!(
+            "UNRECORDED_USER_{index}: do not merge; original completion conditions still apply"
+        );
+        fixture.worker.run_text(&directive).await.unwrap();
+        if index == 0 {
+            assert_eq!(
+                fixture
+                    .worker
+                    .session_history()
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.annotation.entry_id == legacy_id)
+                    .unwrap()
+                    .annotation
+                    .origin,
+                JournalContext,
+                "legacy startup classification survives a normal turn"
+            );
+        }
+        assert_eq!(
+            host.reads.lock().unwrap().len(),
+            index,
+            "normal turns do not fetch compaction Journal"
+        );
+        let snapshot = compaction_snapshot(index);
+        *host.snapshot.lock().unwrap() = snapshot.clone();
+        let first_request = observed.requests().len();
+        let updating_host = host.clone();
+        observed.set_observer(move |call| {
+            if call == first_request {
+                // A background update at the provider boundary, after the
+                // request has been captured but before generation completes.
+                *updating_host.snapshot.lock().unwrap() = compaction_snapshot(100 + index);
+            }
+        });
+        let source = fixture.worker.segment_id();
+        let frozen_catalog = fixture.worker.prompts().load_full();
+        historical_sources.push((
+            source,
+            journal_source_records(fixture.worker.store(), session, source),
+        ));
+        fixture.worker.compact(retained).await.unwrap();
+        let input = first_compactor_input(&observed.requests()[first_request]);
+        assert_full_initial_summary(
+            &input,
+            if index == 0 {
+                &initial
+            } else {
+                &summaries[index - 1]
+            },
+        );
+        let body = journal_body(&fixture.worker);
+        assert_frozen_journal_transport(&input, &body);
+        assert_journal_provenance(
+            &body,
+            Some(&serde_json::to_string(&snapshot).unwrap()),
+            &frozen_catalog,
+            Some(COMPACTION_HOST_WORKSPACE_ID),
+        );
+        assert!(
+            body.contains(&serde_json::to_string(&snapshot).unwrap()),
+            "contents, references, fixed source_end and partial processing checkpoint must match"
+        );
+        assert!(!body.contains(&format!("JOURNAL_POSITION_{}:", 100 + index)));
+        assert_eq!(host.reads.lock().unwrap().len(), index + 1);
+        let history = fixture.worker.history();
+        let overview = input
+            .split("## Previous Journal reference (historical, not automatically retained)")
+            .next()
+            .unwrap();
+        for old in &old_bodies {
+            assert!(
+                !overview.contains(old),
+                "superseded Journal is excluded from ordinary overview"
+            );
+            assert!(
+                !body.contains(old),
+                "frozen latest reference does not incorporate old injections"
+            );
+            assert!(
+                history
+                    .iter()
+                    .all(|item| !item.as_text().is_some_and(|text| text.contains(old))),
+                "superseded Journal is not retained"
+            );
+        }
+        assert!(
+            input.contains(&directive)
+                || history
+                    .iter()
+                    .any(|item| item.as_text() == Some(directive.as_str())),
+            "unrecorded user instruction must reach summary input or retained tail"
+        );
+        if retained == 1_000_000 {
+            assert!(
+                history
+                    .iter()
+                    .any(|item| item.as_text() == Some("TAIL_ASSISTANT_1"))
+            );
+        }
+        let task = history
+            .iter()
+            .filter_map(Item::as_text)
+            .find(|text| text.starts_with("[Session TaskStore snapshot]"))
+            .unwrap();
+        let json = task
+            .split("```json\n")
+            .nth(1)
+            .unwrap()
+            .split("\n```")
+            .next()
+            .unwrap();
+        let tasks: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            tasks["tasks"].as_array().unwrap().len(),
+            1,
+            "replayed TaskCreate must not duplicate across compactions"
+        );
+        assert_eq!(tasks["tasks"][0]["subject"], "JOURNAL_TASK");
+        assert_eq!(tasks["tasks"][0]["status"], "pending");
+        assert!(input.contains("JOURNAL_TASK"));
+        old_bodies.push(body);
+        for (source, before) in &historical_sources {
+            assert_eq!(
+                journal_source_records(fixture.worker.store(), session, *source),
+                *before,
+                "original segments must remain unchanged"
+            );
+        }
+    }
+    assert_ne!(original_segment, fixture.worker.segment_id());
+    let reads = host.reads.lock().unwrap().clone();
+    assert!(
+        reads
+            .iter()
+            .all(|context| context.worker_id == "test-worker"
+                && context.session_id == session.to_string())
+    );
+    // Reloaded prompt resources must not regenerate the persisted reference
+    // or relabel its original source/projection on normal turns or restore.
+    let mut templates = initial_catalog.projection().templates.clone();
+    templates
+        .get_mut("internal.subjektiv_journal_compaction")
+        .unwrap()
+        .push_str("\nRELOADED_PROMPT_MUST_NOT_REPLACE_FROZEN_BODY");
+    let mut reloaded_projection =
+        worker::EffectivePromptCatalog::new(templates, "test-schema", "test-toolchain").unwrap();
+    reloaded_projection.source_digest = "b".repeat(64);
+    let reloaded_catalog =
+        Arc::new(worker::PromptCatalog::from_projection(reloaded_projection).unwrap());
+    assert_ne!(
+        initial_catalog.projection().catalog_digest,
+        reloaded_catalog.projection().catalog_digest
+    );
+    fixture.worker.prompts().store(reloaded_catalog);
+    fixture
+        .worker
+        .run_text("normal post-compaction turn")
+        .await
+        .unwrap();
+    let records = fixture
+        .worker
+        .store()
+        .read_all(session, fixture.worker.segment_id())
+        .unwrap();
+    let snapshot = session_store::public_snapshot::project_current_session_snapshot(&records);
+    let target = snapshot
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| {
+            matches!(
+                entry.data,
+                protocol::SessionSnapshotEntryData::UserInput { .. }
+            )
+        })
+        .unwrap();
+    fixture
+        .worker
+        .rewind_to(target.entry_id.clone())
+        .await
+        .unwrap();
+    let restored_body = journal_body(&fixture.worker);
+    assert_eq!(restored_body, *old_bodies.last().unwrap());
+    assert_journal_provenance(
+        &restored_body,
+        old_bodies
+            .last()
+            .unwrap()
+            .lines()
+            .rfind(|line| !line.is_empty()),
+        &initial_catalog,
+        Some(COMPACTION_HOST_WORKSPACE_ID),
+    );
+    fixture
+        .worker
+        .run_text("normal turn after typed history restore")
+        .await
+        .unwrap();
+    assert_eq!(
+        host.reads.lock().unwrap().len(),
+        3,
+        "rewind uses the shared typed restore path without fresh Journal acquisition"
+    );
+    assert_eq!(host.startup_reads.load(Ordering::SeqCst), 0);
+    let normal = observed.requests().last().unwrap().clone();
+    assert_eq!(
+        normal
+            .items
+            .iter()
+            .filter(|item| item.as_text() == Some(old_bodies.last().unwrap().as_str()))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn journal_absent_disabled_unavailable_and_over_byte_budget_keep_conversation_compaction() {
+    for case in [
+        "absent",
+        "disabled",
+        "unavailable",
+        "over-byte-budget",
+        "no-host",
+    ] {
+        let mut snapshot = compaction_snapshot(0);
+        if case == "absent" {
+            snapshot.journals.clear();
+        }
+        if case == "over-byte-budget" {
+            snapshot.journals[0].current_position =
+                "x".repeat(subjektiv::journal::startup::STARTUP_MAX_BYTES);
+        }
+        let expected_json = (case == "absent").then(|| serde_json::to_string(&snapshot).unwrap());
+        let mut host = CompactionJournalHost::new(snapshot);
+        host.granted = case != "disabled";
+        host.unavailable = case == "unavailable";
+        let host = Arc::new(host);
+        let client = MockClient::new(vec![
+            single_text_events("seed"),
+            write_summary_tool_use_events("fallback", "fallback summary"),
+            single_text_events("done"),
+        ]);
+        let observed = client.clone();
+        let mut fixture = if case == "no-host" {
+            SummaryInputFixture::new(MANUAL_ONLY_MANIFEST_TOML, client).await
+        } else {
+            SummaryInputFixture::with_journal(MANUAL_ONLY_MANIFEST_TOML, client, host.clone()).await
+        };
+        let inherited = long_summary("fallback-predecessor");
+        fixture
+            .restore_seed(
+                vec![
+                    summary_entry(
+                        Item::system_message(format!("{SUMMARY_MARKER}{inherited}")),
+                        session_store::LoggedSessionHistoryOrigin::CompactionSummary,
+                    ),
+                    summary_entry(
+                        Item::system_message("PREVIOUS_JOURNAL_DELEGATED_CONTEXT"),
+                        session_store::LoggedSessionHistoryOrigin::JournalContext,
+                    ),
+                    annotated(Item::user_message(
+                        "UNRECORDED_FALLBACK_GOAL: implementation still unfinished",
+                    )),
+                ],
+                true,
+            )
+            .await;
+        fixture.worker.compact(0).await.unwrap();
+        let body = journal_body(&fixture.worker);
+        let expected = match case {
+            "no-host" | "disabled" => "disabled",
+            "absent" => "absent",
+            _ => "unavailable",
+        };
+        assert!(
+            body.contains(&format!("Journal read status: {expected}.")),
+            "{case}"
+        );
+        let input = first_compactor_input(&observed.requests()[1]);
+        assert_frozen_journal_transport(&input, &body);
+        assert_journal_provenance(
+            &body,
+            expected_json.as_deref(),
+            &fixture.worker.prompts().load_full(),
+            (case != "no-host").then_some(COMPACTION_HOST_WORKSPACE_ID),
+        );
+        assert_full_initial_summary(&input, &inherited);
+        assert!(input.contains("UNRECORDED_FALLBACK_GOAL"), "{case}");
+        assert!(input.contains("## Previous Journal reference (historical, not automatically retained)\nPREVIOUS_JOURNAL_DELEGATED_CONTEXT"));
+        assert!(
+            fixture.worker.history().iter().all(|item| !item
+                .as_text()
+                .is_some_and(|text| text.contains("PREVIOUS_JOURNAL_DELEGATED_CONTEXT"))),
+            "fallback retains only the newly frozen reference, not an old snapshot as latest"
+        );
+        assert!(!body.contains("JOURNAL_POSITION_0"));
+        assert!(!body.contains("journal-reference-0"));
+        assert_eq!(
+            host.reads.lock().unwrap().len(),
+            usize::from(!matches!(case, "disabled" | "no-host")),
+            "{case}"
+        );
+        assert!(
+            fixture.worker.history()[0]
+                .as_text()
+                .unwrap()
+                .contains("fallback summary")
+        );
+    }
+}
+
+#[tokio::test]
+async fn journal_snapshot_counts_against_compactor_hard_input_cap_without_mutating_source() {
+    let manifest = MANUAL_ONLY_MANIFEST_TOML.replace("[compaction]", "[compaction]\nworker_context_max_tokens = 7000\nfinish_warning_remaining_tokens = 0\nfinal_reserve_tokens = 0\noverview_target_tokens = 1");
+    for large in [false, true] {
+        let mut snapshot = compaction_snapshot(0);
+        if large {
+            snapshot.journals[0].current_position = " x".repeat(15_000);
+        }
+        assert!(
+            serde_json::to_vec(&snapshot).unwrap().len()
+                <= subjektiv::journal::startup::STARTUP_MAX_BYTES
+        );
+        if large {
+            assert!(
+                agen::token_counter::total_tokens(
+                    &[Item::user_message(&snapshot.journals[0].current_position)],
+                    &[]
+                )
+                .tokens
+                    > 7_000
+            );
+        }
+        let host = Arc::new(CompactionJournalHost::new(snapshot));
+        let client = MockClient::new(vec![
+            single_text_events("seed"),
+            write_summary_tool_use_events("summary", "new summary"),
+            single_text_events("done"),
+        ]);
+        let observed = client.clone();
+        let mut fixture = SummaryInputFixture::with_journal(&manifest, client, host.clone()).await;
+        fixture.worker.run_text("unfinished goal").await.unwrap();
+        let session = fixture.worker.session_id();
+        let source = fixture.worker.segment_id();
+        let before = journal_source_records(fixture.worker.store(), session, source);
+        let history = fixture.worker.history();
+        let result = fixture.worker.compact(0).await;
+        if large {
+            let error = result.expect_err(
+                "mandatory frozen Journal must not be truncated to evade hard input cap",
+            );
+            assert!(
+                matches!(error, WorkerError::CompactCancelled)
+                    || error.to_string().contains("input occupancy"),
+                "{error:?}"
+            );
+            assert_eq!(
+                observed.requests().len(),
+                1,
+                "over-budget input must not reach the provider"
+            );
+            assert_eq!(fixture.worker.segment_id(), source);
+            assert_eq!(fixture.worker.history(), history);
+            assert_eq!(
+                fixture.worker.store().list_segments(session).unwrap(),
+                vec![source]
+            );
+            assert_eq!(
+                fixture
+                    .worker
+                    .store()
+                    .read_by_name("test-worker")
+                    .unwrap()
+                    .unwrap()
+                    .active
+                    .unwrap()
+                    .segment_id,
+                Some(source)
+            );
+        } else {
+            result.unwrap();
+            assert_eq!(observed.requests().len(), 3);
+            assert_ne!(fixture.worker.segment_id(), source);
+        }
+        assert_eq!(host.reads.lock().unwrap().len(), 1);
+        assert_eq!(
+            journal_source_records(fixture.worker.store(), session, source),
+            before
+        );
+    }
 }

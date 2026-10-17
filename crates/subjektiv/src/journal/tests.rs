@@ -100,6 +100,10 @@ fn released_binding_preserves_open_and_receipts_but_never_revives_old_session_wr
     f.store().release_journal_writer(&binding).unwrap();
     f.store().release_journal_writer(&binding).unwrap();
     f.reopen();
+    assert!(matches!(
+        f.store().journal_compaction_snapshot(&f.host),
+        Err(JournalError::PermissionDenied(_))
+    ));
     let old = f
         .store()
         .query_journal_operation(&f.host, &f.journal_id, "create")
@@ -407,6 +411,102 @@ fn release_and_late_admission_are_serialized_by_the_persisted_binding_check() {
     );
     drop(workspace);
     manager.shutdown().unwrap();
+}
+
+#[test]
+fn compaction_snapshot_prioritizes_current_session_without_waiting_or_mutating_recording() {
+    let f = Fixture::new();
+    let (generation, context) = f.generation("in-flight", f.ranges.clone());
+    f.execute(
+        &context,
+        "open",
+        open_action(&"日本語\\\"\\n".repeat(6000)),
+        f.ranges.clone(),
+    );
+    f.execute(
+        &context,
+        "position",
+        JournalAction::UpdatePosition {
+            current_position: "partial activity; checkpoint still behind".into(),
+        },
+        vec![],
+    );
+    let mut latest = String::new();
+    for n in 0..5 {
+        let session = format!("supplement-{n}");
+        let host = session_host(f.store(), &f.host.subject_id, &session);
+        f.store()
+            .accept_journal_sources(&host, "recent", &[source_range(&session, 0, 10)])
+            .unwrap();
+        latest = session;
+    }
+    let reader = JournalHostContext::validated_reader(f.store(), &f.host.subject_id).unwrap();
+    let startup = f
+        .store()
+        .journal_startup_snapshot(&reader, Some(&latest))
+        .unwrap();
+    assert_eq!(startup.journals[0].source_session_id, latest);
+    let before = f.state();
+    let snapshot = f.store().journal_compaction_snapshot(&f.host).unwrap();
+    assert_eq!(snapshot.journals[0].source_session_id, "source-session");
+    assert_eq!(snapshot.journals[0].process_order, before.0.process_order);
+    assert_eq!(snapshot.journals[0].process_byte, before.0.process_byte);
+    assert_eq!(
+        snapshot.journals[0].entries[0].state,
+        JournalEntryState::Open
+    );
+    assert!(snapshot.journals[0].entries[0].omitted);
+    assert!(snapshot.omitted);
+    assert_eq!(snapshot.journals.len(), 3);
+    assert!(serde_json::to_vec(&snapshot).unwrap().len() <= startup::STARTUP_MAX_BYTES);
+    assert_eq!(
+        f.store().journal_compaction_snapshot(&f.host).unwrap(),
+        snapshot
+    );
+    assert_eq!(f.state(), before);
+    assert_eq!(
+        f.store()
+            .active_journal_generation(&f.host, &f.journal_id)
+            .unwrap(),
+        Some(generation)
+    );
+    assert!(matches!(
+        f.store().journal_compaction_snapshot(&reader),
+        Err(JournalError::PermissionDenied(_))
+    ));
+    f.execute(
+        &context,
+        "new-position",
+        JournalAction::UpdatePosition {
+            current_position: "background recording progressed after snapshot".into(),
+        },
+        vec![],
+    );
+    let refreshed = f.store().journal_compaction_snapshot(&f.host).unwrap();
+    assert_ne!(
+        refreshed.journals[0].state_token,
+        snapshot.journals[0].state_token
+    );
+    assert_ne!(
+        refreshed.journals[0].current_position,
+        snapshot.journals[0].current_position
+    );
+    let empty_host = session_host(f.store(), &f.host.subject_id, "not-yet-admitted");
+    assert!(
+        !f.store()
+            .journal_compaction_snapshot(&empty_host)
+            .unwrap()
+            .journals
+            .is_empty()
+    );
+    let other = f
+        .store()
+        .create_subject_with_behavior(SubjectRole::new("other").unwrap(), "unchanged".into())
+        .unwrap();
+    let other_host = session_host(f.store(), &other.id, "other-session");
+    let empty = f.store().journal_compaction_snapshot(&other_host).unwrap();
+    assert!(empty.journals.is_empty());
+    assert!(!empty.omitted);
 }
 
 #[test]

@@ -8,6 +8,7 @@ use session_store::{Store, WorkerMetadataStore};
 use std::sync::atomic::AtomicBool;
 
 mod compaction;
+mod connected_compaction;
 mod handoff;
 mod memory_links;
 
@@ -288,6 +289,65 @@ fn save(
         panic!("expected receipt")
     };
     receipt
+}
+
+#[test]
+fn compaction_host_reads_pending_recording_without_advancing_or_accepting_foreign_sessions() {
+    let fixture = Fixture::new("partially performed; not confirmed");
+    let connection = worker::subjektiv::SubjektivHostConnection::new(
+        fixture.host().clone(),
+        fixture.context.clone(),
+    )
+    .unwrap();
+    assert!(connection.journal_compaction_granted());
+    assert!(
+        connection
+            .journal_compaction_context()
+            .unwrap()
+            .journals
+            .is_empty()
+    );
+    let (adapter, _, _) = fixture.adapter();
+    let before = adapter.state().unwrap();
+    let snapshot = connection.journal_compaction_context().unwrap();
+    assert_eq!(
+        snapshot.journals[0].source_session_id,
+        fixture.context.session_id
+    );
+    assert_eq!(
+        snapshot.journals[0].process_order,
+        before.current_journal.process_order
+    );
+    assert_eq!(
+        snapshot.journals[0].process_byte,
+        before.current_journal.process_byte
+    );
+    assert_eq!(adapter.state().unwrap(), before);
+    assert!(
+        fixture
+            .host()
+            .catalog
+            .store
+            .active_journal_generation(&adapter.context, &adapter.grant.journal_id)
+            .unwrap()
+            .is_some()
+    );
+    for context in [
+        SubjektivHostContext {
+            worker_id: "foreign-worker".into(),
+            ..fixture.context.clone()
+        },
+        SubjektivHostContext {
+            session_id: session_store::SessionId::now_v7().to_string(),
+            ..fixture.context.clone()
+        },
+    ] {
+        assert!(fixture.host().journal_compaction_context(&context).is_err());
+    }
+    fixture.host().live.store(false, Ordering::Release);
+    assert!(!connection.journal_compaction_granted());
+    assert!(connection.journal_compaction_context().is_err());
+    fixture.host().live.store(true, Ordering::Release);
 }
 
 #[test]
