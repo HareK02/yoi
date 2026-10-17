@@ -36969,6 +36969,7 @@ mod tests {
     mod embedded_owned_execution_tests;
     mod external_checkout_tests;
     mod protocol_backpressure_tests;
+    mod restored_parent_control_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod subjektiv_journal_tests;
