@@ -598,6 +598,57 @@ pub(super) async fn startup_route(
         .await
 }
 
+pub(super) async fn compaction_route(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    source: Option<axum::Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
+    Json(input): Json<JournalCompactionRequest>,
+) -> ApiResult<Json<journal::startup::JournalStartupSnapshot>> {
+    let worker = verified_worker(source)?;
+    api.store
+        .db_executor()
+        .run(move || {
+            validate_workspace_scope(&api, &path.workspace_id)?;
+            let lease = api
+                .store
+                .require_current_worker_singleton_owner(&path.workspace_id, &worker)?
+                .ok_or_else(|| {
+                    Error::WorkspacePermissionDenied(
+                        "Journal compaction requires the current main Subject Worker".into(),
+                    )
+                })?;
+            let (subject, role) = subjektiv_scope_from_singleton_key(&lease.key)?;
+            if role != SubjektivWorkerAuthority::Subject {
+                return Err(Error::WorkspacePermissionDenied(
+                    "Journal compaction is not a Job capability".into(),
+                )
+                .into());
+            }
+            let store = store(&api)?;
+            let attribution = store
+                .session_attribution(&input.session_id)
+                .map_err(|error| Error::Store(error.to_string()))?
+                .filter(|attr| {
+                    attr.subject_id == subject
+                        && attr.runtime_id == worker.runtime_id
+                        && attr.worker_id == worker.worker_id
+                })
+                .ok_or_else(|| {
+                    Error::WorkspacePermissionDenied(
+                        "foreign or unattributed compaction Session".into(),
+                    )
+                })?;
+            let host =
+                JournalHostContext::validated_session(&store, attribution).map_err(domain)?;
+            store
+                .journal_compaction_snapshot(&host)
+                .map(Json)
+                .map_err(domain)
+                .map_err(ApiError::from)
+        })
+        .await
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SubjectReleaseInput {

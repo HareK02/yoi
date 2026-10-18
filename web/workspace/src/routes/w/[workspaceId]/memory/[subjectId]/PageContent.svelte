@@ -170,6 +170,8 @@
     <span class="read-only-label">Behavior editable</span>
   </header>
 
+  <nav aria-label="Subjectの記録"><a href={workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}/journal`)}>Journal · 最近の出来事とSessionを探す →</a></nav>
+
   {#if subject}
     <section class="subject-overview" aria-label="Subject status">
       <div>

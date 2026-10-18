@@ -175,6 +175,26 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     "invalid Workspace control response: missing items".to_string(),
                 )
             })?;
+        for item in items.iter_mut() {
+            let subject = item.get_mut("subject").ok_or_else(|| {
+                WorkspaceClientError::Request(
+                    "invalid Workspace control response: missing subject".to_string(),
+                )
+            })?;
+            let runtime: server_api::WorkerControlSubject = serde_json::from_value(subject.take())
+                .map_err(|error| {
+                    WorkspaceClientError::Request(format!(
+                        "invalid Workspace control subject: {error}"
+                    ))
+                })?;
+            // Backend lists only Runtime subjects; Tools use a tagged union so
+            // callers can pass the observed subject unchanged to control tools.
+            *subject = serde_json::json!({
+                "kind": "runtime_worker",
+                "runtime_id": runtime.runtime_id,
+                "worker_id": runtime.worker_id,
+            });
+        }
         let mut seen = std::collections::HashSet::new();
         items.retain(|item| {
             item.get("subject")
@@ -1318,7 +1338,6 @@ mod tests {
                         "items": [
                             {
                                 "subject": {
-                                    "kind": "runtime_worker",
                                     "runtime_id": "runtime-a",
                                     "worker_id": "worker-a"
                                 },
@@ -1326,7 +1345,6 @@ mod tests {
                             },
                             {
                                 "subject": {
-                                    "kind": "runtime_worker",
                                     "runtime_id": "runtime-a",
                                     "worker_id": "worker-a"
                                 },
@@ -1664,7 +1682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_service_deduplicates_worker_list_by_stable_subject() {
+    async fn control_service_projects_runtime_subject_and_deduplicates_worker_list() {
         let client = Arc::new(RecordingWorkspaceClient::default());
         let control = WorkspaceWorkerControlService {
             client: client.clone(),

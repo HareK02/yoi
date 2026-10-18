@@ -829,7 +829,9 @@ fn boundary_reference(
 fn canonical_body(entry: &LoggedHistoryEntry) -> Option<CanonicalBody<'_>> {
     if matches!(
         entry.metadata.origin,
-        LoggedSessionHistoryOrigin::DerivedSummary | LoggedSessionHistoryOrigin::CompactionSummary
+        LoggedSessionHistoryOrigin::DerivedSummary
+            | LoggedSessionHistoryOrigin::CompactionSummary
+            | LoggedSessionHistoryOrigin::JournalContext
     ) {
         return None;
     }

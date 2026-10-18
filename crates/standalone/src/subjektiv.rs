@@ -840,6 +840,44 @@ impl SubjektivHost for LocalSubjectHost {
             .journal_startup_snapshot(&reader, predecessor.as_deref())
             .map_err(journal::journal_error)
     }
+    fn journal_compaction_granted(&self) -> bool {
+        self.live.load(Ordering::Acquire)
+    }
+    fn journal_compaction_context(
+        &self,
+        context: &SubjektivHostContext,
+    ) -> Result<subjektiv::journal::startup::JournalStartupSnapshot, SubjektivHostError> {
+        self.body(context)?;
+        let attribution = self
+            .catalog
+            .store
+            .session_attribution(&context.session_id)
+            .map_err(domain_error)?
+            .filter(|attr| {
+                attr.subject_id == self.binding.subject_id
+                    && attr.runtime_id == self.binding.scope_id
+                    && attr.worker_id == self.worker_id.to_string()
+            })
+            .ok_or_else(|| {
+                SubjektivHostError::InvalidArgument(
+                    "foreign or unattributed compaction Session".into(),
+                )
+            })?;
+        let host = subjektiv::journal::JournalHostContext::validated_session(
+            &self.catalog.store,
+            attribution,
+        )
+        .map_err(journal::journal_error)?;
+        if host.writer_binding_id() != Some(self.writer.binding_id.as_str()) {
+            return Err(SubjektivHostError::InvalidArgument(
+                "compaction writer lifetime mismatch".into(),
+            ));
+        }
+        self.catalog
+            .store
+            .journal_compaction_snapshot(&host)
+            .map_err(journal::journal_error)
+    }
     fn journal_recording_granted(&self) -> bool {
         self.live.load(Ordering::Acquire)
     }

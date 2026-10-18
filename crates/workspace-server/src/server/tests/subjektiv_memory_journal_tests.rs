@@ -729,3 +729,6 @@ async fn memory_journal_router_correction_reverse_lookup_preserves_memory_and_or
         before
     );
 }
+
+#[path = "subjektiv_journal_browser_tests.rs"]
+mod browser_tests;

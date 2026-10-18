@@ -23,6 +23,12 @@ pub enum JournalRecordingReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct JournalCompactionRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JournalRecordingRequest {
     pub reason: JournalRecordingReason,
 }

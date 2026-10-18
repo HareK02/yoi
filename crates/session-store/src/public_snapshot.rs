@@ -1889,6 +1889,7 @@ fn provenance(origin: &LoggedSessionHistoryOrigin) -> SessionEntryProvenance {
         LoggedSessionHistoryOrigin::ModelOutput { .. } => SessionEntryProvenance::ModelOutput,
         LoggedSessionHistoryOrigin::ToolOutput { .. } => SessionEntryProvenance::ToolOutput,
         LoggedSessionHistoryOrigin::CompactionSummary
+        | LoggedSessionHistoryOrigin::JournalContext
         | LoggedSessionHistoryOrigin::DerivedSummary => SessionEntryProvenance::DerivedSummary,
         LoggedSessionHistoryOrigin::LegacyUnknown => SessionEntryProvenance::LegacyUnknown,
     }

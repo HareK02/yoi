@@ -40,6 +40,7 @@
 pub mod binding;
 pub use binding::JournalWriterBinding;
 pub(crate) use binding::migrate as migrate_binding;
+pub mod browser;
 mod lifecycle;
 pub mod memory_links;
 pub(crate) use lifecycle::migrate as migrate_lifecycle;

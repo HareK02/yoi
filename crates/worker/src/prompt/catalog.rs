@@ -103,6 +103,7 @@ pub enum WorkerPrompt {
     ResidentMemoryRestoreSection,
     SubjektivResidentContext,
     SubjektivJournalStartup,
+    SubjektivJournalCompaction,
     WorkerOrchestrationGuidanceSection,
     SubWorkerSpawnToolDescription,
 }
@@ -128,6 +129,7 @@ impl WorkerPrompt {
             Self::ResidentMemorySummarySection => "internal.resident_memory_summary_section",
             Self::ResidentMemoryRestoreSection => "internal.resident_memory_restore_section",
             Self::SubjektivJournalStartup => "internal.subjektiv_journal_startup",
+            Self::SubjektivJournalCompaction => "internal.subjektiv_journal_compaction",
             Self::SubjektivResidentContext => "internal.subjektiv_resident_context",
             Self::WorkerOrchestrationGuidanceSection => {
                 "internal.worker_orchestration_guidance_section"
@@ -154,6 +156,7 @@ impl WorkerPrompt {
         WorkerPrompt::ResidentMemoryRestoreSection,
         WorkerPrompt::SubjektivResidentContext,
         WorkerPrompt::SubjektivJournalStartup,
+        WorkerPrompt::SubjektivJournalCompaction,
         WorkerPrompt::WorkerOrchestrationGuidanceSection,
         WorkerPrompt::SubWorkerSpawnToolDescription,
     ];
@@ -540,6 +543,25 @@ impl PromptCatalog {
             minijinja::context! {
                 surface_ready => surface_ready,
                 summary => summary.unwrap_or_default(),
+            },
+        )
+    }
+    pub(crate) fn subjektiv_journal_compaction(
+        &self,
+        status: &str,
+        snapshot_json: &str,
+        snapshot_sha256: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Result<String, CatalogError> {
+        self.render(
+            WorkerPrompt::SubjektivJournalCompaction,
+            minijinja::context! {
+                status => status,
+                snapshot_json => snapshot_json,
+                snapshot_sha256 => snapshot_sha256,
+                workspace_id => workspace_id,
+                source_digest => self.projection.source_digest,
+                projection_digest => self.projection.catalog_digest,
             },
         )
     }

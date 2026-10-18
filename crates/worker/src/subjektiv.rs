@@ -80,6 +80,17 @@ pub trait SubjektivHost: Send + Sync + 'static {
             "Journal startup not granted".into(),
         ))
     }
+    fn journal_compaction_granted(&self) -> bool {
+        false
+    }
+    fn journal_compaction_context(
+        &self,
+        _context: &SubjektivHostContext,
+    ) -> Result<JournalStartupSnapshot, SubjektivHostError> {
+        Err(SubjektivHostError::Unavailable(
+            "Journal compaction not granted".into(),
+        ))
+    }
     /// Recording admission is separate from both Memory and Journal Job operation grants.
     fn journal_recording_granted(&self) -> bool {
         false
@@ -262,6 +273,29 @@ impl SubjektivHost for BackendSubjektivHost {
                         "/api/w/{}/subjektiv/journal/startup",
                         self.workspace_id
                     )),
+                    Duration::from_secs(5),
+                )
+                .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?,
+        )
+    }
+    fn journal_compaction_granted(&self) -> bool {
+        true
+    }
+    fn journal_compaction_context(
+        &self,
+        context: &SubjektivHostContext,
+    ) -> Result<JournalStartupSnapshot, SubjektivHostError> {
+        decode(
+            self.client
+                .execute_with_timeout(
+                    WorkspaceRequest::json(
+                        WorkspaceRequestMethod::Post,
+                        format!("/api/w/{}/subjektiv/journal/compaction", self.workspace_id),
+                        serde_json::to_string(&transport::JournalCompactionRequest {
+                            session_id: context.session_id.clone(),
+                        })
+                        .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?,
+                    ),
                     Duration::from_secs(5),
                 )
                 .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?,
@@ -487,6 +521,19 @@ impl SubjektivHostConnection {
             ));
         }
         self.host.journal_startup_context(&self.context)
+    }
+
+    pub fn journal_compaction_granted(&self) -> bool {
+        self.host.journal_compaction_granted()
+    }
+
+    pub fn journal_compaction_context(&self) -> Result<JournalStartupSnapshot, SubjektivHostError> {
+        if !self.host.journal_compaction_granted() {
+            return Err(SubjektivHostError::Unavailable(
+                "Journal compaction not granted".into(),
+            ));
+        }
+        self.host.journal_compaction_context(&self.context)
     }
     pub fn new(
         host: Arc<dyn SubjektivHost>,

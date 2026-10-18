@@ -5,6 +5,11 @@ import {
   parseSubjektivMemoryReadResponse,
   parseSubjektivSubjectResponse,
 } from "#lib/workspace/memory/api.ts";
+import {
+  boundedParam,
+  loadJournal,
+  offsetParam,
+} from "#lib/workspace/memory/journal-api.ts";
 import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 import type { PageLoad } from "./$types";
 
@@ -33,65 +38,106 @@ function safeIntegerQuery(
   return String(parsed);
 }
 
-export const load = deferPage(async ({ fetch, params, url }: Parameters<PageLoad>[0]) => {
-  const subjectId = params.subjectId;
-  const memoryId = params.memoryId;
-  const subjectPath = `/subjektiv/subjects/${encodeURIComponent(subjectId)}`;
-  const memoryPath = `${subjectPath}/memories/${encodeURIComponent(memoryId)}`;
-  const detailQuery = new URLSearchParams({ limit: "1000" });
-  for (
-    const [key, positive] of [
-      ["offset", false],
-      ["byte_offset", false],
-    ] as const
-  ) {
-    const value = safeIntegerQuery(url.searchParams, key, positive);
-    if (value !== null) detailQuery.set(key, value);
-  }
-  const changeId = boundedCursor(url.searchParams.get("change_id"), 512);
-  if (changeId) detailQuery.set("change_id", changeId);
-  const evidenceCursor = boundedCursor(
-    url.searchParams.get("evidence_cursor"),
-    512,
-  );
-  if (evidenceCursor) detailQuery.set("evidence_cursor", evidenceCursor);
-  const changeCursor = boundedCursor(url.searchParams.get("change_cursor"));
-  const changeQuery = new URLSearchParams({ limit: "100" });
-  if (changeCursor) changeQuery.set("cursor", changeCursor);
+export const load = deferPage(
+  async ({ fetch, params, url }: Parameters<PageLoad>[0]) => {
+    const subjectId = params.subjectId;
+    const memoryId = params.memoryId;
+    const subjectPath = `/subjektiv/subjects/${encodeURIComponent(subjectId)}`;
+    const memoryPath = `${subjectPath}/memories/${
+      encodeURIComponent(memoryId)
+    }`;
+    const detailQuery = new URLSearchParams({ limit: "1000" });
+    for (
+      const [key, positive] of [
+        ["offset", false],
+        ["byte_offset", false],
+      ] as const
+    ) {
+      const value = safeIntegerQuery(url.searchParams, key, positive);
+      if (value !== null) detailQuery.set(key, value);
+    }
+    const changeId = boundedCursor(url.searchParams.get("change_id"), 512);
+    if (changeId) detailQuery.set("change_id", changeId);
+    const evidenceCursor = boundedCursor(
+      url.searchParams.get("evidence_cursor"),
+      512,
+    );
+    if (evidenceCursor) detailQuery.set("evidence_cursor", evidenceCursor);
+    const changeCursor = boundedCursor(url.searchParams.get("change_cursor"));
+    const changeQuery = new URLSearchParams({ limit: "100" });
+    if (changeCursor) changeQuery.set("cursor", changeCursor);
 
-  const [subject, memory, changes] = await Promise.all([
-    loadJson(
-      fetch,
-      workspaceApiPath(params.workspaceId, subjectPath),
-      undefined,
-      (value) => parseSubjektivSubjectResponse(value, subjectId),
-      MEMORY_API_LOAD_POLICY,
-    ),
-    loadJson(
-      fetch,
-      `${workspaceApiPath(params.workspaceId, memoryPath)}?${detailQuery}`,
-      undefined,
-      (value) => parseSubjektivMemoryReadResponse(value, memoryId),
-      MEMORY_API_LOAD_POLICY,
-    ),
-    loadJson(
-      fetch,
-      `${
-        workspaceApiPath(params.workspaceId, `${memoryPath}/changes`)
-      }?${changeQuery}`,
-      undefined,
-      (value) => parseSubjektivMemoryListChangesResponse(value, memoryId),
-      MEMORY_API_LOAD_POLICY,
-    ),
-  ]);
+    const [subject, memory, changes] = await Promise.all([
+      loadJson(
+        fetch,
+        workspaceApiPath(params.workspaceId, subjectPath),
+        undefined,
+        (value) => parseSubjektivSubjectResponse(value, subjectId),
+        MEMORY_API_LOAD_POLICY,
+      ),
+      loadJson(
+        fetch,
+        `${workspaceApiPath(params.workspaceId, memoryPath)}?${detailQuery}`,
+        undefined,
+        (value) => parseSubjektivMemoryReadResponse(value, memoryId),
+        MEMORY_API_LOAD_POLICY,
+      ),
+      loadJson(
+        fetch,
+        `${
+          workspaceApiPath(params.workspaceId, `${memoryPath}/changes`)
+        }?${changeQuery}`,
+        undefined,
+        (value) => parseSubjektivMemoryListChangesResponse(value, memoryId),
+        MEMORY_API_LOAD_POLICY,
+      ),
+    ]);
 
-  return {
-    workspaceId: params.workspaceId,
-    subjectId,
-    memoryId,
-    changeCursor,
-    subject,
-    memory,
-    changes,
-  };
-});
+    const candidateOffset = offsetParam(
+      url.searchParams,
+      "journal_candidate_offset",
+    );
+    const sourceOffset = offsetParam(url.searchParams, "journal_source_offset");
+    const selectedCandidate = boundedParam(
+      url.searchParams,
+      "journal_candidate",
+      512,
+    );
+    const candidates = memory.data?.source_candidates ?? [];
+    const selected = selectedCandidate
+      ? candidates.filter((c) => c.candidate_id === selectedCandidate)
+      : candidates.slice(candidateOffset, candidateOffset + 3);
+    // 関連はimmutable change/candidateの保存済み参照だけ。本文取得の失敗から未接続を推測しない。
+    const journalSources = memory.data
+      ? await Promise.all(selected.map(async (candidate) => ({
+        candidateId: candidate.candidate_id,
+        result: await loadJournal(fetch, params.workspaceId, subjectId, {
+          action: "memory_sources",
+          selector: {
+            memory_id: memoryId,
+            change_id: memory.data!.change_id,
+            candidate_id: candidate.candidate_id,
+          },
+          source_offset: selectedCandidate ? sourceOffset : 0,
+          limit: selectedCandidate ? 20 : 3,
+        }),
+      })))
+      : [];
+
+    return {
+      workspaceId: params.workspaceId,
+      journalSources,
+      journalCandidateNext:
+        !selectedCandidate && candidateOffset + 3 < candidates.length
+          ? candidateOffset + 3
+          : null,
+      journalQuery: url.searchParams.toString(),
+      subjectId,
+      memoryId,
+      changeCursor,
+      subject,
+      memory,
+      changes,
+    };
+  },
+);

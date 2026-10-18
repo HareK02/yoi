@@ -28,6 +28,7 @@ use subjektiv::api::*;
 mod backend_job_profile;
 mod subjektiv_job;
 mod subjektiv_journal;
+mod subjektiv_journal_browser;
 mod subjektiv_memory_journal;
 mod worker_operations;
 mod worker_protocol;
@@ -3133,7 +3134,11 @@ async fn authorize_scoped_workspace_request(
             ));
         }
     }
-    if mutating || request.headers().contains_key(axum::http::header::UPGRADE) {
+    // The Journal browser uses POST only to carry bounded typed read selectors. Its
+    // action set is read-only and follows the same user read authority as Memory GET.
+    if (mutating && !subjektiv_journal_browser::is_read_path(&request_path, workspace_id))
+        || request.headers().contains_key(axum::http::header::UPGRADE)
+    {
         let workspace = api
             .store
             .get_workspace(workspace_id)
@@ -3309,7 +3314,8 @@ async fn authorize_workspace_api_request(
         }
     }
     if !public_server_api
-        && (mutating || request.headers().contains_key(axum::http::header::UPGRADE))
+        && ((mutating && !subjektiv_journal_browser::is_read_path(&request_path, &workspace_id))
+            || request.headers().contains_key(axum::http::header::UPGRADE))
     {
         let workspace = match api.store.get_workspace(&workspace_id).await {
             Ok(workspace) => workspace,
@@ -13148,8 +13154,10 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
         post(scoped_submit_backend_job_result),
     )
     .route("/api/w/{workspace_id}/subjektiv/journal/release", post(subjektiv_journal::release_route))
+    .route("/api/w/{workspace_id}/subjektiv/journal/compaction", post(subjektiv_journal::compaction_route))
     .route("/api/w/{workspace_id}/subjektiv/journal/startup", get(subjektiv_journal::startup_route))
     .route("/api/w/{workspace_id}/subjektiv/journal/recording", post(subjektiv_journal::recording_route))
+    .route("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/journal-browser", post(subjektiv_journal_browser::route))
     .route("/api/w/{workspace_id}/subjektiv/journal/memory", post(subjektiv_memory_journal::route))
     .route("/api/w/{workspace_id}/subjektiv/journal/job", post(subjektiv_journal::job_route))
     .route("/api/w/{workspace_id}/subjektiv/journal/job/finish", post(subjektiv_journal::finish_route))
@@ -36909,6 +36917,9 @@ mod db_execution_tests;
 mod tests {
     mod assignment_delivery_tests {
         include!("server_assignment_delivery_tests.rs");
+        mod ticket_web_roundtrip_tests {
+            include!("server_ticket_web_roundtrip_tests.rs");
+        }
     }
 
     mod assignment_start_tests {
@@ -36916,6 +36927,10 @@ mod tests {
     }
     mod assignment_tracking_tests {
         include!("server_assignment_tracking_tests.rs");
+        mod tools_backend_tests {
+            use super::*;
+            include!("server_ticket_tools_backend_tests.rs");
+        }
     }
 
     mod ticket_case_signed_tests {
@@ -36938,6 +36953,7 @@ mod tests {
     mod embedded_owned_execution_tests;
     mod external_checkout_tests;
     mod protocol_backpressure_tests;
+    mod restored_parent_control_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod subjektiv_journal_tests;
