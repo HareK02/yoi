@@ -77,6 +77,177 @@ async fn request_with_logs(app: Router, request: Request<Body>) -> (StatusCode, 
 }
 
 #[tokio::test]
+async fn cleanup_retention_failures_preserve_cause_on_execution_and_recovery() {
+    // Real cleanup route, removal store, embedded Runtime and retention I/O.
+    // A file in place of the receipt directory deterministically fails both attempts.
+    let dir = tempfile::tempdir().unwrap();
+    let api = test_api(dir.path()).await;
+    let spawned = api
+        .spawn_workspace_worker(
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                intent: WorkerSpawnIntent::WorkspaceCompanion,
+                requested_worker_name: Some("retention-error-test".into()),
+                singleton_key: None,
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
+                },
+                profile: ProfileSelector::Builtin("builtin:companion".into()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: Some(runtime_test_bundle()),
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_subjektiv_attached: false,
+                resolved_control_operation: None,
+            },
+        )
+        .unwrap();
+    let worker = spawned.worker.unwrap().worker;
+    api.runtime
+        .stop_worker(
+            &worker,
+            WorkerLifecycleRequest {
+                reason: Some("retention diagnostic fixture".into()),
+                ticket_assignment: None,
+            },
+        )
+        .unwrap();
+    let runtime_root = dir.path().join(".test-embedded-runtime-store");
+    let worker_root = runtime_root.join("workers").join(&worker.worker_id);
+    fs::create_dir_all(worker_root.join("session/segments")).unwrap();
+    fs::write(
+        worker_root.join("session/session.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "session_id": session_store::new_session_id(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        worker_root.join("session/segments/segment-a.jsonl"),
+        b"retention evidence\n",
+    )
+    .unwrap();
+    sync_worker_observation(&api, &api.runtime.worker(&worker).unwrap()).unwrap();
+    fs::create_dir_all(runtime_root.join("retention")).unwrap();
+    fs::write(
+        runtime_root.join("retention/operations"),
+        b"not a directory",
+    )
+    .unwrap();
+    let app = authenticated_protocol_fixture_router(api.clone());
+    let path = format!(
+        "/api/w/{TEST_WORKSPACE_ID}/runtimes/{EMBEDDED_WORKER_RUNTIME_ID}/cleanup-executions"
+    );
+    let mut operation_id = None;
+    for phase in ["execution", "recovery"] {
+        let plan = build_runtime_cleanup_plan(&api, EMBEDDED_WORKER_RUNTIME_ID).unwrap();
+        let candidate = plan
+            .workers
+            .iter()
+            .find(|item| item.worker_id == worker.worker_id)
+            .unwrap();
+        let request = ExecuteRuntimeCleanupRequest {
+            expected_plan_digest: plan.digest,
+            worker_target_ids: vec![candidate.target_id.clone()],
+            workdir_target_ids: Vec::new(),
+            confirm_dirty_discard_target_ids: Vec::new(),
+        };
+        let (status, body, events) = request_with_logs(
+            app.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri(&path)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(events.len(), 1, "{events:?}");
+        let prepared = api
+            .store
+            .recover_worker_removal_execution(TEST_WORKSPACE_ID, &worker)
+            .unwrap()
+            .unwrap();
+        if let Some(previous) = &operation_id {
+            assert_eq!(previous, &prepared.plan.operation_id);
+        } else {
+            operation_id = Some(prepared.plan.operation_id.clone());
+        }
+        for text in [
+            body["message"].as_str().unwrap(),
+            events[0]["message"].as_str().unwrap(),
+        ] {
+            assert!(text.contains("runtime_retention_failed"), "{text}");
+            assert!(
+                text.contains(&format!("retention {phase} failed")),
+                "{text}"
+            );
+            assert!(
+                text.contains("commit pending Worker retention receipt"),
+                "{text}"
+            );
+            assert!(text.contains("os error"), "{text}");
+            assert!(text.contains(&worker.worker_id), "{text}");
+            assert!(text.contains(&prepared.plan.operation_id), "{text}");
+            assert!(!text.contains(runtime_root.to_str().unwrap()), "{text}");
+        }
+        assert!(
+            api.store
+                .get_worker_registry(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .is_some()
+        );
+        assert!(worker_root.exists());
+    }
+    // Repair only the injected fault: the same saved removal can still complete.
+    fs::remove_file(runtime_root.join("retention/operations")).unwrap();
+    let result = WorkerRemovalService::new(&api)
+        .execute_target_removal(&api.runtime, &worker, "retry diagnostic fixture", None)
+        .await
+        .unwrap();
+    assert_eq!(result.status, StatusCode::OK.as_u16(), "{}", result.body);
+    assert!(
+        api.store
+            .get_worker_registry(TEST_WORKSPACE_ID, &worker)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn retention_failure_details_keep_causes_without_paths_or_credentials() {
+    let detail = retention_failure_detail(
+        "commit receipt at /private/provider/path: Permission denied (os error 13); token credential-secret password=body-secret Bearer bearer-secret",
+    );
+    assert!(detail.contains("Permission denied (os error 13)"));
+    for private in [
+        "/private/provider/path",
+        "credential-secret",
+        "body-secret",
+        "bearer-secret",
+    ] {
+        assert!(!detail.contains(private), "{detail}");
+    }
+    let structured =
+        retention_failure_detail(r#"I/O error: {"token":"opaque-value","password":"other-value"}"#);
+    assert!(structured.contains("I/O error"));
+    assert!(!structured.contains("opaque-value"));
+    assert!(!structured.contains("other-value"));
+    let bounded = retention_failure_detail(&"あ".repeat(1000));
+    assert!(bounded.len() <= 1024 + '…'.len_utf8());
+    assert!(bounded.ends_with('…'));
+}
+
+#[tokio::test]
 async fn generated_cancellation_errors_preserve_response_and_log_details() {
     let dir = tempfile::tempdir().unwrap();
     let (api, execution) = test_api_with_recording_backend(dir.path()).await;

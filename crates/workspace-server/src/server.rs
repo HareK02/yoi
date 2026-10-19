@@ -1994,11 +1994,12 @@ impl WorkerRemovalService {
         let result =
             match runtime.execute_worker_retention(target, prepared.runtime_request.clone()) {
                 Ok(result) => result,
-                Err(_) => {
-                    return Ok(worker_remove_error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "runtime_retention_failed",
-                        "Runtime retention recovery failed; removal can be retried",
+                Err(error) => {
+                    return Ok(runtime_retention_failure_response(
+                        target,
+                        &prepared.plan.operation_id,
+                        "recovery",
+                        &error,
                     ));
                 }
             };
@@ -2382,17 +2383,18 @@ impl WorkerRemovalService {
         let retention_result =
             match runtime.execute_worker_retention(&target, prepared.runtime_request.clone()) {
                 Ok(result) => result,
-                Err(_) => {
+                Err(error) => {
                     let _ = self.store.fail_worker_removal(
                         &self.workspace_id,
                         &plan.operation_id,
                         &plan.input_fingerprint,
                         "runtime_retention_failed",
                     );
-                    return Ok(worker_remove_error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "runtime_retention_failed",
-                        "Runtime retention execution failed; removal can be retried",
+                    return Ok(runtime_retention_failure_response(
+                        target,
+                        &plan.operation_id,
+                        "execution",
+                        &error,
                     ));
                 }
             };
@@ -24939,6 +24941,63 @@ fn worker_remove_error_response(
         status: status.as_u16(),
         body,
     }
+}
+
+// Preserve the Runtime cause through WorkerRemove, cleanup, and API logging.
+// Runtime errors can contain private paths or credentials; do not publish their
+// raw Display. Keep the operation and OS failure text for diagnosis.
+fn runtime_retention_failure_response(
+    target: &RuntimeWorkerRef,
+    operation_id: &str,
+    phase: &str,
+    error: &RuntimeRegistryError,
+) -> worker::WorkspaceResponse {
+    let detail = retention_failure_detail(&error.clone().into_error().to_string());
+    worker_remove_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "runtime_retention_failed",
+        &format!(
+            "Runtime retention {phase} failed for Worker {}:{} (operation {operation_id}): {detail}; removal can be retried",
+            target.runtime_id, target.worker_id,
+        ),
+    )
+}
+
+fn retention_failure_detail(message: &str) -> String {
+    let mut redact_next = false;
+    let mut detail = String::new();
+    for word in message.split_whitespace() {
+        let label = word
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .to_ascii_lowercase();
+        let secret_label = matches!(
+            label.as_str(),
+            "bearer" | "credential" | "password" | "secret" | "token" | "key"
+        );
+        let sensitive = redact_next
+            || (word.contains('/') && label != "i/o")
+            || word.contains('\\')
+            || (!secret_label
+                && ["credential", "password", "secret", "token", "key"]
+                    .iter()
+                    .any(|marker| label.contains(marker)));
+        redact_next = secret_label;
+        let word = if sensitive { "[redacted]" } else { word };
+        if !detail.is_empty() {
+            detail.push(' ');
+        }
+        let remaining = 1024usize.saturating_sub(detail.len());
+        let mut end = word.len().min(remaining);
+        while !word.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.push_str(&word[..end]);
+        if end < word.len() || detail.len() >= 1024 {
+            detail.push('…');
+            break;
+        }
+    }
+    detail
 }
 
 fn worker_retention_error_response(
