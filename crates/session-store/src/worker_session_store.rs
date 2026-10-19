@@ -36,7 +36,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-const SESSION_SCHEMA_VERSION: u32 = 3;
+const SESSION_SCHEMA_VERSION: u32 = 4;
+const ANNOTATED_SESSION_SCHEMA_VERSION: u32 = 3;
 const PREVIOUS_SESSION_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SESSION_SCHEMA_VERSION: u32 = 1;
 const SESSION_FILE: &str = "session.json";
@@ -212,9 +213,11 @@ impl WorkerSessionStore {
                     SESSION_SCHEMA_VERSION => {
                         validate_canonical_segment_logs(&root)?;
                     }
-                    PREVIOUS_SESSION_SCHEMA_VERSION | LEGACY_SESSION_SCHEMA_VERSION => {
-                        migrate_segment_logs_to_v3(
-                            &root,
+                    LEGACY_SESSION_SCHEMA_VERSION
+                    | PREVIOUS_SESSION_SCHEMA_VERSION
+                    | ANNOTATED_SESSION_SCHEMA_VERSION => {
+                        migrate_segment_logs_to_v4(
+                            segment_log_paths(&root)?,
                             manifest.session_id,
                             manifest.schema_version,
                         )?;
@@ -1107,7 +1110,12 @@ fn open_retained_file(path: &Path) -> std::io::Result<File> {
 }
 
 fn segment_log_paths(root: &Path) -> Result<Vec<(SegmentId, PathBuf)>, StoreError> {
-    let segments = root.join(SEGMENTS_DIR);
+    segment_log_paths_in_directory(&root.join(SEGMENTS_DIR))
+}
+
+fn segment_log_paths_in_directory(
+    segments: &Path,
+) -> Result<Vec<(SegmentId, PathBuf)>, StoreError> {
     if !segments.exists() {
         return Ok(Vec::new());
     }
@@ -1150,21 +1158,22 @@ fn segment_log_paths(root: &Path) -> Result<Vec<(SegmentId, PathBuf)>, StoreErro
     Ok(paths)
 }
 
-fn migrate_segment_logs_to_v3(
-    root: &Path,
+fn migrate_segment_logs_to_v4(
+    paths: Vec<(SegmentId, PathBuf)>,
     session_id: SessionId,
     source_schema_version: u32,
 ) -> Result<(), StoreError> {
     struct MigrationPlan {
         path: PathBuf,
         source: Vec<u8>,
+        entries: Vec<LogEntry>,
         output: Vec<u8>,
     }
 
     // Phase 1 is strictly read-only. Every segment must parse and canonicalize
     // successfully before the first authoritative byte is replaced.
     let mut plans = Vec::new();
-    for (segment_id, path) in segment_log_paths(root)? {
+    for (segment_id, path) in paths {
         let source = fs::read(&path)?;
         let canonical = parse_legacy_jsonl(source_schema_version, session_id, segment_id, &source)
             .map_err(|error| StoreError::Corrupt {
@@ -1174,16 +1183,24 @@ fn migrate_segment_logs_to_v3(
                     path.display()
                 ),
             })?;
-        let mut output = Vec::new();
-        for entry in canonical {
-            serde_json::to_writer(&mut output, &entry)?;
-            output.push(b'\n');
-        }
         plans.push(MigrationPlan {
             path,
             source,
-            output,
+            entries: canonical,
+            output: Vec::new(),
         });
+    }
+    // Resolve trusted creation boundaries first, then update inherited copies by
+    // logical identity too (fork/rewind seeds retain the same entry id).
+    let summaries = crate::legacy_session_log::compaction_summary_ids(
+        plans.iter().flat_map(|plan| plan.entries.iter()),
+    );
+    for plan in &mut plans {
+        crate::legacy_session_log::migrate_compaction_origins(&mut plan.entries, &summaries);
+        for entry in std::mem::take(&mut plan.entries) {
+            serde_json::to_writer(&mut plan.output, &entry)?;
+            plan.output.push(b'\n');
+        }
     }
 
     // Fence the complete preflight snapshot before starting phase 2. Session
@@ -1207,6 +1224,30 @@ fn migrate_segment_logs_to_v3(
     Ok(())
 }
 
+/// Upgrade the standalone per-Session layout using the same persisted format
+/// migration as Worker aggregates. Called only at writable Host store startup.
+pub(crate) fn migrate_fs_session(root: &Path, session_id: SessionId) -> Result<(), StoreError> {
+    let marker = root.join("session-schema.json");
+    let version: u32 = match fs::read(&marker) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ANNOTATED_SESSION_SCHEMA_VERSION
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match version {
+        SESSION_SCHEMA_VERSION => Ok(()),
+        ANNOTATED_SESSION_SCHEMA_VERSION => {
+            migrate_segment_logs_to_v4(segment_log_paths_in_directory(root)?, session_id, version)?;
+            atomic_write_json(&marker, &SESSION_SCHEMA_VERSION)
+        }
+        _ => Err(StoreError::Corrupt {
+            line: 0,
+            message: format!("unsupported standalone Session schema {version}"),
+        }),
+    }
+}
+
 fn validate_canonical_segment_logs(root: &Path) -> Result<(), StoreError> {
     for (_, path) in segment_log_paths(root)? {
         let _: Vec<LogEntry> = parse_jsonl(&fs::read(&path)?)?;
@@ -1223,17 +1264,26 @@ fn parse_legacy_jsonl(
     let text = std::str::from_utf8(bytes).map_err(|error| {
         serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     })?;
-    text.lines()
+    let mut offset = 0_u64;
+    text.split_inclusive('\n')
         .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(line_index, line)| {
-            crate::legacy_session_log::decode_entry(
+        .filter_map(|(line_index, line)| {
+            let start = offset;
+            offset += line.len() as u64;
+            (!line.trim().is_empty()).then_some((line_index, line, start))
+        })
+        .map(|(line_index, line, start)| {
+            let mut entry = crate::legacy_session_log::decode_entry(
                 schema_version,
                 line,
                 session_id,
                 segment_id,
                 line_index,
-            )
+            )?;
+            // Byte offsets change during migration. Persist identities previously
+            // synthesized from the OLD offsets before rewriting any record.
+            entry.ensure_legacy_session_entry_id(session_id, segment_id, start);
+            Ok(entry)
         })
         .collect()
 }

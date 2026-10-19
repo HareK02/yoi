@@ -8,6 +8,9 @@ use agen::llm_client::types::RequestConfig;
 use protocol::Segment;
 use serde::Deserialize;
 
+#[cfg(test)]
+mod tests;
+
 use crate::{
     LogEntry, LoggedHistoryEntry, LoggedItem, LoggedSessionHistoryEntryId,
     LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin, LoggedSystemHistoryEntry, SegmentId,
@@ -83,6 +86,7 @@ pub(crate) fn decode_entry(
             LegacySessionLogEntryV2::History(entry) => Entry::History(entry),
             LegacySessionLogEntryV2::Current(entry) => Entry::Current(entry),
         },
+        3 => Entry::Current(serde_json::from_str(line)?),
         _ => unreachable!("legacy decoder called for unsupported schema {schema_version}"),
     };
     Ok(match entry {
@@ -91,6 +95,61 @@ pub(crate) fn decode_entry(
         }
         Entry::Current(entry) => entry,
     })
+}
+
+/// Schema 3 used DerivedSummary for Host compaction seeds. Only the trusted
+/// creation boundary may identify one; arbitrary text and later seed items do not.
+/// Include already-upgraded entries so an interrupted multi-file migration resumes.
+pub(crate) fn compaction_summary_ids<'a>(
+    entries: impl Iterator<Item = &'a LogEntry>,
+) -> std::collections::HashSet<LoggedSessionHistoryEntryId> {
+    entries
+        .filter_map(|entry| {
+            let LogEntry::AnnotatedSegmentStart {
+                compacted_from: Some(_),
+                forked_from: None,
+                history,
+                ..
+            } = entry
+            else {
+                return None;
+            };
+            let first = history.first()?;
+            (matches!(
+                first.metadata.origin,
+                LoggedSessionHistoryOrigin::DerivedSummary
+                    | LoggedSessionHistoryOrigin::CompactionSummary
+            ) && matches!(
+                first.item,
+                LoggedItem::Message {
+                    role: crate::LoggedRole::System,
+                    ..
+                }
+            ) && agen::Item::from(first.item.clone())
+                .as_text()
+                .is_some_and(|text| text.starts_with("[Compacted context summary]\n\n")))
+            .then(|| first.metadata.entry_id.clone())
+        })
+        .collect()
+}
+
+pub(crate) fn migrate_compaction_origins(
+    entries: &mut [LogEntry],
+    summaries: &std::collections::HashSet<LoggedSessionHistoryEntryId>,
+) {
+    // Only inherited seed copies can share these identities. Appended input is
+    // not a construction boundary and must never be reclassified from its text.
+    for entry in entries {
+        if let LogEntry::AnnotatedSegmentStart { history, .. } = entry {
+            for entry in history {
+                if summaries.contains(&entry.metadata.entry_id)
+                    && entry.metadata.origin == LoggedSessionHistoryOrigin::DerivedSummary
+                {
+                    entry.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
+                }
+            }
+        }
+    }
 }
 
 enum Entry {

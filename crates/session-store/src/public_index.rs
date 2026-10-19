@@ -1602,6 +1602,7 @@ mod tests {
                 segment_id(20),
                 "completed",
                 LogEntry::RunCompleted {
+                    entry_id: None,
                     ts: 4,
                     interrupted: false,
                     result: EngineResult::Finished,
@@ -1640,7 +1641,10 @@ mod tests {
             (
                 segment_id(24),
                 "abandoned",
-                LogEntry::PausedTurnAbandoned { ts: 4 },
+                LogEntry::PausedTurnAbandoned {
+                    entry_id: None,
+                    ts: 4,
+                },
             ),
         ];
         for (segment_id, text, outcome) in outcomes {

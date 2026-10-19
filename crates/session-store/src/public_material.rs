@@ -814,7 +814,9 @@ fn boundary_reference(
     offset: u64,
 ) -> String {
     let id = match record {
-        LogEntry::RunYielded { entry_id, .. }
+        LogEntry::RunCompleted { entry_id, .. }
+        | LogEntry::PausedTurnAbandoned { entry_id, .. }
+        | LogEntry::RunYielded { entry_id, .. }
         | LogEntry::RunResumed { entry_id, .. }
         | LogEntry::RunCancelled { entry_id, .. }
         | LogEntry::RunErrored { entry_id, .. } => entry_id.as_ref(),

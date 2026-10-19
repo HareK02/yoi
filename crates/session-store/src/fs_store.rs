@@ -68,6 +68,24 @@ impl FsStore {
     ) -> Result<Self, StoreError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && let Some(session_id) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse().ok())
+            {
+                let _guard = match retention.lock_live(session_id) {
+                    Ok(guard) => guard,
+                    // Interrupted erasure may leave bytes behind. Never read or
+                    // upgrade them, and do not block unrelated live Sessions.
+                    Err(StoreError::SessionErased(_)) => continue,
+                    Err(error) => return Err(error),
+                };
+                crate::worker_session_store::migrate_fs_session(&entry.path(), session_id)?;
+            }
+        }
         Ok(Self {
             root,
             append_lock: Arc::new(Mutex::new(())),
@@ -434,6 +452,7 @@ impl Store for FsStore {
         let path = self.log_path(session_id, segment_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+            crate::worker_session_store::migrate_fs_session(parent, session_id)?;
         }
         let mut content = String::new();
         for entry in entries {

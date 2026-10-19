@@ -1693,6 +1693,7 @@ allow = []
         // A valid JSON record without its final newline is not committed.
         log.write_all(
             &serde_json::to_vec(&LogEntry::RunCompleted {
+                entry_id: None,
                 ts: 4,
                 interrupted: false,
                 result: agen::EngineResult::Finished,

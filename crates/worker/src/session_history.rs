@@ -101,10 +101,8 @@ fn from_logged(entry: &LoggedHistoryEntry) -> HistoryEntry<SessionHistoryMetadat
 }
 
 /// Rebuild typed Worker history directly from the append-only Session Log.
-/// Missing metadata is not inferred from role or arbitrary plaintext. The one adopted legacy
-/// Host seed is an opening `DerivedSummary` system item in an annotated compacted Segment,
-/// bearing the exact Host summary marker. It is interpreted as `CompactionSummary` without
-/// rewriting the durable record; later items and pasted markers never qualify.
+/// Persisted origins are authoritative. Legacy Host summaries are upgraded by
+/// the Session schema migration, never reinterpreted during normal restoration.
 pub(crate) fn restore_history_entries(
     _session_id: SessionId,
     _segment_id: SegmentId,
@@ -113,32 +111,8 @@ pub(crate) fn restore_history_entries(
     let mut history = Vec::new();
     for entry in entries {
         match entry {
-            LogEntry::AnnotatedSegmentStart {
-                history: seed,
-                compacted_from,
-                ..
-            } => {
+            LogEntry::AnnotatedSegmentStart { history: seed, .. } => {
                 history = seed.iter().map(from_logged).collect();
-                // Older Host compactions always put this DerivedSummary system item
-                // first in the replacement seed. Only that trusted construction boundary
-                // may interpret the marker; never infer origin from appended/pasted text.
-                if compacted_from.is_some()
-                    && let Some(first) = history.first_mut()
-                    && first.annotation.origin == WorkerHistoryProvenance::DerivedSummary
-                    && matches!(
-                        &first.item,
-                        Item::Message {
-                            role: agen::Role::System,
-                            ..
-                        }
-                    )
-                    && first
-                        .item
-                        .as_text()
-                        .is_some_and(|text| text.starts_with(COMPACTION_SUMMARY_HEADER))
-                {
-                    first.annotation.origin = WorkerHistoryProvenance::CompactionSummary;
-                }
             }
             LogEntry::AnnotatedUserInput { history: input, .. } => {
                 history.extend(input.iter().map(from_logged))
@@ -181,7 +155,7 @@ mod tests {
     use session_store::LogEntry;
 
     #[test]
-    fn restore_recognizes_only_legacy_host_compaction_seed_summary() {
+    fn restore_preserves_persisted_origin_without_legacy_reinterpretation() {
         let summary = history_entry(
             Item::system_message(format!("{COMPACTION_SUMMARY_HEADER}host summary")),
             WorkerHistoryProvenance::DerivedSummary,
@@ -213,11 +187,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 restored[0].annotation.origin,
-                if compacted {
-                    WorkerHistoryProvenance::CompactionSummary
-                } else {
-                    WorkerHistoryProvenance::DerivedSummary
-                }
+                WorkerHistoryProvenance::DerivedSummary
             );
             assert_eq!(
                 restored[1].annotation.origin,

@@ -62,6 +62,7 @@ fn round_trip_write_and_read() {
             turn_count: 1,
         },
         LogEntry::RunCompleted {
+            entry_id: None,
             ts: 3200,
             interrupted: false,
             result: EngineResult::Finished,
@@ -157,9 +158,10 @@ fn create_segment_replacement_keeps_open_old_log_and_commits_complete_new_log() 
     assert_eq!(reopened.read_entry_count(sid, segid).unwrap(), new.len());
     assert_eq!(
         std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-        1,
-        "successful replacement must not leave temporary files"
+        2,
+        "successful replacement leaves only the segment and Session schema marker"
     );
+    assert!(path.parent().unwrap().join("session-schema.json").is_file());
 }
 
 #[test]

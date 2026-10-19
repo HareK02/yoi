@@ -329,6 +329,7 @@ pub fn save_run_completed(
         session_id,
         segment_id,
         LogEntry::RunCompleted {
+            entry_id: None,
             ts: segment_log::now_millis(),
             interrupted,
             result,

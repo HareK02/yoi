@@ -5576,6 +5576,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.apply_interrupt_prep()?;
         self.last_run_interrupted = false;
         self.commit_entry(LogEntry::PausedTurnAbandoned {
+            entry_id: None,
             ts: segment_log::now_millis(),
         })?;
         Ok(())
@@ -6636,6 +6637,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     EngineRunExit::Yielded | EngineRunExit::Interrupted(_) => unreachable!(),
                 };
                 self.commit_entry(LogEntry::RunCompleted {
+                    entry_id: None,
                     ts: segment_log::now_millis(),
                     interrupted,
                     result,
@@ -6653,6 +6655,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             }
             EngineRunExit::Interrupted(RunInterruptionReason::LimitReached) => {
                 self.commit_entry(LogEntry::RunCompleted {
+                    entry_id: None,
                     ts: segment_log::now_millis(),
                     interrupted: false,
                     result: EngineResult::LimitReached,
@@ -14512,6 +14515,7 @@ permission = "write"
         );
         worker
             .commit_entry(LogEntry::RunCompleted {
+                entry_id: None,
                 ts: segment_log::now_millis(),
                 interrupted: false,
                 result: EngineResult::Finished,

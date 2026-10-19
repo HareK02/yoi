@@ -2468,8 +2468,7 @@ async fn pasted_markers_and_other_derived_context_remain_ordinary_overview_mater
 }
 
 #[tokio::test]
-async fn restored_legacy_summary_requires_compacted_lineage_first_position_origin_role_and_marker()
-{
+async fn restore_does_not_reinterpret_legacy_summary_markers() {
     use session_store::LoggedSessionHistoryOrigin::{
         CompactionSummary, DerivedSummary, LegacyUnknown,
     };
@@ -2525,13 +2524,9 @@ async fn restored_legacy_summary_requires_compacted_lineage_first_position_origi
             .iter()
             .find(|entry| entry.annotation.entry_id == candidate_id)
             .unwrap();
-        assert_eq!(
-            restored.annotation.origin == CompactionSummary,
-            case == "trusted",
-            "{case}"
-        );
-        // A restore-time upgrade is an in-memory interpretation of the trusted
-        // seed; it must not silently rewrite the historical durable record.
+        assert_ne!(restored.annotation.origin, CompactionSummary, "{case}");
+        // Migration belongs to the persisted store, not this restore path.
+        // Even a legacy Host seed must not be silently reinterpreted here.
         assert!(
             replacement_seed(&fixture.worker)
                 .iter()
@@ -2541,11 +2536,7 @@ async fn restored_legacy_summary_requires_compacted_lineage_first_position_origi
         fixture.worker.compact(0).await.unwrap();
 
         let input = first_compactor_input(&observed.requests()[1]);
-        if case == "trusted" {
-            assert_full_initial_summary(&input, &inherited);
-        } else {
-            assert!(!input.contains(INITIAL_SUMMARY_HEADING), "{case}");
-        }
+        assert!(!input.contains(INITIAL_SUMMARY_HEADING), "{case}");
     }
 }
 

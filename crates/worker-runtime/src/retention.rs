@@ -640,7 +640,7 @@ impl FsWorkerRetentionProvider {
     ) -> Result<(WorkerSessionArchiveManifest, PathBuf), RuntimeError> {
         let (manifest, session_root) = self.session_archive_identity(archive_id)?;
         let archive_dir = self.archive_dir(archive_id)?;
-        let manifest = validate_existing_archive(&archive_dir, &manifest)?;
+        let manifest = validate_existing_archive(&archive_dir, &manifest, false)?;
         Ok((manifest, session_root))
     }
 
@@ -1108,7 +1108,7 @@ fn commit_session_archive(
     };
     let archive_dir = provider.archive_dir(archive_id)?;
     if archive_dir.exists() {
-        return validate_existing_archive(&archive_dir, &manifest);
+        return validate_existing_archive(&archive_dir, &manifest, true);
     }
     let parent = archive_dir
         .parent()
@@ -1150,7 +1150,7 @@ fn commit_session_archive(
             source,
         })?;
         sync_directory(parent, "archive Worker Session")?;
-        validate_existing_archive(&archive_dir, &manifest)
+        validate_existing_archive(&archive_dir, &manifest, true)
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
@@ -1158,17 +1158,165 @@ fn commit_session_archive(
     result
 }
 
+// The public archive manifest is an immutable ingestion receipt also retained by
+// Backend. Schema migration replaces the payload, not that receipt. This local
+// storage attestation binds the new bytes to the exact verified ingestion receipt.
+// It is published only with the entire staged Runtime tree, never by a reader.
+#[derive(Serialize, Deserialize)]
+struct MigratedArchiveStorage {
+    schema_version: u32,
+    ingestion: WorkerSessionArchiveManifest,
+    checksum_sha256: String,
+    bytes: u64,
+    file_count: u64,
+}
+
+const ARCHIVE_STORAGE_FILE: &str = "session-storage.json";
+
+fn archive_storage(
+    archive_dir: &Path,
+    ingestion: &WorkerSessionArchiveManifest,
+) -> Result<Option<MigratedArchiveStorage>, RuntimeError> {
+    let path = archive_dir.join(ARCHIVE_STORAGE_FILE);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let storage: MigratedArchiveStorage =
+                serde_json::from_slice(&bytes).map_err(|error| RuntimeError::StoreCorrupt {
+                    operation: "read migrated archive storage",
+                    path: path.clone(),
+                    message: error.to_string(),
+                })?;
+            if storage.schema_version != 1 || &storage.ingestion != ingestion {
+                return Err(RuntimeError::StoreCorrupt {
+                    operation: "read migrated archive storage",
+                    path,
+                    message: "archive storage attestation does not match ingestion receipt".into(),
+                });
+            }
+            Ok(Some(storage))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(RuntimeError::StoreIo {
+            operation: "read migrated archive storage",
+            path,
+            source,
+        }),
+    }
+}
+
+/// Called only on the private Runtime migration staging tree under its owner
+/// lock. Failure discards the whole tree, including manifests and attestations.
+pub(crate) fn migrate_staged_sessions(root: &Path) -> Result<(), RuntimeError> {
+    for directory in ["workers", "orphaned-workers", "archives/workers"] {
+        let directory = root.join(directory);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(RuntimeError::StoreIo {
+                    operation: "enumerate Session migration",
+                    path: directory,
+                    source,
+                });
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|source| RuntimeError::StoreIo {
+                operation: "enumerate Session migration",
+                path: directory.clone(),
+                source,
+            })?;
+            let aggregate = entry.path();
+            let session = aggregate.join("session");
+            if !session
+                .join("session.json")
+                .try_exists()
+                .map_err(|source| RuntimeError::StoreIo {
+                    operation: "inspect Session migration",
+                    path: session.clone(),
+                    source,
+                })?
+            {
+                continue;
+            }
+            let identity: CanonicalSessionManifest = read_json(
+                &session.join("session.json"),
+                "read Session migration identity",
+            )?;
+            let session_id = identity.session_id.parse().map_err(|_| {
+                RuntimeError::InvalidRequest("Session migration identity is invalid".into())
+            })?;
+            match runtime_session_retention(root).ensure_live(session_id) {
+                Ok(()) => {}
+                // Erasure fences remain authoritative even if physical removal
+                // was interrupted. Do not inspect or migrate fenced originals.
+                Err(session_store::StoreError::SessionErased(_)) => continue,
+                Err(error) => return Err(retention_error(error)),
+            }
+            let archive = if directory == root.join("archives/workers") {
+                let manifest: WorkerSessionArchiveManifest = read_json(
+                    &aggregate.join("manifest.json"),
+                    "read archive before Session migration",
+                )?;
+                Some(validate_existing_archive(&aggregate, &manifest, false)?)
+            } else {
+                None
+            };
+            session_store::WorkerSessionStore::new(&session).map_err(|error| {
+                RuntimeError::StoreCorrupt {
+                    operation: "migrate Session schema",
+                    path: session.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            if let Some(ingestion) = archive {
+                let (checksum_sha256, bytes, file_count) = checksum_files(
+                    &collect_files(&session, "migrate archive storage")?,
+                    "migrate archive storage",
+                )?;
+                atomic_write_json(
+                    &aggregate.join(ARCHIVE_STORAGE_FILE),
+                    &MigratedArchiveStorage {
+                        schema_version: 1,
+                        ingestion,
+                        checksum_sha256,
+                        bytes,
+                        file_count,
+                    },
+                    "commit migrated archive storage",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_existing_archive(
     archive_dir: &Path,
     expected: &WorkerSessionArchiveManifest,
+    require_current_source: bool,
 ) -> Result<WorkerSessionArchiveManifest, RuntimeError> {
     let existing: WorkerSessionArchiveManifest = read_json(
         &archive_dir.join("manifest.json"),
         "verify Worker Session archive",
     )?;
+    let storage = archive_storage(archive_dir, &existing)?;
     let mut comparable_expected = expected.clone();
     comparable_expected.archived_at_unix_seconds = existing.archived_at_unix_seconds;
-    if existing != comparable_expected {
+    let mut current = existing.clone();
+    if let Some(storage) = &storage {
+        current.content_checksum_sha256 = storage.checksum_sha256.clone();
+        current.content_bytes = storage.bytes;
+        current.content_file_count = storage.file_count;
+    }
+    // Reads use the original receipt; a retry with a migrated live source uses
+    // the current storage summary. All other identity/policy fields must agree.
+    let expected_manifest = if require_current_source {
+        &current
+    } else {
+        &existing
+    };
+    if expected_manifest != &comparable_expected {
         return Err(RuntimeError::StoreCorrupt {
             operation: "verify Worker Session archive",
             path: archive_dir.join("manifest.json"),
@@ -1180,9 +1328,9 @@ fn validate_existing_archive(
         "verify Worker Session archive",
     )?;
     let (checksum, bytes, count) = checksum_files(&files, "verify Worker Session archive")?;
-    if checksum != existing.content_checksum_sha256
-        || bytes != existing.content_bytes
-        || count != existing.content_file_count
+    if checksum != current.content_checksum_sha256
+        || bytes != current.content_bytes
+        || count != current.content_file_count
     {
         return Err(RuntimeError::StoreCorrupt {
             operation: "verify Worker Session archive",
@@ -1658,6 +1806,249 @@ mod tests {
             session_disposition: disposition,
             diagnostics_disposition: DiagnosticsDisposition::Purge,
         }
+    }
+
+    fn old_compacted_source(root: &Path, worker_id: WorkerId) -> session_store::SegmentId {
+        use session_store::{
+            LogEntry, LoggedContentPart, LoggedHistoryEntry, LoggedItem, LoggedRole,
+            LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin,
+            Store,
+        };
+        let worker = root.join("workers").join(worker_id.to_string());
+        write_json(
+            &worker.join("worker.json"),
+            &serde_json::json!({"workspace_id": "workspace-a"}),
+        );
+        let store = session_store::WorkerSessionStore::new(worker.join("session")).unwrap();
+        let session_id = session_store::new_session_id();
+        let parent = session_store::new_segment_id();
+        let compact = session_store::new_segment_id();
+        let original = LoggedHistoryEntry {
+            item: LoggedItem::Message {
+                role: LoggedRole::User,
+                content: vec![LoggedContentPart::Text {
+                    text: "request".into(),
+                }],
+            },
+            metadata: LoggedSessionHistoryMetadata {
+                entry_id: LoggedSessionHistoryEntryId("original".into()),
+                origin: LoggedSessionHistoryOrigin::LocalHumanInput,
+                derivation: None,
+            },
+        };
+        let summary = LoggedHistoryEntry {
+            item: LoggedItem::Message {
+                role: LoggedRole::System,
+                content: vec![LoggedContentPart::Text {
+                    text: "[Compacted context summary]\n\nsummary".into(),
+                }],
+            },
+            metadata: LoggedSessionHistoryMetadata {
+                entry_id: LoggedSessionHistoryEntryId("summary".into()),
+                origin: LoggedSessionHistoryOrigin::DerivedSummary,
+                derivation: Some(session_store::LoggedHistoryDerivation {
+                    sources: vec![original.metadata.entry_id.clone()],
+                }),
+            },
+        };
+        for (id, history, compacted_from) in [
+            (parent, vec![original], None),
+            (
+                compact,
+                vec![summary],
+                Some(session_store::SegmentOrigin {
+                    segment_id: parent,
+                    at_turn_index: 0,
+                }),
+            ),
+        ] {
+            store
+                .create_segment(
+                    session_id,
+                    id,
+                    &[LogEntry::AnnotatedSegmentStart {
+                        ts: 1,
+                        session_id,
+                        system_prompt: None,
+                        config: Default::default(),
+                        history,
+                        forked_from: None,
+                        compacted_from,
+                    }],
+                )
+                .unwrap();
+        }
+        let mut metadata = session_store::WorkerMetadata::new(
+            worker_id.to_string(),
+            Some(session_store::WorkerActiveSegmentRef::active_segment(
+                session_id, compact,
+            )),
+        );
+        metadata.workspace_id = Some("workspace-a".into());
+        write_json(&worker.join("metadata.json"), &metadata);
+        write_json(
+            &worker.join("session/session.json"),
+            &serde_json::json!({"schema_version": 3, "session_id": session_id}),
+        );
+        compact
+    }
+
+    #[test]
+    fn session_migration_repairs_failed_archive_and_preserves_ingestion_receipt_on_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let worker = WorkerId::now_v7();
+        let compact = old_compacted_source(temp.path(), worker);
+        let provider = FsWorkerRetentionProvider::new(temp.path());
+        let request = request(worker, SessionDisposition::Archive);
+        assert!(
+            provider
+                .execute(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("Archived canonical source is unreadable")
+        );
+        let archive_dir = provider.archive_dir("archive-a").unwrap();
+        let original_manifest = fs::read(archive_dir.join("manifest.json")).unwrap();
+        // Production invokes this only in the private tree before atomic switch.
+        migrate_staged_sessions(temp.path()).unwrap();
+        assert_eq!(
+            fs::read(archive_dir.join("manifest.json")).unwrap(),
+            original_manifest
+        );
+        let (manifest, session_root) = provider.session_archive("archive-a").unwrap();
+        let reader = session_store::public_material::SessionPublicMaterialReader::open_worker(
+            &session_root,
+            compact,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(reader.descriptors().len(), 1);
+        let once = fs::read(archive_dir.join(ARCHIVE_STORAGE_FILE)).unwrap();
+        migrate_staged_sessions(temp.path()).unwrap();
+        assert_eq!(
+            fs::read(archive_dir.join(ARCHIVE_STORAGE_FILE)).unwrap(),
+            once
+        );
+        let result = provider.execute(&request).unwrap();
+        assert!(result.source_removed);
+        assert_eq!(result.archive.as_ref(), Some(&manifest));
+        assert_eq!(provider.execute(&request).unwrap(), result);
+        assert!(!provider.worker_dir(worker).exists());
+        // Both historical receipt and rewritten payload remain verified.
+        fs::write(
+            session_root
+                .join("segments")
+                .join(format!("{compact}.jsonl")),
+            b"tampered",
+        )
+        .unwrap();
+        assert!(provider.session_archive("archive-a").is_err());
+    }
+
+    #[test]
+    fn session_migration_updates_published_archive_without_changing_completed_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let worker = WorkerId::now_v7();
+        let compact = old_compacted_source(temp.path(), worker);
+        let provider = FsWorkerRetentionProvider::new(temp.path());
+        let path = provider
+            .worker_dir(worker)
+            .join("session/segments")
+            .join(format!("{compact}.jsonl"));
+        let old = fs::read_to_string(&path).unwrap();
+        fs::write(&path, old.replace("derived_summary", "compaction_summary")).unwrap();
+        let request = request(worker, SessionDisposition::Archive);
+        // Frozen schema-v3 completed-operation fixture: the old Runtime had
+        // already accepted this payload and removed its live source.
+        let archive =
+            commit_session_archive(&provider, &request, &provider.worker_dir(worker)).unwrap();
+        let completed = WorkerRetentionExecutionResult {
+            operation_id: request.operation_id.clone(),
+            input_fingerprint: request.input_fingerprint.clone(),
+            worker_id: worker,
+            session_disposition: SessionDisposition::Archive,
+            diagnostics_disposition: DiagnosticsDisposition::Purge,
+            archive: Some(archive),
+            source_removed: true,
+            diagnostics_retained: false,
+        };
+        write_json(
+            &provider.operation_path(&request.operation_id).unwrap(),
+            &RetentionOperationReceipt {
+                schema_version: OPERATION_SCHEMA_VERSION,
+                request: request.clone(),
+                result: completed.clone(),
+            },
+        );
+        fs::remove_dir_all(provider.worker_dir(worker)).unwrap();
+        let receipt = fs::read(provider.operation_path(&request.operation_id).unwrap()).unwrap();
+        migrate_staged_sessions(temp.path()).unwrap();
+        let (manifest, root) = provider.session_archive("archive-a").unwrap();
+        assert_eq!(completed.archive.as_ref(), Some(&manifest));
+        assert_eq!(
+            fs::read(provider.operation_path(&request.operation_id).unwrap()).unwrap(),
+            receipt
+        );
+        assert_eq!(provider.execute(&request).unwrap(), completed);
+        assert!(session_store::WorkerSessionStore::open_read_only(&root).is_ok());
+        let storage_path = provider
+            .archive_dir("archive-a")
+            .unwrap()
+            .join(ARCHIVE_STORAGE_FILE);
+        let mut storage: MigratedArchiveStorage = read_json(&storage_path, "test").unwrap();
+        storage.ingestion.archive_id = "another-archive".into();
+        write_json(&storage_path, &storage);
+        assert!(provider.session_archive("archive-a").is_err());
+    }
+
+    #[test]
+    fn session_migration_rejects_corrupt_archive_before_replacing_its_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let worker = WorkerId::now_v7();
+        let compact = old_compacted_source(temp.path(), worker);
+        let provider = FsWorkerRetentionProvider::new(temp.path());
+        let request = request(worker, SessionDisposition::Archive);
+        assert!(provider.execute(&request).is_err());
+        let archive = provider.archive_dir("archive-a").unwrap();
+        let path = archive
+            .join("session/segments")
+            .join(format!("{compact}.jsonl"));
+        fs::write(&path, b"corrupt\n").unwrap();
+        assert!(migrate_staged_sessions(temp.path()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"corrupt\n");
+        assert!(!archive.join(ARCHIVE_STORAGE_FILE).exists());
+    }
+
+    #[test]
+    fn session_migration_does_not_read_or_upgrade_erased_originals() {
+        let temp = tempfile::tempdir().unwrap();
+        let worker = WorkerId::now_v7();
+        let compact = old_compacted_source(temp.path(), worker);
+        let session = temp
+            .path()
+            .join("workers")
+            .join(worker.to_string())
+            .join("session");
+        let manifest = fs::read(session.join("session.json")).unwrap();
+        let identity: CanonicalSessionManifest = serde_json::from_slice(&manifest).unwrap();
+        let id = identity.session_id.parse().unwrap();
+        let retention = runtime_session_retention(temp.path());
+        retention
+            .delete(
+                id,
+                session_store::retention::SessionDeletionIntent::ErasePermanently,
+                || Ok(()),
+            )
+            .unwrap();
+        let path = session.join("segments").join(format!("{compact}.jsonl"));
+        fs::write(&path, b"unreadable fenced content\n").unwrap();
+        migrate_staged_sessions(temp.path()).unwrap();
+        assert_eq!(fs::read(session.join("session.json")).unwrap(), manifest);
+        assert_eq!(fs::read(path).unwrap(), b"unreadable fenced content\n");
+        assert!(matches!(
+            retention.ensure_live(id),
+            Err(session_store::StoreError::SessionErased(_))
+        ));
     }
 
     #[test]

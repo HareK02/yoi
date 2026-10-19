@@ -244,6 +244,7 @@ fn late_run_boundary_is_new_material_without_changing_previously_supplied_bodies
         ),
         (
             LogEntry::RunCompleted {
+                entry_id: None,
                 ts: 5,
                 interrupted: false,
                 result: agen::EngineResult::Finished,
@@ -256,6 +257,7 @@ fn late_run_boundary_is_new_material_without_changing_previously_supplied_bodies
         ),
         (
             LogEntry::RunCompleted {
+                entry_id: None,
                 ts: 5,
                 interrupted: true,
                 result: agen::EngineResult::LimitReached,
@@ -660,6 +662,143 @@ fn fork_clips_parent_suffix_and_maps_inherited_copy_to_original_segment() {
         ids(&read(temp.path(), session, root)),
         ["Eoriginal", "Eabandoned"]
     );
+}
+
+#[test]
+fn schema_v3_compaction_migrates_persistently_and_strict_reader_keeps_original_ids() {
+    for standalone in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let session = crate::new_session_id();
+        let root = crate::new_segment_id();
+        let compact = crate::new_segment_id();
+        let mut summary = message(
+            "summary",
+            LoggedRole::System,
+            "[Compacted context summary]\n\nold summary",
+        );
+        summary.metadata.origin = LoggedSessionHistoryOrigin::DerivedSummary;
+        summary.metadata.derivation = Some(crate::LoggedHistoryDerivation {
+            sources: vec![LoggedSessionHistoryEntryId("u".into())],
+        });
+        let mut start = seed(session, vec![summary.clone()]);
+        if let LogEntry::AnnotatedSegmentStart { compacted_from, .. } = &mut start {
+            *compacted_from = Some(SegmentOrigin {
+                segment_id: root,
+                at_turn_index: 0,
+            });
+        }
+        let records = [
+            start,
+            output("new", "new"),
+            cancelled(),
+            LogEntry::RunCompleted {
+                ts: 6,
+                entry_id: None,
+                interrupted: false,
+                result: agen::EngineResult::Finished,
+                active_run_turn_count: None,
+            },
+            LogEntry::PausedTurnAbandoned {
+                ts: 7,
+                entry_id: None,
+            },
+        ];
+        let session_root = if standalone {
+            temp.path().join(session.to_string())
+        } else {
+            temp.path().to_path_buf()
+        };
+        let paths = if standalone {
+            session_root.clone()
+        } else {
+            session_root.join("segments")
+        };
+        std::fs::create_dir_all(&paths).unwrap();
+        for (id, entries) in [
+            (
+                root,
+                vec![seed(
+                    session,
+                    vec![message("u", LoggedRole::User, "request")],
+                )],
+            ),
+            (compact, records.to_vec()),
+        ] {
+            let bytes: String = entries
+                .iter()
+                .map(|entry| format!("{}\n", serde_json::to_string(entry).unwrap()))
+                .collect();
+            std::fs::write(paths.join(format!("{id}.jsonl")), bytes).unwrap();
+        }
+        if !standalone {
+            std::fs::write(
+                session_root.join("session.json"),
+                serde_json::to_vec(
+                    &serde_json::json!({"schema_version": 3, "session_id": session}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let open = || {
+            if standalone {
+                SessionPublicMaterialReader::open_fs(
+                    temp.path(),
+                    session,
+                    compact,
+                    Default::default(),
+                )
+            } else {
+                SessionPublicMaterialReader::open_worker(&session_root, compact, Default::default())
+            }
+        };
+        assert!(
+            open().is_err(),
+            "strict reader must not reinterpret old provenance"
+        );
+        let migrate = || {
+            if standalone {
+                FsStore::new(temp.path()).unwrap();
+            } else {
+                WorkerSessionStore::new(&session_root).unwrap();
+            }
+        };
+        migrate();
+        let reader = open().unwrap();
+        assert_eq!(&ids(&reader)[..2], ["Eu", "Enew"]);
+        let path = paths.join(format!("{compact}.jsonl"));
+        let bytes = std::fs::read(&path).unwrap();
+        let entries: Vec<LogEntry> = String::from_utf8(bytes.clone())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let LogEntry::AnnotatedSegmentStart { history, .. } = &entries[0] else {
+            panic!()
+        };
+        summary.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
+        assert_eq!(history, &[summary]);
+        // Run-transition ids synthesized from byte offsets must be frozen before
+        // the changed summary record shifts every subsequent record offset.
+        let mut old_offset = 0;
+        for (index, original) in records.iter().enumerate() {
+            if index >= 2 {
+                let mut expected = original.clone();
+                expected.ensure_legacy_session_entry_id(session, compact, old_offset);
+                assert_eq!(
+                    serde_json::to_value(&entries[index]).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+                assert_eq!(
+                    ids(&reader)[index],
+                    format!("El-run-{session}-{compact}-{old_offset}")
+                );
+            }
+            old_offset += serde_json::to_vec(original).unwrap().len() as u64 + 1;
+        }
+        migrate();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
 }
 
 #[test]

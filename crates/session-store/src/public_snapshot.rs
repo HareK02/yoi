@@ -1705,6 +1705,7 @@ pub(crate) fn project_session_snapshot_for_segment(
                 interrupted,
                 result,
                 active_run_turn_count: persisted_count,
+                ..
             } => {
                 if *interrupted && matches!(result, agen::EngineResult::Yielded) {
                     let count = (*persisted_count)
@@ -2038,6 +2039,7 @@ mod tests {
 
     fn complete(ts: u64) -> LogEntry {
         LogEntry::RunCompleted {
+            entry_id: None,
             ts,
             interrupted: false,
             result: agen::EngineResult::Finished,

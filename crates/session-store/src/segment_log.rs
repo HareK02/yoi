@@ -122,6 +122,8 @@ pub enum LogEntry {
     /// Replay restores both interruption state and any resumable logical-run
     /// turn budget.
     RunCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_id: Option<crate::LoggedSessionHistoryEntryId>,
         ts: u64,
         interrupted: bool,
         result: EngineResult,
@@ -194,7 +196,11 @@ pub enum LogEntry {
     /// A paused interrupted turn was explicitly abandoned without calling
     /// `run()` or `resume()` again. Replay clears the interrupted marker so
     /// the restored Worker is idle and future user input starts a normal new turn.
-    PausedTurnAbandoned { ts: u64 },
+    PausedTurnAbandoned {
+        ts: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_id: Option<crate::LoggedSessionHistoryEntryId>,
+    },
 
     /// `RequestConfig` changed.
     ConfigChanged { ts: u64, config: RequestConfig },
@@ -253,7 +259,9 @@ impl LogEntry {
     /// written to storage is also the value published to live subscribers.
     pub fn ensure_session_entry_id(&mut self) {
         let entry_id = match self {
-            Self::RunYielded { entry_id, .. }
+            Self::RunCompleted { entry_id, .. }
+            | Self::PausedTurnAbandoned { entry_id, .. }
+            | Self::RunYielded { entry_id, .. }
             | Self::RunResumed { entry_id, .. }
             | Self::RunCancelled { entry_id, .. }
             | Self::RunErrored { entry_id, .. } => entry_id,
@@ -275,7 +283,9 @@ impl LogEntry {
         record_start: u64,
     ) {
         let entry_id = match self {
-            Self::RunYielded { entry_id, .. }
+            Self::RunCompleted { entry_id, .. }
+            | Self::PausedTurnAbandoned { entry_id, .. }
+            | Self::RunYielded { entry_id, .. }
             | Self::RunResumed { entry_id, .. }
             | Self::RunCancelled { entry_id, .. }
             | Self::RunErrored { entry_id, .. } => entry_id,
@@ -586,6 +596,7 @@ mod tests {
                 turn_count: 1,
             },
             LogEntry::RunCompleted {
+                entry_id: None,
                 ts: 3200,
                 interrupted: false,
                 result: EngineResult::Finished,
@@ -893,12 +904,16 @@ mod tests {
                 compacted_from: None,
             },
             LogEntry::RunCompleted {
+                entry_id: None,
                 ts: 100,
                 interrupted: true,
                 result: EngineResult::Paused,
                 active_run_turn_count: Some(1),
             },
-            LogEntry::PausedTurnAbandoned { ts: 200 },
+            LogEntry::PausedTurnAbandoned {
+                entry_id: None,
+                ts: 200,
+            },
         ]);
         assert!(!state.last_run_interrupted);
         assert_eq!(state.active_run_turn_count, None);
@@ -1056,6 +1071,7 @@ mod tests {
                 turn_count: 2,
             },
             LogEntry::RunCompleted {
+                entry_id: None,
                 ts: 300,
                 interrupted: true,
                 result: EngineResult::LimitReached,
@@ -1069,13 +1085,16 @@ mod tests {
 
     #[test]
     fn paused_turn_abandoned_entry_round_trip_via_json() {
-        let entry = LogEntry::PausedTurnAbandoned { ts: 12345 };
+        let entry = LogEntry::PausedTurnAbandoned {
+            entry_id: None,
+            ts: 12345,
+        };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["kind"], "paused_turn_abandoned");
         let decoded: LogEntry = serde_json::from_str(&json).unwrap();
         match decoded {
-            LogEntry::PausedTurnAbandoned { ts } => assert_eq!(ts, 12345),
+            LogEntry::PausedTurnAbandoned { ts, .. } => assert_eq!(ts, 12345),
             other => panic!("expected PausedTurnAbandoned, got {other:?}"),
         }
     }

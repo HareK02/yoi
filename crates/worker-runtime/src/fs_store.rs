@@ -39,7 +39,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 11;
+const EXECUTION_SCHEMA_VERSION: u32 = 10;
 // Frozen source schemas: do not move their meaning when adding a migration.
 const AGGREGATE_SCHEMA_VERSION: u32 = 9;
 const PREVIOUS_SCHEMA_VERSION: u32 = 8;
@@ -640,8 +641,8 @@ fn plan_runtime_store_migration(
             format!("Runtime store schema version {schema_version} is out of range"),
         )
     })?;
-    let staging = migration_sibling(root, "schema-v10-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v10-backup")?;
+    let staging = migration_sibling(root, "schema-v11-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v11-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -674,11 +675,12 @@ fn plan_runtime_store_migration(
             | LEGACY_SCHEMA_VERSION
             | PREVIOUS_SCHEMA_VERSION
             | AGGREGATE_SCHEMA_VERSION
+            | EXECUTION_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -1008,6 +1010,23 @@ fn migrate_worker_record(
     mapping: Option<&LegacyWorkerIdentityMapping>,
     identity_path: &Path,
 ) -> Result<WorkerAggregateRecord, RuntimeError> {
+    if source_schema_version == EXECUTION_SCHEMA_VERSION {
+        if identity_document
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(EXECUTION_SCHEMA_VERSION))
+        {
+            return Err(runtime_store_corrupt(
+                identity_path,
+                "Worker schema does not match Runtime migration source".into(),
+            ));
+        }
+        identity_document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
+        let aggregate: WorkerAggregateRecord = serde_json::from_value(identity_document)
+            .map_err(|error| runtime_store_corrupt(identity_path, error.to_string()))?;
+        aggregate.clone().validate(identity_path)?;
+        return Ok(aggregate);
+    }
     if source_schema_version == AGGREGATE_SCHEMA_VERSION {
         migrate_v9_restore_guard(&mut identity_document, identity_path)?;
         remove_legacy_job_input_counter(&mut identity_document);
@@ -1499,14 +1518,19 @@ fn remove_runtime_migration_directory(path: &Path) -> Result<(), RuntimeError> {
 }
 
 fn recover_runtime_store_migration(root: &Path) -> Result<(), RuntimeError> {
-    for suffix in ["schema-v9-staging", "pre-schema-v9-backup"] {
+    for suffix in [
+        "schema-v9-staging",
+        "pre-schema-v9-backup",
+        "schema-v10-staging",
+        "pre-schema-v10-backup",
+    ] {
         let earlier = migration_sibling(root, suffix)?;
         if earlier.exists() {
-            return Err(runtime_store_corrupt(root, "unfinished schema-v9 migration requires explicit recovery before schema-v10 startup".into()));
+            return Err(runtime_store_corrupt(root, "unfinished earlier Runtime migration requires explicit recovery before schema-v11 startup".into()));
         }
     }
-    let staging = migration_sibling(root, "schema-v10-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v10-backup")?;
+    let staging = migration_sibling(root, "schema-v11-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v11-backup")?;
     let root_exists = migration_directory_exists(root)?;
     let staging_exists = migration_directory_exists(&staging)?;
     let backup_exists = migration_directory_exists(&backup)?;
@@ -1708,8 +1732,8 @@ fn migrate_runtime_store(
     if !plan.migration_required {
         return Ok(plan);
     }
-    let staging = migration_sibling(root, "schema-v10-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v10-backup")?;
+    let staging = migration_sibling(root, "schema-v11-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v11-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -1903,6 +1927,7 @@ fn migrate_runtime_store_in_place(
             ),
         ));
     }
+    crate::retention::migrate_staged_sessions(root)?;
     let (document, _) = migrate_runtime_document(
         document,
         plan.current_schema_version,
@@ -2684,6 +2709,70 @@ mod tests {
     }
 
     #[test]
+    fn schema_v10_startup_migrates_stopped_sessions_atomically() {
+        for corrupt in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("runtime");
+            write_empty_schema_v8_store(&root);
+            let mut runtime: serde_json::Value =
+                read_json(&root.join(RUNTIME_FILE), "test").unwrap();
+            runtime["schema_version"] = serde_json::json!(10);
+            atomic_write_json(&root.join(RUNTIME_FILE), &runtime, "test").unwrap();
+            let worker_id = WorkerId::now_v7();
+            let aggregate = root.join(WORKERS_DIR).join(worker_id.to_string());
+            fs::create_dir_all(&aggregate).unwrap();
+            let record = migrate_worker_record(
+                schema_v7_worker_document(worker_id),
+                7,
+                None,
+                &aggregate.join(WORKER_FILE),
+            )
+            .unwrap();
+            let mut record = serde_json::to_value(record).unwrap();
+            record["schema_version"] = serde_json::json!(10);
+            atomic_write_json(&aggregate.join(WORKER_FILE), &record, "test").unwrap();
+            let session = aggregate.join("session");
+            fs::create_dir_all(session.join("segments")).unwrap();
+            atomic_write_json(&session.join("session.json"), &serde_json::json!({"schema_version":3,"session_id":session_store::new_session_id()}), "test").unwrap();
+            if corrupt {
+                fs::write(
+                    session
+                        .join("segments")
+                        .join(format!("{}.jsonl", session_store::new_segment_id())),
+                    b"invalid\n",
+                )
+                .unwrap();
+            }
+            let before = fs::read(session.join("session.json")).unwrap();
+            let options = FsRuntimeStoreOptions::new(&root).with_runtime_id("runtime-test");
+            assert!(
+                FsRuntimeStore::migration_plan(&options)
+                    .unwrap()
+                    .migration_required
+            );
+            assert_eq!(fs::read(session.join("session.json")).unwrap(), before);
+            let result = FsRuntimeStore::open_or_create(root.clone(), "runtime-test");
+            if corrupt {
+                assert!(result.is_err());
+                assert_eq!(stored_schema_version(&root), 10);
+                assert_eq!(fs::read(session.join("session.json")).unwrap(), before);
+                let record: serde_json::Value =
+                    read_json(&aggregate.join(WORKER_FILE), "test").unwrap();
+                assert_eq!(record["schema_version"], 10);
+            } else {
+                drop(result.unwrap());
+                assert_eq!(stored_schema_version(&root), 11);
+                let manifest: serde_json::Value =
+                    read_json(&session.join("session.json"), "test").unwrap();
+                assert_eq!(manifest["schema_version"], 4);
+                let once = fs::read(session.join("session.json")).unwrap();
+                drop(FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap());
+                assert_eq!(fs::read(session.join("session.json")).unwrap(), once);
+            }
+        }
+    }
+
+    #[test]
     fn auth_initialized_directory_without_snapshot_is_a_fresh_store() {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("runtime");
@@ -3062,7 +3151,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
-        let staging = migration_sibling(&root, "schema-v10-staging").unwrap();
+        let staging = migration_sibling(&root, "schema-v11-staging").unwrap();
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("partial"), b"partial").unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
@@ -3077,7 +3166,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
-        let backup = migration_sibling(&root, "pre-schema-v10-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v11-backup").unwrap();
         fs::rename(&root, &backup).unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
 
@@ -3091,10 +3180,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
-        let staging = migration_sibling(&root, "schema-v10-staging").unwrap();
+        let staging = migration_sibling(&root, "schema-v11-staging").unwrap();
         copy_runtime_tree(&root, &root, &staging).unwrap();
         migrate_runtime_store_in_place(&staging, "test-runtime").unwrap();
-        let backup = migration_sibling(&root, "pre-schema-v10-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v11-backup").unwrap();
         fs::rename(&root, &backup).unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
 
@@ -3109,10 +3198,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
-        let staging = migration_sibling(&root, "schema-v10-staging").unwrap();
+        let staging = migration_sibling(&root, "schema-v11-staging").unwrap();
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join(RUNTIME_FILE), b"{\"schema_version\":8}").unwrap();
-        let backup = migration_sibling(&root, "pre-schema-v10-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v11-backup").unwrap();
         fs::rename(&root, &backup).unwrap();
 
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
@@ -3129,7 +3218,7 @@ mod tests {
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
         migrate_runtime_store_in_place(&root, "test-runtime").unwrap();
-        let backup = migration_sibling(&root, "pre-schema-v10-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v11-backup").unwrap();
         write_empty_schema_v8_store(&backup);
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
 

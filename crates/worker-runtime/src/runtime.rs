@@ -13097,11 +13097,9 @@ mod tests {
             display_name: None,
         })
         .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported Runtime store schema version 2; expected 6, 7, 8, 9, or 10")
-        );
+        assert!(error.to_string().contains(
+            "unsupported Runtime store schema version 2; expected 6, 7, 8, 9, 10, or 11"
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -13142,7 +13140,7 @@ mod tests {
         let worker_aggregate: serde_json::Value =
             serde_json::from_slice(&std::fs::read(worker_store_dir.join("worker.json")).unwrap())
                 .unwrap();
-        assert_eq!(worker_aggregate["schema_version"], serde_json::json!(10));
+        assert_eq!(worker_aggregate["schema_version"], serde_json::json!(11));
         assert_eq!(worker_aggregate["status"], serde_json::json!("stopped"));
         assert_eq!(
             worker_aggregate["execution_state"]["state"],
@@ -14166,7 +14164,7 @@ mod tests {
         );
         let migrated_aggregate: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
-        assert_eq!(migrated_aggregate["schema_version"], serde_json::json!(10));
+        assert_eq!(migrated_aggregate["schema_version"], serde_json::json!(11));
         assert!(migrated_aggregate.get("request").is_none());
         assert!(migrated_aggregate.get("execution").is_none());
         assert_eq!(
