@@ -403,3 +403,36 @@ fn check_pattern(pattern: &str) -> Result<(), ToolError> {
 #[cfg(test)]
 #[path = "checkout_tests.rs"]
 mod tests;
+
+/// Read a bounded native text window through the same checked target and attachment tracker.
+/// Search callers do not establish the prior-Read precondition for mutations.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_checkout_text(
+    router: Arc<WorkdirSessionRouter>,
+    tracker: Tracker,
+    alias: &str,
+    generation: u64,
+    path: WorkdirPath,
+    validator: Vec<u8>,
+    offset: usize,
+    limit: usize,
+    max_bytes: usize,
+    record_read: bool,
+) -> Result<(workdir::ReadResult, Option<Vec<u8>>), ToolError> {
+    let selected =
+        crate::routing::resolve_session(&router, Some(alias), WorkdirSessionCapability::Read)?;
+    if selected.generation != generation {
+        return Err(stale_checkout("checkout connection changed"));
+    }
+    let tracker = tracker.scoped_attachment(&selected.alias, selected.generation);
+    let target = FileTarget {
+        session: selected.session.clone(),
+        path: path.clone(),
+        validator: Some(validator),
+    };
+    let (result, validator) = target.read(offset, limit, max_bytes).await?;
+    if record_read {
+        tracker.record_workdir_observation(&path, result.content_hash.clone(), result.total_lines);
+    }
+    Ok((result, validator))
+}

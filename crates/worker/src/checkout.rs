@@ -7,7 +7,7 @@
 //! empty children mean "no indexable children", not "empty directory". List/Glob/Grep discover
 //! content; Inspect checks selected coordinates.
 //!
-//! Interfaces/validators bind the projection incarnation, attachment generation, and provider state
+//! Object validators bind the projection incarnation, attachment generation, and provider state
 //! so alias reuse after restore or detach cannot transfer old observations to a new connection.
 //! Publication also checks the generation recorded at acquisition. Possessing an Interface grants
 //! no authority: route-reconstructed permission inputs and current provider capability/scope are
@@ -28,9 +28,8 @@ use manifest::{ToolPermissionAction, ToolPermissionConfig};
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
 use wip_protocol::{
-    Documentation, FieldDeclaration, INTERFACE_FORMAT_V1, InterfaceDescriptor, Object,
-    OperationDeclaration, ParameterDeclaration, ProtocolError, ProtocolErrorCode,
-    ReturnDeclaration, TypeExpr, Value,
+    Documentation, INTERFACE_FORMAT_V1, InterfaceDescriptor, Object, OperationDeclaration,
+    ParameterDeclaration, ProtocolError, ProtocolErrorCode, ReturnDeclaration, TypeExpr, Value,
 };
 use workdir::{
     CheckoutObservation, EntryKind, WorkdirPath, WorkdirSessionCapability as Cap,
@@ -236,45 +235,17 @@ impl Provider {
             return Ok(None);
         }
         let workdir = selected.session.workdir().id().as_str().to_owned();
-        let root = checkout_root(&alias);
-        // The router guard pins this connection across both observations. Root
-        // lifetime is attachment lifetime, not directory-content validator state.
-        let scope = if target.is_root() {
-            None
-        } else {
-            let root_observation =
-                match selected.session.checkout_observe(WorkdirPath::root()).await {
-                    Ok(o) => o,
-                    Err(_) => return Ok(None),
-                };
-            self.entry_projection(
-                &root,
-                &alias,
-                selected.generation,
-                &workdir,
-                WorkdirPath::root(),
-                root_observation,
-            )
-        };
-        let Some(projection) = self.entry_projection(
+        let projection = self.entry_projection(
             path,
             &alias,
             selected.generation,
             &workdir,
             target,
             observation,
-        ) else {
-            return Ok(None);
-        };
-        if path == root {
-            return WipPublication::self_scoped(projection).map(Some);
-        }
-        let Some(scope) = scope else {
-            return Ok(None);
-        };
-        Ok(Some(WipPublication {
+        );
+        Ok(projection.map(|projection| WipPublication {
             projection,
-            scope: Some(scope.object),
+            scope: None,
         }))
     }
     fn entry_projection(
@@ -286,15 +257,36 @@ impl Provider {
         target: WorkdirPath,
         observation: CheckoutObservation,
     ) -> Option<WipProjection> {
-        let ops = self.operations(&observation);
-        if ops.is_empty() {
-            return None;
-        }
+        use crate::file_operation::Contract as C;
+        let has = |cap, name| observation.capabilities.supports(cap) && self.may_allow(name);
+        let mut contracts = Vec::new();
         let kind = if observation.kind == EntryKind::File {
+            if has(Cap::Read, "Read") {
+                contracts.extend([C::ReadLines, C::SearchText]);
+            }
+            if has(Cap::Edit, "Edit") {
+                contracts.push(C::Edit);
+            }
+            if has(Cap::Write, "Write") {
+                contracts.push(C::Write);
+            }
             "file"
         } else {
+            if has(Cap::Read, "List") {
+                contracts.push(C::List);
+            }
+            if has(Cap::Glob, "Glob") {
+                contracts.push(C::Glob);
+            }
+            if has(Cap::Grep, "Grep") {
+                contracts.push(C::Grep);
+            }
+            if has(Cap::Write, "Write") {
+                contracts.push(C::CreateFile);
+            }
             "directory"
         };
+        let primary = *contracts.first()?;
         let validator = self.wrap_validator(alias, generation, workdir, &observation.validator);
         let handler = Arc::new(FileHandler {
             provider: self.clone(),
@@ -304,86 +296,17 @@ impl Provider {
             target,
             observation,
         });
-        let family = format!("{kind}-g{generation}");
-        let mut projection = self.project(path, descriptor(ops), validator, &family, handler);
-        // Keep path-qualified local names (permissions/capabilities may differ
-        // per target) while binding every content Interface to its live entrance.
-        projection.interface.scope = checkout_root(alias);
-        projection.interface.name.push_str("#target/");
-        projection.interface.name.push_str(&encode_identity(path));
-        projection.object.interfaces = vec![projection.interface.clone()];
+        let mut projection = self.project(path, primary.descriptor(), validator, kind, handler);
+        projection.interface = primary.reference();
+        projection.interface_validator = Some(primary.validator());
+        projection.object.interfaces = Vec::new();
+        crate::file_operation::expose(&mut projection, contracts);
         Some(projection)
-    }
-
-    fn operations(&self, o: &CheckoutObservation) -> Vec<OperationDeclaration> {
-        let mut ops = Vec::new();
-        let has = |cap, name| o.capabilities.supports(cap) && self.may_allow(name);
-        if o.kind == EntryKind::File {
-            if has(Cap::Read, "Read") {
-                ops.push(operation(
-                    "read",
-                    "Read text with line offsets and numbered output",
-                    crate::file_operation::parameters("read", true).unwrap(),
-                ));
-            }
-            if has(Cap::Edit, "Edit") {
-                ops.push(operation(
-                    "edit",
-                    "Replace a unique string (requires prior Read)",
-                    crate::file_operation::parameters("edit", true).unwrap(),
-                ));
-            }
-            if has(Cap::Write, "Write") {
-                ops.push(operation(
-                    "write",
-                    "Overwrite this existing file (requires prior Read)",
-                    crate::file_operation::parameters("write", true).unwrap(),
-                ));
-            }
-        } else {
-            if has(Cap::Read, "List") {
-                ops.push(operation(
-                    "list",
-                    "List direct contents, directories first then lexical path. Bounded live pages, not a snapshot; pass returned after to continue. Limit defaults to 100, maximum 1000. List permission and provider Read/enumeration authority apply. Includes hidden/ignored names per provider List policy, unlike Glob/Grep.",
-                    vec![parameter("limit", false, TypeExpr::Integer), parameter("after", false, cursor_type())],
-                ));
-            }
-            if has(Cap::Glob, "Glob") {
-                ops.push(operation(
-                    "glob",
-                    "Glob within this directory",
-                    vec![
-                        parameter("pattern", true, TypeExpr::String),
-                        parameter("path", false, TypeExpr::String),
-                    ],
-                ));
-            }
-            if has(Cap::Grep, "Grep") {
-                ops.push(operation(
-                    "grep",
-                    "Search within this directory with the existing Grep contract",
-                    grep_parameters(),
-                ));
-            }
-            if has(Cap::Write, "Write") {
-                ops.push(operation("create_file", "Create a new relative file, creating permitted missing parents; never overwrite", vec![parameter("path",true,TypeExpr::String),parameter("content",true,TypeExpr::String)]));
-            }
-        }
-        ops
     }
 }
 
 #[async_trait]
 impl WipSubtreeProvider for Arc<Provider> {
-    fn interface_target(&self, reference: &wip_protocol::InterfaceReference) -> Option<String> {
-        if reference.scope == ROOT {
-            return Some(ROOT.into());
-        }
-        let (_, encoded) = reference.name.rsplit_once("#target/")?;
-        let path = decode_identity(encoded)?;
-        let (alias, _) = self.parse(&path)?;
-        (reference.scope == checkout_root(&alias)).then_some(path)
-    }
     async fn publication(&self, path: &str) -> Result<Option<WipPublication>, ProtocolError> {
         let _permit = tokio::time::timeout(self.deadline, self.permits.acquire())
             .await
@@ -604,6 +527,54 @@ impl WipOperationHandler for FileHandler {
         arguments: &BTreeMap<String, Value>,
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
+        if matches!(operation, "read_lines" | "search_text") {
+            let (offset, limit) =
+                crate::file_operation::window(arguments, operation == "search_text")?;
+            if !self.provider.allowed("Read",&json!({"target_workdir":self.alias,"file_path":self.target.as_str(),"offset":offset,"limit":limit})) {
+                return Err(protocol(ProtocolErrorCode::PermissionDenied,"text read denied"));
+            }
+            let result = tokio::time::timeout(
+                self.provider.deadline,
+                tools::checkout::read_checkout_text(
+                    self.provider.router.clone(),
+                    self.provider.tracker.clone(),
+                    &self.alias,
+                    self.generation,
+                    self.target.clone(),
+                    self.observation.validator.clone(),
+                    offset,
+                    limit,
+                    crate::file_operation::MAX_BYTES,
+                    operation == "read_lines",
+                ),
+            )
+            .await
+            .map_err(|_| {
+                protocol(
+                    ProtocolErrorCode::ResourceLimitExceeded,
+                    "text read deadline",
+                )
+            })?
+            .map_err(map_tool_error)?;
+            let (read, validator) = result;
+            self.check_connection()?;
+            let text = String::from_utf8_lossy(&read.bytes);
+            let value = crate::file_operation::page_result(
+                operation,
+                arguments,
+                &text,
+                offset,
+                read.truncated,
+            )?;
+            return Ok(match validator {
+                Some(raw) => WipOperationOutput::native_with_validator(
+                    value,
+                    self.provider
+                        .wrap_validator(&self.alias, self.generation, &self.workdir, &raw),
+                ),
+                None => WipOperationOutput::native(value),
+            });
+        }
         let tool = match operation {
             "list" => "List",
             "read" => "Read",
@@ -774,52 +745,9 @@ fn operation(
         parameters,
         returns: ReturnDeclaration {
             documentation: None,
-            r#type: result_type(name == "list"),
+            r#type: TypeExpr::Json,
         },
     }
-}
-fn field(name: &str, required: bool, r#type: TypeExpr) -> FieldDeclaration {
-    FieldDeclaration {
-        name: name.into(),
-        required,
-        documentation: None,
-        r#type,
-    }
-}
-fn cursor_type() -> TypeExpr {
-    TypeExpr::Record {
-        fields: vec![
-            field("kind", true, TypeExpr::String),
-            field("entry", true, TypeExpr::Entry),
-        ],
-    }
-}
-fn result_type(list: bool) -> TypeExpr {
-    let mut item = vec![field("entry", true, TypeExpr::Entry)];
-    if list {
-        item.extend([
-            field("kind", true, TypeExpr::String),
-            field("size", true, TypeExpr::Integer),
-        ]);
-    }
-    let mut fields = vec![
-        field("summary", true, TypeExpr::String),
-        field("content", false, TypeExpr::String),
-        field(
-            "items",
-            true,
-            TypeExpr::List {
-                items: Box::new(TypeExpr::Record { fields: item }),
-            },
-        ),
-    ];
-    if list {
-        fields.extend([
-            field("truncated", true, TypeExpr::Boolean),
-            field("after", false, cursor_type()),
-        ]);
-    }
-    TypeExpr::Record { fields }
 }
 fn kind_name(kind: EntryKind) -> &'static str {
     match kind {
@@ -840,19 +768,6 @@ fn cursor_value(alias: &str, cursor: &workdir::ListCursor) -> Value {
 }
 fn descriptor(operations: Vec<OperationDeclaration>) -> InterfaceDescriptor {
     InterfaceDescriptor{format:INTERFACE_FORMAT_V1.into(),documentation:Some(Documentation{summary:"AI-oriented attached Workdir operations".into(),details:Some("The route binds attachment and target. Line offsets are zero-based; text output numbers lines from one. Read-before-write and provider validators are both required. Paths are Worldspace references, never host paths.".into())}),types:Vec::new(),operations}
-}
-fn grep_parameters() -> Vec<ParameterDeclaration> {
-    let mut p = vec![parameter("pattern", true, TypeExpr::String)];
-    for name in ["path", "glob", "type", "output_mode"] {
-        p.push(parameter(name, false, TypeExpr::String));
-    }
-    for name in ["-A", "-B", "-C", "head_limit", "offset"] {
-        p.push(parameter(name, false, TypeExpr::Integer));
-    }
-    for name in ["case_insensitive", "multiline"] {
-        p.push(parameter(name, false, TypeExpr::Boolean));
-    }
-    p
 }
 fn error(code: ProtocolErrorCode, message: &str) -> ProtocolError {
     ProtocolError {
