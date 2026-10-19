@@ -9,6 +9,11 @@ import {
 import { afterEach, expect, test, vi } from "vitest";
 import Setup from "./+page.svelte";
 import {
+  browserSession,
+  observeBrowserSession,
+} from "#lib/workspace/auth/session-state.ts";
+import { SESSION_CHANGED_EVENT } from "#lib/workspace/auth/hosting.ts";
+import {
   authUser,
   credentialFixture,
   loginOptions,
@@ -17,6 +22,7 @@ import {
 
 afterEach(() => {
   cleanup();
+  browserSession.invalidate();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -268,3 +274,150 @@ test("API token identity is not mistaken for a verified browser session", async 
   expect(screen.queryByRole("link", { name: "Open hosting settings" }))
     .toBeNull();
 });
+
+function gate<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+const setupActor = { ...authUser, auth_method: "browser_session" };
+const replacedActor = {
+  ...setupActor,
+  user_id: "other-user",
+  account_id: "other-account",
+  handle: "bob",
+};
+function identityResponse(actor: typeof setupActor | null) {
+  return Response.json({
+    actor,
+    session: actor
+      ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
+      : { kind: "anonymous" },
+  });
+}
+async function changedInAnotherTab(actor: typeof setupActor | null) {
+  window.dispatchEvent(
+    new StorageEvent("storage", {
+      key: "yoi.browser-auth-generation",
+      newValue: JSON.stringify({
+        id: crypto.randomUUID(),
+        reason: actor ? "authentication" : "logout",
+      }),
+    }),
+  );
+  await browserSession.refresh();
+}
+for (const phase of ["login", "whoami", "access", "confirmation"] as const) {
+  for (const replacement of [null, replacedActor]) {
+    test(`newer ${replacement ? "actor" : "logout"} while setup ${phase} is pending cannot publish old verified success`, async () => {
+      const { fetcher } = boundary();
+      const original = fetcher.getMockImplementation()!;
+      const started = gate<void>();
+      const pending = gate<Response>();
+      let current: typeof setupActor | null = setupActor;
+      let reads = 0;
+      fetcher.mockImplementation((input, init) => {
+        const path = String(input);
+        if (path === "/api/auth/whoami") {
+          ++reads;
+          if (
+            (phase === "whoami" && reads === 1) ||
+            (phase === "confirmation" && reads === 2)
+          ) {
+            started.resolve();
+            return pending.promise;
+          }
+          return Promise.resolve(identityResponse(current));
+        }
+        if (
+          (phase === "access" && path === "/api/hosting/access") ||
+          (phase === "login" && path === "/api/auth/passkeys/login/complete")
+        ) {
+          started.resolve();
+          return pending.promise;
+        }
+        return original(input, init);
+      });
+      observeBrowserSession();
+      render(Setup);
+      await enroll();
+      await fireEvent.click(
+        await screen.findByRole("button", { name: "Sign in with new passkey" }),
+      );
+      await started.promise;
+      const notify = vi.fn();
+      window.addEventListener(SESSION_CHANGED_EVENT, notify);
+      try {
+        current = replacement;
+        await changedInAnotherTab(current);
+        const acceptedGeneration = browserSession.authenticationGeneration;
+        pending.resolve(
+          phase === "access"
+            ? Response.json({ is_admin: true })
+            : phase === "login"
+            ? Response.json({ user: authUser })
+            : identityResponse(setupActor),
+        );
+        await waitFor(() =>
+          expect(
+            (screen.getByRole("button", {
+              name: "Sign in with new passkey",
+            }) as HTMLButtonElement).disabled,
+          ).toBe(false)
+        );
+        expect(screen.queryByRole("link", { name: "Open hosting settings" }))
+          .toBeNull();
+        expect(
+          screen.queryByText(
+            "Passkey login and hosting administrator access verified.",
+          ),
+        ).toBeNull();
+        expect(notify).not.toHaveBeenCalled();
+        expect(browserSession.authenticationGeneration).toBe(
+          acceptedGeneration,
+        );
+        expect(browserSession.snapshot).toMatchObject({
+          kind: "ready",
+          value: { actor: current },
+        });
+      } finally {
+        window.removeEventListener(SESSION_CHANGED_EVENT, notify);
+      }
+    });
+  }
+}
+for (const replacement of [null, replacedActor]) {
+  test(`setup verified success is removed on subsequent ${replacement ? "actor replacement" : "logout"}`, async () => {
+    const { fetcher } = boundary();
+    observeBrowserSession();
+    render(Setup);
+    await enroll();
+    await fireEvent.click(
+      await screen.findByRole("button", { name: "Sign in with new passkey" }),
+    );
+    await screen.findByRole("link", { name: "Open hosting settings" });
+    const original = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation((input, init) =>
+      String(input) === "/api/auth/whoami"
+        ? Promise.resolve(identityResponse(replacement))
+        : original(input, init)
+    );
+    await changedInAnotherTab(replacement);
+    await waitFor(() =>
+      expect(screen.queryByRole("link", { name: "Open hosting settings" }))
+        .toBeNull()
+    );
+    expect(
+      screen.queryByText(
+        "Passkey login and hosting administrator access verified.",
+      ),
+    ).toBeNull();
+    expect(
+      (screen.getByRole("button", {
+        name: "Sign in with new passkey",
+      }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+}
