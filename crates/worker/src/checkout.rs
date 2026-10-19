@@ -637,6 +637,12 @@ impl WipOperationHandler for FileHandler {
             .map_err(map_tool_error)?;
             let (read, validator, record_read) = result;
             self.check_connection()?;
+            if read.byte_truncated {
+                return Err(protocol(
+                    ProtocolErrorCode::ResourceLimitExceeded,
+                    "text line window exceeds the provider byte budget; use byte ranges",
+                ));
+            }
             let text = String::from_utf8_lossy(&read.bytes);
             let value = crate::file_operation::page_result(
                 operation,

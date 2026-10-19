@@ -204,7 +204,11 @@ pub struct ReadResult {
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
     pub total_lines: usize,
     pub content_hash: ContentHash,
+    /// More source lines remain, or the selected window exceeded the response byte budget.
     pub truncated: bool,
+    /// The selected line window was cut by its byte budget, possibly within a line.
+    /// Line-based cursors must not treat such a window as completely scanned.
+    pub byte_truncated: bool,
 }
 
 /// Binary-safe byte range read with an optional whole-file version fence.
