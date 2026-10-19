@@ -5708,6 +5708,38 @@ impl WorkspaceApi {
         if let Some(grant) = request.resolved_execution_grant.as_ref() {
             subject_authorization::bind_reserved_grant(self, grant, &worker_id.to_string())?;
         }
+        // A completed exact-source allocation is historical acceptance, not a new
+        // launch. Source/grant authorization and the full fingerprint were checked
+        // above. Do not reserve its already-linked attachments again, redispatch
+        // initial input, or compensate an existing Worker on a replay failure.
+        let reserved_worker = RuntimeWorkerRef::new(runtime_id, worker_id.to_string());
+        if request.resolved_control_operation.is_some()
+            && !self
+                .store
+                .has_active_worker_create_reservation(&self.config.workspace_id, &reserved_worker)?
+        {
+            let record = self
+                .store
+                .get_worker_registry(&self.config.workspace_id, &reserved_worker)?
+                .ok_or_else(|| {
+                    Error::Store("completed Worker allocation has no registry evidence".into())
+                })?;
+            let summary = self
+                .runtime
+                .worker(&reserved_worker)
+                .unwrap_or_else(|_| worker_summary_from_registry(&record));
+            return Ok(WorkerSpawnResult {
+                state: InternalWorkerOperationState::Accepted,
+                worker: Some(summary),
+                acceptance_evidence: vec![crate::hosts::WorkerSpawnAcceptanceEvidence {
+                    kind: "saved_creation".into(),
+                    detail:
+                        "Exact allocation was previously accepted; no new execution was requested"
+                            .into(),
+                }],
+                diagnostics: Vec::new(),
+            });
+        }
         if let Some(assignment) = request.ticket_assignment.as_ref() {
             self.store.bind_ticket_assignment_operation_worker(
                 &self.config.workspace_id,

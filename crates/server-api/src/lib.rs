@@ -1351,6 +1351,7 @@ pub trait ServerApi {
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
         browser_auth = true,
     )]
     async fn subjektiv_subject_permissions_get(
@@ -1365,6 +1366,7 @@ pub trait ServerApi {
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
         browser_auth = true,
     )]
     async fn subjektiv_subject_permissions_set(
@@ -14697,11 +14699,7 @@ mod openapi_artifact_tests {
         // the Runtime/Worker-source signed operation inventory above.
         const OTHER_OPENAPI_EXCLUDED: &[&str] = &["worker_session", "worker_session_history"];
         const DOCUMENTED_SIGNED_INTERNAL: &[&str] = &["workspace_runtime_config"];
-        const BROWSER_ONLY: &[&str] = &[
-            "merge_request_selector_repair",
-            "subjektiv_subject_permissions_get",
-            "subjektiv_subject_permissions_set",
-        ];
+        const BROWSER_ONLY: &[&str] = &["merge_request_selector_repair"];
 
         let document = canonical_openapi_document().expect("canonical OpenAPI contract must build");
         let value: serde_json::Value =
