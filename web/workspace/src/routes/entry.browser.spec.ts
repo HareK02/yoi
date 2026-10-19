@@ -8,6 +8,7 @@ import {
   waitFor,
 } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
+import { browserSession } from "#lib/workspace/auth/session-state.ts";
 import Home from "./+page.svelte";
 import Dashboard from "./dashboard/+page.svelte";
 import { authUser } from "#lib/workspace/auth/api.test-fixtures.ts";
@@ -20,6 +21,7 @@ import { goto } from "$app/navigation";
 vi.mock("$app/navigation", () => ({ goto: vi.fn(async () => {}) }));
 afterEach(() => {
   cleanup();
+  browserSession.invalidate();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
 });
@@ -51,6 +53,9 @@ function boundary() {
         if (state.sessionGate) return state.sessionGate.promise;
         return state.whoamiStatus === 200
           ? Response.json({
+            session: state.signedIn
+              ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
+              : { kind: "anonymous" },
             actor: state.signedIn
               ? {
                 ...authUser,
@@ -288,7 +293,10 @@ test("same actor focus retains creation disclosure, repository fields, errors an
   await screen.findByText("Loading session…");
   expect(screen.queryByLabelText("Workspace display name")).toBeNull();
   state.sessionGate.resolve(
-    Response.json({ actor: { ...authUser, auth_method: "browser_session" } }),
+    Response.json({
+      session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+      actor: { ...authUser, auth_method: "browser_session" },
+    }),
   );
   expect(
     (await screen.findByLabelText("Workspace display name") as HTMLInputElement)
@@ -323,7 +331,10 @@ test("pending create remains single across focus and a success during unknown se
   await waitFor(() => expect(response.bodyUsed).toBe(true));
   expect(goto).not.toHaveBeenCalled();
   state.sessionGate.resolve(
-    Response.json({ actor: { ...authUser, auth_method: "browser_session" } }),
+    Response.json({
+      session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+      actor: { ...authUser, auth_method: "browser_session" },
+    }),
   );
   expect(
     (await screen.findByRole("link", { name: "Open created Workspace" }))

@@ -7016,6 +7016,7 @@ async fn attach_server_request_context(
 }
 
 fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
+    let auth = auth_public_config(&service.auth_api().config);
     let service = Arc::new(service);
     let origin_context = Router::new()
         .merge(server_api::server_api_axum::auth_activation_options(
@@ -7047,7 +7048,6 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
         .merge(server_api::server_api_axum::auth_device_login_approve(
             service.clone(),
         ))
-        .merge(server_api::server_api_axum::auth_whoami(service.clone()))
         .layer(middleware::from_fn_with_state(
             service.as_ref().clone(),
             attach_server_request_context,
@@ -7068,12 +7068,20 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
             service.clone(),
         ))
         .merge(server_api::server_api_axum::auth_logout(service.clone()))
+        .merge(
+            server_api::server_api_axum::auth_whoami(service.clone())
+                .layer(middleware::from_fn(attach_server_origin_context)),
+        )
         .merge(server_api::server_api_axum::auth_device_login_start(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::auth_device_login_poll(service))
         .merge(origin_context)
         .merge(actor_context)
+        .layer(middleware::from_fn_with_state(
+            auth,
+            append_session_marker_cookie,
+        ))
         .layer(middleware::map_response(
             |mut response: Response| async move {
                 // Current role/policy and authentication responses must not be cached
@@ -7084,6 +7092,62 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
                 response
             },
         ))
+}
+
+// The typed auth operations expose one Set-Cookie. At the HTTP boundary, pair only a real
+// session Set-Cookie with a non-authenticating expiry marker, including login and logout.
+// Mirroring its attributes keeps Secure/Path/Domain/SameSite aligned without a second policy.
+async fn append_session_marker_cookie(
+    State(auth): State<AuthPublicConfig>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let marker = response
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .find_map(|value| {
+            let value = value.to_str().ok()?;
+            let (pair, attributes) = value.split_once(';')?;
+            let (name, token) = pair.split_once('=')?;
+            if name != auth.cookie_name {
+                return None;
+            }
+            let max_age = attributes
+                .split(';')
+                .find_map(|attr| attr.trim().strip_prefix("Max-Age=")?.parse::<i64>().ok())?;
+            let (hash, marker_age) = if max_age <= 0 {
+                (String::new(), 0)
+            } else {
+                (
+                    token_hash(token),
+                    max_age + crate::auth::SESSION_EXPIRY_GRACE_SECONDS,
+                )
+            };
+            let attributes = attributes
+                .split(';')
+                .map(|attr| {
+                    if attr.trim().starts_with("Max-Age=") {
+                        format!(" Max-Age={marker_age}")
+                    } else {
+                        attr.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            HeaderValue::from_str(&format!(
+                "{}={hash};{attributes}",
+                crate::auth::session_marker_cookie_name(name)
+            ))
+            .ok()
+        });
+    if let Some(marker) = marker {
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, marker);
+    }
+    response
 }
 
 fn generated_workspace_catalog_contract_router(service: ServerApiContractService) -> Router {
@@ -8311,9 +8375,15 @@ impl server_api::ServerApi for ServerApiContractService {
         &self,
         context: server_api::ServerRequestContext,
     ) -> std::result::Result<WhoamiResponse, server_api::RepositoryApiError> {
-        Ok(WhoamiResponse {
-            actor: context.actor,
-        })
+        let headers = contract_request_headers(&context)?;
+        let api = self.auth_api();
+        crate::auth::resolve_whoami(
+            api.store.clone(),
+            &headers,
+            &auth_public_config(&api.config).cookie_name,
+        )
+        .await
+        .map_err(|error| ApiError::from(error).into_repository_api_error())
     }
 
     async fn auth_logout(
@@ -30485,14 +30555,14 @@ fn issue_browser_session(
         token_hash: token_hash(&session_token),
         user_id: user.user_id.clone(),
         created_at: crate::auth::now_rfc3339(),
-        expires_at: rfc3339_after(Duration::days(14)),
+        expires_at: rfc3339_after(Duration::seconds(crate::auth::BROWSER_SESSION_SECONDS)),
         revoked_at: None,
     })?;
     let auth = auth_public_config(&api.config);
     let cookie = session_set_cookie(
         session_cookie_policy(&auth),
         &session_token,
-        14 * 24 * 60 * 60,
+        crate::auth::BROWSER_SESSION_SECONDS,
     );
     Ok((
         AuthUserResponse {
@@ -30687,6 +30757,16 @@ fn logout_browser_session(
         let _ = api
             .store
             .revoke_browser_session(&token_hash(&session_token), &crate::auth::now_rfc3339())?;
+    }
+    // A missing auth cookie after Max-Age must not prevent explicit logout from revoking
+    // the recovery reference. This hash is never accepted as an authentication credential.
+    if let Some(hash) = parse_cookie(
+        &headers,
+        &crate::auth::session_marker_cookie_name(&auth.cookie_name),
+    ) {
+        let _ = api
+            .store
+            .revoke_browser_session(&hash, &crate::auth::now_rfc3339())?;
     }
     Ok((
         LogoutResponse {
@@ -53776,6 +53856,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(registration_response.status(), StatusCode::OK);
+        assert_auth_response_has_expiry_marker(registration_response.headers(), &cookie_name);
         let registration_cookie = registration_response
             .headers()
             .get(axum::http::header::SET_COOKIE)
@@ -53813,6 +53894,12 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        assert_eq!(registered_whoami["session"]["kind"], "authenticated");
+        assert!(
+            registered_whoami["session"]["expires_at"]
+                .as_str()
+                .is_some()
+        );
         assert_eq!(
             registered_whoami["actor"]["handle"],
             "generated-passkey-user"
@@ -53867,6 +53954,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(login_response.status(), StatusCode::OK);
+        assert_auth_response_has_expiry_marker(login_response.headers(), &cookie_name);
         let login_cookie = login_response
             .headers()
             .get(axum::http::header::SET_COOKIE)
@@ -53949,6 +54037,169 @@ mod tests {
         )
         .unwrap();
         assert!(logged_out_whoami["actor"].is_null());
+    }
+
+    // Real generated auth routes, DB executor and SQLite; no auth resolution is mocked.
+    #[tokio::test]
+    async fn whoami_expiry_marker_survives_auth_cookie_loss_but_logout_revokes_it() {
+        let workspace = tempfile::tempdir().unwrap();
+        let api = test_api(workspace.path()).await;
+        seed_test_api_token(api.store.as_ref(), "expiry-router");
+        let user = api.store.get_user("user-expiry-router").unwrap().unwrap();
+        let auth = auth_public_config(&api.config);
+        let cookie_name = auth.cookie_name;
+        let hash = token_hash("expired-router-secret");
+        api.store
+            .create_browser_session(&BrowserSessionRecord {
+                session_id: "expired-router-session".into(),
+                token_hash: hash.clone(),
+                user_id: user.user_id,
+                created_at: crate::auth::now_rfc3339(),
+                expires_at: rfc3339_after(Duration::minutes(-1)),
+                revoked_at: None,
+            })
+            .unwrap();
+        let marker = format!(
+            "{}={hash}",
+            crate::auth::session_marker_cookie_name(&cookie_name)
+        );
+        let app = generated_auth_contract_router(ServerApiContractService::Workspace(api.clone()));
+        for (cookie, kind) in [
+            (String::new(), "anonymous"),
+            (format!("{cookie_name}=expired-router-secret"), "expired"),
+            (marker.clone(), "expired"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/auth/whoami")
+                        .header(axum::http::header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(axum::http::header::SET_COOKIE)
+            );
+            let value: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(value["actor"], Value::Null);
+            assert_eq!(value["session"]["kind"], kind);
+        }
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/passkeys/addition/options")
+                    .header(axum::http::header::COOKIE, &marker)
+                    .header(ORIGIN, &auth.origin)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Preserve the operation's existing auth_required/403 contract; no HTML redirect.
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(!denied.headers().contains_key(axum::http::header::LOCATION));
+        let logout = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/logout")
+                    .header(axum::http::header::COOKIE, &marker)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::OK);
+        let cleared: Vec<_> = logout
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cleared.len(), 2);
+        assert!(
+            cleared
+                .iter()
+                .all(|value| value.contains("Max-Age=0") && value.contains("HttpOnly"))
+        );
+        assert!(cleared.iter().any(|value| value.starts_with(&format!(
+            "{}=;",
+            crate::auth::session_marker_cookie_name(&cookie_name)
+        ))));
+        assert!(api.store.resolve_browser_session(&hash).unwrap().is_none());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/whoami")
+                    .header(axum::http::header::COOKIE, marker)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(value["session"]["kind"], "anonymous");
+    }
+
+    fn assert_auth_response_has_expiry_marker(headers: &HeaderMap, cookie_name: &str) {
+        let cookies: Vec<_> = headers
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        let auth = cookies
+            .iter()
+            .find(|value| value.starts_with(&format!("{cookie_name}=")))
+            .unwrap();
+        let (_, token) = auth.split(';').next().unwrap().split_once('=').unwrap();
+        let marker = cookies
+            .iter()
+            .find(|value| {
+                value.starts_with(&format!(
+                    "{}=",
+                    crate::auth::session_marker_cookie_name(cookie_name)
+                ))
+            })
+            .unwrap();
+        let expected = token_hash(token);
+        assert_eq!(
+            parse_cookie(
+                &{
+                    let mut headers = HeaderMap::new();
+                    headers.insert(axum::http::header::COOKIE, marker.parse().unwrap());
+                    headers
+                },
+                &crate::auth::session_marker_cookie_name(cookie_name)
+            ),
+            Some(expected)
+        );
+        assert!(auth.contains(&format!("Max-Age={}", crate::auth::BROWSER_SESSION_SECONDS)));
+        assert!(marker.contains(&format!(
+            "Max-Age={}",
+            crate::auth::BROWSER_SESSION_SECONDS + crate::auth::SESSION_EXPIRY_GRACE_SECONDS
+        )));
+        for attribute in ["Path=/", "HttpOnly", "SameSite=Lax", "Secure"] {
+            assert_eq!(
+                auth.contains(attribute),
+                marker.contains(attribute),
+                "{attribute}"
+            );
+        }
     }
 
     #[tokio::test]

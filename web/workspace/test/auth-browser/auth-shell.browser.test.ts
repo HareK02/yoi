@@ -3,6 +3,7 @@
 import { assert, assertEquals } from "@std/assert";
 import { resolve } from "@std/path";
 import { type Browser, chromium, type Page } from "playwright";
+import { sessionNavigation } from "./session-navigation.ts";
 import {
   startOwnedProcesses,
   stopOwnedProcesses,
@@ -14,7 +15,7 @@ type Mutation = { path: string; keys: string[] };
 type Harness = {
   page: Page;
   mutations: Mutation[];
-  go: (path: string, mode?: string) => Promise<void>;
+  go: (path: string, mode?: string, unavailableRoot?: boolean) => Promise<void>;
 };
 const login = async (page: Page) => {
   await page.getByRole("button", { name: "Log in with passkey", exact: true })
@@ -67,6 +68,19 @@ async function isolated(
     const page = await context.newPage();
     const mutations: Mutation[] = [];
     const errors: string[] = [];
+    const rejectedLoads: unknown[] = [];
+    let expectsUnavailableRoot = false;
+    await page.exposeFunction(
+      "__authFixtureRejectedLoad",
+      (reason: unknown) => rejectedLoads.push(reason),
+    );
+    await page.addInitScript(() => {
+      window.addEventListener("unhandledrejection", (event) => {
+        void (window as unknown as {
+          __authFixtureRejectedLoad: (reason: unknown) => Promise<void>;
+        }).__authFixtureRejectedLoad(event.reason);
+      });
+    });
     page.on("pageerror", (error) => errors.push(error.message));
     page.on("request", (request) => {
       const path = new URL(request.url()).pathname;
@@ -81,14 +95,38 @@ async function isolated(
     await body({
       page,
       mutations,
-      go: async (path, mode = "anonymous") => {
-        const url = new URL(path, origin);
-        url.searchParams.set("fixture", mode);
-        await page.goto(url.href);
+      go: async (path, mode = "anonymous", unavailableRoot = false) => {
+        // fixture選択を実際の戻り先queryへ混入させない。同じcontextのcookieをHTTPで設定する。
+        expectsUnavailableRoot ||= unavailableRoot ||
+          (path.startsWith("/account") &&
+            [
+              "session-error",
+              "session-malformed",
+              "session-retry",
+              "network-error",
+            ].includes(mode));
+        const setup = new URL("/", origin);
+        setup.searchParams.set("fixture", mode);
+        await page.request.get(setup.href);
+        await page.goto(new URL(path, origin).href);
       },
     });
     await noOverflow(page);
-    assertEquals(errors, []);
+    // root load自身の503ではKitのstatic fallback再実行も同じHttpErrorをrejectする。
+    // minifyされたclass名で除外せず、意図した障害fixtureのstatus/bodyと件数だけを許す。
+    if (expectsUnavailableRoot && rejectedLoads.length > 0) {
+      for (const reason of rejectedLoads) {
+        assertEquals(reason, {
+          status: 503,
+          body: {
+            status: 503,
+            message:
+              "Your session could not be loaded. Login status is unknown. Retry this page.",
+          },
+        });
+      }
+      assertEquals(errors.length, rejectedLoads.length);
+    } else assertEquals(errors, []);
   } finally {
     await context.close();
   }
@@ -113,12 +151,13 @@ Deno.test("standalone auth separates login, registration, own account and explic
       readyUrl: `${origin}/health`,
     }],
     `${root}/tools/web-ux/scenarios/anonymous-entry.json`,
-    `${root}/target/web-ux/auth-interactions/processes`,
+    `${root}/target/web-ux/t767-validation/auth-interactions/processes`,
     [],
   );
   let browser: Browser | undefined;
   try {
     browser = await chromium.launch();
+    await sessionNavigation(t, browser, isolated, origin);
     for (const theme of ["light", "dark"] as const) {
       for (const width of [1440, 768, 390]) {
         const step = (
@@ -130,11 +169,11 @@ Deno.test("standalone auth separates login, registration, own account and explic
             () => isolated(browser!, body, theme, width),
           );
         await step(
-          "anonymous account replaces history with login then returns to own account",
+          "expired account replaces history with login then returns to own account",
           async ({ page, go, mutations }) => {
             await page.goto(`${origin}/health`);
             const historyBefore = await page.evaluate(() => history.length);
-            await go("/account");
+            await go("/account", "session-expired");
             await at(page, "/login?returnTo=%2Faccount");
             assertEquals(
               await page.evaluate(() => history.length),
@@ -208,16 +247,12 @@ Deno.test("standalone auth separates login, registration, own account and explic
             );
             await page.getByRole("button", { name: "Log out", exact: true })
               .click();
-            await page.getByRole("button", {
-              name: "Log in with passkey",
-              exact: true,
-            }).waitFor();
-            assertEquals(new URL(page.url()).pathname, "/login");
+            await page.getByRole("heading", { name: "Yoi", exact: true })
+              .waitFor();
+            assertEquals(new URL(page.url()).pathname, "/");
             await page.reload();
-            await page.getByRole("button", {
-              name: "Log in with passkey",
-              exact: true,
-            }).waitFor();
+            await page.getByRole("heading", { name: "Yoi", exact: true })
+              .waitFor();
             assertEquals(count(mutations, "/api/auth/logout"), 1);
           },
         );
@@ -410,10 +445,15 @@ Deno.test("standalone auth separates login, registration, own account and explic
         () =>
           isolated(browser!, async ({ page, go, mutations }) => {
             await go(path, "session-error");
-            await page.getByRole("button", {
-              name: "Retry session",
-              exact: true,
-            }).waitFor();
+            if (path === "/account") {
+              // 初回protected loadの確認不能はroot loaderの503。画面内再確認とは分ける。
+              await page.getByText(/Login status is unknown/i).waitFor();
+            } else {
+              await page.getByRole("button", {
+                name: "Retry session",
+                exact: true,
+              }).waitFor();
+            }
             assertEquals(
               await page.getByRole("link", {
                 name: "Log in to continue",
@@ -627,6 +667,9 @@ Deno.test("standalone auth separates login, registration, own account and explic
           "/register?returnTo=%2Flogin",
           "/activate",
           "/login/../login",
+          "/%2f%2fexample.invalid",
+          "/account?filter=%252F%252Fexample.invalid",
+          "/account#%5Cexample.invalid",
         ]
       ) {
         await t.step(
@@ -713,7 +756,11 @@ Deno.test("standalone auth separates login, registration, own account and explic
               count(mutations, `/api/auth/passkeys/${purpose}/complete`),
               0,
             );
-            await page.getByRole("button", { name: label, exact: true })
+            await page.getByRole("button", {
+              name: label,
+              exact: true,
+              includeHidden: true,
+            })
               .evaluate((button) => {
                 button.dispatchEvent(
                   new MouseEvent("click", { bubbles: true }),

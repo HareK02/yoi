@@ -1,5 +1,6 @@
 // 本番build/client/shellだけを検証する合成HTTP/WebAuthn境界。
-// 実認証・署名・cookie安全性・policyの永続化は検証しない。本文/credentialは記録しない。
+// 実認証・署名・製品cookie設計・policyの永続化は検証しない。本文/credentialは記録しない。
+// cookie-sessionは実HTTPのMax-AgeをChromiumが失効させる境界だけを検証する。Backendの判定は合成。
 import { extname, join, resolve } from "@std/path";
 import { setupWebAuthnProjection } from "../hosting-browser/setup-projection.ts";
 
@@ -22,6 +23,9 @@ type State = {
   signedIn: boolean;
   whoamiCalls: number;
   selfRegistrationEnabled: boolean;
+  expired: boolean;
+  expiresAt: string | null;
+  cookieSession: boolean;
 };
 const sessions = new Map<string, State>();
 const mime: Record<string, string> = {
@@ -62,7 +66,10 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
   const selected = url.searchParams.get("fixture");
   let id = request.headers.get("cookie")?.match(/auth-fixture=([\w-]+)/)?.[1];
   // routeごとに独立。クライアントgoto後も同じ合成sessionをwhoamiへ投影する。
-  if (selected || !id || !sessions.has(id)) {
+  if (
+    (selected && sessions.get(id ?? "")?.mode !== selected) || !id ||
+    !sessions.has(id)
+  ) {
     id = crypto.randomUUID();
     sessions.set(id, {
       mode: selected ?? "anonymous",
@@ -72,13 +79,54 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
         selected?.startsWith("addition-") === true,
       whoamiCalls: 0,
       selfRegistrationEnabled: selected !== "policy-disabled",
+      expired: selected?.startsWith("session-expired") === true,
+      expiresAt: null,
+      cookieSession: false,
     });
   }
   const state = sessions.get(id)!;
   const { mode } = state;
+  const sessionCookiePresent = request.headers.get("cookie")?.split(/;\s*/)
+    .includes("auth-fixture-session=active") === true;
+  if (state.cookieSession && !sessionCookiePresent) {
+    state.signedIn = false;
+    state.expired = true;
+  }
+  // 制御は同一browser contextの合成fixtureに限定。認証・cookieをJSで偽造しない。
+  if (path === "/__ui_fixture/session") {
+    if (request.method === "POST") {
+      const { operation } = await request.json();
+      if (operation === "arm-cookie") {
+        state.signedIn = true;
+        state.expired = false;
+        state.cookieSession = true;
+        state.expiresAt = new Date(Date.now() + 3000).toISOString();
+        return Response.json({ expires_at: state.expiresAt }, {
+          headers: {
+            "set-cookie":
+              "auth-fixture-session=active; Max-Age=3; Path=/; HttpOnly; SameSite=Strict",
+          },
+        });
+      }
+      if (operation === "expire" || operation === "anonymous") {
+        state.signedIn = false;
+        state.expired = operation === "expire";
+        state.cookieSession = false;
+        state.expiresAt = null;
+      } else return new Response(null, { status: 400 });
+    }
+    return Response.json({
+      session_cookie_present: sessionCookiePresent,
+      whoami_calls: state.whoamiCalls,
+      expired: state.expired,
+    });
+  }
   if (path === "/__ui_fixture/webauthn.js") {
     let extra = "";
-    if (mode.endsWith("-cancel")) {
+    if (mode.endsWith("-cancel-once")) {
+      extra =
+        `for (const method of ['get','create']) { const original=navigator.credentials[method].bind(navigator.credentials); let first=true; Object.defineProperty(navigator.credentials,method,{configurable:true,value:async(...args)=>{if(first){first=false;throw new DOMException('Passkey cancelled','NotAllowedError')}return original(...args)}}); }`;
+    } else if (mode.endsWith("-cancel")) {
       extra =
         `for (const method of ['get','create']) Object.defineProperty(navigator.credentials,method,{configurable:true,value:async()=>{throw new DOMException('Passkey cancelled','NotAllowedError')}});`;
     } else if (mode.endsWith("-unsupported")) {
@@ -116,6 +164,13 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
       actor: state.signedIn
         ? { ...user, auth_method: "browser_session" }
         : null,
+      session: state.signedIn
+        ? {
+          kind: "authenticated",
+          expires_at: state.expiresAt ??
+            new Date(Date.now() + 86_400_000).toISOString(),
+        }
+        : { kind: state.expired ? "expired" : "anonymous" },
     });
   }
   if (path === "/api/auth/registration-policy") {
@@ -160,7 +215,15 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
   }
   if (path === "/api/auth/logout") {
     state.signedIn = false;
-    return Response.json({ status: "logged_out" });
+    state.expired = false;
+    state.cookieSession = false;
+    state.expiresAt = null;
+    return Response.json({ status: "logged_out" }, {
+      headers: {
+        "set-cookie":
+          "auth-fixture-session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict",
+      },
+    });
   }
   if (path === "/api/auth/device-login/approve") {
     if (!state.signedIn) return new Response(null, { status: 401 });
@@ -187,7 +250,7 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
       return new Response(null, { status: 503 });
     }
     if (mode === `${purpose}-expired` && stage === "complete") {
-      if (purpose === "addition") state.signedIn = false;
+      // challengeの401だけではbrowser sessionの失効を主張しない。
       return new Response(null, { status: 401 });
     }
     if (stage === "options") {
@@ -197,6 +260,9 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
       );
     }
     state.signedIn = true;
+    state.expired = false;
+    state.cookieSession = false;
+    state.expiresAt = null;
     return Response.json({ user });
   }
   if (path === "/api/auth/activation/options") {
@@ -204,6 +270,9 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
   }
   if (path === "/api/auth/activation/complete") {
     state.signedIn = true;
+    state.expired = false;
+    state.cookieSession = false;
+    state.expiresAt = null;
     return Response.json({ user });
   }
   // Workspace画面の既存fixtureを再利用する。認証/登録/作成APIの代わりにはしない。

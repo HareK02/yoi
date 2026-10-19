@@ -11,8 +11,21 @@ import { dashboardFixture } from "../../src/lib/workspace/home/dashboard.test-fi
 
 Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const url = new URL(request.url);
-  if (url.pathname === "/api/auth/whoami") return Response.json({ actor: { user_id: "fixture-user", account_id: "fixture-owner", handle: "alice", display_name: "Alice", auth_method: "browser_session" } });
-  if (url.pathname === "/api/hosting/access") return Response.json({ is_admin: false });
+  if (url.pathname === "/api/auth/whoami") {
+    return Response.json({
+      session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+      actor: {
+        user_id: "fixture-user",
+        account_id: "fixture-owner",
+        handle: "alice",
+        display_name: "Alice",
+        auth_method: "browser_session",
+      },
+    });
+  }
+  if (url.pathname === "/api/hosting/access") {
+    return Response.json({ is_admin: false });
+  }
   if (url.pathname === "/api/workspaces" && request.method === "POST") {
     return Response.json({
       message:

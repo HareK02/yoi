@@ -10,6 +10,10 @@ import type {
 
 const root = resolve(import.meta.dirname!, "../../../..");
 const phase = Deno.args[0] ?? "after";
+const coverage = Deno.args[1] ?? "all";
+if (coverage !== "all" && coverage !== "session") {
+  throw new Error("Expected capture coverage: all or session");
+}
 if (!/^[a-zA-Z0-9_-]+$/.test(phase)) {
   throw new Error("Expected safe capture label");
 }
@@ -86,7 +90,39 @@ const routes: RouteScenario[] = [
   route(
     "account-redirect",
     "/account?fixture=anonymous",
-    'button:text-is("Log in with passkey")',
+    'h1:text-is("Yoi")',
+  ),
+  route(
+    "expired-account",
+    "/account?fixture=session-expired&tab=keys#passkeys",
+    '[role="status"]:has-text("Your browser session expired")',
+  ),
+  route(
+    "expired-login",
+    "/login?fixture=session-expired-cancel-once&returnTo=%2Faccount%3Ftab%3Dkeys%23passkeys",
+    '[role="status"]:has-text("Your browser session expired")',
+    [
+      {
+        id: "initial",
+        label: "Explicit expiry and login continuation, not anonymous entry",
+        fullPage: true,
+      },
+      {
+        id: "cancelled",
+        label: "Cancelled passkey keeps expiry context and retry destination",
+        fullPage: true,
+        interaction: login,
+        ready: ready('[role="alert"]:has-text("cancelled")'),
+      },
+      {
+        id: "returned",
+        label:
+          "Retry confirms authentication before returning to the requested account",
+        fullPage: true,
+        interaction: login,
+        ready: ready('button:text-is("Add passkey to alice")'),
+      },
+    ],
   ),
   route("register", "/register?fixture=anonymous", `${id}:enabled`, [
     {
@@ -129,10 +165,10 @@ const routes: RouteScenario[] = [
       },
       {
         id: "logout",
-        label: "Log out returns to login",
+        label: "Log out forgets expiry and returns to public home",
         fullPage: true,
         interaction: [click('button:text-is("Log out")')],
-        ready: ready('button:text-is("Log in with passkey")'),
+        ready: ready('h1:text-is("Yoi")'),
       },
     ],
   ),
@@ -184,7 +220,7 @@ const routes: RouteScenario[] = [
   route(
     "account-session-error",
     "/account?fixture=session-error",
-    'button:text-is("Retry session")',
+    "text=/Login status is unknown/",
   ),
   route(
     "register-session-error",
@@ -297,6 +333,14 @@ const routes: RouteScenario[] = [
     ],
   ),
 ];
+const sessionCaptureIds = new Set([
+  "login",
+  "account-redirect",
+  "expired-account",
+  "expired-login",
+  "session-error",
+  "account-session-error",
+]);
 await Deno.mkdir(`${root}/target/web-ux`, { recursive: true });
 for (const colorScheme of ["light", "dark"] as const) {
   for (const width of [1440, 768, 390]) {
@@ -314,7 +358,9 @@ for (const colorScheme of ["light", "dark"] as const) {
         auth: { kind: "anonymous" },
       }],
       viewports: [{ width, height: 900, label: `${width}` }],
-      routes,
+      routes: coverage === "session"
+        ? routes.filter((route) => sessionCaptureIds.has(route.id))
+        : routes,
       redact: {
         // 初期撮影後にもfillする。空の入力まで恒久的に隠すと次の操作が不能になる。
         // 合成codeはsubmit直後に破棄され、pendingのdisabled入力だけを隠す。

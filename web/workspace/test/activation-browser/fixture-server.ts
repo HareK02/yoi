@@ -41,6 +41,9 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
   if (path === "/api/workspaces") return new Response(null, { status: 503 });
   if (path === "/api/auth/whoami") {
     return Response.json({
+      session: mode !== "anonymous"
+        ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
+        : { kind: "anonymous" },
       actor: mode === "anonymous"
         ? null
         : { ...user, auth_method: "browser_session" },

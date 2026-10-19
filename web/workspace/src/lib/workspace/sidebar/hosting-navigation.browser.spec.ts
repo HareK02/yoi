@@ -18,6 +18,9 @@ for (
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async (input) => {
       if (String(input) === "/api/auth/whoami") {
         return Response.json({
+          session: actor
+            ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
+            : { kind: "anonymous" },
           actor: actor ? { ...authUser, auth_method: "browser_session" } : null,
         });
       }

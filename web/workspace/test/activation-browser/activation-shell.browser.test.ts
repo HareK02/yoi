@@ -143,11 +143,13 @@ Deno.test("activation standalone shell supports issuance, reissue, denial, resta
               path.startsWith("POST ")
             ).length;
             await go("/hosting/accounts", mode);
-            await page.getByText(
-              mode === "anonymous"
-                ? "Sign in with a hosting administrator account to issue activation codes."
-                : "Hosting administrator access is required.",
-            ).waitFor();
+            if (mode === "anonymous") {
+              await page.waitForURL("http://127.0.0.1:15381/");
+              await page.getByRole("heading", { name: "Yoi", exact: true })
+                .waitFor();
+            } else {await page.getByText(
+                "Hosting administrator access is required.",
+              ).waitFor();}
             assertEquals(
               await page.getByLabel("Account ID (handle)").count(),
               0,
