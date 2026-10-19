@@ -172,6 +172,10 @@ async fn command_page(
 }
 
 impl BashTool {
+    pub fn input_schema() -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(BashParams)).expect("Bash schema serialization")
+    }
+
     pub fn new(router: Arc<WorkdirSessionRouter>, output: BashOutputView) -> Self {
         Self {
             router,
@@ -499,10 +503,9 @@ pub(crate) fn routed_bash_tool(
     output: BashOutputView,
 ) -> ToolDefinition {
     Arc::new(move || {
-        let schema = schemars::schema_for!(BashParams);
         let meta = ToolMeta::new("Bash")
             .description("Execute a shell command in one selected Workdir. Workdir owns launch, lossless bounded byte transport, timeout and cancel; Bash owns preview, quota-limited ephemeral output and read-only virtual references. This is not a sandbox.")
-            .input_schema(serde_json::to_value(schema).expect("Bash schema serialization"));
+            .input_schema(BashTool::input_schema());
         let tool: Arc<dyn Tool> = Arc::new(BashTool::new(router.clone(), output.clone()));
         (meta, tool)
     })

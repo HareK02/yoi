@@ -5,6 +5,7 @@
 //! an external plugin-loading surface.
 
 pub mod backend_job_result;
+pub(crate) mod bash;
 pub mod chat_invocation;
 pub mod drive;
 pub mod flow_transition;

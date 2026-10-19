@@ -1861,6 +1861,20 @@ where
             )
         })?;
     }
+    if wip_mode {
+        crate::feature::builtin::bash::mount(
+            &mut wip_mount_registry,
+            worker.workdir_sessions(),
+            bash_output.clone(),
+            wip_permissions.clone(),
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("mount Bash output WIP projection: {error}"),
+            )
+        })?;
+    }
     if wip_mode && let Some(feature) = &workdir_wip_feature {
         crate::feature::builtin::manage_workdir::wip::mount_workspace_workdir_wip(
             &mut wip_mount_registry,

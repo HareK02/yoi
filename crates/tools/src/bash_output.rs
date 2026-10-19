@@ -183,6 +183,9 @@ impl BashOutputView {
         // happens inside the runtime, so idle expiry must start here as well.
         self.start_reaper();
         let mut store = self.store.lock().unwrap();
+        if !self.is_active() {
+            return Err("Bash output authority revoked".into());
+        }
         store.expire(Instant::now());
         while store.records.len() >= STORE_COUNT || store.reserved + COMMAND_BYTES > STORE_BYTES {
             let Some(index) = store
@@ -220,6 +223,9 @@ impl BashOutputView {
             return None;
         }
         let mut store = self.store.lock().unwrap();
+        if !self.is_active() {
+            return None;
+        }
         store.expire(Instant::now());
         store
             .records
