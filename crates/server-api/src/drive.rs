@@ -134,6 +134,14 @@ pub enum DriveEntryKind {
     File,
 }
 
+/// Current caller's advisory publication ceiling, never a grant or execution credential.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct DriveCapabilities {
+    pub write: bool,
+}
+
 /// Metadata only: content is returned through bounded text or binary routes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -491,6 +499,7 @@ impl api_macros::HttpRequestError for DriveApiError {
 
 impl api_macros::openapi::OpenApiSchema for DriveApiError {}
 impl api_macros::openapi::OpenApiSchema for DriveEntry {}
+impl api_macros::openapi::OpenApiSchema for DriveCapabilities {}
 impl api_macros::openapi::OpenApiSchema for DriveEntryQuery {}
 impl api_macros::openapi::OpenApiSchema for DriveListQuery {}
 impl api_macros::openapi::OpenApiSchema for DriveSearchQuery {}
@@ -518,6 +527,7 @@ pub fn drive_api_typescript() -> String {
         DriveEntryRef::decl(&config),
         DriveEntryKind::decl(&config),
         DriveEntry::decl(&config),
+        DriveCapabilities::decl(&config),
         DriveEntryQuery::decl(&config),
         DriveListQuery::decl(&config),
         DriveSearchQuery::decl(&config),

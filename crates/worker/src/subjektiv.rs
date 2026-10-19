@@ -943,7 +943,6 @@ enabled = true
             WorkerFilesystemAuthority::None,
             WorkerBootstrapLayout::Direct {
                 runtime_base: temp.path().join("runtime"),
-                bash_output_dir: temp.path().join("bash-output"),
             },
             WorkerControllerTransport::InProcess,
         )
@@ -1137,7 +1136,6 @@ enabled = true
                 WorkerFilesystemAuthority::None,
                 WorkerBootstrapLayout::Direct {
                     runtime_base: temp.path().join("runtime"),
-                    bash_output_dir: temp.path().join("bash"),
                 },
                 WorkerControllerTransport::InProcess,
             )
@@ -1319,7 +1317,6 @@ enabled = true
             WorkerFilesystemAuthority::None,
             WorkerBootstrapLayout::Direct {
                 runtime_base: temp.path().join("runtime"),
-                bash_output_dir: temp.path().join("bash"),
             },
             WorkerControllerTransport::InProcess,
         )
@@ -1379,7 +1376,6 @@ enabled = true
             WorkerFilesystemAuthority::None,
             WorkerBootstrapLayout::Direct {
                 runtime_base: temp.path().join("runtime"),
-                bash_output_dir: temp.path().join("bash-output"),
             },
             WorkerControllerTransport::InProcess,
         )

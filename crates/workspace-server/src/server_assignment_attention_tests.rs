@@ -466,7 +466,6 @@ impl AttentionWorkerFactory {
             worker.with_notification_coalesce_delay(std::time::Duration::from_millis(10)),
             worker::WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: root.join(uuid::Uuid::now_v7().to_string()),
-                bash_output_dir: root.join("bash-output"),
             },
             worker::WorkerControllerTransport::InProcess,
         )

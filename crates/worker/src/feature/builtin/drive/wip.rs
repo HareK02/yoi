@@ -40,7 +40,11 @@ pub fn mount_drive_wip(
     registry.allocate_namespace("drive", "drive")?;
     // Registration is only a namespace entrance. The subtree provides the
     // current target/scope/descriptor/handler in a single self-scoped snapshot.
-    let names = root_specs();
+    // This unresolved entrance has no live capability evidence.
+    let names: Vec<_> = root_specs()
+        .into_iter()
+        .filter(|spec| !mutation(spec))
+        .collect();
     let descriptor = descriptor(&names, true);
     registry.mount(WipProjection {
         route: ROOT.into(),
@@ -63,7 +67,7 @@ pub fn mount_drive_wip(
     })?;
     registry.mount_subtree(WipSubtreeMount {
         root: ROOT.into(),
-        provider: Arc::new(DriveProvider(feature.clone())),
+        provider: Arc::new(DriveProvider::new(feature.clone())),
     })?;
     registry.replace_compatibility_tools(ROOT, SPECS.iter().map(|spec| spec.name))?;
     Ok(())
@@ -80,7 +84,19 @@ impl WipOperationHandler for Unresolved {
         Err(map_error(DriveError::Denied))
     }
 }
-pub(super) struct DriveProvider(pub(super) DriveFeature);
+#[derive(Clone)]
+pub(super) struct DriveProvider {
+    feature: DriveFeature,
+    observation_nonce: Arc<str>,
+}
+impl DriveProvider {
+    pub(super) fn new(feature: DriveFeature) -> Self {
+        Self {
+            feature,
+            observation_nonce: uuid::Uuid::now_v7().to_string().into(),
+        }
+    }
+}
 #[async_trait]
 impl WipSubtreeProvider for DriveProvider {
     // Arbitrary tree depth is safe: there are deliberately no indexable entries.
@@ -92,27 +108,50 @@ impl WipSubtreeProvider for DriveProvider {
     }
     async fn publication(&self, path: &str) -> Result<Option<WipPublication>, ProtocolError> {
         let result = if path == ROOT {
-            self.0.backend.root().await
+            self.feature.backend.root().await
         } else {
-            let Some(entry) = parse_entry(&self.0, path).map_err(protocol)? else {
+            let Some(entry) = parse_entry(&self.feature, path).map_err(protocol)? else {
                 return Ok(None);
             };
-            self.0.backend.metadata(&entry).await
+            self.feature.backend.metadata(&entry).await
         };
         let entry = match result {
             Ok(entry) => entry,
             Err(DriveError::Denied | DriveError::NotFound) => return Ok(None),
             Err(error) => return Err(protocol(error)),
         };
+        let capabilities = match self.feature.backend.capabilities().await {
+            Ok(capabilities) => capabilities,
+            Err(DriveError::Denied | DriveError::NotFound) => return Ok(None),
+            Err(error) => return Err(protocol(error)),
+        };
         let root = path == ROOT;
-        let specs = if root {
+        let specs: Vec<_> = if root {
             root_specs()
         } else {
             entry_specs(&entry)
-        };
+        }
+        .into_iter()
+        .filter(|spec| {
+            !mutation(spec) || (capabilities.write && publication_may_allow(&self.feature, spec))
+        })
+        .collect();
+        let common_mutations: Vec<_> = specs
+            .iter()
+            .filter_map(|spec| match spec.operation {
+                "edit" => Some(crate::file_operation::Contract::Edit),
+                "write" => Some(crate::file_operation::Contract::Write),
+                _ => None,
+            })
+            .collect();
         let descriptor = descriptor(&specs, root);
         let reference = contextual_reference(INTERFACE, path);
-        let validator = entry.last_mutation_id.as_bytes().to_vec();
+        let validator = object_validator(
+            &self.observation_nonce,
+            &entry,
+            &entry.last_mutation_id,
+            &specs,
+        );
         let object = Object {
             name: if root {
                 "drive".into()
@@ -130,7 +169,8 @@ impl WipSubtreeProvider for DriveProvider {
             )),
             validator: Some(validator),
         };
-        let projection = WipProjection {
+        let common_read = entry.kind == DriveEntryKind::File;
+        let mut projection = WipProjection {
             route: path.into(),
             capability: "drive:content".into(),
             kind: WipProjectionKind::Native,
@@ -139,18 +179,80 @@ impl WipSubtreeProvider for DriveProvider {
             interface_validator: Some(digest(format!("{descriptor:?}").as_bytes()).into_bytes()),
             descriptor,
             handler: Arc::new(DriveHandler {
-                feature: self.0.clone(),
+                feature: self.feature.clone(),
+                observation_nonce: self.observation_nonce.clone(),
                 entry,
                 specs,
                 root,
             }),
         };
+        // This is publication evidence only. Backend execution rechecks current
+        // authority and the captured commit precondition on every mutation.
+        crate::file_operation::expose(&mut projection, common_mutations);
+        if common_read {
+            crate::file_operation::expose(
+                &mut projection,
+                [
+                    crate::file_operation::Contract::ReadLines,
+                    crate::file_operation::Contract::SearchText,
+                ],
+            );
+        }
         WipPublication::self_scoped(projection).map(Some)
     }
     async fn children(&self, _: &str) -> Result<Vec<String>, ProtocolError> {
         Ok(Vec::new())
     }
 }
+fn object_validator(
+    observation_nonce: &str,
+    entry: &DriveEntry,
+    mutation: &str,
+    specs: &[Spec],
+) -> Vec<u8> {
+    // Object observations belong to one mount, even when a restored Host reuses
+    // the same Feature instance. Feature.nonce separately identifies mutations.
+    // Current membership is part of Object representation, not the shared Interface lifetime.
+    let operations: Vec<_> = specs.iter().map(|spec| spec.operation).collect();
+    digest(
+        format!(
+            "{observation_nonce:?}:{:?}:{:?}:{mutation:?}:{operations:?}",
+            entry.entry.workspace_id, entry.entry.node_id
+        )
+        .as_bytes(),
+    )
+    .into_bytes()
+}
+
+fn mutation(spec: &Spec) -> bool {
+    matches!(
+        spec.operation,
+        "write" | "edit" | "delete" | "relocate" | "create_folder" | "create_text" | "save_workdir"
+    )
+}
+
+fn publication_may_allow(feature: &DriveFeature, spec: &Spec) -> bool {
+    let Some(permissions) = &feature.permissions else {
+        return true;
+    };
+    // Like checkout publication, retain potentially allowed argument-dependent
+    // operations but hide an unconditional Deny/Ask ceiling. This is not an
+    // authorization decision: exact arguments are still checked at execution.
+    for rule in permissions
+        .rules
+        .iter()
+        .filter(|rule| rule.tool.eq_ignore_ascii_case(spec.name))
+    {
+        if rule.action == manifest::ToolPermissionAction::Allow {
+            return true;
+        }
+        if rule.pattern == "*" {
+            return false;
+        }
+    }
+    permissions.default_action == manifest::ToolPermissionAction::Allow
+}
+
 fn root_specs() -> Vec<Spec> {
     SPECS
         .iter()
@@ -194,11 +296,10 @@ fn parameter(name: &str, required: bool, r#type: TypeExpr) -> ParameterDeclarati
     }
 }
 fn descriptor(specs: &[Spec], _root: bool) -> InterfaceDescriptor {
-    InterfaceDescriptor {format:INTERFACE_FORMAT_V1.into(),documentation:Some(Documentation {summary:"Backend-authorized Workspace Drive operations".into(),details:Some("Entry IDs are Workspace-bound. The Host/Client retain the last committed request observed for an entry. Never supply validators or silently retry a conflict against a newer observation. On outcome-unknown, query the original request receipt. Read-only grants reject mutations at Backend. List/search return paths for direct Inspect, never tree inventories. Image bytes attach to durable ToolOutput; URLs are not image viewing. Workdir source read and Drive destination write are independent.".into())}),types:Vec::new(),operations:specs.iter().map(|spec|OperationDeclaration {name:spec.operation.into(),documentation:Some(Documentation {summary:spec.description.into(),details:None}),parameters:match spec.operation {
+    InterfaceDescriptor {format:INTERFACE_FORMAT_V1.into(),documentation:Some(Documentation {summary:"Backend-authorized Workspace Drive operations".into(),details:Some("Entry IDs are Workspace-bound. The Host/Client retain the last committed request observed for an entry. Never supply validators or silently retry a conflict against a newer observation. On outcome-unknown, query the original request receipt. Read-only grants reject mutations at Backend. List/search return paths for direct Inspect, never tree inventories. Image bytes attach to durable ToolOutput; URLs are not image viewing. Workdir source read and Drive destination write are independent.".into())}),types:Vec::new(),operations:specs.iter().filter(|spec| !matches!(spec.operation,"edit"|"write")).map(|spec|OperationDeclaration {name:spec.operation.into(),documentation:Some(Documentation {summary:spec.description.into(),details:None}),parameters:match spec.operation {
         "list"=>vec![parameter("limit",false,TypeExpr::Integer),parameter("after",false,TypeExpr::String)],
         "search"=>vec![parameter("query",true,TypeExpr::String),parameter("include_text",false,TypeExpr::Boolean),parameter("limit",false,TypeExpr::Integer),parameter("after",false,TypeExpr::String)],
         "read"=>vec![parameter("max_bytes",false,TypeExpr::Integer)],
-        "write"|"edit"=>crate::file_operation::parameters(spec.operation,false).expect("shared text arguments"),
         "create_text"=>vec![parameter("name",true,TypeExpr::String),parameter("content",true,TypeExpr::String),parameter("content_type",false,TypeExpr::String)],
         "create_folder"=>vec![parameter("name",true,TypeExpr::String)],
         "relocate"=>vec![parameter("parent",true,TypeExpr::Entry),parameter("name",true,TypeExpr::String)],
@@ -209,6 +310,7 @@ fn descriptor(specs: &[Spec], _root: bool) -> InterfaceDescriptor {
 }
 struct DriveHandler {
     feature: DriveFeature,
+    observation_nonce: Arc<str>,
     entry: DriveEntry,
     specs: Vec<Spec>,
     root: bool,
@@ -221,21 +323,34 @@ impl WipOperationHandler for DriveHandler {
         arguments: &BTreeMap<String, Value>,
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
+        let common_text = matches!(operation, "read_lines" | "search_text");
+        let backend_operation = if common_text { "read" } else { operation };
         let spec = self
             .specs
             .iter()
-            .find(|spec| spec.operation == operation)
+            .find(|spec| spec.operation == backend_operation)
             .ok_or_else(|| {
                 failure(
                     ProtocolErrorCode::OperationNotFound,
                     "Drive operation is not published",
                 )
             })?;
-        let declaration = descriptor(&self.specs, self.root)
-            .operations
-            .into_iter()
-            .find(|op| op.name == operation)
-            .unwrap();
+        let contract = match operation {
+            "read_lines" => Some(crate::file_operation::Contract::ReadLines),
+            "search_text" => Some(crate::file_operation::Contract::SearchText),
+            "edit" => Some(crate::file_operation::Contract::Edit),
+            "write" => Some(crate::file_operation::Contract::Write),
+            _ => None,
+        };
+        let declaration = if let Some(contract) = contract {
+            contract.descriptor().operations.into_iter().next().unwrap()
+        } else {
+            descriptor(&self.specs, self.root)
+                .operations
+                .into_iter()
+                .find(|op| op.name == operation)
+                .unwrap()
+        };
         if arguments
             .keys()
             .any(|key| !declaration.parameters.iter().any(|p| p.name == *key))
@@ -244,8 +359,22 @@ impl WipOperationHandler for DriveHandler {
                 "unrecognized arguments; committed-request observations are Client-managed".into(),
             )));
         }
-        let mut input = wip_to_json(&Value::Record(arguments.clone()))
-            .map_err(|_| map_error(DriveError::Invalid("invalid WIP arguments".into())))?;
+        let mut input = if common_text {
+            // Validate the common input before performing any source read. Its
+            // line window is evaluated only after the complete bounded read.
+            crate::file_operation::text_result(operation, arguments, "")?;
+            if self
+                .entry
+                .size
+                .is_some_and(|size| size > server_api::DRIVE_CHUNK_MAX_BYTES)
+            {
+                return Err(map_error(DriveError::Limit));
+            }
+            json!({"entry": self.entry.entry, "max_bytes": server_api::DRIVE_CHUNK_MAX_BYTES})
+        } else {
+            wip_to_json(&Value::Record(arguments.clone()))
+                .map_err(|_| map_error(DriveError::Invalid("invalid WIP arguments".into())))?
+        };
         let fields = input
             .as_object_mut()
             .ok_or_else(|| map_error(DriveError::Invalid("named arguments required".into())))?;
@@ -298,6 +427,19 @@ impl WipOperationHandler for DriveHandler {
             )
             .await
             .map_err(map_error)?;
+        if common_text {
+            let content = complete_text(&output.value)?;
+            let value = crate::file_operation::text_result(operation, arguments, content)?;
+            return Ok(WipOperationOutput::native_with_validator(
+                value,
+                object_validator(
+                    &self.observation_nonce,
+                    &self.entry,
+                    &self.entry.last_mutation_id,
+                    &self.specs,
+                ),
+            ));
+        }
         let value = json_to_wip(&output.value).map_err(|_| {
             WipOperationError::OutcomeUnknown(
                 "Completed Drive result unavailable; query request_status before another mutation"
@@ -314,13 +456,39 @@ impl WipOperationHandler for DriveHandler {
                         "Committed Drive request identity unavailable".into(),
                     )
                 })?;
-            WipOperationOutput::native_with_validator(value, last_mutation_id.as_bytes().to_vec())
+            WipOperationOutput::native_with_validator(
+                value,
+                object_validator(
+                    &self.observation_nonce,
+                    &self.entry,
+                    last_mutation_id,
+                    &self.specs,
+                ),
+            )
         } else {
             WipOperationOutput::native(value)
         };
         Ok(result.with_attachments(output.attachments))
     }
 }
+/// A bounded line/search contract cannot claim that a partial blob is the full
+/// source. Retain Drive's separate whole-text read with its truncation flag.
+fn complete_text(value: &serde_json::Value) -> Result<&str, WipOperationError> {
+    let content = value["text"]
+        .as_str()
+        .ok_or_else(|| map_error(DriveError::Unavailable))?;
+    let size = value["entry"]["metadata"]["size"]
+        .as_u64()
+        .ok_or_else(|| map_error(DriveError::Unavailable))?;
+    if value["truncated"].as_bool() != Some(false)
+        || size != content.len() as u64
+        || content.len() > server_api::DRIVE_CHUNK_MAX_BYTES as usize
+    {
+        return Err(map_error(DriveError::Limit));
+    }
+    Ok(content)
+}
+
 fn parse_entry(feature: &DriveFeature, path: &str) -> Result<Option<DriveEntryRef>, DriveError> {
     let workspace = feature.backend.workspace()?;
     let prefix = format!(

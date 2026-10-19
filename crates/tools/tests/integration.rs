@@ -11,7 +11,7 @@ use agen::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolExecutionHandle,
     ToolExecutionTerminal, ToolMeta,
 };
-use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
+use manifest::Scope;
 use serde_json::json;
 use tempfile::TempDir;
 use tools::{
@@ -22,21 +22,6 @@ use workdir::{
     WorkdirSessionRouter, WorkdirToolBroker, WorkdirToolScope, WorkdirToolScopePermission,
     WorkdirToolScopeRule,
 };
-
-fn scope_with_spill(workspace: &Path, spill: &Path) -> Scope {
-    let base = Scope::writable(workspace).unwrap();
-    let mut config = ScopeConfig {
-        allow: base.allow_rules(),
-        deny: base.deny_rules(),
-    };
-    config.allow.push(ScopeRule {
-        target: spill.to_path_buf(),
-        permission: Permission::Read,
-        recursive: true,
-        symlink_policy: Default::default(),
-    });
-    Scope::from_config(&config).unwrap()
-}
 
 struct Registry {
     entries: Vec<(ToolMeta, Arc<dyn Tool>)>,
@@ -61,39 +46,38 @@ impl Registry {
     }
 }
 
-fn setup() -> (TempDir, TempDir, Registry) {
+fn setup() -> (TempDir, Registry) {
     let dir = TempDir::new().unwrap();
-    let spill = TempDir::new().unwrap();
-    let scope = scope_with_spill(dir.path(), spill.path());
+    let scope = Scope::writable(dir.path()).unwrap();
     let fs: WorkdirSessionHandle =
         Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
     let tracker = Tracker::new();
-    let reg = Registry::new(core_builtin_tools(fs, tracker, spill.path().to_path_buf()));
-    (dir, spill, reg)
+    let reg = Registry::new(core_builtin_tools(
+        fs,
+        tracker,
+        tools::bash_output::BashOutputView::new(),
+    ));
+    (dir, reg)
 }
 
-fn setup_routed() -> (
-    TempDir,
-    TempDir,
-    TempDir,
-    Arc<WorkdirSessionRouter>,
-    Registry,
-) {
+fn setup_routed() -> (TempDir, TempDir, Arc<WorkdirSessionRouter>, Registry) {
     let left = TempDir::new().unwrap();
     let right = TempDir::new().unwrap();
-    let spill = TempDir::new().unwrap();
     let router = Arc::new(WorkdirSessionRouter::new());
     for (alias, dir) in [("left", &left), ("right", &right)] {
-        let scope = scope_with_spill(dir.path(), spill.path());
+        let scope = Scope::writable(dir.path()).unwrap();
         let session: WorkdirSessionHandle =
             Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
         router
             .attach(WorkdirAttachmentAlias::new(alias).unwrap(), session)
             .unwrap();
     }
-    let definitions =
-        routed_builtin_tools(router.clone(), Tracker::new(), spill.path().to_path_buf());
-    (left, right, spill, router, Registry::new(definitions))
+    let definitions = routed_builtin_tools(
+        router.clone(),
+        Tracker::new(),
+        tools::bash_output::BashOutputView::new(),
+    );
+    (left, right, router, Registry::new(definitions))
 }
 
 fn valid_gif_with_len(target_len: usize) -> Vec<u8> {
@@ -137,7 +121,7 @@ async fn call_err(tool: &Arc<dyn Tool>, input: serde_json::Value) -> agen::tool:
 
 #[test]
 fn core_builtin_tools_registers_full_set() {
-    let (_dir, _spill, reg) = setup();
+    let (_dir, reg) = setup();
     let mut names = reg.names();
     names.sort();
     assert_eq!(names, vec!["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
@@ -145,7 +129,7 @@ fn core_builtin_tools_registers_full_set() {
 
 #[test]
 fn meta_has_description_and_schema() {
-    let (_dir, _spill, reg) = setup();
+    let (_dir, reg) = setup();
     for (meta, _) in &reg.entries {
         assert!(
             !meta.description.is_empty(),
@@ -163,7 +147,7 @@ fn meta_has_description_and_schema() {
 
 #[test]
 fn routed_tool_schemas_share_optional_target_workdir() {
-    let (_left, _right, _spill, router, mut reg) = setup_routed();
+    let (_left, _right, router, mut reg) = setup_routed();
     reg.entries.push(routed_view_image_tool(router)());
     for (meta, _) in &reg.entries {
         let target = &meta.input_schema["properties"]["target_workdir"];
@@ -174,7 +158,7 @@ fn routed_tool_schemas_share_optional_target_workdir() {
 
 #[tokio::test]
 async fn routed_tools_require_alias_only_when_attachment_set_is_ambiguous() {
-    let (_left, _right, _spill, router, reg) = setup_routed();
+    let (_left, _right, router, reg) = setup_routed();
     let error = call_err(&reg.get("Read"), json!({ "file_path": "same.txt" })).await;
     let message = error.to_string();
     assert!(message.contains("target_workdir_required"), "{message}");
@@ -199,7 +183,7 @@ async fn empty_routed_surface_returns_no_attachment_error() {
     let reg = Registry::new(routed_builtin_tools(
         router,
         Tracker::new(),
-        Path::new("unused").to_path_buf(),
+        tools::bash_output::BashOutputView::new(),
     ));
     let message = call_err(&reg.get("Read"), json!({ "file_path": "file.txt" }))
         .await
@@ -209,7 +193,7 @@ async fn empty_routed_surface_returns_no_attachment_error() {
 
 #[tokio::test]
 async fn target_alias_routes_each_tool_and_isolates_read_before_edit() {
-    let (left, right, _spill, router, mut reg) = setup_routed();
+    let (left, right, router, mut reg) = setup_routed();
     std::fs::write(left.path().join("same.txt"), "left value\n").unwrap();
     std::fs::write(right.path().join("same.txt"), "right value\n").unwrap();
     std::fs::write(left.path().join("only-left.log"), "LEFT-NEEDLE\n").unwrap();
@@ -282,7 +266,7 @@ async fn target_alias_routes_each_tool_and_isolates_read_before_edit() {
     )
     .await;
     assert_eq!(
-        std::fs::canonicalize(bash.content.unwrap().trim()).unwrap(),
+        std::fs::canonicalize(serde_json::from_str::<serde_json::Value>(&bash.content.unwrap()).unwrap()["stdout_preview"].as_str().unwrap().trim()).unwrap(),
         std::fs::canonicalize(right.path()).unwrap()
     );
 
@@ -304,13 +288,12 @@ async fn target_alias_routes_each_tool_and_isolates_read_before_edit() {
 async fn selected_attachment_capability_is_checked_without_fallback() {
     let left = TempDir::new().unwrap();
     let right = TempDir::new().unwrap();
-    let spill = TempDir::new().unwrap();
     let router = Arc::new(WorkdirSessionRouter::new());
     router
         .attach(
             WorkdirAttachmentAlias::new("writable").unwrap(),
             Arc::new(LocalWorkdirSession::new(
-                scope_with_spill(left.path(), spill.path()),
+                Scope::writable(left.path()).unwrap(),
                 left.path().to_path_buf(),
             )),
         )
@@ -322,7 +305,7 @@ async fn selected_attachment_capability_is_checked_without_fallback() {
                 workdir::Workdir::new("readonly"),
                 right.path().to_path_buf(),
                 right.path().to_path_buf(),
-                manifest::SharedScope::new(scope_with_spill(right.path(), spill.path())),
+                manifest::SharedScope::new(Scope::writable(right.path()).unwrap()),
                 workdir::WorkdirSessionCapabilities::READ_ONLY,
             )),
         )
@@ -330,7 +313,7 @@ async fn selected_attachment_capability_is_checked_without_fallback() {
     let reg = Registry::new(routed_builtin_tools(
         router.clone(),
         Tracker::new(),
-        spill.path().to_path_buf(),
+        tools::bash_output::BashOutputView::new(),
     ));
 
     let message = call_err(
@@ -352,7 +335,7 @@ async fn selected_attachment_capability_is_checked_without_fallback() {
 
 #[tokio::test]
 async fn routed_tools_observe_detach_after_registration() {
-    let (_left, _right, _spill, router, reg) = setup_routed();
+    let (_left, _right, router, reg) = setup_routed();
     let alias = WorkdirAttachmentAlias::new("left").unwrap();
     router.detach(&alias).await.unwrap();
 
@@ -372,7 +355,6 @@ async fn routed_tools_observe_detach_after_registration() {
 async fn detach_and_reattach_same_alias_requires_a_fresh_read() {
     let first = TempDir::new().unwrap();
     let second = TempDir::new().unwrap();
-    let spill = TempDir::new().unwrap();
     std::fs::write(first.path().join("same.txt"), "same bytes\n").unwrap();
     std::fs::write(second.path().join("same.txt"), "same bytes\n").unwrap();
 
@@ -382,7 +364,7 @@ async fn detach_and_reattach_same_alias_requires_a_fresh_read() {
         .attach(
             alias.clone(),
             Arc::new(LocalWorkdirSession::new(
-                scope_with_spill(first.path(), spill.path()),
+                Scope::writable(first.path()).unwrap(),
                 first.path().to_path_buf(),
             )),
         )
@@ -390,7 +372,7 @@ async fn detach_and_reattach_same_alias_requires_a_fresh_read() {
     let reg = Registry::new(routed_builtin_tools(
         router.clone(),
         Tracker::new(),
-        spill.path().to_path_buf(),
+        tools::bash_output::BashOutputView::new(),
     ));
     call(
         &reg.get("Read"),
@@ -403,7 +385,7 @@ async fn detach_and_reattach_same_alias_requires_a_fresh_read() {
         .attach(
             alias.clone(),
             Arc::new(LocalWorkdirSession::new(
-                scope_with_spill(second.path(), spill.path()),
+                Scope::writable(second.path()).unwrap(),
                 second.path().to_path_buf(),
             )),
         )
@@ -432,6 +414,8 @@ async fn detach_and_reattach_same_alias_requires_a_fresh_read() {
 struct ExternalValidatingSession {
     inner: LocalWorkdirSession,
     truncate_first_binary_response: bool,
+    command_response_losses: std::sync::atomic::AtomicUsize,
+    lose_terminal_only: bool,
     mutate_after_first_binary_response: Option<std::path::PathBuf>,
 }
 
@@ -550,7 +534,23 @@ impl workdir::WorkdirSession for ExternalValidatingSession {
         &self,
         request: workdir::CommandOutputRequest,
     ) -> Result<workdir::CommandOutput, workdir::WorkdirError> {
-        self.inner.command_output(request).await
+        let output = self.inner.command_output(request).await?;
+        if (!self.lose_terminal_only || output.terminal.is_some())
+            && self
+                .command_response_losses
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+        {
+            // The production provider has committed a page, but its response is lost.
+            return Err(workdir::WorkdirError::Transport(
+                "injected lost response".into(),
+            ));
+        }
+        Ok(output)
     }
 
     async fn cancel_command(
@@ -568,11 +568,12 @@ impl workdir::WorkdirSession for ExternalValidatingSession {
 #[tokio::test]
 async fn external_view_image_uses_a_protocol_bounded_request() {
     let dir = TempDir::new().unwrap();
-    let spill = TempDir::new().unwrap();
-    let scope = scope_with_spill(dir.path(), spill.path());
+    let scope = Scope::writable(dir.path()).unwrap();
     let session: WorkdirSessionHandle = Arc::new(ExternalValidatingSession {
         inner: LocalWorkdirSession::new(scope, dir.path().to_path_buf()),
         truncate_first_binary_response: false,
+        command_response_losses: std::sync::atomic::AtomicUsize::new(0),
+        lose_terminal_only: false,
         mutate_after_first_binary_response: None,
     });
     let png = include_bytes!("fixtures/view-image/valid.png");
@@ -590,13 +591,14 @@ async fn external_view_image_uses_a_protocol_bounded_request() {
 #[tokio::test]
 async fn external_view_image_rejects_truncated_and_cross_version_chunks() {
     let dir = TempDir::new().unwrap();
-    let spill = TempDir::new().unwrap();
     let image_path = dir.path().join("image.png");
-    let scope = scope_with_spill(dir.path(), spill.path());
+    let scope = Scope::writable(dir.path()).unwrap();
     std::fs::write(&image_path, include_bytes!("fixtures/view-image/valid.png")).unwrap();
     let truncated: WorkdirSessionHandle = Arc::new(ExternalValidatingSession {
         inner: LocalWorkdirSession::new(scope.clone(), dir.path().to_path_buf()),
         truncate_first_binary_response: true,
+        command_response_losses: std::sync::atomic::AtomicUsize::new(0),
+        lose_terminal_only: false,
         mutate_after_first_binary_response: None,
     });
     let (_meta, tool) = view_image_tool(truncated)();
@@ -613,6 +615,8 @@ async fn external_view_image_rejects_truncated_and_cross_version_chunks() {
     let changing: WorkdirSessionHandle = Arc::new(ExternalValidatingSession {
         inner: LocalWorkdirSession::new(scope, dir.path().to_path_buf()),
         truncate_first_binary_response: false,
+        command_response_losses: std::sync::atomic::AtomicUsize::new(0),
+        lose_terminal_only: false,
         mutate_after_first_binary_response: Some(image_path),
     });
     let (_meta, tool) = view_image_tool(changing)();
@@ -626,8 +630,7 @@ async fn external_view_image_rejects_truncated_and_cross_version_chunks() {
 async fn view_image_enforces_the_ten_mib_boundary_without_partial_attachments() {
     const LIMIT: usize = 10 * 1024 * 1024;
     let dir = TempDir::new().unwrap();
-    let spill = TempDir::new().unwrap();
-    let scope = scope_with_spill(dir.path(), spill.path());
+    let scope = Scope::writable(dir.path()).unwrap();
     let session: WorkdirSessionHandle =
         Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
     let (_meta, tool) = view_image_tool(session)();
@@ -650,8 +653,7 @@ async fn view_image_enforces_the_ten_mib_boundary_without_partial_attachments() 
 #[tokio::test]
 async fn view_image_attaches_valid_supported_image_fixtures() {
     let dir = TempDir::new().unwrap();
-    let spill = TempDir::new().unwrap();
-    let scope = scope_with_spill(dir.path(), spill.path());
+    let scope = Scope::writable(dir.path()).unwrap();
     let session: WorkdirSessionHandle =
         Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
     let (_meta, tool) = view_image_tool(session)();
@@ -726,8 +728,7 @@ async fn delegated_view_image_preserves_caller_relative_path_identity() {
 #[tokio::test]
 async fn view_image_reads_scoped_bytes_into_durable_tool_detail() {
     let dir = TempDir::new().unwrap();
-    let spill = TempDir::new().unwrap();
-    let scope = scope_with_spill(dir.path(), spill.path());
+    let scope = Scope::writable(dir.path()).unwrap();
     let session: WorkdirSessionHandle =
         Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
     let png = include_bytes!("fixtures/view-image/valid.png");
@@ -752,7 +753,7 @@ async fn view_image_reads_scoped_bytes_into_durable_tool_detail() {
 
 #[tokio::test]
 async fn read_then_edit_then_read_roundtrip() {
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let file = dir.path().join("a.txt");
     std::fs::write(&file, "hello world\n").unwrap();
     let p = "a.txt";
@@ -784,7 +785,7 @@ async fn read_then_edit_then_read_roundtrip() {
 
 #[tokio::test]
 async fn write_then_grep_finds_content() {
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let write = reg.get("Write");
     let grep = reg.get("Grep");
 
@@ -813,7 +814,7 @@ async fn write_then_grep_finds_content() {
 
 #[tokio::test]
 async fn glob_finds_written_files() {
-    let (_dir, _spill, reg) = setup();
+    let (_dir, reg) = setup();
     let write = reg.get("Write");
     let glob = reg.get("Glob");
 
@@ -837,7 +838,7 @@ async fn glob_finds_written_files() {
 
 #[tokio::test]
 async fn absolute_path_is_rejected() {
-    let (_dir, _spill, reg) = setup();
+    let (_dir, reg) = setup();
     let outside = TempDir::new().unwrap();
     let write = reg.get("Write");
 
@@ -859,7 +860,7 @@ async fn absolute_path_is_rejected() {
 
 #[tokio::test]
 async fn write_to_existing_without_read_fails() {
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let file = dir.path().join("exists.txt");
     std::fs::write(&file, "preexisting").unwrap();
 
@@ -880,7 +881,7 @@ async fn write_to_existing_without_read_fails() {
 async fn shared_workdir_across_tools() {
     // The key invariant: all builtin tools share the same WorkdirSession instance,
     // so read-history set by Read is visible to Edit and Write.
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let file = dir.path().join("shared.txt");
     std::fs::write(&file, "one\n").unwrap();
 
@@ -907,7 +908,7 @@ async fn shared_workdir_across_tools() {
 
 #[tokio::test]
 async fn edit_requires_read_across_tools() {
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let file = dir.path().join("a.txt");
     std::fs::write(&file, "foo\n").unwrap();
 
@@ -928,7 +929,7 @@ async fn edit_requires_read_across_tools() {
 
 #[tokio::test]
 async fn deterministic_tool_order_is_registration_order() {
-    let (_dir, _spill, reg) = setup();
+    let (_dir, reg) = setup();
     // Registration order from core_builtin_tools(): Read, Write, Edit, Glob, Grep, Bash
     let names: Vec<&str> = reg.entries.iter().map(|(m, _)| m.name.as_str()).collect();
     assert_eq!(
@@ -940,7 +941,7 @@ async fn deterministic_tool_order_is_registration_order() {
 // Regression: tool name capitalization matches Claude Code reference
 #[test]
 fn tool_names_match_reference_spec() {
-    let (_dir, _spill, reg) = setup();
+    let (_dir, reg) = setup();
     for expected in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
         assert!(
             reg.entries.iter().any(|(m, _)| m.name == expected),
@@ -953,15 +954,14 @@ fn tool_names_match_reference_spec() {
 async fn tracker_recent_files_tracks_read_write_edit() {
     // Build a fresh registry that shares a tracker we can query afterwards.
     let dir = TempDir::new().unwrap();
-    let spill = TempDir::new().unwrap();
-    let scope = scope_with_spill(dir.path(), spill.path());
+    let scope = Scope::writable(dir.path()).unwrap();
     let fs: WorkdirSessionHandle =
         Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
     let tracker = Tracker::new();
     let reg = Registry::new(core_builtin_tools(
         fs,
         tracker.clone(),
-        spill.path().to_path_buf(),
+        tools::bash_output::BashOutputView::new(),
     ));
 
     let a = dir.path().join("a.txt");
@@ -1003,118 +1003,314 @@ async fn tracker_recent_files_tracks_read_write_edit() {
 async fn bash_inherits_workdir_cwd() {
     // The Bash tool starts at the WorkdirSession's pwd. Without any `cd`, its
     // `pwd` should canonicalize to the workspace root we set up.
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let bash = reg.get("Bash");
     let out = call(&bash, json!({ "command": "pwd", "cwd": "." })).await;
     let body = out.content.unwrap();
-    let actual = std::fs::canonicalize(body.trim()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let actual = std::fs::canonicalize(parsed["stdout_preview"].as_str().unwrap().trim()).unwrap();
     let expected = std::fs::canonicalize(dir.path()).unwrap();
     assert_eq!(actual, expected);
 }
 
+fn output_fixture() -> (
+    TempDir,
+    WorkdirSessionHandle,
+    tools::bash_output::BashOutputView,
+    Arc<dyn Tool>,
+) {
+    let root = TempDir::new().unwrap();
+    let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::new(
+        Scope::writable(root.path()).unwrap(),
+        root.path().into(),
+    ));
+    let view = tools::bash_output::BashOutputView::new();
+    let (_, bash) = tools::bash_tool(session.clone(), view.clone())();
+    (root, session, view, bash)
+}
+
 #[tokio::test]
-async fn bash_provider_output_exposes_readable_retained_path() {
-    let (_dir, spill, reg) = setup();
-    let bash = reg.get("Bash");
+async fn bash_output_is_retained_without_a_filesystem_grant_or_telemetry_subscriber() {
+    let (root, _session, view, bash) = output_fixture();
     let out = call(
         &bash,
-        json!({ "command": "printf 'x%.0s' {1..20480}", "cwd": "." }),
+        json!({ "command": "printf 'x%.0s' {1..20480}; printf '\\377€' >&2; exit 7", "cwd": "." }),
     )
     .await;
-    let body = out.content.unwrap();
-    assert!(body.contains("bounded WorkdirSession command output"));
-    assert!(body.contains("full output saved to"));
-    assert!(body.contains(spill.path().to_str().unwrap()));
-    let artifact = std::fs::read_dir(spill.path())
-        .unwrap()
-        .next()
-        .expect("retained output")
-        .unwrap()
-        .path();
-    assert_eq!(std::fs::metadata(artifact).unwrap().len(), 20_480);
+    let body: serde_json::Value = serde_json::from_str(&out.content.unwrap()).unwrap();
+    assert_eq!(body["output"]["terminal"]["exit_code"], 7);
+    assert_eq!(body["preview_omitted"], true);
+    assert_eq!(body["output"]["storage_truncated"], false);
+    let id = body["output"]["id"].as_str().unwrap();
+    assert_eq!(
+        view.read(id, workdir::CommandStream::Stdout, 0, 65536)
+            .unwrap(),
+        vec![b'x'; 20480]
+    );
+    assert_eq!(
+        view.read(id, workdir::CommandStream::Stderr, 0, 65536)
+            .unwrap(),
+        [vec![255], "€".as_bytes().to_vec()].concat()
+    );
+    assert!(
+        body["stdout_entry"]
+            .as_str()
+            .unwrap()
+            .starts_with("/bash-output/")
+    );
+    assert!(!body.to_string().contains(root.path().to_str().unwrap()));
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+async fn await_command_output(
+    events: &mut tokio::sync::broadcast::Receiver<workdir::CommandEvent>,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap(),
+                workdir::CommandEvent::Output { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("command output readiness");
+}
+async fn await_command_terminal(
+    events: &mut tokio::sync::broadcast::Receiver<workdir::CommandEvent>,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let workdir::CommandEvent::Terminal { status, .. } = events.recv().await.unwrap() {
+                assert_eq!(status, workdir::CommandStatus::Cancelled);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("command terminal fence");
 }
 
 #[tokio::test]
 async fn bash_cancellation_returns_bounded_progress_as_terminal_output() {
-    let (dir, _spill, reg) = setup();
-    let marker = dir.path().join("must-not-run-after-cancel");
-    let command = format!(
-        "printf 'before\\n'; printf 'err-before\\n' >&2; sleep 1; touch {}; printf 'after\\n'",
-        marker.display()
-    );
-    let input = serde_json::to_string(&json!({ "command": command, "cwd": "." })).unwrap();
+    let (_root, session, _view, bash) = output_fixture();
+    let mut events = session.subscribe_command_events().unwrap();
     let context = ToolExecutionContext::new("call-heavy", "attempt-heavy", 0);
-    let bash = reg.get("Bash");
     let executing = bash.clone();
     let execution_context = context.clone();
-    let execution = tokio::spawn(async move { executing.execute(&input, execution_context).await });
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    bash.cancel_execution(&context)
-        .await
-        .expect("signal exact execution cancellation");
-    let error = tokio::time::timeout(std::time::Duration::from_secs(2), execution)
-        .await
-        .expect("cancelled Bash should terminate inside the Engine grace budget")
-        .expect("Bash task join");
-
-    let ToolError::Cancelled(output) = error.expect_err("cancelled command is non-success") else {
-        panic!("expected typed cancellation result");
+    let execution = tokio::spawn(async move {
+        executing.execute(r#"{"command":"printf 'before'; printf 'err-before' >&2; while :; do :; done","cwd":"."}"#, execution_context).await
+    });
+    await_command_output(&mut events).await;
+    bash.cancel_execution(&context).await.unwrap();
+    let ToolError::Cancelled(output) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+    else {
+        panic!("expected cancellation");
     };
-    let content = output.content.expect("bounded progress output");
-    assert!(
-        content.contains("before"),
-        "missing pre-cancel stdout: {content}"
-    );
-    assert!(
-        content.contains("err-before"),
-        "missing pre-cancel stderr: {content}"
-    );
-    assert!(
-        !content.contains("after"),
-        "post-cancel output leaked: {content}"
-    );
-    assert!(content.len() <= 16 * 1024, "output must remain bounded");
-
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-    assert!(
-        !marker.exists(),
-        "the cancelled command continued executing after terminal confirmation"
-    );
+    let body: serde_json::Value = serde_json::from_str(&output.content.unwrap()).unwrap();
+    assert_eq!(body["stdout_preview"], "before");
+    assert_eq!(body["stderr_preview"], "err-before");
+    assert_eq!(body["output"]["terminal"]["status"], "cancelled");
+    assert_eq!(body["output"]["terminal"]["transport_complete"], true);
 }
 
 #[tokio::test]
 async fn bash_force_close_cleanup_stops_command_and_keeps_session_reusable() {
-    let (dir, _spill, reg) = setup();
-    let marker = dir.path().join("must-not-survive-force-close");
-    let command = format!("sleep 1; touch {}", marker.display());
-    let input = serde_json::to_string(&json!({ "command": command, "cwd": "." })).unwrap();
-    let bash = reg.get("Bash");
+    let (_root, session, _view, bash) = output_fixture();
+    let mut events = session.subscribe_command_events().unwrap();
     let context = ToolExecutionContext::new("call-force", "attempt-force", 0);
-    let (handle, terminal) = ToolExecutionHandle::start(bash.clone(), input, context);
-
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let (handle, terminal) = ToolExecutionHandle::start(
+        bash.clone(),
+        r#"{"command":"printf ready; while :; do :; done","cwd":"."}"#.into(),
+        context,
+    );
+    await_command_output(&mut events).await;
     handle.force_close();
     assert!(matches!(
         terminal.await,
         ToolExecutionTerminal::OutcomeUnknown
     ));
-
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-    assert!(
-        !marker.exists(),
-        "CommandGuard cleanup allowed a force-closed command to continue"
-    );
-
-    let output = bash
-        .execute(
-            r#"{"command":"printf 'reused'","cwd":"."}"#,
-            Default::default(),
-        )
-        .await
-        .expect("workdir session remains reusable after cleanup");
-    assert_eq!(output.content.as_deref(), Some("reused"));
+    await_command_terminal(&mut events).await;
+    let output = call(&bash, json!({"command":"printf reused", "cwd":"."})).await;
+    let body: serde_json::Value = serde_json::from_str(&output.content.unwrap()).unwrap();
+    assert_eq!(body["stdout_preview"], "reused");
 }
 
 // Sanity: unused Path import guard
 const _: fn() -> &'static Path = || Path::new("/");
+
+#[tokio::test]
+async fn parent_and_sibling_broker_commands_keep_output_ownership_after_revoke() {
+    let (root, source, parent_view, parent_bash) = output_fixture();
+    let broker = WorkdirToolBroker::new(source);
+    let mut leases = Vec::new();
+    let mut views = Vec::new();
+    let mut commands = Vec::new();
+    for name in ["left", "right"] {
+        std::fs::create_dir(root.path().join(name)).unwrap();
+        let lease = Arc::new(
+            broker
+                .scope(WorkdirToolScope {
+                    rules: vec![WorkdirToolScopeRule {
+                        target: WorkdirPath::new(name).unwrap(),
+                        permission: WorkdirToolScopePermission::Write,
+                        recursive: true,
+                        symlink_policy: Default::default(),
+                    }],
+                    cwd: WorkdirPath::new(name).unwrap(),
+                    command: true,
+                })
+                .await
+                .unwrap(),
+        );
+        let authority = lease.clone();
+        let view = parent_view.child(Arc::new(move || authority.is_active()));
+        let (_, bash) = tools::bash_tool(lease.tool_session(), view.clone())();
+        leases.push(lease);
+        views.push(view);
+        commands.push(bash);
+    }
+    let left_input =
+        json!({"command":"printf 'left-%.0s' {1..10000}; printf left-err >&2", "cwd":"."});
+    let right_input =
+        json!({"command":"printf 'right-%.0s' {1..10000}; printf right-err >&2", "cwd":"."});
+    let parent_input = json!({"command":"printf parent; printf parent-err >&2", "cwd":"."});
+    let (left, right, parent) = tokio::join!(
+        call(&commands[0], left_input),
+        call(&commands[1], right_input),
+        call(&parent_bash, parent_input)
+    );
+    let outputs = [left, right, parent]
+        .map(|out| serde_json::from_str::<serde_json::Value>(&out.content.unwrap()).unwrap());
+    for (index, label) in ["left", "right", "parent"].iter().enumerate() {
+        let id = outputs[index]["output"]["id"].as_str().unwrap();
+        let bytes = parent_view
+            .read(id, workdir::CommandStream::Stderr, 0, 65536)
+            .unwrap();
+        assert_eq!(bytes, format!("{label}-err").as_bytes());
+        for (child_index, view) in views.iter().enumerate() {
+            assert_eq!(view.metadata(id).is_some(), child_index == index);
+        }
+    }
+    let left_id = outputs[0]["output"]["id"].as_str().unwrap();
+    leases[0].close().await.unwrap();
+    assert!(views[0].metadata(left_id).is_none());
+    assert!(parent_view.metadata(left_id).is_some());
+    assert!(
+        views[1]
+            .metadata(outputs[1]["output"]["id"].as_str().unwrap())
+            .is_some()
+    );
+    leases[1].close().await.unwrap();
+    broker.close().await.unwrap();
+    parent_view.revoke();
+    assert!(parent_view.metadata(left_id).is_none());
+}
+
+#[tokio::test]
+async fn utf8_quota_boundary_preserves_raw_prefix_and_reports_saved_vs_seen() {
+    let (_root, _session, view, bash) = output_fixture();
+    let out = call(
+        &bash,
+        json!({"command":"printf '%4194303s' ''; printf '€'", "cwd":"."}),
+    )
+    .await;
+    let body: serde_json::Value = serde_json::from_str(&out.content.unwrap()).unwrap();
+    let id = body["output"]["id"].as_str().unwrap();
+    let saved = body["output"]["stdout_saved"].as_u64().unwrap() as usize;
+    assert_eq!(saved, 4 * 1024 * 1024);
+    assert_eq!(body["output"]["stdout_seen"], 4 * 1024 * 1024 + 2);
+    assert_eq!(body["output"]["stderr_seen"], 0);
+    assert_eq!(body["output"]["storage_truncated"], true);
+    assert_eq!(
+        view.read(id, workdir::CommandStream::Stdout, saved - 1, 10)
+            .unwrap(),
+        vec![0xe2]
+    );
+    assert!(
+        view.line_window(id, workdir::CommandStream::Stdout, 0, 1)
+            .unwrap()
+            .is_err()
+    );
+    assert!(out.summary.starts_with("$ "));
+}
+
+#[tokio::test]
+async fn timeout_terminal_fences_retained_stdout_and_stderr() {
+    let (_root, _session, view, bash) = output_fixture();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), bash.execute(r#"{"command":"printf before; printf err-before >&2; while :; do :; done","cwd":".","timeout":1}"#, Default::default())).await.unwrap().unwrap_err();
+    let ToolError::Interrupted(out) = error else {
+        panic!("expected timeout output");
+    };
+    let body: serde_json::Value = serde_json::from_str(&out.content.unwrap()).unwrap();
+    let id = body["output"]["id"].as_str().unwrap();
+    assert_eq!(body["output"]["terminal"]["status"], "timed_out");
+    assert_eq!(body["output"]["terminal"]["transport_complete"], true);
+    assert_eq!(
+        view.read(id, workdir::CommandStream::Stdout, 0, 65536)
+            .unwrap(),
+        b"before"
+    );
+    assert_eq!(
+        view.read(id, workdir::CommandStream::Stderr, 0, 65536)
+            .unwrap(),
+        b"err-before"
+    );
+}
+
+// Integration: real process pipes and provider replay into the production Bash collector.
+// Only response delivery is fault-injected; Runtime's HTTP suite covers actual wire routing.
+#[tokio::test]
+async fn lost_page_and_terminal_responses_replay_without_restarting_or_double_appending() {
+    for lose_terminal_only in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let session = Arc::new(ExternalValidatingSession {
+            inner: LocalWorkdirSession::new(
+                Scope::writable(dir.path()).unwrap(),
+                dir.path().into(),
+            ),
+            truncate_first_binary_response: false,
+            mutate_after_first_binary_response: None,
+            command_response_losses: std::sync::atomic::AtomicUsize::new(1),
+            lose_terminal_only,
+        });
+        let view = tools::bash_output::BashOutputView::new();
+        let definitions = core_builtin_tools(session.clone(), Tracker::new(), view.clone());
+        let bash = Registry::new(definitions).get("Bash");
+        let out = call(&bash, json!({"cwd":".","command":"printf once >> effect.txt; printf 'x%.0s' {1..200000}; printf err >&2; exit 3"})).await;
+        let body: serde_json::Value = serde_json::from_str(&out.content.unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("effect.txt")).unwrap(),
+            b"once"
+        );
+        assert_eq!(
+            session
+                .command_response_losses
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert_eq!(body["output"]["stdout_saved"], 200000);
+        assert_eq!(body["output"]["stdout_delivered"], 200000);
+        assert_eq!(body["output"]["stderr_saved"], 3);
+        assert_eq!(body["output"]["terminal"]["exit_code"], 3);
+        assert_eq!(body["output"]["terminal"]["transport_complete"], true);
+        assert_eq!(body["output"]["storage_truncated"], false);
+        let id = body["output"]["id"].as_str().unwrap();
+        for offset in (0..200000).step_by(65536) {
+            assert_eq!(
+                view.read(id, workdir::CommandStream::Stdout, offset, 65536)
+                    .unwrap(),
+                vec![b'x'; (200000 - offset).min(65536)]
+            );
+        }
+        use workdir::WorkdirSession as _;
+        session.close().await.unwrap();
+    }
+}

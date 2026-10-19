@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition};
-use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
+use manifest::Scope;
 use serde_json::json;
 use tempfile::TempDir;
 use tools::{Tracker, core_builtin_tools};
@@ -28,31 +28,23 @@ impl Registry {
     }
 }
 
-fn setup() -> (TempDir, TempDir, Registry) {
+fn setup() -> (TempDir, Registry) {
     let dir = TempDir::new().unwrap();
-    let spill = TempDir::new().unwrap();
-    let base = Scope::writable(dir.path()).unwrap();
-    let mut config = ScopeConfig {
-        allow: base.allow_rules(),
-        deny: base.deny_rules(),
-    };
-    config.allow.push(ScopeRule {
-        target: spill.path().to_path_buf(),
-        permission: Permission::Read,
-        recursive: true,
-        symlink_policy: Default::default(),
-    });
-    let scope = Scope::from_config(&config).unwrap();
+    let scope = Scope::writable(dir.path()).unwrap();
     let fs: WorkdirSessionHandle =
         std::sync::Arc::new(LocalWorkdirSession::new(scope, dir.path().to_path_buf()));
     let tracker = Tracker::new();
-    let reg = Registry::new(core_builtin_tools(fs, tracker, spill.path().to_path_buf()));
-    (dir, spill, reg)
+    let reg = Registry::new(core_builtin_tools(
+        fs,
+        tracker,
+        tools::bash_output::BashOutputView::new(),
+    ));
+    (dir, reg)
 }
 
 #[tokio::test]
 async fn unicode_path_and_content() {
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let file = dir.path().join("日本語ファイル.txt");
     let content = "こんにちは 🦀 世界\nabc\n";
 
@@ -87,7 +79,7 @@ async fn unicode_path_and_content() {
 async fn symlink_to_outside_scope_is_rejected_for_write() {
     use std::os::unix::fs::symlink;
 
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let outside = TempDir::new().unwrap();
     let outside_target = outside.path().join("secret.txt");
     std::fs::write(&outside_target, "secret").unwrap();
@@ -151,7 +143,7 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
 async fn broken_symlink_reports_target_and_repair_hint() {
     use std::os::unix::fs::symlink;
 
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let link = dir.path().join("external-project");
     let target = dir.path().join("missing-target");
     symlink(&target, &link).unwrap();
@@ -173,7 +165,7 @@ async fn broken_symlink_reports_target_and_repair_hint() {
 
 #[tokio::test]
 async fn empty_file_read_and_edit() {
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let file = dir.path().join("empty.txt");
     std::fs::write(&file, "").unwrap();
 
@@ -207,7 +199,7 @@ async fn empty_file_read_and_edit() {
 
 #[tokio::test]
 async fn very_long_single_line() {
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let file = dir.path().join("long.txt");
     let big: String = "x".repeat(1024 * 1024); // 1 MiB, no newlines
     std::fs::write(&file, &big).unwrap();
@@ -226,7 +218,7 @@ async fn very_long_single_line() {
 
 #[tokio::test]
 async fn absolute_path_requires_matching_read_scope() {
-    let (_dir, _spill, reg) = setup();
+    let (_dir, reg) = setup();
     let outside = tempfile::tempdir().unwrap();
     let outside_file = outside.path().join("outside.txt");
     std::fs::write(&outside_file, "secret").unwrap();
@@ -247,7 +239,7 @@ async fn absolute_path_requires_matching_read_scope() {
 
 #[tokio::test]
 async fn directory_target_is_rejected_for_read() {
-    let (_dir, _spill, reg) = setup();
+    let (_dir, reg) = setup();
     let read = reg.get("Read");
     let err = read
         .execute(&json!({ "file_path": "." }).to_string(), Default::default())
@@ -258,7 +250,7 @@ async fn directory_target_is_rejected_for_read() {
 
 #[tokio::test]
 async fn deeply_nested_new_file_is_created() {
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let deep = dir.path().join("a/b/c/d/e/deep.txt");
     let write = reg.get("Write");
     write
@@ -277,7 +269,7 @@ async fn deeply_nested_new_file_is_created() {
 
 #[tokio::test]
 async fn replace_preserves_unicode() {
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let file = dir.path().join("u.txt");
     std::fs::write(&file, "🦀 rust 🦀\n").unwrap();
 
@@ -306,7 +298,7 @@ async fn replace_preserves_unicode() {
 
 #[tokio::test]
 async fn grep_handles_unicode_pattern() {
-    let (dir, _spill, reg) = setup();
+    let (dir, reg) = setup();
     let file = dir.path().join("u.txt");
     std::fs::write(&file, "English\n日本語\nрусский\n").unwrap();
 

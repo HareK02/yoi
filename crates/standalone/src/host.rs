@@ -23,9 +23,7 @@ use session_store::{
     CombinedStore, FsStore, FsWorkerStore, WorkerActiveSegmentRef, WorkerMetadataStore,
 };
 use thiserror::Error;
-use worker::bootstrap::{
-    WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout, bash_output_dir_for_worker_id,
-};
+use worker::bootstrap::{WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout};
 use worker::controller::WorkerControllerTransport;
 use worker::ipc::protocol_session::{
     WorkerProtocolSessionStreams, dispatch_worker_protocol_method, live_log_entry_event,
@@ -216,7 +214,6 @@ impl StandaloneHost {
             WorkerFilesystemAuthority::local(launch.cwd.clone(), launch.cwd.clone());
         let workspace_context = WorkerWorkspaceContext::local_filesystem(None);
         let runtime_base = store.runtime_dir(worker_id);
-        let bash_output_dir = bash_output_dir_for_worker_id(worker_id);
 
         let mut bootstrap = WorkerBootstrap::new(
             bootstrap_manifest,
@@ -224,10 +221,7 @@ impl StandaloneHost {
             launch.prompt_catalog,
             workspace_context,
             filesystem_authority,
-            WorkerBootstrapLayout::Direct {
-                runtime_base,
-                bash_output_dir,
-            },
+            WorkerBootstrapLayout::Direct { runtime_base },
             WorkerControllerTransport::InProcess,
         );
         if let Some(subject) = &subject {
@@ -428,7 +422,6 @@ impl StandaloneHost {
         );
         let workspace_context = WorkerWorkspaceContext::local_filesystem(None);
         let runtime_base = store.runtime_dir(worker_id);
-        let bash_output_dir = bash_output_dir_for_worker_id(worker_id);
 
         let mut bootstrap = WorkerBootstrap::new(
             manifest,
@@ -436,10 +429,7 @@ impl StandaloneHost {
             worker::PromptCatalogSource::builtins_only(),
             workspace_context,
             filesystem_authority,
-            WorkerBootstrapLayout::Direct {
-                runtime_base,
-                bash_output_dir,
-            },
+            WorkerBootstrapLayout::Direct { runtime_base },
             WorkerControllerTransport::InProcess,
         );
         if let Some(subject) = &subject {

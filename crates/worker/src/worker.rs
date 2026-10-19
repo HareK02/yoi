@@ -17552,12 +17552,10 @@ permission = "write"
         let layout = if runtime_managed {
             crate::WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: temp.path().join("runtime/runs/1"),
-                bash_output_dir: temp.path().join("bash"),
             }
         } else {
             crate::WorkerBootstrapLayout::Direct {
                 runtime_base: temp.path().join("runtime"),
-                bash_output_dir: temp.path().join("bash"),
             }
         };
         crate::WorkerBootstrap::new(

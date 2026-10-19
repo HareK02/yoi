@@ -256,6 +256,7 @@ fn read_result() -> WorkdirSessionOperationResult {
         total_lines: 1,
         content_hash: sha2::Sha256::digest(b"visible\n").into(),
         truncated: false,
+        byte_truncated: false,
     })
 }
 

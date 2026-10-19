@@ -466,8 +466,19 @@ async fn call(
     runtime
         .call(
             path.into(),
-            interface(path, true),
-            op.into(),
+            match op {
+                "edit" => crate::file_operation::Contract::Edit.reference(),
+                "write" => crate::file_operation::Contract::Write.reference(),
+                "read_lines" => crate::file_operation::Contract::ReadLines.reference(),
+                "search_text" => crate::file_operation::Contract::SearchText.reference(),
+                _ => interface(path, true),
+            },
+            match op {
+                "read_lines" => "read",
+                "search_text" => "search",
+                _ => op,
+            }
+            .into(),
             args,
             ToolExecutionContext::direct(),
         )
@@ -825,11 +836,11 @@ async fn workspace_config_production_reattach_new_lifetime_rejects_old_same_byte
     client.state.lock().unwrap().active = None;
     let second = feature.attach("second", None).await.unwrap();
     assert_ne!(first.connection_id, second.connection_id);
-    assert!(
-        call(&runtime, path, "write", json!({"content":"bad"}))
-            .await
-            .is_err()
-    );
+    let error = call(&runtime, path, "write", json!({"content":"bad"}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ValidatorMismatch"), "{error}");
     assert!(client.state.lock().unwrap().commits.is_empty());
     observe_interface(&runtime, path, true).await;
     call(&runtime, path, "write", json!({"content":"new-lifetime"}))
@@ -957,4 +968,190 @@ async fn workspace_config_production_ungranted_root_does_not_poison_worldspace_d
             .iter()
             .all(|r| r.method == WorkspaceRequestMethod::Get)
     );
+}
+
+#[tokio::test]
+async fn common_read_only_text_windows_search_and_rejections_preserve_backend_authority() {
+    let client = Router::new();
+    {
+        let mut state = client.state.lock().unwrap();
+        state.read_only = true;
+        state.entries.get_mut("main.dcdl").unwrap().1 = "α\r\nneedle.*\nNeedle.*\nlast\n".into();
+    }
+    let (feature, runtime) = runtime(client.clone());
+    feature.attach("read-only", None).await.unwrap();
+    let path = "/workspace-config/main.dcdl";
+    observe_interface(&runtime, path, true).await;
+    let object = runtime
+        .inspect(path.into(), true)
+        .await
+        .unwrap()
+        .content
+        .unwrap();
+    assert!(object.contains(&crate::file_operation::Contract::ReadLines.reference().name));
+    assert!(object.contains(&crate::file_operation::Contract::SearchText.reference().name));
+    assert!(!object.contains(&crate::file_operation::Contract::Write.reference().name));
+    assert!(!object.contains(&crate::file_operation::Contract::Edit.reference().name));
+    let read = call(&runtime, path, "read_lines", json!({"offset":1,"limit":2}))
+        .await
+        .unwrap();
+    let read: Json = serde_json::from_str(read.content.as_deref().unwrap()).unwrap();
+    assert!(read["content"].as_str().unwrap().contains("needle.*"));
+    assert!(read["content"].as_str().unwrap().contains("Needle.*"));
+    assert!(!read["content"].as_str().unwrap().contains('α'));
+    assert_eq!(read["next_offset"], 3);
+    assert_eq!(read["truncated"], true);
+    let search = call(
+        &runtime,
+        path,
+        "search_text",
+        json!({"pattern":"needle.*","limit":3}),
+    )
+    .await
+    .unwrap();
+    let search: Json = serde_json::from_str(search.content.as_deref().unwrap()).unwrap();
+    assert_eq!(search["matches"], json!([{"line":2,"text":"needle.*"}]));
+    assert_eq!(search["next_offset"], 3);
+    assert_eq!(search["truncated"], true);
+    for (op, arguments) in [
+        ("read_lines", json!({"limit":0})),
+        ("read_lines", json!({"limit":2001})),
+        ("search_text", json!({"pattern":""})),
+        (
+            "search_text",
+            json!({"pattern":"x","case_insensitive":true}),
+        ),
+    ] {
+        let before = client
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r.path.ends_with("/read"))
+            .count();
+        assert!(call(&runtime, path, op, arguments).await.is_err());
+        let after = client
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r.path.ends_with("/read"))
+            .count();
+        assert_eq!(before, after);
+    }
+    assert!(
+        call(&runtime, path, "write", json!({"content":"denied"}))
+            .await
+            .is_err()
+    );
+    client.state.lock().unwrap().granted = false;
+    assert!(call(&runtime, path, "read_lines", json!({})).await.is_err());
+    assert!(client.state.lock().unwrap().commits.is_empty());
+}
+
+#[tokio::test]
+async fn common_text_read_refuses_oversized_rendered_window() {
+    let client = Router::new();
+    let (feature, runtime) = runtime(client.clone());
+    feature.attach("bounded", None).await.unwrap();
+    let path = "/workspace-config/main.dcdl";
+    client
+        .state
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut("main.dcdl")
+        .unwrap()
+        .1 = "x".repeat(64 * 1024);
+    observe_interface(&runtime, path, true).await;
+    let error = call(&runtime, path, "read_lines", json!({}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ResourceLimitExceeded"), "{error}");
+    assert!(client.state.lock().unwrap().commits.is_empty());
+}
+
+#[tokio::test]
+async fn workspace_config_backend_validators_reject_path_and_connection_transplant_even_for_identical_sources()
+ {
+    use crate::wip::WipOperationError;
+    use wip_protocol::ProtocolErrorCode;
+    let client = Router::new();
+    let path = "profiles/team/deep/model.dcdl";
+    client
+        .state
+        .lock()
+        .unwrap()
+        .entries
+        .get_mut(path)
+        .unwrap()
+        .1 = "model = old".into();
+    let (feature, runtime) = runtime(client.clone());
+    let first = feature.attach("path-binding", None).await.unwrap();
+    let backend = backend::WorkspaceConfigBackend::new(client.clone());
+    let (main_validator, deep_validator) = {
+        let state = client.state.lock().unwrap();
+        (state.validator("main.dcdl"), state.validator(path))
+    };
+    assert_ne!(main_validator, deep_validator);
+    let read = |connection_id: String, validator: String| WorkspaceConfigReadRequest {
+        connection_id,
+        path: path.into(),
+        validator,
+    };
+    let result = backend
+        .post::<WorkspaceConfigReadResponse, _>(
+            "/read",
+            &read(first.connection_id.clone(), main_validator),
+            false,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::ValidatorMismatch)
+    );
+    let result: WorkspaceConfigReadResponse = backend
+        .post(
+            "/read",
+            &read(first.connection_id.clone(), deep_validator.clone()),
+            false,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("correct path validator rejected"));
+    assert_eq!(result.content, "model = old");
+    assert_eq!(result.validator, deep_validator);
+    client.state.lock().unwrap().active = None;
+    let second = feature.attach("connection-binding", None).await.unwrap();
+    assert_ne!(first.connection_id, second.connection_id);
+    for connection in [first.connection_id, second.connection_id.clone()] {
+        let result = backend
+            .post::<WorkspaceConfigReadResponse, _>(
+                "/read",
+                &read(connection, deep_validator.clone()),
+                false,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::ValidatorMismatch)
+        );
+    }
+    // Fresh path/connection observation restores native common mutation access,
+    // and the returned exact post-operation validator also supports common reads.
+    let route = format!("/workspace-config/{path}");
+    observe_interface(&runtime, &route, true).await;
+    call(
+        &runtime,
+        &route,
+        "write",
+        json!({"content":"model = updated"}),
+    )
+    .await
+    .unwrap();
+    let result = call(&runtime, &route, "read_lines", json!({}))
+        .await
+        .unwrap();
+    assert!(result.content.unwrap().contains("model = updated"));
+    assert_eq!(client.state.lock().unwrap().commits.len(), 1);
 }

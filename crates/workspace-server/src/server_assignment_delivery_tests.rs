@@ -799,7 +799,6 @@ impl DeliveryWorkerFactory {
             worker::WorkerFilesystemAuthority::None,
             worker::WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: root.join(uuid::Uuid::now_v7().to_string()),
-                bash_output_dir: root.join("bash-output"),
             },
             worker::WorkerControllerTransport::InProcess,
         )

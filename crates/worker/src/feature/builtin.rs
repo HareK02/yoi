@@ -5,6 +5,7 @@
 //! an external plugin-loading surface.
 
 pub mod backend_job_result;
+pub(crate) mod bash;
 
 /// Host metadata participants are independent of model-facing Tool enablement.
 /// Disabling a Feature must not preserve stale Session-bound authority evidence.

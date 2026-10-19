@@ -471,11 +471,10 @@ async fn generated_workdir_provider_errors_preserve_response_and_log_details() {
     ));
     // Seed an already registered command, without launching a real process.
     let provider_handle = CommandHandle("logging-command".to_string());
-    session
-        .active_commands
-        .lock()
-        .await
-        .insert(provider_handle.0.clone(), provider_handle.clone());
+    session.active_commands.lock().await.insert(
+        provider_handle.0.clone(),
+        Arc::new(ExternalProviderCommandState::new(provider_handle.clone())),
+    );
     let handle = fixture
         .api
         .workdir_sessions
@@ -720,7 +719,7 @@ async fn self_workdir_provider_refusals_log_operation_identity_without_request_t
             Reason::ScopedCapabilityDenied,
         ),
         (
-            json!({"operation": "command_start", "request": {"command": secret, "timeout_secs": 1, "output_limit": 1024, "cwd": "", "tool_call_id": secret}}),
+            json!({"operation": "command_start", "request": {"command": secret, "timeout_secs": 1, "transport_byte_budget": 1048576, "cwd": "", "tool_call_id": secret}}),
             "command_start",
             "denied",
             Reason::ScopedCapabilityDenied,
@@ -942,8 +941,8 @@ async fn self_workdir_post_start_registration_failure_does_not_claim_pre_dispatc
         serde_json::to_vec(&json!({
             "target_workdir": "checkout",
             "operation": {"operation": "command_start", "request": {
-                "command": "body-secret", "timeout_secs": 1, "output_limit": 1024,
-                "cwd": "", "spill_dir": null, "tool_call_id": "body-secret"
+                "command": "body-secret", "timeout_secs": 1, "transport_byte_budget": 1048576,
+                "cwd": "", "tool_call_id": "body-secret"
             }}
         }))
         .unwrap(),
@@ -1071,8 +1070,8 @@ async fn saturated_host_before_command_start_returns_availability_without_a_prov
         serde_json::to_vec(&json!({
             "target_workdir": "checkout",
             "operation": {"operation": "command_start", "request": {
-                "command": "not-dispatched", "timeout_secs": 1, "output_limit": 1024,
-                "cwd": "", "spill_dir": null, "tool_call_id": "not-dispatched"
+                "command": "not-dispatched", "timeout_secs": 1, "transport_byte_budget": 1048576,
+                "cwd": "", "tool_call_id": "not-dispatched"
             }}
         }))
         .unwrap(),
