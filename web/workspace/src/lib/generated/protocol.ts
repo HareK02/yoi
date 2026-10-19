@@ -178,6 +178,8 @@ compaction?: InFlightCompaction | null, };
 
 export type SessionEntryProvenance = "human_input" | "worker_input" | "flow_instruction" | "backend_instruction" | "model_output" | "tool_output" | "derived_summary" | "legacy_unknown";
 
+export type SessionEntryUsePolicy = { observation_readable: boolean, memory_evidence: boolean, };
+
 export type SessionMessageRole = "user" | "assistant";
 
 export type SessionContentPart = { "kind": "text", text: string, } | { "kind": "refusal", refusal: string, };
