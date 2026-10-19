@@ -914,3 +914,82 @@ async fn waiting_remote_command_rejects_empty_response_without_http_busy_loop() 
     })
     .await;
 }
+
+#[tokio::test]
+async fn remote_checked_byte_read_uses_common_contract_and_keeps_binary_boundaries() {
+    use base64::Engine as _;
+    let fixture = HttpFixture::new(WorkdirSessionCapabilities::READ_ONLY).await;
+    let remote = Arc::new(fixture.open(TOKEN).await.unwrap());
+    let (runtime, _) = native_runtime(remote);
+    let path = "/checkouts/main/src/deep/a.txt";
+    observe_interface(&runtime, path).await;
+    let output = runtime
+        .invoke(
+            path.into(),
+            crate::file_operation::Contract::ReadBytes.reference(),
+            "read".into(),
+            json!({"offset":1,"limit":3}),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let json: Json = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    assert_eq!(json["encoding"], "base64");
+    assert_eq!(json["offset"], 1);
+    assert_eq!(json["next_offset"], 4);
+    let source = fixture
+        .state
+        .session
+        .read_bytes(workdir::ReadBytesRequest {
+            path: WorkdirPath::new("src/deep/a.txt").unwrap(),
+            offset: 1,
+            max_bytes: 3,
+            expected_hash: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(json["data"].as_str().unwrap())
+            .unwrap(),
+        source.bytes
+    );
+}
+
+#[tokio::test]
+async fn http_failed_text_read_does_not_authorize_mutations() {
+    for operation in ["write", "edit"] {
+        for oversized in ["\"".repeat(50_000), "x".repeat(65_530)] {
+            let fixture = HttpFixture::new(WorkdirSessionCapabilities::READ_WRITE).await;
+            let remote = fixture.open(TOKEN).await.unwrap();
+            checkout_wip_tests::failed_text_read_cannot_authorize_mutation(
+                Arc::new(remote),
+                &fixture.dir.path().join("text"),
+                &oversized,
+                operation,
+            )
+            .await;
+            let mutations = fixture
+                .state
+                .operations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        op,
+                        WorkdirSessionOperation::CheckoutExecute(CheckoutRequest {
+                            operation: CheckoutOperation::Write { .. }
+                                | CheckoutOperation::Edit { .. },
+                            ..
+                        })
+                    )
+                })
+                .count();
+            assert_eq!(
+                mutations, 1,
+                "only the mutation after a successful Read may reach the provider"
+            );
+        }
+    }
+}

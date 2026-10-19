@@ -517,7 +517,7 @@ async fn user_uploaded_markdown_roundtrips_through_workdirless_tools_and_native_
                 read["entry"]["metadata"]["last_mutation_id"],
                 uploaded["entry"]["last_mutation_id"]
             );
-            value(native_tool(&tools, "Invoke", json!({"path":path,"interface":reference,"operation":"write","arguments":{"content":updated_text}})).await.unwrap())
+            value(native_tool(&tools, "Invoke", json!({"path":path,"interface":file_write_reference(&inspected),"operation":"write","arguments":{"content":updated_text}})).await.unwrap())["metadata"].clone()
         } else {
             let read = value(
                 tool(&f.features[0], "DriveRead", json!({"entry":id}))
@@ -733,6 +733,19 @@ async fn worker_removal_preserves_drive_reference_for_explicitly_granted_replace
         .await
         .unwrap();
     assert!(f.api.runtime.worker(old).is_err());
+    let client = f.clients[0].clone();
+    let capability = tokio::task::spawn_blocking(move || {
+        client.request(
+            WorkspaceRequestMethod::Get,
+            format!("{}/capabilities", base()),
+            vec![],
+            65536,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!(200..300).contains(&capability.status));
     assert!(
         f.api
             .store
@@ -1571,11 +1584,30 @@ impl agen::llm_client::LlmClient for NoLlm {
         panic!("native tool fixture must not call an LLM")
     }
 }
+fn file_write_reference(observed: &Value) -> Value {
+    observed["interfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["reference"]["name"] == "yoi.file/write-text/v1")
+        .expect("write capability")["reference"]
+        .clone()
+}
 fn native_tools(
     feature: &DriveFeature,
 ) -> std::collections::BTreeMap<String, Arc<dyn agen::tool::Tool>> {
+    native_tools_with_checkouts(feature, None)
+}
+fn native_tools_with_checkouts(
+    feature: &DriveFeature,
+    router: Option<Arc<WorkdirSessionRouter>>,
+) -> std::collections::BTreeMap<String, Arc<dyn agen::tool::Tool>> {
     let mut mounts = worker::wip::WipMountRegistry::new();
     worker::feature::builtin::drive::wip::mount_drive_wip(&mut mounts, feature).unwrap();
+    if let Some(router) = router {
+        worker::checkout::mount_checkouts(&mut mounts, router, tools::Tracker::new(), None)
+            .unwrap();
+    }
     let mut engine = agen::Engine::<_, agen::state::Mutable, ()>::new_annotated(NoLlm);
     engine.register_tools(
         feature
@@ -1651,7 +1683,14 @@ async fn native_tree_does_not_index_entries_but_direct_inspect_and_invoke_use_cu
     );
     assert_eq!(read["text"], "native content");
     let denied_write = native_tool(&tools, "Invoke", json!({"path":path,"interface":reference,"operation":"write","arguments":{"content":"lost"}})).await;
-    denied(denied_write);
+    assert!(denied_write.is_err());
+    assert!(
+        !inspected["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["reference"]["name"] == "yoi.file/write-text/v1")
+    );
     f.revoke(1).await;
     assert!(
         native_tool(
@@ -1705,12 +1744,12 @@ async fn native_create_and_write_use_client_managed_committed_requests_and_rejec
             .await
             .unwrap(),
     );
-    let updated = value(native_tool(&first, "Invoke", json!({"path":path,"interface":observed_first["interfaces"][0]["reference"],"operation":"write","arguments":{"content":"committed"}})).await.unwrap());
+    let updated = value(native_tool(&first, "Invoke", json!({"path":path,"interface":file_write_reference(&observed_first),"operation":"write","arguments":{"content":"committed"}})).await.unwrap())["metadata"].clone();
     assert_ne!(
         updated["entry"]["metadata"]["last_mutation_id"],
         created["entry"]["metadata"]["last_mutation_id"]
     );
-    let error = native_tool(&second, "Invoke", json!({"path":path,"interface":observed_second["interfaces"][0]["reference"],"operation":"write","arguments":{"content":"lost"}})).await.unwrap_err();
+    let error = native_tool(&second, "Invoke", json!({"path":path,"interface":file_write_reference(&observed_second),"operation":"write","arguments":{"content":"lost"}})).await.unwrap_err();
     assert!(
         error.to_string().to_lowercase().contains("validator"),
         "stale native mutation must report validator conflict: {error:?}"
@@ -1831,5 +1870,145 @@ async fn image_attachment_retains_original_bytes_after_drive_update_and_revocati
         image.data(),
         original,
         "history attachment must not fetch latest Drive content"
+    );
+}
+
+#[tokio::test]
+async fn common_file_inspect_invoke_crosses_drive_and_checkout_without_transferring_authority() {
+    let f = Fixture::new(["read_write", "read_only"]).await;
+    let created = f.create("common.md", "first\n雪 needle\nlast\n").await;
+    let path = created["entry"]["path"].as_str().unwrap();
+    let checkout = f._temp.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("file"), "first\n雪 needle\nlast\n").unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            workdir::WorkdirAttachmentAlias::new("main").unwrap(),
+            Arc::new(workdir::LocalWorkdirSession::materialized(
+                checkout.clone(),
+                checkout.clone(),
+                manifest::SharedScope::new(manifest::Scope::writable(&checkout).unwrap()),
+                workdir::WorkdirSessionCapabilities::READ_WRITE,
+            )),
+        )
+        .unwrap();
+    let tools = native_tools_with_checkouts(&f.features[0], Some(router));
+    let drive = value(
+        native_tool(&tools, "Inspect", json!({"path":path}))
+            .await
+            .unwrap(),
+    );
+    let local = value(
+        native_tool(&tools, "Inspect", json!({"path":"/checkouts/main/file"}))
+            .await
+            .unwrap(),
+    );
+    for name in [
+        "yoi.file/read-lines/v1",
+        "yoi.file/search-text/v1",
+        "yoi.file/edit-text/v1",
+        "yoi.file/write-text/v1",
+    ] {
+        let selected = drive["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["reference"]["name"] == name)
+            .unwrap();
+        let reference = &selected["reference"];
+        assert_eq!(reference["scope"], "/");
+        assert!(
+            local["interfaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["reference"] == *reference)
+        );
+        let signature = value(
+            native_tool(&tools, "Inspect", json!({"path":selected["path"]}))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            signature["interface_signature"]
+                .as_str()
+                .unwrap()
+                .contains(name)
+        );
+        let (operation, arguments) = match name {
+            "yoi.file/read-lines/v1" => ("read", json!({"offset":1,"limit":1})),
+            "yoi.file/search-text/v1" => ("search", json!({"pattern":"needle","limit":2})),
+            "yoi.file/edit-text/v1" => {
+                ("edit", json!({"old_string":"needle","new_string":"found"}))
+            }
+            _ => ("write", json!({"content":"saved\n"})),
+        };
+        let mut results = vec![];
+        for target in [path, "/checkouts/main/file"] {
+            results.push(value(native_tool(&tools,"Invoke",json!({"path":target,"interface":reference,"operation":operation,"arguments":arguments})).await.unwrap()));
+        }
+        if matches!(operation, "read" | "search") {
+            assert_eq!(results[0], results[1]);
+        } else {
+            assert!(results.iter().all(|v| v.get("metadata").is_some()));
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(checkout.join("file")).unwrap(),
+        "saved\n"
+    );
+    assert_eq!(
+        value(
+            tool(
+                &f.features[1],
+                "DriveRead",
+                json!({"entry":entry(&created)})
+            )
+            .await
+            .unwrap()
+        )["text"],
+        "saved\n"
+    );
+    // A capability query is not a grant: drop the writer to readonly after the common write was cached.
+    f.revoke(0).await;
+    owner_call(&f.api,&f.owner,"POST",&format!("{}/grants",base()),Some(json!({"runtime_id":f.clients[0].worker.runtime_id,"worker_id":f.clients[0].worker.worker_id,"access":"read_only"}))).await;
+    assert!(native_tool(&tools,"Invoke",json!({"path":path,"interface":file_write_reference(&drive),"operation":"write","arguments":{"content":"lost"}})).await.is_err());
+    let refreshed = value(
+        native_tool(&tools, "Inspect", json!({"path":path,"refresh":true}))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        !refreshed["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["reference"]["name"] == "yoi.file/write-text/v1")
+    );
+    let common_read = json!({"scope":"/","name":"yoi.file/read-lines/v1"});
+    assert_eq!(
+        value(
+            native_tool(
+                &tools,
+                "Invoke",
+                json!({"path":path,"interface":common_read,"operation":"read","arguments":{}})
+            )
+            .await
+            .unwrap()
+        )["content"],
+        "     1\tsaved\n"
+    );
+    assert_eq!(
+        value(
+            tool(
+                &f.features[1],
+                "DriveRead",
+                json!({"entry":entry(&created)})
+            )
+            .await
+            .unwrap()
+        )["text"],
+        "saved\n"
     );
 }
