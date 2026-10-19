@@ -982,6 +982,17 @@ pub enum SessionEntryProvenance {
     LegacyUnknown,
 }
 
+/// Public use decisions contain no Feature identity or private payload. Absence
+/// denotes the older projection contract, not permission to expose System input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SessionEntryUsePolicy {
+    pub observation_readable: bool,
+    pub memory_evidence: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -994,6 +1005,8 @@ pub struct SessionSnapshotEntry {
     pub provenance: SessionEntryProvenance,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derived_from: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_policy: Option<SessionEntryUsePolicy>,
     #[serde(flatten)]
     pub data: SessionSnapshotEntryData,
 }
@@ -2619,6 +2632,7 @@ mod tests {
             session: SessionSnapshot {
                 pending_submissions: PendingSubmissionsSnapshot::default(),
                 entries: vec![SessionSnapshotEntry {
+                    use_policy: None,
                     entry_id: "entry-1".into(),
                     timestamp: 1,
                     provenance: SessionEntryProvenance::HumanInput,

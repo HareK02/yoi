@@ -22,6 +22,7 @@ fn seed(
                 content: vec![crate::LoggedContentPart::Text { text: text.into() }],
             },
             metadata: LoggedSessionHistoryMetadata {
+                system_input: None,
                 entry_id: LoggedSessionHistoryEntryId("summary".into()),
                 origin,
                 derivation: Some(crate::LoggedHistoryDerivation {

@@ -1621,6 +1621,7 @@ allow = []
         let history = |id: &str, item: LoggedItem| LoggedHistoryEntry {
             item,
             metadata: LoggedSessionHistoryMetadata {
+                system_input: None,
                 entry_id: LoggedSessionHistoryEntryId(id.into()),
                 origin: LoggedSessionHistoryOrigin::BackendInstruction { operation_id: None },
                 derivation: None,

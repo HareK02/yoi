@@ -74,6 +74,7 @@ impl std::fmt::Display for SessionEntryRef {
 pub(crate) enum ReferenceKind {
     User,
     Assistant,
+    System,
     Tool,
 }
 
@@ -82,6 +83,7 @@ impl ReferenceKind {
         match self {
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::System => "system",
             Self::Tool => "tool",
         }
     }
@@ -90,6 +92,7 @@ impl ReferenceKind {
         match value {
             "user" => Some(Self::User),
             "assistant" | "agent" => Some(Self::Assistant),
+            "system" => Some(Self::System),
             "tool" => Some(Self::Tool),
             _ => None,
         }
@@ -131,6 +134,7 @@ pub(crate) struct OverviewItem {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReferenceEntry {
+    use_policy: Option<protocol::SessionEntryUsePolicy>,
     pub id: SessionEntryRef,
     pub origin: SessionEntryProvenance,
     pub entry_range: [u64; 2],
@@ -242,6 +246,7 @@ pub(crate) struct SessionEntryEvidence {
 
 #[derive(Debug, Clone)]
 struct CapturedHistoryEntry {
+    use_policy: Option<protocol::SessionEntryUsePolicy>,
     item: Item,
     entry_id: session_store::LoggedSessionHistoryEntryId,
     origin: SessionEntryProvenance,
@@ -302,10 +307,12 @@ impl SessionCapture {
                         is_error,
                         attachments: _,
                     } => Item::tool_result_item(call_id, summary, content, is_error),
-                    // Observation deliberately excludes system items and
-                    // controller errors from model-visible session evidence.
-                    SessionSnapshotEntryData::SystemItem { .. }
-                    | SessionSnapshotEntryData::Invoke { .. }
+                    SessionSnapshotEntryData::SystemItem { content, .. } => {
+                        entry.use_policy?;
+                        Item::system_message(content)
+                    }
+                    // Controller errors are not model-visible evidence.
+                    SessionSnapshotEntryData::Invoke { .. }
                     | SessionSnapshotEntryData::Usage { .. }
                     | SessionSnapshotEntryData::RunStats { .. }
                     | SessionSnapshotEntryData::RunYielded { .. }
@@ -314,6 +321,7 @@ impl SessionCapture {
                     | SessionSnapshotEntryData::RunError { .. } => return None,
                 };
                 Some(CapturedHistoryEntry {
+                    use_policy: entry.use_policy,
                     item,
                     entry_id: session_store::LoggedSessionHistoryEntryId(entry.entry_id),
                     origin: entry.provenance,
@@ -328,6 +336,7 @@ impl SessionCapture {
             .into_iter()
             .enumerate()
             .map(|(index, item)| CapturedHistoryEntry {
+                use_policy: None,
                 item,
                 entry_id: session_store::LoggedSessionHistoryEntryId(format!("{index:08}")),
                 origin: SessionEntryProvenance::LegacyUnknown,
@@ -342,10 +351,21 @@ impl SessionCapture {
     ) -> Self {
         let entries = entries
             .into_iter()
-            .map(|entry| CapturedHistoryEntry {
-                item: entry.item,
-                entry_id: entry.annotation.entry_id,
-                origin: public_provenance(&entry.annotation.origin),
+            .map(|entry| {
+                let (item, use_policy) = if let Some(input) = &entry.annotation.system_input {
+                    (
+                        Item::system_message(input.public_projection().body),
+                        Some(input.public_use_policy()),
+                    )
+                } else {
+                    (entry.item, None)
+                };
+                CapturedHistoryEntry {
+                    item,
+                    use_policy,
+                    entry_id: entry.annotation.entry_id,
+                    origin: public_provenance(&entry.annotation.origin),
+                }
             })
             .collect();
         Self::from_captured_entries(segment_id, entries)
@@ -364,7 +384,8 @@ impl SessionCapture {
             let entry_range = [idx as u64, idx as u64];
             match item {
                 Item::Message { role, content, .. } => {
-                    let Some(kind) = message_reference_kind(&entry.origin, role) else {
+                    let Some(kind) = message_reference_kind(&entry.origin, role, entry.use_policy)
+                    else {
                         continue;
                     };
                     let text = content
@@ -376,6 +397,7 @@ impl SessionCapture {
                     let summary = truncate_chars(&text, 240);
                     let id = SessionEntryRef::from_history_entry_id(&entry.entry_id);
                     index.push(ReferenceEntry {
+                        use_policy: entry.use_policy,
                         id: id.clone(),
                         origin: entry.origin.clone(),
                         entry_range,
@@ -386,7 +408,9 @@ impl SessionCapture {
                         summary: summary.clone(),
                         search_text: text.clone(),
                     });
-                    if matches!(kind, ReferenceKind::User | ReferenceKind::Assistant) {
+                    if entry.use_policy.is_none_or(|p| p.observation_readable)
+                        && matches!(kind, ReferenceKind::User | ReferenceKind::Assistant)
+                    {
                         overview.push(OverviewItem {
                             id: id.clone(),
                             origin: entry.origin.clone(),
@@ -403,6 +427,7 @@ impl SessionCapture {
                 } => {
                     let text = format!("{name}\n{arguments}");
                     index.push(ReferenceEntry {
+                        use_policy: entry.use_policy,
                         id: SessionEntryRef::from_history_entry_id(&entry.entry_id),
                         origin: entry.origin.clone(),
                         entry_range,
@@ -430,6 +455,7 @@ impl SessionCapture {
                         content.as_deref().unwrap_or_default(),
                     );
                     index.push(ReferenceEntry {
+                        use_policy: entry.use_policy,
                         id: SessionEntryRef::from_history_entry_id(&entry.entry_id),
                         origin: entry.origin.clone(),
                         entry_range,
@@ -510,6 +536,9 @@ impl SessionCapture {
         let mut hits = Vec::new();
 
         for entry in &self.index {
+            if entry.use_policy.is_some_and(|p| !p.observation_readable) {
+                continue;
+            }
             if entry.entry_range[0] < min_entry_index || entry.entry_range[0] > max_entry_index {
                 continue;
             }
@@ -581,6 +610,9 @@ impl SessionCapture {
         };
 
         for entry in selected {
+            if entry.use_policy.is_some_and(|p| !p.observation_readable) {
+                continue;
+            }
             if entries.len() >= max_items {
                 truncated = true;
                 break;
@@ -695,21 +727,11 @@ impl SessionCapture {
 
     pub(crate) fn evidence_for(&self, id: &str) -> Option<SessionEntryEvidence> {
         let entry = self.index.iter().find(|entry| entry.id.as_str() == id)?;
-        let excerpt = self
-            .read(
-                ReadSelector::Id(id),
-                ReadOptions {
-                    include_tools: true,
-                    tool_part: ToolPart::Both,
-                    detail: ReadDetail::Compact,
-                    max_items: 1,
-                    max_bytes: 2 * 1024,
-                },
-            )
-            .entries
-            .first()
-            .map(|entry| entry.text.clone())
-            .unwrap_or_else(|| entry.summary.clone());
+        if entry.use_policy.is_some_and(|p| !p.memory_evidence) {
+            return None;
+        }
+        let item = &self.entries.get(entry.entry_range[0] as usize)?.item;
+        let excerpt = render_item(item, entry, ReadDetail::Compact, 2 * 1024);
         Some(SessionEntryEvidence {
             segment_id: self.segment_id.clone(),
             entry_ref: entry.id.clone(),
@@ -731,9 +753,8 @@ fn public_provenance(origin: &WorkerHistoryProvenance) -> SessionEntryProvenance
         }
         WorkerHistoryProvenance::WorkerInput { .. } => SessionEntryProvenance::WorkerInput,
         WorkerHistoryProvenance::FlowInstruction { .. } => SessionEntryProvenance::FlowInstruction,
-        WorkerHistoryProvenance::BackendInstruction { .. } => {
-            SessionEntryProvenance::BackendInstruction
-        }
+        WorkerHistoryProvenance::BackendInstruction { .. }
+        | WorkerHistoryProvenance::Provided { .. } => SessionEntryProvenance::BackendInstruction,
         WorkerHistoryProvenance::ModelOutput { .. } => SessionEntryProvenance::ModelOutput,
         WorkerHistoryProvenance::ToolOutput { .. } => SessionEntryProvenance::ToolOutput,
         WorkerHistoryProvenance::CompactionSummary
@@ -746,7 +767,15 @@ fn public_provenance(origin: &WorkerHistoryProvenance) -> SessionEntryProvenance
 fn message_reference_kind(
     origin: &SessionEntryProvenance,
     provider_role: &Role,
+    use_policy: Option<protocol::SessionEntryUsePolicy>,
 ) -> Option<ReferenceKind> {
+    if use_policy.is_some() {
+        return match provider_role {
+            Role::System => Some(ReferenceKind::System),
+            Role::User => Some(ReferenceKind::User),
+            Role::Assistant => Some(ReferenceKind::Assistant),
+        };
+    }
     match origin {
         SessionEntryProvenance::HumanInput | SessionEntryProvenance::WorkerInput => {
             Some(ReferenceKind::User)
@@ -947,6 +976,148 @@ mod tests {
                     .entries
                     .is_empty()
             );
+        }
+    }
+
+    #[test]
+    fn generic_public_input_observation_and_memory_policies_survive_store_restore_independently() {
+        use session_store::{
+            FeatureInputPayload, FsStore, InputCompactionUse, InputEvidenceUse,
+            InputObservationUse, LogEntry, LoggedSystemHistoryEntry, PublicSystemItem,
+            PublicSystemPresentation, Store, SystemInputEnvelope, SystemInputMetadata,
+            SystemInputUsePolicy,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store = FsStore::new(root.path()).unwrap();
+        let session = session_store::new_session_id();
+        let segment = session_store::new_segment_id();
+        store
+            .create_segment(
+                session,
+                segment,
+                &[LogEntry::AnnotatedSegmentStart {
+                    ts: 1,
+                    session_id: session,
+                    system_prompt: None,
+                    config: Default::default(),
+                    history: vec![],
+                    forked_from: None,
+                    compacted_from: None,
+                }],
+            )
+            .unwrap();
+        let mut inputs = Vec::new();
+        for (producer, observation, memory_evidence, public) in [
+            (
+                "same",
+                InputObservationUse::Readable,
+                InputEvidenceUse::Exclude,
+                true,
+            ),
+            (
+                "same",
+                InputObservationUse::Hidden,
+                InputEvidenceUse::Include,
+                true,
+            ),
+            (
+                "renamed",
+                InputObservationUse::Readable,
+                InputEvidenceUse::Include,
+                true,
+            ),
+            (
+                "renamed",
+                InputObservationUse::Hidden,
+                InputEvidenceUse::Exclude,
+                true,
+            ),
+            (
+                "private",
+                InputObservationUse::Readable,
+                InputEvidenceUse::Include,
+                false,
+            ),
+        ] {
+            let entry = LoggedSystemHistoryEntry::from_input(
+                WorkerHistoryProvenance::Provided {
+                    producer: producer.into(),
+                },
+                None,
+                SystemInputEnvelope::new(
+                    "private model text",
+                    SystemInputMetadata::new(
+                        SystemInputUsePolicy {
+                            recording_material: InputEvidenceUse::Exclude,
+                            memory_evidence,
+                            observation,
+                            compaction: InputCompactionUse::ReferenceInput,
+                        },
+                        Some(
+                            FeatureInputPayload::encode(
+                                "future:owner",
+                                99,
+                                &serde_json::json!({ "secret": "private metadata" }),
+                            )
+                            .unwrap(),
+                        ),
+                        public.then(|| PublicSystemItem {
+                            kind: "supplied-context".into(),
+                            body: "public context: do not extract this".into(),
+                            presentation: PublicSystemPresentation::Context,
+                        }),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            );
+            store
+                .append(
+                    session,
+                    segment,
+                    &LogEntry::AnnotatedSystemItem {
+                        ts: 2,
+                        entry: entry.clone(),
+                        extensions: vec![],
+                    },
+                )
+                .unwrap();
+            inputs.push(entry);
+        }
+        let saved = store.read_all(session, segment).unwrap();
+        let restored =
+            crate::session_history::restore_history_entries(session, segment, &saved).unwrap();
+        let snapshot = session_store::public_snapshot::project_session_snapshot(session, &saved);
+        let snapshot: SessionSnapshot =
+            serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap();
+        for capture in [
+            SessionCapture::from_history_entries(segment.to_string(), restored),
+            SessionCapture::from_session_snapshot(segment.to_string(), snapshot),
+        ] {
+            let hits = capture.search(&SearchOptions {
+                kind: Some(ReferenceKind::System),
+                ..Default::default()
+            });
+            assert_eq!(hits.len(), 2);
+            for (index, input) in inputs.iter().enumerate() {
+                let reference = SessionEntryRef::from_history_entry_id(&input.metadata.entry_id);
+                let read =
+                    capture.read(ReadSelector::Id(reference.as_str()), ReadOptions::default());
+                assert_eq!(!read.entries.is_empty(), matches!(index, 0 | 2));
+                let evidence = capture.evidence_for(reference.as_str());
+                assert_eq!(evidence.is_some(), matches!(index, 1 | 2));
+                for text in read
+                    .entries
+                    .iter()
+                    .map(|entry| entry.text.as_str())
+                    .chain(evidence.iter().map(|entry| entry.excerpt.as_str()))
+                {
+                    assert!(text.contains("public context: do not extract this"));
+                    assert!(!text.contains("private model text"));
+                    assert!(!text.contains("private metadata"));
+                    assert!(!text.contains("future:owner"));
+                }
+            }
         }
     }
 

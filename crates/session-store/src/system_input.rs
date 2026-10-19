@@ -36,6 +36,10 @@ pub enum SystemInputError {
     UnsupportedPayload,
     #[error("system input payload does not match the owner's typed contract")]
     InvalidTypedPayload,
+    #[error("generic system input is missing explicit metadata")]
+    MissingMetadata,
+    #[error("system input metadata does not match its logical record")]
+    InconsistentRecord,
 }
 
 /// One private payload owned by a Feature's versioned typed decoder.
@@ -228,6 +232,23 @@ impl SystemInputMetadata {
 
     pub fn public_item(&self) -> Option<&PublicSystemItem> {
         self.public.as_ref()
+    }
+
+    pub fn public_use_policy(&self) -> protocol::SessionEntryUsePolicy {
+        let has_public = self.public.is_some();
+        protocol::SessionEntryUsePolicy {
+            observation_readable: has_public
+                && self.usage.observation == InputObservationUse::Readable,
+            memory_evidence: has_public && self.usage.memory_evidence == InputEvidenceUse::Include,
+        }
+    }
+
+    pub fn public_projection(&self) -> PublicSystemItem {
+        self.public.clone().unwrap_or_else(|| PublicSystemItem {
+            kind: "input".into(),
+            body: String::new(),
+            presentation: crate::PublicSystemPresentation::Ignored,
+        })
     }
 }
 

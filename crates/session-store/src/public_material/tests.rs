@@ -9,6 +9,7 @@ fn entry(id: &str, item: LoggedItem) -> LoggedHistoryEntry {
     LoggedHistoryEntry {
         item,
         metadata: LoggedSessionHistoryMetadata {
+            system_input: None,
             entry_id: LoggedSessionHistoryEntryId(id.into()),
             origin: LoggedSessionHistoryOrigin::LocalHumanInput,
             derivation: None,
@@ -591,6 +592,7 @@ fn reasoning_proves_rollback_safety_but_private_and_derived_items_are_not_materi
                             },
                         },
                         metadata: LoggedSessionHistoryMetadata {
+                            system_input: None,
                             entry_id: LoggedSessionHistoryEntryId("startup-journal".into()),
                             origin: LoggedSessionHistoryOrigin::DerivedSummary,
                             derivation: None,
@@ -1241,5 +1243,167 @@ fn compaction_without_exact_derivation_or_with_invalid_turn_is_rejected() {
             SessionPublicMaterialReader::open_fs(temp.path(), session, segment, Default::default()),
             Err(PublicMaterialError::Inconsistent)
         ));
+    }
+}
+
+#[test]
+fn generic_system_material_uses_explicit_evidence_purpose_not_producer_or_body() {
+    use crate::{
+        FeatureInputPayload, InputCompactionUse, InputEvidenceUse, InputObservationUse,
+        LoggedSystemHistoryEntry, SystemInputEnvelope, SystemInputMetadata, SystemInputUsePolicy,
+    };
+    for worker_layout in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let session = crate::new_session_id();
+        let segment = crate::new_segment_id();
+        let fork = crate::new_segment_id();
+        let make = |producer: &str, recording_material, memory_evidence, body: &str| {
+            LoggedSystemHistoryEntry::from_input(
+                LoggedSessionHistoryOrigin::Provided {
+                    producer: producer.into(),
+                },
+                None,
+                SystemInputEnvelope::new(
+                    body,
+                    SystemInputMetadata::new(
+                        SystemInputUsePolicy {
+                            recording_material,
+                            memory_evidence,
+                            observation: InputObservationUse::Hidden,
+                            compaction: InputCompactionUse::Retain,
+                        },
+                        Some(
+                            FeatureInputPayload::encode(
+                                "unknown:future",
+                                99,
+                                &serde_json::json!({"private": "not-public"}),
+                            )
+                            .unwrap(),
+                        ),
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+        };
+        let inputs = [
+            make(
+                "same-owner",
+                InputEvidenceUse::Include,
+                InputEvidenceUse::Exclude,
+                "do not extract this; original material",
+            ),
+            make(
+                "same-owner",
+                InputEvidenceUse::Exclude,
+                InputEvidenceUse::Include,
+                "memory-only original",
+            ),
+            make(
+                "renamed-owner",
+                InputEvidenceUse::Exclude,
+                InputEvidenceUse::Exclude,
+                "reference without warning text",
+            ),
+        ];
+        let root = if worker_layout {
+            temp.path().join("worker")
+        } else {
+            temp.path().join(session.to_string())
+        };
+        let store: Box<dyn Store> = if worker_layout {
+            Box::new(WorkerSessionStore::new(&root).unwrap())
+        } else {
+            Box::new(FsStore::new(temp.path()).unwrap())
+        };
+        store
+            .create_segment(session, segment, &[seed(session, vec![])])
+            .unwrap();
+        for entry in &inputs {
+            store
+                .append(
+                    session,
+                    segment,
+                    &LogEntry::AnnotatedSystemItem {
+                        ts: 2,
+                        entry: entry.clone(),
+                        extensions: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .append(
+                session,
+                segment,
+                &LogEntry::TurnEnd {
+                    ts: 3,
+                    turn_count: 1,
+                },
+            )
+            .unwrap();
+        let mut fork_seed = seed(
+            session,
+            inputs
+                .iter()
+                .map(LoggedSystemHistoryEntry::to_history_entry)
+                .collect(),
+        );
+        if let LogEntry::AnnotatedSegmentStart { forked_from, .. } = &mut fork_seed {
+            *forked_from = Some(crate::SegmentOrigin {
+                segment_id: segment,
+                at_turn_index: 1,
+            });
+        }
+        store.create_segment(session, fork, &[fork_seed]).unwrap();
+        let open = |active, purpose| {
+            if worker_layout {
+                SessionPublicMaterialReader::open_worker_for_use(
+                    &root,
+                    active,
+                    Default::default(),
+                    crate::retention::fs_retention(temp.path()),
+                    purpose,
+                )
+                .unwrap()
+            } else {
+                SessionPublicMaterialReader::open_fs_for_use(
+                    temp.path(),
+                    session,
+                    active,
+                    Default::default(),
+                    crate::retention::fs_retention(temp.path()),
+                    purpose,
+                )
+                .unwrap()
+            }
+        };
+        for (purpose, selected, expected_text) in [
+            (
+                PublicMaterialUse::Recording,
+                0,
+                "do not extract this; original material",
+            ),
+            (PublicMaterialUse::MemoryEvidence, 1, "memory-only original"),
+        ] {
+            let original = open(segment, purpose);
+            let inherited = open(fork, purpose);
+            assert_eq!(
+                ids(&original),
+                vec![format!("E{}", inputs[selected].metadata.entry_id.0)]
+            );
+            assert_eq!(ids(&inherited), ids(&original));
+            let descriptor = inherited.descriptors().next().unwrap();
+            let body = inherited
+                .read_content(descriptor, 0, 16 * 1024)
+                .unwrap()
+                .content;
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["role"], "system");
+            assert_eq!(value["content"][0]["text"], expected_text);
+            assert!(!body.contains("not-public"));
+            assert!(!body.contains("unknown:future"));
+        }
     }
 }

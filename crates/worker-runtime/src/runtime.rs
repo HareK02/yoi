@@ -12422,6 +12422,7 @@ mod tests {
                 session: protocol::SessionSnapshot {
                     pending_submissions: protocol::PendingSubmissionsSnapshot::default(),
                     entries: vec![protocol::SessionSnapshotEntry {
+                        use_policy: None,
                         entry_id: "restored-log-entry".to_owned(),
                         timestamp: 1,
                         provenance: protocol::SessionEntryProvenance::LegacyUnknown,

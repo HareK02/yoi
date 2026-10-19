@@ -92,6 +92,9 @@ pub struct PromptRenderProvenance {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SystemItem {
+    /// Generic System body; private metadata and public presentation are supplied
+    /// independently by the producer in the same annotated history record.
+    Input { body: String },
     /// One-time derived Journal reference context. The bounded Host snapshot is
     /// retained as JSON independently of its rendered body and prompt projection.
     JournalStartup {
@@ -227,9 +230,9 @@ impl SystemItem {
                 event: event.clone(),
             },
             Self::TaskReminder { .. } => PublicSystemPresentation::TaskReminder,
-            Self::LegacyKnowledgeIgnored { .. } | Self::LegacyIgnored { .. } => {
-                PublicSystemPresentation::Ignored
-            }
+            Self::Input { .. }
+            | Self::LegacyKnowledgeIgnored { .. }
+            | Self::LegacyIgnored { .. } => PublicSystemPresentation::Ignored,
             Self::JournalStartup { .. }
             | Self::ResidentSummaryRefresh { .. }
             | Self::SubjectBehaviorRefresh { .. }
@@ -253,6 +256,7 @@ impl SystemItem {
     /// for this item. Returns the variant's stored `body` verbatim.
     pub fn history_text(&self) -> String {
         match self {
+            SystemItem::Input { body } => body.clone(),
             SystemItem::JournalStartup { body, .. } => body.clone(),
             SystemItem::Notification { body, .. } => body.clone(),
             SystemItem::WorkerEvent { body, .. } => body.clone(),
@@ -280,6 +284,7 @@ impl SystemItem {
     /// wire — keep flexible.
     pub fn kind_label(&self) -> &'static str {
         match self {
+            SystemItem::Input { .. } => "input",
             SystemItem::JournalStartup { .. } => "journal_startup",
             SystemItem::Notification { .. } => "notification",
             SystemItem::WorkerEvent { .. } => "worker_event",

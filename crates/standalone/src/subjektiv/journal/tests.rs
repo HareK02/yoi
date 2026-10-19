@@ -212,6 +212,7 @@ fn message(id: &str, text: &str) -> session_store::LoggedHistoryEntry {
             content: vec![session_store::LoggedContentPart::Text { text: text.into() }],
         },
         metadata: session_store::LoggedSessionHistoryMetadata {
+            system_input: None,
             entry_id: session_store::LoggedSessionHistoryEntryId(id.into()),
             origin: session_store::LoggedSessionHistoryOrigin::LocalHumanInput,
             derivation: None,

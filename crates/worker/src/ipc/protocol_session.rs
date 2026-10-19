@@ -90,7 +90,7 @@ pub fn live_log_entry_event(entry: LogEntry) -> Option<Event> {
         }
         LogEntry::AnnotatedSystemItem { entry, .. } => {
             let entry_id = Some(entry.metadata.entry_id.0.clone());
-            let value = serde_json::to_value(entry.item.public_item())
+            let value = serde_json::to_value(entry.public_item())
                 .expect("public system input is serializable");
             Some(Event::SystemItem {
                 entry_id,
@@ -348,6 +348,7 @@ mod tests {
                     prompt_provenance: None,
                 },
                 metadata: session_store::LoggedSessionHistoryMetadata {
+                    system_input: None,
                     entry_id: entry_id.clone(),
                     origin: session_store::LoggedSessionHistoryOrigin::BackendInstruction {
                         operation_id: None,

@@ -742,6 +742,7 @@ impl Store for WorkerSessionStore {
         segment_id: SegmentId,
         entry: &LogEntry,
     ) -> Result<(), StoreError> {
+        entry.validate_system_inputs()?;
         let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, true)?;
         self.append_log_entry(&self.log_path(segment_id), entry)
@@ -800,6 +801,9 @@ impl Store for WorkerSessionStore {
         segment_id: SegmentId,
         entries: &[LogEntry],
     ) -> Result<(), StoreError> {
+        for entry in entries {
+            entry.validate_system_inputs()?;
+        }
         let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, true)?;
         let mut content = Vec::new();
@@ -1430,6 +1434,7 @@ mod tests {
         LoggedHistoryEntry {
             item: LoggedItem::from(item),
             metadata: LoggedSessionHistoryMetadata {
+                system_input: None,
                 entry_id: LoggedSessionHistoryEntryId::new(),
                 origin: LoggedSessionHistoryOrigin::LegacyUnknown,
                 derivation: None,

@@ -3567,6 +3567,7 @@ mod completion_flow_tests {
         session_store::LoggedHistoryEntry {
             item: session_store::LoggedItem::from(item),
             metadata: session_store::LoggedSessionHistoryMetadata {
+                system_input: None,
                 entry_id: session_store::LoggedSessionHistoryEntryId::new(),
                 origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
                 derivation: None,
@@ -4324,6 +4325,7 @@ mod completion_flow_tests {
         }));
         app.handle_worker_event(Event::SessionEntryCommitted {
             entry: protocol::SessionSnapshotEntry {
+                use_policy: None,
                 entry_id: "run-failure".into(),
                 timestamp: 2,
                 provenance: protocol::SessionEntryProvenance::LegacyUnknown,

@@ -27,7 +27,7 @@ use thiserror::Error;
 
 use crate::{
     LogEntry, LoggedContentPart, LoggedHistoryEntry, LoggedItem, LoggedRole,
-    LoggedSessionHistoryOrigin, SegmentId, SegmentOrigin, SessionId, StoreError, SystemItem,
+    LoggedSessionHistoryOrigin, SegmentId, SegmentOrigin, SessionId, StoreError,
     WorkerAggregateStore, WorkerSessionStore, WorkerStoreError,
 };
 
@@ -1165,7 +1165,7 @@ fn capture_tool_correction(
     let LogEntry::ToolResultCorrected { entry, .. } = record else {
         return false;
     };
-    if let Some(data) = project_item(&entry.metadata.entry_id.0, &entry.item) {
+    if let Some(data) = project_history_item(entry) {
         // We read backwards: the first correction seen is the latest one.
         corrections
             .entry(entry.metadata.entry_id.0.clone())
@@ -1600,12 +1600,12 @@ pub(crate) fn project_session_snapshot_for_segment(
             } => extend_history(&mut entries, history, Some(segments), *ts),
             LogEntry::AnnotatedAssistantItem { ts, entry }
             | LogEntry::AnnotatedToolResult { ts, entry } => {
-                if let Some(data) = project_item(&entry.metadata.entry_id.0, &entry.item) {
+                if let Some(data) = project_history_item(entry) {
                     entries.push(history_entry(entry, *ts, data));
                 }
             }
             LogEntry::ToolResultCorrected { ts, entry } => {
-                if let Some(data) = project_item(&entry.metadata.entry_id.0, &entry.item) {
+                if let Some(data) = project_history_item(entry) {
                     if let Some(existing) = entries
                         .iter_mut()
                         .find(|existing| existing.entry_id == entry.metadata.entry_id.0)
@@ -1618,11 +1618,16 @@ pub(crate) fn project_session_snapshot_for_segment(
                 }
             }
             LogEntry::AnnotatedSystemItem { ts, entry, .. } => entries.push(system_entry(
-                &entry.item,
+                &entry.public_item(),
                 entry.metadata.entry_id.0.clone(),
                 *ts,
                 provenance(&entry.metadata.origin),
                 derivation_ids(entry),
+                entry
+                    .metadata
+                    .system_input
+                    .as_ref()
+                    .map(crate::SystemInputMetadata::public_use_policy),
             )),
             LogEntry::RunYielded {
                 ts,
@@ -1775,7 +1780,7 @@ fn extend_history(
                 segments: input_segments.cloned().unwrap_or_default(),
             }
         } else {
-            let Some(data) = project_item(&entry.metadata.entry_id.0, &entry.item) else {
+            let Some(data) = project_history_item(entry) else {
                 continue;
             };
             data
@@ -1790,6 +1795,11 @@ fn history_entry(
     data: SessionSnapshotEntryData,
 ) -> SessionSnapshotEntry {
     SessionSnapshotEntry {
+        use_policy: entry
+            .metadata
+            .system_input
+            .as_ref()
+            .map(crate::SystemInputMetadata::public_use_policy),
         entry_id: entry.metadata.entry_id.0.clone(),
         timestamp,
         provenance: provenance(&entry.metadata.origin),
@@ -1833,6 +1843,7 @@ fn run_transition_entry(
     data: SessionSnapshotEntryData,
 ) -> SessionSnapshotEntry {
     SessionSnapshotEntry {
+        use_policy: None,
         entry_id: persisted_entry_id
             .map(|entry_id| entry_id.0.clone())
             .unwrap_or_else(|| legacy_entry_id(session_key, segment_id, log_index, 0)),
@@ -1852,6 +1863,7 @@ fn legacy_entry(
     data: SessionSnapshotEntryData,
 ) -> SessionSnapshotEntry {
     SessionSnapshotEntry {
+        use_policy: None,
         entry_id: legacy_entry_id(session_key, segment_id, log_index, item_index),
         timestamp,
         provenance: SessionEntryProvenance::LegacyUnknown,
@@ -1884,9 +1896,8 @@ fn provenance(origin: &LoggedSessionHistoryOrigin) -> SessionEntryProvenance {
         LoggedSessionHistoryOrigin::FlowInstruction { .. } => {
             SessionEntryProvenance::FlowInstruction
         }
-        LoggedSessionHistoryOrigin::BackendInstruction { .. } => {
-            SessionEntryProvenance::BackendInstruction
-        }
+        LoggedSessionHistoryOrigin::BackendInstruction { .. }
+        | LoggedSessionHistoryOrigin::Provided { .. } => SessionEntryProvenance::BackendInstruction,
         LoggedSessionHistoryOrigin::ModelOutput { .. } => SessionEntryProvenance::ModelOutput,
         LoggedSessionHistoryOrigin::ToolOutput { .. } => SessionEntryProvenance::ToolOutput,
         LoggedSessionHistoryOrigin::CompactionSummary
@@ -1912,6 +1923,18 @@ pub fn session_tool_attachment_id(
     hash.update((data.len() as u64).to_be_bytes());
     hash.update(data);
     URL_SAFE_NO_PAD.encode(hash.finalize())
+}
+
+fn project_history_item(entry: &LoggedHistoryEntry) -> Option<SessionSnapshotEntryData> {
+    if let Some(input) = &entry.metadata.system_input {
+        let public = input.public_projection();
+        return Some(SessionSnapshotEntryData::SystemItem {
+            item_kind: public.kind.clone(),
+            content: public.body.clone(),
+            data: Some(serde_json::to_value(public).expect("public system input is serializable")),
+        });
+    }
+    project_item(&entry.metadata.entry_id.0, &entry.item)
 }
 
 fn project_item(entry_id: &str, item: &LoggedItem) -> Option<SessionSnapshotEntryData> {
@@ -1986,17 +2009,19 @@ fn project_item(entry_id: &str, item: &LoggedItem) -> Option<SessionSnapshotEntr
 }
 
 fn system_entry(
-    item: &SystemItem,
+    item: &crate::PublicSystemItem,
     entry_id: String,
     timestamp: u64,
     provenance: SessionEntryProvenance,
     derived_from: Vec<String>,
+    use_policy: Option<protocol::SessionEntryUsePolicy>,
 ) -> SessionSnapshotEntry {
-    let public = item.public_item();
+    let public = item.clone();
     let data = Some(serde_json::to_value(&public).expect("public system input is serializable"));
     let item_kind = public.kind;
     let content = public.body;
     SessionSnapshotEntry {
+        use_policy,
         entry_id,
         timestamp,
         provenance,
@@ -2285,6 +2310,7 @@ mod tests {
                 content: vec![LoggedContentPart::Text { text: text.into() }],
             },
             metadata: LoggedSessionHistoryMetadata {
+                system_input: None,
                 entry_id: LoggedSessionHistoryEntryId(entry_id.into()),
                 origin,
                 derivation: None,
@@ -3583,6 +3609,7 @@ mod tests {
             .map(|item| LoggedHistoryEntry {
                 item,
                 metadata: LoggedSessionHistoryMetadata {
+                    system_input: None,
                     entry_id: LoggedSessionHistoryEntryId::new(),
                     origin: LoggedSessionHistoryOrigin::LegacyUnknown,
                     derivation: None,
@@ -3637,6 +3664,7 @@ mod tests {
                         }],
                     },
                     metadata: LoggedSessionHistoryMetadata {
+                        system_input: None,
                         entry_id: user_entry_id,
                         origin: LoggedSessionHistoryOrigin::HumanInput {
                             account_id: "account-1".into(),
@@ -3706,6 +3734,7 @@ mod tests {
                                 }],
                             },
                             metadata: LoggedSessionHistoryMetadata {
+                                system_input: None,
                                 entry_id: LoggedSessionHistoryEntryId::new(),
                                 origin: LoggedSessionHistoryOrigin::FlowInstruction {
                                     selector: "builtin:coder-review".into(),
@@ -3725,6 +3754,7 @@ mod tests {
                                 }],
                             },
                             metadata: LoggedSessionHistoryMetadata {
+                                system_input: None,
                                 entry_id: user_entry_id.clone(),
                                 origin: origin.clone(),
                                 derivation: Some(LoggedHistoryDerivation {
@@ -3755,6 +3785,7 @@ mod tests {
     fn annotated_projection_preserves_identity_and_provenance() {
         let session_id = crate::new_session_id();
         let metadata = LoggedSessionHistoryMetadata {
+            system_input: None,
             entry_id: LoggedSessionHistoryEntryId::new(),
             origin: LoggedSessionHistoryOrigin::ModelOutput {
                 worker: LoggedWorkerSubject {
@@ -4317,6 +4348,7 @@ mod tests {
                 is_error: false,
             },
             metadata: LoggedSessionHistoryMetadata {
+                system_input: None,
                 entry_id: LoggedSessionHistoryEntryId("ancestor-image".into()),
                 origin: LoggedSessionHistoryOrigin::LegacyUnknown,
                 derivation: None,
@@ -4411,6 +4443,7 @@ mod tests {
                 is_error: false,
             },
             metadata: LoggedSessionHistoryMetadata {
+                system_input: None,
                 entry_id: LoggedSessionHistoryEntryId("tool-images".into()),
                 origin: LoggedSessionHistoryOrigin::LegacyUnknown,
                 derivation: None,

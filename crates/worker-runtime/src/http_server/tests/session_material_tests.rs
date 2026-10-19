@@ -35,6 +35,7 @@ fn message(id: &str, role: LoggedRole, text: &str) -> LoggedHistoryEntry {
             content: vec![LoggedContentPart::Text { text: text.into() }],
         },
         metadata: LoggedSessionHistoryMetadata {
+            system_input: None,
             entry_id: LoggedSessionHistoryEntryId(id.into()),
             origin: LoggedSessionHistoryOrigin::LocalHumanInput,
             derivation: None,

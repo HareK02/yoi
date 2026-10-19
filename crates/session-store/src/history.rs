@@ -67,6 +67,10 @@ pub enum LoggedSessionHistoryOrigin {
     ToolOutput {
         worker: LoggedWorkerSubject,
     },
+    /// Descriptive producer identity; use policies live in separate metadata.
+    Provided {
+        producer: String,
+    },
     /// Host-produced opening context summary; not auto-read or TaskStore material.
     CompactionSummary,
     /// Frozen Host Journal reference, never independent observation evidence.
@@ -86,14 +90,26 @@ pub struct LoggedSessionHistoryMetadata {
     pub origin: LoggedSessionHistoryOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derivation: Option<LoggedHistoryDerivation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_input: Option<crate::SystemInputMetadata>,
 }
 
 impl LoggedSessionHistoryMetadata {
+    fn validate_system_input(&self) -> Result<(), crate::SystemInputError> {
+        if matches!(self.origin, LoggedSessionHistoryOrigin::Provided { .. })
+            && self.system_input.is_none()
+        {
+            return Err(crate::SystemInputError::MissingMetadata);
+        }
+        Ok(())
+    }
+
     pub fn legacy_unknown() -> Self {
         Self {
             entry_id: LoggedSessionHistoryEntryId::new(),
             origin: LoggedSessionHistoryOrigin::LegacyUnknown,
             derivation: None,
+            system_input: None,
         }
     }
 }
@@ -101,18 +117,138 @@ impl LoggedSessionHistoryMetadata {
 /// Persisted item and metadata are one value so transforms cannot reorder or
 /// truncate one without the other.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "HistoryEntryWire")]
 pub struct LoggedHistoryEntry {
     pub item: LoggedItem,
     pub metadata: LoggedSessionHistoryMetadata,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryEntryWire {
+    item: LoggedItem,
+    metadata: LoggedSessionHistoryMetadata,
+}
+
+impl TryFrom<HistoryEntryWire> for LoggedHistoryEntry {
+    type Error = crate::SystemInputError;
+
+    fn try_from(wire: HistoryEntryWire) -> Result<Self, Self::Error> {
+        let entry = Self {
+            item: wire.item,
+            metadata: wire.metadata,
+        };
+        entry.validate_system_input()?;
+        Ok(entry)
+    }
+}
+
+impl LoggedHistoryEntry {
+    pub fn validate_system_input(&self) -> Result<(), crate::SystemInputError> {
+        self.metadata.validate_system_input()?;
+        if self.metadata.system_input.is_some() {
+            let LoggedItem::Message {
+                role: crate::LoggedRole::System,
+                content,
+            } = &self.item
+            else {
+                return Err(crate::SystemInputError::InconsistentRecord);
+            };
+            let [crate::LoggedContentPart::Text { text }] = content.as_slice() else {
+                return Err(crate::SystemInputError::InconsistentRecord);
+            };
+            if text.len() > crate::system_input::MAX_SYSTEM_INPUT_BYTES {
+                return Err(crate::SystemInputError::ResourceLimit);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Typed system-item history record. The typed system event remains available
 /// to client replay while its model-visible projection carries the same stable
 /// metadata used by live history.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "SystemEntryWire")]
 pub struct LoggedSystemHistoryEntry {
     pub item: crate::SystemItem,
     pub metadata: LoggedSessionHistoryMetadata,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemEntryWire {
+    item: crate::SystemItem,
+    metadata: LoggedSessionHistoryMetadata,
+}
+
+impl TryFrom<SystemEntryWire> for LoggedSystemHistoryEntry {
+    type Error = crate::SystemInputError;
+
+    fn try_from(wire: SystemEntryWire) -> Result<Self, Self::Error> {
+        let entry = Self {
+            item: wire.item,
+            metadata: wire.metadata,
+        };
+        entry.validate_system_input()?;
+        Ok(entry)
+    }
+}
+
+impl LoggedSystemHistoryEntry {
+    pub fn from_input(
+        origin: LoggedSessionHistoryOrigin,
+        derivation: Option<LoggedHistoryDerivation>,
+        input: crate::SystemInputEnvelope,
+    ) -> Self {
+        let (body, system_input) = input.into_parts();
+        Self {
+            item: crate::SystemItem::Input { body },
+            metadata: LoggedSessionHistoryMetadata {
+                entry_id: LoggedSessionHistoryEntryId::new(),
+                origin,
+                derivation,
+                system_input: Some(system_input),
+            },
+        }
+    }
+
+    pub fn validate_system_input(&self) -> Result<(), crate::SystemInputError> {
+        self.metadata.validate_system_input()?;
+        match (&self.item, &self.metadata.system_input) {
+            (crate::SystemItem::Input { body }, Some(_)) => {
+                if body.len() > crate::system_input::MAX_SYSTEM_INPUT_BYTES {
+                    return Err(crate::SystemInputError::ResourceLimit);
+                }
+            }
+            (crate::SystemItem::Input { .. }, None) => {
+                return Err(crate::SystemInputError::MissingMetadata);
+            }
+            (_, Some(_)) => return Err(crate::SystemInputError::InconsistentRecord),
+            (_, None) => {}
+        }
+        Ok(())
+    }
+
+    pub fn to_history_entry(&self) -> LoggedHistoryEntry {
+        LoggedHistoryEntry {
+            item: self.item.to_history_item().into(),
+            metadata: self.metadata.clone(),
+        }
+    }
+
+    pub fn public_item(&self) -> crate::PublicSystemItem {
+        if matches!(self.item, crate::SystemItem::Input { .. }) {
+            return self
+                .metadata
+                .system_input
+                .as_ref()
+                .and_then(crate::SystemInputMetadata::public_item)
+                .cloned()
+                .unwrap_or_else(|| self.item.public_item());
+        }
+        self.item.public_item()
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +268,7 @@ mod tests {
                 }],
             },
             metadata: LoggedSessionHistoryMetadata {
+                system_input: None,
                 entry_id: LoggedSessionHistoryEntryId::new(),
                 origin: LoggedSessionHistoryOrigin::HumanInput {
                     account_id: "account-1".into(),
@@ -148,6 +285,61 @@ mod tests {
             decoded.metadata.derivation.unwrap().sources,
             vec![source_id]
         );
+    }
+
+    #[test]
+    fn external_system_records_reject_missing_policy_role_mismatch_and_overlimit_body() {
+        let valid = serde_json::json!({
+            "item": { "kind": "input", "body": "context" },
+            "metadata": {
+                "entry_id": "stable-entry", "origin": { "kind": "provided", "producer": "owner" },
+                "system_input": { "usage": {
+                    "recording_material": "exclude", "memory_evidence": "exclude",
+                    "observation": "hidden", "compaction": "reference_input"
+                } }
+            }
+        });
+        let restored: LoggedSystemHistoryEntry = serde_json::from_value(valid.clone()).unwrap();
+        let flat = serde_json::to_value(restored.to_history_entry()).unwrap();
+        assert!(serde_json::from_value::<LoggedHistoryEntry>(flat.clone()).is_ok());
+        for generic in [true, false] {
+            let wire = if generic { &valid } else { &flat };
+            let decode = |wire| {
+                if generic {
+                    serde_json::from_value::<LoggedSystemHistoryEntry>(wire).is_err()
+                } else {
+                    serde_json::from_value::<LoggedHistoryEntry>(wire).is_err()
+                }
+            };
+            let mut missing = wire.clone();
+            missing["metadata"]
+                .as_object_mut()
+                .unwrap()
+                .remove("system_input");
+            assert!(decode(missing));
+            let mut absent_policy = wire.clone();
+            absent_policy["metadata"]["system_input"]
+                .as_object_mut()
+                .unwrap()
+                .remove("usage");
+            assert!(decode(absent_policy));
+            let mut invalid_role = wire.clone();
+            invalid_role["item"] =
+                serde_json::to_value(LoggedItem::from(agen::Item::user_message("not system")))
+                    .unwrap();
+            assert!(decode(invalid_role));
+            let mut oversized = wire.clone();
+            if generic {
+                oversized["item"]["body"] = "x"
+                    .repeat(crate::system_input::MAX_SYSTEM_INPUT_BYTES + 1)
+                    .into();
+            } else {
+                oversized["item"]["content"][0]["text"] = "x"
+                    .repeat(crate::system_input::MAX_SYSTEM_INPUT_BYTES + 1)
+                    .into();
+            }
+            assert!(decode(oversized));
+        }
     }
 
     #[test]

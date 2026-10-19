@@ -119,6 +119,7 @@ fn annotated(item: Item) -> session_store::LoggedHistoryEntry {
     session_store::LoggedHistoryEntry {
         item: session_store::LoggedItem::from(item),
         metadata: session_store::LoggedSessionHistoryMetadata {
+            system_input: None,
             entry_id: session_store::LoggedSessionHistoryEntryId::new(),
             origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
             derivation: None,

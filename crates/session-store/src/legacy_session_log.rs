@@ -167,6 +167,7 @@ fn legacy_metadata(
     identity.extend_from_slice(&(line_index as u64).to_be_bytes());
     identity.extend_from_slice(&(item_index as u64).to_be_bytes());
     LoggedSessionHistoryMetadata {
+        system_input: None,
         entry_id: LoggedSessionHistoryEntryId(format!(
             "l-{}",
             base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, identity)

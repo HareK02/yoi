@@ -24,6 +24,7 @@ pub(crate) fn test_logged_history_entry(item: impl Into<Item>) -> LoggedHistoryE
     LoggedHistoryEntry {
         item: session_store::LoggedItem::from(item.into()),
         metadata: LoggedSessionHistoryMetadata {
+            system_input: None,
             entry_id: LoggedSessionHistoryEntryId::new(),
             origin: LoggedSessionHistoryOrigin::LegacyUnknown,
             derivation: None,
@@ -38,6 +39,7 @@ pub(crate) fn test_logged_system_entry(
     session_store::LoggedSystemHistoryEntry {
         item,
         metadata: LoggedSessionHistoryMetadata {
+            system_input: None,
             entry_id: LoggedSessionHistoryEntryId::new(),
             origin: LoggedSessionHistoryOrigin::LegacyUnknown,
             derivation: None,
@@ -58,6 +60,7 @@ pub(crate) fn metadata(
     derivation: Option<SessionHistoryDerivation>,
 ) -> SessionHistoryMetadata {
     SessionHistoryMetadata {
+        system_input: None,
         entry_id: SessionHistoryEntryId::new(),
         origin,
         derivation,
@@ -80,6 +83,7 @@ pub(crate) fn history_entry_with_id(
     HistoryEntry::new(
         item,
         SessionHistoryMetadata {
+            system_input: None,
             entry_id,
             origin,
             derivation: None,

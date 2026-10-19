@@ -1831,6 +1831,7 @@ mod tests {
                 }],
             },
             metadata: LoggedSessionHistoryMetadata {
+                system_input: None,
                 entry_id: LoggedSessionHistoryEntryId("original".into()),
                 origin: LoggedSessionHistoryOrigin::LocalHumanInput,
                 derivation: None,
@@ -1844,6 +1845,7 @@ mod tests {
                 }],
             },
             metadata: LoggedSessionHistoryMetadata {
+                system_input: None,
                 entry_id: LoggedSessionHistoryEntryId("summary".into()),
                 origin: LoggedSessionHistoryOrigin::DerivedSummary,
                 derivation: Some(session_store::LoggedHistoryDerivation {

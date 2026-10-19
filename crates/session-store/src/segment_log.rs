@@ -254,6 +254,23 @@ pub struct SegmentOrigin {
 }
 
 impl LogEntry {
+    /// Validate generic System records before a Store publishes any bytes.
+    pub fn validate_system_inputs(&self) -> Result<(), crate::SystemInputError> {
+        match self {
+            Self::AnnotatedSegmentStart { history, .. }
+            | Self::AnnotatedUserInput { history, .. } => {
+                for entry in history {
+                    entry.validate_system_input()?;
+                }
+            }
+            Self::AnnotatedAssistantItem { entry, .. }
+            | Self::AnnotatedToolResult { entry, .. }
+            | Self::ToolResultCorrected { entry, .. } => entry.validate_system_input()?,
+            Self::AnnotatedSystemItem { entry, .. } => entry.validate_system_input()?,
+            _ => {}
+        }
+        Ok(())
+    }
     /// Allocate the durable public identity for a newly committed Run
     /// transition. Calling this repeatedly is idempotent so the exact value
     /// written to storage is also the value published to live subscribers.
@@ -537,6 +554,7 @@ mod tests {
         LoggedHistoryEntry {
             item: LoggedItem::from(item),
             metadata: LoggedSessionHistoryMetadata {
+                system_input: None,
                 entry_id: LoggedSessionHistoryEntryId::new(),
                 origin: LoggedSessionHistoryOrigin::LegacyUnknown,
                 derivation: None,
