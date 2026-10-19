@@ -6,7 +6,6 @@ use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use uuid::Uuid;
 
 use protocol::Segment;
 use server_api::{
@@ -502,7 +501,10 @@ pub struct WorkerLifecycleSpawnRequest {
     pub profile: String,
     pub singleton_key: Option<String>,
     pub ticket_id: Option<String>,
+    /// Required for ordinary and Ticket spawn; exact retries reuse this ID and full input.
     pub operation_id: Option<String>,
+    /// Explicit requested authority. Profile selection alone grants nothing.
+    pub execution_grant: Option<server_api::authorization::WorkerDelegationRequest>,
     pub display_name: String,
     pub initial_submit: Vec<Segment>,
 }
@@ -514,25 +516,27 @@ struct WorkspaceWorkerLifecycleService {
 fn workspace_worker_create_request(
     request: WorkerLifecycleSpawnRequest,
 ) -> Result<CreateWorkspaceWorkerRequest, WorkspaceClientError> {
-    let ticket_assignment = match (request.ticket_id, request.operation_id) {
-        (Some(ticket_id), Some(operation_id)) => {
-            Some(CreateWorkspaceWorkerTicketAssignmentRequest {
+    let control_operation_id = request.operation_id.filter(|id| {
+        !id.trim().is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+    }).ok_or_else(|| WorkspaceClientError::Request(
+        "operation_id is required for every Worker spawn (reuse the same ID and full input after an unknown outcome)".into()
+    ))?;
+    if request.ticket_id.is_none() && request.orchestrator_assignment_id.is_some() {
+        return Err(WorkspaceClientError::Request(
+            "orchestrator_assignment_id requires ticket_id".into(),
+        ));
+    }
+    if let Some(grant) = &request.execution_grant {
+        grant.validate().map_err(WorkspaceClientError::Request)?;
+    }
+    let ticket_assignment =
+        request
+            .ticket_id
+            .map(|ticket_id| CreateWorkspaceWorkerTicketAssignmentRequest {
                 orchestrator_assignment_id: request.orchestrator_assignment_id,
                 ticket_id,
-                operation_id,
-            })
-        }
-        (None, None) => None,
-        _ => {
-            return Err(WorkspaceClientError::Request(
-                "ticket_id and operation_id must be provided together".to_string(),
-            ));
-        }
-    };
-    let control_operation_id = ticket_assignment
-        .as_ref()
-        .map(|assignment| assignment.operation_id.clone())
-        .unwrap_or_else(|| format!("worker-spawn-{}", Uuid::now_v7()));
+                operation_id: control_operation_id.clone(),
+            });
     Ok(CreateWorkspaceWorkerRequest {
         runtime_id: request.runtime_id,
         display_name: request.display_name,
@@ -551,6 +555,7 @@ fn workspace_worker_create_request(
             .collect(),
         feature_connections: Default::default(),
         control_operation_id: Some(control_operation_id),
+        execution_grant: request.execution_grant,
     })
 }
 
@@ -744,7 +749,13 @@ struct WorkerSpawnInput {
     runtime_id: String,
     /// Singular Workdir selection wrapped into the shared attachment collection
     /// under the stable `workdir` alias.
-    working_directory_id: String,
+    #[serde(default)]
+    working_directory_id: Option<String>,
+    /// Stable caller-chosen intent ID. Exact retries retain this ID and full input.
+    operation_id: String,
+    /// Explicit permission/resource request; selecting a Profile grants nothing.
+    #[serde(default)]
+    execution_grant: Option<server_api::authorization::WorkerDelegationRequest>,
     profile: String,
     /// Optional opaque Workspace singleton key. Prefixes are caller-owned and uninterpreted.
     #[serde(default)]
@@ -931,13 +942,23 @@ impl Tool for WorkspaceWorkerTool {
                     .ticket_id
                     .map(|ticket_id| authority_id(&ticket_id, "ticket_id"))
                     .transpose()?;
-                let operation_id = ticket_id
-                    .as_ref()
-                    .map(|ticket_id| {
-                        let call_id = non_empty(ctx.call_id.clone(), "tool call_id")?;
-                        Ok::<_, ToolError>(format!("worker-spawn:{ticket_id}:{call_id}"))
-                    })
-                    .transpose()?;
+                let operation_id = Some(authority_id(&input.operation_id, "operation_id")?);
+                let workdir_attachments = match input.working_directory_id {
+                    Some(id) => vec![WorkerLifecycleWorkdirAttachment {
+                        alias: INITIAL_WORKDIR_ALIAS.to_string(),
+                        working_directory_id: authority_id(&id, "working_directory_id")?,
+                        relative_cwd: input
+                            .relative_cwd
+                            .map(|value| validate_relative_cwd(&value))
+                            .transpose()?,
+                    }],
+                    None if input.relative_cwd.is_none() => Vec::new(),
+                    None => {
+                        return Err(ToolError::ExecutionFailed(
+                            "relative_cwd requires working_directory_id".into(),
+                        ));
+                    }
+                };
                 self.control
                     .spawn_worker(WorkerLifecycleSpawnRequest {
                         orchestrator_assignment_id: input
@@ -945,17 +966,8 @@ impl Tool for WorkspaceWorkerTool {
                             .map(|id| authority_id(&id, "orchestrator_assignment_id"))
                             .transpose()?,
                         runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
-                        workdir_attachments: vec![WorkerLifecycleWorkdirAttachment {
-                            alias: INITIAL_WORKDIR_ALIAS.to_string(),
-                            working_directory_id: authority_id(
-                                &input.working_directory_id,
-                                "working_directory_id",
-                            )?,
-                            relative_cwd: input
-                                .relative_cwd
-                                .map(|value| validate_relative_cwd(&value))
-                                .transpose()?,
-                        }],
+                        workdir_attachments,
+                        execution_grant: input.execution_grant,
                         profile: non_empty(input.profile, "profile")?,
                         singleton_key: input.singleton_key,
                         ticket_id,
@@ -1594,6 +1606,7 @@ mod tests {
                 "relative_cwd": "crates/worker",
                 "profile": "builtin:coder",
                 "ticket_id": "00001KZ9E0DBS",
+                "operation_id": "stable-ticket-intent",
                 "initial_submit": [
                     { "kind": "flow", "selector": "builtin:coder-review" },
                     { "kind": "text", "content": "Implement Ticket 00001" }
@@ -1623,7 +1636,7 @@ mod tests {
             body["ticket_assignment"],
             serde_json::json!({
                 "ticket_id": "00001KZ9E0DBS",
-                "operation_id": "worker-spawn:00001KZ9E0DBS:call-1"
+                "operation_id": "stable-ticket-intent"
             })
         );
         assert_eq!(body["workdir_attachments"].as_array().unwrap().len(), 1);
@@ -1910,10 +1923,80 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ordinary_spawn_requires_stable_id_and_forwards_grant_without_ticket_or_workdir() {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        let tool = WorkspaceWorkerTool {
+            operation: WorkerOperation::Spawn,
+            control: test_control(client.clone()),
+            runtime_worker_control: true,
+        };
+        let mut input = serde_json::json!({"runtime_id":"runtime-1", "profile":"builtin:coder"});
+        assert!(
+            tool.execute(&input.to_string(), ToolExecutionContext::direct())
+                .await
+                .is_err()
+        );
+        assert!(client.requests.lock().unwrap().is_empty());
+        input["operation_id"] = serde_json::json!("ordinary-intent-1");
+        input["execution_grant"] = serde_json::json!({"permissions":[{"operation":"ticket", "resource":{"kind":"feature"}}], "redelegation":[]});
+        for call_id in ["call-1", "retry-another-call"] {
+            tool.execute(
+                &input.to_string(),
+                ToolExecutionContext::new(call_id, "batch", 0),
+            )
+            .await
+            .unwrap();
+        }
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body, requests[1].body);
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["control_operation_id"], "ordinary-intent-1");
+        assert_eq!(body["execution_grant"], input["execution_grant"]);
+        assert_eq!(body["workdir_attachments"], serde_json::json!([]));
+        assert!(
+            body.get("ticket_assignment")
+                .is_none_or(|value| value.is_null())
+        );
+    }
+
+    #[test]
+    fn lifecycle_spawn_rejects_missing_or_blank_id_before_backend() {
+        for operation_id in [
+            None,
+            Some("".into()),
+            Some(" ".into()),
+            Some("bad\nidentity".into()),
+        ] {
+            let result = workspace_worker_create_request(WorkerLifecycleSpawnRequest {
+                orchestrator_assignment_id: None,
+                runtime_id: "runtime-1".into(),
+                workdir_attachments: Vec::new(),
+                profile: "builtin:coder".into(),
+                singleton_key: None,
+                ticket_id: None,
+                operation_id,
+                execution_grant: None,
+                display_name: "Worker".into(),
+                initial_submit: Vec::new(),
+            });
+            assert!(result.unwrap_err().to_string().contains("operation_id"));
+        }
+    }
+
     #[test]
     fn worker_spawn_schema_exposes_normal_typed_segment_variants() {
         let schema = serde_json::to_value(schemars::schema_for!(WorkerSpawnInput)).unwrap();
         let text = serde_json::to_string(&schema).unwrap();
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("operation_id"))
+        );
+        assert!(text.contains("execution_grant"));
         assert!(text.contains("initial_submit"));
         assert!(text.contains("ticket_id"));
         assert!(text.contains("selector"));
@@ -1941,7 +2024,8 @@ mod tests {
             profile: "builtin:coder".to_string(),
             singleton_key: Some("subjektiv:subject-1".to_string()),
             ticket_id: None,
-            operation_id: None,
+            operation_id: Some("ordinary-spawn-intent-1".into()),
+            execution_grant: None,
             display_name: "Coder".to_string(),
             initial_submit: vec![
                 Segment::Flow {
@@ -1991,6 +2075,7 @@ mod tests {
             singleton_key: None,
             ticket_id: Some("T-719".to_string()),
             operation_id: Some("spawn-ticket-worker:T-719:call-1".to_string()),
+            execution_grant: None,
             display_name: "Worker · T-719".to_string(),
             initial_submit: vec![Segment::text("Investigate Ticket T-719.")],
         })

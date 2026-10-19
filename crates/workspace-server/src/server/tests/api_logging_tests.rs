@@ -105,6 +105,7 @@ async fn cleanup_retention_failures_preserve_cause_on_execution_and_recovery() {
                 resolved_memory_settings: None,
                 resolved_subjektiv_attached: false,
                 resolved_control_operation: None,
+                resolved_execution_grant: None,
             },
         )
         .unwrap();
@@ -279,6 +280,7 @@ async fn generated_cancellation_errors_preserve_response_and_log_details() {
                 resolved_memory_settings: Some(test_worker_memory_settings()),
                 resolved_subjektiv_attached: false,
                 resolved_control_operation: None,
+                resolved_execution_grant: None,
             },
         )
         .unwrap()
@@ -682,13 +684,24 @@ async fn self_workdir_provider_refusals_log_operation_identity_without_request_t
     let mut fixture = manual_worker_assignment_fixture().await;
     let root = tempfile::tempdir().unwrap();
     let provider_root = root.path().to_path_buf();
+    // Use an attachment-relative path so Host resource validation succeeds;
+    // the provider's narrower scope still owns this read refusal.
+    let provider_scope = manifest::Scope::writable(&provider_root)
+        .unwrap()
+        .with_added_deny_rules([manifest::ScopeRule {
+            target: provider_root.join("private"),
+            permission: manifest::Permission::Read,
+            recursive: true,
+            symlink_policy: manifest::SymlinkPolicy::Resolved,
+        }])
+        .unwrap();
     // Fresh sessions exercise the real opening/broker/dispatch path on each request.
     fixture.runtime.workdir_session_factory = Some(Arc::new(move |id| {
         Ok(Arc::new(workdir::LocalWorkdirSession::materialized_bound(
             workdir::Workdir::new(id),
             provider_root.clone(),
             provider_root.clone(),
-            manifest::SharedScope::new(manifest::Scope::writable(&provider_root).unwrap()),
+            manifest::SharedScope::new(provider_scope.clone()),
             Caps::READ_ONLY,
         )) as WorkdirSessionHandle)
     }));
@@ -708,7 +721,7 @@ async fn self_workdir_provider_refusals_log_operation_identity_without_request_t
     );
     let cases = [
         (
-            json!({"operation": "read", "request": {"path": "/host/private/secret.txt", "offset": 0, "limit": 10, "max_bytes": 1024}}),
+            json!({"operation": "read", "request": {"path": "private/secret.txt", "offset": 0, "limit": 10, "max_bytes": 1024}}),
             "read",
             "out_of_scope",
             Reason::PathOutOfScope,

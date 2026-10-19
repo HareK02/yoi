@@ -509,6 +509,15 @@ const TICKET_SERVICE_VERSION: &str = "1";
 
 pub trait TicketService: Send + Sync {
     fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError>;
+
+    /// Typed creation without a synthetic Tool context. The default keeps legacy
+    /// handoff-only fixture implementations fail-closed; production installs
+    /// provide creation through the shared authorized backend dispatch.
+    fn create(&self, _input: NewTicket) -> TicketResult<TicketRef> {
+        Err(TicketError::Conflict(
+            "Ticket creation service is unavailable".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -526,6 +535,7 @@ fn is_canonical_ticket_resource_key(resource_key: &str) -> bool {
 
 struct WorkspaceTicketService {
     backend: WorkspaceHttpTicketBackend,
+    access: TicketFeatureAccess,
 }
 
 fn ticket_handoff_from_record(ticket: Ticket) -> Result<TicketHandoff, TicketError> {
@@ -544,6 +554,17 @@ fn ticket_handoff_from_record(ticket: Ticket) -> Result<TicketHandoff, TicketErr
 impl TicketService for WorkspaceTicketService {
     fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError> {
         ticket_handoff_from_record(self.backend.show_unprojected(ticket_ref)?)
+    }
+
+    fn create(&self, input: NewTicket) -> TicketResult<TicketRef> {
+        // Services retain the same Profile ceiling as Tools and WIP. Host
+        // permission cannot turn a read-only Feature surface into an author.
+        if !self.access.authoring {
+            return Err(TicketError::Conflict(
+                "Ticket creation is disabled by the Profile authoring policy".into(),
+            ));
+        }
+        self.backend.create(input)
     }
 }
 
@@ -801,8 +822,17 @@ impl FeatureModule for TicketFeature {
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
         let workspace_client = self.workspace_client();
+        // Direct registry installs do not necessarily have a matching manifest
+        // switch. The public module identity still requires live activation
+        // authority before any Tool, instruction or service contribution.
+        workspace_client
+            .authorize_feature_activation(FEATURE_ID)
+            .map_err(|error| {
+                FeatureInstallError::Install(format!("Ticket activation rejected: {error}"))
+            })?;
         let ticket_service: Arc<dyn TicketService> = Arc::new(WorkspaceTicketService {
             backend: WorkspaceHttpTicketBackend::new(workspace_client.clone()),
+            access: self.access,
         });
         context.services().provide(
             ServiceDeclaration::new(
@@ -1104,6 +1134,22 @@ impl WorkspaceHttpTicketBackend {
                         "Tickets must be created open; closing requires a case judgment".into(),
                     ));
                 }
+                // Shared trusted boundary for Tool, WIP and Ticket service callers.
+                // Activation (`ticket`) is not `ticket.create`. Other Ticket operations
+                // are not yet adapted to this seam; missing checks there are not
+                // supplied automatically by a universal Tool executor.
+                client
+                    .authorize_operation(
+                        "ticket.create",
+                        &server_api::authorization::PermissionResource::Workspace {
+                            workspace_id: workspace_id.clone(),
+                        },
+                    )
+                    .map_err(|error| {
+                        TicketError::Conflict(format!(
+                            "Ticket create authorization failed: {error}"
+                        ))
+                    })?;
                 let ticket = Self::request(
                     client,
                     WorkspaceRequestMethod::Post,
@@ -3541,9 +3587,13 @@ mod tests {
     }
 
     fn workspace_feature(access: TicketFeatureAccess) -> TicketFeature {
-        let client: Arc<dyn WorkspaceClient> = Arc::new(
-            crate::worker::TestWorkspaceHttpClient::new("workspace", "http://backend"),
-        );
+        let client: Arc<dyn WorkspaceClient> = Arc::new(CreateAuthorizationClient {
+            workspace: Some("workspace"),
+            activation_allowed: true,
+            allowed: true,
+            backend_status: 200,
+            requests: Default::default(),
+        });
         ticket_tools_feature(client, access)
     }
 
@@ -4075,6 +4125,7 @@ mod tests {
         });
 
         let service = WorkspaceTicketService {
+            access: TicketFeatureAccess::read_only(),
             backend: WorkspaceHttpTicketBackend::new(Arc::new(
                 crate::worker::TestWorkspaceHttpClient::new("workspace-a", base_url),
             )),
@@ -4095,11 +4146,322 @@ mod tests {
         }
     }
 
+    // This suite keeps the real Feature/Tool/WIP/backend-dispatch code; only the
+    // Host transport is replaced. Host grant/storage behavior is tested at Server.
+    #[derive(Debug)]
+    struct CreateAuthorizationClient {
+        workspace: Option<&'static str>,
+        activation_allowed: bool,
+        allowed: bool,
+        backend_status: u16,
+        requests: Mutex<Vec<WorkspaceRequest>>,
+    }
+
+    impl WorkspaceClient for CreateAuthorizationClient {
+        fn workspace_id(&self) -> Option<&str> {
+            self.workspace
+        }
+        fn kind(&self) -> &str {
+            "create-authorization-fixture"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            let authorization = request.path.ends_with("/authorization/check");
+            let mut permitted = self.allowed;
+            if authorization {
+                assert_eq!(request.method, WorkspaceRequestMethod::Post);
+                let body: Value = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                if body["operation"] == "ticket" {
+                    assert_eq!(
+                        body,
+                        json!({"operation":"ticket", "resource":{"kind":"feature"}})
+                    );
+                    permitted = self.activation_allowed;
+                } else {
+                    assert_eq!(
+                        body,
+                        json!({"operation":"ticket.create", "resource":{"kind":"workspace","workspace_id":"workspace"}})
+                    );
+                }
+            } else {
+                assert_eq!(request.path, "/api/w/workspace/tickets");
+            }
+            self.requests.lock().unwrap().push(request);
+            Ok(crate::worker::WorkspaceResponse {
+                status: if authorization {
+                    if permitted { 200 } else { 403 }
+                } else {
+                    self.backend_status
+                },
+                body: if authorization {
+                    if permitted {
+                        "{}".into()
+                    } else {
+                        json!({"message":"Ticket permission revoked"}).to_string()
+                    }
+                } else if self.backend_status != 200 {
+                    json!({"error":"Forbidden", "message":"backend create denied", "diagnostics":[]}).to_string()
+                } else {
+                    serde_json::to_string(&TicketRef {
+                        id: "created-1".into(),
+                        resource_key: Some("T-1".into()),
+                        slug: "created".into(),
+                        status: ticket::TicketStatus::Open,
+                    })
+                    .unwrap()
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn create_authorization_guards_tool_wip_installed_service_and_backend_without_local_root()
+    {
+        for (allowed, backend_status) in [(false, 200), (true, 200), (true, 403)] {
+            for surface in ["tool", "wip", "service", "backend"] {
+                let client = Arc::new(CreateAuthorizationClient {
+                    workspace: Some("workspace"),
+                    activation_allowed: true,
+                    allowed,
+                    backend_status,
+                    requests: Default::default(),
+                });
+                let result = match surface {
+                    "backend" => WorkspaceHttpTicketBackend::new(client.clone())
+                        .create(NewTicket::new("Create"))
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    "service" => {
+                        let report = FeatureRegistryBuilder::new()
+                            .with_module(ticket_tools_feature(
+                                client.clone(),
+                                TicketFeatureAccess::workspace_authoring(),
+                            ))
+                            .install_into_pending(
+                                &mut Vec::new(),
+                                &mut HookRegistryBuilder::default(),
+                            );
+                        assert!(!report.has_errors(), "{}", report.error_message());
+                        let service = report
+                            .services
+                            .service::<dyn TicketService>(&ServiceId::builtin(TICKET_SERVICE_ID))
+                            .unwrap();
+                        service
+                            .create(NewTicket::new("Create"))
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
+                    "tool" => {
+                        let tools = enabled_ticket_definitions(
+                            client.clone(),
+                            TicketFeatureAccess::workspace_authoring(),
+                        );
+                        let (_, tool) = tools
+                            .into_iter()
+                            .find(|definition| definition().0.name == "TicketCreate")
+                            .unwrap()();
+                        tool.execute(r#"{"title":"Create"}"#, ToolExecutionContext::direct())
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
+                    _ => {
+                        let tools = native_ticket_tools(
+                            client.clone(),
+                            TicketFeatureAccess::workspace_authoring(),
+                        )
+                        .unwrap();
+                        let handler = TicketCollectionWipHandler {
+                            tools: operation_map(tools),
+                            permissions: None,
+                            collection_route: "/tickets".into(),
+                            observations: Arc::new(Mutex::new(TicketObservationState::default())),
+                        };
+                        handler
+                            .call(
+                                "create",
+                                &BTreeMap::from([(
+                                    "title".into(),
+                                    WipValue::String("Create".into()),
+                                )]),
+                                WipCallContext {
+                                    execution: ToolExecutionContext::direct(),
+                                    security_context: "test".into(),
+                                },
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| match error {
+                                WipOperationError::Protocol(ProtocolError {
+                                    code: ProtocolErrorCode::PermissionDenied,
+                                    message,
+                                    ..
+                                }) => message,
+                                _ => panic!("a definitive denial is not outcome-unknown"),
+                            })
+                    }
+                };
+                assert_eq!(
+                    result.is_ok(),
+                    allowed && backend_status == 200,
+                    "{surface}: {result:?}"
+                );
+                if allowed && backend_status == 403 {
+                    let error = result.unwrap_err();
+                    assert!(error.contains("HTTP status 403"), "{surface}: {error}");
+                    assert!(
+                        error.contains("backend create denied"),
+                        "{surface}: {error}"
+                    );
+                }
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(
+                    requests.len(),
+                    1 + usize::from(allowed) + usize::from(surface == "service"),
+                    "{surface}"
+                );
+                assert!(requests[0].path.ends_with("/authorization/check"));
+                assert_eq!(
+                    requests
+                        .iter()
+                        .filter(|request| request.path.ends_with("/tickets"))
+                        .count(),
+                    usize::from(allowed)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_ticket_install_requires_activation_even_without_manifest_switch() {
+        assert!(!manifest::FeatureConfig::default().ticket.enabled);
+        for create_allowed in [false, true] {
+            let client = Arc::new(CreateAuthorizationClient {
+                workspace: Some("workspace"),
+                activation_allowed: false,
+                allowed: create_allowed,
+                backend_status: 200,
+                requests: Default::default(),
+            });
+            let mut tools = Vec::new();
+            // No manifest-config guard: this is the explicit module install path.
+            let report = FeatureRegistryBuilder::new()
+                .with_module(ticket_tools_feature(
+                    client.clone(),
+                    TicketFeatureAccess::workspace_authoring(),
+                ))
+                .install_into_pending(&mut tools, &mut HookRegistryBuilder::default());
+            assert!(report.has_errors());
+            assert!(
+                report
+                    .error_message()
+                    .contains("Ticket activation rejected")
+            );
+            assert!(report.error_message().contains("HTTP status 403"));
+            assert!(tools.is_empty());
+            assert!(report.installed_instruction_contributions().is_empty());
+            assert!(report.services.providers().is_empty());
+            assert_eq!(client.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn installed_ticket_service_readonly_profile_cannot_create_with_host_permission() {
+        let client = Arc::new(CreateAuthorizationClient {
+            workspace: Some("workspace"),
+            activation_allowed: true,
+            allowed: true,
+            backend_status: 200,
+            requests: Default::default(),
+        });
+        let mut tools = Vec::new();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ticket_tools_feature(
+                client.clone(),
+                TicketFeatureAccess::read_only(),
+            ))
+            .install_into_pending(&mut tools, &mut HookRegistryBuilder::default());
+        assert!(!report.has_errors(), "{}", report.error_message());
+        assert!(!tools.iter().any(|tool| tool().0.name == "TicketCreate"));
+        let service = report
+            .services
+            .service::<dyn TicketService>(&ServiceId::builtin(TICKET_SERVICE_ID))
+            .unwrap();
+        assert!(
+            service
+                .create(NewTicket::new("No profile bypass"))
+                .unwrap_err()
+                .to_string()
+                .contains("Profile authoring policy")
+        );
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "only activation; no create check or backend effect"
+        );
+        let body: Value = serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["operation"], "ticket");
+    }
+
+    #[test]
+    fn legacy_handoff_only_service_does_not_gain_creation() {
+        struct LegacyService;
+        impl TicketService for LegacyService {
+            fn ticket_handoff(&self, _: &str) -> Result<TicketHandoff, TicketError> {
+                unreachable!("creation must not call handoff")
+            }
+        }
+        assert!(
+            LegacyService
+                .create(NewTicket::new("No implicit creation"))
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable")
+        );
+    }
+
+    #[test]
+    fn create_without_workspace_identity_fails_before_transport_and_backend_denial_is_preserved() {
+        for (workspace, allowed, backend_status, expected_calls) in
+            [(None, true, 200, 0), (Some("workspace"), true, 403, 2)]
+        {
+            let client = Arc::new(CreateAuthorizationClient {
+                workspace,
+                activation_allowed: true,
+                allowed,
+                backend_status,
+                requests: Default::default(),
+            });
+            let result =
+                WorkspaceHttpTicketBackend::new(client.clone()).create(NewTicket::new("Create"));
+            assert!(result.is_err());
+            assert_eq!(client.requests.lock().unwrap().len(), expected_calls);
+        }
+    }
+
     #[test]
     fn workspace_http_backend_executes_ticket_create_operation() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
+            let (mut authorization, _) = listener.accept().unwrap();
+            authorization
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = [0_u8; 8192];
+            let len = authorization.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..len]);
+            assert!(request.starts_with("POST /api/w/workspace-a/authorization/check HTTP/1.1"));
+            assert!(request.contains("\"operation\":\"ticket.create\""));
+            assert!(request.contains("\"workspace_id\":\"workspace-a\""));
+            write!(authorization, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
+            drop(authorization);
             let (mut stream, _) = listener.accept().unwrap();
             let mut buffer = [0_u8; 8192];
             let len = stream.read(&mut buffer).unwrap();

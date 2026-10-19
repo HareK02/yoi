@@ -567,6 +567,7 @@ impl BackendWorkspaceProductClient {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: None,
+            execution_grant: None,
         };
         let workspace_id = self.workspace_id.clone();
         let response: BrowserCreateWorkerResponse = self.generated(move |client| async move {

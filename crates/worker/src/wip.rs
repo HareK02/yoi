@@ -6108,6 +6108,10 @@ mod tests {
         };
         let authoring_client = Arc::new(ScriptedWorkspaceClient::new([
             query_response,
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({"scope": null}).to_string(),
+            },
             create_response,
             comment_response,
         ]));
@@ -6189,11 +6193,12 @@ mod tests {
             .await
             .unwrap();
         let authoring_requests = authoring_client.requests();
-        assert_eq!(authoring_requests.len(), 3);
+        assert_eq!(authoring_requests.len(), 4);
         assert!(authoring_requests[0].path.ends_with("/tickets/query"));
-        assert!(authoring_requests[1].path.ends_with("/tickets"));
+        assert!(authoring_requests[1].path.ends_with("/authorization/check"));
+        assert!(authoring_requests[2].path.ends_with("/tickets"));
         assert!(
-            authoring_requests[2]
+            authoring_requests[3]
                 .path
                 .ends_with("/tickets/T-9/thread-events")
         );

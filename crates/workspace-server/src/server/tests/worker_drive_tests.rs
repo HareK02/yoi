@@ -200,6 +200,7 @@ impl Fixture {
                     workdir_attachments: vec![],
                     feature_connections: Default::default(),
                     control_operation_id: None,
+                    execution_grant: None,
                 }),
             )
             .await
@@ -767,6 +768,7 @@ async fn worker_removal_preserves_drive_reference_for_explicitly_granted_replace
             workdir_attachments: vec![],
             feature_connections: Default::default(),
             control_operation_id: None,
+            execution_grant: None,
         }),
     )
     .await

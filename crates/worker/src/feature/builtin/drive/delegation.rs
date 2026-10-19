@@ -102,6 +102,26 @@ impl WorkspaceClient for InternalChildWorkspaceClient {
         self.inner.is_available()
     }
 
+    fn authorize_operation(
+        &self,
+        operation: &str,
+        resource: &server_api::authorization::PermissionResource,
+    ) -> Result<(), WorkspaceClientError> {
+        self.inner.authorize_operation(operation, resource)
+    }
+
+    fn authorize_operation_scope(
+        &self,
+        operation: &str,
+        resource: &server_api::authorization::PermissionResource,
+    ) -> Result<Option<server_api::authorization::PermissionResource>, WorkspaceClientError> {
+        self.inner.authorize_operation_scope(operation, resource)
+    }
+
+    fn authorize_feature_activation(&self, feature: &str) -> Result<(), WorkspaceClientError> {
+        self.inner.authorize_feature_activation(feature)
+    }
+
     fn execute(
         &self,
         request: WorkspaceRequest,

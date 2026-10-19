@@ -225,8 +225,14 @@ impl WorkspaceClient for AvailableWorkspaceClient {
 
     fn execute(
         &self,
-        _request: WorkspaceRequest,
+        request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if request.path.ends_with("/authorization/check") {
+            return Ok(WorkspaceResponse {
+                status: 200,
+                body: "{}".into(),
+            });
+        }
         Err(WorkspaceClientError::Unavailable("test".to_string()))
     }
 }
@@ -249,8 +255,14 @@ impl WorkspaceClient for NoopWorkspaceClient {
 
     fn execute(
         &self,
-        _request: WorkspaceRequest,
+        request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if request.path.ends_with("/authorization/check") {
+            return Ok(WorkspaceResponse {
+                status: 200,
+                body: "{}".into(),
+            });
+        }
         Err(WorkspaceClientError::Unavailable(
             "test client does not execute requests".to_string(),
         ))
@@ -912,6 +924,12 @@ impl WorkspaceClient for JournalWorkspaceClient {
         &self,
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if request.path.ends_with("/authorization/check") {
+            return Ok(WorkspaceResponse {
+                status: 200,
+                body: "{}".into(),
+            });
+        }
         self.requests.lock().unwrap().push(request.clone());
         let (status, body) = if request.path.ends_with("/subjektiv/journal/job/finish") {
             (

@@ -1052,6 +1052,116 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
         self.execute(request)
     }
 
+    /// Ask the Host using this client's authenticated source, never a model-supplied
+    /// identity. Trusted Features call this before protected effects on every surface.
+    /// This is not a universal Tool executor: a missing call is a Feature bug, and
+    /// operations not yet adapted to this seam retain only their existing checks.
+    fn authorize_operation(
+        &self,
+        operation: &str,
+        resource: &server_api::authorization::PermissionResource,
+    ) -> Result<(), WorkspaceClientError> {
+        self.authorize_operation_scope(operation, resource)
+            .map(|_| ())
+    }
+
+    /// Return the Host-selected matching scope for provider-resolved containment.
+    /// `None` is only the Host's explicit legacy decision, never a transport fallback.
+    fn authorize_operation_scope(
+        &self,
+        operation: &str,
+        resource: &server_api::authorization::PermissionResource,
+    ) -> Result<Option<server_api::authorization::PermissionResource>, WorkspaceClientError> {
+        use server_api::authorization::{
+            OperationAuthorizationRequest, OperationAuthorizationResponse, ScopedPermission,
+        };
+        if !self.is_available() {
+            return Err(WorkspaceClientError::Unavailable(
+                "operation authorization requires a Host-bound Workspace client".into(),
+            ));
+        }
+        let workspace_id = self
+            .workspace_id()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                WorkspaceClientError::Unavailable(
+                    "operation authorization requires Workspace identity".into(),
+                )
+            })?;
+        ScopedPermission {
+            operation: operation.into(),
+            resource: resource.clone(),
+        }
+        .validate()
+        .map_err(WorkspaceClientError::Request)?;
+        let request = workspace_server_json_request(
+            format!(
+                "/api/w/{}/authorization/check",
+                encode_workspace_path_segment(workspace_id)
+            ),
+            &OperationAuthorizationRequest {
+                operation: operation.into(),
+                resource: resource.clone(),
+            },
+        )?;
+        // Blocking transports must not run inside a Tokio runtime. The bound
+        // transport enforces this timeout; no authorization success is cached.
+        let execute = || self.execute_with_timeout(request, Duration::from_secs(10));
+        let response = if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::scope(|scope| scope.spawn(execute).join()).map_err(|_| {
+                WorkspaceClientError::Request("authorization request thread panicked".into())
+            })??
+        } else {
+            execute()?
+        };
+        if response.body.len() > 16 * 1024 {
+            return Err(WorkspaceClientError::Request(
+                "authorization response exceeded 16 KiB".into(),
+            ));
+        }
+        if !response.is_success() {
+            // Expose only the bounded public reason, not provider diagnostics or
+            // arbitrary response data. Keep status parseable by Feature adapters.
+            let value: serde_json::Value = serde_json::from_str(&response.body).unwrap_or_default();
+            let reason: String = value
+                .get("message")
+                .or_else(|| value.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Host rejected authorization")
+                .chars()
+                .take(1024)
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            return Err(WorkspaceClientError::Request(format!(
+                "authorization denied for {operation}: HTTP status {}: {reason}",
+                response.status
+            )));
+        }
+        let authorization = serde_json::from_str::<OperationAuthorizationResponse>(&response.body)
+            .map_err(|error| {
+                WorkspaceClientError::Request(format!("invalid authorization response: {error}"))
+            })?;
+        if authorization
+            .scope
+            .as_ref()
+            .is_some_and(|scope| !scope.covers(resource))
+        {
+            return Err(WorkspaceClientError::Request(
+                "Host authorization scope does not cover requested resource".into(),
+            ));
+        }
+        Ok(authorization.scope)
+    }
+
+    /// Activation is separate from operation authority. Only explicit standalone
+    /// contexts with no Workspace binding retain legacy activation without a Host.
+    fn authorize_feature_activation(&self, feature: &str) -> Result<(), WorkspaceClientError> {
+        self.authorize_operation(
+            feature,
+            &server_api::authorization::PermissionResource::Feature,
+        )
+    }
+
     /// Binary transport is unavailable unless a host-bound implementation opts in.
     fn execute_binary(
         &self,
@@ -1168,6 +1278,28 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
         &self,
     ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
         self.inner.current_prompt_projection()
+    }
+
+    fn authorize_operation(
+        &self,
+        operation: &str,
+        resource: &server_api::authorization::PermissionResource,
+    ) -> Result<(), WorkspaceClientError> {
+        // The query has no protected effect. Keep the review capability's
+        // mutation filter intact while asking the bound Host for live authority.
+        self.inner.authorize_operation(operation, resource)
+    }
+
+    fn authorize_operation_scope(
+        &self,
+        operation: &str,
+        resource: &server_api::authorization::PermissionResource,
+    ) -> Result<Option<server_api::authorization::PermissionResource>, WorkspaceClientError> {
+        self.inner.authorize_operation_scope(operation, resource)
+    }
+
+    fn authorize_feature_activation(&self, feature: &str) -> Result<(), WorkspaceClientError> {
+        self.inner.authorize_feature_activation(feature)
     }
 
     fn execute_binary(
@@ -1322,6 +1454,7 @@ struct MarkerWorkspaceClient {
     workspace_id: Option<String>,
     kind: String,
     available: bool,
+    legacy_local_activation: bool,
     reason: String,
 }
 
@@ -1338,11 +1471,213 @@ impl WorkspaceClient for MarkerWorkspaceClient {
         self.available
     }
 
+    fn authorize_feature_activation(&self, feature: &str) -> Result<(), WorkspaceClientError> {
+        // Explicit compatibility for standalone Workers with no Workspace binding.
+        // A missing/broken Workspace client must never become an implicit grant.
+        if self.workspace_id.is_none() && self.legacy_local_activation {
+            return Ok(());
+        }
+        self.authorize_operation(
+            feature,
+            &server_api::authorization::PermissionResource::Feature,
+        )
+    }
+
     fn execute(
         &self,
         _request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         Err(WorkspaceClientError::Unavailable(self.reason.clone()))
+    }
+}
+
+#[cfg(test)]
+mod operation_authorization_tests {
+    use super::*;
+    use server_api::authorization::PermissionResource;
+
+    #[derive(Debug)]
+    struct BoundClient {
+        response: Mutex<WorkspaceResponse>,
+        requests: Mutex<Vec<WorkspaceRequest>>,
+    }
+
+    impl WorkspaceClient for BoundClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace/test")
+        }
+        fn kind(&self) -> &str {
+            "bound-authorization-fixture"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn execute(&self, _: WorkspaceRequest) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            panic!("authorization must select the bounded transport")
+        }
+        fn execute_with_timeout(
+            &self,
+            request: WorkspaceRequest,
+            timeout: Duration,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            assert_eq!(timeout, Duration::from_secs(10));
+            self.requests.lock().unwrap().push(request);
+            Ok(self.response.lock().unwrap().clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_is_bounded_live_and_contains_no_caller_identity() {
+        let client = BoundClient {
+            response: Mutex::new(WorkspaceResponse {
+                status: 200,
+                body: "{}".into(),
+            }),
+            requests: Default::default(),
+        };
+        let resource = PermissionResource::Workspace {
+            workspace_id: "workspace/test".into(),
+        };
+        client
+            .authorize_operation("ticket.create", &resource)
+            .unwrap();
+        *client.response.lock().unwrap() = WorkspaceResponse {
+            status: 403,
+            body: r#"{"message":"permission revoked","diagnostics":[{"message":"private"}]}"#
+                .into(),
+        };
+        let reason = client
+            .authorize_operation("ticket.create", &resource)
+            .unwrap_err()
+            .to_string();
+        assert!(reason.contains("HTTP status 403"));
+        assert!(reason.contains("permission revoked"));
+        assert!(!reason.contains("private"));
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "success must not become a cached grant");
+        for request in requests.iter() {
+            assert_eq!(request.method, WorkspaceRequestMethod::Post);
+            assert_eq!(request.path, "/api/w/workspace%2Ftest/authorization/check");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(request.body.as_deref().unwrap())
+                    .unwrap(),
+                serde_json::json!({ "operation":"ticket.create", "resource":{"kind":"workspace", "workspace_id":"workspace/test"} })
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_authorization_preserves_matching_scope_and_rejects_cross_resource() {
+        let resource = PermissionResource::Workdir {
+            working_directory_id: "wd-1".into(),
+            path: "docs/file.md".into(),
+            recursive: false,
+        };
+        let granted = PermissionResource::Workdir {
+            working_directory_id: "wd-1".into(),
+            path: "docs".into(),
+            recursive: true,
+        };
+        let client = BoundClient {
+            response: Mutex::new(WorkspaceResponse {
+                status: 200,
+                body: serde_json::json!({"scope":granted}).to_string(),
+            }),
+            requests: Default::default(),
+        };
+        assert_eq!(
+            client
+                .authorize_operation_scope("filesystem.read", &resource)
+                .unwrap(),
+            Some(granted)
+        );
+        *client.response.lock().unwrap() = WorkspaceResponse {
+            status: 200,
+            body: serde_json::json!({"scope":{"kind":"workspace","workspace_id":"workspace/test"}})
+                .to_string(),
+        };
+        assert!(
+            client
+                .authorize_operation_scope("filesystem.read", &resource)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reviewer_query_preserves_host_scope_and_does_not_widen_mutation_access() {
+        let scope = PermissionResource::Workdir {
+            working_directory_id: "wd-1".into(),
+            path: "docs".into(),
+            recursive: true,
+        };
+        let inner = Arc::new(BoundClient {
+            response: Mutex::new(WorkspaceResponse {
+                status: 200,
+                body: serde_json::json!({"scope":scope}).to_string(),
+            }),
+            requests: Default::default(),
+        });
+        let reviewer = ReviewerChildWorkspaceClient::new(
+            inner.clone(),
+            ReviewerContext {
+                ticket_id: "T-1".into(),
+                merge_request_id: "MR-1".into(),
+            },
+            "capability".into(),
+        );
+        let requested = PermissionResource::Workdir {
+            working_directory_id: "wd-1".into(),
+            path: "docs/file.md".into(),
+            recursive: false,
+        };
+        assert_eq!(
+            reviewer
+                .authorize_operation_scope("filesystem.read", &requested)
+                .unwrap(),
+            Some(scope)
+        );
+        assert!(
+            reviewer
+                .execute(WorkspaceRequest::json(
+                    WorkspaceRequestMethod::Post,
+                    "/api/w/workspace%2Ftest/tickets",
+                    "{}"
+                ))
+                .is_err()
+        );
+        assert_eq!(
+            inner.requests.lock().unwrap().len(),
+            1,
+            "only the bounded authorization query reaches the Host"
+        );
+        *inner.response.lock().unwrap() = WorkspaceResponse {
+            status: 403,
+            body: "{}".into(),
+        };
+        assert!(
+            reviewer
+                .authorize_operation_scope("filesystem.read", &requested)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_and_oversized_authorization_responses_fail_closed() {
+        for body in [
+            "not-json".into(),
+            "{\"unexpected_grant\":true}".into(),
+            " ".repeat(16 * 1024 + 1),
+        ] {
+            let client = BoundClient {
+                response: Mutex::new(WorkspaceResponse { status: 200, body }),
+                requests: Default::default(),
+            };
+            assert!(
+                client
+                    .authorize_operation("ticket", &PermissionResource::Feature)
+                    .is_err()
+            );
+        }
     }
 }
 
@@ -1587,6 +1922,7 @@ pub fn unavailable_workspace_client(
         workspace_id: workspace_id.map(|id| id.as_str().to_string()),
         kind: "unavailable".to_string(),
         available: false,
+        legacy_local_activation: workspace_id.is_none(),
         reason: reason.into(),
     })
 }
@@ -1601,6 +1937,7 @@ pub fn marker_workspace_client(
         reason: format!("workspace client kind `{kind}` does not expose Workspace operations"),
         kind,
         available: true,
+        legacy_local_activation: false,
     })
 }
 
@@ -1649,7 +1986,15 @@ impl WorkerWorkspaceContext {
     }
 
     pub fn local_filesystem(workspace_id: Option<WorkspaceId>) -> Self {
-        let client = marker_workspace_client(workspace_id.as_ref(), "local-filesystem");
+        // This constructor explicitly selects legacy standalone activation only
+        // without Workspace identity; it never authorizes protected operations.
+        let client = Arc::new(MarkerWorkspaceClient {
+            workspace_id: workspace_id.as_ref().map(|id| id.as_str().to_string()),
+            kind: "local-filesystem".into(),
+            available: true,
+            legacy_local_activation: workspace_id.is_none(),
+            reason: "local filesystem context does not expose Workspace operations".into(),
+        });
         Self {
             workspace_id,
             client,
@@ -3844,6 +4189,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         registry: FeatureRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
         self.backend_job.get_or_init(|| None);
+        let client = self.workspace_client_handle();
+        let manifest = self.manifest().clone();
+        let registry = registry.with_activation_guard(move || {
+            crate::feature::authorize_requested_manifest(client.as_ref(), &manifest)
+                .map_err(|error| error.to_string())
+        });
         let worker = self.engine.as_mut().expect("worker taken during run");
         let report = registry.install_into_engine(worker, &mut self.hook_builder);
         if report.has_errors() {
@@ -10552,6 +10903,12 @@ mod build_summary_prompt_tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                return Ok(WorkspaceResponse {
+                    status: 200,
+                    body: "{}".into(),
+                });
+            }
             let request: server_api::MemoryBackendRequest =
                 serde_json::from_str(request.body.as_deref().unwrap_or_default()).unwrap();
             assert!(matches!(
@@ -10613,6 +10970,12 @@ mod build_summary_prompt_tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                return Ok(WorkspaceResponse {
+                    status: 200,
+                    body: "{}".into(),
+                });
+            }
             let request: server_api::SubjektivMemoryBackendRequest =
                 serde_json::from_str(request.body.as_deref().unwrap_or_default()).unwrap();
             assert!(matches!(
@@ -10953,6 +11316,12 @@ mod build_summary_prompt_tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                return Ok(WorkspaceResponse {
+                    status: 200,
+                    body: "{}".into(),
+                });
+            }
             self.requests
                 .lock()
                 .expect("recorded workspace requests lock")
@@ -10985,6 +11354,12 @@ mod build_summary_prompt_tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                return Ok(WorkspaceResponse {
+                    status: 200,
+                    body: "{}".into(),
+                });
+            }
             self.requests
                 .lock()
                 .expect("Flow source request lock")

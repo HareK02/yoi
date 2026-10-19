@@ -59,6 +59,7 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -794,6 +795,7 @@ async fn tracking_fixture(
             resolved_memory_settings: None,
             resolved_subjektiv_attached: false,
             resolved_control_operation: None,
+            resolved_execution_grant: None,
         },
     );
     summary.tags = vec!["orchestrator".into(), "singleton".into()];

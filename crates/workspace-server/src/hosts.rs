@@ -567,6 +567,10 @@ pub struct WorkerSpawnRequest {
     /// Trusted Backend operation identity used to make Worker-owned spawns replay-safe.
     #[serde(skip, default)]
     pub resolved_control_operation: Option<WorkerControlOperation>,
+    /// Host-derived child execution ceiling, persisted against the ordinary
+    /// Worker reservation before Runtime activation. Not accepted from JSON.
+    #[serde(skip, default)]
+    pub resolved_execution_grant: Option<server_api::authorization::WorkerExecutionGrant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -7892,6 +7896,7 @@ mod tests {
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
+            resolved_execution_grant: None,
             resolved_workspace_api: Some(test_workspace_api()),
             resolved_memory_settings: Some(test_memory_settings()),
             resolved_subjektiv_attached: false,
@@ -8182,6 +8187,7 @@ mod tests {
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
                     resolved_subjektiv_attached: false,
@@ -8294,6 +8300,7 @@ mod tests {
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
                     resolved_subjektiv_attached: false,
@@ -8335,6 +8342,7 @@ mod tests {
                     resolved_worker_observation_enabled: false,
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
                     resolved_subjektiv_attached: false,

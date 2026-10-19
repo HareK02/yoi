@@ -929,7 +929,7 @@ mod tests {
         let (_manager, _workspace, store) = open_store(&root, "workspace-a");
         let migrated_subject = store.subject(&subject_id).unwrap().unwrap();
         assert!(migrated_subject.behavior_md.is_empty());
-        assert!(migrated_subject.behavior_md.is_empty());
+        assert!(store.subject_permissions(&subject_id).unwrap().is_none());
         let lifecycle_attribution = attribution(
             &subject_id,
             "runtime-1",

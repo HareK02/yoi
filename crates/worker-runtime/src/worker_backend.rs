@@ -1113,6 +1113,7 @@ fn runtime_local_workdir_router(
     attachments: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
     capabilities: &BTreeMap<WorkdirAttachmentAlias, WorkdirSessionCapabilities>,
     command_output_scope: manifest::SharedScope,
+    authorization_client: Option<Arc<dyn WorkspaceClient>>,
 ) -> Result<Arc<WorkdirSessionRouter>, String> {
     let router = Arc::new(WorkdirSessionRouter::new());
     for (alias, binding) in attachments {
@@ -1121,22 +1122,28 @@ fn runtime_local_workdir_router(
             .copied()
             .unwrap_or(WorkdirSessionCapabilities::READ_ONLY);
         let scope = runtime_attachment_scope(binding.root(), capabilities)?;
+        let source = runtime_local_workdir_session(
+            &binding.working_directory.id,
+            binding.root(),
+            binding.cwd(),
+            scope,
+            command_output_scope.clone(),
+            capabilities,
+            binding.command_environment(),
+            binding
+                .session_resources()
+                .map_err(|error| format!("open Workdir attachment `{alias}` resources: {error}"))?,
+        );
+        let source = match authorization_client.as_ref() {
+            Some(client) => worker::authorized_workdir::authorized_workdir_session(
+                source,
+                client.clone(),
+                binding.working_directory.id.clone(),
+            ),
+            None => source,
+        };
         router
-            .attach(
-                alias.clone(),
-                runtime_local_workdir_session(
-                    &binding.working_directory.id,
-                    binding.root(),
-                    binding.cwd(),
-                    scope,
-                    command_output_scope.clone(),
-                    capabilities,
-                    binding.command_environment(),
-                    binding.session_resources().map_err(|error| {
-                        format!("open Workdir attachment `{alias}` resources: {error}")
-                    })?,
-                ),
-            )
+            .attach(alias.clone(), source)
             .map_err(|error| format!("bind Workdir attachment `{alias}`: {error}"))?;
     }
     Ok(router)
@@ -1163,7 +1170,12 @@ fn restored_workdir_router(
             local_capabilities.insert(attachment.alias.clone(), attachment.capabilities);
         }
     }
-    let router = runtime_local_workdir_router(local_attachments, &local_capabilities, scope)?;
+    let router = runtime_local_workdir_router(
+        local_attachments,
+        &local_capabilities,
+        scope,
+        Some(workspace_client.clone()),
+    )?;
     for attachment in logical_attachments {
         if let Some(local) = local_attachments.get(&attachment.alias) {
             if local.working_directory.id != attachment.working_directory_id {
@@ -1572,6 +1584,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             &request.workdir_attachments,
             &workdir_capabilities,
             worker.scope().clone(),
+            Some(worker.workspace_client_handle()),
         )?);
         if let (Some(runtime_id), Some(workspace_id)) =
             (observation_runtime_id, observation_workspace_id.clone())
@@ -10234,7 +10247,8 @@ mod tests {
         let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
         let attachments = BTreeMap::from([(alias, binding.clone())]);
         let scope = manifest::SharedScope::new(manifest::Scope::writable(binding.root()).unwrap());
-        let router = runtime_local_workdir_router(&attachments, &BTreeMap::new(), scope).unwrap();
+        let router =
+            runtime_local_workdir_router(&attachments, &BTreeMap::new(), scope, None).unwrap();
         session_clone.close().await.unwrap();
         assert_eq!(
             materializer.cleanup_working_directory(id).unwrap_err().code,

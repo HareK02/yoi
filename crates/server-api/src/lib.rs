@@ -6,6 +6,7 @@ use api_macros::api;
 pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, WebSocketOperation};
+pub mod authorization;
 mod drive;
 mod notification;
 pub use notification::*;
@@ -22,6 +23,34 @@ use webauthn_rs_proto::{
     RequestChallengeResponse,
 };
 pub use workspace_config::*;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SubjectPermissionsResponse {
+    pub permissions: Option<authorization::SubjectPermissions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SubjectPermissionsMutationResponse {
+    pub permissions: authorization::SubjectPermissions,
+    /// New operations are already fenced. These are cancellation requests and
+    /// Backend command cleanup evidence, not proof that a Runtime turn stopped.
+    pub interruptions: Vec<SubjectPermissionInterruption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SubjectPermissionInterruption {
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub cancellation_accepted: bool,
+    pub backend_command_sessions_closed: bool,
+    pub diagnostics: Vec<String>,
+}
 
 #[allow(dead_code)]
 #[derive(JsonSchema)]
@@ -168,6 +197,11 @@ macro_rules! impl_openapi_schema {
 }
 
 impl_openapi_schema!(
+    SubjectPermissionsResponse,
+    SubjectPermissionsMutationResponse,
+    SubjectPermissionInterruption,
+    authorization::SubjectPermissions,
+    authorization::SubjectPermissionsUpdate,
     AuthBootstrapUserRequest,
     AuthPublicConfig,
     HostingSettings,
@@ -1297,6 +1331,49 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: MemoryConsolidateStagingRequest,
     ) -> Result<MemoryConsolidationResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/authorization/check",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        openapi = false,
+    )]
+    async fn operation_authorize(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: authorization::OperationAuthorizationRequest,
+    ) -> Result<authorization::OperationAuthorizationResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/permissions",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_permissions_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+    ) -> Result<SubjectPermissionsResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/permissions",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_permissions_set(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: authorization::SubjectPermissionsUpdate,
+    ) -> Result<SubjectPermissionsMutationResponse, RepositoryApiError>;
 
     #[post(
         "/api/w/{workspace_id}/subjektiv/subjects",
@@ -10434,6 +10511,10 @@ pub struct CreateWorkspaceWorkerRequest {
     /// Backend idempotency key used only for authenticated Worker-owned spawn/control.
     #[serde(default)]
     pub control_operation_id: Option<String>,
+    /// Requested least-authority child permissions. Host derives the origin; this
+    /// input cannot assert Subject identity or create a body/singleton attachment.
+    #[serde(default)]
+    pub execution_grant: Option<authorization::WorkerDelegationRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -12935,6 +13016,7 @@ mod tests {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: None,
+            execution_grant: None,
         })
         .unwrap();
         assert_eq!(
@@ -12949,6 +13031,7 @@ mod tests {
                 "workdir_attachments": [],
                 "feature_connections": {},
                 "control_operation_id": null,
+                "execution_grant": null,
             })
         );
     }
@@ -14538,6 +14621,7 @@ mod openapi_artifact_tests {
         // identity, or a one-use Reviewer capability. They remain generated Rust client/Axum
         // operations, but must not appear as unauthenticated operations in the public OpenAPI.
         const SIGNED_INTERNAL: &[&str] = &[
+            "operation_authorize",
             "current_worker_workspace_config_get",
             "current_worker_workspace_config_attach",
             "current_worker_workspace_config_observe",
@@ -14575,7 +14659,11 @@ mod openapi_artifact_tests {
         // the Runtime/Worker-source signed operation inventory above.
         const OTHER_OPENAPI_EXCLUDED: &[&str] = &["worker_session", "worker_session_history"];
         const DOCUMENTED_SIGNED_INTERNAL: &[&str] = &["workspace_runtime_config"];
-        const BROWSER_ONLY: &[&str] = &["merge_request_selector_repair"];
+        const BROWSER_ONLY: &[&str] = &[
+            "merge_request_selector_repair",
+            "subjektiv_subject_permissions_get",
+            "subjektiv_subject_permissions_set",
+        ];
 
         let document = canonical_openapi_document().expect("canonical OpenAPI contract must build");
         let value: serde_json::Value =

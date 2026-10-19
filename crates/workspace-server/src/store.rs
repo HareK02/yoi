@@ -21014,6 +21014,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
+            resolved_execution_grant: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
             resolved_subjektiv_attached: false,

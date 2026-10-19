@@ -326,8 +326,31 @@ mod tests {
     use crate::feature::builtin::merge_request::MergeRequestFeature;
     use crate::feature::builtin::ticket::{TicketFeature, TicketFeatureAccess};
     use crate::hook::HookRegistryBuilder;
-    use crate::worker::TestWorkspaceHttpClient;
+    use crate::worker::{
+        WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceResponse,
+    };
     use manifest::MergeRequestFeatureConfig;
+
+    #[derive(Debug)]
+    struct MetadataOnlyHost;
+    impl WorkspaceClient for MetadataOnlyHost {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace")
+        }
+        fn kind(&self) -> &str {
+            "metadata-fixture"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn authorize_feature_activation(&self, feature: &str) -> Result<(), WorkspaceClientError> {
+            assert_eq!(feature, "ticket");
+            Ok(())
+        }
+        fn execute(&self, _: WorkspaceRequest) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            panic!("metadata-only prompt fixture must not perform protected operations")
+        }
+    }
 
     // These builtin resources are the model-visible workflow compatibility contract.
     // Fixtures prove composition and tool descriptions, not an agent's real judgment.
@@ -351,7 +374,7 @@ mod tests {
         mr_config: MergeRequestFeatureConfig,
         access: TicketFeatureAccess,
     ) -> (String, Vec<agen::tool::ToolMeta>) {
-        let client = Arc::new(TestWorkspaceHttpClient::new("workspace", "http://unused"));
+        let client = Arc::new(MetadataOnlyHost);
         let mut tools = Vec::new();
         let mut hooks = HookRegistryBuilder::default();
         let report = FeatureRegistryBuilder::new()

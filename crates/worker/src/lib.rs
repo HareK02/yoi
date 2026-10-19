@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod authorized_workdir;
 mod backend_job;
 pub use backend_job::BackendJobExecutionBinding;
 pub mod bootstrap;

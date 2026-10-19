@@ -1453,6 +1453,14 @@ where
     // Worker-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `worker`.
     let feature_config = worker.manifest().feature.clone();
+    // First boundary: before any Feature initialization, Tool/WIP/service
+    // registration, prompt contribution, or discovery side effect. Host derives
+    // the live caller grant; the Profile only requests these switches.
+    crate::feature::authorize_requested_manifest(
+        worker.workspace_client_handle().as_ref(),
+        worker.manifest(),
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
     let workdir_sessions = worker.workdir_sessions();
     let restrict_workdir_tools_to_current_capabilities = inherited_workdir_tool_broker.is_some();
     let workdir_tool_broker = Some(
@@ -4139,6 +4147,13 @@ mod tests {
                 request: crate::worker::WorkspaceRequest,
             ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError>
             {
+                if request.path == "/api/w/workspace-1/authorization/check" {
+                    assert_eq!(request.method, crate::worker::WorkspaceRequestMethod::Post);
+                    return Ok(crate::worker::WorkspaceResponse {
+                        status: 200,
+                        body: serde_json::json!({"scope":null}).to_string(),
+                    });
+                }
                 // Native discovery reads metadata and the current caller's ceiling, never inventory or mutations.
                 assert_eq!(request.method, crate::worker::WorkspaceRequestMethod::Get);
                 if request.path == "/api/w/workspace-1/drive/capabilities" {
@@ -4217,7 +4232,7 @@ mod tests {
                         worker.workdir_sessions(),
                     )
                     .descriptor();
-                    register_worker_tools(
+                    let registered = register_worker_tools(
                         &mut worker,
                         root.path().join("bash-output"),
                         root.path().join("runtime"),
@@ -4225,8 +4240,16 @@ mod tests {
                         None,
                         None,
                     )
-                    .await
-                    .unwrap();
+                    .await;
+                    if enabled && (!available || workspace.is_none()) {
+                        assert_eq!(
+                            registered.unwrap_err().kind(),
+                            std::io::ErrorKind::PermissionDenied
+                        );
+                        assert!(requests.lock().unwrap().is_empty());
+                        continue;
+                    }
+                    registered.unwrap();
                     let configured = enabled && available && workspace.is_some();
                     let tools = worker.engine().tool_server_handle();
                     tools.flush_pending();

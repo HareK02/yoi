@@ -260,7 +260,7 @@ async fn connected_create(api: &WorkspaceApi, subject: &str, name: &str) -> Runt
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
                 subjektiv: Some(server_api::SubjektivWorkerConnectionRequest { subject_id: subject.into() }),
-            }, control_operation_id: None,
+            }, control_operation_id: None, execution_grant: None,
         }),
     ).await.unwrap();
     RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
@@ -386,6 +386,56 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     let subject = store
         .create_subject(crate::subjektiv::SubjectRole::new("connected-handoff").unwrap())
         .unwrap();
+    let owner =
+        seed_test_workspace_owner_token(api.store.as_ref(), "connected-journal-owner").await;
+    // This fixture exercises Journal continuity, not unset-policy refusal. Assign
+    // the companion's exact activation keys through authenticated administration;
+    // no filesystem, shell or delegation permission is granted to its body.
+    let update = server_api::authorization::SubjectPermissionsUpdate {
+        operation_id: "connected-journal-activation".into(),
+        expected_change_id: None,
+        execution: [
+            "task",
+            "subjektiv",
+            "web",
+            "image",
+            "sub_worker",
+            "worker",
+            "workspace_worker_discovery",
+            "objective",
+            "manage_workdir",
+            "workdir_catalog",
+            "drive",
+            "ticket",
+        ]
+        .into_iter()
+        .map(|name| server_api::authorization::ScopedPermission {
+            operation: name.into(),
+            resource: server_api::authorization::PermissionResource::Feature,
+        })
+        .collect(),
+        delegation: Vec::new(),
+    };
+    let response = build_router(api.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions",
+                    subject.id
+                ))
+                .header("authorization", format!("Bearer {owner}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&update).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let old = connected_create(&api, &subject.id, "connected-old-body").await;
     let old_attr = store
         .subject_session_attributions(&subject.id)

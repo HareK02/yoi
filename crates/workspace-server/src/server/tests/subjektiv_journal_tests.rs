@@ -1686,6 +1686,7 @@ impl SubjectRemovalFixture {
                     }),
                 },
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await

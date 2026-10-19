@@ -1987,6 +1987,12 @@ enabled = false
             "test"
         }
 
+        fn authorize_feature_activation(&self, _feature: &str) -> Result<(), WorkspaceClientError> {
+            // This fixture represents a non-Subject Host admitting ordinary
+            // Internal Worker configuration, not an operation permission grant.
+            Ok(())
+        }
+
         fn is_available(&self) -> bool {
             true
         }
