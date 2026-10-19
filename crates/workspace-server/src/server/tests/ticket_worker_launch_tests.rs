@@ -132,6 +132,16 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
         self.execution.create_working_directory(request)
     }
 
+    fn cleanup_working_directory(
+        &self,
+        id: &str,
+    ) -> std::result::Result<
+        worker_runtime::catalog::WorkingDirectoryStatus,
+        worker_runtime::working_directory::WorkingDirectoryDiagnostic,
+    > {
+        self.execution.cleanup_working_directory(id)
+    }
+
     fn spawn_worker(&self, mut request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
         self.creates.lock().unwrap().push(request.request.clone());
         for claim in &request.request.workdir_attachments {
@@ -164,9 +174,9 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
     }
 }
 
-struct LaunchFixture {
+pub(super) struct LaunchFixture {
     _temp: tempfile::TempDir,
-    api: WorkspaceApi,
+    pub(super) api: WorkspaceApi,
     backend: Arc<LaunchExecutionBackend>,
     runtime_id: String,
     runtime_server: Option<tokio::task::JoinHandle<()>>,
@@ -182,11 +192,51 @@ impl Drop for LaunchFixture {
 }
 
 impl LaunchFixture {
+    // Reuse the authenticated Runtime HTTP harness for Drive/source lifetime
+    // assertions without duplicating its trust/bootstrap/listener lifecycle.
+    pub(super) async fn with_source_workdir() -> (
+        Self,
+        worker_runtime::working_directory::WorkingDirectoryBinding,
+    ) {
+        let fixture = Self::new(true).await;
+        init_clean_git_workspace(fixture._temp.path());
+        let (_, Json(created)) = create_workspace_working_directory(
+            &fixture.api,
+            TEST_WORKSPACE_ID,
+            Some(&fixture.runtime_id),
+            BrowserWorkingDirectoryCreateRequest {
+                runtime_id: Some(fixture.runtime_id.clone()),
+                display_name: None,
+                repository_key: "test-repository".into(),
+                selector: Some("HEAD".into()),
+                operation_id: Some("drive-source-workdir".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let binding = fixture
+            .backend
+            .execution
+            .materializer
+            .bind_working_directory(&created.item.working_directory_id, None)
+            .unwrap();
+        (fixture, binding)
+    }
+
     async fn new(remote: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let config = test_server_config(temp.path());
         let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
-        let backend = Arc::new(LaunchExecutionBackend::default());
+        let backend = Arc::new(LaunchExecutionBackend {
+            execution: DeterministicExecutionBackend {
+                materializer: worker_runtime::working_directory::RuntimeGitMaterializer::new(
+                    temp.path()
+                        .join(".test-embedded-runtime-store/source-workdirs"),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
         let api =
             WorkspaceApi::new_with_execution_backend(config, Arc::new(store), backend.clone())
                 .await

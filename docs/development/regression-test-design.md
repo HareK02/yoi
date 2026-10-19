@@ -95,6 +95,8 @@ T-744では既存Rust代表8件が成功（上表以外の公開reissue/case/Ans
 
 T-725現行本文・保留trackingを読んだ。`workspace-drive/tests/storage.rs::receipts_survive_response_loss_and_restart_without_double_mutation` は実DB/blob再open後のreceipt一致、同request再送一致、別actor競合拒否、list件数1をassertする。`workspace-server/src/server/tests/worker_drive_tests.rs::lost_mutation_response_is_resolved_by_receipt_without_resending_effect` は本番DriveFeature→署名router/storeを通し、receipt committed・POST mutate数1・別Worker listのlast mutation一致をassertするがRuntime起動はfixtureである。これらの保存/応答喪失規則を再設計しない。実Web adapter接続は `drive_web_roundtrip_tests.rs::repositoryless_drive_real_web_adapter_preserves_bytes_cas_and_latest_reference_lifecycle` の既存ignore/明示実行であり、通常suiteの成功へ含めない。Worker寿命・Web画面までの不足と必要コストはT-725再開時の判断で、今回未確認とする。
 
+**2026-10-19、T-725再開後の候補実装**は[Drive接続の調査・検証記録](../report/t725-drive-connections.md)へ分離した。通常Server libにuser upload→WorkdirなしTools/WIP→owner/別Workerの同一node・mutation・bytes・receipt、実Runtime Worker停止/削除→明示grant付き交換Worker、実Runtime HTTP経由のsource Workdir削除→Drive資料保持の3件を追加した。保存/応答喪失/GC/backupは既存を維持し、Ticket一巡も複製しない。3件の単独libtest実測合計5.54秒（Cargo wall合計6.324秒、build温存時）であり、通常runner全体の増分・並列負荷は未測定。代表的な本文投影欠落とcleanupによる誤ったDrive blob削除のmutantを検出し、復元後Server全crateを成功確認した。既存ignored Web adapterも別途1件成功したがbrowser/実モデル/全Workspace runner/CIの成功には含めない。上の保留記述はT-761設計時の観測であり、この候補を対象developへ採用・統合したという記録ではない。
+
 ## 設計時の代表試行と残った検証
 
 全て専用checkoutで逐次実行、Rust buildはjobs 2。表の本体はlibtest/Deno表示、外側は`time -p`の1回測定であり、通常suite全体の増分やCI中央値ではない。
