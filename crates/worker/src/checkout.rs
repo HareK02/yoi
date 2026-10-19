@@ -625,7 +625,6 @@ impl WipOperationHandler for FileHandler {
                     offset,
                     limit,
                     crate::file_operation::MAX_BYTES,
-                    operation == "read_lines",
                 ),
             )
             .await
@@ -636,7 +635,7 @@ impl WipOperationHandler for FileHandler {
                 )
             })?
             .map_err(map_tool_error)?;
-            let (read, validator) = result;
+            let (read, validator, record_read) = result;
             self.check_connection()?;
             let text = String::from_utf8_lossy(&read.bytes);
             let value = crate::file_operation::page_result(
@@ -646,6 +645,11 @@ impl WipOperationHandler for FileHandler {
                 offset,
                 read.truncated,
             )?;
+            // Only a successfully rendered Read can establish mutation authority.
+            // Search and failed result budgets must leave prior-Read history unchanged.
+            if operation == "read_lines" {
+                record_read();
+            }
             return Ok(match validator {
                 Some(raw) => WipOperationOutput::native_with_validator(
                     value,

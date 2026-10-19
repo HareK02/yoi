@@ -841,3 +841,41 @@ async fn remote_checked_byte_read_uses_common_contract_and_keeps_binary_boundari
         source.bytes
     );
 }
+
+#[tokio::test]
+async fn http_failed_text_read_does_not_authorize_mutations() {
+    for operation in ["write", "edit"] {
+        for oversized in ["\"".repeat(50_000), "x".repeat(65_530)] {
+            let fixture = HttpFixture::new(WorkdirSessionCapabilities::READ_WRITE).await;
+            let remote = fixture.open(TOKEN).await.unwrap();
+            checkout_wip_tests::failed_text_read_cannot_authorize_mutation(
+                Arc::new(remote),
+                &fixture.dir.path().join("text"),
+                &oversized,
+                operation,
+            )
+            .await;
+            let mutations = fixture
+                .state
+                .operations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        op,
+                        WorkdirSessionOperation::CheckoutExecute(CheckoutRequest {
+                            operation: CheckoutOperation::Write { .. }
+                                | CheckoutOperation::Edit { .. },
+                            ..
+                        })
+                    )
+                })
+                .count();
+            assert_eq!(
+                mutations, 1,
+                "only the mutation after a successful Read may reach the provider"
+            );
+        }
+    }
+}

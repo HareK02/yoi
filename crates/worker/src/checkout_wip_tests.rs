@@ -1536,3 +1536,82 @@ fn common_contract_registration_rejects_descriptor_redefinition_and_domain_opera
         Err(WipMountError::InterfaceCollision { .. })
     ));
 }
+
+pub(super) async fn failed_text_read_cannot_authorize_mutation(
+    source: WorkdirSessionHandle,
+    disk_file: &std::path::Path,
+    oversized: &str,
+    operation: &str,
+) {
+    let original = format!("{oversized}\nknown\n");
+    std::fs::write(disk_file, &original).unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(WorkdirAttachmentAlias::new("main").unwrap(), source)
+        .unwrap();
+    let r = Arc::new(runtime(router, None));
+    let inspected = model_inspect(r.clone(), "/checkouts/main/text").await;
+    let arguments = if operation == "write" {
+        json!({"content":"changed"})
+    } else {
+        json!({"old_string":"known","new_string":"changed"})
+    };
+    let failure = model_invoke(r.clone(), &inspected, "read", json!({"limit":1}))
+        .await
+        .unwrap_err();
+    assert!(
+        failure.to_string().contains("ResourceLimitExceeded"),
+        "{failure}"
+    );
+    let denied = model_invoke(r.clone(), &inspected, operation, arguments.clone()).await;
+    assert!(denied.is_err(), "failed read authorized {operation}");
+    let denied = denied.unwrap_err();
+    assert!(denied.to_string().contains("InvalidArguments"), "{denied}");
+    assert_eq!(std::fs::read_to_string(disk_file).unwrap(), original);
+    model_invoke(r.clone(), &inspected, "read", json!({"offset":1,"limit":1}))
+        .await
+        .unwrap();
+    // A failed read must neither grant new authority nor erase an earlier successful Read.
+    assert!(
+        model_invoke(r.clone(), &inspected, "read", json!({"limit":1}))
+            .await
+            .is_err()
+    );
+    model_invoke(r, &inspected, operation, arguments)
+        .await
+        .unwrap();
+    let expected = if operation == "write" {
+        "changed".to_string()
+    } else {
+        original.replace("known", "changed")
+    };
+    assert_eq!(std::fs::read_to_string(disk_file).unwrap(), expected);
+}
+
+#[tokio::test]
+async fn failed_text_read_does_not_authorize_write() {
+    for oversized in ["\"".repeat(50_000), "x".repeat(65_530)] {
+        let dir = TempDir::new().unwrap();
+        failed_text_read_cannot_authorize_mutation(
+            session(&dir, false),
+            &dir.path().join("text"),
+            &oversized,
+            "write",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn failed_text_read_does_not_authorize_edit() {
+    for oversized in ["\"".repeat(50_000), "x".repeat(65_530)] {
+        let dir = TempDir::new().unwrap();
+        failed_text_read_cannot_authorize_mutation(
+            session(&dir, false),
+            &dir.path().join("text"),
+            &oversized,
+            "edit",
+        )
+        .await;
+    }
+}

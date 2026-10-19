@@ -404,8 +404,8 @@ fn check_pattern(pattern: &str) -> Result<(), ToolError> {
 #[path = "checkout_tests.rs"]
 mod tests;
 
-/// Read a bounded native text window through the same checked target and attachment tracker.
-/// Search callers do not establish the prior-Read precondition for mutations.
+/// Read a bounded native text window through the same checked target.
+/// The returned one-shot action records prior-Read only after the caller's presentation succeeds.
 #[allow(clippy::too_many_arguments)]
 pub async fn read_checkout_text(
     router: Arc<WorkdirSessionRouter>,
@@ -417,8 +417,7 @@ pub async fn read_checkout_text(
     offset: usize,
     limit: usize,
     max_bytes: usize,
-    record_read: bool,
-) -> Result<(workdir::ReadResult, Option<Vec<u8>>), ToolError> {
+) -> Result<(workdir::ReadResult, Option<Vec<u8>>, impl FnOnce()), ToolError> {
     let selected =
         crate::routing::resolve_session(&router, Some(alias), WorkdirSessionCapability::Read)?;
     if selected.generation != generation {
@@ -431,10 +430,11 @@ pub async fn read_checkout_text(
         validator: Some(validator),
     };
     let (result, validator) = target.read(offset, limit, max_bytes).await?;
-    if record_read {
-        tracker.record_workdir_observation(&path, result.content_hash.clone(), result.total_lines);
-    }
-    Ok((result, validator))
+    let hash = result.content_hash.clone();
+    let total_lines = result.total_lines;
+    Ok((result, validator, move || {
+        tracker.record_workdir_observation(&path, hash, total_lines);
+    }))
 }
 
 /// Binary-safe checked byte window. This does not establish a text prior-Read observation.
