@@ -1204,9 +1204,13 @@ fn archive_storage(
     }
 }
 
-/// Called only on the private Runtime migration staging tree under its owner
-/// lock. Failure discards the whole tree, including manifests and attestations.
-pub(crate) fn migrate_staged_sessions(root: &Path) -> Result<(), RuntimeError> {
+// Share discovery and erasure fencing between the read-only Runtime preflight
+// and its private staging pass. Session Store remains the authority for schema
+// admission and conversion; Runtime must not duplicate its version table.
+fn for_each_live_session(
+    root: &Path,
+    mut visit: impl FnMut(&Path, bool) -> Result<(), RuntimeError>,
+) -> Result<(), RuntimeError> {
     for directory in ["workers", "orphaned-workers", "archives/workers"] {
         let directory = root.join(directory);
         let entries = match fs::read_dir(&directory) {
@@ -1253,42 +1257,70 @@ pub(crate) fn migrate_staged_sessions(root: &Path) -> Result<(), RuntimeError> {
                 Err(session_store::StoreError::SessionErased(_)) => continue,
                 Err(error) => return Err(retention_error(error)),
             }
-            let archive = if directory == root.join("archives/workers") {
-                let manifest: WorkerSessionArchiveManifest = read_json(
-                    &aggregate.join("manifest.json"),
-                    "read archive before Session migration",
-                )?;
-                Some(validate_existing_archive(&aggregate, &manifest, false)?)
-            } else {
-                None
-            };
-            session_store::WorkerSessionStore::new(&session).map_err(|error| {
-                RuntimeError::StoreCorrupt {
-                    operation: "migrate Session schema",
-                    path: session.clone(),
-                    message: error.to_string(),
-                }
-            })?;
-            if let Some(ingestion) = archive {
-                let (checksum_sha256, bytes, file_count) = checksum_files(
-                    &collect_files(&session, "migrate archive storage")?,
-                    "migrate archive storage",
-                )?;
-                atomic_write_json(
-                    &aggregate.join(ARCHIVE_STORAGE_FILE),
-                    &MigratedArchiveStorage {
-                        schema_version: 1,
-                        ingestion,
-                        checksum_sha256,
-                        bytes,
-                        file_count,
-                    },
-                    "commit migrated archive storage",
-                )?;
-            }
+            visit(&aggregate, directory == root.join("archives/workers"))?;
         }
     }
     Ok(())
+}
+
+/// Read-only admission probe: a rejected Session needs the existing staged
+/// migration attempt (which will also reject corrupt/unsupported inputs).
+/// Never create a writable Session store or rewrite archive attestations here.
+pub(crate) fn sessions_require_migration(root: &Path) -> Result<bool, RuntimeError> {
+    let mut required = false;
+    for_each_live_session(root, |aggregate, _| {
+        required |=
+            session_store::WorkerSessionStore::open_read_only(aggregate.join("session")).is_err();
+        Ok(())
+    })?;
+    Ok(required)
+}
+
+/// Called only on the private Runtime migration staging tree under its owner
+/// lock. Failure discards the whole tree, including manifests and attestations.
+pub(crate) fn migrate_staged_sessions(root: &Path) -> Result<(), RuntimeError> {
+    for_each_live_session(root, |aggregate, is_archive| {
+        let session = aggregate.join("session");
+        let archive = if is_archive {
+            let manifest: WorkerSessionArchiveManifest = read_json(
+                &aggregate.join("manifest.json"),
+                "read archive before Session migration",
+            )?;
+            Some(validate_existing_archive(aggregate, &manifest, false)?)
+        } else {
+            None
+        };
+        // Current Sessions need no writable admission, and their storage
+        // attestations must remain byte-for-byte unchanged.
+        if session_store::WorkerSessionStore::open_read_only(&session).is_ok() {
+            return Ok(());
+        }
+        session_store::WorkerSessionStore::new(&session).map_err(|error| {
+            RuntimeError::StoreCorrupt {
+                operation: "migrate Session schema",
+                path: session.clone(),
+                message: error.to_string(),
+            }
+        })?;
+        if let Some(ingestion) = archive {
+            let (checksum_sha256, bytes, file_count) = checksum_files(
+                &collect_files(&session, "migrate archive storage")?,
+                "migrate archive storage",
+            )?;
+            atomic_write_json(
+                &aggregate.join(ARCHIVE_STORAGE_FILE),
+                &MigratedArchiveStorage {
+                    schema_version: 1,
+                    ingestion,
+                    checksum_sha256,
+                    bytes,
+                    file_count,
+                },
+                "commit migrated archive storage",
+            )?;
+        }
+        Ok(())
+    })
 }
 
 fn validate_existing_archive(
@@ -1753,12 +1785,16 @@ fn temporary_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tmp-{}-{sequence}", std::process::id()))
 }
 
+#[cfg(all(test, feature = "fs-store"))]
+#[path = "retention/runtime_v5_tests.rs"]
+mod runtime_v5_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
 
-    fn write_json(path: &Path, value: &impl Serialize) {
+    pub(super) fn write_json(path: &Path, value: &impl Serialize) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
     }
@@ -1786,7 +1822,7 @@ mod tests {
         fs::write(worker.join("runs/attempt-a/worker.sock"), b"not retained").unwrap();
     }
 
-    fn request(
+    pub(super) fn request(
         worker_id: WorkerId,
         disposition: SessionDisposition,
     ) -> WorkerRetentionExecutionRequest {
