@@ -816,6 +816,218 @@ async fn worker_feature_activation_is_distinct_from_ticket_create_and_revocation
     assert_eq!(backend.list(Default::default()).unwrap().len(), 1);
 }
 
+fn creation_record_counts(f: &Fixture) -> [i64; 3] {
+    let connection = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
+    [
+        "worker_create_reservations",
+        "worker_registry",
+        "worker_control_grants",
+    ]
+    .map(|table| {
+        connection
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE workspace_id=?1"),
+                [TEST_WORKSPACE_ID],
+                |row| row.get(0),
+            )
+            .unwrap()
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generic_create_routes_refuse_body_and_child_delegation_before_any_creation_effect() {
+    let f = Fixture::new().await;
+    let permissions = vec![activation("ticket"), create_permission()];
+    f.assign(vec![], permissions.clone()).await;
+    let mut child_request = f.child_request("redelegating-editor", permissions.clone());
+    child_request["execution_grant"]["redelegation"] = json!(permissions);
+    let (status, child) = f.spawn(&f.source, child_request).await;
+    assert_eq!(status, StatusCode::OK, "{child}");
+    let child = RuntimeWorkerRef::new(
+        child["runtime_id"].as_str().unwrap(),
+        child["worker_id"].as_str().unwrap(),
+    );
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let grants = store
+        .list_subject_worker_execution_grants(&f.subject)
+        .unwrap();
+    let records = creation_record_counts(&f);
+    let runtime_calls = f.runtime.spawn_requests().len();
+    for source in [&f.source, &child] {
+        for path in [
+            format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
+            "/api/workers".into(),
+        ] {
+            let exact = f.child_request("generic-must-not-allocate", permissions.clone());
+            let mut missing_id = exact.clone();
+            missing_id
+                .as_object_mut()
+                .unwrap()
+                .remove("control_operation_id");
+            let mut blank_id = exact.clone();
+            blank_id["control_operation_id"] = json!(" ");
+            let mut conflicting = exact.clone();
+            conflicting["display_name"] = json!("Different payload, same operation ID");
+            for request in [exact.clone(), exact, missing_id, blank_id, conflicting] {
+                let (status, body) = response(
+                    &f.api,
+                    runtime_source_request(
+                        &f.identity,
+                        Some(&source.worker_id),
+                        "POST",
+                        &path,
+                        serde_json::to_vec(&request).unwrap(),
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+                assert!(
+                    body["message"].as_str().unwrap().contains("worker-control"),
+                    "{body}"
+                );
+                assert_eq!(
+                    creation_record_counts(&f),
+                    records,
+                    "{path}: no reservation, registry or control grant"
+                );
+                assert_eq!(
+                    store
+                        .list_subject_worker_execution_grants(&f.subject)
+                        .unwrap(),
+                    grants
+                );
+                assert_eq!(
+                    f.runtime.spawn_requests().len(),
+                    runtime_calls,
+                    "{path}: no Runtime creation"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generic_create_routes_preserve_human_and_non_subject_worker_creation() {
+    let f = Fixture::new().await;
+    let mut request = f.child_request("unused-on-generic-route", vec![]);
+    request.as_object_mut().unwrap().remove("execution_grant");
+    request
+        .as_object_mut()
+        .unwrap()
+        .remove("control_operation_id");
+    for path in [
+        format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
+        "/api/workers".into(),
+    ] {
+        let (status, human_child) = response(
+            &f.api,
+            human_request(&f.owner, "POST", &path, Some(request.clone())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "human {path}: {human_child}");
+        let (status, worker_child) = response(
+            &f.api,
+            runtime_source_request(
+                &f.identity,
+                Some(human_child["worker_id"].as_str().unwrap()),
+                "POST",
+                &path,
+                serde_json::to_vec(&request).unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "non-Subject {path}: {worker_child}");
+        assert!(
+            open_subjektiv_store(&f.api)
+                .unwrap()
+                .worker_execution_grant(
+                    worker_child["runtime_id"].as_str().unwrap(),
+                    worker_child["worker_id"].as_str().unwrap(),
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subject_control_creation_recovers_control_grant_failure_and_lost_response_without_duplicates()
+ {
+    let f = Fixture::new().await;
+    let permissions = vec![activation("ticket"), create_permission()];
+    f.assign(vec![], permissions.clone()).await;
+    let mut missing_id = f.child_request("control-grant-recovery", permissions.clone());
+    missing_id
+        .as_object_mut()
+        .unwrap()
+        .remove("control_operation_id");
+    let records = creation_record_counts(&f);
+    let (status, body) = f.spawn(&f.source, missing_id).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(creation_record_counts(&f), records);
+    let connection = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_control_grant BEFORE INSERT ON worker_control_grants BEGIN SELECT RAISE(ABORT, 'injected control grant failure'); END;").unwrap();
+    let request = f.child_request("control-grant-recovery", permissions);
+    let (status, body) = f.spawn(&f.source, request.clone()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let grants = store
+        .list_subject_worker_execution_grants(&f.subject)
+        .unwrap();
+    assert_eq!(
+        grants.len(),
+        1,
+        "Worker exists before control grant persistence fails"
+    );
+    let child = RuntimeWorkerRef::new(&grants[0].runtime_id, &grants[0].worker_id);
+    assert_eq!(
+        f.runtime.workers.lock().unwrap().len(),
+        2,
+        "one source and one child"
+    );
+    assert!(
+        f.api
+            .store
+            .list_active_worker_control_grants(TEST_WORKSPACE_ID, &f.source, 10)
+            .unwrap()
+            .is_empty()
+    );
+    connection
+        .execute_batch("DROP TRIGGER fail_control_grant;")
+        .unwrap();
+    let runtime_calls = f.runtime.spawn_requests().len();
+    for _ in 0..2 {
+        // The first success is deliberately not used as a retry credential.
+        let (status, body) = f.spawn(&f.source, request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["worker_id"], child.worker_id);
+        assert_eq!(
+            store
+                .list_subject_worker_execution_grants(&f.subject)
+                .unwrap(),
+            grants
+        );
+        let control = f
+            .api
+            .store
+            .list_active_worker_control_grants(TEST_WORKSPACE_ID, &f.source, 10)
+            .unwrap();
+        assert_eq!(control.len(), 1);
+        assert_eq!(control[0].subject, child);
+        assert_eq!(
+            f.runtime.spawn_requests().len(),
+            runtime_calls,
+            "completed creation must not resubmit to Runtime"
+        );
+    }
+    let records = creation_record_counts(&f);
+    let mut conflict = request;
+    conflict["display_name"] = json!("Changed control retry");
+    assert!(!f.spawn(&f.source, conflict).await.0.is_success());
+    assert_eq!(creation_record_counts(&f), records);
+    assert_eq!(f.runtime.spawn_requests().len(), runtime_calls);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_delegation_creates_workdirless_ticketless_editor_and_replays_one_worker_and_grant()
  {

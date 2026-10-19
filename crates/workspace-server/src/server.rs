@@ -32338,6 +32338,15 @@ async fn create_workspace_worker_authenticated_on_host(
         }
         None
     };
+    // Generic creation has no authenticated-origin operation reservation or
+    // control-grant recovery. A supplied ID alone must not make that path a
+    // delegation API; require the normal worker-control lifecycle instead.
+    if resolved_execution_grant.is_some() && resolved_control_operation.is_none() {
+        return Err(Error::WorkspacePermissionDenied(
+            "Subject delegation requires worker-control creation with control_operation_id; generic Worker creation is not supported".into(),
+        )
+        .into());
+    }
     let resolved_subjektiv_attached = match feature_connections.subjektiv {
         None => {
             validate_caller_worker_singleton_key(singleton_key.as_deref())?;

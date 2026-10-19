@@ -7,6 +7,11 @@
 //! all children issued from it; restoring a Worker cannot refresh that assignment.
 //! Checks refuse new effects; they do not undo effects already committed. Trusted
 //! Features must call the operation boundary themselves, including alternate surfaces.
+//!
+//! Subject delegation uses the normal Worker control lifecycle, which binds stable
+//! operation identity to the authenticated origin and recovers control-grant writes.
+//! Generic Worker creation rejects Subject delegation before reservation, even if
+//! the payload supplies an operation ID; its manual allocations are not replay-safe.
 
 use super::*;
 use server_api::authorization::{
