@@ -67,6 +67,7 @@ impl Fixture {
                 content: vec![session_store::LoggedContentPart::Text { text: text.into() }],
             },
             metadata: session_store::LoggedSessionHistoryMetadata {
+                input_metadata: None,
                 entry_id: session_store::LoggedSessionHistoryEntryId(format!("original-{index}")),
                 origin: session_store::LoggedSessionHistoryOrigin::LocalHumanInput,
                 derivation: None,

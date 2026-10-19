@@ -11,7 +11,7 @@ use agen::llm_client::{
     types::Item,
 };
 use futures::Stream;
-use session_store::{CombinedStore, FsWorkerStore, LogEntry, LoggedSessionHistoryOrigin};
+use session_store::{CombinedStore, FsWorkerStore, LogEntry};
 use std::pin::Pin;
 
 const BEFORE: &str = "FROZEN_POSITION: B partially implemented; tests not run; result unconfirmed";
@@ -139,14 +139,14 @@ async fn local_host_compaction_freezes_pending_journal_through_request_and_durab
         let worker = prepared.worker();
         assert_ne!(worker.segment_id(), source_segment);
         let seed = worker.store().read_all(worker.session_id(), worker.segment_id()).unwrap().into_iter().find_map(|entry| match entry { LogEntry::AnnotatedSegmentStart { history, .. } => Some(history), _ => None }).expect("durable compacted seed");
-        let journal_items: Vec<_> = seed.iter().filter(|entry| entry.metadata.origin == LoggedSessionHistoryOrigin::JournalContext).collect();
+        let journal_items: Vec<_> = seed.iter().filter(|entry| entry.metadata.input_metadata.as_ref().is_some_and(|input| input.usage().compaction == session_store::InputCompactionUse::ReferenceInput)).collect();
         assert_eq!(journal_items.len(), 1);
         let journal_item = Item::from(journal_items[0].item.clone());
         let body = journal_item.as_text().unwrap();
         assert!(body.contains(&expected_json), "durable seed contains the full selected JSON and processing checkpoint");
         assert!(body.contains(BEFORE));
         assert!(!body.contains(AFTER));
-        assert!(seed.iter().any(|entry| entry.metadata.origin == LoggedSessionHistoryOrigin::CompactionSummary && Item::from(entry.item.clone()).as_text().is_some_and(|text| text.contains(COMPLEMENT))));
+        assert!(seed.iter().any(|entry| entry.metadata.input_metadata.as_ref().is_some_and(|input| input.usage().compaction == session_store::InputCompactionUse::OpeningSummary) && Item::from(entry.item.clone()).as_text().is_some_and(|text| text.contains(COMPLEMENT))));
         let requests = model.requests.lock().unwrap();
         let input = requests[0].items.iter().find_map(|item| match item {
             Item::Message { role: agen::llm_client::types::Role::User, .. } => item.as_text().filter(|text| text.contains("## Conversation overview/index")),

@@ -1,0 +1,3 @@
+{"kind":"system_item","ts":1,"item":{"kind":"skill_activation","name":"legacy-skill","body":"legacy skill body"}}
+{"kind":"user_input","ts":2,"segments":[{"kind":"text","content":"legacy user body"}],"extensions":[{"domain":"old","payload":{"kept":true}}]}
+{"kind":"assistant_item","ts":3,"item":{"kind":"message","role":"assistant","content":[{"kind":"text","text":"legacy reply"}]}}

@@ -6,6 +6,16 @@
 
 pub mod backend_job_result;
 pub(crate) mod bash;
+
+/// Host metadata participants are independent of model-facing Tool enablement.
+/// Disabling a Feature must not preserve stale Session-bound authority evidence.
+pub(crate) fn session_metadata_lifecycles()
+-> Vec<std::sync::Arc<dyn crate::metadata_lifecycle::SessionMetadataLifecycle>> {
+    vec![std::sync::Arc::new(
+        crate::subjektiv_metadata::SessionAttributionMetadata,
+    )]
+}
+
 pub mod chat_invocation;
 pub mod drive;
 pub mod flow_transition;

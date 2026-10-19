@@ -1615,10 +1615,10 @@ where
     if ordinary_subjektiv_features_enabled
         && lifecycle_enabled
         && let Some(host) = subjektiv_host.as_ref()
-        && host.host.journal_startup_granted()
+        && (host.host.journal_startup_granted() || host.host.journal_compaction_granted())
     {
-        worker.install_initial_context_source(Arc::new(
-            crate::feature::builtin::journal::JournalStartupContextSource::new(
+        worker.install_session_context_source(Arc::new(
+            crate::feature::builtin::journal::JournalContextSource::new(
                 host.clone(),
                 worker.prompts(),
             ),

@@ -3943,6 +3943,7 @@ Deno.test("live system items reconcile with committed history by entry identity"
   const item = {
     kind: "resident_summary_refresh",
     body: "Resident memory refresh",
+    presentation: { kind: "context" },
   };
   const event: Event = {
     event: "system_item",

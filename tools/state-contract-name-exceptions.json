@@ -70,12 +70,12 @@
     ]
   },
   {
-    "path": "crates/session-store/src/system_item.rs",
+    "path": "crates/session-store/src/legacy_session_log/tests/v5.rs",
     "kind": "saved_data",
-    "reason": "frozen_subject_behavior_log_reads_old_counter_without_republishing_itの保存済みSystemItem fixture。旧JSONを読んでもexact archived bodyを維持することを証明する。削除すると過去Session log形式の読取回帰を検出できない。",
+    "reason": "旧Subject behavior JSONに保存されていたcounterの実fixture。v1–4専用migration境界で旧綴りを読み、本文を維持して現行payloadへcounterを再公開しないことを検証する。通常v5 decoderは旧Feature kind自体を拒否する。",
     "lines": [
       {
-        "sha256": "5b5998029cfed30634e8b063b759aefd70e30dab3d02ce9defe9086977fc9811",
+        "sha256": "54c30cb3198eb16e57c7e580fce4dc058f89e793b77a2955be317aa38b490138",
         "count": 1
       }
     ]

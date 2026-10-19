@@ -79,7 +79,7 @@ async fn recorded_idle_body_handoff_preserves_open_after_source_deletion_and_see
         let sessions = session_store::FsStore::new_with_retention(workers.sessions_dir(second.worker_id()), crate::store::session_retention(&state)).unwrap();
         let pointer = session_store::FsWorkerStore::new(workers.worker_metadata_dir(second.worker_id())).unwrap().read_by_name(&second.record().storage_key).unwrap().unwrap().active.unwrap();
         let entries = sessions.read_all(session, pointer.segment_id.unwrap()).unwrap();
-        let journal_items = entries.iter().filter(|entry| matches!(entry, session_store::LogEntry::AnnotatedSystemItem { entry, .. } if matches!(entry.item, session_store::SystemItem::JournalStartup { .. }))).count();
+        let journal_items = entries.iter().filter(|entry| matches!(entry, session_store::LogEntry::AnnotatedSystemItem { entry, .. } if entry.metadata.input_metadata.as_ref().and_then(|input| input.feature_payload()).is_some_and(|payload| payload.schema() == "journal:startup"))).count();
         assert_eq!(journal_items, 1);
         assert_eq!(catalog.store.subject(&subject.id).unwrap().unwrap().behavior_md, "BEHAVIOR_ORIGINAL_UNCHANGED");
         second.shutdown().await.unwrap();

@@ -597,30 +597,40 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     let segments = session.list_segments(session_id).unwrap();
     assert_eq!(segments.len(), 1);
     let entries = session.read_all_read_only(session_id, segments[0]).unwrap();
+    #[derive(serde::Deserialize)]
+    struct SavedJournal {
+        snapshot: serde_json::Value,
+        snapshot_sha256: String,
+        prompt_provenance: session_store::PromptRenderProvenance,
+    }
     let startup: Vec<_> = entries
         .iter()
         .enumerate()
-        .filter_map(|(index, log)| match log {
-            session_store::LogEntry::AnnotatedSystemItem { entry, .. } => match &entry.item {
-                session_store::SystemItem::JournalStartup {
-                    snapshot,
-                    snapshot_sha256,
-                    body,
-                    prompt_provenance,
-                } => Some((index, snapshot, snapshot_sha256, body, prompt_provenance)),
-                _ => None,
-            },
-            _ => None,
+        .filter_map(|(index, log)| {
+            let session_store::LogEntry::AnnotatedSystemItem { entry, .. } = log else {
+                return None;
+            };
+            let payload = entry
+                .metadata
+                .input_metadata
+                .as_ref()?
+                .feature_payload()?
+                .decode::<SavedJournal>("journal:startup", 1)
+                .ok()?;
+            Some((index, payload, entry.item.history_text()))
         })
         .collect();
     assert_eq!(startup.len(), 1, "startup must be durably committed once");
-    let (startup_index, snapshot, digest, body, provenance) = startup[0];
+    let (startup_index, payload, body) = &startup[0];
+    let snapshot = &payload.snapshot;
+    let digest = &payload.snapshot_sha256;
+    let provenance = &payload.prompt_provenance;
     let first_input = entries
         .iter()
         .position(|entry| matches!(entry, session_store::LogEntry::AnnotatedUserInput { .. }))
         .expect("new body persisted its initial human input");
     assert!(
-        startup_index < first_input,
+        *startup_index < first_input,
         "startup reference must be persisted before the first human input/model request"
     );
     assert_eq!(snapshot["subject_id"], subject.id);

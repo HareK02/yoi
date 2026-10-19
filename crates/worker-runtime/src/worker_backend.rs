@@ -5030,6 +5030,7 @@ mod tests {
                     }],
                 },
                 metadata: LoggedSessionHistoryMetadata {
+                    input_metadata: None,
                     entry_id,
                     origin: LoggedSessionHistoryOrigin::LegacyUnknown,
                     derivation: None,

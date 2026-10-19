@@ -41,6 +41,7 @@ pub(crate) fn read_without_atime_bounded(path: &Path, max_bytes: u64) -> io::Res
 pub mod event_trace;
 pub mod fs_store;
 pub mod history;
+pub mod input_metadata;
 mod legacy_session_log;
 pub mod logged_item;
 mod paste_artifact;
@@ -64,6 +65,10 @@ pub use history::{
     LoggedHistoryDerivation, LoggedHistoryEntry, LoggedSessionHistoryEntryId,
     LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin, LoggedSystemHistoryEntry,
     LoggedWorkerSubject,
+};
+pub use input_metadata::{
+    FeatureInputPayload, HistoryInputMetadata, HistoryInputUsePolicy, InputCompactionUse,
+    InputEvidenceUse, InputMetadataError, InputObservationUse, SystemInputEnvelope,
 };
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
 pub use paste_artifact::PasteArtifactLimits;
@@ -98,7 +103,8 @@ pub use segment::{
 pub use segment_log::{LogEntry, RestoredState, SegmentOrigin, SessionExtension, collect_state};
 pub use store::{Store, StoreError};
 pub use system_item::{
-    PromptRenderProvenance, SystemItem, SystemReminder, SystemReminderSource, render_worker_event,
+    PromptRenderProvenance, PublicSystemItem, PublicSystemPresentation, SystemItem, SystemReminder,
+    SystemReminderSource, render_worker_event,
 };
 pub use uploaded_file::{
     DEFAULT_MAX_FILES_PER_SUBMISSION, DEFAULT_MAX_SESSION_ARTIFACT_BYTES,

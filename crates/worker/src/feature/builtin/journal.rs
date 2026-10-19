@@ -23,7 +23,7 @@ use crate::hook::{
 use crate::subjektiv::{SubjektivHostConnection, SubjektivHostError};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use subjektiv::journal::transport::*;
@@ -32,12 +32,73 @@ use subjektiv::journal::{
     MAX_JOURNAL_RESPONSE_BYTES,
 };
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JournalStartupInput {
+    pub snapshot: subjektiv::journal::startup::JournalStartupSnapshot,
+    pub snapshot_sha256: String,
+    pub prompt_provenance: session_store::PromptRenderProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JournalReadStatus {
+    Available,
+    Absent,
+    Disabled,
+    Unavailable,
+}
+impl JournalReadStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Absent => "absent",
+            Self::Disabled => "disabled",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalCompactionInput {
+    status: JournalReadStatus,
+    snapshot: Option<subjektiv::journal::startup::JournalStartupSnapshot>,
+    snapshot_sha256: Option<String>,
+    prompt_provenance: session_store::PromptRenderProvenance,
+}
+
+fn journal_input(
+    body: String,
+    payload: session_store::FeatureInputPayload,
+    kind: &str,
+) -> Result<session_store::SystemInputEnvelope, String> {
+    use session_store::*;
+    let public = PublicSystemItem {
+        kind: kind.into(),
+        body: body.clone(),
+        presentation: PublicSystemPresentation::Context,
+    };
+    let metadata = HistoryInputMetadata::new(
+        HistoryInputUsePolicy {
+            recording_material: InputEvidenceUse::Exclude,
+            memory_evidence: InputEvidenceUse::Exclude,
+            observation: InputObservationUse::Hidden,
+            compaction: InputCompactionUse::ReferenceInput,
+        },
+        Some(payload),
+        Some(public),
+    )
+    .map_err(|e| e.to_string())?;
+    SystemInputEnvelope::new(body, metadata).map_err(|e| e.to_string())
+}
+
 /// Subjektiv owns startup projection; Core only commits its typed initial items.
-pub(crate) struct JournalStartupContextSource {
+pub(crate) struct JournalContextSource {
     host: SubjektivHostConnection,
     prompts: Arc<arc_swap::ArcSwap<crate::prompt::catalog::PromptCatalog>>,
 }
-impl JournalStartupContextSource {
+impl JournalContextSource {
     pub(crate) fn new(
         host: SubjektivHostConnection,
         prompts: Arc<arc_swap::ArcSwap<crate::prompt::catalog::PromptCatalog>>,
@@ -46,9 +107,12 @@ impl JournalStartupContextSource {
     }
 }
 #[async_trait]
-impl crate::worker::InitialContextSource for JournalStartupContextSource {
+impl crate::worker::SessionContextSource for JournalContextSource {
     async fn load(&self) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
         use sha2::{Digest, Sha256};
+        if !self.host.host.journal_startup_granted() {
+            return Ok(Vec::new());
+        }
         let snapshot = self
             .host
             .journal_startup_context()
@@ -58,8 +122,8 @@ impl crate::worker::InitialContextSource for JournalStartupContextSource {
         let empty = snapshot.journals.is_empty() && !snapshot.omitted;
         // Hash the same canonical JSON value retained by SystemItem, so replay
         // can verify provenance without depending on domain struct field order.
-        let snapshot = serde_json::to_value(snapshot).map_err(|e| e.to_string())?;
-        let snapshot_json = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
+        let snapshot_value = serde_json::to_value(&snapshot).map_err(|e| e.to_string())?;
+        let snapshot_json = serde_json::to_string(&snapshot_value).map_err(|e| e.to_string())?;
         if snapshot_json.len() > subjektiv::journal::startup::STARTUP_MAX_BYTES {
             return Err("Host Journal startup snapshot exceeds independent byte budget".into());
         }
@@ -74,9 +138,10 @@ impl crate::worker::InitialContextSource for JournalStartupContextSource {
             return Err("Journal startup prompt exceeds rendered byte budget".into());
         }
         let projection = prompts.projection();
-        Ok(vec![session_store::LoggedSystemHistoryEntry {
-            item: session_store::SystemItem::JournalStartup {
-                body,
+        let payload = session_store::FeatureInputPayload::encode(
+            "journal:startup",
+            1,
+            &JournalStartupInput {
                 snapshot,
                 snapshot_sha256: Sha256::digest(snapshot_json.as_bytes())
                     .iter()
@@ -89,11 +154,38 @@ impl crate::worker::InitialContextSource for JournalStartupContextSource {
                     logical_name: "internal.subjektiv_journal_startup".into(),
                 },
             },
-            metadata: crate::session_history::metadata(
-                session_store::LoggedSessionHistoryOrigin::JournalContext,
-                None,
-            ),
-        }])
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(vec![session_store::LoggedSystemHistoryEntry::from_input(
+            session_store::LoggedSessionHistoryOrigin::Provided {
+                producer: "subjektiv.journal".into(),
+            },
+            None,
+            journal_input(body, payload, "journal_startup")?,
+        )])
+    }
+
+    async fn load_compaction_context(
+        &self,
+        session: session_store::SessionId,
+    ) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
+        // A changed Session must never reuse the old source's Host ownership.
+        let connection = if self.host.context.session_id == session.to_string() {
+            Ok(Some(self.host.clone()))
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "context source belongs to a different Session",
+            ))
+        };
+        let input = freeze_compaction_journal(connection, &self.prompts.load_full())?;
+        Ok(vec![session_store::LoggedSystemHistoryEntry::from_input(
+            session_store::LoggedSessionHistoryOrigin::Provided {
+                producer: "subjektiv.journal".into(),
+            },
+            None,
+            input,
+        )])
     }
 }
 
@@ -103,7 +195,8 @@ impl crate::worker::InitialContextSource for JournalStartupContextSource {
 pub(crate) fn freeze_compaction_journal(
     connection: std::io::Result<Option<SubjektivHostConnection>>,
     prompts: &crate::prompt::catalog::PromptCatalog,
-) -> Result<String, crate::prompt::catalog::CatalogError> {
+) -> Result<session_store::SystemInputEnvelope, String> {
+    use JournalReadStatus::*;
     let workspace_id = connection.as_ref().ok().and_then(|connection| {
         connection
             .as_ref()
@@ -116,24 +209,25 @@ pub(crate) fn freeze_compaction_journal(
         Ok(_) => None,
         Err(_) => Some(Err(())),
     };
+    let snapshot = read.as_ref().and_then(|read| read.as_ref().ok()).cloned();
     let (status, json) = match read {
-        None => ("disabled", String::new()),
+        None => (Disabled, String::new()),
         Some(Ok(snapshot)) => {
             let status = if snapshot.journals.is_empty() {
-                "absent"
+                Absent
             } else {
-                "available"
+                Available
             };
             match serde_json::to_string(&snapshot) {
                 Ok(json) if json.len() <= subjektiv::journal::startup::STARTUP_MAX_BYTES => {
                     (status, json)
                 }
-                _ => ("unavailable", String::new()),
+                _ => (Unavailable, String::new()),
             }
         }
-        Some(Err(())) => ("unavailable", String::new()),
+        Some(Err(())) => (Unavailable, String::new()),
     };
-    if status == "unavailable" {
+    if status == Unavailable {
         tracing::warn!("Journal compaction snapshot unavailable; continuing without Journal");
     }
     use sha2::{Digest, Sha256};
@@ -143,12 +237,35 @@ pub(crate) fn freeze_compaction_journal(
             .map(|byte| format!("{byte:02x}"))
             .collect()
     });
-    prompts.subjektiv_journal_compaction(
-        status,
-        &json,
-        snapshot_sha256.as_deref(),
-        workspace_id.as_deref(),
+    let body = prompts
+        .subjektiv_journal_compaction(
+            status.as_str(),
+            &json,
+            snapshot_sha256.as_deref(),
+            workspace_id.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
+    let payload = session_store::FeatureInputPayload::encode(
+        "journal:compaction",
+        1,
+        &JournalCompactionInput {
+            status,
+            prompt_provenance: session_store::PromptRenderProvenance {
+                workspace_id,
+                source_digest: prompts.projection().source_digest.clone(),
+                projection_digest: prompts.projection().catalog_digest.clone(),
+                logical_name: "internal.subjektiv_journal_compaction".into(),
+            },
+            snapshot: if status == Unavailable {
+                None
+            } else {
+                snapshot
+            },
+            snapshot_sha256,
+        },
     )
+    .map_err(|e| e.to_string())?;
+    journal_input(body, payload, "journal_compaction")
 }
 
 #[derive(Clone)]

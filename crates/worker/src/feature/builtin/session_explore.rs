@@ -371,7 +371,7 @@ fn parse_entry_ref(value: &str) -> Result<SessionEntryRef, ToolError> {
 fn parse_kind(value: &str) -> Result<ReferenceKind, ToolError> {
     ReferenceKind::parse(value).ok_or_else(|| {
         ToolError::InvalidArgument(format!(
-            "invalid kind {value:?}; expected user, assistant, or tool"
+            "invalid kind {value:?}; expected user, assistant, system, or tool"
         ))
     })
 }

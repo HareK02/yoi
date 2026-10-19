@@ -148,15 +148,24 @@ struct SegmentHeader {
     file_len: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicMaterialUse {
+    Recording,
+    MemoryEvidence,
+}
+
 /// A fixed material catalog. Opening a new catalog observes newly appended
 /// records; reading a body through this catalog verifies its saved digest and
 /// byte length again. Missing/corrected/deleted sources are explicit failures.
+/// Evidence eligibility never publishes private model text or Feature payload:
+/// System inputs also require an explicit public projection for every public use.
 pub struct SessionPublicMaterialReader {
     session_id: SessionId,
     active_segment_id: SegmentId,
     layout: Layout,
     limits: PublicMaterialLimits,
     materials: Vec<Material>,
+    purpose: PublicMaterialUse,
     retention: Option<crate::retention::SessionRetentionStore>,
 }
 
@@ -180,7 +189,13 @@ impl SessionPublicMaterialReader {
         active_segment_id: SegmentId,
         limits: PublicMaterialLimits,
     ) -> Result<Self, PublicMaterialError> {
-        Self::open_worker_guarded(session_root, active_segment_id, limits, None)
+        Self::open_worker_guarded(
+            session_root,
+            active_segment_id,
+            limits,
+            None,
+            PublicMaterialUse::Recording,
+        )
     }
 
     /// Uses the Host's aggregate-external control root for the whole scan and every body read.
@@ -191,7 +206,30 @@ impl SessionPublicMaterialReader {
         limits: PublicMaterialLimits,
         retention: crate::retention::SessionRetentionStore,
     ) -> Result<Self, PublicMaterialError> {
-        Self::open_worker_guarded(session_root, active_segment_id, limits, Some(retention))
+        Self::open_worker_for_use(
+            session_root,
+            active_segment_id,
+            limits,
+            retention,
+            PublicMaterialUse::Recording,
+        )
+    }
+
+    /// Selects the evidence purpose independently of public display and observation.
+    pub fn open_worker_for_use(
+        session_root: &Path,
+        active_segment_id: SegmentId,
+        limits: PublicMaterialLimits,
+        retention: crate::retention::SessionRetentionStore,
+        purpose: PublicMaterialUse,
+    ) -> Result<Self, PublicMaterialError> {
+        Self::open_worker_guarded(
+            session_root,
+            active_segment_id,
+            limits,
+            Some(retention),
+            purpose,
+        )
     }
 
     fn open_worker_guarded(
@@ -199,6 +237,7 @@ impl SessionPublicMaterialReader {
         active_segment_id: SegmentId,
         limits: PublicMaterialLimits,
         retention: Option<crate::retention::SessionRetentionStore>,
+        purpose: PublicMaterialUse,
     ) -> Result<Self, PublicMaterialError> {
         let store = WorkerSessionStore::open_read_only(session_root)
             .map_err(|_| PublicMaterialError::Unavailable)?;
@@ -212,6 +251,7 @@ impl SessionPublicMaterialReader {
             Layout::Worker(session_root.into()),
             limits,
             retention,
+            purpose,
         )
     }
 
@@ -238,12 +278,32 @@ impl SessionPublicMaterialReader {
         limits: PublicMaterialLimits,
         retention: crate::retention::SessionRetentionStore,
     ) -> Result<Self, PublicMaterialError> {
+        Self::open_fs_for_use(
+            sessions_root,
+            session_id,
+            active_segment_id,
+            limits,
+            retention,
+            PublicMaterialUse::Recording,
+        )
+    }
+
+    /// Uses retained originals with the independently selected evidence policy.
+    pub fn open_fs_for_use(
+        sessions_root: &Path,
+        session_id: SessionId,
+        active_segment_id: SegmentId,
+        limits: PublicMaterialLimits,
+        retention: crate::retention::SessionRetentionStore,
+        purpose: PublicMaterialUse,
+    ) -> Result<Self, PublicMaterialError> {
         Self::open(
             session_id,
             active_segment_id,
             Layout::Fs(sessions_root.join(session_id.to_string())),
             limits,
             Some(retention),
+            purpose,
         )
     }
 
@@ -263,6 +323,7 @@ impl SessionPublicMaterialReader {
         layout: Layout,
         limits: PublicMaterialLimits,
         retention: Option<crate::retention::SessionRetentionStore>,
+        purpose: PublicMaterialUse,
     ) -> Result<Self, PublicMaterialError> {
         let _guard = retention
             .as_ref()
@@ -310,11 +371,10 @@ impl SessionPublicMaterialReader {
             let source_ids: Option<Vec<String>> = if compact {
                 let summaries: Vec<_> = history
                     .iter()
-                    .filter(|e| {
-                        matches!(
-                            e.metadata.origin,
-                            LoggedSessionHistoryOrigin::CompactionSummary
-                        )
+                    .filter(|entry| {
+                        entry.metadata.input_metadata.as_ref().is_some_and(|input| {
+                            input.usage().compaction == crate::InputCompactionUse::OpeningSummary
+                        })
                     })
                     .collect();
                 if summaries.len() != 1 {
@@ -435,23 +495,19 @@ impl SessionPublicMaterialReader {
                     } => turn = *total_turn_count,
                     _ => {}
                 }
+                let system_history;
                 let entries: &[LoggedHistoryEntry] = match &record {
                     LogEntry::AnnotatedSegmentStart { history, .. }
                     | LogEntry::AnnotatedUserInput { history, .. } => history,
                     LogEntry::AnnotatedAssistantItem { entry, .. }
                     | LogEntry::AnnotatedToolResult { entry, .. }
                     | LogEntry::ToolResultCorrected { entry, .. } => std::slice::from_ref(entry),
+                    LogEntry::AnnotatedSystemItem { entry, .. } => {
+                        system_history = entry.to_history_entry();
+                        std::slice::from_ref(&system_history)
+                    }
                     _ => &[],
                 };
-                if let LogEntry::AnnotatedSystemItem { entry, .. } = &record {
-                    charge(&mut examined, limits.max_entries)?;
-                    if entry.metadata.entry_id.0.is_empty()
-                        || !history_seen.insert(entry.metadata.entry_id.0.clone())
-                    {
-                        return Err(PublicMaterialError::Inconsistent);
-                    }
-                    history_ids.push(entry.metadata.entry_id.0.clone());
-                }
                 for (history_index, entry) in entries.iter().enumerate() {
                     charge(&mut examined, limits.max_entries)?;
                     let id = &entry.metadata.entry_id.0;
@@ -468,7 +524,7 @@ impl SessionPublicMaterialReader {
                     if in_run && ai_materialized(&entry.item) {
                         safe = true;
                     }
-                    let Some((sha256, total_bytes)) = canonical_metadata(entry)? else {
+                    let Some((sha256, total_bytes)) = canonical_metadata(entry, purpose)? else {
                         continue;
                     };
                     let location = Location {
@@ -621,6 +677,7 @@ impl SessionPublicMaterialReader {
             layout,
             limits,
             materials,
+            purpose,
             retention: retention.clone(),
         })
     }
@@ -660,6 +717,7 @@ impl SessionPublicMaterialReader {
         let Some((_, record)) = reader.next()? else {
             return Err(PublicMaterialError::Missing);
         };
+        let system_history;
         let (body, origin) = if let Some(boundary) = run_boundary(&record) {
             if boundary_reference(
                 &record,
@@ -683,12 +741,16 @@ impl SessionPublicMaterialReader {
                 LogEntry::AnnotatedAssistantItem { entry, .. }
                 | LogEntry::AnnotatedToolResult { entry, .. }
                 | LogEntry::ToolResultCorrected { entry, .. } => Some(entry),
+                LogEntry::AnnotatedSystemItem { entry, .. } => {
+                    system_history = entry.to_history_entry();
+                    Some(&system_history)
+                }
                 _ => None,
             }
             .filter(|e| format!("E{}", e.metadata.entry_id.0) == descriptor.identity.entry_ref)
             .ok_or(PublicMaterialError::Changed)?;
             (
-                canonical_body(entry).ok_or(PublicMaterialError::Changed)?,
+                canonical_body(entry, self.purpose).ok_or(PublicMaterialError::Changed)?,
                 PublicMaterialOrigin::History {
                     origin: entry.metadata.origin.clone(),
                 },
@@ -765,7 +827,7 @@ enum CanonicalBody<'a> {
     Message {
         origin: &'a LoggedSessionHistoryOrigin,
         role: LoggedRole,
-        content: &'a [crate::LoggedContentPart],
+        content: std::borrow::Cow<'a, [crate::LoggedContentPart]>,
     },
     ToolCall {
         origin: &'a LoggedSessionHistoryOrigin,
@@ -828,14 +890,33 @@ fn boundary_reference(
         .unwrap_or_else(|| format!("El-run-{session}-{segment}-{offset}"))
 }
 
-fn canonical_body(entry: &LoggedHistoryEntry) -> Option<CanonicalBody<'_>> {
-    if matches!(
-        entry.metadata.origin,
-        LoggedSessionHistoryOrigin::DerivedSummary
-            | LoggedSessionHistoryOrigin::CompactionSummary
-            | LoggedSessionHistoryOrigin::JournalContext
-    ) {
-        return None;
+fn canonical_body(
+    entry: &LoggedHistoryEntry,
+    purpose: PublicMaterialUse,
+) -> Option<CanonicalBody<'_>> {
+    if let Some(input) = &entry.metadata.input_metadata {
+        let usage = input.usage();
+        let allowed = match purpose {
+            PublicMaterialUse::Recording => usage.recording_material,
+            PublicMaterialUse::MemoryEvidence => usage.memory_evidence,
+        };
+        if allowed == crate::InputEvidenceUse::Exclude {
+            return None;
+        }
+        if let LoggedItem::Message {
+            role: LoggedRole::System,
+            ..
+        } = &entry.item
+        {
+            let public = input.public_item()?;
+            return Some(CanonicalBody::Message {
+                origin: &entry.metadata.origin,
+                role: LoggedRole::System,
+                content: std::borrow::Cow::Owned(vec![crate::LoggedContentPart::Text {
+                    text: public.body.clone(),
+                }]),
+            });
+        }
     }
     match &entry.item {
         LoggedItem::Message {
@@ -847,7 +928,7 @@ fn canonical_body(entry: &LoggedHistoryEntry) -> Option<CanonicalBody<'_>> {
         LoggedItem::Message { role, content } => Some(CanonicalBody::Message {
             origin: &entry.metadata.origin,
             role: *role,
-            content,
+            content: std::borrow::Cow::Borrowed(content),
         }),
         LoggedItem::ToolCall {
             call_id,
@@ -880,8 +961,9 @@ fn canonical_body(entry: &LoggedHistoryEntry) -> Option<CanonicalBody<'_>> {
 
 fn canonical_metadata(
     entry: &LoggedHistoryEntry,
+    purpose: PublicMaterialUse,
 ) -> Result<Option<(String, u64)>, PublicMaterialError> {
-    let Some(body) = canonical_body(entry) else {
+    let Some(body) = canonical_body(entry, purpose) else {
         return Ok(None);
     };
     let mut sink = BodySink::new(0, 0);

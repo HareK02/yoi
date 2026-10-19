@@ -3091,7 +3091,7 @@ async fn socket_worker_event_turn_ended_while_idle_auto_starts_turn() {
                     Ok(Some(Event::SystemItem { ref item, .. }))
                         if item.get("kind").and_then(|k| k.as_str()) == Some("worker_event")
                             && item
-                                .pointer("/event/worker_name")
+                                .pointer("/presentation/event/worker_name")
                                 .and_then(|v| v.as_str()) == Some("child") =>
                     {
                         saw_worker_event_echo = true;
