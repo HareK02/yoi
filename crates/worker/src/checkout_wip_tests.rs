@@ -1619,3 +1619,82 @@ async fn failed_text_read_does_not_authorize_edit() {
         .await;
     }
 }
+
+pub(super) async fn assert_long_utf8_search_refuses_incomplete_line(
+    source: WorkdirSessionHandle,
+    directory: &std::path::Path,
+) {
+    let original = format!("{}needle\nnext\n", "雪".repeat(22_000));
+    std::fs::write(directory.join("text"), &original).unwrap();
+    for (name, text) in [
+        ("normal", "雪\nneedle\nnext\n"),
+        ("unterminated", "雪\nneedle\nnext"),
+    ] {
+        std::fs::write(directory.join(name), text).unwrap();
+    }
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(WorkdirAttachmentAlias::new("main").unwrap(), source)
+        .unwrap();
+    let r = Arc::new(runtime(router, None));
+    let inspected = model_inspect(r.clone(), "/checkouts/main/text").await;
+    let result = model_invoke(
+        r.clone(),
+        &inspected,
+        "search",
+        json!({"pattern":"needle","limit":1}),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "search advanced over a byte-truncated UTF-8 line: {result:?}"
+    );
+    let failure = result.unwrap_err();
+    assert!(
+        failure.to_string().contains("ResourceLimitExceeded"),
+        "{failure}"
+    );
+    let read = model_invoke(r.clone(), &inspected, "read", json!({"limit":1}))
+        .await
+        .unwrap_err();
+    assert!(read.to_string().contains("ResourceLimitExceeded"), "{read}");
+    let write = model_invoke(r.clone(), &inspected, "write", json!({"content":"lost"}))
+        .await
+        .unwrap_err();
+    assert!(write.to_string().contains("InvalidArguments"), "{write}");
+    assert_eq!(
+        std::fs::read_to_string(directory.join("text")).unwrap(),
+        original
+    );
+    for name in ["normal", "unterminated"] {
+        let inspected = model_inspect(r.clone(), &format!("/checkouts/main/{name}")).await;
+        for offset in 0..=3 {
+            let page = json_content(
+                model_invoke(
+                    r.clone(),
+                    &inspected,
+                    "search",
+                    json!({"pattern":"needle","offset":offset,"limit":1}),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(page["next_offset"], (offset + 1).min(3));
+            assert_eq!(page["truncated"], offset < 2);
+            assert_eq!(
+                page["matches"],
+                if offset == 1 {
+                    json!([{"line":2,"text":"needle"}])
+                } else {
+                    json!([])
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn long_utf8_search_refuses_incomplete_line_and_preserves_line_pagination() {
+    let dir = TempDir::new().unwrap();
+    assert_long_utf8_search_refuses_incomplete_line(session(&dir, false), dir.path()).await;
+}

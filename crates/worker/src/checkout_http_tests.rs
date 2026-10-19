@@ -993,3 +993,14 @@ async fn http_failed_text_read_does_not_authorize_mutations() {
         }
     }
 }
+
+#[tokio::test]
+async fn http_long_utf8_search_refuses_incomplete_line_and_preserves_line_pagination() {
+    let fixture = HttpFixture::new(WorkdirSessionCapabilities::READ_WRITE).await;
+    let remote = fixture.open(TOKEN).await.unwrap();
+    checkout_wip_tests::assert_long_utf8_search_refuses_incomplete_line(
+        Arc::new(remote),
+        fixture.dir.path(),
+    )
+    .await;
+}
