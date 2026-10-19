@@ -358,7 +358,8 @@ async fn observe_interface(runtime: &WipRuntime, path: &str) -> wip_protocol::In
 }
 
 async fn native_call(runtime: &WipRuntime, path: &str, operation: &str, args: Json) -> Value {
-    let interface = observe_interface(runtime, path).await;
+    observe_interface(runtime, path).await;
+    let interface = super::checkout_wip_tests::contract(operation).reference();
     runtime
         .call(
             path.into(),
@@ -620,7 +621,8 @@ async fn committed_write_unknown(fault: WriteResponseFault) {
     let (runtime, router) = native_runtime(remote);
     let file = "/checkouts/main/src/deep/a.txt";
     native_call(&runtime, file, "read", json!({})).await;
-    let interface = observe_interface(&runtime, file).await;
+    observe_interface(&runtime, file).await;
+    let interface = super::checkout_wip_tests::contract("write").reference();
     *fixture.state.write_fault.lock().unwrap() = Some(fault);
     let error = runtime
         .call(

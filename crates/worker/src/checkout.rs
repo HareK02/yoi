@@ -116,13 +116,21 @@ impl Provider {
         }
         Some((decode_identity(slug)?, WorkdirPath::new(tail).ok()?))
     }
-    fn wrap_validator(&self, alias: &str, generation: u64, workdir: &str, raw: &[u8]) -> Vec<u8> {
+    fn wrap_validator(
+        &self,
+        alias: &str,
+        generation: u64,
+        workdir: &str,
+        target: &WorkdirPath,
+        raw: &[u8],
+    ) -> Vec<u8> {
         let mut hash = Sha256::new();
         for value in [
             self.incarnation.as_bytes(),
             alias.as_bytes(),
             &generation.to_be_bytes(),
             workdir.as_bytes(),
+            target.as_str().as_bytes(),
             raw,
         ] {
             hash.update(value.len().to_be_bytes());
@@ -287,7 +295,8 @@ impl Provider {
             "directory"
         };
         let primary = *contracts.first()?;
-        let validator = self.wrap_validator(alias, generation, workdir, &observation.validator);
+        let validator =
+            self.wrap_validator(alias, generation, workdir, &target, &observation.validator);
         let handler = Arc::new(FileHandler {
             provider: self.clone(),
             alias: alias.into(),
@@ -511,8 +520,13 @@ impl FileHandler {
         if let Some(raw) = result.validator {
             Ok(WipOperationOutput::native_with_validator(
                 value,
-                self.provider
-                    .wrap_validator(&self.alias, self.generation, &self.workdir, &raw),
+                self.provider.wrap_validator(
+                    &self.alias,
+                    self.generation,
+                    &self.workdir,
+                    &self.target,
+                    &raw,
+                ),
             ))
         } else {
             Ok(WipOperationOutput::native(value))
@@ -533,6 +547,16 @@ impl WipOperationHandler for FileHandler {
             if !self.provider.allowed("Read",&json!({"target_workdir":self.alias,"file_path":self.target.as_str(),"offset":offset,"limit":limit})) {
                 return Err(protocol(ProtocolErrorCode::PermissionDenied,"text read denied"));
             }
+            let _permit =
+                tokio::time::timeout(self.provider.deadline, self.provider.permits.acquire())
+                    .await
+                    .map_err(|_| {
+                        protocol(
+                            ProtocolErrorCode::ResourceLimitExceeded,
+                            "text read capacity deadline",
+                        )
+                    })?
+                    .map_err(|_| protocol(ProtocolErrorCode::Internal, "text read unavailable"))?;
             let result = tokio::time::timeout(
                 self.provider.deadline,
                 tools::checkout::read_checkout_text(
@@ -569,8 +593,13 @@ impl WipOperationHandler for FileHandler {
             return Ok(match validator {
                 Some(raw) => WipOperationOutput::native_with_validator(
                     value,
-                    self.provider
-                        .wrap_validator(&self.alias, self.generation, &self.workdir, &raw),
+                    self.provider.wrap_validator(
+                        &self.alias,
+                        self.generation,
+                        &self.workdir,
+                        &self.target,
+                        &raw,
+                    ),
                 ),
                 None => WipOperationOutput::native(value),
             });
@@ -722,14 +751,6 @@ fn join_under(parent: &WorkdirPath, relative: &str) -> Result<String, WipOperati
     } else {
         format!("{}/{}", parent.as_str(), child.as_str())
     })
-}
-fn parameter(name: &str, required: bool, r#type: TypeExpr) -> ParameterDeclaration {
-    ParameterDeclaration {
-        name: name.into(),
-        required,
-        documentation: None,
-        r#type,
-    }
 }
 fn operation(
     name: &str,

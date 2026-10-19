@@ -683,7 +683,12 @@ async fn committed_checkout_mutation_losing_connection_is_unknown_not_rejected_o
         let calls = Arc::new(AtomicUsize::new(0));
         let route = object_path("main", &file.target);
         let mut projection = p.node(&route).await.unwrap().unwrap();
-        let interface = projection.interface.clone();
+        let interface = match operation {
+            "write" => crate::file_operation::Contract::Write,
+            "edit" => crate::file_operation::Contract::Edit,
+            _ => crate::file_operation::Contract::CreateFile,
+        }
+        .reference();
         projection.handler = Arc::new(DetachBeforePublication {
             file,
             calls: calls.clone(),
