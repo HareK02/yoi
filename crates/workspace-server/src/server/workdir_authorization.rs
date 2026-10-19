@@ -134,13 +134,6 @@ fn authorize_permissions(
             // Validating cwd is not a shell confinement mechanism. The command can cd elsewhere,
             // so a prefix grant (even one covering cwd recursively) is never enough.
             resource(working_directory_id, COMMAND, &request.cwd, false)?;
-            if request.spill_dir.is_some() {
-                // This is a provider-local PathBuf, not an attachment-relative WorkdirPath.
-                // Do not authorize an unrepresentable write destination as attachment scope.
-                return Err(denied(
-                    "caller-selected provider-local command spill paths are unsupported",
-                ));
-            }
             check(COMMAND, &WorkdirPath::root(), true)
         }
         WorkdirSessionOperation::CommandOutput(_) => {
@@ -233,9 +226,8 @@ mod tests {
         WorkdirSessionOperation::CommandStart(CommandRequest {
             command: "cd ..; cat secret".into(),
             timeout_secs: 1,
-            output_limit: 1024,
+            transport_byte_budget: 1024,
             cwd: path(cwd),
-            spill_dir: None,
             tool_call_id: None,
         })
     }
@@ -427,14 +419,6 @@ mod tests {
         assert!(!allowed(&[grant(COMMAND, ".", false)], &command("src")));
         assert!(!allowed(&[grant(WRITE, ".", true)], &command("src")));
         assert!(allowed(&[grant(COMMAND, ".", true)], &command("src")));
-        let WorkdirSessionOperation::CommandStart(mut request) = command("src") else {
-            unreachable!()
-        };
-        request.spill_dir = Some("/provider/private".into());
-        assert!(!allowed(
-            &[grant(COMMAND, ".", true)],
-            &WorkdirSessionOperation::CommandStart(request)
-        ));
     }
 
     #[test]

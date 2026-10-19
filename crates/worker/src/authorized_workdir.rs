@@ -417,11 +417,6 @@ impl WorkdirSession for AuthorizedWorkdirSession {
     async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
         // Validate coordinates without treating cwd as the command's access scope.
         WorkdirPath::new(request.cwd.as_str()).map_err(WorkdirError::from)?;
-        if request.spill_dir.is_some() {
-            return Err(WorkdirError::Denied(
-                "provider-local command spill paths have no attachment resource mapping".into(),
-            ));
-        }
         self.authorize_command()?;
         self.session.start_command(request).await
     }
@@ -609,9 +604,8 @@ mod tests {
         CommandRequest {
             command: command.into(),
             timeout_secs: 10,
-            output_limit: 4096,
+            transport_byte_budget: 4096,
             cwd: WorkdirPath::root(),
-            spill_dir: None,
             tool_call_id: None,
         }
     }
@@ -786,7 +780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unmappable_absolute_or_spill_paths_are_denied_before_local_effects() {
+    async fn unmappable_absolute_paths_are_denied_before_local_effects() {
         let root = tempfile::tempdir().unwrap();
         let client = AuthorizationClient::new(vec![
             permission(WRITE, ".", true),
@@ -804,15 +798,7 @@ mod tests {
                 .await,
             Err(WorkdirError::Denied(_))
         ));
-        let mut request = command("printf bad > escaped");
-        request.spill_dir = Some(root.path().join("spill"));
-        assert!(matches!(
-            session.start_command(request).await,
-            Err(WorkdirError::Denied(_))
-        ));
         assert!(!root.path().join("absolute").exists());
-        assert!(!root.path().join("escaped").exists());
-        assert!(!root.path().join("spill").exists());
         assert!(client.requests.lock().unwrap().is_empty());
         session.close().await.unwrap();
     }
