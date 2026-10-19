@@ -630,6 +630,16 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Completed resource-owner evidence retained while Runtime settlement may
+    /// still need retry. This is not a new request or execution authorization.
+    fn completed_restore_failure(
+        &self,
+        _operation_id: WorkerLifecycleOperationId,
+        _worker_ref: &WorkerRef,
+    ) -> Option<WorkerExecutionSpawnResult> {
+        None
+    }
+
     fn reconcile_restore(
         &self,
         request: WorkerExecutionRestoreRequest,
@@ -896,6 +906,15 @@ impl WorkerExecutionBackendRef {
         request: &WorkerExecutionRestoreRequest,
     ) -> Result<(), WorkerExecutionResult> {
         self.backend.preflight_restore(request)
+    }
+
+    pub(crate) fn completed_restore_failure(
+        &self,
+        operation_id: WorkerLifecycleOperationId,
+        worker_ref: &WorkerRef,
+    ) -> Option<WorkerExecutionSpawnResult> {
+        self.backend
+            .completed_restore_failure(operation_id, worker_ref)
     }
 
     pub(crate) fn reconcile_restore(

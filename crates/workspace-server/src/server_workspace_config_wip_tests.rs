@@ -584,7 +584,10 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for ConfigCaptureFacto
     async fn restore_controller(
         &self,
         request: worker_runtime::execution::WorkerExecutionRestoreRequest,
-    ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
+    ) -> std::result::Result<
+        worker_runtime::worker_backend::RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
         self.inner.restore_controller(request).await
     }
 }

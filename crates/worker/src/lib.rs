@@ -69,9 +69,10 @@ pub use session_history::{
 pub use shared_state::WorkerSharedState;
 pub use worker::{
     LocalWorkingDirectory, SubjektivSessionAttributionLifecycle, Worker, WorkerError,
-    WorkerFilesystemAuthority, WorkerRunResult, WorkerWorkspaceContext, WorkspaceBinaryRequest,
-    WorkspaceBinaryResponse, WorkspaceClient, WorkspaceClientError, WorkspaceId, WorkspaceIdError,
-    WorkspacePromptCatalogResolution, WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse,
-    WorkspaceServerOperation, WorkspaceWorkerDiscoveryRequest, apply_worker_manifest,
-    marker_workspace_client, unavailable_workspace_client,
+    WorkerFilesystemAuthority, WorkerRunResult, WorkerStartupFeatureCleanup,
+    WorkerWorkspaceContext, WorkspaceBinaryRequest, WorkspaceBinaryResponse, WorkspaceClient,
+    WorkspaceClientError, WorkspaceId, WorkspaceIdError, WorkspacePromptCatalogResolution,
+    WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse, WorkspaceServerOperation,
+    WorkspaceWorkerDiscoveryRequest, apply_worker_manifest, marker_workspace_client,
+    unavailable_workspace_client,
 };

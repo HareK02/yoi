@@ -759,6 +759,211 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
     ));
 }
 
+mod socket_startup_failure {
+    //! Connect the real controller startup, command observer, socket bind and session rollback.
+    //! Only the Workdir telemetry boundary and LLM are substituted. This ordinary controller
+    //! integration target uses an isolated directory at the socket path to reject the real bind.
+    use super::*;
+    use std::path::PathBuf;
+    use tokio::sync::broadcast;
+    use workdir::WorkdirSession;
+
+    #[derive(Debug)]
+    struct ObservedSession {
+        local: LocalWorkdirSession,
+        socket_path: PathBuf,
+        events: broadcast::Sender<workdir::CommandEvent>,
+        subscriptions: AtomicUsize,
+        receivers_at_close: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl WorkdirSession for ObservedSession {
+        fn workdir(&self) -> &Workdir {
+            self.local.workdir()
+        }
+
+        fn capabilities(&self) -> WorkdirSessionCapabilities {
+            self.local.capabilities()
+        }
+
+        async fn stat(
+            &self,
+            request: workdir::StatRequest,
+        ) -> Result<workdir::StatResult, WorkdirError> {
+            self.local.stat(request).await
+        }
+
+        async fn read(
+            &self,
+            request: workdir::ReadRequest,
+        ) -> Result<workdir::ReadResult, WorkdirError> {
+            self.local.read(request).await
+        }
+
+        async fn write(
+            &self,
+            request: workdir::WriteRequest,
+        ) -> Result<workdir::WriteResult, WorkdirError> {
+            self.local.write(request).await
+        }
+
+        async fn edit(
+            &self,
+            request: workdir::EditRequest,
+        ) -> Result<workdir::EditResult, WorkdirError> {
+            self.local.edit(request).await
+        }
+
+        async fn list(
+            &self,
+            request: workdir::ListRequest,
+        ) -> Result<workdir::ListResult, WorkdirError> {
+            self.local.list(request).await
+        }
+
+        async fn glob(
+            &self,
+            request: workdir::GlobRequest,
+        ) -> Result<workdir::GlobResult, WorkdirError> {
+            self.local.glob(request).await
+        }
+
+        async fn grep(
+            &self,
+            request: workdir::GrepRequest,
+        ) -> Result<workdir::GrepResult, WorkdirError> {
+            self.local.grep(request).await
+        }
+
+        async fn start_command(
+            &self,
+            request: CommandRequest,
+        ) -> Result<workdir::CommandHandle, WorkdirError> {
+            self.local.start_command(request).await
+        }
+
+        async fn command_status(
+            &self,
+            handle: workdir::CommandHandle,
+        ) -> Result<workdir::CommandStatus, WorkdirError> {
+            self.local.command_status(handle).await
+        }
+
+        async fn command_output(
+            &self,
+            request: CommandOutputRequest,
+        ) -> Result<workdir::CommandOutput, WorkdirError> {
+            self.local.command_output(request).await
+        }
+
+        async fn cancel_command(&self, handle: workdir::CommandHandle) -> Result<(), WorkdirError> {
+            self.local.cancel_command(handle).await
+        }
+
+        fn subscribe_command_events(&self) -> Option<broadcast::Receiver<workdir::CommandEvent>> {
+            // Runtime creation and initial file writes must already have succeeded. A directory
+            // survives SocketServer's stale-file removal and makes the subsequent Unix bind fail.
+            std::fs::create_dir(&self.socket_path).unwrap();
+            self.subscriptions.fetch_add(1, Ordering::SeqCst);
+            Some(self.events.subscribe())
+        }
+
+        async fn close(&self) -> Result<(), WorkdirError> {
+            // Record before any await: aborting without joining must not pass by getting a
+            // scheduler turn during the provider's asynchronous close. The sender stays alive
+            // even after close, so channel closure cannot accidentally dispose of the observer.
+            self.receivers_at_close
+                .lock()
+                .unwrap()
+                .push(self.events.receiver_count());
+            self.local.close().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn socket_bind_failure_joins_command_observer_before_closing_session() {
+        let root = tempfile::tempdir().unwrap();
+        let run_dir = root.path().join("runs/1");
+        let socket_path = run_dir.join("worker.sock");
+        let client = MockClient::new(simple_text_events());
+        let manifest = WorkerManifest::from_toml(MANIFEST_TOML).unwrap();
+        let store = CombinedStore::new(
+            FsStore::new(root.path().join("sessions")).unwrap(),
+            FsWorkerStore::new(root.path().join("workers")).unwrap(),
+        );
+        let engine =
+            Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
+                client.clone(),
+            );
+        let mut worker = Worker::new(
+            manifest,
+            engine,
+            store,
+            WorkerWorkspaceContext::local_filesystem(None),
+            WorkerFilesystemAuthority::local(root.path().into(), root.path().into()),
+            manifest::Scope::writable(root.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (events, unused_receiver) = broadcast::channel(8);
+        drop(unused_receiver);
+        let session = Arc::new(ObservedSession {
+            local: LocalWorkdirSession::materialized_bound(
+                Workdir::new("socket-startup-failure"),
+                root.path().into(),
+                root.path().into(),
+                worker.scope().clone(),
+                WorkdirSessionCapabilities::ALL,
+            ),
+            socket_path: socket_path.clone(),
+            events,
+            subscriptions: AtomicUsize::new(0),
+            receivers_at_close: Mutex::new(Vec::new()),
+        });
+        worker.bind_single_workdir_session(Some(session.clone()));
+        let sessions = worker.workdir_sessions();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            WorkerController::spawn_runtime_managed_run(
+                worker,
+                &run_dir,
+                &root.path().join("bash-output"),
+            ),
+        )
+        .await
+        .expect("socket startup and rollback must settle");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a directory at the Unix socket path must reject controller startup"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(session.subscriptions.load(Ordering::SeqCst), 1);
+        assert_eq!(*session.receivers_at_close.lock().unwrap(), vec![0]);
+        assert_eq!(session.events.receiver_count(), 0);
+        assert!(sessions.aliases().is_empty());
+        // No controller retains the Worker/Engine after the failed startup.
+        assert_eq!(Arc::strong_count(&client.call_count), 1);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 0);
+        assert!(socket_path.is_dir());
+        assert!(tokio::net::UnixStream::connect(&socket_path).await.is_err());
+        assert!(matches!(
+            session
+                .start_command(CommandRequest {
+                    command: "printf unreachable".to_owned(),
+                    timeout_secs: 5,
+                    output_limit: 1024,
+                    cwd: workdir::WorkdirPath::root(),
+                    spill_dir: None,
+                    tool_call_id: None,
+                })
+                .await,
+            Err(WorkdirError::Unavailable(_))
+        ));
+    }
+}
+
 async fn wait_for_status(handle: &WorkerHandle, status: WorkerStatus) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {

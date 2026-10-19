@@ -3,6 +3,7 @@
 //! up on drop.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use manifest::ScopeRule;
 use session_store::SegmentId;
@@ -11,13 +12,82 @@ use super::error::ScopeLockError;
 use super::mutate::release_worker;
 use super::table::{LockFileGuard, default_allocation_path};
 
-/// Owned allocation: on drop, opens the lock file and releases this
-/// Worker's entry. The guard keeps only the name + lock-file path; it
-/// does not hold the `flock` for the Worker's lifetime.
+/// Owned allocation shared with any retained cleanup handles. Only the final
+/// owner's drop attempts best-effort release; no `flock` is held for its lifetime.
 #[derive(Debug)]
 pub struct ScopeAllocationGuard {
+    owner: Arc<ScopeAllocationOwner>,
+}
+
+/// Retains an allocation's release authority even after its Worker is consumed
+/// or dropped. A successful controller transfer should drop this handle without
+/// explicitly releasing the live Worker's allocation.
+#[derive(Debug, Clone)]
+pub struct ScopeAllocationCleanup {
+    owner: Arc<ScopeAllocationOwner>,
+}
+
+#[derive(Debug)]
+struct ScopeAllocationOwner {
     worker_name: String,
     lock_path: PathBuf,
+    state: Mutex<ScopeAllocationOwnerState>,
+}
+
+#[derive(Debug)]
+struct ScopeAllocationOwnerState {
+    guard_attached: bool,
+    released: bool,
+}
+
+impl ScopeAllocationOwner {
+    fn release(&self) -> Result<(), ScopeLockError> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.guard_attached {
+            return Err(ScopeLockError::AllocationGuardAttached {
+                worker_name: self.worker_name.clone(),
+            });
+        }
+        if state.released {
+            return Ok(());
+        }
+        let mut guard = LockFileGuard::open(&self.lock_path)?;
+        if guard.data().find(&self.worker_name).is_some() {
+            release_worker(&mut guard, &self.worker_name)?;
+        } else {
+            // A previous save may have removed the entry but failed after rename.
+            // Complete the durable save before reporting release as confirmed.
+            guard.save()?;
+        }
+        state.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for ScopeAllocationOwner {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
+impl Drop for ScopeAllocationGuard {
+    fn drop(&mut self) {
+        self.owner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .guard_attached = false;
+    }
+}
+
+impl ScopeAllocationCleanup {
+    /// Release only after the factory has returned an error and no live
+    /// Controller can still use this allocation. An attached guard rejects
+    /// release. Success is idempotent across all clones; failure retains the
+    /// authority for an explicit retry.
+    pub fn release(&self) -> Result<(), ScopeLockError> {
+        self.owner.release()
+    }
 }
 
 /// Exclusive authority to activate a replacement Segment for one allocated Worker.
@@ -56,12 +126,58 @@ impl SegmentActivationCommitError {
 }
 
 impl ScopeAllocationGuard {
+    fn new(worker_name: String, lock_path: PathBuf) -> Self {
+        Self {
+            owner: Arc::new(ScopeAllocationOwner {
+                worker_name,
+                lock_path,
+                state: Mutex::new(ScopeAllocationOwnerState {
+                    guard_attached: true,
+                    released: false,
+                }),
+            }),
+        }
+    }
+
+    fn commit_acquisition(self, table: &mut LockFileGuard) -> Result<Self, ScopeLockError> {
+        let mut published = false;
+        match table.save_with_publication(&mut published) {
+            Ok(()) => Ok(self),
+            Err(source) => {
+                let cleanup = if published {
+                    Some(self.cleanup_handle())
+                } else {
+                    // A staged entry is not ours until rename. Disarm before
+                    // detaching so Drop cannot remove a preexisting allocation
+                    // (or reopen the table lock still held by this caller).
+                    self.owner
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .released = true;
+                    None
+                };
+                drop(self);
+                match cleanup {
+                    Some(cleanup) => Err(ScopeLockError::AcquisitionSaveFailed { source, cleanup }),
+                    None => Err(ScopeLockError::Io(source)),
+                }
+            }
+        }
+    }
+
     pub fn worker_name(&self) -> &str {
-        &self.worker_name
+        &self.owner.worker_name
     }
 
     pub fn lock_path(&self) -> &Path {
-        &self.lock_path
+        &self.owner.lock_path
+    }
+
+    pub fn cleanup_handle(&self) -> ScopeAllocationCleanup {
+        ScopeAllocationCleanup {
+            owner: Arc::clone(&self.owner),
+        }
     }
 
     /// Lock the machine-wide table and validate a Segment replacement before
@@ -71,24 +187,25 @@ impl ScopeAllocationGuard {
         expected: SegmentId,
         replacement: SegmentId,
     ) -> Result<SegmentActivationGuard, ScopeLockError> {
-        let guard = LockFileGuard::open(&self.lock_path)?;
+        let guard = LockFileGuard::open(self.lock_path())?;
         let actual = guard
             .data()
             .allocations
             .iter()
-            .find(|allocation| allocation.worker_name == self.worker_name)
+            .find(|allocation| allocation.worker_name == self.worker_name())
             .and_then(|allocation| allocation.segment_id);
 
         if actual != Some(expected) {
             return Err(ScopeLockError::SegmentChanged {
-                worker_name: self.worker_name.clone(),
+                worker_name: self.worker_name().to_owned(),
                 expected,
                 actual,
             });
         }
 
         if let Some(existing) = guard.data().allocations.iter().find(|allocation| {
-            allocation.segment_id == Some(replacement) && allocation.worker_name != self.worker_name
+            allocation.segment_id == Some(replacement)
+                && allocation.worker_name != self.worker_name()
         }) {
             return Err(ScopeLockError::SegmentConflict {
                 segment_id: replacement,
@@ -99,7 +216,7 @@ impl ScopeAllocationGuard {
 
         Ok(SegmentActivationGuard {
             guard,
-            worker_name: self.worker_name.clone(),
+            worker_name: self.worker_name().to_owned(),
             expected,
             replacement,
         })
@@ -145,14 +262,6 @@ impl SegmentActivationGuard {
     }
 }
 
-impl Drop for ScopeAllocationGuard {
-    fn drop(&mut self) {
-        if let Ok(mut guard) = LockFileGuard::open(&self.lock_path) {
-            let _ = release_worker(&mut guard, &self.worker_name);
-        }
-    }
-}
-
 /// Open the default lock file, register a top-level Worker, and return a
 /// guard that will release the allocation on drop.
 pub fn install_top_level(
@@ -185,7 +294,7 @@ pub fn install_top_level_with_deny(
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
     let lock_path = default_allocation_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
-    super::mutate::register_worker_with_deny(
+    super::mutate::prepare_worker_with_deny(
         &mut guard,
         worker_name.clone(),
         pid,
@@ -194,10 +303,7 @@ pub fn install_top_level_with_deny(
         scope_deny,
         segment_id,
     )?;
-    Ok(ScopeAllocationGuard {
-        worker_name,
-        lock_path,
-    })
+    ScopeAllocationGuard::new(worker_name, lock_path).commit_acquisition(&mut guard)
 }
 
 #[cfg(test)]
@@ -210,7 +316,7 @@ pub(crate) fn install_top_level_at_for_test(
     segment_id: SegmentId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
     let mut guard = LockFileGuard::open(&lock_path)?;
-    super::mutate::register_worker_with_deny(
+    super::mutate::prepare_worker_with_deny(
         &mut guard,
         worker_name.clone(),
         pid,
@@ -219,10 +325,7 @@ pub(crate) fn install_top_level_at_for_test(
         Vec::new(),
         segment_id,
     )?;
-    Ok(ScopeAllocationGuard {
-        worker_name,
-        lock_path,
-    })
+    ScopeAllocationGuard::new(worker_name, lock_path).commit_acquisition(&mut guard)
 }
 
 /// Take ownership of an existing allocation that was pre-registered by
@@ -240,6 +343,15 @@ pub fn adopt_allocation(
     segment_id: SegmentId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
     let lock_path = default_allocation_path()?;
+    adopt_allocation_at(lock_path, worker_name, new_pid, segment_id)
+}
+
+fn adopt_allocation_at(
+    lock_path: PathBuf,
+    worker_name: String,
+    new_pid: u32,
+    segment_id: SegmentId,
+) -> Result<ScopeAllocationGuard, ScopeLockError> {
     let mut guard = LockFileGuard::open(&lock_path)?;
     let alloc = guard
         .data_mut()
@@ -247,11 +359,7 @@ pub fn adopt_allocation(
         .ok_or_else(|| ScopeLockError::UnknownWorker(worker_name.clone()))?;
     alloc.pid = new_pid;
     alloc.segment_id = Some(segment_id);
-    guard.save()?;
-    Ok(ScopeAllocationGuard {
-        worker_name,
-        lock_path,
-    })
+    ScopeAllocationGuard::new(worker_name, lock_path).commit_acquisition(&mut guard)
 }
 
 /// Information about a Worker that currently holds an allocation for a
@@ -330,6 +438,388 @@ mod tests {
     }
 
     #[test]
+    fn retained_cleanup_handle_defers_release_until_final_owner_drop() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("workers.json");
+        let guard = install_top_level_at_for_test(
+            lock_path.clone(),
+            "retained".into(),
+            std::process::id(),
+            sock("retained"),
+            Vec::new(),
+            sid(),
+        )
+        .unwrap();
+        let cleanup = guard.cleanup_handle();
+        let retained = cleanup.clone();
+
+        drop(guard);
+        drop(cleanup);
+        {
+            let table = LockFileGuard::open(&lock_path).unwrap();
+            assert!(table.data().find("retained").is_some());
+        }
+        drop(retained);
+        let table = LockFileGuard::open(&lock_path).unwrap();
+        assert!(table.data().find("retained").is_none());
+    }
+
+    #[test]
+    fn dropping_cleanup_handle_after_transfer_preserves_live_guard() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("workers.json");
+        let segment = sid();
+        let guard = install_top_level_at_for_test(
+            lock_path.clone(),
+            "transferred".into(),
+            std::process::id(),
+            sock("transferred"),
+            Vec::new(),
+            segment,
+        )
+        .unwrap();
+
+        drop(guard.cleanup_handle());
+        // A successful controller transfer leaves the guard usable, including
+        // the existing activation protocol, without retaining a cleanup handle.
+        let replacement = sid();
+        guard
+            .begin_segment_activation(segment, replacement)
+            .unwrap()
+            .commit()
+            .unwrap();
+        {
+            let table = LockFileGuard::open(&lock_path).unwrap();
+            assert_eq!(
+                table.data().find("transferred").unwrap().segment_id,
+                Some(replacement)
+            );
+        }
+        drop(guard);
+        let table = LockFileGuard::open(&lock_path).unwrap();
+        assert!(table.data().find("transferred").is_none());
+    }
+
+    #[test]
+    fn cleanup_rejects_live_guard_then_releases_only_detached_allocation() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("workers.json");
+        let guard = install_top_level_at_for_test(
+            lock_path.clone(),
+            "live".into(),
+            std::process::id(),
+            sock("live"),
+            Vec::new(),
+            sid(),
+        )
+        .unwrap();
+        let _competitor = install_top_level_at_for_test(
+            lock_path.clone(),
+            "competitor".into(),
+            std::process::id(),
+            sock("competitor"),
+            Vec::new(),
+            sid(),
+        )
+        .unwrap();
+        let cleanup = guard.cleanup_handle();
+        assert!(matches!(
+            cleanup.release(),
+            Err(ScopeLockError::AllocationGuardAttached { worker_name }) if worker_name == "live"
+        ));
+        drop(cleanup.clone());
+        {
+            let table = LockFileGuard::open(&lock_path).unwrap();
+            assert!(table.data().find("live").is_some());
+            assert!(table.data().find("competitor").is_some());
+        }
+
+        drop(guard);
+        cleanup.release().unwrap();
+        cleanup.clone().release().unwrap();
+        let table = LockFileGuard::open(&lock_path).unwrap();
+        assert!(table.data().find("live").is_none());
+        assert!(table.data().find("competitor").is_some());
+    }
+
+    #[test]
+    fn published_install_failure_retains_cleanup_across_error_drop_and_retry() {
+        use super::super::table::{SaveFaultPoint, fail_next_save_at_for_test};
+
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("workers.json");
+        let _competitor = install_top_level_at_for_test(
+            lock_path.clone(),
+            "competitor".into(),
+            std::process::id(),
+            sock("competitor"),
+            Vec::new(),
+            sid(),
+        )
+        .unwrap();
+        let segment = sid();
+        fail_next_save_at_for_test(&lock_path, SaveFaultPoint::AfterRename);
+        let error = install_top_level_at_for_test(
+            lock_path.clone(),
+            "failed".into(),
+            std::process::id(),
+            sock("failed"),
+            Vec::new(),
+            segment,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &error,
+            ScopeLockError::AcquisitionSaveFailed { .. }
+        ));
+        let cleanup = error.allocation_cleanup_handle().unwrap();
+        let retry = error.allocation_cleanup_handle().unwrap();
+        drop(error);
+        {
+            let table = LockFileGuard::open(&lock_path).unwrap();
+            assert_eq!(
+                table.data().find("failed").unwrap().segment_id,
+                Some(segment)
+            );
+            assert!(table.data().find("competitor").is_some());
+        }
+
+        fail_next_save_at_for_test(&lock_path, SaveFaultPoint::BeforeRename);
+        assert!(matches!(cleanup.release(), Err(ScopeLockError::Io(_))));
+        drop(cleanup);
+        {
+            let table = LockFileGuard::open(&lock_path).unwrap();
+            assert!(table.data().find("failed").is_some());
+        }
+        retry.release().unwrap();
+        let table = LockFileGuard::open(&lock_path).unwrap();
+        assert!(table.data().find("failed").is_none());
+        assert!(table.data().find("competitor").is_some());
+    }
+
+    #[test]
+    fn refused_install_has_no_cleanup_authority_over_existing_allocation() {
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("workers.json");
+        let segment = sid();
+        let _competitor = install_top_level_at_for_test(
+            lock_path.clone(),
+            "competitor".into(),
+            std::process::id(),
+            sock("competitor"),
+            vec![write_rule("/shared", true)],
+            segment,
+        )
+        .unwrap();
+        let cases = [
+            ("competitor", sid(), Vec::new()),
+            ("other", segment, Vec::new()),
+            ("other", sid(), vec![write_rule("/shared", true)]),
+        ];
+        for (name, requested_segment, scope) in cases {
+            let error = install_top_level_at_for_test(
+                lock_path.clone(),
+                name.into(),
+                std::process::id(),
+                sock("refused"),
+                scope,
+                requested_segment,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                &error,
+                ScopeLockError::DuplicateWorkerName(_)
+                    | ScopeLockError::SegmentConflict { .. }
+                    | ScopeLockError::WriteConflict { .. }
+            ));
+            assert!(error.allocation_cleanup_handle().is_none());
+            drop(error);
+            let table = LockFileGuard::open(&lock_path).unwrap();
+            assert_eq!(table.data().allocations.len(), 1);
+            assert_eq!(
+                table.data().find("competitor").unwrap().socket,
+                sock("competitor")
+            );
+            assert_eq!(
+                table.data().find("competitor").unwrap().segment_id,
+                Some(segment)
+            );
+        }
+    }
+
+    #[test]
+    fn unpublished_install_failure_has_no_cleanup_authority() {
+        use super::super::table::{SaveFaultPoint, fail_next_save_at_for_test};
+
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("workers.json");
+        let _competitor = install_top_level_at_for_test(
+            lock_path.clone(),
+            "competitor".into(),
+            std::process::id(),
+            sock("competitor"),
+            Vec::new(),
+            sid(),
+        )
+        .unwrap();
+        fail_next_save_at_for_test(&lock_path, SaveFaultPoint::BeforeRename);
+        let error = install_top_level_at_for_test(
+            lock_path.clone(),
+            "failed".into(),
+            std::process::id(),
+            sock("failed"),
+            Vec::new(),
+            sid(),
+        )
+        .unwrap_err();
+        assert!(matches!(&error, ScopeLockError::Io(_)));
+        assert!(error.allocation_cleanup_handle().is_none());
+        drop(error);
+        let table = LockFileGuard::open(&lock_path).unwrap();
+        assert!(table.data().find("failed").is_none());
+        assert!(table.data().find("competitor").is_some());
+    }
+
+    #[test]
+    fn published_adoption_failure_retains_cleanup_for_retry() {
+        use super::super::table::{SaveFaultPoint, fail_next_save_at_for_test};
+
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("workers.json");
+        {
+            let mut table = LockFileGuard::open(&lock_path).unwrap();
+            delegate_placeholder(&mut table, "child", std::process::id());
+            delegate_placeholder(&mut table, "competitor", std::process::id());
+        }
+        let segment = sid();
+        fail_next_save_at_for_test(&lock_path, SaveFaultPoint::AfterRename);
+        let error = adopt_allocation_at(
+            lock_path.clone(),
+            "child".into(),
+            std::process::id(),
+            segment,
+        )
+        .unwrap_err();
+        let cleanup = error.allocation_cleanup_handle().unwrap();
+        drop(error);
+        {
+            let table = LockFileGuard::open(&lock_path).unwrap();
+            assert_eq!(
+                table.data().find("child").unwrap().segment_id,
+                Some(segment)
+            );
+        }
+        fail_next_save_at_for_test(&lock_path, SaveFaultPoint::AfterRename);
+        assert!(matches!(cleanup.release(), Err(ScopeLockError::Io(_))));
+        {
+            let table = LockFileGuard::open(&lock_path).unwrap();
+            assert!(table.data().find("child").is_none());
+            assert!(table.data().find("competitor").is_some());
+        }
+        cleanup.release().unwrap();
+        let table = LockFileGuard::open(&lock_path).unwrap();
+        assert!(table.data().find("child").is_none());
+        assert!(table.data().find("competitor").is_some());
+    }
+
+    #[test]
+    fn unpublished_adoption_failure_preserves_placeholder_without_cleanup_authority() {
+        use super::super::table::{SaveFaultPoint, fail_next_save_at_for_test};
+
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("workers.json");
+        let placeholder_pid = std::process::id();
+        {
+            let mut table = LockFileGuard::open(&lock_path).unwrap();
+            delegate_placeholder(&mut table, "child", placeholder_pid);
+        }
+        fail_next_save_at_for_test(&lock_path, SaveFaultPoint::BeforeRename);
+        let error = adopt_allocation_at(
+            lock_path.clone(),
+            "child".into(),
+            placeholder_pid.wrapping_add(1),
+            sid(),
+        )
+        .unwrap_err();
+        assert!(matches!(&error, ScopeLockError::Io(_)));
+        assert!(error.allocation_cleanup_handle().is_none());
+        drop(error);
+        let table = LockFileGuard::open(&lock_path).unwrap();
+        let allocation = table.data().find("child").unwrap();
+        assert_eq!(allocation.pid, placeholder_pid);
+        assert_eq!(allocation.segment_id, None);
+    }
+
+    #[test]
+    fn failed_cleanup_release_retains_authority_for_retry() {
+        use super::super::table::{SaveFaultPoint, fail_next_save_at_for_test};
+
+        for point in [SaveFaultPoint::BeforeRename, SaveFaultPoint::AfterRename] {
+            let dir = TempDir::new().unwrap();
+            let lock_path = dir.path().join("workers.json");
+            let guard = install_top_level_at_for_test(
+                lock_path.clone(),
+                "failed".into(),
+                std::process::id(),
+                sock("failed"),
+                vec![read_rule("/shared", true)],
+                sid(),
+            )
+            .unwrap();
+            let _other = install_top_level_at_for_test(
+                lock_path.clone(),
+                "other".into(),
+                std::process::id(),
+                sock("other"),
+                vec![read_rule("/shared", true)],
+                sid(),
+            )
+            .unwrap();
+            let cleanup = guard.cleanup_handle();
+            let retry = cleanup.clone();
+            drop(guard);
+            fail_next_save_at_for_test(&lock_path, point);
+
+            assert!(matches!(cleanup.release(), Err(ScopeLockError::Io(_))));
+            drop(cleanup);
+            {
+                let table = LockFileGuard::open(&lock_path).unwrap();
+                assert_eq!(
+                    table.data().find("failed").is_some(),
+                    point == SaveFaultPoint::BeforeRename
+                );
+                assert!(table.data().find("other").is_some());
+            }
+            retry.release().unwrap();
+            {
+                let table = LockFileGuard::open(&lock_path).unwrap();
+                assert!(table.data().find("failed").is_none());
+                assert!(table.data().find("other").is_some());
+            }
+
+            // Success disarms every clone and final Drop, even if the name is
+            // subsequently allocated to a different Worker.
+            let _replacement = install_top_level_at_for_test(
+                lock_path.clone(),
+                "failed".into(),
+                std::process::id(),
+                sock("replacement"),
+                vec![read_rule("/shared", true)],
+                sid(),
+            )
+            .unwrap();
+            retry.clone().release().unwrap();
+            drop(retry);
+            let table = LockFileGuard::open(&lock_path).unwrap();
+            assert_eq!(
+                table.data().find("failed").unwrap().socket,
+                sock("replacement")
+            );
+            assert!(table.data().find("other").is_some());
+        }
+    }
+
+    #[test]
     fn adopt_allocation_rewrites_pid_and_releases_on_drop() {
         let dir = TempDir::new().unwrap();
         let _sandbox = RuntimeDirSandbox::new(dir.path());
@@ -358,6 +848,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _sandbox = RuntimeDirSandbox::new(dir.path());
         let err = adopt_allocation("ghost".into(), 42, sid()).unwrap_err();
+        assert!(err.allocation_cleanup_handle().is_none());
         assert!(matches!(err, ScopeLockError::UnknownWorker(ref n) if n == "ghost"));
     }
 

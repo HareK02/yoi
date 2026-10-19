@@ -271,6 +271,7 @@ where
     St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
 {
     let cleanup_sessions = worker.workdir_sessions();
+    let factory_owned_cleanup = worker.startup_feature_cleanup_handle().is_some();
     let controller = match layout {
         WorkerBootstrapLayout::Direct {
             runtime_base,
@@ -305,7 +306,10 @@ where
             controller_task,
         }),
         Err(source) => {
-            let cleanup_failed = cleanup_sessions.close_all().await.is_err();
+            // Factory-owned task scopes must settle before sessions close.
+            // Cleanup remains unconfirmed here; preserve the startup source.
+            let cleanup_failed =
+                factory_owned_cleanup || cleanup_sessions.close_all().await.is_err();
             Err(WorkerBootstrapError::Controller {
                 source,
                 cleanup_failed,

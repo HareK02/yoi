@@ -832,9 +832,18 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for DeliveryWorkerFact
     async fn restore_controller(
         &self,
         request: delivery_execution::WorkerExecutionRestoreRequest,
-    ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
+    ) -> std::result::Result<
+        worker_runtime::worker_backend::RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
         self.controller(request.worker_ref.worker_id.to_string(), true)
             .await
+            .map_err(|_| {
+                worker_runtime::worker_backend::RuntimeRestoreFailure::unproven(
+                    worker_runtime::worker_backend::RuntimeRestoreStage::Reconstruction,
+                    "delivery fixture reconstruction failed",
+                )
+            })
     }
 }
 

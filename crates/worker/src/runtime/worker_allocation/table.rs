@@ -245,6 +245,14 @@ impl LockFileGuard {
     /// Persist with atomic replacement while the separate allocation lock stays
     /// held. A crash exposes either the old complete table or the new one.
     pub fn save(&mut self) -> io::Result<()> {
+        let mut published = false;
+        self.save_with_publication(&mut published)
+    }
+
+    /// Report this save's rename while the caller still holds the table lock.
+    /// In-memory mutation alone is not evidence that an acquisition took place.
+    pub(super) fn save_with_publication(&mut self, published: &mut bool) -> io::Result<()> {
+        *published = false;
         let json = serde_json::to_vec_pretty(&self.data).map_err(io::Error::other)?;
         let mut temp_os = self.data_path.as_os_str().to_owned();
         temp_os.push(".tmp");
@@ -264,6 +272,7 @@ impl LockFileGuard {
             ));
         }
         fs::rename(&temp_path, &self.data_path)?;
+        *published = true;
         #[cfg(test)]
         if take_save_fault(&self.data_path, SaveFaultPoint::AfterRename) {
             return Err(io::Error::other(

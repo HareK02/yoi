@@ -85,7 +85,10 @@ impl RuntimeWorkerFactory for CapturingFactory {
     async fn restore_controller(
         &self,
         request: worker_runtime::execution::WorkerExecutionRestoreRequest,
-    ) -> std::result::Result<RuntimeWorkerController, String> {
+    ) -> std::result::Result<
+        RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
         let worker_ref = request.worker_ref.clone();
         let controller = self.inner.restore_controller(request).await?;
         self.captures

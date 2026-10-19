@@ -494,9 +494,18 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for AttentionWorkerFac
     async fn restore_controller(
         &self,
         request: worker_runtime::execution::WorkerExecutionRestoreRequest,
-    ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
+    ) -> std::result::Result<
+        worker_runtime::worker_backend::RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
         self.controller(request.worker_ref.worker_id.to_string(), true)
             .await
+            .map_err(|_| {
+                worker_runtime::worker_backend::RuntimeRestoreFailure::unproven(
+                    worker_runtime::worker_backend::RuntimeRestoreStage::Reconstruction,
+                    "attention fixture reconstruction failed",
+                )
+            })
     }
 }
 

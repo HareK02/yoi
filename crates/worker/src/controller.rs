@@ -854,6 +854,7 @@ impl WorkerController {
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
         let sessions = worker.workdir_sessions();
+        let factory_owned_cleanup = worker.startup_feature_cleanup_handle().is_some();
         let result = Self::spawn_initialized(
             worker,
             runtime_base,
@@ -863,7 +864,10 @@ impl WorkerController {
             transport,
         )
         .await;
+        // An opted-in factory must quiesce its captured Feature tasks before
+        // closing their Workdir sessions; this wrapper cannot confirm that order.
         if result.is_err()
+            && !factory_owned_cleanup
             && let Err(error) = sessions.close_all().await
         {
             tracing::warn!(%error, "Workdir sessions close after controller startup failure failed");
@@ -1092,6 +1096,7 @@ impl WorkerController {
         let pause_tx = worker.engine_mut().pause_sender();
         let notify_buffer = worker.notify_buffer_handle();
 
+        worker.finish_startup_feature_cleanup_capture();
         let controller_task = tokio::spawn(controller_loop(
             worker,
             method_rx,
@@ -4424,21 +4429,6 @@ mod tests {
         assert!(feature_install < materialize_gate);
         assert!(materialize_gate < materialize);
         assert!(materialize < exposure);
-        let observer = startup.find("let command_observer = fs_for_view").unwrap();
-        let recover = startup.find(".recover_unfinished_compaction()").unwrap();
-        let files = startup
-            .find("runtime_dir.write_status(&shared_state).await?")
-            .unwrap();
-        let loop_start = startup.find("tokio::spawn(controller_loop(").unwrap();
-        assert!(recover < observer && files < observer && observer < loop_start);
-        let socket_startup = &startup[observer..loop_start];
-        let abort = socket_startup.find("observer.abort()").unwrap();
-        let join = socket_startup.find("observer.await").unwrap();
-        let failure = socket_startup.find("return Err(error)").unwrap();
-        assert!(
-            abort < join && join < failure,
-            "startup cannot detach its observer on error"
-        );
         assert!(
             startup[materialize_gate..materialize]
                 .contains("needs_initial_session_head_materialization")

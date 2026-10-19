@@ -2489,6 +2489,14 @@ impl Runtime {
         .map(|result| (Some(result), None))
     }
 
+    #[cfg(all(test, feature = "fs-store"))]
+    pub(crate) fn test_runtime_store(&self) -> FsRuntimeStore {
+        match &self.lock().unwrap().persistence {
+            RuntimePersistence::Fs(store) => store.clone(),
+            RuntimePersistence::Memory => panic!("expected filesystem Runtime"),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn test_restore_request(
         &self,
@@ -2944,7 +2952,11 @@ impl Runtime {
             return Err(error);
         }
 
-        let restore_result = if reconcile {
+        let completed_failure = backend.completed_restore_failure(operation_id, worker_ref);
+        let has_completed_failure = completed_failure.is_some();
+        let restore_result = if let Some(result) = completed_failure {
+            result
+        } else if reconcile {
             backend.reconcile_restore(request)
         } else {
             backend.restore_worker(request)
@@ -3069,7 +3081,7 @@ impl Runtime {
                 }
             }
             WorkerExecutionSpawnResult::Rejected(result) => {
-                if reconcile {
+                if reconcile && !has_completed_failure {
                     return Ok(RuntimeWorkerRestoreResult::failed(
                         WorkerRestoreState::ReconciliationRequired,
                         "worker_restore_reconciliation_rejected",
