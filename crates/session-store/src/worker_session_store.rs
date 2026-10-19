@@ -36,7 +36,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-const SESSION_SCHEMA_VERSION: u32 = 4;
+const SESSION_SCHEMA_VERSION: u32 = 5;
+const COMPACTION_SESSION_SCHEMA_VERSION: u32 = 4;
 const ANNOTATED_SESSION_SCHEMA_VERSION: u32 = 3;
 const PREVIOUS_SESSION_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SESSION_SCHEMA_VERSION: u32 = 1;
@@ -204,7 +205,15 @@ impl WorkerSessionStore {
 
     /// Open the Session store rooted at `<worker-aggregate>/session`.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        let root = root.into();
+        Self::new_with_migration_writer(root.into(), atomic_write_bytes)
+    }
+
+    // Keep fault injection at the storage publication boundary, without global
+    // flags or a public alternate restore API. Production always uses atomic writes.
+    fn new_with_migration_writer(
+        root: PathBuf,
+        write_segment: impl FnMut(&Path, &[u8]) -> Result<(), StoreError>,
+    ) -> Result<Self, StoreError> {
         fs::create_dir_all(root.join(SEGMENTS_DIR))?;
         let session_id = match fs::read(root.join(SESSION_FILE)) {
             Ok(bytes) => {
@@ -215,11 +224,13 @@ impl WorkerSessionStore {
                     }
                     LEGACY_SESSION_SCHEMA_VERSION
                     | PREVIOUS_SESSION_SCHEMA_VERSION
-                    | ANNOTATED_SESSION_SCHEMA_VERSION => {
-                        migrate_segment_logs_to_v4(
+                    | ANNOTATED_SESSION_SCHEMA_VERSION
+                    | COMPACTION_SESSION_SCHEMA_VERSION => {
+                        migrate_segment_logs_to_v5(
                             segment_log_paths(&root)?,
                             manifest.session_id,
                             manifest.schema_version,
+                            write_segment,
                         )?;
                         manifest.schema_version = SESSION_SCHEMA_VERSION;
                         atomic_write_json(&root.join(SESSION_FILE), &manifest)?;
@@ -1162,10 +1173,11 @@ fn segment_log_paths_in_directory(
     Ok(paths)
 }
 
-fn migrate_segment_logs_to_v4(
+fn migrate_segment_logs_to_v5(
     paths: Vec<(SegmentId, PathBuf)>,
     session_id: SessionId,
     source_schema_version: u32,
+    mut write_segment: impl FnMut(&Path, &[u8]) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
     struct MigrationPlan {
         path: PathBuf,
@@ -1196,12 +1208,19 @@ fn migrate_segment_logs_to_v4(
     }
     // Resolve trusted creation boundaries first, then update inherited copies by
     // logical identity too (fork/rewind seeds retain the same entry id).
-    let summaries = crate::legacy_session_log::compaction_summary_ids(
-        plans.iter().flat_map(|plan| plan.entries.iter()),
-    );
+    let summaries = if source_schema_version < COMPACTION_SESSION_SCHEMA_VERSION {
+        crate::legacy_session_log::compaction_summary_ids(
+            plans.iter().flat_map(|plan| plan.entries.iter()),
+        )
+    } else {
+        // v4 already made the explicit origin migration. Preserve its origins.
+        Default::default()
+    };
     for plan in &mut plans {
         crate::legacy_session_log::migrate_compaction_origins(&mut plan.entries, &summaries);
-        for entry in std::mem::take(&mut plan.entries) {
+        for mut entry in std::mem::take(&mut plan.entries) {
+            crate::legacy_session_log::migrate_system_inputs(&mut entry)?;
+            entry.validate_system_inputs()?;
             serde_json::to_writer(&mut plan.output, &entry)?;
             plan.output.push(b'\n');
         }
@@ -1223,7 +1242,7 @@ fn migrate_segment_logs_to_v4(
     }
 
     for plan in plans {
-        atomic_write_bytes(&plan.path, &plan.output)?;
+        write_segment(&plan.path, &plan.output)?;
     }
     Ok(())
 }
@@ -1240,9 +1259,19 @@ pub(crate) fn migrate_fs_session(root: &Path, session_id: SessionId) -> Result<(
         Err(error) => return Err(error.into()),
     };
     match version {
-        SESSION_SCHEMA_VERSION => Ok(()),
-        ANNOTATED_SESSION_SCHEMA_VERSION => {
-            migrate_segment_logs_to_v4(segment_log_paths_in_directory(root)?, session_id, version)?;
+        SESSION_SCHEMA_VERSION => {
+            validate_canonical_segment_paths(segment_log_paths_in_directory(root)?)
+        }
+        LEGACY_SESSION_SCHEMA_VERSION
+        | PREVIOUS_SESSION_SCHEMA_VERSION
+        | ANNOTATED_SESSION_SCHEMA_VERSION
+        | COMPACTION_SESSION_SCHEMA_VERSION => {
+            migrate_segment_logs_to_v5(
+                segment_log_paths_in_directory(root)?,
+                session_id,
+                version,
+                atomic_write_bytes,
+            )?;
             atomic_write_json(&marker, &SESSION_SCHEMA_VERSION)
         }
         _ => Err(StoreError::Corrupt {
@@ -1253,8 +1282,15 @@ pub(crate) fn migrate_fs_session(root: &Path, session_id: SessionId) -> Result<(
 }
 
 fn validate_canonical_segment_logs(root: &Path) -> Result<(), StoreError> {
-    for (_, path) in segment_log_paths(root)? {
-        let _: Vec<LogEntry> = parse_jsonl(&fs::read(&path)?)?;
+    validate_canonical_segment_paths(segment_log_paths(root)?)
+}
+
+fn validate_canonical_segment_paths(paths: Vec<(SegmentId, PathBuf)>) -> Result<(), StoreError> {
+    for (_, path) in paths {
+        let entries: Vec<LogEntry> = parse_jsonl(&fs::read(&path)?)?;
+        for entry in entries {
+            entry.validate_system_inputs()?;
+        }
     }
     Ok(())
 }
@@ -2020,6 +2056,146 @@ mod tests {
             fs::read(root.path().join(SESSION_FILE)).unwrap(),
             manifest_before
         );
+    }
+
+    #[test]
+    fn v5_migration_retries_after_second_file_publication_fails() {
+        fn identity_and_body(entries: &[LogEntry]) -> Vec<serde_json::Value> {
+            entries
+                .iter()
+                .flat_map(|record| match record {
+                    LogEntry::AnnotatedSystemItem { entry, .. } => vec![entry.to_history_entry()],
+                    LogEntry::AnnotatedUserInput { history, .. } => history.clone(),
+                    _ => panic!("unexpected record in fixed migration fixture"),
+                })
+                .map(|entry| {
+                    serde_json::json!({
+                        "entry_id": entry.metadata.entry_id,
+                        "origin": entry.metadata.origin,
+                        "derivation": entry.metadata.derivation,
+                        "item": entry.item,
+                    })
+                })
+                .collect()
+        }
+
+        const SOURCE: &str =
+            include_str!("legacy_session_log/tests/fixtures/v4-system-inputs.jsonl");
+        let root = tempfile::tempdir().unwrap();
+        let session_id = new_session_id();
+        let first_id = SegmentId::from_u128(1);
+        let second_id = SegmentId::from_u128(2);
+        fs::create_dir_all(root.path().join(SEGMENTS_DIR)).unwrap();
+        let marker_path = root.path().join(SESSION_FILE);
+        atomic_write_json(
+            &marker_path,
+            &SessionManifest {
+                schema_version: COMPACTION_SESSION_SCHEMA_VERSION,
+                session_id,
+            },
+        )
+        .unwrap();
+        let old_marker = fs::read(&marker_path).unwrap();
+        let first_path = root
+            .path()
+            .join(SEGMENTS_DIR)
+            .join(format!("{first_id}.jsonl"));
+        let second_path = root
+            .path()
+            .join(SEGMENTS_DIR)
+            .join(format!("{second_id}.jsonl"));
+        let second_source = SOURCE.replace("-id", "-second-id");
+        fs::write(&first_path, SOURCE).unwrap();
+        fs::write(&second_path, &second_source).unwrap();
+        let old_first = fs::read(&first_path).unwrap();
+        let old_second = fs::read(&second_path).unwrap();
+        let first_identity =
+            identity_and_body(&parse_legacy_jsonl(4, session_id, first_id, &old_first).unwrap());
+        let second_identity =
+            identity_and_body(&parse_legacy_jsonl(4, session_id, second_id, &old_second).unwrap());
+
+        let mut writes = 0;
+        let mut first_published = None;
+        let failure = WorkerSessionStore::new_with_migration_writer(
+            root.path().to_path_buf(),
+            |path, bytes| {
+                writes += 1;
+                match writes {
+                    1 => {
+                        assert_eq!(path, first_path.as_path());
+                        // Both files are still old when the first publication starts.
+                        assert_eq!(fs::read(&first_path).unwrap(), old_first);
+                        assert_eq!(fs::read(&second_path).unwrap(), old_second);
+                        atomic_write_bytes(path, bytes)?;
+                        first_published = Some(bytes.to_vec());
+                        Ok(())
+                    }
+                    2 => {
+                        assert_eq!(path, second_path.as_path());
+                        assert_eq!(
+                            fs::read(&first_path).unwrap(),
+                            *first_published.as_ref().unwrap()
+                        );
+                        assert_eq!(fs::read(&second_path).unwrap(), old_second);
+                        // Fail only this atomic-write boundary, after complete
+                        // preflight and a real successful first-file publication.
+                        Err(std::io::Error::other("injected second migration write failure").into())
+                    }
+                    _ => panic!("publication continued after its write failure"),
+                }
+            },
+        );
+        let error = match failure {
+            Ok(_) => panic!("the injected publication failure must reject store open"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("injected second migration write failure")
+        );
+        assert_eq!(writes, 2);
+        let first_published = first_published.unwrap();
+        assert_ne!(first_published, old_first);
+        assert_eq!(fs::read(&first_path).unwrap(), first_published);
+        assert_eq!(fs::read(&second_path).unwrap(), old_second);
+        assert_eq!(fs::read(&marker_path).unwrap(), old_marker);
+        let updated_first: Vec<LogEntry> = parse_jsonl(&first_published).unwrap();
+        for entry in &updated_first {
+            entry.validate_system_inputs().unwrap();
+        }
+        assert!(matches!(
+            &updated_first[0],
+            LogEntry::AnnotatedSystemItem {
+                entry: crate::LoggedSystemHistoryEntry {
+                    item: crate::SystemItem::Input { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(identity_and_body(&updated_first), first_identity);
+
+        // Retry via the public production constructor, without any injection or
+        // hand-built mixed fixture. The old marker drives the same migration.
+        let store = WorkerSessionStore::new(root.path()).unwrap();
+        let first = store.read_all(session_id, first_id).unwrap();
+        let second = store.read_all(session_id, second_id).unwrap();
+        assert_eq!(identity_and_body(&first), first_identity);
+        assert_eq!(identity_and_body(&second), second_identity);
+        for entry in first.iter().chain(second.iter()) {
+            entry.validate_system_inputs().unwrap();
+        }
+        assert_eq!(fs::read(&first_path).unwrap(), first_published);
+        let second_published = fs::read(&second_path).unwrap();
+        assert_ne!(second_published, old_second);
+        let manifest: SessionManifest =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        assert_eq!(manifest.schema_version, SESSION_SCHEMA_VERSION);
+        drop(store);
+        WorkerSessionStore::new(root.path()).unwrap();
+        assert_eq!(fs::read(&first_path).unwrap(), first_published);
+        assert_eq!(fs::read(&second_path).unwrap(), second_published);
     }
 
     #[test]

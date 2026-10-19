@@ -340,22 +340,13 @@ mod tests {
     #[test]
     fn system_item_log_entry_keeps_identity_in_live_event() {
         let entry_id = session_store::LoggedSessionHistoryEntryId::new();
+        let mut input =
+            crate::feature::builtin::memory::resident_summary_input("refresh".into(), None)
+                .unwrap();
+        input.metadata.entry_id = entry_id.clone();
         let event = live_log_entry_event(LogEntry::AnnotatedSystemItem {
             ts: session_store::segment_log::now_millis(),
-            entry: session_store::LoggedSystemHistoryEntry {
-                item: session_store::SystemItem::ResidentSummaryRefresh {
-                    body: "refresh".to_string(),
-                    prompt_provenance: None,
-                },
-                metadata: session_store::LoggedSessionHistoryMetadata {
-                    system_input: None,
-                    entry_id: entry_id.clone(),
-                    origin: session_store::LoggedSessionHistoryOrigin::BackendInstruction {
-                        operation_id: None,
-                    },
-                    derivation: None,
-                },
-            },
+            entry: input,
             extensions: Vec::new(),
         })
         .expect("SystemItem must be live-relevant");
@@ -381,25 +372,22 @@ mod tests {
             logical_name: "private-template".into(),
         };
         let items = [
-            session_store::SystemItem::SubjectBehaviorRefresh {
-                body: "displayed context".into(),
-                behavior_md: "private-raw-behavior".into(),
-                prompt_provenance: Some(provenance.clone()),
-            },
-            session_store::SystemItem::JournalStartup {
-                body: "displayed reference".into(),
-                snapshot: serde_json::json!({ "internal": "private-snapshot" }),
-                snapshot_sha256: "private-snapshot-digest".into(),
-                prompt_provenance: provenance,
-            },
+            crate::feature::builtin::memory::subject_behavior_input(
+                "displayed context".into(),
+                "private-raw-behavior".into(),
+                Some(provenance.clone()),
+            )
+            .unwrap(),
+            crate::feature::builtin::memory::resident_summary_input(
+                "displayed reference".into(),
+                Some(provenance),
+            )
+            .unwrap(),
         ];
-        for item in items {
+        for input in items {
             let entry = LogEntry::AnnotatedSystemItem {
                 ts: 7,
-                entry: session_store::LoggedSystemHistoryEntry {
-                    item,
-                    metadata: session_store::LoggedSessionHistoryMetadata::legacy_unknown(),
-                },
+                entry: input,
                 extensions: vec![],
             };
             let persisted: LogEntry =

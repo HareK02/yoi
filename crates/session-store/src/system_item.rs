@@ -86,23 +86,16 @@ pub struct PromptRenderProvenance {
 /// `notify_wrapper` template) re-shape the live rendering on a later
 /// resume.
 ///
-/// New variants get added here as fresh injection kinds come online
-/// (e.g. `TaskReminder`). The `kind` JSON tag is the snake_case form of
-/// the variant name.
+/// Feature-owned inputs use `Input` plus explicit annotated metadata; adding a
+/// Feature must not extend this enum or ordinary replay. Only core events have
+/// dedicated variants. Pre-v5 Feature kinds exist exclusively in the migration
+/// decoder, not in this current wire contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SystemItem {
     /// Generic System body; private metadata and public presentation are supplied
     /// independently by the producer in the same annotated history record.
     Input { body: String },
-    /// One-time derived Journal reference context. The bounded Host snapshot is
-    /// retained as JSON independently of its rendered body and prompt projection.
-    JournalStartup {
-        body: String,
-        snapshot: serde_json::Value,
-        snapshot_sha256: String,
-        prompt_provenance: PromptRenderProvenance,
-    },
     /// Free-form notification sent in by an external caller via
     /// `Method::Notify`. `message` is the raw caller-supplied text;
     /// `body` is the wrapped LLM-context form (Worker renders it via
@@ -125,24 +118,12 @@ pub enum SystemItem {
         prompt_provenance: Option<PromptRenderProvenance>,
     },
 
-    /// Result of an explicitly selected chat Feature invocation. The typed
-    /// result is retained for clients; `body` is the exact bounded context made
-    /// visible to the Worker model.
-    FeatureInvocationResult {
-        result: protocol::FeatureInvocationResult,
-        body: String,
-    },
-
     /// `@<path>` file reference resolution. `body` is the rendered
     /// LLM-context text (`[File: <path>]\n…` for regular files,
     /// `[Dir: <path>]\n…` for directory listings, possibly with a
     /// truncation hint) so replay reconstructs worker history
     /// byte-identical to what was sent.
     FileAttachment { path: String, body: String },
-
-    /// Explicit Agent Skill activation. `body` is the exact LLM-facing
-    /// Skill text committed before any subsequent LLM request can use it.
-    SkillActivation { name: String, body: String },
 
     /// Historical persisted Knowledge reference resolution. Knowledge is no
     /// longer active, so restored sessions ignore this item instead of replaying
@@ -163,29 +144,6 @@ pub enum SystemItem {
         #[serde(default = "default_task_reminder_source")]
         source: SystemReminderSource,
         body: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        prompt_provenance: Option<PromptRenderProvenance>,
-    },
-
-    /// Restore-boundary refresh of the current resident Memory projection.
-    /// The exact rendered body is retained so replay is byte-identical; a
-    /// refresh with no ready summary explicitly supersedes older resident
-    /// context without deleting or rewriting history.
-    ResidentSummaryRefresh {
-        body: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        prompt_provenance: Option<PromptRenderProvenance>,
-    },
-
-    /// A Host-fetched change to user-managed Subject behavior. Each changed
-    /// body is appended rather than rewriting prior prompt/session content.
-    SubjectBehaviorRefresh {
-        body: String,
-        /// Exact user-managed behavior acknowledged after durable commit. Old
-        /// logs omit this value; an empty value is not an acknowledgement of a
-        /// nonempty behavior and does not replace their stored rendered body.
-        #[serde(default)]
-        behavior_md: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_provenance: Option<PromptRenderProvenance>,
     },
@@ -233,13 +191,9 @@ impl SystemItem {
             Self::Input { .. }
             | Self::LegacyKnowledgeIgnored { .. }
             | Self::LegacyIgnored { .. } => PublicSystemPresentation::Ignored,
-            Self::JournalStartup { .. }
-            | Self::ResidentSummaryRefresh { .. }
-            | Self::SubjectBehaviorRefresh { .. }
-            | Self::SkillActivation { .. }
-            | Self::FeatureInvocationResult { .. }
-            | Self::FileAttachment { .. }
-            | Self::Interrupt { .. } => PublicSystemPresentation::Context,
+            Self::FileAttachment { .. } | Self::Interrupt { .. } => {
+                PublicSystemPresentation::Context
+            }
         };
         PublicSystemItem {
             kind: self.kind_label().to_owned(),
@@ -257,19 +211,14 @@ impl SystemItem {
     pub fn history_text(&self) -> String {
         match self {
             SystemItem::Input { body } => body.clone(),
-            SystemItem::JournalStartup { body, .. } => body.clone(),
             SystemItem::Notification { body, .. } => body.clone(),
             SystemItem::WorkerEvent { body, .. } => body.clone(),
-            SystemItem::FeatureInvocationResult { body, .. } => body.clone(),
             SystemItem::FileAttachment { body, .. } => body.clone(),
-            SystemItem::SkillActivation { body, .. } => body.clone(),
             SystemItem::LegacyKnowledgeIgnored { .. } => String::new(),
             SystemItem::LegacyIgnored { slug } => {
                 format!("Ignored legacy procedure item: /{slug}")
             }
             SystemItem::TaskReminder { body, .. } => body.clone(),
-            SystemItem::ResidentSummaryRefresh { body, .. } => body.clone(),
-            SystemItem::SubjectBehaviorRefresh { body, .. } => body.clone(),
             SystemItem::Interrupt { body, .. } => body.clone(),
         }
     }
@@ -285,17 +234,12 @@ impl SystemItem {
     pub fn kind_label(&self) -> &'static str {
         match self {
             SystemItem::Input { .. } => "input",
-            SystemItem::JournalStartup { .. } => "journal_startup",
             SystemItem::Notification { .. } => "notification",
             SystemItem::WorkerEvent { .. } => "worker_event",
-            SystemItem::FeatureInvocationResult { .. } => "feature_invocation_result",
             SystemItem::FileAttachment { .. } => "file_attachment",
-            SystemItem::SkillActivation { .. } => "skill_activation",
             SystemItem::LegacyKnowledgeIgnored { .. } => "legacy_knowledge_ignored",
             SystemItem::LegacyIgnored { .. } => "legacy_ignored",
             SystemItem::TaskReminder { .. } => "task_reminder",
-            SystemItem::ResidentSummaryRefresh { .. } => "resident_summary_refresh",
-            SystemItem::SubjectBehaviorRefresh { .. } => "subject_behavior_refresh",
             SystemItem::Interrupt { .. } => "interrupt",
         }
     }
@@ -353,18 +297,20 @@ mod tests {
     }
 
     #[test]
-    fn subject_behavior_refresh_round_trips_with_exact_body() {
-        let item = SystemItem::SubjectBehaviorRefresh {
-            body: "current Subject context".to_string(),
-            behavior_md: "exact behavior".to_string(),
-            prompt_provenance: None,
-        };
-        let raw = serde_json::to_string(&item).unwrap();
-        let parsed: SystemItem = serde_json::from_str(&raw).unwrap();
-        assert_eq!(parsed.history_text(), "current Subject context");
-        assert!(
-            matches!(parsed, SystemItem::SubjectBehaviorRefresh { behavior_md, .. } if behavior_md == "exact behavior")
-        );
+    fn current_system_item_rejects_frozen_feature_kinds() {
+        // Even well-formed old payloads cannot enter normal v5 decode/replay.
+        for line in include_str!("legacy_session_log/tests/fixtures/v4-system-inputs.jsonl")
+            .lines()
+            .take(5)
+        {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(serde_json::from_value::<SystemItem>(record["entry"]["item"].clone()).is_err());
+            assert!(
+                serde_json::from_value::<crate::LoggedSystemHistoryEntry>(record["entry"].clone())
+                    .is_err()
+            );
+            assert!(serde_json::from_str::<crate::LogEntry>(line).is_err());
+        }
     }
 
     #[test]
@@ -390,21 +336,6 @@ mod tests {
         let mut unknown = valid;
         unknown["presentation"] = serde_json::json!({ "kind": "execute_feature_payload" });
         assert!(serde_json::from_value::<PublicSystemItem>(unknown).is_err());
-    }
-
-    #[test]
-    fn frozen_subject_behavior_log_reads_old_counter_without_republishing_it() {
-        let old = r#"{"kind":"subject_behavior_refresh","body":"exact archived body","behavior_revision":7}"#;
-        let item: SystemItem = serde_json::from_str(old).unwrap();
-        assert_eq!(item.history_text(), "exact archived body");
-        assert_eq!(
-            serde_json::to_value(item).unwrap(),
-            serde_json::json!({
-                "kind": "subject_behavior_refresh",
-                "body": "exact archived body",
-                "behavior_md": ""
-            })
-        );
     }
 
     #[test]
@@ -498,29 +429,6 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
-    }
-
-    #[test]
-    fn invocation_result_retains_typed_outcome_and_exact_context() {
-        let result = protocol::FeatureInvocationResult {
-            invocation_id: "stable-invoke".into(),
-            identity: protocol::FeatureInvocationIdentity("builtin:test/prepare".into()),
-            status: protocol::FeatureInvocationStatus::OutcomeUnknown,
-            message: "operation may have committed".into(),
-            context: None,
-        };
-        let body = "Outcome unknown; do not retry automatically";
-        let item = SystemItem::FeatureInvocationResult {
-            result: result.clone(),
-            body: body.into(),
-        };
-        let restored: SystemItem =
-            serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
-        assert_eq!(restored.history_text(), body);
-        assert_eq!(restored.kind_label(), "feature_invocation_result");
-        assert!(
-            matches!(restored, SystemItem::FeatureInvocationResult { result: saved, .. } if saved == result)
-        );
     }
 
     #[test]

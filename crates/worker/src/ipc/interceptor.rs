@@ -262,6 +262,31 @@ impl WorkerInterceptor {
         )
     }
 
+    fn commit_system_entries(
+        &self,
+        entries: &[session_store::LoggedSystemHistoryEntry],
+    ) -> Result<(), session_store::StoreError> {
+        let Some(writer) = &self.log_writer else {
+            return Ok(());
+        };
+        for entry in entries {
+            writer.commit_annotated_system_item_then(
+                entry.clone(),
+                Vec::new(),
+                &mut |history| {
+                    self.pending_committed_history
+                        .lock()
+                        .expect("pending committed history poisoned")
+                        .push_back(history.clone());
+                    if let Some(source) = &self.resident_context_source {
+                        source.system_item_committed(&entry.item, &history.annotation);
+                    }
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn current_turn_index(&self) -> usize {
         self.next_turn_index
             .load(Ordering::Relaxed)
@@ -386,11 +411,6 @@ impl WorkerInterceptor {
                     prompt_provenance, ..
                 } if prompt_provenance.is_none() => {
                     *prompt_provenance = Some(provenance("internal.task_reminder"));
-                }
-                SystemItem::SubjectBehaviorRefresh {
-                    prompt_provenance, ..
-                } if prompt_provenance.is_none() => {
-                    *prompt_provenance = Some(provenance("internal.subjektiv_resident_context"));
                 }
                 SystemItem::Interrupt {
                     prompt_provenance, ..
@@ -617,15 +637,17 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
             return Ok(PreRequestAction::Yield);
         }
 
-        let mut system_items: Vec<SystemItem> = std::mem::take(
+        let mut system_items: Vec<session_store::LoggedSystemHistoryEntry> = std::mem::take(
             &mut *pending_hook_system_items
                 .lock()
                 .expect("pending hook system-item queue poisoned"),
         );
-        self.attach_prompt_provenance(&mut system_items);
+        for entry in &mut system_items {
+            self.attach_prompt_provenance(std::slice::from_mut(&mut entry.item));
+        }
         let mut appended_items: Vec<Item> = system_items
             .iter()
-            .map(SystemItem::to_history_item)
+            .map(|entry| entry.item.to_history_item())
             .collect();
         let effective_context = if appended_items.is_empty() {
             Cow::Borrowed(context.as_slice())
@@ -639,7 +661,7 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
         let compact_decision =
             self.request_compact_decision(current_tokens, effective_context.as_ref());
         if !matches!(compact_decision, AutomaticCompactDecision::Continue) {
-            if let Err(error) = self.commit_system_items(&system_items) {
+            if let Err(error) = self.commit_system_entries(&system_items) {
                 return Ok(PreRequestAction::Cancel(format!(
                     "session persistence failed: {error}"
                 )));
@@ -683,7 +705,7 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
         if appended_items.is_empty() {
             return Ok(PreRequestAction::Continue);
         }
-        Ok(match self.commit_system_items(&system_items) {
+        Ok(match self.commit_system_entries(&system_items) {
             Ok(()) => PreRequestAction::ContinueWith(appended_items),
             Err(error) => PreRequestAction::Cancel(format!("session persistence failed: {error}")),
         })
@@ -983,7 +1005,14 @@ mod tests {
             input
                 .system_items()
                 .expect("test interceptor has durable append authority")
-                .append_subject_behavior_refresh("current Subject context", "Ask when uncertain.");
+                .append_input(
+                    crate::feature::builtin::memory::subject_behavior_input(
+                        "current Subject context".into(),
+                        "Ask when uncertain.".into(),
+                        None,
+                    )
+                    .unwrap(),
+                );
             Ok(HookPreRequestAction::Continue)
         }
     }
@@ -1000,11 +1029,23 @@ mod tests {
 
         fn system_item_committed(
             &self,
-            item: &SystemItem,
-            _metadata: &crate::session_history::SessionHistoryMetadata,
+            _item: &SystemItem,
+            metadata: &crate::session_history::SessionHistoryMetadata,
         ) {
-            if let SystemItem::SubjectBehaviorRefresh { behavior_md, .. } = item {
-                self.confirmed.lock().unwrap().push(behavior_md.to_owned());
+            if let Some(input) = metadata
+                .system_input
+                .as_ref()
+                .and_then(|input| input.feature_payload())
+                .and_then(|payload| {
+                    payload
+                        .decode::<crate::feature::builtin::memory::SubjectBehaviorInput>(
+                            "subject:behavior",
+                            1,
+                        )
+                        .ok()
+                })
+            {
+                self.confirmed.lock().unwrap().push(input.behavior_md);
             }
         }
     }
@@ -1549,11 +1590,7 @@ mod tests {
         assert_eq!(*confirmed.lock().unwrap(), ["Ask when uncertain."]);
         assert!(matches!(
             committed.lock().unwrap().as_slice(),
-            [SystemItem::SubjectBehaviorRefresh {
-                behavior_md,
-                prompt_provenance: Some(_),
-                ..
-            }] if behavior_md == "Ask when uncertain."
+            [SystemItem::Input { body }] if body == "current Subject context"
         ));
     }
 
@@ -1654,12 +1691,15 @@ mod tests {
             })),
         )
         .with_resident_context_source(Some(source));
-        let items = ["raw behavior", ""].map(|behavior_md| SystemItem::SubjectBehaviorRefresh {
-            body: "same rendered context".into(),
-            behavior_md: behavior_md.into(),
-            prompt_provenance: None,
+        let items = ["raw behavior", ""].map(|behavior_md| {
+            crate::feature::builtin::memory::subject_behavior_input(
+                "same rendered context".into(),
+                behavior_md.into(),
+                None,
+            )
+            .unwrap()
         });
-        interceptor.commit_system_items(&items).unwrap();
+        interceptor.commit_system_entries(&items).unwrap();
         assert_eq!(*confirmed.lock().unwrap(), ["raw behavior", ""]);
         assert_eq!(committed.lock().unwrap().len(), 2);
     }

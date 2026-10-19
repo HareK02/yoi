@@ -2757,11 +2757,25 @@ pub trait SystemItemCommitter: Send + Sync {
                 .unwrap_or(WorkerHistoryProvenance::BackendInstruction { operation_id: None }),
             None,
         );
-        let history = HistoryEntry::new(item.to_history_item(), metadata.clone());
+        self.commit_annotated_system_item_then(
+            session_store::LoggedSystemHistoryEntry { item, metadata },
+            extensions,
+            after_commit,
+        )
+    }
+
+    fn commit_annotated_system_item_then(
+        &self,
+        entry: session_store::LoggedSystemHistoryEntry,
+        extensions: Vec<SessionExtension>,
+        after_commit: &mut dyn FnMut(&HistoryEntry<SessionHistoryMetadata>),
+    ) -> Result<HistoryEntry<SessionHistoryMetadata>, StoreError> {
+        entry.validate_system_input()?;
+        let history = HistoryEntry::new(entry.item.to_history_item(), entry.metadata.clone());
         self.commit_usage_boundary(
             LogEntry::AnnotatedSystemItem {
                 ts: segment_log::now_millis(),
-                entry: session_store::LoggedSystemHistoryEntry { item, metadata },
+                entry,
                 extensions,
             },
             &mut || after_commit(&history),
@@ -2934,14 +2948,21 @@ pub(crate) enum SystemPromptContribution {
 pub(crate) struct ResidentContextRefresh {
     pub body: String,
     pub behavior_md: String,
+    pub prompt_provenance: Option<session_store::PromptRenderProvenance>,
 }
 
-/// Initial-only System messages and Feature-owned metadata. Core persists and
-/// replays each pair unchanged; it does not infer provenance from the payload.
-/// Prepared with the head, never at restore/request hooks.
+/// Feature-owned System context at explicit creation and compaction boundaries.
+/// Core persists and replays each pair unchanged; normal restore never reloads it.
 #[async_trait::async_trait]
-pub(crate) trait InitialContextSource: Send + Sync {
+pub(crate) trait SessionContextSource: Send + Sync {
     async fn load(&self) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String>;
+
+    async fn load_compaction_context(
+        &self,
+        _session: SessionId,
+    ) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait::async_trait]
@@ -3132,7 +3153,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     inject_resident_summary: bool,
     /// Deferred resident prompt source installed by an enabled Feature.
     feature_resident_summary_source: Option<Arc<dyn SystemPromptContributionSource>>,
-    initial_context_source: Option<Arc<dyn InitialContextSource>>,
+    session_context_source: Option<Arc<dyn SessionContextSource>>,
     /// Exact complete seed retained across ambiguous Store responses. The committed
     /// segment remains authoritative; metadata must be repaired before accepting input.
     prepared_initial_seed: Option<Vec<LogEntry>>,
@@ -3404,7 +3425,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
-            initial_context_source: None,
+            session_context_source: None,
             prepared_initial_seed: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
@@ -3452,8 +3473,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.inject_resident_summary = enabled;
     }
 
-    pub(crate) fn install_initial_context_source(&mut self, source: Arc<dyn InitialContextSource>) {
-        self.initial_context_source = Some(source);
+    pub(crate) fn install_session_context_source(&mut self, source: Arc<dyn SessionContextSource>) {
+        self.session_context_source = Some(source);
     }
 
     pub(crate) fn install_system_prompt_contribution(
@@ -3629,10 +3650,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.workspace_context.client_handle()
     }
 
-    /// Bind a live capability before Feature installation. This is deliberately
-    /// separate from Workspace authority and is not inherited by SubWorkers.
-    pub fn bind_subjektiv_host(&mut self, host: Option<Arc<dyn crate::subjektiv::SubjektivHost>>) {
+    pub(crate) fn set_subjektiv_host(
+        &mut self,
+        host: Option<Arc<dyn crate::subjektiv::SubjektivHost>>,
+    ) {
         self.subjektiv_host = host;
+        self.session_context_source = None;
     }
 
     pub fn subjektiv_host_connection(
@@ -3700,26 +3723,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     {
         let activation = self.workspace_client().activate_skill(name)?;
         self.ensure_segment_head().await?;
-        let body = format!(
-            "Agent Skill `{}` activated from {}.\n\n{}",
-            activation.name, activation.provenance.id, activation.body
-        );
-        let skill_metadata = new_history_metadata(
-            WorkerHistoryProvenance::BackendInstruction { operation_id: None },
-            None,
-        );
+        let input = crate::skill::activation_input(&activation).map_err(StoreError::from)?;
+        let history_entry = HistoryEntry::new(input.item.to_history_item(), input.metadata.clone());
         self.commit_entry(LogEntry::AnnotatedSystemItem {
             ts: segment_log::now_millis(),
-            entry: session_store::LoggedSystemHistoryEntry {
-                item: SystemItem::SkillActivation {
-                    name: activation.name.clone(),
-                    body: body.clone(),
-                },
-                metadata: skill_metadata.clone(),
-            },
+            entry: input,
             extensions: Vec::new(),
         })?;
-        let history_entry = HistoryEntry::new(agen::Item::system_message(body), skill_metadata);
         let mut annotate = history_annotator(
             self.log_writer_handle(),
             vec![history_entry.clone()],
@@ -4594,18 +4604,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .lock()
                 .expect("restore system-item queue poisoned"),
         );
-        for item in system_items {
-            let history_item = item.to_history_item();
-            let metadata = new_history_metadata(
-                WorkerHistoryProvenance::BackendInstruction { operation_id: None },
-                None,
-            );
+        for entry in system_items {
+            let history_item = entry.item.to_history_item();
+            let metadata = entry.metadata.clone();
             self.commit_entry(LogEntry::AnnotatedSystemItem {
                 ts: segment_log::now_millis(),
-                entry: session_store::LoggedSystemHistoryEntry {
-                    item,
-                    metadata: metadata.clone(),
-                },
+                entry,
                 extensions: Vec::new(),
             })?;
             let history_entry = HistoryEntry::new(history_item, metadata);
@@ -5368,17 +5372,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     .invocation_receipts
                     .push(InvocationReceipt::new(invocation, Some(result.clone())));
             }
-            let item = SystemItem::FeatureInvocationResult { result, body };
-            let metadata = new_history_metadata(
-                WorkerHistoryProvenance::BackendInstruction { operation_id: None },
-                None,
-            );
-            let history = HistoryEntry::new(item.to_history_item(), metadata.clone());
+            let input =
+                crate::feature::invocation::result_input(result, body).map_err(StoreError::from)?;
+            let history = HistoryEntry::new(input.item.to_history_item(), input.metadata.clone());
             handle
                 .writer
                 .append_entry_locked(LogEntry::AnnotatedSystemItem {
                     ts: segment_log::now_millis(),
-                    entry: session_store::LoggedSystemHistoryEntry { item, metadata },
+                    entry: input,
                     extensions: vec![pending_activation_extension(&completed)],
                 })?;
             *state = completed;
@@ -5882,7 +5883,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         } else {
             if self.prepared_initial_seed.is_none() {
                 self.ensure_system_prompt_materialized().await?;
-                let items = match &self.initial_context_source {
+                let items = match &self.session_context_source {
                     Some(source) => source.load().await.map_err(WorkerError::InvalidState)?,
                     None => Vec::new(),
                 };
@@ -6939,11 +6940,18 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
 
         // Freeze one Host-owned read before starting the compactor. Background recording
         // remains independent; never re-read when building the replacement segment.
-        let journal_context = crate::feature::builtin::journal::freeze_compaction_journal(
-            self.subjektiv_host_connection(),
-            &self.prompts.load_full(),
-        )
-        .map_err(WorkerError::PromptCatalog)?;
+        let frozen_context = match &self.session_context_source {
+            Some(source) => source
+                .load_compaction_context(self.session_id())
+                .await
+                .map_err(WorkerError::InvalidState)?,
+            None => Vec::new(),
+        };
+        for entry in &frozen_context {
+            entry
+                .validate_system_input()
+                .map_err(|e| WorkerError::InvalidState(e.to_string()))?;
+        }
         let history_entries = self.session.history().entries();
         let retain_from = cut.index.min(history_entries.len());
         let initial_summary = initial_compaction_summary(history_entries)?;
@@ -6953,11 +6961,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let retained_history_entries = history_entries[retain_from..]
             .iter()
             .filter(|entry| {
-                !matches!(
-                    entry.annotation.origin,
-                    WorkerHistoryProvenance::CompactionSummary
-                        | WorkerHistoryProvenance::JournalContext
-                )
+                crate::session_history::compaction_use(&entry.annotation)
+                    == session_store::InputCompactionUse::Retain
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -6976,11 +6981,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let mut entries_to_summarise = history_entries[..retain_from]
             .iter()
             .filter(|entry| {
-                !matches!(
-                    entry.annotation.origin,
-                    WorkerHistoryProvenance::CompactionSummary
-                        | WorkerHistoryProvenance::JournalContext
-                )
+                crate::session_history::compaction_use(&entry.annotation)
+                    == session_store::InputCompactionUse::Retain
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -7067,24 +7069,29 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // Journals. In particular, a failed/empty read must not silently lose context
         // that the previous summary intentionally delegated to its injected Journal.
         // Carry them only into the compactor, never alongside the new reference seed.
-        for entry in history_entries
-            .iter()
-            .filter(|entry| entry.annotation.origin == WorkerHistoryProvenance::JournalContext)
-        {
+        for entry in history_entries.iter().filter(|entry| {
+            crate::session_history::compaction_use(&entry.annotation)
+                == session_store::InputCompactionUse::ReferenceInput
+        }) {
             if let Some(body) = entry.item.as_text() {
                 summary_input.text.push_str(
-                    "\n\n## Previous Journal reference (historical, not automatically retained)\n",
+                    "\n\n## Previous reference input (historical, not automatically retained)\n",
                 );
                 summary_input.text.push_str(body);
                 summary_input
                     .text
-                    .push_str("\n## End previous Journal reference\n");
+                    .push_str("\n## End previous reference input\n");
             }
         }
         // Mandatory context, outside overview truncation. The internal Worker's normal
         // request budget checks include this exact body and the full previous summary.
         summary_input.text.push_str("\n\n");
-        summary_input.text.push_str(&journal_context);
+        for (index, entry) in frozen_context.iter().enumerate() {
+            if index != 0 {
+                summary_input.text.push_str("\n\n");
+            }
+            summary_input.text.push_str(&entry.item.history_text());
+        }
         if summary_input.warning_exceeded {
             self.alert(
                 AlertLevel::Warn,
@@ -7400,8 +7407,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             crate::session_history::COMPACTION_SUMMARY_HEADER
         ));
         compact_introduced_system_messages.push(summary_message.clone());
-        let journal_message = Item::system_message(journal_context);
-        compact_introduced_system_messages.push(journal_message.clone());
+        let context_messages = frozen_context
+            .iter()
+            .map(|entry| entry.item.to_history_item())
+            .collect::<Vec<_>>();
+        compact_introduced_system_messages.extend(context_messages.iter().cloned());
         compact_introduced_system_messages.extend(auto_read_messages.iter().cloned());
         if let Some(msg) = reference_message.as_ref() {
             compact_introduced_system_messages.push(msg.clone());
@@ -7414,7 +7424,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         compact_introduced_system_messages.push(task_snapshot_message.clone());
 
         new_history.push(summary_message);
-        new_history.push(journal_message);
+        new_history.extend(context_messages);
         new_history.extend(auto_read_messages);
         if let Some(msg) = reference_message {
             new_history.push(msg);
@@ -7454,6 +7464,32 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .iter()
             .map(|entry| entry.annotation.entry_id.clone())
             .collect::<Vec<_>>();
+        let generic_summary_input = session_store::SystemInputEnvelope::new(
+            new_history[0]
+                .as_text()
+                .expect("compaction summary is text"),
+            session_store::SystemInputMetadata::new(
+                session_store::SystemInputUsePolicy {
+                    recording_material: session_store::InputEvidenceUse::Exclude,
+                    memory_evidence: session_store::InputEvidenceUse::Exclude,
+                    observation: session_store::InputObservationUse::Hidden,
+                    compaction: session_store::InputCompactionUse::OpeningSummary,
+                },
+                None,
+                None,
+            )
+            .map_err(|e| WorkerError::InvalidState(e.to_string()))?,
+        )
+        .map_err(|e| WorkerError::InvalidState(e.to_string()))?;
+        let summary_entry = session_store::LoggedSystemHistoryEntry::from_input(
+            WorkerHistoryProvenance::Provided {
+                producer: "worker.compaction".into(),
+            },
+            Some(SessionHistoryDerivation {
+                sources: derived_sources.clone(),
+            }),
+            generic_summary_input,
+        );
         let mut original_cursor = 0usize;
         let compacted_history_entries = new_history
             .iter()
@@ -7461,25 +7497,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .enumerate()
             .map(|(index, item)| {
                 if index == 0 {
-                    HistoryEntry::new(
-                        item,
-                        new_history_metadata(
-                            WorkerHistoryProvenance::CompactionSummary,
-                            Some(SessionHistoryDerivation {
-                                sources: derived_sources.clone(),
-                            }),
-                        ),
-                    )
-                } else if index == 1 {
-                    HistoryEntry::new(
-                        item,
-                        new_history_metadata(
-                            WorkerHistoryProvenance::JournalContext,
-                            Some(SessionHistoryDerivation {
-                                sources: derived_sources.clone(),
-                            }),
-                        ),
-                    )
+                    HistoryEntry::new(item, summary_entry.metadata.clone())
+                } else if let Some(context) = frozen_context.get(index - 1) {
+                    HistoryEntry::new(item, context.metadata.clone())
                 } else if let Some((offset, original)) = original_entries[original_cursor..]
                     .iter()
                     .enumerate()
@@ -7977,7 +7997,7 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
-            initial_context_source: None,
+            session_context_source: None,
             prepared_initial_seed: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
@@ -8358,7 +8378,7 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
-            initial_context_source: None,
+            session_context_source: None,
             prepared_initial_seed: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
@@ -8490,7 +8510,7 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
-            initial_context_source: None,
+            session_context_source: None,
             prepared_initial_seed: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
@@ -8901,7 +8921,7 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
-            initial_context_source: None,
+            session_context_source: None,
             prepared_initial_seed: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: true,
@@ -9296,9 +9316,10 @@ fn summary_shrink_prompt(
 fn initial_compaction_summary(
     entries: &[HistoryEntry<SessionHistoryMetadata>],
 ) -> Result<Option<String>, WorkerError> {
-    let mut summaries = entries
-        .iter()
-        .filter(|entry| entry.annotation.origin == WorkerHistoryProvenance::CompactionSummary);
+    let mut summaries = entries.iter().filter(|entry| {
+        crate::session_history::compaction_use(&entry.annotation)
+            == session_store::InputCompactionUse::OpeningSummary
+    });
     let Some(entry) = summaries.next() else {
         return Ok(None);
     };
@@ -10739,13 +10760,32 @@ mod build_summary_prompt_tests {
     #[test]
     fn malformed_or_duplicate_host_summaries_fail_instead_of_omitting_context() {
         use crate::session_history::history_entry;
-        let valid = history_entry(
-            Item::system_message(format!(
-                "{}body",
-                crate::session_history::COMPACTION_SUMMARY_HEADER
-            )),
-            WorkerHistoryProvenance::CompactionSummary,
-        );
+        let opening = |item| {
+            let mut entry = history_entry(
+                item,
+                WorkerHistoryProvenance::Provided {
+                    producer: "arbitrary-summary-source".into(),
+                },
+            );
+            entry.annotation.system_input = Some(
+                session_store::SystemInputMetadata::new(
+                    session_store::SystemInputUsePolicy {
+                        recording_material: session_store::InputEvidenceUse::Exclude,
+                        memory_evidence: session_store::InputEvidenceUse::Exclude,
+                        observation: session_store::InputObservationUse::Hidden,
+                        compaction: session_store::InputCompactionUse::OpeningSummary,
+                    },
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+            entry
+        };
+        let valid = opening(Item::system_message(format!(
+            "{}body",
+            crate::session_history::COMPACTION_SUMMARY_HEADER
+        )));
         assert_eq!(
             initial_compaction_summary(std::slice::from_ref(&valid))
                 .unwrap()
@@ -10757,13 +10797,7 @@ mod build_summary_prompt_tests {
             Item::user_message("pasted"),
             Item::system_message("missing marker"),
         ] {
-            assert!(
-                initial_compaction_summary(&[history_entry(
-                    item,
-                    WorkerHistoryProvenance::CompactionSummary
-                )])
-                .is_err()
-            );
+            assert!(initial_compaction_summary(&[opening(item)]).is_err());
         }
     }
 
@@ -11190,7 +11224,7 @@ mod build_summary_prompt_tests {
                     1
                 }
                 LogEntry::AnnotatedSystemItem { entry, .. }
-                    if matches!(entry.item, SystemItem::FeatureInvocationResult { .. }) =>
+                    if input_schema(entry) == Some("feature:invocation-result") =>
                 {
                     2
                 }
@@ -14162,13 +14196,7 @@ permission = "write"
             let entries = store.read_all(session_id, segment_id).unwrap();
             assert!(matches!(
                 entries.last(),
-                Some(LogEntry::AnnotatedSystemItem {
-                    entry: session_store::LoggedSystemHistoryEntry {
-                        item: SystemItem::ResidentSummaryRefresh { .. },
-                        ..
-                    },
-                    ..
-                })
+                Some(LogEntry::AnnotatedSystemItem { entry, .. }) if input_schema(entry) == Some("memory:resident-summary")
             ));
         }
     }
@@ -14465,15 +14493,10 @@ permission = "write"
         assert!(entries.iter().any(|entry| {
             matches!(
                 entry,
-                LogEntry::AnnotatedSystemItem {
-                    entry: session_store::LoggedSystemHistoryEntry {
-                        item: SystemItem::SkillActivation { name, body },
-                        ..
-                    },
-                    ..
-                } if name == "triage-errors"
-                    && body.contains("# Triage Errors")
-                    && body == history_text
+                LogEntry::AnnotatedSystemItem { entry, .. }
+                    if entry.metadata.system_input.as_ref().and_then(|input| input.feature_payload()).and_then(|payload| payload.decode::<crate::skill::SkillActivationInput>("skill:activation", 1).ok()).is_some_and(|payload| payload.name == "triage-errors")
+                    && entry.item.history_text().contains("# Triage Errors")
+                    && entry.item.history_text() == history_text
             )
         }));
     }
@@ -15867,7 +15890,7 @@ permission = "write"
                 .position(|entry| {
                     matches!(entry,
                         LogEntry::AnnotatedSystemItem { entry, .. }
-                            if matches!(entry.item, SystemItem::FeatureInvocationResult { .. })
+                            if input_schema(entry) == Some("feature:invocation-result")
                     )
                 })
                 .expect("invocation result must be durable before the model request");
@@ -15876,7 +15899,7 @@ permission = "write"
                 .position(|entry| {
                     matches!(entry,
                         LogEntry::AnnotatedSystemItem { entry, .. }
-                            if matches!(entry.item, SystemItem::SubjectBehaviorRefresh { .. })
+                            if input_schema(entry) == Some("subject:behavior")
                     )
                 })
                 .expect("Subject behavior refresh must be durable before the model request");
@@ -16115,14 +16138,14 @@ permission = "write"
                 .iter()
                 .filter(|entry| matches!(entry,
                     LogEntry::AnnotatedSystemItem { entry, .. }
-                        if matches!(entry.item, SystemItem::FeatureInvocationResult { .. })
+                        if input_schema(entry) == Some("feature:invocation-result")
                 ))
                 .count(),
             2 // Explicit replay displays the cached result; it does not repeat the effect.
         );
         assert!(entries.iter().any(|entry| matches!(entry,
             LogEntry::AnnotatedSystemItem { entry, .. }
-                if matches!(entry.item, SystemItem::ResidentSummaryRefresh { .. })
+                if input_schema(entry) == Some("memory:resident-summary")
         )));
     }
 
@@ -16165,7 +16188,7 @@ permission = "write"
                     LogEntry::AnnotatedSystemItem {
                         entry, extensions, ..
                     } => {
-                        matches!(entry.item, SystemItem::FeatureInvocationResult { .. })
+                        input_schema(entry) == Some("feature:invocation-result")
                             && extensions.iter().any(|extension| {
                                 extension.domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN
                                     && serde_json::from_value::<PendingActivationState>(
@@ -16756,34 +16779,70 @@ permission = "write"
         }));
     }
 
-    fn startup_test_item() -> SystemItem {
-        SystemItem::JournalStartup {
-            body: "PRIOR_JOURNAL_REFERENCE".into(),
-            snapshot: serde_json::json!({"subject_id":"subject", "journals":[], "omitted":false}),
-            snapshot_sha256: "snapshot-digest".into(),
-            prompt_provenance: PromptRenderProvenance {
-                workspace_id: None,
-                source_digest: "source".into(),
-                projection_digest: "projection".into(),
-                logical_name: "internal.subjektiv_journal_startup".into(),
+    fn input_schema(entry: &session_store::LoggedSystemHistoryEntry) -> Option<&str> {
+        entry
+            .metadata
+            .system_input
+            .as_ref()?
+            .feature_payload()
+            .map(|payload| payload.schema())
+    }
+
+    fn startup_test_input() -> session_store::LoggedSystemHistoryEntry {
+        use session_store::*;
+        let payload = FeatureInputPayload::encode(
+            "journal:startup",
+            1,
+            &crate::feature::builtin::journal::JournalStartupInput {
+                snapshot: subjektiv::journal::startup::JournalStartupSnapshot {
+                    subject_id: "subject".into(),
+                    journals: vec![],
+                    omitted: false,
+                },
+                snapshot_sha256: "snapshot-digest".into(),
+                prompt_provenance: PromptRenderProvenance {
+                    workspace_id: None,
+                    source_digest: "source".into(),
+                    projection_digest: "projection".into(),
+                    logical_name: "internal.subjektiv_journal_startup".into(),
+                },
             },
-        }
+        )
+        .unwrap();
+        LoggedSystemHistoryEntry::from_input(
+            LoggedSessionHistoryOrigin::Provided {
+                producer: "arbitrary-context-provider".into(),
+            },
+            None,
+            SystemInputEnvelope::new(
+                "PRIOR_JOURNAL_REFERENCE",
+                SystemInputMetadata::new(
+                    SystemInputUsePolicy {
+                        recording_material: InputEvidenceUse::Exclude,
+                        memory_evidence: InputEvidenceUse::Exclude,
+                        observation: InputObservationUse::Hidden,
+                        compaction: InputCompactionUse::ReferenceInput,
+                    },
+                    Some(payload),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
     }
     struct StartupTestSource {
         calls: Arc<AtomicUsize>,
         fail: Arc<AtomicBool>,
     }
     #[async_trait]
-    impl InitialContextSource for StartupTestSource {
+    impl SessionContextSource for StartupTestSource {
         async fn load(&self) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail.load(Ordering::SeqCst) {
                 return Err("startup read failed".into());
             }
-            Ok(vec![session_store::LoggedSystemHistoryEntry {
-                item: startup_test_item(),
-                metadata: new_history_metadata(WorkerHistoryProvenance::JournalContext, None),
-            }])
+            Ok(vec![startup_test_input()])
         }
     }
 
@@ -16791,7 +16850,7 @@ permission = "write"
     async fn initial_system_messages_preserve_feature_metadata_without_payload_classification() {
         struct Source(Vec<session_store::LoggedSystemHistoryEntry>);
         #[async_trait]
-        impl InitialContextSource for Source {
+        impl SessionContextSource for Source {
             async fn load(&self) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
                 Ok(self.0.clone())
             }
@@ -16807,16 +16866,19 @@ permission = "write"
                 },
                 metadata: new_history_metadata(WorkerHistoryProvenance::JournalContext, None),
             },
-            session_store::LoggedSystemHistoryEntry {
-                item: startup_test_item(),
-                metadata: new_history_metadata(
+            {
+                let mut input = startup_test_input();
+                let custom = new_history_metadata(
                     WorkerHistoryProvenance::BackendInstruction {
                         operation_id: Some("feature-selected-origin".into()),
                     },
                     Some(SessionHistoryDerivation {
                         sources: vec![SessionHistoryEntryId::new()],
                     }),
-                ),
+                );
+                input.metadata.origin = custom.origin;
+                input.metadata.derivation = custom.derivation;
+                input
             },
         ];
         let mut worker = Worker::new(
@@ -16829,7 +16891,7 @@ permission = "write"
         )
         .await
         .unwrap();
-        worker.install_initial_context_source(Arc::new(Source(expected.clone())));
+        worker.install_session_context_source(Arc::new(Source(expected.clone())));
         worker.materialize_durable_session_head().await.unwrap();
         let log = store
             .read_all(worker.session_id(), worker.segment_id())
@@ -16886,7 +16948,7 @@ permission = "write"
             .await
             .unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
-            worker.install_initial_context_source(Arc::new(StartupTestSource {
+            worker.install_session_context_source(Arc::new(StartupTestSource {
                 calls: calls.clone(),
                 fail: Arc::new(AtomicBool::new(false)),
             }));
@@ -16907,7 +16969,9 @@ permission = "write"
             assert_eq!(replay[0].item.as_text(), Some("PRIOR_JOURNAL_REFERENCE"));
             assert_eq!(
                 replay[0].annotation.origin,
-                WorkerHistoryProvenance::JournalContext
+                WorkerHistoryProvenance::Provided {
+                    producer: "arbitrary-context-provider".into()
+                }
             );
             let view =
                 crate::session_capture::SessionCapture::from_history_entries("startup", replay);
@@ -16918,7 +16982,7 @@ permission = "write"
             let entries = store
                 .read_all(worker.session_id(), worker.segment_id())
                 .unwrap();
-            let journal = entries.iter().position(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if matches!(entry.item, SystemItem::JournalStartup { .. }))).unwrap();
+            let journal = entries.iter().position(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if input_schema(entry) == Some("journal:startup"))).unwrap();
             let user = entries
                 .iter()
                 .position(|entry| matches!(entry, LogEntry::AnnotatedUserInput { .. }))
@@ -16944,7 +17008,7 @@ permission = "write"
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let fail = Arc::new(AtomicBool::new(true));
-        worker.install_initial_context_source(Arc::new(StartupTestSource {
+        worker.install_session_context_source(Arc::new(StartupTestSource {
             calls: calls.clone(),
             fail: fail.clone(),
         }));
@@ -16975,7 +17039,7 @@ permission = "write"
         .await
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        worker.install_initial_context_source(Arc::new(StartupTestSource {
+        worker.install_session_context_source(Arc::new(StartupTestSource {
             calls: calls.clone(),
             fail: Arc::new(AtomicBool::new(false)),
         }));
@@ -17030,7 +17094,7 @@ permission = "write"
         .unwrap();
         worker.enable_worker_metadata_write_through().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        worker.install_initial_context_source(Arc::new(StartupTestSource {
+        worker.install_session_context_source(Arc::new(StartupTestSource {
             calls: calls.clone(),
             fail: Arc::new(AtomicBool::new(false)),
         }));
@@ -17052,7 +17116,7 @@ permission = "write"
                 &manifest.worker.name, manifest.clone(), store.clone(),
                 PromptCatalogSource::builtins_only(), WorkerWorkspaceContext::no_workspace(),
                 WorkerFilesystemAuthority::None, Some(Box::new(NoopClient))).await.unwrap();
-            restored.install_initial_context_source(Arc::new(StartupTestSource {
+            restored.install_session_context_source(Arc::new(StartupTestSource {
                 calls: calls.clone(),
                 fail: Arc::new(AtomicBool::new(true)),
             }));
@@ -17377,7 +17441,7 @@ permission = "write"
             .iter()
             .filter_map(|entry| match entry {
                 LogEntry::AnnotatedSystemItem { entry, .. }
-                    if matches!(entry.item, SystemItem::JournalStartup { .. }) =>
+                    if input_schema(entry) == Some("journal:startup") =>
                 {
                     Some(entry.item.clone())
                 }
@@ -17428,7 +17492,7 @@ permission = "write"
                     .iter()
                     .filter_map(|entry| match entry {
                         LogEntry::AnnotatedSystemItem { entry, .. }
-                            if matches!(entry.item, SystemItem::JournalStartup { .. }) =>
+                            if input_schema(entry) == Some("journal:startup") =>
                         {
                             Some(&entry.item)
                         }

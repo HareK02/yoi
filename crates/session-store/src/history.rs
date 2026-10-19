@@ -95,7 +95,7 @@ pub struct LoggedSessionHistoryMetadata {
 }
 
 impl LoggedSessionHistoryMetadata {
-    fn validate_system_input(&self) -> Result<(), crate::SystemInputError> {
+    pub(crate) fn validate_system_input(&self) -> Result<(), crate::SystemInputError> {
         if matches!(self.origin, LoggedSessionHistoryOrigin::Provided { .. })
             && self.system_input.is_none()
         {

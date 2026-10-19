@@ -2220,8 +2220,46 @@ fn summary_entry(
     origin: session_store::LoggedSessionHistoryOrigin,
 ) -> session_store::LoggedHistoryEntry {
     let mut entry = annotated(item);
+    entry.metadata.system_input = matches!(
+        &entry.item,
+        session_store::LoggedItem::Message {
+            role: session_store::LoggedRole::System,
+            ..
+        }
+    )
+    .then(|| {
+        session_store::SystemInputMetadata::new(
+            session_store::SystemInputUsePolicy {
+                recording_material: session_store::InputEvidenceUse::Exclude,
+                memory_evidence: session_store::InputEvidenceUse::Exclude,
+                observation: session_store::InputObservationUse::Hidden,
+                compaction: match origin {
+                    session_store::LoggedSessionHistoryOrigin::CompactionSummary => {
+                        session_store::InputCompactionUse::OpeningSummary
+                    }
+                    session_store::LoggedSessionHistoryOrigin::JournalContext => {
+                        session_store::InputCompactionUse::ReferenceInput
+                    }
+                    _ => session_store::InputCompactionUse::Retain,
+                },
+            },
+            None,
+            None,
+        )
+        .unwrap()
+    });
     entry.metadata.origin = origin;
     entry
+}
+
+fn compaction_use(
+    metadata: &session_store::LoggedSessionHistoryMetadata,
+) -> session_store::InputCompactionUse {
+    metadata
+        .system_input
+        .as_ref()
+        .map(|input| input.usage().compaction)
+        .unwrap_or(session_store::InputCompactionUse::Retain)
 }
 
 fn long_summary(label: &str) -> String {
@@ -2359,7 +2397,8 @@ async fn full_initial_summary_survives_small_overview_budgets_and_both_retention
             assert_eq!(
                 replacement
                     .iter()
-                    .filter(|entry| entry.metadata.origin == CompactionSummary)
+                    .filter(|entry| compaction_use(&entry.metadata)
+                        == session_store::InputCompactionUse::OpeningSummary)
                     .count(),
                 1
             );
@@ -2604,7 +2643,9 @@ async fn three_chained_compactions_transport_each_complete_predecessor_without_r
         let seed = replacement_seed(&fixture.worker);
         let inherited = seed
             .iter()
-            .filter(|entry| entry.metadata.origin == CompactionSummary)
+            .filter(|entry| {
+                compaction_use(&entry.metadata) == session_store::InputCompactionUse::OpeningSummary
+            })
             .collect::<Vec<_>>();
         assert_eq!(inherited.len(), 1);
         assert_eq!(
@@ -2892,7 +2933,7 @@ impl worker::subjektiv::SubjektivHost for CompactionJournalHost {
     }
 
     fn journal_startup_granted(&self) -> bool {
-        true
+        false
     }
 
     fn journal_startup_context(
@@ -2996,8 +3037,8 @@ fn compaction_snapshot(generation: usize) -> subjektiv::journal::startup::Journa
 fn journal_body(worker: &Worker<MockClient, TestStore>) -> String {
     let seed = replacement_seed(worker);
     assert_eq!(
-        seed[1].metadata.origin,
-        session_store::LoggedSessionHistoryOrigin::JournalContext
+        compaction_use(&seed[1].metadata),
+        session_store::InputCompactionUse::ReferenceInput
     );
     let item = Item::from(seed[1].item.clone());
     assert!(matches!(
@@ -3009,8 +3050,8 @@ fn journal_body(worker: &Worker<MockClient, TestStore>) -> String {
     ));
     assert_eq!(
         seed.iter()
-            .filter(|entry| entry.metadata.origin
-                == session_store::LoggedSessionHistoryOrigin::JournalContext)
+            .filter(|entry| compaction_use(&entry.metadata)
+                == session_store::InputCompactionUse::ReferenceInput)
             .count(),
         1
     );
@@ -3119,20 +3160,34 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
     projection.source_digest = "a".repeat(64);
     let initial_catalog = Arc::new(worker::PromptCatalog::from_projection(projection).unwrap());
     fixture.worker.prompts().store(initial_catalog.clone());
-    let legacy_startup = session_store::LoggedSystemHistoryEntry {
-        item: session_store::SystemItem::JournalStartup {
-            body: "OLD_TYPED_STARTUP_JOURNAL".into(),
-            snapshot: serde_json::json!({"journals": []}),
-            snapshot_sha256: "legacy-startup-digest".into(),
-            prompt_provenance: session_store::PromptRenderProvenance {
-                workspace_id: None,
-                source_digest: "legacy-source".into(),
-                projection_digest: "legacy-projection".into(),
-                logical_name: "internal.subjektiv_journal_startup".into(),
-            },
-        },
-        metadata: summary_entry(Item::system_message(""), DerivedSummary).metadata,
-    };
+    // Already migrated generic input with unrelated provenance/payload; Core
+    // must select it by explicit policy, not identify a Journal Feature.
+    let legacy_startup = session_store::LoggedSystemHistoryEntry::from_input(
+        DerivedSummary,
+        None,
+        session_store::SystemInputEnvelope::new(
+            "OLD_TYPED_STARTUP_JOURNAL",
+            session_store::SystemInputMetadata::new(
+                session_store::SystemInputUsePolicy {
+                    recording_material: session_store::InputEvidenceUse::Exclude,
+                    memory_evidence: session_store::InputEvidenceUse::Exclude,
+                    observation: session_store::InputObservationUse::Hidden,
+                    compaction: session_store::InputCompactionUse::ReferenceInput,
+                },
+                Some(
+                    session_store::FeatureInputPayload::encode(
+                        "renamed-owner:reference",
+                        8,
+                        &serde_json::json!({"private": "retained opaque context"}),
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
     let legacy_id = legacy_startup.metadata.entry_id.clone();
     fixture
         .restore_seed_with_system(
@@ -3166,7 +3221,7 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
             .unwrap()
             .annotation
             .origin,
-        JournalContext
+        DerivedSummary
     );
     let session = fixture.worker.session_id();
     let original_segment = fixture.worker.segment_id();
@@ -3191,8 +3246,8 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
                     .unwrap()
                     .annotation
                     .origin,
-                JournalContext,
-                "legacy startup classification survives a normal turn"
+                DerivedSummary,
+                "generic source provenance survives a normal turn unchanged"
             );
         }
         assert_eq!(
@@ -3243,7 +3298,7 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
         assert_eq!(host.reads.lock().unwrap().len(), index + 1);
         let history = fixture.worker.history();
         let overview = input
-            .split("## Previous Journal reference (historical, not automatically retained)")
+            .split("## Previous reference input (historical, not automatically retained)")
             .next()
             .unwrap();
         for old in &old_bodies {
@@ -3336,6 +3391,17 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
         .run_text("normal post-compaction turn")
         .await
         .unwrap();
+    let frozen_seed = replacement_seed(&fixture.worker)
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                compaction_use(&entry.metadata),
+                session_store::InputCompactionUse::ReferenceInput
+                    | session_store::InputCompactionUse::OpeningSummary
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(frozen_seed.len(), 2);
     let records = fixture
         .worker
         .store()
@@ -3375,6 +3441,20 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
         .run_text("normal turn after typed history restore")
         .await
         .unwrap();
+    for frozen in frozen_seed {
+        let replayed = fixture
+            .worker
+            .session_history()
+            .entries()
+            .iter()
+            .find(|entry| entry.annotation.entry_id == frozen.metadata.entry_id)
+            .expect("frozen entry identity survives re-restore");
+        assert_eq!(replayed.item, Item::from(frozen.item));
+        assert_eq!(
+            replayed.annotation, frozen.metadata,
+            "origin, derivation, public allowlist, policy and private payload survive atomic seed/restore"
+        );
+    }
     assert_eq!(
         host.reads.lock().unwrap().len(),
         3,
@@ -3445,27 +3525,41 @@ async fn journal_absent_disabled_unavailable_and_over_byte_budget_keep_conversat
             )
             .await;
         fixture.worker.compact(0).await.unwrap();
-        let body = journal_body(&fixture.worker);
-        let expected = match case {
-            "no-host" | "disabled" => "disabled",
-            "absent" => "absent",
-            _ => "unavailable",
-        };
-        assert!(
-            body.contains(&format!("Journal read status: {expected}.")),
-            "{case}"
-        );
         let input = first_compactor_input(&observed.requests()[1]);
-        assert_frozen_journal_transport(&input, &body);
-        assert_journal_provenance(
-            &body,
-            expected_json.as_deref(),
-            &fixture.worker.prompts().load_full(),
-            (case != "no-host").then_some(COMPACTION_HOST_WORKSPACE_ID),
-        );
+        let body = if matches!(case, "disabled" | "no-host") {
+            assert_eq!(
+                replacement_seed(&fixture.worker)
+                    .iter()
+                    .filter(|entry| compaction_use(&entry.metadata)
+                        == session_store::InputCompactionUse::ReferenceInput)
+                    .count(),
+                0
+            );
+            assert!(!input.contains("Journal reference frozen at this compaction boundary"));
+            String::new()
+        } else {
+            let body = journal_body(&fixture.worker);
+            let expected = if case == "absent" {
+                "absent"
+            } else {
+                "unavailable"
+            };
+            assert!(
+                body.contains(&format!("Journal read status: {expected}.")),
+                "{case}"
+            );
+            assert_frozen_journal_transport(&input, &body);
+            assert_journal_provenance(
+                &body,
+                expected_json.as_deref(),
+                &fixture.worker.prompts().load_full(),
+                Some(COMPACTION_HOST_WORKSPACE_ID),
+            );
+            body
+        };
         assert_full_initial_summary(&input, &inherited);
         assert!(input.contains("UNRECORDED_FALLBACK_GOAL"), "{case}");
-        assert!(input.contains("## Previous Journal reference (historical, not automatically retained)\nPREVIOUS_JOURNAL_DELEGATED_CONTEXT"));
+        assert!(input.contains("## Previous reference input (historical, not automatically retained)\nPREVIOUS_JOURNAL_DELEGATED_CONTEXT"));
         assert!(
             fixture.worker.history().iter().all(|item| !item
                 .as_text()

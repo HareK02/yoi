@@ -1,5 +1,7 @@
 use super::*;
 
+mod v5;
+
 fn seed(
     origin: LoggedSessionHistoryOrigin,
     compacted: bool,

@@ -157,8 +157,8 @@ pub enum PublicMaterialUse {
 /// A fixed material catalog. Opening a new catalog observes newly appended
 /// records; reading a body through this catalog verifies its saved digest and
 /// byte length again. Missing/corrected/deleted sources are explicit failures.
-/// Explicit evidence permission applies to model text, not the private payload;
-/// Web display and observation instead use the producer's public projection.
+/// Evidence eligibility never publishes private model text or Feature payload:
+/// System inputs also require an explicit public projection for every public use.
 pub struct SessionPublicMaterialReader {
     session_id: SessionId,
     active_segment_id: SegmentId,
@@ -828,7 +828,7 @@ enum CanonicalBody<'a> {
     Message {
         origin: &'a LoggedSessionHistoryOrigin,
         role: LoggedRole,
-        content: &'a [crate::LoggedContentPart],
+        content: std::borrow::Cow<'a, [crate::LoggedContentPart]>,
     },
     ToolCall {
         origin: &'a LoggedSessionHistoryOrigin,
@@ -904,25 +904,20 @@ fn canonical_body(
         if allowed == crate::InputEvidenceUse::Exclude {
             return None;
         }
+        let public = input.public_item()?;
         if let LoggedItem::Message {
             role: LoggedRole::System,
-            content,
+            ..
         } = &entry.item
         {
             return Some(CanonicalBody::Message {
                 origin: &entry.metadata.origin,
                 role: LoggedRole::System,
-                content,
+                content: std::borrow::Cow::Owned(vec![crate::LoggedContentPart::Text {
+                    text: public.body.clone(),
+                }]),
             });
         }
-        return None;
-    }
-    if matches!(
-        entry.metadata.origin,
-        LoggedSessionHistoryOrigin::DerivedSummary
-            | LoggedSessionHistoryOrigin::CompactionSummary
-            | LoggedSessionHistoryOrigin::JournalContext
-    ) {
         return None;
     }
     match &entry.item {
@@ -935,7 +930,7 @@ fn canonical_body(
         LoggedItem::Message { role, content } => Some(CanonicalBody::Message {
             origin: &entry.metadata.origin,
             role: *role,
-            content,
+            content: std::borrow::Cow::Borrowed(content),
         }),
         LoggedItem::ToolCall {
             call_id,

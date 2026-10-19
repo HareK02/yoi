@@ -26,6 +26,30 @@ use server_api::*;
 
 use crate::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod, WorkspaceServerOperation};
 
+impl<C: agen::llm_client::client::LlmClient + 'static, St: session_store::Store>
+    crate::Worker<C, St>
+{
+    /// Bind live Host capability and its context provider, not authority inherited
+    /// from a previous binding. Ordinary Feature/lifecycle gates also apply to embedders.
+    pub fn bind_subjektiv_host(&mut self, host: Option<Arc<dyn SubjektivHost>>) {
+        self.set_subjektiv_host(host);
+        if self.manifest_lifecycle_features_enabled()
+            && self.backend_job().is_none()
+            && crate::feature::builtin::memory::ordinary_subjektiv_features_enabled(self.manifest())
+            && let Ok(Some(connection)) = self.subjektiv_host_connection()
+            && (connection.host.journal_startup_granted()
+                || connection.host.journal_compaction_granted())
+        {
+            self.install_session_context_source(Arc::new(
+                crate::feature::builtin::journal::JournalContextSource::new(
+                    connection,
+                    self.prompts(),
+                ),
+            ));
+        }
+    }
+}
+
 /// Host-issued execution context, never deserialized from model arguments.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubjektivHostContext {
@@ -1130,7 +1154,12 @@ enabled = true
             let initial = store.read_all(session, segment).unwrap();
             let journal = initial.iter().find_map(|entry| match entry {
                 LogEntry::AnnotatedSystemItem { entry, .. }
-                    if matches!(entry.item, SystemItem::JournalStartup { .. }) =>
+                    if entry
+                        .metadata
+                        .system_input
+                        .as_ref()
+                        .and_then(|input| input.feature_payload())
+                        .is_some_and(|payload| payload.schema() == "journal:startup") =>
                 {
                     Some(entry)
                 }
@@ -1140,22 +1169,33 @@ enabled = true
             let body = journal.map(|journal| {
                 assert_eq!(
                     journal.metadata.origin,
-                    LoggedSessionHistoryOrigin::JournalContext
+                    LoggedSessionHistoryOrigin::Provided {
+                        producer: "subjektiv.journal".into()
+                    }
                 );
-                let SystemItem::JournalStartup {
-                    body,
-                    snapshot: saved,
-                    snapshot_sha256,
-                    prompt_provenance,
-                } = &journal.item
-                else {
+                let SystemItem::Input { body } = &journal.item else {
                     unreachable!()
                 };
-                assert_eq!(*saved, serde_json::to_value(&snapshot).unwrap());
+                let payload = journal
+                    .metadata
+                    .system_input
+                    .as_ref()
+                    .unwrap()
+                    .feature_payload()
+                    .unwrap()
+                    .decode::<crate::feature::builtin::journal::JournalStartupInput>(
+                        "journal:startup",
+                        1,
+                    )
+                    .unwrap();
+                let saved = serde_json::to_value(&payload.snapshot).unwrap();
+                let snapshot_sha256 = &payload.snapshot_sha256;
+                let prompt_provenance = &payload.prompt_provenance;
+                assert_eq!(saved, serde_json::to_value(&snapshot).unwrap());
                 use sha2::{Digest, Sha256};
                 assert_eq!(
                     *snapshot_sha256,
-                    Sha256::digest(serde_json::to_vec(saved).unwrap())
+                    Sha256::digest(serde_json::to_vec(&saved).unwrap())
                         .iter()
                         .map(|byte| format!("{byte:02x}"))
                         .collect::<String>()
@@ -1168,7 +1208,7 @@ enabled = true
                     body.trim_end(),
                     format!(
                         "## Prior Journal context\n\n```json\n{}\n```",
-                        serde_json::to_string(saved).unwrap()
+                        serde_json::to_string(&saved).unwrap()
                     )
                 );
                 body.as_str()
@@ -1237,7 +1277,7 @@ enabled = true
             }
             assert_eq!(host.startup_calls.load(Ordering::SeqCst), 1);
             let logs = store.read_all(session, segment).unwrap();
-            assert_eq!(logs.iter().filter(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if matches!(entry.item, SystemItem::JournalStartup { .. }))).count(), usize::from(contributes_context));
+            assert_eq!(logs.iter().filter(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if entry.metadata.system_input.as_ref().and_then(|input| input.feature_payload()).is_some_and(|payload| payload.schema() == "journal:startup"))).count(), usize::from(contributes_context));
             controller
                 .handle
                 .send(Method::Shutdown {

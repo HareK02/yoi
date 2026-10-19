@@ -39,6 +39,45 @@ const MAX_INVOCATION_DESCRIPTOR_BYTES: usize =
     protocol::invocation::MAX_FEATURE_INVOCATION_DESCRIPTOR_BYTES;
 const MAX_COMPLETION_RESPONSE_BYTES: usize = 64 * 1024;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InvocationResultInput {
+    pub result: FeatureInvocationResult,
+}
+
+pub(crate) fn result_input(
+    result: FeatureInvocationResult,
+    body: String,
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::SystemInputError> {
+    use session_store::*;
+    let payload = FeatureInputPayload::encode(
+        "feature:invocation-result",
+        1,
+        &InvocationResultInput { result },
+    )?;
+    let metadata = SystemInputMetadata::new(
+        SystemInputUsePolicy {
+            recording_material: InputEvidenceUse::Exclude,
+            memory_evidence: InputEvidenceUse::Exclude,
+            observation: InputObservationUse::Hidden,
+            compaction: InputCompactionUse::Retain,
+        },
+        Some(payload),
+        Some(PublicSystemItem {
+            kind: "feature_invocation_result".into(),
+            body: body.clone(),
+            presentation: PublicSystemPresentation::Context,
+        }),
+    )?;
+    Ok(LoggedSystemHistoryEntry::from_input(
+        LoggedSessionHistoryOrigin::Provided {
+            producer: "feature.invocation".into(),
+        },
+        None,
+        SystemInputEnvelope::new(body, metadata)?,
+    ))
+}
+
 pub(crate) fn invocation_result_is_bounded(result: &FeatureInvocationResult) -> bool {
     result.message.len() <= MAX_INVOCATION_MESSAGE_BYTES
         && result

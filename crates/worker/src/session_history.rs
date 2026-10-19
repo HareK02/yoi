@@ -67,6 +67,16 @@ pub(crate) fn metadata(
     }
 }
 
+pub(crate) fn compaction_use(
+    metadata: &SessionHistoryMetadata,
+) -> session_store::InputCompactionUse {
+    metadata
+        .system_input
+        .as_ref()
+        .map(|input| input.usage().compaction)
+        .unwrap_or(session_store::InputCompactionUse::Retain)
+}
+
 #[cfg(test)]
 pub(crate) fn history_entry(
     item: Item,
@@ -134,22 +144,10 @@ pub(crate) fn restore_history_entries(
                 }
                 *target = from_logged(entry);
             }
-            LogEntry::AnnotatedSystemItem { entry, .. } => {
-                history.push(HistoryEntry::new(entry.item.to_history_item(), {
-                    let mut metadata = entry.metadata.clone();
-                    // Old typed startup records used generic placeholder origins.
-                    // Preserve explicitly supplied metadata on current contributions.
-                    if matches!(
-                        metadata.origin,
-                        WorkerHistoryProvenance::DerivedSummary
-                            | WorkerHistoryProvenance::LegacyUnknown
-                    ) && matches!(entry.item, session_store::SystemItem::JournalStartup { .. })
-                    {
-                        metadata.origin = WorkerHistoryProvenance::JournalContext;
-                    }
-                    metadata
-                }))
-            }
+            LogEntry::AnnotatedSystemItem { entry, .. } => history.push(HistoryEntry::new(
+                entry.item.to_history_item(),
+                entry.metadata.clone(),
+            )),
             _ => {}
         }
     }

@@ -43,6 +43,80 @@ use crate::worker::{
     WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
 };
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SubjectBehaviorInput {
+    pub behavior_md: String,
+    pub prompt_provenance: Option<session_store::PromptRenderProvenance>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResidentSummaryInput {
+    prompt_provenance: Option<session_store::PromptRenderProvenance>,
+}
+
+fn resident_input(
+    body: String,
+    schema: &str,
+    payload: &impl serde::Serialize,
+    kind: &str,
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::SystemInputError> {
+    use session_store::*;
+    let input = SystemInputEnvelope::new(
+        body.clone(),
+        SystemInputMetadata::new(
+            SystemInputUsePolicy {
+                recording_material: InputEvidenceUse::Exclude,
+                memory_evidence: InputEvidenceUse::Exclude,
+                observation: InputObservationUse::Hidden,
+                compaction: InputCompactionUse::Retain,
+            },
+            Some(FeatureInputPayload::encode(schema, 1, payload)?),
+            Some(PublicSystemItem {
+                kind: kind.into(),
+                body,
+                presentation: PublicSystemPresentation::Context,
+            }),
+        )?,
+    )?;
+    Ok(LoggedSystemHistoryEntry::from_input(
+        LoggedSessionHistoryOrigin::Provided {
+            producer: "subjektiv.resident-context".into(),
+        },
+        None,
+        input,
+    ))
+}
+
+pub(crate) fn subject_behavior_input(
+    body: String,
+    behavior_md: String,
+    prompt_provenance: Option<session_store::PromptRenderProvenance>,
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::SystemInputError> {
+    resident_input(
+        body,
+        "subject:behavior",
+        &SubjectBehaviorInput {
+            behavior_md,
+            prompt_provenance,
+        },
+        "subject_behavior_refresh",
+    )
+}
+
+pub(crate) fn resident_summary_input(
+    body: String,
+    prompt_provenance: Option<session_store::PromptRenderProvenance>,
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::SystemInputError> {
+    resident_input(
+        body,
+        "memory:resident-summary",
+        &ResidentSummaryInput { prompt_provenance },
+        "resident_summary_refresh",
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkspaceHttpMemoryBackend {
     client: Arc<dyn WorkspaceClient>,
@@ -714,7 +788,7 @@ impl WorkspaceSubjektivResidentSummarySource {
     fn render(
         &self,
         output: &server_api::SubjektivResidentContextOutput,
-    ) -> Result<String, String> {
+    ) -> Result<(String, session_store::PromptRenderProvenance), String> {
         use memory::backend::MemoryResidentSummaryAvailability as Availability;
         let availability = match output.memory_surface.availability {
             Availability::Ready => "ready",
@@ -723,14 +797,24 @@ impl WorkspaceSubjektivResidentSummarySource {
             Availability::Failed => "failed",
             Availability::Unavailable => "unavailable",
         };
-        self.prompts
-            .load()
+        let prompts = self.prompts.load_full();
+        let body = prompts
             .subjektiv_resident_context(
                 &output.behavior_md,
                 availability,
                 output.memory_surface.content.as_deref(),
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let projection = prompts.projection();
+        Ok((
+            body,
+            session_store::PromptRenderProvenance {
+                workspace_id: self.host.host.workspace_id(),
+                source_digest: projection.source_digest.clone(),
+                projection_digest: projection.catalog_digest.clone(),
+                logical_name: "internal.subjektiv_resident_context".into(),
+            },
+        ))
     }
 
     fn remember_behavior(&self, output: &server_api::SubjektivResidentContextOutput) {
@@ -752,7 +836,7 @@ impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource 
     async fn load(&self) -> SystemPromptContribution {
         match self.fetch().await {
             Ok(output) => match self.render(&output) {
-                Ok(rendered) => {
+                Ok((rendered, _)) => {
                     self.remember_behavior(&output);
                     SystemPromptContribution::Ready(rendered)
                 }
@@ -788,20 +872,30 @@ impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource 
         if !changed {
             return Ok(None);
         }
-        let rendered = self.render(&output)?;
+        let (rendered, prompt_provenance) = self.render(&output)?;
         Ok(Some(ResidentContextRefresh {
             body: rendered,
             behavior_md: output.behavior_md,
+            prompt_provenance: Some(prompt_provenance),
         }))
     }
 
     fn system_item_committed(
         &self,
-        item: &session_store::SystemItem,
-        _metadata: &crate::session_history::SessionHistoryMetadata,
+        _item: &session_store::SystemItem,
+        metadata: &crate::session_history::SessionHistoryMetadata,
     ) {
-        if let session_store::SystemItem::SubjectBehaviorRefresh { behavior_md, .. } = item {
-            self.confirm_resident_context_behavior(behavior_md);
+        if let Some(input) = metadata
+            .system_input
+            .as_ref()
+            .and_then(|input| input.feature_payload())
+            .and_then(|payload| {
+                payload
+                    .decode::<SubjectBehaviorInput>("subject:behavior", 1)
+                    .ok()
+            })
+        {
+            self.confirm_resident_context_behavior(&input.behavior_md);
         }
     }
 
@@ -954,7 +1048,13 @@ impl Hook<PreLlmRequest> for SubjektivBehaviorRefreshHook {
                     "Subject behavior refresh requires durable session append authority",
                 )
             })?;
-            system_items.append_subject_behavior_refresh(refresh.body, refresh.behavior_md);
+            let input = subject_behavior_input(
+                refresh.body,
+                refresh.behavior_md,
+                refresh.prompt_provenance,
+            )
+            .map_err(|error| HookError::new(HookErrorCategory::Dependency, error.to_string()))?;
+            system_items.append_input(input);
         }
         Ok(HookPreRequestAction::Continue)
     }
@@ -979,16 +1079,18 @@ impl Hook<WorkerRestored> for SubjektivResidentRestoreRefreshHook {
             .resident_memory_restore_section(surface_ready, summary)
             .map_err(|error| HookError::new(HookErrorCategory::Internal, error.to_string()))?;
         let projection = prompts.projection();
-        context.system_items().append_resident_summary_refresh(
+        let input = resident_summary_input(
             body,
-            session_store::PromptRenderProvenance {
+            Some(session_store::PromptRenderProvenance {
                 workspace_id: self.workspace_id.clone(),
 
                 source_digest: projection.source_digest.clone(),
                 projection_digest: projection.catalog_digest.clone(),
                 logical_name: WorkerPrompt::ResidentMemoryRestoreSection.key().to_string(),
-            },
-        );
+            }),
+        )
+        .map_err(|error| HookError::new(HookErrorCategory::Dependency, error.to_string()))?;
+        context.system_items().append_input(input);
         Ok(())
     }
 }
@@ -1751,14 +1853,13 @@ permission = "write"
             .expect("changed behavior must produce one refresh");
         assert_eq!(refresh.behavior_md, "Ask when uncertain.");
         assert!(refresh.body.contains("Ask when uncertain."));
-        source.system_item_committed(
-            &session_store::SystemItem::SubjectBehaviorRefresh {
-                body: refresh.body.clone(),
-                behavior_md: refresh.behavior_md.clone(),
-                prompt_provenance: None,
-            },
-            &session_store::LoggedSessionHistoryMetadata::legacy_unknown(),
-        );
+        let input = subject_behavior_input(
+            refresh.body.clone(),
+            refresh.behavior_md.clone(),
+            refresh.prompt_provenance.clone(),
+        )
+        .unwrap();
+        source.system_item_committed(&input.item, &input.metadata);
         assert!(
             source
                 .load_changed_resident_context()
@@ -1775,14 +1876,13 @@ permission = "write"
             .expect("cleared behavior must produce one refresh");
         assert_eq!(cleared.behavior_md, "");
         assert!(cleared.body.contains("No user-managed behavior is set"));
-        source.system_item_committed(
-            &session_store::SystemItem::SubjectBehaviorRefresh {
-                body: cleared.body.clone(),
-                behavior_md: cleared.behavior_md.clone(),
-                prompt_provenance: None,
-            },
-            &session_store::LoggedSessionHistoryMetadata::legacy_unknown(),
-        );
+        let input = subject_behavior_input(
+            cleared.body.clone(),
+            cleared.behavior_md.clone(),
+            cleared.prompt_provenance.clone(),
+        )
+        .unwrap();
+        source.system_item_committed(&input.item, &input.metadata);
         assert!(
             source
                 .load_changed_resident_context()
@@ -1840,14 +1940,13 @@ permission = "write"
             .await
             .unwrap()
             .unwrap();
-        source.system_item_committed(
-            &session_store::SystemItem::SubjectBehaviorRefresh {
-                body: first.body.clone(),
-                behavior_md: first.behavior_md.clone(),
-                prompt_provenance: None,
-            },
-            &session_store::LoggedSessionHistoryMetadata::legacy_unknown(),
-        );
+        let input = subject_behavior_input(
+            first.body.clone(),
+            first.behavior_md.clone(),
+            first.prompt_provenance.clone(),
+        )
+        .unwrap();
+        source.system_item_committed(&input.item, &input.metadata);
         assert_eq!(
             source
                 .load_changed_resident_context()
@@ -1856,14 +1955,13 @@ permission = "write"
                 .unwrap(),
             second
         );
-        source.system_item_committed(
-            &session_store::SystemItem::SubjectBehaviorRefresh {
-                body: second.body.clone(),
-                behavior_md: second.behavior_md.clone(),
-                prompt_provenance: None,
-            },
-            &session_store::LoggedSessionHistoryMetadata::legacy_unknown(),
-        );
+        let input = subject_behavior_input(
+            second.body.clone(),
+            second.behavior_md.clone(),
+            second.prompt_provenance.clone(),
+        )
+        .unwrap();
+        source.system_item_committed(&input.item, &input.metadata);
         assert!(
             source
                 .load_changed_resident_context()
