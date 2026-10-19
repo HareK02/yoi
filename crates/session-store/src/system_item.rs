@@ -199,7 +199,7 @@ pub enum SystemItem {
 
 /// Allowlisted presentation data shared by live events and retained snapshots.
 /// Private Feature payloads and render provenance never cross this boundary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PublicSystemItem {
     pub kind: String,
@@ -207,7 +207,7 @@ pub struct PublicSystemItem {
     pub presentation: PublicSystemPresentation,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PublicSystemPresentation {
     Notification { message: String },

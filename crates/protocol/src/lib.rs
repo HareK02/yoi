@@ -408,7 +408,7 @@ pub enum Method {
 /// Transport is fire-and-forget; receivers must tolerate out-of-order
 /// delivery (e.g. `TurnEnded` arriving after `ShutDown` for the same
 /// child Worker).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]

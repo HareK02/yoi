@@ -51,6 +51,7 @@ pub mod retention;
 pub mod segment;
 pub mod segment_log;
 pub mod store;
+pub mod system_input;
 pub mod system_item;
 pub mod uploaded_file;
 pub mod worker_metadata;
@@ -97,6 +98,10 @@ pub use segment::{
 };
 pub use segment_log::{LogEntry, RestoredState, SegmentOrigin, SessionExtension, collect_state};
 pub use store::{Store, StoreError};
+pub use system_input::{
+    FeatureInputPayload, InputCompactionUse, InputEvidenceUse, InputObservationUse,
+    SystemInputEnvelope, SystemInputError, SystemInputMetadata, SystemInputUsePolicy,
+};
 pub use system_item::{
     PromptRenderProvenance, PublicSystemItem, PublicSystemPresentation, SystemItem, SystemReminder,
     SystemReminderSource, render_worker_event,
