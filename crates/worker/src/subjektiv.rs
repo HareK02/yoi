@@ -1068,7 +1068,8 @@ enabled = true
     async fn direct_startup_journal_is_durable_before_first_user_and_provider_exactly_once() {
         use session_store::{LogEntry, LoggedSessionHistoryOrigin, Store, SystemItem};
         use std::sync::atomic::Ordering;
-        for empty in [false, true] {
+        for (empty, omitted) in [(false, false), (true, false), (true, true)] {
+            let contributes_context = !empty || omitted;
             let temp = tempfile::tempdir().unwrap();
             let _sandbox =
                 crate::runtime::worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
@@ -1078,7 +1079,7 @@ enabled = true
             manifest.feature.subjektiv.profile.extraction.enabled = false;
             let snapshot = JournalStartupSnapshot {
                 subject_id: "subject".into(),
-                omitted: false,
+                omitted,
                 journals: if empty {
                     vec![]
                 } else {
@@ -1127,43 +1128,51 @@ enabled = true
             );
             let controller = prepared.start().await.unwrap();
             let initial = store.read_all(session, segment).unwrap();
-            let journal = initial
-                .iter()
-                .find_map(|entry| match entry {
-                    LogEntry::AnnotatedSystemItem { entry, .. }
-                        if matches!(entry.item, SystemItem::JournalStartup { .. }) =>
-                    {
-                        Some(entry)
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(
-                journal.metadata.origin,
-                LoggedSessionHistoryOrigin::DerivedSummary
-            );
-            let SystemItem::JournalStartup {
-                body,
-                snapshot: saved,
-                snapshot_sha256,
-                prompt_provenance,
-            } = &journal.item
-            else {
-                unreachable!()
-            };
-            assert_eq!(*saved, serde_json::to_value(&snapshot).unwrap());
-            use sha2::{Digest, Sha256};
-            assert_eq!(
-                *snapshot_sha256,
-                Sha256::digest(serde_json::to_vec(saved).unwrap())
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            assert_eq!(
-                prompt_provenance.logical_name,
-                "internal.subjektiv_journal_startup"
-            );
+            let journal = initial.iter().find_map(|entry| match entry {
+                LogEntry::AnnotatedSystemItem { entry, .. }
+                    if matches!(entry.item, SystemItem::JournalStartup { .. }) =>
+                {
+                    Some(entry)
+                }
+                _ => None,
+            });
+            assert_eq!(journal.is_some(), contributes_context);
+            let body = journal.map(|journal| {
+                assert_eq!(
+                    journal.metadata.origin,
+                    LoggedSessionHistoryOrigin::JournalContext
+                );
+                let SystemItem::JournalStartup {
+                    body,
+                    snapshot: saved,
+                    snapshot_sha256,
+                    prompt_provenance,
+                } = &journal.item
+                else {
+                    unreachable!()
+                };
+                assert_eq!(*saved, serde_json::to_value(&snapshot).unwrap());
+                use sha2::{Digest, Sha256};
+                assert_eq!(
+                    *snapshot_sha256,
+                    Sha256::digest(serde_json::to_vec(saved).unwrap())
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                );
+                assert_eq!(
+                    prompt_provenance.logical_name,
+                    "internal.subjektiv_journal_startup"
+                );
+                assert_eq!(
+                    body.trim_end(),
+                    format!(
+                        "## Prior Journal context\n\n```json\n{}\n```",
+                        serde_json::to_string(saved).unwrap()
+                    )
+                );
+                body.as_str()
+            });
             assert!(
                 !initial
                     .iter()
@@ -1183,25 +1192,39 @@ enabled = true
                     .await
                     .unwrap()
                     .unwrap();
-                let index = request
-                    .items
-                    .iter()
-                    .position(|item| item.as_text() == Some(body.as_str()))
-                    .unwrap();
-                let user_index = request
-                    .items
-                    .iter()
-                    .position(|item| item.as_text() == Some("FIRST_USER_REQUEST"))
-                    .unwrap();
-                assert!(index < user_index);
-                assert_eq!(
-                    request
+                if let Some(body) = body {
+                    let index = request
                         .items
                         .iter()
-                        .filter(|item| item.as_text() == Some(body.as_str()))
-                        .count(),
-                    1
-                );
+                        .position(|item| item.as_text() == Some(body))
+                        .unwrap();
+                    let user_index = request
+                        .items
+                        .iter()
+                        .position(|item| item.as_text() == Some("FIRST_USER_REQUEST"))
+                        .unwrap();
+                    assert!(index < user_index);
+                    assert!(matches!(
+                        request.items[index],
+                        agen::Item::Message {
+                            role: agen::llm_client::types::Role::System,
+                            ..
+                        }
+                    ));
+                    assert_eq!(
+                        request
+                            .items
+                            .iter()
+                            .filter(|item| item.as_text() == Some(body))
+                            .count(),
+                        1
+                    );
+                } else {
+                    assert!(!request.items.iter().any(|item| {
+                        item.as_text()
+                            .is_some_and(|text| text.contains("Prior Journal context"))
+                    }));
+                }
                 tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
                         if matches!(events.recv().await.unwrap(), protocol::Event::RunEnd { .. }) {
@@ -1214,7 +1237,7 @@ enabled = true
             }
             assert_eq!(host.startup_calls.load(Ordering::SeqCst), 1);
             let logs = store.read_all(session, segment).unwrap();
-            assert_eq!(logs.iter().filter(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if matches!(entry.item, SystemItem::JournalStartup { .. }))).count(), 1);
+            assert_eq!(logs.iter().filter(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if matches!(entry.item, SystemItem::JournalStartup { .. }))).count(), usize::from(contributes_context));
             controller
                 .handle
                 .send(Method::Shutdown {

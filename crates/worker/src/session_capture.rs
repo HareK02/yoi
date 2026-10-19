@@ -903,6 +903,11 @@ mod tests {
                 WorkerHistoryProvenance::DerivedSummary,
             ),
             (
+                // Exclusion is driven by origin, not role or instructions in the body.
+                Item::user_message("prior-journal-secret"),
+                WorkerHistoryProvenance::JournalContext,
+            ),
+            (
                 Item::system_message("raw-system-secret"),
                 WorkerHistoryProvenance::LegacyUnknown,
             ),
@@ -930,7 +935,7 @@ mod tests {
         );
         assert!(
             capture
-                .read(ReadSelector::EntryRange([0, 3]), ReadOptions::default())
+                .read(ReadSelector::EntryRange([0, 4]), ReadOptions::default())
                 .entries
                 .is_empty()
         );

@@ -47,18 +47,24 @@ impl JournalStartupContextSource {
 }
 #[async_trait]
 impl crate::worker::InitialContextSource for JournalStartupContextSource {
-    async fn load(&self) -> Result<Vec<session_store::SystemItem>, String> {
+    async fn load(&self) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
         use sha2::{Digest, Sha256};
         let snapshot = self
             .host
             .journal_startup_context()
             .map_err(|e| e.to_string())?;
+        // A successful empty read contributes no model context. Keep an omitted
+        // snapshot even when empty: truncation is not evidence of absence.
+        let empty = snapshot.journals.is_empty() && !snapshot.omitted;
         // Hash the same canonical JSON value retained by SystemItem, so replay
         // can verify provenance without depending on domain struct field order.
         let snapshot = serde_json::to_value(snapshot).map_err(|e| e.to_string())?;
         let snapshot_json = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
         if snapshot_json.len() > subjektiv::journal::startup::STARTUP_MAX_BYTES {
             return Err("Host Journal startup snapshot exceeds independent byte budget".into());
+        }
+        if empty {
+            return Ok(Vec::new());
         }
         let prompts = self.prompts.load();
         let body = prompts
@@ -68,19 +74,25 @@ impl crate::worker::InitialContextSource for JournalStartupContextSource {
             return Err("Journal startup prompt exceeds rendered byte budget".into());
         }
         let projection = prompts.projection();
-        Ok(vec![session_store::SystemItem::JournalStartup {
-            body,
-            snapshot,
-            snapshot_sha256: Sha256::digest(snapshot_json.as_bytes())
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-            prompt_provenance: session_store::PromptRenderProvenance {
-                workspace_id: self.host.host.workspace_id(),
-                source_digest: projection.source_digest.clone(),
-                projection_digest: projection.catalog_digest.clone(),
-                logical_name: "internal.subjektiv_journal_startup".into(),
+        Ok(vec![session_store::LoggedSystemHistoryEntry {
+            item: session_store::SystemItem::JournalStartup {
+                body,
+                snapshot,
+                snapshot_sha256: Sha256::digest(snapshot_json.as_bytes())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                prompt_provenance: session_store::PromptRenderProvenance {
+                    workspace_id: self.host.host.workspace_id(),
+                    source_digest: projection.source_digest.clone(),
+                    projection_digest: projection.catalog_digest.clone(),
+                    logical_name: "internal.subjektiv_journal_startup".into(),
+                },
             },
+            metadata: crate::session_history::metadata(
+                session_store::LoggedSessionHistoryOrigin::JournalContext,
+                None,
+            ),
         }])
     }
 }

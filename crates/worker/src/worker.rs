@@ -2917,10 +2917,12 @@ pub(crate) struct ResidentContextRefresh {
     pub behavior_md: String,
 }
 
-/// Initial-only Feature contributions; prepared with the head, never at restore/request hooks.
+/// Initial-only System messages and Feature-owned metadata. Core persists and
+/// replays each pair unchanged; it does not infer provenance from the payload.
+/// Prepared with the head, never at restore/request hooks.
 #[async_trait::async_trait]
 pub(crate) trait InitialContextSource: Send + Sync {
-    async fn load(&self) -> Result<Vec<SystemItem>, String>;
+    async fn load(&self) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String>;
 }
 
 #[async_trait::async_trait]
@@ -5878,16 +5880,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     forked_from: None,
                     compacted_from: None,
                 }];
-                for item in items {
+                for entry in items {
                     seed.push(LogEntry::AnnotatedSystemItem {
                         ts: segment_log::now_millis(),
-                        entry: session_store::LoggedSystemHistoryEntry {
-                            item,
-                            metadata: new_history_metadata(
-                                WorkerHistoryProvenance::DerivedSummary,
-                                None,
-                            ),
-                        },
+                        entry,
                         extensions: Vec::new(),
                     });
                 }
@@ -5914,12 +5910,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             ));
         };
         if *session_id != loc.session_id
-            || seed.iter().skip(1).any(|entry| {
-                !matches!(entry,
-                    LogEntry::AnnotatedSystemItem { entry, .. }
-                        if entry.metadata.origin == WorkerHistoryProvenance::DerivedSummary
-                )
-            })
+            || seed
+                .iter()
+                .skip(1)
+                .any(|entry| !matches!(entry, LogEntry::AnnotatedSystemItem { .. }))
         {
             return Err(WorkerError::InvalidState(
                 "unexpected records in initial segment seed".into(),
@@ -16738,12 +16732,92 @@ permission = "write"
     }
     #[async_trait]
     impl InitialContextSource for StartupTestSource {
-        async fn load(&self) -> Result<Vec<SystemItem>, String> {
+        async fn load(&self) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail.load(Ordering::SeqCst) {
                 return Err("startup read failed".into());
             }
-            Ok(vec![startup_test_item()])
+            Ok(vec![session_store::LoggedSystemHistoryEntry {
+                item: startup_test_item(),
+                metadata: new_history_metadata(WorkerHistoryProvenance::JournalContext, None),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_system_messages_preserve_feature_metadata_without_payload_classification() {
+        struct Source(Vec<session_store::LoggedSystemHistoryEntry>);
+        #[async_trait]
+        impl InitialContextSource for Source {
+            async fn load(&self) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
+                Ok(self.0.clone())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(temp.path()).unwrap();
+        let expected = vec![
+            session_store::LoggedSystemHistoryEntry {
+                item: SystemItem::Notification {
+                    message: "reference".into(),
+                    body: "reference".into(),
+                    prompt_provenance: None,
+                },
+                metadata: new_history_metadata(WorkerHistoryProvenance::JournalContext, None),
+            },
+            session_store::LoggedSystemHistoryEntry {
+                item: startup_test_item(),
+                metadata: new_history_metadata(
+                    WorkerHistoryProvenance::BackendInstruction {
+                        operation_id: Some("feature-selected-origin".into()),
+                    },
+                    Some(SessionHistoryDerivation {
+                        sources: vec![SessionHistoryEntryId::new()],
+                    }),
+                ),
+            },
+        ];
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        worker.install_initial_context_source(Arc::new(Source(expected.clone())));
+        worker.materialize_durable_session_head().await.unwrap();
+        let log = store
+            .read_all(worker.session_id(), worker.segment_id())
+            .unwrap();
+        let saved: Vec<_> = log
+            .iter()
+            .filter_map(|entry| match entry {
+                LogEntry::AnnotatedSystemItem { entry, .. } => Some(entry),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            serde_json::to_value(saved).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let replay =
+            restore_history_entries(worker.session_id(), worker.segment_id(), &log).unwrap();
+        assert_eq!(replay.len(), expected.len());
+        for (entry, expected) in replay.iter().zip(&expected) {
+            assert_eq!(entry.annotation, expected.metadata);
+            assert_eq!(
+                entry.item.as_text(),
+                Some(expected.item.history_text().as_str())
+            );
+            assert!(matches!(
+                entry.item,
+                Item::Message {
+                    role: agen::llm_client::types::Role::System,
+                    ..
+                }
+            ));
         }
     }
 
@@ -17240,7 +17314,7 @@ permission = "write"
     }
 
     #[tokio::test]
-    async fn normal_restore_revalidates_current_body_authority_without_startup_fetch() {
+    async fn normal_restore_revalidates_current_body_authority_without_refetching_empty_startup() {
         let temp = tempfile::tempdir().unwrap();
         let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
         let (manifest, store) = body_publication_fixture(&temp);
@@ -17258,7 +17332,7 @@ permission = "write"
         let initial = store.read_all(session, segment).unwrap();
         let saved_startup = initial
             .iter()
-            .find_map(|entry| match entry {
+            .filter_map(|entry| match entry {
                 LogEntry::AnnotatedSystemItem { entry, .. }
                     if matches!(entry.item, SystemItem::JournalStartup { .. }) =>
                 {
@@ -17266,7 +17340,8 @@ permission = "write"
                 }
                 _ => None,
             })
-            .unwrap();
+            .collect::<Vec<_>>();
+        assert!(saved_startup.is_empty());
         stop_body_publication_controller(controller).await;
         assert_eq!(host.startup_calls.load(Ordering::SeqCst), 1);
         host.startup_unavailable.store(true, Ordering::SeqCst);
@@ -17319,7 +17394,7 @@ permission = "write"
                     .collect::<Vec<_>>();
                 assert_eq!(
                     serde_json::to_value(saved).unwrap(),
-                    serde_json::to_value(vec![&saved_startup]).unwrap()
+                    serde_json::to_value(&saved_startup).unwrap()
                 );
                 stop_body_publication_controller(controller).await;
             } else {

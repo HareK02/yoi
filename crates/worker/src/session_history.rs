@@ -133,9 +133,14 @@ pub(crate) fn restore_history_entries(
             LogEntry::AnnotatedSystemItem { entry, .. } => {
                 history.push(HistoryEntry::new(entry.item.to_history_item(), {
                     let mut metadata = entry.metadata.clone();
-                    // Typed startup records predate the dedicated Journal origin.
-                    // Classify only this trusted event, never a plaintext marker.
-                    if matches!(entry.item, session_store::SystemItem::JournalStartup { .. }) {
+                    // Old typed startup records used generic placeholder origins.
+                    // Preserve explicitly supplied metadata on current contributions.
+                    if matches!(
+                        metadata.origin,
+                        WorkerHistoryProvenance::DerivedSummary
+                            | WorkerHistoryProvenance::LegacyUnknown
+                    ) && matches!(entry.item, session_store::SystemItem::JournalStartup { .. })
+                    {
                         metadata.origin = WorkerHistoryProvenance::JournalContext;
                     }
                     metadata
