@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
+  import { browserSession, sessionMutation } from "#lib/workspace/auth/session-state.ts";
   import { loadWhoami, loginWithPasskey } from '#lib/workspace/auth/api.ts';
   import { enrollHostingPasskey } from '#lib/workspace/auth/hosting-enrollment.ts';
   import { loadHostingAccess, notifySessionChanged } from '#lib/workspace/auth/hosting.ts';
@@ -45,6 +46,7 @@
     const expected = user;
     busy = true;
     error = '';
+    sessionMutation();
     try {
       const signedIn = await loginWithPasskey(controller.signal);
       if (!active) return;
@@ -57,6 +59,8 @@
     } catch {
       if (active) error = 'Passkey login or hosting administrator access could not be verified. Try signing in again, or ask the host operator to check this account.';
     } finally {
+      sessionMutation();
+      await browserSession.refresh();
       if (active) busy = false;
     }
   }

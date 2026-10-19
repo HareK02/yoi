@@ -34,6 +34,9 @@ function boundary(
     const path = String(input);
     if (path === "/api/auth/whoami") {
       return Response.json({
+        session: actor
+          ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
+          : { kind: "anonymous" },
         actor: actor ? { ...authUser, auth_method: "browser_session" } : null,
       });
     }
@@ -121,7 +124,7 @@ test("enrollment clears token and omits cookies, then verifies an actual passkey
   expect(settings.getAttribute("href")).toBe("/hosting/settings");
   expect(get).toHaveBeenCalledTimes(1);
   expect(fetcher.mock.calls.filter(([path]) => path === "/api/auth/whoami"))
-    .toHaveLength(1);
+    .toHaveLength(2);
   expect(fetcher.mock.calls.filter(([path]) => path === "/api/hosting/access"))
     .toHaveLength(1);
   expect(
@@ -172,6 +175,7 @@ test("a different cookie actor cannot be accepted as the enrolled administrator"
   fetcher.mockImplementation(async (input, init) =>
     String(input) === "/api/auth/whoami"
       ? Response.json({
+        session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
         actor: {
           ...authUser,
           user_id: "other-user",
@@ -248,7 +252,10 @@ test("API token identity is not mistaken for a verified browser session", async 
   const original = fetcher.getMockImplementation()!;
   fetcher.mockImplementation(async (input, init) =>
     String(input) === "/api/auth/whoami"
-      ? Response.json({ actor: { ...authUser, auth_method: "api_token" } })
+      ? Response.json({
+        session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+        actor: { ...authUser, auth_method: "api_token" },
+      })
       : original(input, init)
   );
   render(Setup);

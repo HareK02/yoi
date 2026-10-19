@@ -6,11 +6,13 @@ import {
   screen,
   waitFor,
 } from "@testing-library/svelte";
+import { browserSession } from "#lib/workspace/auth/session-state.ts";
 import { afterEach, expect, test, vi } from "vitest";
 import Accounts from "./+page.svelte";
 import { authUser } from "#lib/workspace/auth/api.test-fixtures.ts";
 afterEach(() => {
   cleanup();
+  browserSession.invalidate();
   vi.unstubAllGlobals();
 });
 function boundary(
@@ -20,6 +22,9 @@ function boundary(
   const fetcher = vi.fn<typeof fetch>(async (input, init) => {
     if (input === "/api/auth/whoami") {
       return Response.json({
+        session: mode !== "anonymous"
+          ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
+          : { kind: "anonymous" },
         actor: mode === "anonymous"
           ? null
           : { ...authUser, auth_method: "browser_session" },

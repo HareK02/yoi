@@ -5,12 +5,18 @@ import { parseWorkspaceResponse } from "#lib/workspace/api/workspace-model.ts";
 import { settle } from "#lib/workspace/navigation/deferred.ts";
 import type { LayoutLoad } from "./$types";
 
-export const load = ({ fetch, params }: Parameters<LayoutLoad>[0]) => {
+export const load = async (
+  { fetch, params, parent }: Parameters<LayoutLoad>[0],
+) => {
+  await parent();
   const workspaceId = params.workspaceId;
   return { deferredWorkspace: settle(loadWorkspace(fetch, workspaceId)) };
 };
 
-async function loadWorkspace(fetch: Parameters<LayoutLoad>[0]["fetch"], workspaceId: string) {
+async function loadWorkspace(
+  fetch: Parameters<LayoutLoad>[0]["fetch"],
+  workspaceId: string,
+) {
   const [workspaceResult, repositoryResult] = await Promise.all([
     loadJson(
       fetch,
@@ -43,4 +49,4 @@ async function loadWorkspace(fetch: Parameters<LayoutLoad>[0]["fetch"], workspac
     repositories,
     repositoriesError,
   };
-};
+}

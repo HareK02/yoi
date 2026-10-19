@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, expect, test, vi } from "vitest";
+import { browserSession, sessionMutation } from "./session-state.ts";
 import { BrowserAuth } from "./browser-session.svelte.ts";
 import { addPasskey, loginWithPasskey, logout } from "./api.ts";
 import { SESSION_CHANGED_EVENT } from "./hosting.ts";
@@ -13,6 +14,7 @@ import {
 const sessions: BrowserAuth[] = [];
 afterEach(() => {
   for (const auth of sessions.splice(0)) auth.dispose();
+  browserSession.invalidate();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -33,6 +35,9 @@ function session() {
 
 function whoami(authenticated: boolean) {
   return Response.json({
+    session: authenticated
+      ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
+      : { kind: "anonymous" },
     actor: authenticated
       ? { ...authUser, auth_method: "browser_session" }
       : null,
@@ -98,7 +103,11 @@ test("loading and failed whoami are not anonymous readiness and cannot start aut
   expect(await auth.run("pending", "done", operation)).toBe(false);
   expect(operation).not.toHaveBeenCalled();
   await auth.refresh();
-  expect(auth.session).toEqual({ kind: "ready", actor: null });
+  expect(auth.session).toEqual({
+    kind: "ready",
+    actor: null,
+    session: { kind: "anonymous" },
+  });
 });
 
 for (
@@ -117,6 +126,7 @@ for (
     );
     const auth = session();
     const first = auth.refresh();
+    browserSession.invalidate();
     const second = auth.refresh();
     latest.resolve(
       latestStatus === 200
@@ -146,13 +156,21 @@ test("a delayed pre-logout whoami cannot resurrect the previous actor", async ()
   const oldResponse = gate<Response>();
   fetcher.mockReturnValueOnce(oldResponse.promise);
   const oldRefresh = auth.refresh();
-  await auth.refresh();
-  expect(auth.actor?.handle).toBe("alice");
-  expect(await auth.run("Logging out", "Logged out", logout)).toBe(true);
-  expect(auth.session).toEqual({ kind: "ready", actor: null });
+  expect(await auth.run("Logging out", "Logged out", logout, "logout")).toBe(
+    true,
+  );
+  expect(auth.session).toEqual({
+    kind: "ready",
+    actor: null,
+    session: { kind: "anonymous" },
+  });
   oldResponse.resolve(whoami(true));
   await oldRefresh;
-  expect(auth.session).toEqual({ kind: "ready", actor: null });
+  expect(auth.session).toEqual({
+    kind: "ready",
+    actor: null,
+    session: { kind: "anonymous" },
+  });
   expect(auth.status).toBe("Logged out");
 });
 
@@ -190,7 +208,7 @@ test("busy login rejects duplicate operations and refresh until its post-complet
   options.resolve(Response.json(loginOptions));
   await confirmingStarted.promise;
   expect(auth.busy).toBe(true);
-  expect(auth.session.kind).toBe("loading");
+  expect(auth.session.kind).toBe("ready");
   expect(await auth.run("duplicate", "incorrect", duplicate)).toBe(false);
   await auth.refresh();
   expect(paths(fetcher).filter((path) => path === "/api/auth/whoami"))
@@ -220,7 +238,7 @@ for (const status of [400, 401, 410]) {
     expect(auth.status).toBe("");
     expect(auth.error).toMatch(
       status === 401
-        ? /Your session or authentication challenge expired/
+        ? /Authentication request was rejected/
         : /The request or authentication challenge is invalid or expired/,
     );
     expect(auth.session.kind).toBe("ready");
@@ -270,7 +288,11 @@ for (
     expect(auth.error).not.toContain("secret credential detail");
     expect(auth.status).toBe("");
     expect(auth.busy).toBe(false);
-    expect(auth.session).toEqual({ kind: "ready", actor: null });
+    expect(auth.session).toEqual({
+      kind: "ready",
+      actor: null,
+      session: { kind: "anonymous" },
+    });
     expect(paths(fetcher)).toEqual([
       "/api/auth/whoami",
       "/api/auth/passkeys/login/options",
@@ -338,7 +360,7 @@ for (const rejected of [false, true]) {
   });
 }
 
-test("dispose aborts WebAuthn and ignores a late credential without completion, session notification or refresh", async () => {
+test("dispose aborts WebAuthn without accepting late credentials, while shared session is rechecked", async () => {
   const { fetcher, get } = boundary();
   const auth = session();
   await auth.refresh();
@@ -360,12 +382,17 @@ test("dispose aborts WebAuthn and ignores a late credential without completion, 
   expect(signal.aborted).toBe(true);
   credential.resolve(credentialFixture(true));
   expect(await run).toBe(false);
-  expect(auth.session).toEqual({ kind: "ready", actor: null });
+  expect(auth.session).toEqual({
+    kind: "ready",
+    actor: null,
+    session: { kind: "anonymous" },
+  });
   expect(auth.status).toBe("Waiting");
   expect(auth.error).toBe("");
   expect(paths(fetcher)).toEqual([
     "/api/auth/whoami",
     "/api/auth/passkeys/login/options",
+    "/api/auth/whoami",
   ]);
   expect(
     dispatch.mock.calls.filter(([event]) =>
@@ -409,6 +436,7 @@ test("dispose ignores a completion response even when the HTTP boundary does not
     "/api/auth/whoami",
     "/api/auth/passkeys/login/options",
     "/api/auth/passkeys/login/complete",
+    "/api/auth/whoami",
   ]);
   expect(
     dispatch.mock.calls.filter(([event]) =>
@@ -443,14 +471,72 @@ test("dispose during the post-operation whoami prevents its late actor from beco
     (signal) => loginWithPasskey(signal),
   );
   await started.promise;
-  expect(auth.session.kind).toBe("loading");
+  expect(auth.session.kind).toBe("ready");
   expect(auth.busy).toBe(true);
   auth.dispose();
   response.resolve(whoami(true));
   expect(await run).toBe(false);
-  expect(auth.session.kind).toBe("loading");
+  expect(auth.session.kind).toBe("ready");
   expect(auth.actor).toBeNull();
 });
+
+for (const newer of ["logout", "another-actor"] as const) {
+  test(`confirmation superseded by ${newer} cannot report success or navigate using the old return URL`, async () => {
+    const { fetcher } = boundary();
+    const auth = session();
+    await auth.refresh();
+    const confirming = gate<Response>();
+    const started = gate<void>();
+    const request = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation((input, init) => {
+      if (String(input) === "/api/auth/whoami") {
+        started.resolve();
+        return confirming.promise;
+      }
+      return request(input, init);
+    });
+    const changed = vi.fn();
+    window.addEventListener(SESSION_CHANGED_EVENT, changed);
+    const navigate = vi.fn();
+    try {
+      const run = auth.run("Waiting", "Logged in", loginWithPasskey).then(
+        (confirmed) => {
+          if (confirmed && auth.actor) navigate("/account?old=return#entry");
+          return confirmed;
+        },
+      );
+      await started.promise;
+      sessionMutation(newer === "logout" ? "logout" : "authentication");
+      fetcher.mockResolvedValueOnce(
+        newer === "logout" ? whoami(false) : Response.json({
+          actor: {
+            ...authUser,
+            user_id: "other-user",
+            account_id: "other-account",
+            handle: "bob",
+            auth_method: "browser_session",
+          },
+          session: {
+            kind: "authenticated",
+            expires_at: "2099-01-01T00:00:00Z",
+          },
+        }),
+      );
+      await browserSession.refresh();
+      confirming.resolve(whoami(true));
+      expect(await run).toBe(false);
+      expect(auth.actor?.handle ?? null).toBe(
+        newer === "logout" ? null : "bob",
+      );
+      expect(auth.status).toBe("");
+      expect(auth.busy).toBe(false);
+      expect(changed).not.toHaveBeenCalled();
+      expect(navigate).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener(SESSION_CHANGED_EVENT, changed);
+    }
+  });
+}
 
 for (const purpose of ["login", "addition"] as const) {
   test(`${purpose} null credential reports cancellation and never sends completion`, async () => {

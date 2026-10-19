@@ -10,6 +10,10 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   if (url.pathname === "/health") return new Response("ok");
   if (url.pathname === "/api/auth/whoami") {
     return Response.json({
+      session:
+        request.headers.get("cookie")?.includes("fixture-actor=authenticated")
+          ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
+          : { kind: "anonymous" },
       actor:
         request.headers.get("cookie")?.includes("fixture-actor=authenticated")
           ? {

@@ -1,11 +1,12 @@
 //! 隔離した実yoi-serverのhost CLI・HTTP APIで、管理者初期設定、登録可否の永続化、
 //! ID不要login、本人の鍵追加、限定activation、Workspace所有・catalog選択境界を検証する。DB・認証・routerは本番実装を使い、
-//! authenticatorはresident store/選択を持つsoftware model、署名エンジンのみSoftPasskeyとする（browser UI／OS認証器は対象外）。
+//! authenticatorはresident store/選択を持つsoftware model、署名エンジンのみSoftPasskeyとする（OS／物理認証器は対象外）。
 //! `cargo test -p yoi-e2e --features e2e --test auth_passkeys`で明示選択する。
 //! binary供給、HOME/XDG/DB/動的port、readiness、ログ、RAII回収は共有harnessが所有する。
-//! HTTPはproxy／redirect／cookie storeなし、各要求にtimeoutを設ける。
-//! `/`・`/login`・`/dashboard`のstatic shellは対象外。実Server CLIにはstatic assets設定経路がなく、
-//! shell表示／browser遷移は本番routerのin-process検証やbrowser側の合成HTTP検証と区別する。
+//! 通常ケースのHTTPはproxy／redirect／cookie storeなし、各要求にtimeoutを設ける。
+//! 実Server CLIにはstatic assets設定経路がない。追加の明示選択browser_sessionsだけが
+//! 本番static shellをloopback proxyで実Backendへ接続し、Cookieの自然消失と復帰を検証する。
+//! 固定expiry sessionを公開store APIで作るfixture境界と、14日実時間経過の未検証は同moduleに記す。
 
 use std::error::Error;
 use std::fs::OpenOptions;
@@ -28,6 +29,9 @@ use server_api::{
 mod resident_model;
 use resident_model::ResidentAuthenticator;
 use yoi_e2e::WorkerE2eEnvironment;
+
+#[path = "auth_passkeys/browser_sessions.rs"]
+mod browser_sessions;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 const BROWSER_ORIGIN: &str = "http://localhost:5173";

@@ -6705,6 +6705,7 @@ dependencies = [
 name = "yoi-e2e"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "libc",
  "reqwest",
  "serde",
@@ -6714,6 +6715,7 @@ dependencies = [
  "tempfile",
  "webauthn-authenticator-rs",
  "webauthn-rs-proto",
+ "yoi-workspace-server",
 ]
 
 [[package]]

@@ -91,11 +91,38 @@ pub fn parse_bearer(headers: &HeaderMap) -> Option<String> {
 }
 
 pub fn parse_cookie(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
-    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
-    cookie_header.split(';').find_map(|pair| {
-        let (name, value) = pair.trim().split_once('=')?;
-        (name == cookie_name && !value.is_empty()).then(|| value.to_string())
-    })
+    unique_cookie(headers, cookie_name)
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_empty())
+}
+
+// Cookie has no path/domain metadata on requests. Duplicates (including identical values
+// and multiple Cookie headers) cannot be disambiguated safely after cookie tossing.
+fn unique_cookie(
+    headers: &HeaderMap,
+    cookie_name: &str,
+) -> std::result::Result<Option<String>, ()> {
+    let mut found = None;
+    for header in headers.get_all(header::COOKIE) {
+        let header = header.to_str().map_err(|_| ())?;
+        for pair in header.split(';') {
+            let pair = pair.trim();
+            let Some((name, value)) = pair.split_once('=') else {
+                if pair == cookie_name {
+                    return Err(());
+                }
+                continue;
+            };
+            if name == cookie_name {
+                if found.is_some() {
+                    return Err(());
+                }
+                found = Some(value.to_owned());
+            }
+        }
+    }
+    Ok(found)
 }
 
 pub async fn resolve_request_actor(
@@ -121,6 +148,14 @@ pub(crate) fn resolve_request_actor_sync(
     bearer: Option<String>,
     session: Option<String>,
 ) -> Result<Option<RequestActor>> {
+    Ok(resolve_credentials_sync(store, bearer, session)?.map(|(actor, _)| actor))
+}
+
+fn resolve_credentials_sync(
+    store: &dyn ControlPlaneStore,
+    bearer: Option<String>,
+    session: Option<String>,
+) -> Result<Option<(RequestActor, Option<String>)>> {
     if let Some(token) = bearer {
         let token_hash = token_hash(&token);
         if let Some(api_token) = store.resolve_api_token(&token_hash)? {
@@ -132,7 +167,10 @@ pub(crate) fn resolve_request_actor_sync(
                 return Ok(None);
             }
             store.mark_api_token_used(&token_hash, &now_rfc3339())?;
-            return actor_for_user(store, &api_token.user_id, ActorAuthMethod::ApiToken);
+            return Ok(
+                actor_for_user(store, &api_token.user_id, ActorAuthMethod::ApiToken)?
+                    .map(|actor| (actor, None)),
+            );
         }
     }
 
@@ -141,11 +179,93 @@ pub(crate) fn resolve_request_actor_sync(
             if is_expired(&session.expires_at) {
                 return Ok(None);
             }
-            return actor_for_user(store, &session.user_id, ActorAuthMethod::BrowserSession);
+            return Ok(
+                actor_for_user(store, &session.user_id, ActorAuthMethod::BrowserSession)?
+                    .map(|actor| (actor, Some(session.expires_at))),
+            );
         }
     }
 
     Ok(None)
+}
+
+// This marker is a non-authenticating reference to the existing non-revoked session row.
+// It outlives the auth cookie so Max-Age expiry remains distinguishable from a new browser.
+// No second session store is introduced; clearing all cookies necessarily loses this evidence.
+// Keep the established 14-day authentication lifetime. The additional week is only a bounded
+// return-navigation window (including a week away); it never extends authentication. The store
+// reclaims expired rows past this same boundary on subsequent session issuance. Neither whoami
+// nor other reads refresh the marker or the row's absolute expiry.
+pub const BROWSER_SESSION_SECONDS: i64 = 14 * 24 * 60 * 60;
+pub const SESSION_EXPIRY_GRACE_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+pub fn session_marker_cookie_name(cookie_name: &str) -> String {
+    format!("{cookie_name}_expiry")
+}
+
+pub async fn resolve_whoami(
+    store: std::sync::Arc<dyn ControlPlaneStore>,
+    headers: &HeaderMap,
+    cookie_name: &str,
+) -> Result<server_api::WhoamiResponse> {
+    let bearer = parse_bearer(headers);
+    // Even an empty/invalid auth cookie takes precedence over an older marker.
+    // An ambiguous primary is invalid, not absent; never fall back to an older marker.
+    let session = unique_cookie(headers, cookie_name).unwrap_or_else(|()| Some(String::new()));
+    let marker = parse_cookie(headers, &session_marker_cookie_name(cookie_name));
+    let executor = store.db_executor();
+    executor
+        .run(move || resolve_whoami_sync(store.as_ref(), bearer, session, marker))
+        .await
+}
+
+fn resolve_whoami_sync(
+    store: &dyn ControlPlaneStore,
+    bearer: Option<String>,
+    session_token: Option<String>,
+    marker: Option<String>,
+) -> Result<server_api::WhoamiResponse> {
+    use server_api::{BrowserSessionState, WhoamiResponse};
+    let anonymous = || WhoamiResponse {
+        actor: None,
+        session: BrowserSessionState::Anonymous {},
+    };
+    // Preserve the existing API-token precedence and fallback rules, including expired tokens.
+    if let Some((actor, expires_at)) =
+        resolve_credentials_sync(store, bearer, session_token.clone())?
+    {
+        return Ok(WhoamiResponse {
+            actor: Some(actor),
+            session: BrowserSessionState::Authenticated { expires_at },
+        });
+    }
+    let hash = match session_token {
+        Some(token) => token_hash(&token),
+        None => match marker {
+            Some(hash) => hash,
+            None => return Ok(anonymous()),
+        },
+    };
+    let Some(session) = store.resolve_browser_session(&hash)? else {
+        return Ok(anonymous());
+    };
+    if store.get_user(&session.user_id)?.is_none() {
+        return Ok(anonymous());
+    }
+    if within_session_expiry_grace(&session.expires_at, Utc::now()) {
+        return Ok(WhoamiResponse {
+            actor: None,
+            session: BrowserSessionState::Expired {},
+        });
+    }
+    // A marker for a still-valid session cannot restore authentication after partial deletion.
+    Ok(anonymous())
+}
+
+fn within_session_expiry_grace(expires_at: &str, now: DateTime<Utc>) -> bool {
+    DateTime::parse_from_rfc3339(expires_at).is_ok_and(|expires_at| {
+        expires_at <= now && now < expires_at + Duration::seconds(SESSION_EXPIRY_GRACE_SECONDS)
+    })
 }
 
 fn actor_for_user<S: ControlPlaneStore + ?Sized>(
@@ -274,6 +394,13 @@ mod tests {
             .unwrap();
         assert_eq!(actor.user_id, "user-auth");
         assert_eq!(actor.auth_method, ActorAuthMethod::ApiToken);
+        let whoami = resolve_whoami(store.clone(), &headers, "session")
+            .await
+            .unwrap();
+        assert_eq!(
+            whoami.session,
+            server_api::BrowserSessionState::Authenticated { expires_at: None }
+        );
         assert!(
             store
                 .resolve_api_token(&hash)
@@ -363,18 +490,117 @@ mod tests {
         assert!(futures::poll!(queued.as_mut()).is_pending());
         let mut headers = HeaderMap::new();
         headers.insert(header::COOKIE, "session=session-secret".parse().unwrap());
+        let actor_result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            resolve_request_actor(store.clone(), &headers, "session"),
+        )
+        .await;
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            resolve_request_actor(store, &headers, "session"),
+            resolve_whoami(store, &headers, "session"),
         )
         .await;
         release.send(()).unwrap();
         blocker.await.unwrap().unwrap();
         queued.await.unwrap();
         assert!(matches!(
+            actor_result.expect("actor lookup rejects capacity"),
+            Err(Error::DbCapacityExceeded)
+        ));
+        assert!(matches!(
             result.expect("capacity rejection must not wait for queued SQL"),
             Err(Error::DbCapacityExceeded)
         ));
+    }
+
+    #[tokio::test]
+    async fn whoami_classifies_only_live_store_backed_session_expiry() {
+        use server_api::BrowserSessionState;
+        let store = seeded_store();
+        for (secret, offset, revoked) in [
+            ("recent", -60, false),
+            ("old", -SESSION_EXPIRY_GRACE_SECONDS - 60, false),
+            ("revoked", -60, true),
+        ] {
+            store
+                .create_browser_session(&BrowserSessionRecord {
+                    session_id: format!("session-{secret}"),
+                    token_hash: token_hash(secret),
+                    user_id: "user-auth".into(),
+                    created_at: "1".into(),
+                    expires_at: rfc3339_after(Duration::seconds(offset)),
+                    revoked_at: revoked.then(|| now_rfc3339()),
+                })
+                .unwrap();
+        }
+        let cases = [
+            (String::new(), BrowserSessionState::Anonymous {}),
+            ("session=unknown".into(), BrowserSessionState::Anonymous {}),
+            ("session=recent".into(), BrowserSessionState::Expired {}),
+            (
+                format!("session_expiry={}", token_hash("recent")),
+                BrowserSessionState::Expired {},
+            ),
+            (
+                format!("session_expiry={}", token_hash("session-secret")),
+                BrowserSessionState::Anonymous {},
+            ),
+            (
+                "session_expiry=unknown".into(),
+                BrowserSessionState::Anonymous {},
+            ),
+            (
+                "session_expiry=recent".into(),
+                BrowserSessionState::Anonymous {},
+            ),
+            (
+                format!("session=unknown; session_expiry={}", token_hash("recent")),
+                BrowserSessionState::Anonymous {},
+            ),
+            (
+                format!("session=; session_expiry={}", token_hash("recent")),
+                BrowserSessionState::Anonymous {},
+            ),
+            ("session=revoked".into(), BrowserSessionState::Anonymous {}),
+            (
+                format!("session_expiry={}", token_hash("revoked")),
+                BrowserSessionState::Anonymous {},
+            ),
+            ("session=old".into(), BrowserSessionState::Anonymous {}),
+            (
+                format!("session_expiry={}", token_hash("old")),
+                BrowserSessionState::Anonymous {},
+            ),
+            (
+                format!(
+                    "session=session-secret; session_expiry={}",
+                    token_hash("recent")
+                ),
+                BrowserSessionState::Authenticated {
+                    expires_at: Some("9999-01-01T00:00:00Z".into()),
+                },
+            ),
+        ];
+        for (cookie, expected) in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, cookie.parse().unwrap());
+            let response = resolve_whoami(store.clone(), &headers, "session")
+                .await
+                .unwrap();
+            assert_eq!(response.session, expected, "cookie: {cookie}");
+            assert_eq!(
+                response.actor.is_some(),
+                matches!(expected, BrowserSessionState::Authenticated { .. })
+            );
+            if !matches!(expected, BrowserSessionState::Authenticated { .. }) {
+                assert!(
+                    resolve_request_actor(store.clone(), &headers, "session")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
     }
 
     #[test]
@@ -394,5 +620,137 @@ mod tests {
                 .all(|(index, value)| index == 4 || value.is_ascii_hexdigit())
         );
         assert_eq!(code, code.to_ascii_uppercase());
+    }
+
+    #[test]
+    fn expiry_grace_includes_expiry_but_excludes_its_absolute_end() {
+        let expiry = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for (offset, expected) in [
+            (-1, false),
+            (0, true),
+            (SESSION_EXPIRY_GRACE_SECONDS - 1, true),
+            (SESSION_EXPIRY_GRACE_SECONDS, false),
+        ] {
+            assert_eq!(
+                within_session_expiry_grace(
+                    &expiry.to_rfc3339(),
+                    expiry + Duration::seconds(offset)
+                ),
+                expected
+            );
+        }
+        assert!(!within_session_expiry_grace("invalid", expiry));
+    }
+
+    #[tokio::test]
+    async fn duplicate_cookies_never_select_an_actor_or_promote_an_ambiguous_marker() {
+        use server_api::BrowserSessionState;
+        let store = seeded_store();
+        let expired_hash = token_hash("expired-duplicate");
+        store
+            .create_browser_session(&BrowserSessionRecord {
+                session_id: "expired-duplicate".into(),
+                token_hash: expired_hash.clone(),
+                user_id: "user-auth".into(),
+                created_at: now_rfc3339(),
+                expires_at: rfc3339_after(Duration::seconds(-60)),
+                revoked_at: None,
+            })
+            .unwrap();
+        for cookies in [
+            vec!["session=session-secret; session=unknown".to_owned()],
+            vec!["session=session-secret; session=session-secret".to_owned()],
+            vec![
+                "session=session-secret".to_owned(),
+                "session=unknown".to_owned(),
+            ],
+            vec![format!(
+                "session=; session=session-secret; session_expiry={expired_hash}"
+            )],
+            vec![format!(
+                "session_expiry={expired_hash}; session_expiry={expired_hash}"
+            )],
+            vec![format!("session; session_expiry={expired_hash}")],
+        ] {
+            let mut headers = HeaderMap::new();
+            for cookie in cookies {
+                headers.append(header::COOKIE, cookie.parse().unwrap());
+            }
+            assert!(
+                resolve_request_actor(store.clone(), &headers, "session")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                resolve_whoami(store.clone(), &headers, "session")
+                    .await
+                    .unwrap()
+                    .session,
+                BrowserSessionState::Anonymous {}
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("session=session-secret; session_expiry={expired_hash}")
+                .parse()
+                .unwrap(),
+        );
+        assert!(matches!(
+            resolve_whoami(store, &headers, "session")
+                .await
+                .unwrap()
+                .session,
+            BrowserSessionState::Authenticated { .. }
+        ));
+    }
+
+    #[test]
+    fn session_issuance_reclaims_only_rows_beyond_recovery_grace() {
+        let store = seeded_store();
+        let record = |secret: &str, offset| BrowserSessionRecord {
+            session_id: secret.into(),
+            token_hash: token_hash(secret),
+            user_id: "user-auth".into(),
+            created_at: now_rfc3339(),
+            expires_at: rfc3339_after(Duration::seconds(offset)),
+            revoked_at: None,
+        };
+        store
+            .create_browser_session(&record("past-grace", -SESSION_EXPIRY_GRACE_SECONDS - 60))
+            .unwrap();
+        assert!(
+            store
+                .resolve_browser_session(&token_hash("past-grace"))
+                .unwrap()
+                .is_some()
+        );
+        store
+            .create_browser_session(&record("within-grace", -SESSION_EXPIRY_GRACE_SECONDS + 60))
+            .unwrap();
+        assert!(
+            store
+                .resolve_browser_session(&token_hash("past-grace"))
+                .unwrap()
+                .is_none()
+        );
+        store
+            .create_browser_session(&record("new-session", BROWSER_SESSION_SECONDS))
+            .unwrap();
+        assert!(
+            store
+                .resolve_browser_session(&token_hash("within-grace"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .resolve_browser_session(&token_hash("new-session"))
+                .unwrap()
+                .is_some()
+        );
     }
 }

@@ -108,6 +108,7 @@ async function loadPage(
 ) {
   const result = await load(
     {
+      parent: async () => ({}),
       fetch: fetchFn,
       params: { workspaceId },
       url: new URL(
@@ -141,7 +142,7 @@ test("actual loader posts browse only; rows render while orchestrator is unresol
     "/api/w/workspace-a/repositories": () => repos.promise,
   });
   const pending = loadPage(request);
-  expect(request).toHaveBeenCalledTimes(1);
+  await waitFor(() => expect(request).toHaveBeenCalledTimes(1));
   expect(request.mock.calls[0][0]).toBe("/api/w/workspace-a/tickets/browse");
   expect(request.mock.calls[0][1]?.method).toBe("POST");
   expect(JSON.parse(String(request.mock.calls[0][1]?.body))).toEqual(
