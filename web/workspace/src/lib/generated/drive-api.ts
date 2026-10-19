@@ -31,6 +31,8 @@ export type DriveEntry = {
   latest_url: string;
 };
 
+export type DriveCapabilities = { write: boolean };
+
 export type DriveEntryQuery = { entry_workspace_id: string; id: string };
 
 export type DriveListQuery = {

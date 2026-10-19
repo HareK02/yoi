@@ -1026,6 +1026,10 @@ impl WipMountRegistry {
         descriptor: &InterfaceDescriptor,
         validator: Option<&[u8]>,
     ) -> bool {
+        if let Some(contract) = crate::file_operation::Contract::from_reference(interface) {
+            return *descriptor != contract.descriptor()
+                || validator != Some(contract.validator().as_slice());
+        }
         self.mounts.values().any(|mounted| {
             mounted.projection.interface == *interface
                 && (mounted.projection.descriptor != *descriptor
@@ -1091,6 +1095,10 @@ impl WipMountRegistry {
         validator: Option<&[u8]>,
         replacing_route: Option<&str>,
     ) -> bool {
+        if let Some(contract) = crate::file_operation::Contract::from_reference(interface) {
+            return *descriptor != contract.descriptor()
+                || validator != Some(contract.validator().as_slice());
+        }
         self.additional_interfaces.iter().any(|(route, all)| {
             Some(route.as_str()) != replacing_route
                 && all.iter().any(|p| {
@@ -1603,6 +1611,18 @@ impl WipHost {
         }
         if let Some(validator) = projection.handler.object_validator() {
             projection.object.validator = Some(validator);
+        }
+        if let Some(contract) =
+            crate::file_operation::Contract::from_reference(&projection.interface)
+        {
+            if !projection
+                .handler
+                .operation_available(contract.handler_operation())
+            {
+                return None;
+            }
+            // Common descriptor identity never varies with subject or capability filtering.
+            return Some(projection);
         }
         let contextual = contextual_family || projection.handler.contextual_interface();
         let original_len = projection.descriptor.operations.len();

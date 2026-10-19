@@ -270,7 +270,7 @@ impl Provider {
         let mut contracts = Vec::new();
         let kind = if observation.kind == EntryKind::File {
             if has(Cap::Read, "Read") {
-                contracts.extend([C::ReadLines, C::SearchText]);
+                contracts.extend([C::ReadLines, C::SearchText, C::ReadBytes]);
             }
             if has(Cap::Edit, "Edit") {
                 contracts.push(C::Edit);
@@ -541,6 +541,52 @@ impl WipOperationHandler for FileHandler {
         arguments: &BTreeMap<String, Value>,
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
+        if operation == "read_bytes" {
+            let (offset, limit) = crate::file_operation::byte_range(arguments)?;
+            if !self.provider.allowed("Read",&json!({"target_workdir":self.alias,"file_path":self.target.as_str(),"offset":offset,"limit":limit})) {return Err(protocol(ProtocolErrorCode::PermissionDenied,"byte read denied"));}
+            let _permit =
+                tokio::time::timeout(self.provider.deadline, self.provider.permits.acquire())
+                    .await
+                    .map_err(|_| {
+                        protocol(
+                            ProtocolErrorCode::ResourceLimitExceeded,
+                            "byte read capacity deadline",
+                        )
+                    })?
+                    .map_err(|_| protocol(ProtocolErrorCode::Internal, "byte read unavailable"))?;
+            let (read, raw) = tokio::time::timeout(
+                self.provider.deadline,
+                tools::checkout::read_checkout_bytes(
+                    self.provider.router.clone(),
+                    &self.alias,
+                    self.generation,
+                    self.target.clone(),
+                    self.observation.validator.clone(),
+                    offset,
+                    limit,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                protocol(
+                    ProtocolErrorCode::ResourceLimitExceeded,
+                    "byte read deadline",
+                )
+            })?
+            .map_err(map_tool_error)?;
+            self.check_connection()?;
+            let value = crate::file_operation::bytes_result(arguments, &read.bytes, read.eof)?;
+            return Ok(WipOperationOutput::native_with_validator(
+                value,
+                self.provider.wrap_validator(
+                    &self.alias,
+                    self.generation,
+                    &self.workdir,
+                    &self.target,
+                    &raw,
+                ),
+            ));
+        }
         if matches!(operation, "read_lines" | "search_text") {
             let (offset, limit) =
                 crate::file_operation::window(arguments, operation == "search_text")?;

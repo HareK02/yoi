@@ -59,6 +59,7 @@ pub(crate) const MAX_BYTES: usize = 64 * 1024;
 /// Contracts have independent capability membership and no target-dependent descriptor fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Contract {
+    ReadBytes,
     ReadLines,
     SearchText,
     Edit,
@@ -72,6 +73,7 @@ impl Contract {
     pub(crate) fn reference(self) -> InterfaceReference {
         crate::wip::root_reference(match self {
             Self::ReadLines => "yoi.file/read-lines/v1",
+            Self::ReadBytes => "yoi.file/read-bytes/v1",
             Self::SearchText => "yoi.file/search-text/v1",
             Self::Edit => "yoi.file/edit-text/v1",
             Self::Write => "yoi.file/write-text/v1",
@@ -84,6 +86,7 @@ impl Contract {
     pub(crate) fn from_reference(r: &InterfaceReference) -> Option<Self> {
         [
             Self::ReadLines,
+            Self::ReadBytes,
             Self::SearchText,
             Self::Edit,
             Self::Write,
@@ -97,7 +100,7 @@ impl Contract {
     }
     pub(crate) fn operation(self) -> &'static str {
         match self {
-            Self::ReadLines => "read",
+            Self::ReadLines | Self::ReadBytes => "read",
             Self::SearchText => "search",
             Self::Edit => "edit",
             Self::Write => "write",
@@ -110,12 +113,29 @@ impl Contract {
     pub(crate) fn handler_operation(self) -> &'static str {
         match self {
             Self::ReadLines => "read_lines",
+            Self::ReadBytes => "read_bytes",
             Self::SearchText => "search_text",
             _ => self.operation(),
         }
     }
     pub(crate) fn descriptor(self) -> InterfaceDescriptor {
         let (summary, parameters, result) = match self {
+            Self::ReadBytes => (
+                "Read a bounded binary byte range",
+                vec![
+                    parameter("offset", false, TypeExpr::Integer),
+                    parameter("limit", false, TypeExpr::Integer),
+                ],
+                TypeExpr::Record {
+                    fields: vec![
+                        field("encoding", true, TypeExpr::String),
+                        field("data", true, TypeExpr::String),
+                        field("offset", true, TypeExpr::Integer),
+                        field("next_offset", true, TypeExpr::Integer),
+                        field("eof", true, TypeExpr::Boolean),
+                    ],
+                },
+            ),
             Self::ReadLines => (
                 "Read a bounded text line window",
                 parameters("read", true).unwrap(),
@@ -166,6 +186,7 @@ impl Contract {
             ),
         };
         InterfaceDescriptor {format:INTERFACE_FORMAT_V1.into(),types:vec![],documentation:Some(Documentation {summary:summary.into(),details:Some(match self {
+            Self::ReadBytes=>"Binary-safe byte range, independent of UTF-8 and line boundaries. Offset defaults to 0; limit defaults to 16384 and must be 1..=32768 bytes. Offset must be <=9007199254708223. Returns encoding=base64 with RFC4648 standard padded data, offset and next_offset in bytes, eof when no later bytes remain. At EOF returns empty data, eof=true and next_offset=offset; offsets beyond EOF are InvalidArguments. Encoded pretty JSON result is bounded to 64 KiB. Does not establish text prior-Read for mutation. InvalidArguments rejects ranges/unknown fields, ResourceLimitExceeded bounds, ValidatorMismatch stale source, PermissionDenied authority. Provider source bounds apply; no automatic retry.",
             Self::ReadLines|Self::SearchText=>"UTF-8 text (invalid source bytes decoded lossily); Rust lines semantics (CRLF stripped, final newline is not an extra line). Zero-based offset defaults to 0. Limit defaults to 2000, must be 1..=2000. Source/result windows exceeding 64 KiB are refused, never silently skipped. Read returns one-based numbered content. Search is case-sensitive literal matching, pattern nonempty and at most 4096 bytes, returning one-based line/text records. next_offset advances by scanned lines including nonmatches; truncated means more lines remain. Provider source bounds may refuse retrieval. InvalidArguments rejects bad ranges/patterns; ResourceLimitExceeded rejects bounds; ValidatorMismatch rejects stale state; PermissionDenied rejects current authority. No automatic retry.",
             Self::Edit|Self::Write|Self::CreateFile=>"UTF-8 text with provider size bounds. Checked save, prior Read and CAS requirements remain provider-owned. Edit rejects empty or identical old/new strings, missing or ambiguous matches unless replace_all. Success returns metadata with provider commit information. InvalidArguments rejects invalid edits; ResourceLimitExceeded rejects bounds; ValidatorMismatch rejects stale state; PermissionDenied rejects current authority. Post-dispatch failure may be OutcomeUnknown: reconcile, never automatically retry.",
             _=>"Paths and cursors are Worldspace entries, not host paths. Provider scope, permission, visibility, bounds and cancellation remain authoritative. Discovery does not acquire every result or add indexable children. InvalidArguments, ResourceLimitExceeded, PermissionDenied and ValidatorMismatch preserve provider failures. No automatic retry.",
@@ -551,4 +572,77 @@ mod tests {
             );
         }
     }
+}
+
+/// Bounds reserve room for base64 expansion, JSON encoding, and exact lossless integer offsets.
+pub(crate) fn byte_range(
+    args: &BTreeMap<String, Value>,
+) -> Result<(u64, usize), WipOperationError> {
+    if args
+        .keys()
+        .any(|k| !["offset", "limit"].contains(&k.as_str()))
+    {
+        return Err(failure(
+            ProtocolErrorCode::InvalidArguments,
+            "unknown byte argument",
+        ));
+    }
+    let integer = |name: &str, default: u64| match args.get(name) {
+        None => Ok(default),
+        Some(Value::Integer(i)) => u64::try_from(*i)
+            .map_err(|_| failure(ProtocolErrorCode::InvalidArguments, "negative byte range")),
+        _ => Err(failure(
+            ProtocolErrorCode::InvalidArguments,
+            "invalid byte range",
+        )),
+    };
+    let offset = integer("offset", 0)?;
+    let limit = integer("limit", 16384)?;
+    if offset > 9_007_199_254_708_223 || !(1..=32768).contains(&limit) {
+        return Err(failure(
+            ProtocolErrorCode::InvalidArguments,
+            "byte range exceeds bounds",
+        ));
+    }
+    Ok((offset, limit as usize))
+}
+pub(crate) fn bytes_result(
+    args: &BTreeMap<String, Value>,
+    bytes: &[u8],
+    eof: bool,
+) -> Result<Value, WipOperationError> {
+    use base64::Engine as _;
+    let (offset, limit) = byte_range(args)?;
+    if bytes.len() > limit || (bytes.is_empty() && !eof) {
+        return Err(failure(
+            ProtocolErrorCode::Internal,
+            "provider returned an invalid byte range",
+        ));
+    }
+    let value = Value::Record(BTreeMap::from([
+        ("encoding".into(), Value::String("base64".into())),
+        (
+            "data".into(),
+            Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
+        ),
+        ("offset".into(), Value::Integer(offset as i64)),
+        (
+            "next_offset".into(),
+            Value::Integer((offset + bytes.len() as u64) as i64),
+        ),
+        ("eof".into(), Value::Boolean(eof)),
+    ]));
+    let json = crate::wip::wip_to_json(&value)
+        .map_err(|_| failure(ProtocolErrorCode::Internal, "byte result unavailable"))?;
+    if serde_json::to_vec_pretty(&json)
+        .map_err(|_| failure(ProtocolErrorCode::Internal, "byte result unavailable"))?
+        .len()
+        > MAX_BYTES
+    {
+        return Err(failure(
+            ProtocolErrorCode::ResourceLimitExceeded,
+            "encoded byte result exceeds bound",
+        ));
+    }
+    Ok(value)
 }

@@ -1587,6 +1587,20 @@ impl WorkdirSession for LocalWorkdirSession {
         }
         let is_create = matches!(&request.operation, Op::Create { .. });
         let output = match request.operation {
+            Op::ReadBytes { offset, max_bytes } => fs_operation::run_read_bytes_bounded(
+                &self.inner.root,
+                ReadBytesRequest {
+                    path: path.clone(),
+                    offset,
+                    max_bytes,
+                    expected_hash: None,
+                },
+                &pinned,
+                self.inner
+                    .read_limits
+                    .unwrap_or(BoundedReadLimits::EXTERNAL_DEFAULT),
+            )
+            .map(Output::ReadBytes),
             Op::Read {
                 offset,
                 limit,
@@ -1679,7 +1693,7 @@ impl WorkdirSession for LocalWorkdirSession {
                 checkout_execute_error(&path, WorkdirError::from(error))
             }
         })?;
-        if matches!(&output, Output::Read(_)) {
+        if matches!(&output, Output::Read(_) | Output::ReadBytes(_)) {
             pinned.confirm().map_err(|e| checkout_io(&path, e))?;
             return Ok(crate::CheckoutResult {
                 observation: self

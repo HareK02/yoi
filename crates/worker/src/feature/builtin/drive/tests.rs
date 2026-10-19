@@ -7,12 +7,14 @@ use std::collections::VecDeque;
 struct Client {
     responses: Mutex<VecDeque<Result<WorkspaceResponse, WorkspaceClientError>>>,
     requests: Mutex<Vec<WorkspaceRequest>>,
+    capabilities: Mutex<WorkspaceResponse>,
 }
 impl Client {
     fn new(responses: Vec<WorkspaceResponse>) -> Arc<Self> {
         Arc::new(Self {
             responses: Mutex::new(responses.into_iter().map(Ok).collect()),
             requests: Mutex::new(Vec::new()),
+            capabilities: Mutex::new(response(DriveCapabilities { write: false })),
         })
     }
 }
@@ -30,7 +32,15 @@ impl WorkspaceClient for Client {
         &self,
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        let capabilities = request.path == "/api/w/workspace/drive/capabilities";
         self.requests.lock().unwrap().push(request);
+        if capabilities {
+            let response = self.capabilities.lock().unwrap();
+            return Ok(WorkspaceResponse {
+                status: response.status,
+                body: response.body.clone(),
+            });
+        }
         self.responses
             .lock()
             .unwrap()
@@ -479,7 +489,7 @@ async fn drive_native_entry_is_directly_resolvable_but_never_indexable_and_binds
     let feature = feature(client.clone());
     let mut mounts = crate::wip::WipMountRegistry::new();
     wip::mount_drive_wip(&mut mounts, &feature).unwrap();
-    let provider = wip::DriveProvider(feature);
+    let provider = wip::DriveProvider::new(feature);
     let path = entry_path(&entry.entry);
     let publication = provider.publication(&path).await.unwrap().unwrap();
     assert_eq!(publication.projection.route, path);
@@ -487,7 +497,8 @@ async fn drive_native_entry_is_directly_resolvable_but_never_indexable_and_binds
         publication.scope.as_ref().unwrap().r#ref,
         publication.projection.object.r#ref
     );
-    assert_eq!(publication.projection.object.validator, Some(b"3".to_vec()));
+    assert!(publication.projection.object.validator.is_some());
+    assert_ne!(publication.projection.object.validator, Some(b"3".to_vec()));
     assert!(provider.children("/drive").await.unwrap().is_empty());
     assert!(
         provider
@@ -504,7 +515,7 @@ async fn drive_native_entry_is_directly_resolvable_but_never_indexable_and_binds
             .flat_map(|op| &op.parameters)
             .any(|parameter| parameter.name == "expected_mutation_id")
     );
-    assert_eq!(client.requests.lock().unwrap().len(), 1);
+    assert_eq!(client.requests.lock().unwrap().len(), 2);
 }
 
 #[derive(Debug)]
@@ -655,4 +666,663 @@ async fn oversized_images_and_unknown_arguments_fail_before_binary_transfer() {
         .is_err()
     );
     assert_eq!(client.json.requests.lock().unwrap().len(), 1);
+}
+
+fn native_context() -> crate::wip::WipCallContext {
+    crate::wip::WipCallContext {
+        execution: ToolExecutionContext::direct(),
+        security_context: "drive-test".into(),
+    }
+}
+fn native_args(value: Value) -> std::collections::BTreeMap<String, wip_protocol::Value> {
+    let wip_protocol::Value::Record(args) = crate::wip::json_to_wip(&value).unwrap() else {
+        panic!("named arguments required")
+    };
+    args
+}
+
+#[tokio::test]
+async fn drive_common_text_reads_use_bounded_complete_source_and_literal_window_search() {
+    use crate::file_operation::Contract;
+    use crate::wip::WipSubtreeProvider;
+    let text = "α\r\nneedle.*\nNeedle.*\nlast\n";
+    let mut entry = entry("2", "3");
+    entry.size = Some(text.len() as u32);
+    let read = DriveReadTextResponse {
+        entry: entry.clone(),
+        text: text.into(),
+        truncated: false,
+    };
+    let client = Client::new(vec![
+        response(entry.clone()),
+        response(&read),
+        response(&read),
+    ]);
+    let feature = feature(client.clone());
+    let publication = wip::DriveProvider::new(feature)
+        .publication(&entry_path(&entry.entry))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut projection = publication.projection;
+    assert!(
+        projection
+            .object
+            .interfaces
+            .contains(&Contract::ReadLines.reference())
+    );
+    assert!(
+        projection
+            .object
+            .interfaces
+            .contains(&Contract::SearchText.reference())
+    );
+    assert!(
+        !projection
+            .object
+            .interfaces
+            .contains(&Contract::Write.reference())
+    );
+    assert!(
+        !projection
+            .object
+            .interfaces
+            .contains(&Contract::Edit.reference())
+    );
+    assert!(
+        projection
+            .descriptor
+            .operations
+            .iter()
+            .any(|op| op.name == "read" && op.parameters.iter().any(|p| p.name == "max_bytes"))
+    );
+    let original_handler = projection.handler.clone();
+    assert!(crate::file_operation::select(
+        &mut projection,
+        &Contract::ReadLines.reference()
+    ));
+    let read = projection
+        .handler
+        .call(
+            "read",
+            &native_args(json!({"offset":1,"limit":2})),
+            native_context(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("common read failed"));
+    let value = crate::wip::wip_to_json(&read.value).unwrap();
+    assert_eq!(value["next_offset"], 3);
+    assert_eq!(value["truncated"], true);
+    assert!(value["content"].as_str().unwrap().contains("needle.*"));
+    // The common selector wraps a provider handler once; reuse the original
+    // publication for the independent SearchText contract.
+    projection.handler = original_handler;
+    let request = client.requests.lock().unwrap().last().unwrap().clone();
+    assert!(request.path.contains("max_bytes=65536"));
+    assert!(crate::file_operation::select(
+        &mut projection,
+        &Contract::SearchText.reference()
+    ));
+    let search = projection
+        .handler
+        .call(
+            "search",
+            &native_args(json!({"pattern":"needle.*","limit":3})),
+            native_context(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("common search failed"));
+    let value = crate::wip::wip_to_json(&search.value).unwrap();
+    assert_eq!(value["matches"], json!([{"line":2,"text":"needle.*"}]));
+    assert_eq!(value["next_offset"], 3);
+    assert_eq!(value["truncated"], true);
+}
+
+fn read_response(entry: &DriveEntry, text: &str) -> DriveReadTextResponse {
+    DriveReadTextResponse {
+        entry: entry.clone(),
+        text: text.into(),
+        truncated: false,
+    }
+}
+
+#[tokio::test]
+async fn drive_common_text_refuses_truncated_mismatched_stale_and_denied_reads() {
+    use crate::wip::WipSubtreeProvider;
+    use wip_protocol::ProtocolErrorCode;
+    for (case, expected) in [
+        ("truncated", ProtocolErrorCode::ResourceLimitExceeded),
+        ("size", ProtocolErrorCode::ResourceLimitExceeded),
+        ("stale", ProtocolErrorCode::ValidatorMismatch),
+        ("denied", ProtocolErrorCode::PermissionDenied),
+    ] {
+        let entry = entry("2", "3");
+        let mut read = read_response(&entry, "hello");
+        match case {
+            "truncated" => read.truncated = true,
+            "size" => read.text = "hell".into(),
+            "stale" => read.entry.last_mutation_id = "4".into(),
+            _ => {}
+        }
+        let read = if case == "denied" {
+            WorkspaceResponse {
+                status: 403,
+                body: "denied".into(),
+            }
+        } else {
+            response(read)
+        };
+        let client = Client::new(vec![response(entry.clone()), read]);
+        let projection = wip::DriveProvider::new(feature(client.clone()))
+            .publication(&entry_path(&entry.entry))
+            .await
+            .unwrap()
+            .unwrap()
+            .projection;
+        let result = projection
+            .handler
+            .call("read_lines", &native_args(json!({})), native_context())
+            .await;
+        assert!(
+            matches!(result, Err(crate::wip::WipOperationError::Protocol(ref error)) if error.code == expected),
+            "{case}"
+        );
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3, "{case}: no retries");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method == crate::worker::WorkspaceRequestMethod::Get)
+        );
+    }
+}
+
+#[tokio::test]
+async fn drive_common_text_rejects_oversized_source_before_read_and_remount_changes_object_validator()
+ {
+    use crate::wip::WipSubtreeProvider;
+    let mut entry = entry("2", "3");
+    entry.size = Some(server_api::DRIVE_CHUNK_MAX_BYTES + 1);
+    let client = Client::new(vec![response(entry.clone()), response(entry.clone())]);
+    let first = feature(client.clone());
+    let second = first.clone();
+    let path = entry_path(&entry.entry);
+    let first = wip::DriveProvider::new(first)
+        .publication(&path)
+        .await
+        .unwrap()
+        .unwrap()
+        .projection;
+    let second = wip::DriveProvider::new(second)
+        .publication(&path)
+        .await
+        .unwrap()
+        .unwrap()
+        .projection;
+    assert_ne!(first.object.validator, second.object.validator);
+    assert_eq!(first.object.interfaces, second.object.interfaces);
+    let result = first
+        .handler
+        .call("read_lines", &native_args(json!({})), native_context())
+        .await;
+    assert!(
+        matches!(result, Err(crate::wip::WipOperationError::Protocol(error)) if error.code == wip_protocol::ProtocolErrorCode::ResourceLimitExceeded)
+    );
+    assert_eq!(client.requests.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn drive_common_text_reads_keep_tool_permission_denial_before_backend_read() {
+    use crate::wip::WipSubtreeProvider;
+    let entry = entry("2", "3");
+    let client = Client::new(vec![response(entry.clone())]);
+    let feature = feature(client.clone()).with_permissions(Some(manifest::ToolPermissionConfig {
+        default_action: manifest::ToolPermissionAction::Deny,
+        rules: Vec::new(),
+    }));
+    let projection = wip::DriveProvider::new(feature)
+        .publication(&entry_path(&entry.entry))
+        .await
+        .unwrap()
+        .unwrap()
+        .projection;
+    let result = projection
+        .handler
+        .call("read_lines", &native_args(json!({})), native_context())
+        .await;
+    assert!(
+        matches!(result, Err(crate::wip::WipOperationError::Protocol(error)) if error.code == wip_protocol::ProtocolErrorCode::PermissionDenied)
+    );
+    assert_eq!(client.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn drive_read_only_capability_omits_file_and_folder_mutation_contracts() {
+    use crate::file_operation::Contract;
+    use crate::wip::WipSubtreeProvider;
+    for (kind, root) in [
+        (DriveEntryKind::File, false),
+        (DriveEntryKind::Folder, false),
+        (DriveEntryKind::Folder, true),
+    ] {
+        let mut entry = entry("2", "3");
+        entry.kind = kind;
+        if root {
+            entry.parent = None;
+        }
+        let path = if root {
+            "/drive".into()
+        } else {
+            entry_path(&entry.entry)
+        };
+        let client = Client::new(vec![response(entry.clone())]);
+        let projection = wip::DriveProvider::new(feature(client.clone()))
+            .publication(&path)
+            .await
+            .unwrap()
+            .unwrap()
+            .projection;
+        assert!(
+            !projection
+                .object
+                .interfaces
+                .contains(&Contract::Edit.reference())
+        );
+        assert!(
+            !projection
+                .object
+                .interfaces
+                .contains(&Contract::Write.reference())
+        );
+        assert!(!projection.descriptor.operations.iter().any(|op| matches!(
+            op.name.as_str(),
+            "write"
+                | "edit"
+                | "delete"
+                | "relocate"
+                | "create_folder"
+                | "create_text"
+                | "save_workdir"
+        )));
+        let result = projection
+            .handler
+            .call(
+                "write",
+                &native_args(json!({"content":"denied"})),
+                native_context(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(crate::wip::WipOperationError::Protocol(error)) if error.code == wip_protocol::ProtocolErrorCode::OperationNotFound)
+        );
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].path, "/api/w/workspace/drive/capabilities");
+        assert_eq!(
+            requests[1].method,
+            crate::worker::WorkspaceRequestMethod::Get
+        );
+        assert!(requests[1].body.is_none());
+    }
+}
+
+#[tokio::test]
+async fn drive_capability_failure_never_publishes_an_assumed_write_ceiling() {
+    use crate::wip::WipSubtreeProvider;
+    for (status, body) in [
+        (403, "denied"),
+        (500, "unavailable"),
+        (200, "{}"),
+        (200, "{\"write\":true,\"grant_id\":\"spoof\"}"),
+    ] {
+        let entry = entry("2", "3");
+        let client = Client::new(vec![response(entry.clone())]);
+        *client.capabilities.lock().unwrap() = WorkspaceResponse {
+            status,
+            body: body.into(),
+        };
+        let result = wip::DriveProvider::new(feature(client.clone()))
+            .publication(&entry_path(&entry.entry))
+            .await;
+        assert!(!matches!(result, Ok(Some(_))), "{status}: {body}");
+        assert_eq!(client.requests.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn drive_common_mutation_publication_intersects_tool_permission_ceiling() {
+    use crate::file_operation::Contract;
+    use crate::wip::WipSubtreeProvider;
+    let entry = entry("2", "3");
+    let client = Client::new(vec![response(entry.clone())]);
+    *client.capabilities.lock().unwrap() = response(DriveCapabilities { write: true });
+    let feature = feature(client).with_permissions(Some(manifest::ToolPermissionConfig {
+        default_action: manifest::ToolPermissionAction::Allow,
+        rules: vec![manifest::ToolPermissionRule {
+            tool: "DriveWrite".into(),
+            pattern: "*".into(),
+            action: manifest::ToolPermissionAction::Deny,
+        }],
+    }));
+    let projection = wip::DriveProvider::new(feature)
+        .publication(&entry_path(&entry.entry))
+        .await
+        .unwrap()
+        .unwrap()
+        .projection;
+    assert!(
+        !projection
+            .object
+            .interfaces
+            .contains(&Contract::Write.reference())
+    );
+    assert!(
+        projection
+            .object
+            .interfaces
+            .contains(&Contract::Edit.reference())
+    );
+    assert!(
+        !projection
+            .descriptor
+            .operations
+            .iter()
+            .any(|op| matches!(op.name.as_str(), "write" | "edit"))
+    );
+}
+
+/// Narrow transport fixture for native mutation chaining. The real provider,
+/// Client/Host, permission checks and Backend CAS adapter remain in the path;
+/// only canonical Drive persistence is replaced by an entry and text value.
+#[derive(Debug)]
+struct NativeMutations(Mutex<(DriveEntry, String, Vec<DriveMutationRequest>)>);
+impl WorkspaceClient for NativeMutations {
+    fn workspace_id(&self) -> Option<&str> {
+        Some("workspace")
+    }
+    fn kind(&self) -> &str {
+        "drive-native-mutations"
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn execute(
+        &self,
+        request: WorkspaceRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        let mut state = self.0.lock().unwrap();
+        let suffix = request
+            .path
+            .strip_prefix("/api/w/workspace/drive/")
+            .unwrap();
+        Ok(if suffix == "capabilities" {
+            response(DriveCapabilities { write: true })
+        } else if suffix.starts_with("metadata?") {
+            response(&state.0)
+        } else if suffix.starts_with("read-text?") {
+            response(read_response(&state.0, &state.1))
+        } else if suffix == "mutate" {
+            let request: DriveMutationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            let DriveMutation::UpdateText {
+                id,
+                expected_mutation_id,
+                text,
+                ..
+            } = &request.mutation
+            else {
+                panic!("unexpected mutation")
+            };
+            assert_eq!(id, &state.0.entry);
+            assert_eq!(expected_mutation_id, &state.0.last_mutation_id);
+            state.1 = text.clone();
+            state.0.size = Some(text.len() as u32);
+            state.0.last_mutation_id = request.request_id.clone();
+            let output = response(DriveMutationResponse {
+                request_id: request.request_id.clone(),
+                entry: Some(state.0.clone()),
+            });
+            state.2.push(request);
+            output
+        } else {
+            panic!("unexpected request: {}", request.path)
+        })
+    }
+}
+
+#[tokio::test]
+async fn drive_common_edit_then_write_reuses_exact_post_operation_object_validator() {
+    use crate::file_operation::Contract;
+    use crate::wip::{WipMountRegistry, WipRuntime};
+    let entry = entry("2", "3");
+    let path = entry_path(&entry.entry);
+    let client = Arc::new(NativeMutations(Mutex::new((
+        entry,
+        "hello".into(),
+        Vec::new(),
+    ))));
+    let feature = DriveFeature::new(client.clone(), Arc::new(WorkdirSessionRouter::new()));
+    let mut mounts = WipMountRegistry::new();
+    wip::mount_drive_wip(&mut mounts, &feature).unwrap();
+    let runtime = WipRuntime::from_mounts(mounts, "drive-test".into()).unwrap();
+    runtime
+        .prepare_call_observations(path.clone(), true)
+        .await
+        .unwrap();
+    let edit = runtime
+        .call(
+            path.clone(),
+            Contract::Edit.reference(),
+            "edit".into(),
+            json!({"old_string":"hello","new_string":"updated"}),
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+    let edit: Value = serde_json::from_str(edit.content.as_deref().unwrap()).unwrap();
+    assert!(edit["metadata"]["entry"]["metadata"]["last_mutation_id"].is_string());
+    assert_eq!(client.0.lock().unwrap().1, "updated");
+    // No intervening Inspect/prepare_call_observations: success depends on the
+    // exact nonce-bound post-commit validator returned by the first operation.
+    let write = runtime
+        .call(
+            path,
+            Contract::Write.reference(),
+            "write".into(),
+            json!({"content":"final"}),
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+    let write: Value = serde_json::from_str(write.content.as_deref().unwrap()).unwrap();
+    assert!(write["metadata"]["entry"]["metadata"]["last_mutation_id"].is_string());
+    let state = client.0.lock().unwrap();
+    assert_eq!(state.1, "final");
+    assert_eq!(state.2.len(), 2);
+}
+
+#[tokio::test]
+async fn drive_argument_dependent_write_policy_is_rechecked_and_ask_is_not_published() {
+    use crate::file_operation::Contract;
+    use crate::wip::WipSubtreeProvider;
+    for (default_action, pattern, action, published, code) in [
+        (
+            manifest::ToolPermissionAction::Deny,
+            "*permitted*",
+            manifest::ToolPermissionAction::Allow,
+            true,
+            wip_protocol::ProtocolErrorCode::PermissionDenied,
+        ),
+        (
+            manifest::ToolPermissionAction::Allow,
+            "*",
+            manifest::ToolPermissionAction::Ask,
+            false,
+            wip_protocol::ProtocolErrorCode::OperationNotFound,
+        ),
+    ] {
+        let entry = entry("2", "3");
+        let client = Client::new(vec![response(entry.clone())]);
+        *client.capabilities.lock().unwrap() = response(DriveCapabilities { write: true });
+        let feature =
+            feature(client.clone()).with_permissions(Some(manifest::ToolPermissionConfig {
+                default_action,
+                rules: vec![manifest::ToolPermissionRule {
+                    tool: "DriveWrite".into(),
+                    pattern: pattern.into(),
+                    action,
+                }],
+            }));
+        let projection = wip::DriveProvider::new(feature)
+            .publication(&entry_path(&entry.entry))
+            .await
+            .unwrap()
+            .unwrap()
+            .projection;
+        assert_eq!(
+            projection
+                .object
+                .interfaces
+                .contains(&Contract::Write.reference()),
+            published
+        );
+        let result = projection
+            .handler
+            .call(
+                "write",
+                &native_args(json!({"content":"denied"})),
+                native_context(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(crate::wip::WipOperationError::Protocol(error)) if error.code == code)
+        );
+        assert_eq!(client.requests.lock().unwrap().len(), 2);
+    }
+}
+
+// A single retained Object observation models a restored Client cache. All later
+// publication and execution use the real new-mount provider; the new Host supplies
+// the common contract's root scope independently, without replaying its old ref.
+struct RetainedObjectOnce {
+    current: wip::DriveProvider,
+    retained: Mutex<Option<wip_protocol::Object>>,
+}
+#[async_trait]
+impl crate::wip::WipSubtreeProvider for RetainedObjectOnce {
+    async fn publication(
+        &self,
+        path: &str,
+    ) -> Result<Option<crate::wip::WipPublication>, wip_protocol::ProtocolError> {
+        let Some(mut publication) = self.current.publication(path).await? else {
+            return Ok(None);
+        };
+        if let Some(retained) = self.retained.lock().unwrap().take() {
+            publication.projection.object = retained;
+            publication = crate::wip::WipPublication::self_scoped(publication.projection)?;
+        }
+        Ok(Some(publication))
+    }
+    async fn children(&self, _: &str) -> Result<Vec<String>, wip_protocol::ProtocolError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn drive_same_feature_remount_rejects_retained_object_with_fresh_common_scope_then_reobservation_succeeds()
+ {
+    use crate::file_operation::Contract;
+    use crate::wip::{WipMountRegistry, WipRuntime, WipSubtreeMount, WipSubtreeProvider};
+    let entry = entry("2", "3");
+    let path = entry_path(&entry.entry);
+    let client = Arc::new(NativeMutations(Mutex::new((
+        entry,
+        "hello".into(),
+        Vec::new(),
+    ))));
+    let feature = DriveFeature::new(client.clone(), Arc::new(WorkdirSessionRouter::new()));
+    // mount_drive_wip constructs exactly one of these providers per mount. Reuse
+    // the same Feature, whose mutation request identity deliberately does not rotate.
+    let first = wip::DriveProvider::new(feature.clone());
+    let old = first.publication(&path).await.unwrap().unwrap().projection;
+    let cloned = first
+        .clone()
+        .publication(&path)
+        .await
+        .unwrap()
+        .unwrap()
+        .projection;
+    assert_eq!(old.object.validator, cloned.object.validator);
+    let second = wip::DriveProvider::new(feature.clone());
+    let current = second.publication(&path).await.unwrap().unwrap().projection;
+    assert_ne!(old.object.validator, current.object.validator);
+    let mut old_contract = old.clone();
+    let mut current_contract = current.clone();
+    assert!(crate::file_operation::select(
+        &mut old_contract,
+        &Contract::ReadLines.reference()
+    ));
+    assert!(crate::file_operation::select(
+        &mut current_contract,
+        &Contract::ReadLines.reference()
+    ));
+    assert_eq!(old_contract.interface, current_contract.interface);
+    assert_eq!(old_contract.descriptor, current_contract.descriptor);
+    assert_eq!(
+        old_contract.interface_validator,
+        current_contract.interface_validator
+    );
+
+    // Mount only the selected entry for this cache-restoration fixture. The real
+    // Host still selects the root common contract and validates target membership,
+    // scope_ref and Object/Interface validators before running the Drive handler.
+    let mut mounts = WipMountRegistry::new();
+    mounts.allocate_namespace("drive", "drive").unwrap();
+    mounts.mount(current).unwrap();
+    mounts
+        .mount_subtree(WipSubtreeMount {
+            root: path.clone(),
+            provider: Arc::new(RetainedObjectOnce {
+                current: second,
+                retained: Mutex::new(Some(old.object)),
+            }),
+        })
+        .unwrap();
+    let runtime = WipRuntime::from_mounts(mounts, "drive-remount".into()).unwrap();
+    runtime.inspect(path.clone(), true).await.unwrap();
+    let interface_path = format!(
+        "{}::{}",
+        serde_json::to_string("/").unwrap(),
+        serde_json::to_string(&Contract::ReadLines.reference().name).unwrap()
+    );
+    // This fetch obtains the *new* Host's root scope_ref and the unchanged common
+    // Interface validator; only the retained target observation remains stale.
+    runtime.inspect(interface_path, true).await.unwrap();
+    let error = runtime
+        .call(
+            path.clone(),
+            Contract::ReadLines.reference(),
+            "read".into(),
+            json!({}),
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ValidatorMismatch"), "{error}");
+    assert!(!error.contains("InterfaceMismatch"), "{error}");
+    runtime.inspect(path.clone(), true).await.unwrap();
+    let result = runtime
+        .call(
+            path,
+            Contract::ReadLines.reference(),
+            "read".into(),
+            json!({}),
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+    let result: Value = serde_json::from_str(result.content.as_deref().unwrap()).unwrap();
+    assert!(result["content"].as_str().unwrap().contains("hello"));
+    assert!(client.0.lock().unwrap().2.is_empty());
 }

@@ -12534,6 +12534,14 @@ impl server_api::ServerApi for ServerApiContractService {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
         drive::root(api, &context, &workspace_id).await
     }
+    async fn drive_capabilities(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::DriveCapabilities, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive::capabilities(api, &context, &workspace_id).await
+    }
     async fn drive_metadata(
         &self,
         context: server_api::ServerRequestContext,
