@@ -7131,6 +7131,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn create_browser_session(&self, record: &BrowserSessionRecord) -> Result<()> {
         self.with_immediate_transaction(|conn| {
             activation::require_active(conn, &record.user_id)?;
+            // Retain the real row throughout the non-authenticating recovery window, not
+            // forever. Issuance amortizes reclamation without extending marker lifetime or
+            // introducing another store/scheduler. Inactive stores do not grow between issues.
+            let cutoff = (chrono::Utc::now()
+                - chrono::Duration::seconds(crate::auth::SESSION_EXPIRY_GRACE_SECONDS))
+                .to_rfc3339();
+            conn.execute(
+                "DELETE FROM browser_sessions WHERE julianday(expires_at) <= julianday(?1) OR julianday(expires_at) IS NULL",
+                params![cutoff],
+            )?;
             conn.execute(
                 r#"INSERT INTO browser_sessions (session_id, token_hash, user_id, created_at, expires_at, revoked_at)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,

@@ -505,13 +505,7 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
         }
     }
 
-    async fn start_command(
-        &self,
-        mut request: CommandRequest,
-    ) -> Result<CommandHandle, WorkdirError> {
-        // `spill_dir` belongs to the Worker host running BashTool. This remote
-        // WorkdirSession provider cannot safely resolve or write that host path.
-        request.spill_dir = None;
+    async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
         match self.operate(WorkdirSessionOperation::CommandStart(request))? {
             WorkdirSessionOperationResult::CommandStart(result) => Ok(result),
             _ => Err(Self::mismatch("command_start")),
@@ -1660,9 +1654,9 @@ mod tests {
             .start_command(CommandRequest {
                 command: "true".to_string(),
                 timeout_secs: 120,
-                output_limit: 1024,
+
+                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
                 cwd: workdir::WorkdirPath::root(),
-                spill_dir: Some("/worker-local/bash-output".into()),
                 tool_call_id: Some("call-1".to_string()),
             })
             .await
@@ -1675,7 +1669,7 @@ mod tests {
         assert_eq!(body["operation"]["operation"], "command_start");
         assert_eq!(body["operation"]["request"]["command"], "true");
         assert_eq!(body["operation"]["request"]["cwd"], "");
-        assert!(body["operation"]["request"]["spill_dir"].is_null());
+        assert!(body["operation"]["request"].get("spill_dir").is_none());
         assert_eq!(body["operation"]["request"]["tool_call_id"], "call-1");
         assert!(
             !requests[0]
@@ -1942,9 +1936,9 @@ mod tests {
             .start_command(CommandRequest {
                 command: "printf done".to_string(),
                 timeout_secs: 5,
-                output_limit: 1024,
+
+                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
                 cwd: workdir::WorkdirPath::root(),
-                spill_dir: None,
                 tool_call_id: None,
             })
             .await

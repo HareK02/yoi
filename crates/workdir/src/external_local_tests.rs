@@ -1,6 +1,9 @@
+#[cfg(test)]
+use crate::command_test_support::CollectCommand as _;
 use crate::http::{
     WorkdirSessionOperation, WorkdirSessionOperationResult, dispatch_workdir_session_operation,
 };
+
 use crate::{
     BoundedReadLimits, CommandOutputRequest, CommandRequest, EditRequest, ExternalWorkdirRoot,
     GlobRequest, GrepOutputMode, GrepRequest, LocalWorkdirSession, ReadRequest, Workdir,
@@ -59,11 +62,12 @@ async fn external_local_provider_is_strictly_read_only() {
     let command = WorkdirSession::start_command(
         &session,
         CommandRequest {
+            transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
             command: "echo changed > item.txt".to_string(),
             timeout_secs: 1,
-            output_limit: 1024,
+
             cwd: WorkdirPath::root(),
-            spill_dir: None,
+
             tool_call_id: None,
         },
     )
@@ -145,11 +149,12 @@ async fn external_local_provider_read_write_is_filesystem_only() {
     let command = WorkdirSession::start_command(
         &session,
         CommandRequest {
+            transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
             command: "touch command-ran".to_string(),
             timeout_secs: 1,
-            output_limit: 1024,
+
             cwd: WorkdirPath::root(),
-            spill_dir: None,
+
             tool_call_id: None,
         },
     )
@@ -193,17 +198,18 @@ async fn external_command_permission_is_explicit_and_independent_from_file_acces
 
     let handle = session
         .start_command(CommandRequest {
+            transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
             command: "printf command-ok".to_string(),
             timeout_secs: 5,
-            output_limit: 1024,
+
             cwd: WorkdirPath::root(),
-            spill_dir: None,
+
             tool_call_id: None,
         })
         .await
         .unwrap();
     let output = session
-        .command_output(CommandOutputRequest {
+        .collect_command_output(CommandOutputRequest {
             handle,
             cursor: 0,
             limit: 1024,

@@ -4108,6 +4108,17 @@ impl RequestActor {
 #[serde(deny_unknown_fields)]
 pub struct WhoamiResponse {
     pub actor: Option<RequestActor>,
+    pub session: BrowserSessionState,
+}
+
+/// Browser navigation evidence, not an authorization grant or a generic 401 classification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrowserSessionState {
+    Anonymous {},
+    Authenticated { expires_at: Option<String> },
+    Expired {},
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -11620,6 +11631,7 @@ pub fn auth_api_typescript() -> String {
         ActorAuthMethod::decl(&config),
         AuthenticatedUser::decl(&config),
         RequestActor::decl(&config),
+        BrowserSessionState::decl(&config),
         WhoamiResponse::decl(&config),
         AuthBootstrapUserRequest::decl(&config),
         AuthUserResponse::decl(&config),
@@ -14050,7 +14062,8 @@ mod tests {
                 "handle": "hare",
                 "display_name": "Hare",
                 "auth_method": "browser_session"
-            }
+            },
+            "session": { "kind": "authenticated", "expires_at": "2026-10-20T00:00:00Z" }
         });
         let decoded = serde_json::from_value::<WhoamiResponse>(whoami.clone())
             .expect("server whoami fixture should match shared DTO");
@@ -14232,9 +14245,34 @@ mod tests {
 
         let unexpected_field = serde_json::json!({
             "actor": null,
+            "session": { "kind": "anonymous" },
             "access_token": "must-not-be-accepted"
         });
         assert!(serde_json::from_value::<WhoamiResponse>(unexpected_field).is_err());
+    }
+
+    #[test]
+    fn whoami_session_json_distinguishes_anonymous_expired_and_token_auth() {
+        for session in [
+            serde_json::json!({"kind":"anonymous"}),
+            serde_json::json!({"kind":"expired"}),
+            serde_json::json!({"kind":"authenticated", "expires_at":null}),
+        ] {
+            let value = serde_json::json!({"actor":null, "session":session});
+            let response: WhoamiResponse = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(response).unwrap(), value);
+        }
+        for session in [
+            serde_json::json!({"kind":"unknown"}),
+            serde_json::json!({"kind":"expired", "expires_at":null}),
+        ] {
+            assert!(
+                serde_json::from_value::<WhoamiResponse>(
+                    serde_json::json!({"actor":null, "session":session})
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

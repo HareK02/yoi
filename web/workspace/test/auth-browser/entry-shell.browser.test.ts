@@ -48,7 +48,7 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
       },
     ],
     `${root}/tools/web-ux/scenarios/anonymous-entry.json`,
-    `${root}/target/web-ux/entry-browser/processes`,
+    `${root}/target/web-ux/t767-validation/entry-browser/processes`,
     [],
   );
   try {
@@ -230,16 +230,8 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
               ];
               await page.getByRole("button", { name: "Log out", exact: true })
                 .click();
-              await page.getByRole("button", { name: "Log in with passkey" })
-                .waitFor();
-              retainedCounts.push(
-                await page.locator(".workspace-alert").count(),
-              );
-              await page.getByRole("link", {
-                name: "Dashboard / Workspaces",
-                exact: true,
-              }).click();
               await ready(page, "Log in");
+              assertEquals(new URL(page.url()).pathname, "/");
               retainedCounts.push(
                 await page.locator(".workspace-alert").count(),
               );
@@ -253,8 +245,11 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
               await page.getByRole("link", { name: "Yoi home", exact: true })
                 .click();
               await ready(page, "Log in");
+              retainedCounts.push(
+                await page.locator(".workspace-alert").count(),
+              );
               const folder =
-                `${root}/target/web-ux/entry-browser/private-alerts-${colorScheme}-${width}`;
+                `${root}/target/web-ux/t767-validation/entry-browser/private-alerts-${colorScheme}-${width}`;
               await Deno.mkdir(folder, { recursive: true });
               const bytes = await page.screenshot({
                 path: folder + "/viewport.png",
@@ -281,7 +276,7 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
                 JSON.stringify(
                   {
                     scenario:
-                      "Workspace Stop notification → Account logout → dashboard/login → public home (SPA)",
+                      "Workspace Stop notification → Account logout → public home → login → public home (SPA)",
                     boundary:
                       "synthetic HTTP and Worker subscription; production UI/router/store",
                     path: new URL(page.url()).pathname,
@@ -590,13 +585,19 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
                       display_name: "Alice",
                       auth_method: "browser_session",
                     },
+                    session: {
+                      kind: "authenticated",
+                      expires_at: "2099-01-01T00:00:00Z",
+                    },
                   },
                 });
               });
               await page.evaluate(() =>
                 window.dispatchEvent(new Event("focus"))
               );
-              await page.getByText("Loading session…", { exact: true })
+              await page.getByRole("status").filter({
+                hasText: "Loading session…",
+              })
                 .waitFor();
               const completed = page.waitForResponse((response) =>
                 response.request().method() === "POST" &&
@@ -611,9 +612,10 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
                 )
               );
               assertEquals(new URL(page.url()).pathname, "/dashboard");
+              // 確認中のsubtreeは副作用の結果を保持したままhidden/inertになる。
               assertEquals(
-                await page.getByLabel("Workspace display name").count(),
-                0,
+                await page.getByLabel("Workspace display name").isVisible(),
+                false,
               );
               releaseSession();
               const link = page.getByRole("link", {
@@ -630,7 +632,7 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
                 0,
               );
               const folder =
-                `${root}/target/web-ux/entry-browser/confirmed-${colorScheme}-${width}`;
+                `${root}/target/web-ux/t767-validation/entry-browser/confirmed-${colorScheme}-${width}`;
               await Deno.mkdir(folder, { recursive: true });
               const bytes = await page.screenshot({
                 path: folder + "/viewport.png",

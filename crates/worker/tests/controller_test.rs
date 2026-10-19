@@ -323,8 +323,7 @@ async fn spawn_controller(worker: Worker<MockClient, TestStore>) -> WorkerHandle
     let tmp = tempfile::tempdir().unwrap();
     let runtime_base = tmp.path().to_owned();
     std::mem::forget(tmp);
-    let bash_output_dir = runtime_base.join("bash-output");
-    let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base, &bash_output_dir)
+    let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
         .await
         .unwrap();
     handle
@@ -354,13 +353,9 @@ async fn canonical_worker_handle_uploads_and_submits_attachment() {
     )
     .await
     .unwrap();
-    let (handle, shutdown_rx) = WorkerController::spawn(
-        worker,
-        &root.path().join("runtime"),
-        &root.path().join("bash-output"),
-    )
-    .await
-    .unwrap();
+    let (handle, shutdown_rx) = WorkerController::spawn(worker, &root.path().join("runtime"))
+        .await
+        .unwrap();
     let mut rx = handle.subscribe();
     let file = handle
         .upload_file_with_context(
@@ -420,24 +415,20 @@ async fn canonical_worker_handle_uploads_and_submits_attachment() {
 }
 
 #[tokio::test]
-async fn controller_grants_read_scope_for_exact_bash_output_directory() {
+async fn controller_does_not_grant_or_create_a_model_visible_bash_output_directory() {
     let worker = make_worker(MockClient::new(simple_text_events())).await;
     let shared_scope = worker.scope().clone();
     let runtime_base = tempfile::tempdir().unwrap();
-    let worker_tmp = tempfile::tempdir().unwrap();
-    let bash_output_dir = worker_tmp.path().join("worker-1").join("bash-output");
+    let original_rules = shared_scope.snapshot().allow_rules().to_vec();
 
-    let (handle, shutdown_rx) =
-        WorkerController::spawn(worker, runtime_base.path(), &bash_output_dir)
-            .await
-            .unwrap();
+    let (handle, shutdown_rx) = WorkerController::spawn(worker, runtime_base.path())
+        .await
+        .unwrap();
 
-    assert!(bash_output_dir.is_dir());
-    assert!(shared_scope.snapshot().allow_rules().iter().any(|rule| {
-        rule.target == bash_output_dir
-            && rule.permission == manifest::Permission::Read
-            && rule.recursive
-    }));
+    assert_eq!(
+        shared_scope.snapshot().allow_rules(),
+        original_rules.as_slice()
+    );
     assert!(!handle.runtime_dir.path().join("bash-output").exists());
 
     handle
@@ -463,9 +454,9 @@ async fn shutdown_closes_bound_workdir_session() {
         .start_command(CommandRequest {
             command: "sleep 30".to_owned(),
             timeout_secs: 60,
-            output_limit: 1024,
+
+            transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
             cwd: workdir::WorkdirPath::root(),
-            spill_dir: None,
             tool_call_id: None,
         })
         .await
@@ -473,11 +464,9 @@ async fn shutdown_closes_bound_workdir_session() {
     worker.bind_single_workdir_session(Some(Arc::clone(&session)));
 
     let runtime_base = tempfile::tempdir().unwrap();
-    let bash_output_dir = runtime_base.path().join("bash-output");
-    let (handle, shutdown_rx) =
-        WorkerController::spawn(worker, runtime_base.path(), &bash_output_dir)
-            .await
-            .unwrap();
+    let (handle, shutdown_rx) = WorkerController::spawn(worker, runtime_base.path())
+        .await
+        .unwrap();
     handle
         .send(Method::Shutdown {
             command: worker_command(&handle),
@@ -513,9 +502,9 @@ async fn controller_filters_workdir_command_not_owned_by_worker() {
         .start_command(CommandRequest {
             command: "sleep 0.2".to_owned(),
             timeout_secs: 5,
-            output_limit: 1024,
+
+            transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
             cwd: workdir::WorkdirPath::root(),
-            spill_dir: None,
             tool_call_id: Some("foreign-tool-call".into()),
         })
         .await
@@ -541,7 +530,10 @@ async fn controller_filters_workdir_command_not_owned_by_worker() {
         })
         .await
         .unwrap();
-    assert_eq!(output.status, workdir::CommandStatus::Completed);
+    assert_eq!(
+        output.terminal.unwrap().status,
+        workdir::CommandStatus::Completed
+    );
     handle
         .send(Method::Shutdown {
             command: worker_command(&handle),
@@ -750,9 +742,8 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
     let invalid_runtime_base = runtime_base.path().join("not-a-directory");
     std::fs::write(&invalid_runtime_base, "file").unwrap();
 
-    let bash_output_dir = runtime_base.path().join("bash-output");
     assert!(
-        WorkerController::spawn(worker, &invalid_runtime_base, &bash_output_dir)
+        WorkerController::spawn(worker, &invalid_runtime_base)
             .await
             .is_err()
     );
@@ -761,9 +752,9 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
             .start_command(CommandRequest {
                 command: "printf unreachable".to_owned(),
                 timeout_secs: 5,
-                output_limit: 1024,
+
+                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
                 cwd: workdir::WorkdirPath::root(),
-                spill_dir: None,
                 tool_call_id: None,
             })
             .await,
@@ -1571,8 +1562,7 @@ permission = "write"
     let client = MockClient::new(simple_text_events());
     let worker = make_worker_with_pwd_and_manifest(client, manifest).await.0;
     let tmp = tempfile::tempdir().unwrap();
-    let bash_output_dir = tmp.path().join("bash-output");
-    let result = WorkerController::spawn(worker, tmp.path(), &bash_output_dir).await;
+    let result = WorkerController::spawn(worker, tmp.path()).await;
     assert!(
         result.is_ok(),
         "feature exposure must not imply delegation authority"
@@ -2945,11 +2935,9 @@ async fn status_json_reflects_worker_name() {
 async fn shutdown_closes_method_admission_before_terminal_confirmation() {
     let worker = make_worker(MockClient::new(simple_text_events())).await;
     let runtime_base = tempfile::tempdir().unwrap();
-    let bash_output_dir = runtime_base.path().join("bash-output");
-    let (handle, mut shutdown_rx) =
-        WorkerController::spawn(worker, runtime_base.path(), &bash_output_dir)
-            .await
-            .unwrap();
+    let (handle, mut shutdown_rx) = WorkerController::spawn(worker, runtime_base.path())
+        .await
+        .unwrap();
     handle
         .send(Method::Shutdown {
             command: worker_command(&handle),
@@ -2984,11 +2972,9 @@ async fn shutdown_joins_socket_server_with_active_connection() {
 
     let worker = make_worker(MockClient::new(simple_text_events())).await;
     let runtime_base = tempfile::tempdir().unwrap();
-    let bash_output_dir = runtime_base.path().join("bash-output");
-    let (handle, shutdown_rx) =
-        WorkerController::spawn(worker, runtime_base.path(), &bash_output_dir)
-            .await
-            .unwrap();
+    let (handle, shutdown_rx) = WorkerController::spawn(worker, runtime_base.path())
+        .await
+        .unwrap();
     let socket_path = handle.runtime_dir.socket_path();
     let _connection = UnixStream::connect(&socket_path).await.unwrap();
 

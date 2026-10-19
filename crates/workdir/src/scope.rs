@@ -10,6 +10,9 @@
 //! provider-side before name enumeration, descent, or content reads. Returned coordinates are not
 //! prefixed with cwd again.
 
+#[cfg(test)]
+use crate::command_test_support::CollectCommand as _;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -124,6 +127,7 @@ impl WorkdirToolBroker {
             next_lease_id: AtomicU64::new(1),
             close_lock: Arc::new(tokio::sync::Mutex::new(())),
             owned_commands: Arc::new(Mutex::new(HashSet::new())),
+            command_reads: Mutex::new(HashMap::new()),
             pending_command_events: Arc::new(Mutex::new(HashMap::new())),
             starting_tool_calls: Arc::new(Mutex::new(HashSet::new())),
             forwarded_starts: Arc::new(Mutex::new(HashSet::new())),
@@ -230,25 +234,48 @@ impl WorkdirScopeLease {
                 .source
                 .cancel_command(handle.clone())
                 .await;
-            let terminal = self
+            let read_cursor = self
                 .broker
                 .authority
-                .source
-                .command_output(CommandOutputRequest {
-                    handle,
-                    cursor: 0,
-                    limit: 1,
-                    wait: true,
-                })
-                .await;
+                .command_reads
+                .lock()
+                .expect("command cursor mutex poisoned")
+                .get(&command_id)
+                .cloned()
+                .expect("owned command cursor");
+            let mut read_cursor = read_cursor.lock().await;
+            let mut cursor = *read_cursor;
+            let terminal = loop {
+                let output = self
+                    .broker
+                    .authority
+                    .source
+                    .command_output(CommandOutputRequest {
+                        handle: handle.clone(),
+                        cursor,
+                        limit: crate::MAX_COMMAND_READ_BYTES,
+                        wait: true,
+                    })
+                    .await;
+                match output {
+                    Ok(output) => {
+                        cursor = output.next_cursor;
+                        *read_cursor = cursor;
+                        if let Some(terminal) = output.terminal {
+                            break Ok(terminal);
+                        }
+                    }
+                    Err(error) => break Err(error),
+                }
+            };
             match (cancel, terminal) {
                 (_, Ok(output)) => {
                     self.broker.authority.publish_terminal_if_missing(
                         &command_id,
                         output.status,
                         output.exit_code,
-                        output.next_cursor.unwrap_or(output.content.len()) as u64,
-                        &output.content,
+                        cursor,
+                        "",
                     );
                     self.broker
                         .authority
@@ -582,7 +609,12 @@ struct ScopedWorkdirSession {
     scope_lock: tokio::sync::Mutex<()>,
     next_lease_id: AtomicU64,
     close_lock: Arc<tokio::sync::Mutex<()>>,
+    // Live cleanup responsibility ends at terminal delivery. Read ownership is
+    // retained separately so a lost terminal response can still be replayed.
     owned_commands: Arc<Mutex<HashSet<String>>>,
+    // Starting commands prunes completed entries at the bounded replay ceiling;
+    // current scope validity is still checked before every read or retry.
+    command_reads: Mutex<HashMap<String, Arc<tokio::sync::Mutex<u64>>>>,
     pending_command_events: Arc<Mutex<HashMap<String, Vec<CommandEvent>>>>,
     starting_tool_calls: Arc<Mutex<HashSet<String>>>,
     forwarded_starts: Arc<Mutex<HashSet<String>>>,
@@ -700,6 +732,11 @@ impl ScopedWorkdirSession {
                 .lock()
                 .expect("scoped command set mutex poisoned")
                 .contains(&handle.0)
+            || self
+                .command_reads
+                .lock()
+                .expect("command cursor mutex poisoned")
+                .contains_key(&handle.0)
         {
             Ok(())
         } else {
@@ -1013,6 +1050,7 @@ impl ScopedWorkdirSession {
             next_lease_id: AtomicU64::new(1),
             close_lock: close_lock.clone(),
             owned_commands,
+            command_reads: Mutex::new(HashMap::new()),
             pending_command_events,
             starting_tool_calls,
             forwarded_starts,
@@ -1410,6 +1448,16 @@ impl WorkdirSession for ScopedWorkdirSession {
             .lock()
             .expect("scoped command set mutex poisoned");
         owned.insert(handle.0.clone());
+        {
+            let mut reads = self
+                .command_reads
+                .lock()
+                .expect("command cursor mutex poisoned");
+            if reads.len() >= 64 {
+                reads.retain(|id, _| owned.contains(id));
+            }
+            reads.insert(handle.0.clone(), Arc::new(tokio::sync::Mutex::new(0)));
+        }
         if let Some(tool_call_id) = &tool_call_id {
             self.starting_tool_calls
                 .lock()
@@ -1460,14 +1508,28 @@ impl WorkdirSession for ScopedWorkdirSession {
     ) -> Result<CommandOutput, WorkdirError> {
         self.ensure_owned_command(&request.handle)?;
         let command_id = request.handle.0.clone();
+        let read_cursor = self
+            .command_reads
+            .lock()
+            .expect("command cursor mutex poisoned")
+            .get(&command_id)
+            .cloned();
+        let mut read_cursor = match &read_cursor {
+            Some(cursor) => Some(cursor.lock().await),
+            None => None,
+        };
+        self.ensure_owned_command(&request.handle)?;
         let output = self.source.command_output(request).await?;
-        if !matches!(output.status, CommandStatus::Running) {
+        if let Some(cursor) = &mut read_cursor {
+            **cursor = output.next_cursor;
+        }
+        if let Some(terminal) = &output.terminal {
             self.publish_terminal_if_missing(
                 &command_id,
-                output.status,
-                output.exit_code,
-                output.next_cursor.unwrap_or(output.content.len()) as u64,
-                &output.content,
+                terminal.status,
+                terminal.exit_code,
+                output.next_cursor,
+                "",
             );
             self.owned_commands
                 .lock()
@@ -2083,20 +2145,21 @@ mod tests {
         session: &WorkdirSessionHandle,
         command: impl Into<String>,
         tool_call_id: impl Into<String>,
-    ) -> CommandOutput {
+    ) -> crate::command_test_support::CollectedCommand {
         let handle = session
             .start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: command.into(),
                 timeout_secs: 5,
-                output_limit: 1024,
+
                 cwd: FsPath::root(),
-                spill_dir: None,
+
                 tool_call_id: Some(tool_call_id.into()),
             })
             .await
             .unwrap();
         session
-            .command_output(CommandOutputRequest {
+            .collect_command_output(CommandOutputRequest {
                 handle,
                 cursor: 0,
                 limit: 1024,
@@ -2115,11 +2178,12 @@ mod tests {
             .expect("delegation wrapper must preserve command observation");
         let handle = parent
             .start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "printf ready; sleep 0.2; printf done".into(),
                 timeout_secs: 5,
-                output_limit: 1024,
+
                 cwd: FsPath::root(),
-                spill_dir: None,
+
                 tool_call_id: Some("tool-delegated".into()),
             })
             .await
@@ -2142,7 +2206,7 @@ mod tests {
         assert_eq!(snapshots[0].stdout.content, "ready");
 
         let output = parent
-            .command_output(CommandOutputRequest {
+            .collect_command_output(CommandOutputRequest {
                 handle,
                 cursor: 0,
                 limit: 1024,
@@ -2182,11 +2246,12 @@ mod tests {
         );
         let error = child
             .start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "pwd".into(),
                 timeout_secs: 5,
-                output_limit: 1024,
+
                 cwd: FsPath::root(),
-                spill_dir: None,
+
                 tool_call_id: None,
             })
             .await
@@ -2214,11 +2279,12 @@ mod tests {
 
         let handle = first
             .start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "pwd; sleep 0.2".into(),
                 timeout_secs: 5,
-                output_limit: 4096,
+
                 cwd: FsPath::root(),
-                spill_dir: None,
+
                 tool_call_id: Some("first-command".into()),
             })
             .await
@@ -2242,7 +2308,7 @@ mod tests {
         ));
 
         let output = first
-            .command_output(CommandOutputRequest {
+            .collect_command_output(CommandOutputRequest {
                 handle,
                 cursor: 0,
                 limit: 4096,
@@ -2319,11 +2385,12 @@ mod tests {
         assert!(matches!(
             child
                 .start_command(CommandRequest {
+                    transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                     command: "printf denied".into(),
                     timeout_secs: 5,
-                    output_limit: 1024,
+
                     cwd: FsPath::root(),
-                    spill_dir: None,
+
                     tool_call_id: Some("read-only-command".into()),
                 })
                 .await,
@@ -2625,11 +2692,12 @@ mod tests {
         assert!(matches!(
             child
                 .start_command(CommandRequest {
+                    transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                     command: "printf revoked".into(),
                     timeout_secs: 5,
-                    output_limit: 1024,
+
                     cwd: FsPath::root(),
-                    spill_dir: None,
+
                     tool_call_id: Some("revoked-child-command".into()),
                 })
                 .await,
@@ -2727,11 +2795,12 @@ mod tests {
         for index in 0..MAX_SCOPED_COMMANDS {
             child
                 .start_command(CommandRequest {
+                    transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                     command: "sleep 30".into(),
                     timeout_secs: 60,
-                    output_limit: 1024,
+
                     cwd: FsPath::root(),
-                    spill_dir: None,
+
                     tool_call_id: Some(format!("command-{index}")),
                 })
                 .await
@@ -2740,11 +2809,12 @@ mod tests {
 
         let error = child
             .start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "sleep 30".into(),
                 timeout_secs: 60,
-                output_limit: 1024,
+
                 cwd: FsPath::root(),
-                spill_dir: None,
+
                 tool_call_id: Some("command-over-limit".into()),
             })
             .await
@@ -2774,11 +2844,12 @@ mod tests {
         let command = tokio::spawn(async move {
             command_child
                 .start_command(CommandRequest {
+                    transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                     command: "sleep 30".into(),
                     timeout_secs: 60,
-                    output_limit: 1024,
+
                     cwd: FsPath::root(),
-                    spill_dir: None,
+
                     tool_call_id: Some("racing-command".into()),
                 })
                 .await
@@ -2820,11 +2891,12 @@ mod tests {
         let mut events = child.subscribe_command_events().unwrap();
         let handle = child
             .start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "sleep 30; printf leaked > marker".into(),
                 timeout_secs: 60,
-                output_limit: 1024,
+
                 cwd: FsPath::root(),
-                spill_dir: None,
+
                 tool_call_id: Some("owned-command".into()),
             })
             .await
@@ -3015,11 +3087,12 @@ mod tests {
         assert!(matches!(
             parent
                 .start_command(CommandRequest {
+                    transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                     command: "printf closed".into(),
                     timeout_secs: 5,
-                    output_limit: 1024,
+
                     cwd: FsPath::root(),
-                    spill_dir: None,
+
                     tool_call_id: Some("closed-parent-command".into()),
                 })
                 .await,
@@ -3030,5 +3103,181 @@ mod tests {
             matches!(child_result, Err(WorkdirError::SessionClosed)),
             "child result after parent close: {child_result:?}"
         );
+    }
+    #[tokio::test]
+    async fn scoped_byte_cursor_survives_partial_ack_then_revocation_and_terminal_retry() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir(root.path().join("child")).unwrap();
+        let parent = session(root.path());
+        let child = parent
+            .scope(request("child", WorkdirToolScopePermission::Write))
+            .await
+            .unwrap();
+        let tool = child.tool_session();
+        let handle = tool
+            .start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
+                command: "printf ready; exec yes x".into(),
+                timeout_secs: 10,
+                cwd: FsPath::root(),
+                tool_call_id: None,
+            })
+            .await
+            .unwrap();
+        let mut cursor = 0;
+        for _ in 0..2 {
+            let page = tool
+                .command_output(CommandOutputRequest {
+                    handle: handle.clone(),
+                    cursor,
+                    limit: 1,
+                    wait: true,
+                })
+                .await
+                .unwrap();
+            cursor = page.next_cursor;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), child.close())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tool.command_output(CommandOutputRequest {
+                handle,
+                cursor,
+                limit: 1,
+                wait: false
+            })
+            .await
+            .is_err()
+        );
+        let handle = parent
+            .start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
+                command: "printf parent".into(),
+                timeout_secs: 5,
+                cwd: FsPath::root(),
+                tool_call_id: None,
+            })
+            .await
+            .unwrap();
+        let mut cursor = 0;
+        loop {
+            let request = CommandOutputRequest {
+                handle: handle.clone(),
+                cursor,
+                limit: 1024,
+                wait: true,
+            };
+            let page = parent.command_output(request.clone()).await.unwrap();
+            assert_eq!(parent.command_output(request).await.unwrap(), page);
+            cursor = page.next_cursor;
+            if page.terminal.is_some() {
+                break;
+            }
+        }
+    }
+    #[tokio::test]
+    async fn scoped_terminal_response_loss_replays_without_duplicate_capture_and_rejects_invalid_cursors()
+     {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let root = TempDir::new().unwrap();
+            fs::create_dir(root.path().join("child")).unwrap();
+            let parent = session(root.path());
+            let child = parent
+                .scope(request("child", WorkdirToolScopePermission::Write))
+                .await
+                .unwrap();
+            let tool = child.tool_session();
+            let handle = tool
+                .start_command(CommandRequest {
+                    transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
+                    command: "printf abcdef".into(),
+                    timeout_secs: 5,
+                    cwd: FsPath::root(),
+                    tool_call_id: None,
+                })
+                .await
+                .unwrap();
+            let mut cursor = 0;
+            let mut captured = Vec::new();
+            let terminal_request = loop {
+                let request = CommandOutputRequest {
+                    handle: handle.clone(),
+                    cursor,
+                    limit: 2,
+                    wait: true,
+                };
+                // Simulate losing each produced HTTP response, including terminal:
+                // append only the retried page, never both copies.
+                let lost = tool.command_output(request.clone()).await.unwrap();
+                let replay = tool.command_output(request.clone()).await.unwrap();
+                assert_eq!(replay, lost);
+                for chunk in &replay.chunks {
+                    captured.extend_from_slice(&chunk.bytes);
+                }
+                cursor = replay.next_cursor;
+                if let Some(terminal) = replay.terminal {
+                    assert_eq!(terminal.status, CommandStatus::Completed);
+                    break request;
+                }
+            };
+            assert_eq!(captured, b"abcdef");
+            assert!(
+                !child
+                    .broker
+                    .authority
+                    .owned_commands
+                    .lock()
+                    .unwrap()
+                    .contains(&handle.0)
+            );
+            assert!(
+                child
+                    .broker
+                    .authority
+                    .command_reads
+                    .lock()
+                    .unwrap()
+                    .contains_key(&handle.0)
+            );
+            assert_eq!(
+                tool.command_status(handle.clone()).await.unwrap(),
+                CommandStatus::Completed
+            );
+            for invalid in [0, cursor + 1] {
+                assert!(
+                    tool.command_output(CommandOutputRequest {
+                        handle: handle.clone(),
+                        cursor: invalid,
+                        limit: 2,
+                        wait: false
+                    })
+                    .await
+                    .is_err()
+                );
+            }
+            // Invalid cursor requests do not destroy the retained terminal page.
+            assert!(
+                tool.command_output(terminal_request)
+                    .await
+                    .unwrap()
+                    .terminal
+                    .is_some()
+            );
+            child.close().await.unwrap();
+            assert!(
+                tool.command_output(CommandOutputRequest {
+                    handle,
+                    cursor,
+                    limit: 2,
+                    wait: false
+                })
+                .await
+                .is_err()
+            );
+        })
+        .await
+        .expect("bounded scoped terminal replay");
     }
 }

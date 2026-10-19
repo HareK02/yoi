@@ -21,6 +21,7 @@ Deno.test("deferred load returns before API completion and snapshots navigation 
   const api = gate<string>();
   const event = {
     params: { id: "first" },
+    parent: async () => ({}),
     url: new URL("https://example.test/first?q=old"),
   };
   const load = deferPage(async ({ params, url }: typeof event) => ({
@@ -54,9 +55,12 @@ Deno.test("deferred redirects and HTTP failures are handled results, not unhandl
       ],
     ] as const
   ) {
-    const load = deferPage((_event: { params: {}; url: URL }) => run());
+    const load = deferPage((
+      _event: { params: {}; url: URL; parent: () => Promise<unknown> },
+    ) => run());
     const result = await load({
       params: {},
+      parent: async () => ({}),
       url: new URL("https://example.test/"),
     }).deferredPage;
     assert(
@@ -93,4 +97,40 @@ Deno.test("resolved data preserves page overrides without waiting for the global
       result.data.workspace.name === "team" && result.data.ticket === "T-1" &&
       result.data.workspaceId === "team",
   );
+});
+
+Deno.test("private deferred loader starts only after parent admission and never on parent failure", async () => {
+  for (const outcome of ["admit", "anonymous", "expired", "error"] as const) {
+    const admission = gate<void>();
+    let calls = 0;
+    const load = deferPage(
+      async (
+        _event: { params: {}; url: URL; parent: () => Promise<unknown> },
+      ) => {
+        ++calls;
+        return {};
+      },
+    );
+    const result = load({
+      params: {},
+      url: new URL("https://app.invalid/w/a/tickets"),
+      parent: async () => {
+        await admission.promise;
+        if (outcome === "anonymous") redirect(307, "/");
+        if (outcome === "expired") {
+          redirect(307, "/login?returnTo=%2Fw%2Fa%2Ftickets");
+        }
+        if (outcome === "error") {
+          error(503, "Unknown session");
+        }
+        return {};
+      },
+    });
+    await Promise.resolve();
+    assert(calls === 0);
+    admission.release();
+    const settled = await result.deferredPage;
+    assert(calls === (outcome === "admit" ? 1 : 0));
+    assert(settled.ok === (outcome === "admit"));
+  }
 });

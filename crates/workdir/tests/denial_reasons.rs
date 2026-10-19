@@ -167,11 +167,12 @@ async fn read_only_and_scoped_capability_refusals_do_not_collapse() {
     assert_reason(
         child
             .start_command(workdir::CommandRequest {
+                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "must-not-run".into(),
                 timeout_secs: 1,
-                output_limit: 1,
+
                 cwd: WorkdirPath::root(),
-                spill_dir: None,
+
                 tool_call_id: None,
             })
             .await

@@ -147,7 +147,6 @@ use worker::{
     Worker, WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout,
     WorkerControllerTransport, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
     WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
-    bash_output_dir_for_worker_id,
 };
 
 #[cfg(feature = "ws-server")]
@@ -1090,29 +1089,24 @@ fn runtime_local_workdir_session(
     root: &Path,
     cwd: &Path,
     scope: manifest::SharedScope,
-    command_output_scope: manifest::SharedScope,
     capabilities: WorkdirSessionCapabilities,
     command_environment: std::collections::BTreeMap<String, String>,
     resources: Vec<Arc<dyn workdir::WorkdirSessionResource>>,
 ) -> WorkdirSessionHandle {
-    Arc::new(
-        LocalWorkdirSession::materialized_bound_with_environment_and_command_output_scope(
-            Workdir::new(workdir_id),
-            root.to_path_buf(),
-            cwd.to_path_buf(),
-            scope,
-            command_output_scope,
-            capabilities,
-            command_environment,
-            resources,
-        ),
-    )
+    Arc::new(LocalWorkdirSession::materialized_bound_with_environment(
+        Workdir::new(workdir_id),
+        root.to_path_buf(),
+        cwd.to_path_buf(),
+        scope,
+        capabilities,
+        command_environment,
+        resources,
+    ))
 }
 
 fn runtime_local_workdir_router(
     attachments: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
     capabilities: &BTreeMap<WorkdirAttachmentAlias, WorkdirSessionCapabilities>,
-    command_output_scope: manifest::SharedScope,
     authorization_client: Option<Arc<dyn WorkspaceClient>>,
 ) -> Result<Arc<WorkdirSessionRouter>, String> {
     let router = Arc::new(WorkdirSessionRouter::new());
@@ -1127,7 +1121,6 @@ fn runtime_local_workdir_router(
             binding.root(),
             binding.cwd(),
             scope,
-            command_output_scope.clone(),
             capabilities,
             binding.command_environment(),
             binding
@@ -1153,7 +1146,6 @@ fn restored_workdir_router(
     local_attachments: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
     logical_attachments: &[crate::catalog::LogicalWorkdirAttachment],
     claims: &[crate::catalog::WorkingDirectoryAttachmentClaim],
-    scope: manifest::SharedScope,
     workspace_client: Arc<dyn WorkspaceClient>,
 ) -> Result<Arc<WorkdirSessionRouter>, String> {
     let mut local_capabilities = local_attachments
@@ -1173,7 +1165,6 @@ fn restored_workdir_router(
     let router = runtime_local_workdir_router(
         local_attachments,
         &local_capabilities,
-        scope,
         Some(workspace_client.clone()),
     )?;
     for attachment in logical_attachments {
@@ -1529,7 +1520,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let store = CombinedStore::new(session_store, worker_metadata_store);
 
         let run_dir = self.worker_run_dir(&request.worker_ref)?;
-        let bash_output_dir = bash_output_dir_for_worker_id(&request.worker_ref.worker_id);
         let bootstrap = WorkerBootstrap::new(
             manifest,
             store,
@@ -1538,7 +1528,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             filesystem_authority,
             WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: run_dir.clone(),
-                bash_output_dir,
             },
             self.controller_transport,
         );
@@ -1583,7 +1572,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         worker.bind_workdir_sessions(runtime_local_workdir_router(
             &request.workdir_attachments,
             &workdir_capabilities,
-            worker.scope().clone(),
             Some(worker.workspace_client_handle()),
         )?);
         if let (Some(runtime_id), Some(workspace_id)) =
@@ -1851,7 +1839,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             &request.workdir_attachments,
             &request.logical_workdir_attachments,
             &request.request.workdir_attachments,
-            worker.scope().clone(),
             worker.workspace_client_handle(),
         )?;
         worker.bind_workdir_sessions(workdir_sessions);
@@ -1888,13 +1875,11 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
 
         let workspace_client = worker.workspace_client_handle();
         let run_dir = self.worker_restore_run_dir(&request.worker_ref, request.operation_id)?;
-        let bash_output_dir = bash_output_dir_for_worker_id(&request.worker_ref.worker_id);
         let cleanup_sessions = worker.workdir_sessions();
         let started = PreparedWorker::new(
             worker,
             WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: run_dir.clone(),
-                bash_output_dir,
             },
             self.controller_transport,
         )
@@ -3768,7 +3753,6 @@ where
             working_directory_id,
             binding.root(),
             binding.cwd(),
-            scope.clone(),
             scope,
             WorkdirSessionCapabilities::ALL,
             binding.command_environment(),
@@ -6817,8 +6801,6 @@ mod tests {
 
     #[test]
     fn restored_router_uses_workspace_proxy_for_logical_only_attachment() {
-        let root = tempfile::tempdir().unwrap();
-        let scope = manifest::SharedScope::new(manifest::Scope::writable(root.path()).unwrap());
         let client = WorkerWorkspaceContext::local_filesystem(Some(
             WorkspaceId::new("workspace-a").unwrap(),
         ))
@@ -6833,7 +6815,6 @@ mod tests {
                 capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             }],
             &[],
-            scope,
             client,
         )
         .unwrap();
@@ -6878,7 +6859,6 @@ mod tests {
             .unwrap();
         let alias = WorkdirAttachmentAlias::new("docs").unwrap();
         let workdir_id = binding.working_directory.id.clone();
-        let command_output_scope = manifest::SharedScope::new(manifest::Scope::empty());
         let attachments = BTreeMap::from([(alias.clone(), binding)]);
         let logical = [LogicalWorkdirAttachment {
             alias: alias.clone(),
@@ -6890,9 +6870,7 @@ mod tests {
         ))
         .client_handle();
 
-        let router =
-            restored_workdir_router(&attachments, &logical, &[], command_output_scope, client)
-                .unwrap();
+        let router = restored_workdir_router(&attachments, &logical, &[], client).unwrap();
 
         let session = router.session(&alias).unwrap();
         assert_eq!(
@@ -7579,14 +7557,10 @@ mod tests {
             )
             .await
             .map_err(|err| err.to_string())?;
-            let bash_output_dir = self.runtime_base.join("bash-output");
-            let (handle, shutdown_rx) = WorkerController::spawn_runtime_managed(
-                worker,
-                &self.runtime_base,
-                &bash_output_dir,
-            )
-            .await
-            .map_err(|err| err.to_string())?;
+            let (handle, shutdown_rx) =
+                WorkerController::spawn_runtime_managed(worker, &self.runtime_base)
+                    .await
+                    .map_err(|err| err.to_string())?;
             Ok(RuntimeWorkerController {
                 handle,
                 shutdown: Arc::new(tokio::sync::Mutex::new(Some(shutdown_rx))),
@@ -8710,7 +8684,6 @@ mod tests {
             "working-directory-42",
             root.path(),
             root.path(),
-            spawned_scope.clone(),
             spawned_scope,
             WorkdirSessionCapabilities::READ_ONLY,
             Default::default(),
@@ -8721,7 +8694,6 @@ mod tests {
             "working-directory-42",
             root.path(),
             root.path(),
-            restored_scope.clone(),
             restored_scope,
             WorkdirSessionCapabilities::READ_ONLY,
             Default::default(),
@@ -10246,9 +10218,7 @@ mod tests {
 
         let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
         let attachments = BTreeMap::from([(alias, binding.clone())]);
-        let scope = manifest::SharedScope::new(manifest::Scope::writable(binding.root()).unwrap());
-        let router =
-            runtime_local_workdir_router(&attachments, &BTreeMap::new(), scope, None).unwrap();
+        let router = runtime_local_workdir_router(&attachments, &BTreeMap::new(), None).unwrap();
         session_clone.close().await.unwrap();
         assert_eq!(
             materializer.cleanup_working_directory(id).unwrap_err().code,

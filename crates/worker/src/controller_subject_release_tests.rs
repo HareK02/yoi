@@ -64,7 +64,6 @@ async fn prepared(
         WorkerFilesystemAuthority::None,
         WorkerBootstrapLayout::Direct {
             runtime_base: temp.path().join("runtime"),
-            bash_output_dir: temp.path().join("bash"),
         },
         WorkerControllerTransport::InProcess,
     )

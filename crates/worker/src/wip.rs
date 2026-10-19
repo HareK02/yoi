@@ -7126,3 +7126,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
+
+#[cfg(test)]
+mod bash_output_tests;

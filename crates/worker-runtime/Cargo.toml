@@ -56,6 +56,7 @@ server-api = { path = "../server-api" }
 workdir.workspace = true
 
 [dev-dependencies]
+workdir = { workspace = true, features = ["http-client"] }
 futures.workspace = true
 agen.workspace = true
 serial_test = "3.4.0"

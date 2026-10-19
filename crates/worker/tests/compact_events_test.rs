@@ -1495,11 +1495,9 @@ async fn post_compact_pause_bills_partial_without_rearming_or_consuming_correlat
     let session_id = worker.session_id();
 
     let runtime_tmp = tempfile::tempdir().unwrap();
-    let bash_output_dir = runtime_tmp.path().join("bash-output");
-    let (handle, shutdown_receiver) =
-        WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
-            .await
-            .unwrap();
+    let (handle, shutdown_receiver) = WorkerController::spawn(worker, runtime_tmp.path())
+        .await
+        .unwrap();
     let mut rx = handle.subscribe();
     handle
         .send(Method::submit_text(
@@ -1705,11 +1703,9 @@ async fn controller_does_not_repeat_a_persisted_mid_run_compaction_failure() {
     let (worker, store) = make_worker_with_manifest_and_store(MID_TURN_MANIFEST_TOML, client).await;
     let session_id = worker.session_id();
     let runtime_tmp = tempfile::tempdir().unwrap();
-    let bash_output_dir = runtime_tmp.path().join("bash-output");
-    let (handle, shutdown_receiver) =
-        WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
-            .await
-            .unwrap();
+    let (handle, shutdown_receiver) = WorkerController::spawn(worker, runtime_tmp.path())
+        .await
+        .unwrap();
     let mut rx = handle.subscribe();
 
     handle
@@ -1830,11 +1826,9 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
     let source_session = worker.session_id();
     let source_segment = worker.segment_id();
     let runtime_tmp = tempfile::tempdir().unwrap();
-    let bash_output_dir = runtime_tmp.path().join("bash-output");
-    let (handle, shutdown_receiver) =
-        WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
-            .await
-            .unwrap();
+    let (handle, shutdown_receiver) = WorkerController::spawn(worker, runtime_tmp.path())
+        .await
+        .unwrap();
     let mut rx = handle.subscribe();
 
     handle
@@ -1996,8 +1990,7 @@ async fn controller_compact_method_publishes_progress_and_clear() {
     ]);
     let worker = make_worker_with_manifest(MANUAL_ONLY_MANIFEST_TOML, client).await;
     let runtime_tmp = tempfile::tempdir().unwrap();
-    let bash_output_dir = runtime_tmp.path().join("bash-output");
-    let (handle, _shutdown) = WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
+    let (handle, _shutdown) = WorkerController::spawn(worker, runtime_tmp.path())
         .await
         .unwrap();
     let mut rx = handle.subscribe();

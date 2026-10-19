@@ -443,6 +443,56 @@
         "additionalProperties": false,
         "type": "object"
       },
+      "BrowserSessionState": {
+        "description": "Browser navigation evidence, not an authorization grant or a generic 401 classification.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "anonymous",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "expires_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "const": "authenticated",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "expired",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "BrowserTicketState": {
         "enum": [
           "open",
@@ -15092,8 +15142,14 @@
                 "type": "null"
               }
             ]
+          },
+          "session": {
+            "$ref": "#/components/schemas/BrowserSessionState"
           }
         },
+        "required": [
+          "session"
+        ],
         "type": "object"
       },
       "WorkerBusyState": {
@@ -18099,7 +18155,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:e151963ec3fa9836f43bea7f0f4f17b4a18798b43c111c983c6a2e2ccfd61a01"
+    "x-yoi-source-digest": "sha256:7c4ecff64866c760633454bd9ed66fcf25e16956a5152b97ab91576bb79fe083"
   },
   "openapi": "3.1.0",
   "paths": {

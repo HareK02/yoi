@@ -5,6 +5,7 @@ pub mod error;
 pub mod tracker;
 
 mod bash;
+pub mod bash_output;
 mod edit;
 mod file_target;
 mod glob;
@@ -16,7 +17,7 @@ pub mod view_image;
 mod web;
 mod write;
 
-pub use bash::bash_tool;
+pub use bash::{BashResult, BashTool, bash_tool};
 pub use checkout::{CheckoutToolOutput, execute_checkout_tool};
 pub use edit::edit_tool;
 pub use error::ToolsError;
@@ -35,7 +36,7 @@ pub use write::write_tool;
 pub fn core_builtin_tools(
     session: workdir::WorkdirSessionHandle,
     tracker: Tracker,
-    bash_output_dir: std::path::PathBuf,
+    bash_output: bash_output::BashOutputView,
 ) -> Vec<agen::tool::ToolDefinition> {
     use workdir::WorkdirSessionCapability;
 
@@ -58,7 +59,7 @@ pub fn core_builtin_tools(
         tools.push(grep::routed_grep_tool(router.clone()));
     }
     if capabilities.supports(WorkdirSessionCapability::Command) {
-        tools.push(bash::routed_bash_tool(router, bash_output_dir));
+        tools.push(bash::routed_bash_tool(router, bash_output));
     }
     tools
 }
@@ -71,7 +72,7 @@ pub fn core_builtin_tools(
 pub fn routed_builtin_tools(
     router: std::sync::Arc<workdir::WorkdirSessionRouter>,
     tracker: Tracker,
-    bash_output_dir: std::path::PathBuf,
+    bash_output: bash_output::BashOutputView,
 ) -> Vec<agen::tool::ToolDefinition> {
     vec![
         read::routed_read_tool(router.clone(), tracker.clone()),
@@ -79,14 +80,14 @@ pub fn routed_builtin_tools(
         edit::routed_edit_tool(router.clone(), tracker),
         glob::routed_glob_tool(router.clone()),
         grep::routed_grep_tool(router.clone()),
-        bash::routed_bash_tool(router, bash_output_dir),
+        bash::routed_bash_tool(router, bash_output),
     ]
 }
 
 pub fn routed_builtin_tools_for_current_capabilities(
     router: std::sync::Arc<workdir::WorkdirSessionRouter>,
     tracker: Tracker,
-    bash_output_dir: std::path::PathBuf,
+    bash_output: bash_output::BashOutputView,
 ) -> Vec<agen::tool::ToolDefinition> {
     use workdir::WorkdirSessionCapability;
 
@@ -108,7 +109,7 @@ pub fn routed_builtin_tools_for_current_capabilities(
         tools.push(grep::routed_grep_tool(router.clone()));
     }
     if capabilities.supports(WorkdirSessionCapability::Command) {
-        tools.push(bash::routed_bash_tool(router, bash_output_dir));
+        tools.push(bash::routed_bash_tool(router, bash_output));
     }
     tools
 }
@@ -121,7 +122,7 @@ pub fn read_only_builtin_tools(
         workdir::WorkdirSessionCapabilities::READ_ONLY,
         "read-only tool projection requires a read-only Workdir session"
     );
-    core_builtin_tools(session, Tracker::new(), std::path::PathBuf::new())
+    core_builtin_tools(session, Tracker::new(), bash_output::BashOutputView::new())
 }
 
 pub fn read_only_routed_builtin_tools(
@@ -173,7 +174,7 @@ mod workdir_tool_tests {
             SharedScope::new(Scope::writable(dir.path()).unwrap()),
             WorkdirSessionCapabilities::READ_ONLY,
         ));
-        let names = core_builtin_tools(session, Tracker::new(), dir.path().join("output"))
+        let names = core_builtin_tools(session, Tracker::new(), bash_output::BashOutputView::new())
             .into_iter()
             .map(|definition| definition().0.name)
             .collect::<Vec<_>>();
