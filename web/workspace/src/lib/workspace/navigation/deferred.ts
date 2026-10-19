@@ -39,7 +39,11 @@ export async function settle<T>(
 }
 
 export function deferPage<
-  E extends { params: Record<string, string | undefined>; url: URL },
+  E extends {
+    params: Record<string, string | undefined>;
+    url: URL;
+    parent: () => Promise<unknown>;
+  },
   T extends object,
 >(
   loader: (event: E) => T | Promise<T>,
@@ -51,11 +55,13 @@ export function deferPage<
       params: { ...event.params },
       url: new URL(event.url.href),
     };
-    try {
-      return { deferredPage: settle(loader(snapshot)) };
-    } catch (error) {
-      return { deferredPage: settle(Promise.reject(error)) };
-    }
+    // SvelteKitはparent/childを並列開始する。deferしても認証前fetchを開始しない。
+    return {
+      deferredPage: settle((async () => {
+        await snapshot.parent();
+        return await loader(snapshot);
+      })()),
+    };
   };
 }
 

@@ -6,6 +6,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/svelte";
+import { browserSession } from "#lib/workspace/auth/session-state.ts";
 import { afterEach, expect, test, vi } from "vitest";
 import { tick } from "svelte";
 import { goto } from "$app/navigation";
@@ -26,6 +27,7 @@ vi.mock("$app/state", () => ({ page }));
 
 afterEach(() => {
   cleanup();
+  browserSession.invalidate();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
   page.url = new URL("https://example.test/login");
@@ -61,6 +63,9 @@ function boundary({
         return new Response(null, { status: state.whoamiStatus });
       }
       return Response.json({
+        session: state.authenticated
+          ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
+          : { kind: "anonymous" },
         actor: state.authenticated
           ? { ...authUser, auth_method: "browser_session" }
           : null,
@@ -187,7 +192,10 @@ for (
   const [returnTo, expected] of [
     [null, "/dashboard"],
     ["/account", "/account"],
-    ["/w/project/tickets?ignored=1#fragment", "/w/project/tickets"],
+    [
+      "/w/project/tickets?ignored=1#fragment",
+      "/w/project/tickets?ignored=1#fragment",
+    ],
     [
       "/login/device?code=abcd-EFGH&untrusted=1",
       "/login/device?user_code=abcd-EFGH",
@@ -396,14 +404,11 @@ test("account displays the current identity without editable target fields and a
   expect(goto).not.toHaveBeenCalled();
 });
 
-test("anonymous account redirects to login with an account return path and has no credential inputs", async () => {
+test("account fragment leaves anonymous navigation to the root gate and has no credential inputs", async () => {
   const { fetcher } = boundary();
   render(Account);
-  await waitFor(() =>
-    expect(goto).toHaveBeenCalledWith("/login?returnTo=%2Faccount", {
-      replaceState: true,
-    })
-  );
+  await screen.findByRole("link", { name: "Log in to your account" });
+  expect(goto).not.toHaveBeenCalled();
   expect(
     screen.getByRole("link", { name: "Log in to your account" }).getAttribute(
       "href",
@@ -468,12 +473,12 @@ test("unknown account session shows retry instead of treating errors as anonymou
   expect(goto).not.toHaveBeenCalled();
 });
 
-test("logout posts to the session endpoint and confirms anonymous whoami before login navigation", async () => {
+test("logout confirms the server session is cleared and returns to the public home", async () => {
   const { fetcher } = boundary({ authenticated: true });
   render(Account);
   await fireEvent.click(await screen.findByRole("button", { name: "Log out" }));
   await waitFor(() =>
-    expect(goto).toHaveBeenCalledWith("/login?returnTo=%2Faccount", {
+    expect(goto).toHaveBeenCalledWith("/", {
       replaceState: true,
     })
   );
@@ -494,7 +499,7 @@ test("expired addition revokes stale identity without silently retrying as regis
   await fireEvent.click(
     await screen.findByRole("button", { name: "Add passkey to alice" }),
   );
-  await screen.findByText(/Your session or authentication challenge expired/);
+  await screen.findByText(/Authentication request was rejected/);
   await screen.findByRole("link", { name: "Log in to your account" });
   expect(screen.queryByRole("button", { name: /Add passkey/ })).toBeNull();
   expect(screen.queryByText("Passkey added to your account.")).toBeNull();
@@ -676,7 +681,7 @@ for (const status of [401, 410]) {
     );
     await screen.findByText(
       status === 401
-        ? /Your session or authentication challenge expired/
+        ? /Authentication request was rejected/
         : /The request or authentication challenge is invalid or expired/,
     );
     expect(

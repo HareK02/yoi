@@ -2,7 +2,8 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
-  import { loginWithLegacyPasskey, loginWithPasskey, registerPasskey } from './api.ts';
+  import { loginWithLegacyPasskey, loginWithPasskey, registerPasskey, logout } from './api.ts';
+  import { CLEAR_RETURN_EVENT } from './session-state.ts';
   import { BrowserAuth } from './browser-session.svelte.ts';
   import { loadRegistrationPolicy } from './hosting.ts';
   import { authEntryUrl, safeReturnTo, AUTHENTICATED_HOME } from './routes.ts';
@@ -58,11 +59,16 @@
     }
   }
 
+  async function forget() {
+    await auth.run('Logging out…', 'Logged out.', logout, 'logout');
+  }
   onMount(() => {
+    const clearReturn = () => { void goto(page.url.pathname, { replaceState: true }); };
+    window.addEventListener(CLEAR_RETURN_EVENT, clearReturn);
     void auth.refresh();
     void refreshPolicy();
     window.addEventListener('focus', refreshPolicy);
-    return () => { ++policyRequest; auth.dispose(); window.removeEventListener('focus', refreshPolicy); };
+    return () => { ++policyRequest; auth.dispose(); window.removeEventListener('focus', refreshPolicy); window.removeEventListener(CLEAR_RETURN_EVENT, clearReturn); };
   });
 </script>
 
@@ -74,11 +80,16 @@
   {:else if auth.session.kind === 'error'}
     <p role="alert" class="error">Your session could not be loaded. Login status is unknown.</p>
     <button type="button" disabled={auth.busy} onclick={() => auth.refresh()}>Retry session</button>
+    <button type="button" disabled={auth.busy} onclick={forget}>Forget this session</button>
   {:else if auth.actor}
     <p>Logged in as <strong>{auth.actor.display_name}</strong> <span class="muted">@{auth.actor.handle}</span>.</p>
     <a href={destination}>Continue to {destination === AUTHENTICATED_HOME ? 'dashboard / Workspaces' : 'requested page'}</a>
     <a href="/account">Open Account</a>
   {:else}
+    {#if auth.session.session.kind === 'expired'}
+      <p role="status">Your browser session expired. Log in to return to the requested page.</p>
+      <button type="button" disabled={auth.busy} onclick={forget}>Forget this session</button>
+    {/if}
     {#if mode === 'register'}
       {#if policyLoading}
         <p role="status" class="muted">Checking registration availability…</p>

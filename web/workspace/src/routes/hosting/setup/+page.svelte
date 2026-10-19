@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
-  import { loadWhoami, loginWithPasskey } from '#lib/workspace/auth/api.ts';
+  import { onDestroy, onMount } from 'svelte';
+  import { browserSession, observeBrowserSession, sessionMutation } from "#lib/workspace/auth/session-state.ts";
+  import { loginWithPasskey } from '#lib/workspace/auth/api.ts';
   import { enrollHostingPasskey } from '#lib/workspace/auth/hosting-enrollment.ts';
   import { loadHostingAccess, notifySessionChanged } from '#lib/workspace/auth/hosting.ts';
   import type { AuthUser } from '#lib/workspace/auth/model.ts';
@@ -13,13 +14,26 @@
   const controller = new AbortController();
   let active = true;
 
+  let verifiedGeneration: number | null = null;
+  const isCurrent = (generation: number) => active && generation === browserSession.authenticationGeneration;
   // 初期Bearerでの鍵追加はcookieを使わない。明示Passkey loginのsessionを検証する。
-  async function verifySession(expected: AuthUser): Promise<boolean> {
-    const { actor } = await loadWhoami();
-    if (!active || actor?.user_id !== expected.user_id || actor.account_id !== expected.account_id || actor.auth_method !== 'browser_session') return false;
-    const access = await loadHostingAccess();
-    return active && access.is_admin;
+  function matchesSession(expected: AuthUser): boolean {
+    const snapshot = browserSession.snapshot;
+    if (snapshot.kind !== 'ready' || snapshot.value.session.kind !== 'authenticated') return false;
+    const actor = snapshot.value.actor;
+    return actor?.user_id === expected.user_id && actor.account_id === expected.account_id && actor.auth_method === 'browser_session';
   }
+  onMount(() => {
+    observeBrowserSession();
+    return browserSession.subscribe(() => {
+      // 公開pageにはprivate SessionBoundaryの取消がない。成功表示も確認した世代に限る。
+      // 後続の再確認/失効/主体変更では明示loginとaccess確認からやり直す。
+      if (!user || verifiedGeneration !== browserSession.authenticationGeneration || !matchesSession(user)) {
+        verifiedLogin = false;
+        verifiedGeneration = null;
+      }
+    });
+  });
 
   async function enroll() {
     if (busy || user || !token.trim()) return;
@@ -45,17 +59,35 @@
     const expected = user;
     busy = true;
     error = '';
+    sessionMutation();
+    let generation = browserSession.authenticationGeneration;
     try {
       const signedIn = await loginWithPasskey(controller.signal);
-      if (!active) return;
-      if (signedIn.user_id !== expected.user_id || signedIn.account_id !== expected.account_id || !await verifySession(expected)) {
-        throw new Error('Login or hosting access not verified');
+      if (!isCurrent(generation)) throw new Error('Login superseded');
+      if (signedIn.user_id !== expected.user_id || signedIn.account_id !== expected.account_id) {
+        throw new Error('Unexpected login actor');
       }
-      if (!active) return;
+      // Set-Cookie後の確認を共有状態へ発行し、操作前/操作中のreadを再利用しない。
+      sessionMutation();
+      generation = browserSession.authenticationGeneration;
+      await browserSession.refresh();
+      if (!isCurrent(generation) || !matchesSession(expected)) throw new Error('Session not verified');
+      const access = await loadHostingAccess();
+      if (!isCurrent(generation) || !access.is_admin) throw new Error('Access not verified');
+      // accessのawait中にもcookie/actorは変わり得る。success公開前の最終確認を行う。
+      await browserSession.refresh();
+      if (!isCurrent(generation) || !matchesSession(expected)) throw new Error('Session superseded');
+      verifiedGeneration = generation;
       verifiedLogin = true;
       notifySessionChanged();
     } catch {
       if (active) error = 'Passkey login or hosting administrator access could not be verified. Try signing in again, or ask the host operator to check this account.';
+      // 応答不明時の再確認は自身がまだ現世代の時だけ。古いfinallyで新logout/loginを
+      // invalidateしたり、その確定結果を再取得のloadingへ戻したりしない。
+      if (isCurrent(generation)) {
+        sessionMutation();
+        await browserSession.refresh();
+      }
     } finally {
       if (active) busy = false;
     }

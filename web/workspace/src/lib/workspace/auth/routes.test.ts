@@ -12,16 +12,16 @@ function assertEquals(
 }
 import { authEntryUrl, loginUrl, safeReturnTo } from "./routes.ts";
 
-Deno.test("return destination permits known app screens without forwarding arbitrary query or fragment", () => {
+Deno.test("return destination preserves query and fragment only on known app screens", () => {
   for (
     const [input, expected] of [
       ["/", "/dashboard"],
-      ["/dashboard?query=discard#fragment", "/dashboard"],
+      ["/dashboard?query=keep#fragment", "/dashboard?query=keep#fragment"],
       ["/account", "/account"],
       ["/account?returnTo=//evil.invalid#secret", "/account"],
       [
         "/w/workspace-id/tickets/T-123?filter=all#entry",
-        "/w/workspace-id/tickets/T-123",
+        "/w/workspace-id/tickets/T-123?filter=all#entry",
       ],
       [
         "/login/device?user_code=ABCD-EFGH",
@@ -31,7 +31,7 @@ Deno.test("return destination permits known app screens without forwarding arbit
         "/login/device?code=abcd-1234&returnTo=//evil.invalid",
         "/login/device?user_code=abcd-1234",
       ],
-      ["/login/device?user_code=%252f%252fevil.invalid", "/login/device"],
+      ["/login/device?user_code=%252f%252fevil.invalid", "/dashboard"],
     ]
   ) assertEquals(safeReturnTo(input), expected, input);
 });
@@ -64,6 +64,11 @@ Deno.test("return destination rejects external, ambiguous encoding and authentic
       "/account\t",
       "/account\u0000",
       "/account%00",
+      "/account?q=%255c",
+      "/account?q=%0A",
+      "/account#%5c",
+      "/account?q=%ZZ",
+      "/account?q=%252f%252fevil.invalid",
       "/api/auth/logout",
       "/hosting/setup",
       "/not-an-app-route",
@@ -85,4 +90,39 @@ Deno.test("login links encode one validated destination and discard nested auth 
     loginUrl("/login?returnTo=/login"),
     "/login?returnTo=%2Fdashboard",
   );
+});
+
+Deno.test("return destination accepts canonical UTF-8 resource slugs but not encoded ASCII or delimiters", () => {
+  const target = `/w/team/tickets/T-123-${
+    encodeURIComponent("未ログイン")
+  }?view=comments#entry-2`;
+  assertEquals(safeReturnTo(target), target);
+  for (
+    const [input, expected] of [
+      [
+        "/w/team/tickets?filter=100%25#entry",
+        "/w/team/tickets?filter=100%25#entry",
+      ],
+      [
+        "/w/team/tickets/%e6%9c%aa?filter=100%25#part%25",
+        "/w/team/tickets/%e6%9c%aa?filter=100%25#part%25",
+      ],
+      [
+        "/w/team/tickets/未?query=a%2fb#entry%2f2",
+        "/w/team/tickets/%E6%9C%AA?query=a%2fb#entry%2f2",
+      ],
+    ]
+  ) {
+    assertEquals(safeReturnTo(input), expected);
+  }
+  for (
+    const input of [
+      "/w/team/tickets/%54-123",
+      "/w/team/tickets/T-123%2fother",
+      "/w/team/tickets/%E0%80%AF",
+      "/w/team/tickets/%252f",
+    ]
+  ) {
+    assertEquals(safeReturnTo(input), "/dashboard");
+  }
 });

@@ -4,6 +4,7 @@
   // navigationの構成はWorkspace identityやpermissionの根拠にはしない。
   // Header下辺とSidebar右辺だけで領域境界を示し、viewport外周に線を重ねない。
   // MobileはSidebarがHeader下を占有する間mainをinertにし、隠れた内容へfocusを入れない。
+  import SessionBoundary from '#lib/workspace/auth/SessionBoundary.svelte';
   import { page } from '$app/state';
   import { setContext } from 'svelte';
   import { MediaQuery } from 'svelte/reactivity';
@@ -96,6 +97,7 @@
   });
 </script>
 
+<SessionBoundary>
 {#if standalone}
   <main class="standalone-main">
     {@render children()}
@@ -147,6 +149,7 @@
   </main>
 </div>
 {/if}
+</SessionBoundary>
 
 <style>
   .standalone-main {
