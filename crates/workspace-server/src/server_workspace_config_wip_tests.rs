@@ -187,7 +187,7 @@ async fn config_call(
     runtime
         .invoke(
             path.into(),
-            config_interface(path),
+            if matches!(operation,"edit"|"write") {wip_protocol::InterfaceReference {scope:"/".into(),name:format!("yoi.file/{operation}-text/v1")}} else {config_interface(path)},
             operation.into(),
             args,
             agen::tool::ToolExecutionContext::direct(),

@@ -4139,7 +4139,14 @@ mod tests {
                 request: crate::worker::WorkspaceRequest,
             ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError>
             {
-                // Native discovery must not enumerate or perform any mutation.
+                // Native discovery reads metadata and the current caller's ceiling, never inventory or mutations.
+                assert_eq!(request.method, crate::worker::WorkspaceRequestMethod::Get);
+                if request.path == "/api/w/workspace-1/drive/capabilities" {
+                    return Ok(crate::worker::WorkspaceResponse {
+                        status: 200,
+                        body: serde_json::json!({"write":true}).to_string(),
+                    });
+                }
                 assert_eq!(request.path, "/api/w/workspace-1/drive/root");
                 Ok(crate::worker::WorkspaceResponse { status: 200, body: serde_json::json!({
                     "entry": {"workspace_id": "workspace-1", "node_id": "1"},

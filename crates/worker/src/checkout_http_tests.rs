@@ -800,3 +800,44 @@ async fn remote_checkout_diagnostic_context_keeps_wip_refusal_classification_wit
         "refusal was retried"
     );
 }
+
+#[tokio::test]
+async fn remote_checked_byte_read_uses_common_contract_and_keeps_binary_boundaries() {
+    use base64::Engine as _;
+    let fixture = HttpFixture::new(WorkdirSessionCapabilities::READ_ONLY).await;
+    let remote = Arc::new(fixture.open(TOKEN).await.unwrap());
+    let (runtime, _) = native_runtime(remote);
+    let path = "/checkouts/main/src/deep/a.txt";
+    observe_interface(&runtime, path).await;
+    let output = runtime
+        .invoke(
+            path.into(),
+            crate::file_operation::Contract::ReadBytes.reference(),
+            "read".into(),
+            json!({"offset":1,"limit":3}),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let json: Json = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    assert_eq!(json["encoding"], "base64");
+    assert_eq!(json["offset"], 1);
+    assert_eq!(json["next_offset"], 4);
+    let source = fixture
+        .state
+        .session
+        .read_bytes(workdir::ReadBytesRequest {
+            path: WorkdirPath::new("src/deep/a.txt").unwrap(),
+            offset: 1,
+            max_bytes: 3,
+            expected_hash: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(json["data"].as_str().unwrap())
+            .unwrap(),
+        source.bytes
+    );
+}

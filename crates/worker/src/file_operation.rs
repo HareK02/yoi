@@ -1,5 +1,15 @@
-//! WIP presentation of the provider-neutral file argument contracts. Providers
-//! choose which read surface to publish; routing and preconditions are not args.
+//! Stable root file contracts, independent of provider and target lifetimes.
+//!
+//! Each capability has one versioned reference and complete descriptor. Providers publish only
+//! supported combinations. Root scope is a namespace, never a file grant. Current Object
+//! membership selects the provider handler; target observations, checked operations, prior Read,
+//! CAS and grants remain provider-owned. Contract validators contain no target or connection state.
+//!
+//! Line windows, byte ranges and whole-text domain reads are different meanings, not aliases.
+//! Settings atomic commits and Drive management/cursor pagination remain domain extensions.
+//! Common mutations return one metadata envelope while providers retain their commit details.
+//! Old contextual references in history are neither rewritten nor accepted as aliases; callers
+//! reobserve Objects and common definitions after migration or restore.
 use fs_operation::text::TextOperation;
 use wip_protocol::{ParameterDeclaration, TypeExpr};
 
@@ -185,12 +195,37 @@ impl Contract {
                 mutation_type(),
             ),
         };
-        InterfaceDescriptor {format:INTERFACE_FORMAT_V1.into(),types:vec![],documentation:Some(Documentation {summary:summary.into(),details:Some(match self {
-            Self::ReadBytes=>"Binary-safe byte range, independent of UTF-8 and line boundaries. Offset defaults to 0; limit defaults to 16384 and must be 1..=32768 bytes. Offset must be <=9007199254708223. Returns encoding=base64 with RFC4648 standard padded data, offset and next_offset in bytes, eof when no later bytes remain. At EOF returns empty data, eof=true and next_offset=offset; offsets beyond EOF are InvalidArguments. Encoded pretty JSON result is bounded to 64 KiB. Does not establish text prior-Read for mutation. InvalidArguments rejects ranges/unknown fields, ResourceLimitExceeded bounds, ValidatorMismatch stale source, PermissionDenied authority. Provider source bounds apply; no automatic retry.",
-            Self::ReadLines|Self::SearchText=>"UTF-8 text (invalid source bytes decoded lossily); Rust lines semantics (CRLF stripped, final newline is not an extra line). Zero-based offset defaults to 0. Limit defaults to 2000, must be 1..=2000. Source/result windows exceeding 64 KiB are refused, never silently skipped. Read returns one-based numbered content. Search is case-sensitive literal matching, pattern nonempty and at most 4096 bytes, returning one-based line/text records. next_offset advances by scanned lines including nonmatches; truncated means more lines remain. Provider source bounds may refuse retrieval. InvalidArguments rejects bad ranges/patterns; ResourceLimitExceeded rejects bounds; ValidatorMismatch rejects stale state; PermissionDenied rejects current authority. No automatic retry.",
-            Self::Edit|Self::Write|Self::CreateFile=>"UTF-8 text with provider size bounds. Checked save, prior Read and CAS requirements remain provider-owned. Edit rejects empty or identical old/new strings, missing or ambiguous matches unless replace_all. Success returns metadata with provider commit information. InvalidArguments rejects invalid edits; ResourceLimitExceeded rejects bounds; ValidatorMismatch rejects stale state; PermissionDenied rejects current authority. Post-dispatch failure may be OutcomeUnknown: reconcile, never automatically retry.",
-            _=>"Paths and cursors are Worldspace entries, not host paths. Provider scope, permission, visibility, bounds and cancellation remain authoritative. Discovery does not acquire every result or add indexable children. InvalidArguments, ResourceLimitExceeded, PermissionDenied and ValidatorMismatch preserve provider failures. No automatic retry.",
-        }.into())}),operations:vec![OperationDeclaration {name:self.operation().into(),documentation:None,parameters,returns:ReturnDeclaration {documentation:None,r#type:result}}]}
+        let details = match self {
+            Self::ReadBytes => {
+                "Binary-safe byte range, independent of UTF-8 and line boundaries. Offset defaults to 0; limit defaults to 16384 and must be 1..=32768 bytes. Offset must be <=9007199254708223. Returns encoding=base64 with RFC4648 standard padded data, offset and next_offset in bytes, eof when no later bytes remain. At EOF returns empty data, eof=true and next_offset=offset; offsets beyond EOF are InvalidArguments. Encoded pretty JSON result is bounded to 64 KiB. Does not establish text prior-Read for mutation. InvalidArguments rejects ranges/unknown fields, ResourceLimitExceeded bounds, ValidatorMismatch stale source, PermissionDenied authority. Provider source bounds apply; no automatic retry."
+            }
+            Self::ReadLines | Self::SearchText => {
+                "UTF-8 text (invalid source bytes decoded lossily); Rust lines semantics (CRLF stripped, final newline is not an extra line). Zero-based offset defaults to 0. Limit defaults to 2000, must be 1..=2000. Source/result windows exceeding 64 KiB are refused, never silently skipped. Read returns one-based numbered content. Search is case-sensitive literal matching, pattern nonempty and at most 4096 bytes, returning one-based line/text records. next_offset advances by scanned lines including nonmatches; truncated means more lines remain. Provider source bounds may refuse retrieval. InvalidArguments rejects bad ranges/patterns; ResourceLimitExceeded rejects bounds; ValidatorMismatch rejects stale state; PermissionDenied rejects current authority. No automatic retry."
+            }
+            Self::Edit | Self::Write | Self::CreateFile => {
+                "UTF-8 text with provider size bounds. Checked save, prior Read and CAS requirements remain provider-owned. Edit rejects empty or identical old/new strings, missing or ambiguous matches unless replace_all. Success returns metadata with provider commit information. InvalidArguments rejects invalid edits; ResourceLimitExceeded rejects bounds; ValidatorMismatch rejects stale state; PermissionDenied rejects current authority. Post-dispatch failure may be OutcomeUnknown: reconcile, never automatically retry."
+            }
+            _ => {
+                "Paths and cursors are Worldspace entries, not host paths. Provider scope, permission, visibility, bounds and cancellation remain authoritative. Discovery does not acquire every result or add indexable children. InvalidArguments, ResourceLimitExceeded, PermissionDenied and ValidatorMismatch preserve provider failures. No automatic retry."
+            }
+        };
+        InterfaceDescriptor {
+            format: INTERFACE_FORMAT_V1.into(),
+            types: vec![],
+            documentation: Some(Documentation {
+                summary: summary.into(),
+                details: Some(details.into()),
+            }),
+            operations: vec![OperationDeclaration {
+                name: self.operation().into(),
+                documentation: None,
+                parameters,
+                returns: ReturnDeclaration {
+                    documentation: None,
+                    r#type: result,
+                },
+            }],
+        }
     }
     pub(crate) fn validator(self) -> Vec<u8> {
         Sha256::digest(format!("{:?}", self.descriptor())).to_vec()
@@ -645,4 +680,22 @@ pub(crate) fn bytes_result(
         ));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod byte_tests {
+    use super::*;
+    #[test]
+    fn maximum_raw_byte_page_reserves_base64_and_complete_json_budget() {
+        let args = BTreeMap::from([("limit".into(), Value::Integer(32768))]);
+        let result = bytes_result(&args, &vec![0xff; 32768], false)
+            .unwrap_or_else(|_| panic!("valid bounded bytes"));
+        let json = crate::wip::wip_to_json(&result).unwrap();
+        assert!(serde_json::to_vec_pretty(&json).unwrap().len() <= MAX_BYTES);
+        assert_eq!(json["next_offset"], 32768);
+        assert_eq!(json["eof"], false);
+        assert!(
+            matches!(bytes_result(&args,&vec![0;32769],false),Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::Internal)
+        );
+    }
 }

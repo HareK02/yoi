@@ -122,6 +122,7 @@ impl Provider {
         generation: u64,
         workdir: &str,
         target: &WorkdirPath,
+        capabilities: workdir::WorkdirSessionCapabilities,
         raw: &[u8],
     ) -> Vec<u8> {
         let mut hash = Sha256::new();
@@ -131,6 +132,7 @@ impl Provider {
             &generation.to_be_bytes(),
             workdir.as_bytes(),
             target.as_str().as_bytes(),
+            format!("{capabilities:?}").as_bytes(),
             raw,
         ] {
             hash.update(value.len().to_be_bytes());
@@ -295,8 +297,14 @@ impl Provider {
             "directory"
         };
         let primary = *contracts.first()?;
-        let validator =
-            self.wrap_validator(alias, generation, workdir, &target, &observation.validator);
+        let validator = self.wrap_validator(
+            alias,
+            generation,
+            workdir,
+            &target,
+            observation.capabilities,
+            &observation.validator,
+        );
         let handler = Arc::new(FileHandler {
             provider: self.clone(),
             alias: alias.into(),
@@ -525,6 +533,7 @@ impl FileHandler {
                     self.generation,
                     &self.workdir,
                     &self.target,
+                    self.observation.capabilities,
                     &raw,
                 ),
             ))
@@ -583,6 +592,7 @@ impl WipOperationHandler for FileHandler {
                     self.generation,
                     &self.workdir,
                     &self.target,
+                    self.observation.capabilities,
                     &raw,
                 ),
             ));
@@ -644,6 +654,7 @@ impl WipOperationHandler for FileHandler {
                         self.generation,
                         &self.workdir,
                         &self.target,
+                        self.observation.capabilities,
                         &raw,
                     ),
                 ),
