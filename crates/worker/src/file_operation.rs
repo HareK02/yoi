@@ -265,7 +265,9 @@ pub(crate) fn window(
     };
     let offset = integer("offset", 0)?;
     let limit = integer("limit", MAX_LINES)?;
-    if !(1..=MAX_LINES).contains(&limit) || offset > i64::MAX as usize - MAX_LINES {
+    if !(1..=MAX_LINES).contains(&limit)
+        || (offset as u64) > 9_007_199_254_740_991u64 - MAX_LINES as u64
+    {
         return Err(failure(
             ProtocolErrorCode::InvalidArguments,
             "text range exceeds bounds",
@@ -365,7 +367,19 @@ pub(crate) fn page_result(
             fs_operation::text::render_numbered(text, offset, offset + count, false, MAX_BYTES);
         fields.insert("content".into(), Value::String(rendered.body));
     }
-    Ok(Value::Record(fields))
+    let value = Value::Record(fields);
+    let json = crate::wip::wip_to_json(&value)
+        .map_err(|_| failure(ProtocolErrorCode::Internal, "text result unavailable"))?;
+    // The model receives pretty JSON, so budget escapes and record/indentation overhead too.
+    let encoded = serde_json::to_vec_pretty(&json)
+        .map_err(|_| failure(ProtocolErrorCode::Internal, "text result unavailable"))?;
+    if encoded.len() > MAX_BYTES {
+        return Err(failure(
+            ProtocolErrorCode::ResourceLimitExceeded,
+            "serialized text window exceeds output byte bound",
+        ));
+    }
+    Ok(value)
 }
 fn parameter(n: &str, r: bool, t: TypeExpr) -> ParameterDeclaration {
     ParameterDeclaration {
@@ -458,4 +472,83 @@ fn grep_parameters() -> Vec<ParameterDeclaration> {
         p.push(parameter(n, false, TypeExpr::Boolean));
     }
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn args(value: serde_json::Value) -> BTreeMap<String, Value> {
+        let Value::Record(args) = crate::wip::json_to_wip(&value).unwrap() else {
+            panic!("record")
+        };
+        args
+    }
+    #[test]
+    fn text_window_preserves_unicode_crlf_offsets_and_literal_search_continuation() {
+        let input = "first\r\n雪.*\r\nnot a match\n雪.*\n";
+        let arguments = args(serde_json::json!({"offset":1,"limit":2,"pattern":".*"}));
+        let whole = text_result("search_text", &arguments, input)
+            .unwrap_or_else(|_| panic!("text result refused"));
+        let partial = page_result("search_text", &arguments, "雪.*\r\nnot a match\n", 1, true)
+            .unwrap_or_else(|_| panic!("page refused"));
+        assert_eq!(whole, partial);
+        let result = crate::wip::wip_to_json(&whole).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"matches":[{"line":2,"text":"雪.*"}],"next_offset":3,"truncated":true})
+        );
+        let read = text_result(
+            "read_lines",
+            &args(serde_json::json!({"offset":1,"limit":1})),
+            input,
+        )
+        .unwrap_or_else(|_| panic!("read refused"));
+        assert_eq!(
+            crate::wip::wip_to_json(&read).unwrap(),
+            serde_json::json!({"content":"     2\t雪.*\n","next_offset":2,"truncated":true})
+        );
+    }
+    #[test]
+    fn text_window_refuses_invalid_ranges_patterns_source_and_encoded_output_bounds() {
+        for value in [
+            serde_json::json!({"limit":0}),
+            serde_json::json!({"limit":2001}),
+            serde_json::json!({"offset":-1}),
+            serde_json::json!({"offset":9_007_199_254_740_991i64}),
+            serde_json::json!({"file_path":"elsewhere"}),
+        ] {
+            assert!(
+                matches!(text_result("read_lines",&args(value),"x"),Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::InvalidArguments)
+            );
+        }
+        for pattern in [String::new(), "x".repeat(4097)] {
+            assert!(
+                matches!(text_result("search_text",&args(serde_json::json!({"pattern":pattern})),"x"),Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::InvalidArguments)
+            );
+        }
+        for (operation, arguments, source) in [
+            (
+                "read_lines",
+                serde_json::json!({}),
+                "雪".repeat(MAX_BYTES / 3 + 1),
+            ),
+            ("read_lines", serde_json::json!({}), "\u{1}".repeat(16000)),
+            (
+                "search_text",
+                serde_json::json!({"pattern":"x"}),
+                "x\n".repeat(MAX_LINES),
+            ),
+            (
+                "search_text",
+                serde_json::json!({"pattern":"\""}),
+                format!("{}\n", "\"".repeat(40000)),
+            ),
+        ] {
+            assert!(
+                matches!(text_result(operation,&args(arguments),&source),Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::ResourceLimitExceeded),
+                "{operation}: {} source bytes",
+                source.len()
+            );
+        }
+    }
 }
