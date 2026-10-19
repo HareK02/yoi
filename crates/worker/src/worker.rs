@@ -2742,8 +2742,9 @@ pub trait SystemItemCommitter: Send + Sync {
         )
     }
 
-    /// Notify the producer inside the publication barrier, after the durable
-    /// append and before a rewrite can invalidate its representation.
+    /// Notify after durable append through the writer's publication boundary.
+    /// Completion is a storage fact, not a grant of continuing Feature authority;
+    /// producers must separately fence their representation lifetime.
     fn commit_system_item_with_extensions_then(
         &self,
         item: SystemItem,
