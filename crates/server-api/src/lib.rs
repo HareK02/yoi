@@ -2762,6 +2762,12 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
     ) -> Result<DriveEntry, DriveApiError>;
+    #[get("/api/w/{workspace_id}/drive/capabilities", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    async fn drive_capabilities(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+    ) -> Result<DriveCapabilities, DriveApiError>;
     #[get("/api/w/{workspace_id}/drive/metadata", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
     async fn drive_metadata(
         &self,

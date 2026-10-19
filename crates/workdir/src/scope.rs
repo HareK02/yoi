@@ -1260,6 +1260,9 @@ impl WorkdirSession for ScopedWorkdirSession {
                 .intersection(WorkdirSessionCapabilities::READ_ONLY);
         }
         if let crate::CheckoutOutput::Read(read) = &mut result.output {
+            read.path = result_path.clone();
+        }
+        if let crate::CheckoutOutput::ReadBytes(read) = &mut result.output {
             read.path = result_path;
         }
         Ok(result)

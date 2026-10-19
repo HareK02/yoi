@@ -45,6 +45,7 @@ pub fn mount_workspace_config_wip(
             provider: Arc::new(super::content::ConfigProvider {
                 feature: feature.clone(),
                 backend: backend.clone(),
+                observation_nonce: uuid::Uuid::now_v7().to_string().into(),
             }),
         })?;
     }

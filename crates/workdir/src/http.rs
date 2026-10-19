@@ -693,6 +693,12 @@ mod client {
             let mutation = request.operation.capability() != crate::WorkdirSessionCapability::Read;
             let expected_path = request.target.clone();
             let expected_output = request.operation.capability();
+            let byte_range = match &request.operation {
+                crate::CheckoutOperation::ReadBytes { offset, max_bytes } => {
+                    Some((*offset, *max_bytes))
+                }
+                _ => None,
+            };
             match self
                 .operate(WorkdirSessionOperation::CheckoutExecute(request))
                 .await
@@ -703,10 +709,29 @@ mod client {
                         && result.observation.validator.len() <= 256
                         && match (&result.output, expected_output) {
                             (
+                                crate::CheckoutOutput::ReadBytes(read),
+                                crate::WorkdirSessionCapability::Read,
+                            ) => byte_range.is_some_and(|(offset, max)| {
+                                read.path == expected_path
+                                    && read.offset == offset
+                                    && read.bytes.len() <= max
+                                    && read
+                                        .offset
+                                        .checked_add(read.bytes.len() as u64)
+                                        .is_some_and(|end| {
+                                            end <= read.total_bytes
+                                                || (read.bytes.is_empty() && read.eof)
+                                        })
+                                    && read.eof
+                                        == (read.offset.saturating_add(read.bytes.len() as u64)
+                                            >= read.total_bytes)
+                            }),
+                            (
                                 crate::CheckoutOutput::Read(read),
                                 crate::WorkdirSessionCapability::Read,
                             ) => {
-                                read.path == expected_path
+                                byte_range.is_none()
+                                    && read.path == expected_path
                                     && read.bytes.len()
                                         <= crate::BoundedReadLimits::EXTERNAL_DEFAULT
                                             .max_response_bytes

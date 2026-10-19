@@ -41,13 +41,28 @@ async fn interface(r: &WipRuntime, path: &str) -> wip_protocol::InterfaceReferen
         .unwrap();
     p.interface
 }
+pub(super) fn contract(operation: &str) -> crate::file_operation::Contract {
+    use crate::file_operation::Contract as C;
+    match operation {
+        "read" => C::ReadLines,
+        "search" => C::SearchText,
+        "edit" => C::Edit,
+        "write" => C::Write,
+        "list" => C::List,
+        "glob" => C::Glob,
+        "grep" => C::Grep,
+        "create_file" => C::CreateFile,
+        _ => panic!("unknown file operation {operation}"),
+    }
+}
 async fn call(
     r: &WipRuntime,
     path: &str,
     operation: &str,
     args: Json,
 ) -> Result<ToolOutput, ToolError> {
-    let i = interface(r, path).await;
+    interface(r, path).await;
+    let i = contract(operation).reference();
     r.call(path.into(), i, operation.into(), args, Default::default())
         .await
 }
@@ -336,12 +351,26 @@ async fn checkout_wip_detach_alias_reuse_and_restore_fence_old_references() {
     let old = r.host.projection_live(path).await.unwrap().unwrap();
     router.detach(&alias).await.unwrap();
     assert!(r.host.projection_live(path).await.unwrap().is_none());
-    assert!(r.host.fetch_interface_live(&old.interface).await.is_err());
+    assert_eq!(
+        r.host
+            .fetch_interface_live(&old.interface)
+            .await
+            .unwrap()
+            .validator,
+        old.interface_validator
+    );
     router.attach(alias, session(&b, false)).unwrap();
     let new = r.host.projection_live(path).await.unwrap().unwrap();
-    assert_ne!(old.interface, new.interface);
+    assert_eq!(old.interface, new.interface);
     assert_ne!(old.object.validator, new.object.validator);
-    assert!(r.host.fetch_interface_live(&old.interface).await.is_err());
+    assert_eq!(
+        r.host
+            .fetch_interface_live(&old.interface)
+            .await
+            .unwrap()
+            .validator,
+        old.interface_validator
+    );
     assert!(
         call(
             &r,
@@ -354,14 +383,16 @@ async fn checkout_wip_detach_alias_reuse_and_restore_fence_old_references() {
     );
     let restored = runtime(router, None);
     let next = restored.host.projection_live(path).await.unwrap().unwrap();
-    assert_ne!(new.interface, next.interface);
+    assert_eq!(new.interface, next.interface);
     assert_ne!(new.object.validator, next.object.validator);
-    assert!(
+    assert_eq!(
         restored
             .host
             .fetch_interface_live(&new.interface)
             .await
-            .is_err()
+            .unwrap()
+            .validator,
+        new.interface_validator
     );
     assert_eq!(
         std::fs::read_to_string(b.path().join("file.txt")).unwrap(),
@@ -501,7 +532,7 @@ async fn checkout_wip_post_operation_validators_support_cached_chains() {
         .unwrap();
     let r = runtime(router, None);
     let path = "/checkouts/main/file.txt";
-    let i = interface(&r, path).await;
+    interface(&r, path).await;
     // No rediscovery or Interface refresh between any of these operations.
     for (op, args) in [
         ("read", json!({})),
@@ -509,16 +540,23 @@ async fn checkout_wip_post_operation_validators_support_cached_chains() {
         ("write", json!({"content":"saved\n"})),
         ("read", json!({})),
     ] {
-        r.call(path.into(), i.clone(), op.into(), args, Default::default())
-            .await
-            .unwrap();
+        r.call(
+            path.into(),
+            contract(op).reference(),
+            op.into(),
+            args,
+            Default::default(),
+        )
+        .await
+        .unwrap();
     }
     assert_eq!(
         std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
         "saved\n"
     );
     let parent = "/checkouts/main";
-    let i = interface(&r, parent).await;
+    interface(&r, parent).await;
+    let i = contract("create_file").reference();
     for name in ["one.txt", "nested/two.txt"] {
         r.call(
             parent.into(),
@@ -621,11 +659,12 @@ async fn checkout_wip_scoped_child_search_and_revoke_cannot_expose_siblings() {
             .is_none()
     );
     let file = "/checkouts/child/a.txt";
-    let i = interface(&child, file).await;
+    interface(&child, file).await;
+    let i = contract("write").reference();
     child
         .call(
             file.into(),
-            i.clone(),
+            contract("read").reference(),
             "read".into(),
             json!({}),
             Default::default(),
@@ -690,7 +729,21 @@ pub(super) async fn model_invoke(
     operation: &str,
     arguments: Json,
 ) -> Result<ToolOutput, ToolError> {
-    model_operation(r, "Invoke", json!({"path":inspected["path"], "interface":inspected["interfaces"][0]["reference"], "operation":operation, "arguments":arguments})).await
+    let reference = inspected["interfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| &item["reference"])
+        .find(|r| {
+            Some(wip_protocol::InterfaceReference {
+                scope: r["scope"].as_str().unwrap().into(),
+                name: r["name"].as_str().unwrap().into(),
+            })
+            .and_then(|r| crate::file_operation::Contract::from_reference(&r))
+            .is_some_and(|c| c.operation() == operation)
+        })
+        .unwrap_or(&inspected["interfaces"][0]["reference"]);
+    model_operation(r, "Invoke", json!({"path":inspected["path"], "interface":reference, "operation":operation, "arguments":arguments})).await
 }
 
 #[tokio::test]
@@ -756,10 +809,7 @@ async fn checkout_model_list_glob_grep_entries_are_lazy_and_never_become_tree_ed
     let r = Arc::new(runtime(router, None));
     let entrance = model_inspect(r.clone(), "/checkouts/main").await;
     assert_eq!(entrance["path"], "/checkouts/main");
-    assert_eq!(
-        entrance["interfaces"][0]["reference"]["scope"],
-        "/checkouts/main"
-    );
+    assert_eq!(entrance["interfaces"][0]["reference"]["scope"], "/");
     let projection = r
         .host
         .projection_live("/checkouts/main")
@@ -833,10 +883,7 @@ async fn checkout_model_list_glob_grep_entries_are_lazy_and_never_become_tree_ed
         json!([])
     );
     let deep = model_inspect(r.clone(), "/checkouts/main/nested/deep").await;
-    assert_eq!(
-        deep["interfaces"][0]["reference"]["scope"],
-        "/checkouts/main"
-    );
+    assert_eq!(deep["interfaces"][0]["reference"]["scope"], "/");
     for (operation, args) in [
         ("list", json!({})),
         ("glob", json!({"pattern":"*.txt"})),
@@ -930,7 +977,7 @@ async fn checkout_list_permission_cannot_be_bypassed_with_glob_or_command_identi
 }
 
 #[tokio::test]
-async fn checkout_ancestor_scope_rejects_siblings_prefixes_refs_and_old_connection_before_read() {
+async fn common_scope_rejects_wrong_namespace_scope_ref_and_old_target_authority() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("a.txt"), "same\n").unwrap();
     let router = Arc::new(WorkdirSessionRouter::new());
@@ -947,8 +994,8 @@ async fn checkout_ancestor_scope_rejects_siblings_prefixes_refs_and_old_connecti
     let p = r.host.projection_live(path).await.unwrap().unwrap();
     let fetched = r.host.fetch_interface_live(&p.interface).await.unwrap();
     assert!(
-        fetched.scope_ref.is_none(),
-        "ref-less publication is legitimate"
+        fetched.scope_ref.is_some(),
+        "common namespace uses the Host root scope"
     );
     // Ordinary content changes do not terminate the entrance's Interface lifetime.
     std::fs::write(dir.path().join("new.txt"), "fixture").unwrap();
@@ -963,12 +1010,12 @@ async fn checkout_ancestor_scope_rejects_siblings_prefixes_refs_and_old_connecti
     let request = |reference, scope_ref| CallOperationRequest {
         target: wip_protocol::Target {
             path: path.into(),
-            validator: None,
+            validator: p.object.validator.clone(),
         },
         interface: wip_protocol::InterfaceTarget {
             reference,
             scope_ref,
-            validator: None,
+            validator: fetched.validator.clone(),
         },
         operation: "read".into(),
         arguments: BTreeMap::new(),
@@ -1000,6 +1047,200 @@ async fn checkout_ancestor_scope_rejects_siblings_prefixes_refs_and_old_connecti
     router.attach(main, session(&dir, true)).unwrap();
     let forged = request(p.interface.clone(), None);
     assert!(
-        matches!(r.host.call(forged, WipCallContext { execution:Default::default(),security_context:"fixture".into() }).await, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::InterfaceMismatch)
+        matches!(r.host.call(forged, WipCallContext { execution:Default::default(),security_context:"fixture".into() }).await, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::ValidatorMismatch)
+    );
+}
+
+fn observed_common_request(
+    path: &str,
+    validator: Option<Vec<u8>>,
+    fetched: &FetchInterfaceResponse,
+    operation: &str,
+) -> CallOperationRequest {
+    CallOperationRequest {
+        target: wip_protocol::Target {
+            path: path.into(),
+            validator,
+        },
+        interface: wip_protocol::InterfaceTarget {
+            reference: fetched.interface.clone(),
+            scope_ref: fetched.scope_ref.clone(),
+            validator: fetched.validator.clone(),
+        },
+        operation: operation.into(),
+        arguments: BTreeMap::new(),
+    }
+}
+fn file_context() -> WipCallContext {
+    WipCallContext {
+        execution: Default::default(),
+        security_context: "file-contract-test".into(),
+    }
+}
+
+#[tokio::test]
+async fn shared_contract_survives_one_attachment_update_but_old_object_authority_never_transfers() {
+    let left = TempDir::new().unwrap();
+    let right = TempDir::new().unwrap();
+    for root in [&left, &right] {
+        std::fs::write(root.path().join("a.txt"), "same\n").unwrap();
+    }
+    std::fs::write(left.path().join("b.txt"), "same\n").unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    let alias = WorkdirAttachmentAlias::new("left").unwrap();
+    router.attach(alias.clone(), session(&left, false)).unwrap();
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("right").unwrap(),
+            session(&right, true),
+        )
+        .unwrap();
+    let r = runtime(router.clone(), None);
+    let path = "/checkouts/left/a.txt";
+    let other = "/checkouts/right/a.txt";
+    let first = r.host.projection_live(path).await.unwrap().unwrap();
+    let same_bytes = r
+        .host
+        .projection_live("/checkouts/left/b.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    let independent = r.host.projection_live(other).await.unwrap().unwrap();
+    assert_eq!(first.interface, independent.interface);
+    assert_eq!(first.descriptor, independent.descriptor);
+    assert_ne!(first.object.validator, same_bytes.object.validator);
+    let definition = r.host.fetch_interface_live(&first.interface).await.unwrap();
+    let request =
+        observed_common_request(path, first.object.validator.clone(), &definition, "read");
+    assert!(r.host.call(request.clone(), file_context()).await.is_ok());
+    // Replace the same path with a different inode containing exactly the same bytes.
+    std::fs::write(left.path().join("replacement"), "same\n").unwrap();
+    std::fs::rename(left.path().join("replacement"), left.path().join("a.txt")).unwrap();
+    assert!(
+        matches!(r.host.call(request.clone(),file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::ValidatorMismatch)
+    );
+    assert_eq!(
+        r.host
+            .fetch_interface_live(&first.interface)
+            .await
+            .unwrap()
+            .validator,
+        definition.validator
+    );
+    assert!(
+        r.host
+            .call(
+                observed_common_request(
+                    other,
+                    independent.object.validator.clone(),
+                    &definition,
+                    "read"
+                ),
+                file_context()
+            )
+            .await
+            .is_ok()
+    );
+    call(&r, path, "read", json!({})).await.unwrap();
+    router.detach(&alias).await.unwrap();
+    router.attach(alias, session(&left, false)).unwrap();
+    assert!(
+        matches!(r.host.call(request,file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::ValidatorMismatch)
+    );
+    assert!(
+        r.host
+            .call(
+                observed_common_request(other, independent.object.validator, &definition, "read"),
+                file_context()
+            )
+            .await
+            .is_ok()
+    );
+    call(&r, path, "read", json!({})).await.unwrap();
+    let before_restore = r.host.projection_live(path).await.unwrap().unwrap();
+    let restored = runtime(router, None);
+    let restored_definition = restored
+        .host
+        .fetch_interface_live(&first.interface)
+        .await
+        .unwrap();
+    assert_eq!(definition.descriptor, restored_definition.descriptor);
+    assert_eq!(definition.validator, restored_definition.validator);
+    assert!(
+        matches!(restored.host.call(observed_common_request(path,before_restore.object.validator,&restored_definition,"read"),file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::ValidatorMismatch)
+    );
+    call(&restored, path, "read", json!({})).await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_readonly_contract_rejects_wrong_membership_operation_and_interface_validator() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "雪.*\r\nother\n").unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("main").unwrap(),
+            session(&dir, true),
+        )
+        .unwrap();
+    let r = Arc::new(runtime(router, None));
+    let path = "/checkouts/main/a.txt";
+    let observed = model_inspect(r.clone(), path).await;
+    let read = json_content(
+        model_invoke(r.clone(), &observed, "read", json!({"limit":1}))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        read,
+        json!({"content":"     1\t雪.*\n","next_offset":1,"truncated":true})
+    );
+    let searched = json_content(
+        model_invoke(
+            r.clone(),
+            &observed,
+            "search",
+            json!({"pattern":".*","limit":1}),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        searched,
+        json!({"matches":[{"line":1,"text":"雪.*"}],"next_offset":1,"truncated":true})
+    );
+    let p = r.host.projection_live(path).await.unwrap().unwrap();
+    let read = r
+        .host
+        .fetch_interface_live(&contract("read").reference())
+        .await
+        .unwrap();
+    let write = r
+        .host
+        .fetch_interface_live(&contract("write").reference())
+        .await
+        .unwrap();
+    assert!(
+        matches!(r.host.call(observed_common_request(path,p.object.validator.clone(),&write,"write"),file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::InterfaceMismatch)
+    );
+    assert!(
+        matches!(r.host.call(observed_common_request(path,p.object.validator.clone(),&read,"missing"),file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::OperationNotFound)
+    );
+    let mut stale = observed_common_request(path, p.object.validator.clone(), &read, "read");
+    stale.interface.validator = Some(vec![0]);
+    assert!(
+        matches!(r.host.call(stale,file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::InterfaceValidatorMismatch)
+    );
+    let mut legacy = observed_common_request(path, p.object.validator, &read, "read");
+    legacy.interface.reference = InterfaceReference {
+        scope: "/checkouts/main".into(),
+        name: "yoi.checkout/old/file/v1#target/old".into(),
+    };
+    assert!(
+        matches!(r.host.call(legacy,file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::InterfaceMismatch)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "雪.*\r\nother\n"
     );
 }

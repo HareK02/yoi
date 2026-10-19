@@ -186,6 +186,11 @@ fn validate_external_operation(operation: &WorkdirSessionOperation) -> Result<()
                 && !request.validator.is_empty()
                 && request.validator.len() <= 256
                 && match &request.operation {
+                    crate::CheckoutOperation::ReadBytes { offset, max_bytes } => {
+                        *offset <= 9_007_199_254_740_991
+                            && *max_bytes > 0
+                            && *max_bytes <= BoundedReadLimits::EXTERNAL_DEFAULT.max_response_bytes
+                    }
                     crate::CheckoutOperation::Read {
                         limit, max_bytes, ..
                     } => {
@@ -375,6 +380,13 @@ fn validate_external_result(result: &WorkdirSessionOperationResult) -> Result<()
         WorkdirSessionOperationResult::CheckoutExecute(result) => {
             valid_checkout_observation(&result.observation)
                 && match &result.output {
+                    crate::CheckoutOutput::ReadBytes(read) => {
+                        read.path == result.observation.path
+                            && validate_external_result(&WorkdirSessionOperationResult::ReadBytes(
+                                read.clone(),
+                            ))
+                            .is_ok()
+                    }
                     crate::CheckoutOutput::Read(read) => {
                         read.path == result.observation.path
                             && validate_external_result(&WorkdirSessionOperationResult::Read(
