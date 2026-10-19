@@ -1992,16 +1992,10 @@ fn system_entry(
     provenance: SessionEntryProvenance,
     derived_from: Vec<String>,
 ) -> SessionSnapshotEntry {
-    let mut data = serde_json::to_value(item).ok();
-    if let Some(serde_json::Value::Object(object)) = data.as_mut() {
-        object.remove("prompt_provenance");
-    }
-    let item_kind = data
-        .as_ref()
-        .and_then(|value| value.get("kind"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("system_item")
-        .to_owned();
+    let public = item.public_item();
+    let data = Some(serde_json::to_value(&public).expect("public system input is serializable"));
+    let item_kind = public.kind;
+    let content = public.body;
     SessionSnapshotEntry {
         entry_id,
         timestamp,
@@ -2009,7 +2003,7 @@ fn system_entry(
         derived_from,
         data: SessionSnapshotEntryData::SystemItem {
             item_kind,
-            content: item.history_text(),
+            content,
             data,
         },
     }

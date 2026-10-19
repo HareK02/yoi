@@ -197,7 +197,58 @@ pub enum SystemItem {
     },
 }
 
+/// Allowlisted presentation data shared by live events and retained snapshots.
+/// Private Feature payloads and render provenance never cross this boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicSystemItem {
+    pub kind: String,
+    pub body: String,
+    pub presentation: PublicSystemPresentation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PublicSystemPresentation {
+    Notification { message: String },
+    WorkerEvent { event: WorkerEvent },
+    Context,
+    TaskReminder,
+    Ignored,
+}
+
 impl SystemItem {
+    pub fn public_item(&self) -> PublicSystemItem {
+        let presentation = match self {
+            Self::Notification { message, .. } => PublicSystemPresentation::Notification {
+                message: message.clone(),
+            },
+            Self::WorkerEvent { event, .. } => PublicSystemPresentation::WorkerEvent {
+                event: event.clone(),
+            },
+            Self::TaskReminder { .. } => PublicSystemPresentation::TaskReminder,
+            Self::LegacyKnowledgeIgnored { .. } | Self::LegacyIgnored { .. } => {
+                PublicSystemPresentation::Ignored
+            }
+            Self::JournalStartup { .. }
+            | Self::ResidentSummaryRefresh { .. }
+            | Self::SubjectBehaviorRefresh { .. }
+            | Self::SkillActivation { .. }
+            | Self::FeatureInvocationResult { .. }
+            | Self::FileAttachment { .. }
+            | Self::Interrupt { .. } => PublicSystemPresentation::Context,
+        };
+        PublicSystemItem {
+            kind: self.kind_label().to_owned(),
+            body: if matches!(presentation, PublicSystemPresentation::Ignored) {
+                String::new()
+            } else {
+                self.history_text()
+            },
+            presentation,
+        }
+    }
+
     /// Free-text body the LLM sees inside its `role:system` message
     /// for this item. Returns the variant's stored `body` verbatim.
     pub fn history_text(&self) -> String {
@@ -309,6 +360,31 @@ mod tests {
         assert!(
             matches!(parsed, SystemItem::SubjectBehaviorRefresh { behavior_md, .. } if behavior_md == "exact behavior")
         );
+    }
+
+    #[test]
+    fn public_system_input_decoder_rejects_private_fields_and_unknown_presentations() {
+        let valid = serde_json::json!({
+            "kind": "new-feature-label",
+            "body": "explicit public content",
+            "presentation": { "kind": "context" },
+        });
+        let public: PublicSystemItem = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(public.body, "explicit public content");
+        for private_field in [
+            "payload",
+            "prompt_provenance",
+            "policy",
+            "snapshot",
+            "behavior_md",
+        ] {
+            let mut malformed = valid.clone();
+            malformed[private_field] = serde_json::json!({ "private": true });
+            assert!(serde_json::from_value::<PublicSystemItem>(malformed).is_err());
+        }
+        let mut unknown = valid;
+        unknown["presentation"] = serde_json::json!({ "kind": "execute_feature_payload" });
+        assert!(serde_json::from_value::<PublicSystemItem>(unknown).is_err());
     }
 
     #[test]

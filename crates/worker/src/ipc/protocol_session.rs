@@ -90,7 +90,8 @@ pub fn live_log_entry_event(entry: LogEntry) -> Option<Event> {
         }
         LogEntry::AnnotatedSystemItem { entry, .. } => {
             let entry_id = Some(entry.metadata.entry_id.0.clone());
-            let value = serde_json::to_value(&entry.item).expect("SystemItem is Serialize");
+            let value = serde_json::to_value(entry.item.public_item())
+                .expect("public system input is serializable");
             Some(Event::SystemItem {
                 entry_id,
                 item: value,
@@ -367,6 +368,74 @@ mod tests {
                 assert_eq!(item["kind"], "resident_summary_refresh");
             }
             other => panic!("expected SystemItem, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_and_snapshot_system_projection_exclude_private_feature_fields() {
+        let provenance = session_store::PromptRenderProvenance {
+            workspace_id: Some("private-workspace".into()),
+            source_digest: "private-source".into(),
+            projection_digest: "private-projection".into(),
+            logical_name: "private-template".into(),
+        };
+        let items = [
+            session_store::SystemItem::SubjectBehaviorRefresh {
+                body: "displayed context".into(),
+                behavior_md: "private-raw-behavior".into(),
+                prompt_provenance: Some(provenance.clone()),
+            },
+            session_store::SystemItem::JournalStartup {
+                body: "displayed reference".into(),
+                snapshot: serde_json::json!({ "internal": "private-snapshot" }),
+                snapshot_sha256: "private-snapshot-digest".into(),
+                prompt_provenance: provenance,
+            },
+        ];
+        for item in items {
+            let entry = LogEntry::AnnotatedSystemItem {
+                ts: 7,
+                entry: session_store::LoggedSystemHistoryEntry {
+                    item,
+                    metadata: session_store::LoggedSessionHistoryMetadata::legacy_unknown(),
+                },
+                extensions: vec![],
+            };
+            let persisted: LogEntry =
+                serde_json::from_slice(&serde_json::to_vec(&entry).unwrap()).unwrap();
+            let snapshot = session_store::public_snapshot::project_current_session_snapshot(&[
+                persisted.clone(),
+            ]);
+            let Event::SystemItem {
+                entry_id,
+                item: live,
+            } = live_log_entry_event(persisted).unwrap()
+            else {
+                panic!("expected live system input");
+            };
+            let snapshot_entry = &snapshot.entries[0];
+            assert_eq!(entry_id.as_deref(), Some(snapshot_entry.entry_id.as_str()));
+            let protocol::SessionSnapshotEntryData::SystemItem {
+                data: Some(saved),
+                content,
+                ..
+            } = &snapshot_entry.data
+            else {
+                panic!("expected canonical public system input");
+            };
+            assert_eq!(&live, saved);
+            let public: session_store::PublicSystemItem =
+                serde_json::from_value(live.clone()).unwrap();
+            assert_eq!(&public.body, content);
+            assert!(matches!(
+                public.presentation,
+                session_store::PublicSystemPresentation::Context
+            ));
+            let encoded = serde_json::to_string(&snapshot).unwrap();
+            assert!(!encoded.contains("private-"));
+            assert!(live.get("prompt_provenance").is_none());
+            assert!(live.get("snapshot").is_none());
+            assert!(live.get("behavior_md").is_none());
         }
     }
 

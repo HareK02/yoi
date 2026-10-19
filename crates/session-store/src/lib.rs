@@ -98,7 +98,8 @@ pub use segment::{
 pub use segment_log::{LogEntry, RestoredState, SegmentOrigin, SessionExtension, collect_state};
 pub use store::{Store, StoreError};
 pub use system_item::{
-    PromptRenderProvenance, SystemItem, SystemReminder, SystemReminderSource, render_worker_event,
+    PromptRenderProvenance, PublicSystemItem, PublicSystemPresentation, SystemItem, SystemReminder,
+    SystemReminderSource, render_worker_event,
 };
 pub use uploaded_file::{
     DEFAULT_MAX_FILES_PER_SUBMISSION, DEFAULT_MAX_SESSION_ARTIFACT_BYTES,

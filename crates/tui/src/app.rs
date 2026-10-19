@@ -3013,7 +3013,8 @@ impl App {
     /// `[File: …]` parsing path: each kind maps directly to a typed
     /// block (`Block::Notify`, `Block::WorkerEvent`, …).
     fn apply_system_item(&mut self, value: &serde_json::Value) {
-        let Ok(item) = serde_json::from_value::<session_store::SystemItem>(value.clone()) else {
+        let Ok(item) = serde_json::from_value::<session_store::PublicSystemItem>(value.clone())
+        else {
             // Unknown / forward-compat shape: fall back to rendering the
             // raw text payload (if any) as a generic system message.
             if let Some(text) = value.get("body").and_then(|b| b.as_str()) {
@@ -3024,29 +3025,23 @@ impl App {
             }
             return;
         };
-        match item {
-            session_store::SystemItem::Notification { message, .. } => {
+        let body = item.body;
+        match item.presentation {
+            session_store::PublicSystemPresentation::Notification { message } => {
                 self.blocks.push(Block::Notify { message });
             }
-            session_store::SystemItem::WorkerEvent { event, .. } => {
+            session_store::PublicSystemPresentation::WorkerEvent { event } => {
                 self.blocks.push(Block::WorkerEvent { event });
             }
-            session_store::SystemItem::FeatureInvocationResult { body, .. }
-            | session_store::SystemItem::FileAttachment { body, .. }
-            | session_store::SystemItem::SkillActivation { body, .. }
-            | session_store::SystemItem::JournalStartup { body, .. }
-            | session_store::SystemItem::ResidentSummaryRefresh { body, .. }
-            | session_store::SystemItem::SubjectBehaviorRefresh { body, .. }
-            | session_store::SystemItem::Interrupt { body, .. } => {
+            session_store::PublicSystemPresentation::Context => {
                 self.task_store.apply_system_message_text(&body);
                 self.blocks.push(Block::SystemMessage { text: body });
             }
-            session_store::SystemItem::TaskReminder { body, .. } => {
+            session_store::PublicSystemPresentation::TaskReminder => {
                 self.task_store.apply_system_message_text(&body);
                 self.blocks.push(Block::TaskReminder { text: body });
             }
-            session_store::SystemItem::LegacyIgnored { .. } => {}
-            session_store::SystemItem::LegacyKnowledgeIgnored { .. } => {}
+            session_store::PublicSystemPresentation::Ignored => {}
         }
     }
 
@@ -4450,12 +4445,12 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn live_legacy_workflow_system_item_is_ignored() {
+    fn retired_system_input_is_ignored() {
         let mut app = App::new("test".into());
         let item = serde_json::json!({
-            "kind": "workflow",
-            "slug": "build",
-            "body": "[Workflow /build]\nRun the build",
+            "kind": "retired_input",
+            "body": "",
+            "presentation": { "kind": "ignored" },
         });
         app.handle_worker_event(Event::SystemItem {
             entry_id: None,
@@ -4862,11 +4857,29 @@ mod completion_flow_tests {
     }
 
     #[test]
+    fn feature_label_does_not_select_system_input_presentation() {
+        for label in ["journal_startup", "new-unregistered-feature"] {
+            let mut app = App::new("test".into());
+            app.handle_worker_event(Event::SystemItem {
+                entry_id: None,
+                item: serde_json::json!({
+                    "kind": label,
+                    "body": "explicit public content",
+                    "presentation": { "kind": "context" },
+                }),
+            });
+            assert!(
+                matches!(app.blocks.as_slice(), [Block::SystemMessage { text }] if text == "explicit public content")
+            );
+        }
+    }
+
+    #[test]
     fn live_system_item_notification_appends_notify_block() {
         let mut app = App::new("test".into());
         let item = serde_json::json!({
             "kind": "notification",
-            "message": "hi",
+            "presentation": { "kind": "notification", "message": "hi" },
             "body": "[Notification] hi",
         });
         app.handle_worker_event(Event::SystemItem {
@@ -4884,7 +4897,7 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         let item = serde_json::json!({
             "kind": "worker_event",
-            "event": { "kind": "turn_ended", "worker_name": "child" },
+            "presentation": { "kind": "worker_event", "event": { "kind": "turn_ended", "worker_name": "child" } },
             "body": "[Notification] worker `child` finished a turn",
         });
         app.handle_worker_event(Event::SystemItem {
@@ -5285,6 +5298,7 @@ mod completion_flow_tests {
             item: serde_json::json!({
                 "kind": "task_reminder",
                 "body": snapshot,
+                "presentation": { "kind": "task_reminder" },
             }),
         });
 

@@ -1180,12 +1180,10 @@ pub enum Event {
     },
     /// One agent-injected system item committed to history.
     ///
-    /// Carries the JSON form of `session_store::SystemItem`. Covers
-    /// `Method::Notify` echoes, child-Worker lifecycle events from
-    /// `Method::WorkerEvent`, `@<path>` resolution payloads, and any future
-    /// Clients dispatch on the `kind` tag for typed rendering instead
-    /// of parsing free-text prefixes like `[Notification] …` or
-    /// `[File: …]`.
+    /// Carries the allowlisted JSON form of `session_store::PublicSystemItem`,
+    /// not the storage record. Its descriptive `kind` is independent from the
+    /// typed `presentation` used for notification, reminder, or context rendering.
+    /// Private Feature payloads and prompt provenance are never event data.
     ///
     /// One event per `LogEntry::AnnotatedSystemItem` commit. Disk-side and
     /// wire-side are 1:1.
