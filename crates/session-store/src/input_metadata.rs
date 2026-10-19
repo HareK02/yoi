@@ -238,11 +238,20 @@ impl HistoryInputMetadata {
     }
 
     pub fn public_use_policy(&self) -> protocol::SessionEntryUsePolicy {
-        let has_public = self.public.is_some();
         protocol::SessionEntryUsePolicy {
-            observation_readable: has_public
-                && self.usage.observation == InputObservationUse::Readable,
-            memory_evidence: has_public && self.usage.memory_evidence == InputEvidenceUse::Include,
+            observation_readable: self.usage.observation == InputObservationUse::Readable,
+            memory_evidence: self.usage.memory_evidence == InputEvidenceUse::Include,
+        }
+    }
+
+    pub fn public_system_use_policy(&self) -> protocol::SessionEntryUsePolicy {
+        if self.public.is_some() {
+            self.public_use_policy()
+        } else {
+            protocol::SessionEntryUsePolicy {
+                observation_readable: false,
+                memory_evidence: false,
+            }
         }
     }
 

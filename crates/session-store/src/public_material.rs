@@ -903,12 +903,12 @@ fn canonical_body(
         if allowed == crate::InputEvidenceUse::Exclude {
             return None;
         }
-        let public = input.public_item()?;
         if let LoggedItem::Message {
             role: LoggedRole::System,
             ..
         } = &entry.item
         {
+            let public = input.public_item()?;
             return Some(CanonicalBody::Message {
                 origin: &entry.metadata.origin,
                 role: LoggedRole::System,
@@ -917,7 +917,6 @@ fn canonical_body(
                 }]),
             });
         }
-        return None;
     }
     match &entry.item {
         LoggedItem::Message {

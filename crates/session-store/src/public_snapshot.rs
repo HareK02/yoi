@@ -1627,7 +1627,7 @@ pub(crate) fn project_session_snapshot_for_segment(
                     .metadata
                     .input_metadata
                     .as_ref()
-                    .map(crate::HistoryInputMetadata::public_use_policy),
+                    .map(crate::HistoryInputMetadata::public_system_use_policy),
             )),
             LogEntry::RunYielded {
                 ts,
@@ -1795,11 +1795,19 @@ fn history_entry(
     data: SessionSnapshotEntryData,
 ) -> SessionSnapshotEntry {
     SessionSnapshotEntry {
-        use_policy: entry
-            .metadata
-            .input_metadata
-            .as_ref()
-            .map(crate::HistoryInputMetadata::public_use_policy),
+        use_policy: entry.metadata.input_metadata.as_ref().map(|input| {
+            if matches!(
+                entry.item,
+                LoggedItem::Message {
+                    role: LoggedRole::System,
+                    ..
+                }
+            ) {
+                input.public_system_use_policy()
+            } else {
+                input.public_use_policy()
+            }
+        }),
         entry_id: entry.metadata.entry_id.0.clone(),
         timestamp,
         provenance: provenance(&entry.metadata.origin),
@@ -1927,21 +1935,29 @@ pub fn session_tool_attachment_id(
 
 fn project_history_item(entry: &LoggedHistoryEntry) -> Option<SessionSnapshotEntryData> {
     if let Some(input) = &entry.metadata.input_metadata {
-        if !matches!(
+        if matches!(
             entry.item,
             LoggedItem::Message {
                 role: LoggedRole::System,
                 ..
             }
         ) {
+            let public = input.public_projection();
+            return Some(SessionSnapshotEntryData::SystemItem {
+                item_kind: public.kind.clone(),
+                content: public.body.clone(),
+                data: Some(
+                    serde_json::to_value(public).expect("public system input is serializable"),
+                ),
+            });
+        }
+        let usage = input.usage();
+        if usage.recording_material == crate::InputEvidenceUse::Exclude
+            && usage.memory_evidence == crate::InputEvidenceUse::Exclude
+            && usage.observation == crate::InputObservationUse::Hidden
+        {
             return None;
         }
-        let public = input.public_projection();
-        return Some(SessionSnapshotEntryData::SystemItem {
-            item_kind: public.kind.clone(),
-            content: public.body.clone(),
-            data: Some(serde_json::to_value(public).expect("public system input is serializable")),
-        });
     }
     project_item(&entry.metadata.entry_id.0, &entry.item)
 }

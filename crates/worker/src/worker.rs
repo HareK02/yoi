@@ -6959,7 +6959,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // The old summary is consumed in full by the compaction service even when
         // the cut falls before it. The replacement summary supersedes it: retaining
         // it as well would duplicate inherited context on every compact.
-        let retained_history_entries = history_entries[retain_from..]
+        let mut retained_history_entries = history_entries[retain_from..]
             .iter()
             .filter(|entry| {
                 crate::session_history::compaction_use(&entry.annotation)
@@ -6967,16 +6967,16 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let mut retained_items = retained_history_entries
-            .iter()
-            .map(|entry| entry.item.clone())
-            .collect::<Vec<_>>();
         let default_workdir_alias = (self.workdir_sessions.len() == 1)
             .then(|| self.workdir_sessions.aliases().into_iter().next())
             .flatten()
             .map(|alias| alias.as_str().to_string());
-        let retained_image_references =
-            project_compaction_attachments(&mut retained_items, default_workdir_alias.as_deref());
+        let retained_image_references = project_compaction_attachments(
+            retained_history_entries
+                .iter_mut()
+                .map(|entry| &mut entry.item),
+            default_workdir_alias.as_deref(),
+        );
         // The compactor explores summaries, text details, and ViewImage call arguments. It
         // never needs durable image bodies; relevant images are nominated with add_reference.
         let mut entries_to_summarise = history_entries[..retain_from]
@@ -7326,8 +7326,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             Vec::new()
         };
         let auto_read_tokens = agen::token_counter::total_tokens(&auto_read_messages, &[]).tokens;
-        let retained_estimate = agen::token_counter::total_tokens(&retained_items, &[]);
-        let retained_item_count = u64::try_from(retained_items.len()).unwrap_or(u64::MAX);
+        let retained_estimate = agen::token_counter::total_tokens(
+            &retained_history_entries
+                .iter()
+                .map(|entry| entry.item.clone())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        let retained_item_count = u64::try_from(retained_history_entries.len()).unwrap_or(u64::MAX);
         let summarized_item_count = u64::try_from(items_to_summarise.len()).unwrap_or(u64::MAX);
         let compactor_entries = handle.entries();
         let compactor_turns = compactor_entries
@@ -7382,25 +7388,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let reference_message =
             build_related_file_message(&final_ctx.references, &retained_image_references);
 
-        // Count surviving user_messages before consuming `retained_items`
+        // Count surviving user_messages before consuming the annotated retained tail
         // — needed to align `self.user_segments` after the swap below.
-        let retained_user_msgs = retained_items
+        let retained_user_msgs = retained_history_entries
             .iter()
-            .filter(|i| i.is_user_message())
+            .filter(|entry| entry.item.is_user_message())
             .count();
 
         // Build new history: [summary, ...auto-read, references, ...retained, task snapshot, TaskList synthetic call/result].
         // The TaskStore snapshot trails the retained items so that, on resume,
         // `replay_history` walks any pre-compact Task* calls preserved verbatim
-        // in retained_items first and the trailing snapshot's `replace_with`
+        // in the retained tail first and the trailing snapshot's `replace_with`
         // is the final word — pre-compact `TaskCreate` calls cannot leak as
         // duplicate entries.
-        let mut new_history = Vec::with_capacity(
-            1 + auto_read_messages.len()
-                + 3
-                + reference_message.is_some() as usize
-                + retained_items.len(),
-        );
         let mut compact_introduced_system_messages =
             Vec::with_capacity(2 + auto_read_messages.len() + reference_message.is_some() as usize);
         let summary_message = Item::system_message(format!(
@@ -7424,49 +7424,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         ));
         compact_introduced_system_messages.push(task_snapshot_message.clone());
 
-        new_history.push(summary_message);
-        new_history.extend(context_messages);
-        new_history.extend(auto_read_messages);
-        if let Some(msg) = reference_message {
-            new_history.push(msg);
-        }
-        new_history.extend(retained_items);
-        new_history.push(task_snapshot_message);
-        new_history.push(Item::tool_call("compact-tasklist", "TaskList", "{}"));
-        new_history.push(Item::tool_result_with_content(
-            "compact-tasklist",
-            self.task_feature.snapshot_overview(),
-            task_snapshot_text.clone(),
-        ));
-        let result_estimate = agen::token_counter::total_tokens(&new_history, &[]);
-        if result_context_max_tokens > 0 && result_estimate.tokens > result_context_max_tokens {
-            // This history estimate includes retained items and auto-read files, not
-            // just the summary. Treat the configured result target as advisory;
-            // request-time context safety checks still apply after activation.
-            warn!(
-                result_tokens = result_estimate.tokens,
-                warning_threshold = result_context_max_tokens,
-                retained_tokens = retained_estimate.tokens,
-                summary_tokens,
-                auto_read_tokens,
-                "compacted result context exceeds warning threshold; continuing"
-            );
-            self.alert(
-                AlertLevel::Warn,
-                AlertSource::Compactor,
-                format!(
-                    "compacted result context is larger than expected (≈{} tokens; warning threshold {}); continuing compaction",
-                    result_estimate.tokens, result_context_max_tokens
-                ),
-            );
-        }
         let original_entries = self.session.history().entries();
         let derived_sources = original_entries
             .iter()
             .map(|entry| entry.annotation.entry_id.clone())
             .collect::<Vec<_>>();
         let generic_summary_input = session_store::SystemInputEnvelope::new(
-            new_history[0]
+            summary_message
                 .as_text()
                 .expect("compaction summary is text"),
             session_store::HistoryInputMetadata::new(
@@ -7491,47 +7455,79 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             }),
             generic_summary_input,
         );
-        let mut original_cursor = 0usize;
-        let compacted_history_entries = new_history
+        let derived_entry = |item| {
+            let mut metadata = new_history_metadata(
+                WorkerHistoryProvenance::DerivedSummary,
+                Some(SessionHistoryDerivation {
+                    sources: derived_sources.clone(),
+                }),
+            );
+            metadata.input_metadata = Some(
+                session_store::HistoryInputMetadata::new(
+                    session_store::HistoryInputUsePolicy {
+                        recording_material: session_store::InputEvidenceUse::Exclude,
+                        memory_evidence: session_store::InputEvidenceUse::Exclude,
+                        observation: session_store::InputObservationUse::Hidden,
+                        compaction: session_store::InputCompactionUse::Retain,
+                    },
+                    None,
+                    None,
+                )
+                .expect("bounded private derived context policy"),
+            );
+            HistoryEntry::new(item, metadata)
+        };
+        // Retained items and annotations travel together, including when attachment
+        // projection changes an item. Equal model text never selects an identity.
+        let mut compacted_history_entries =
+            vec![HistoryEntry::new(summary_message, summary_entry.metadata)];
+        compacted_history_entries.extend(
+            frozen_context.iter().map(|entry| {
+                HistoryEntry::new(entry.item.to_history_item(), entry.metadata.clone())
+            }),
+        );
+        compacted_history_entries.extend(auto_read_messages.into_iter().map(&derived_entry));
+        if let Some(item) = reference_message {
+            compacted_history_entries.push(derived_entry(item));
+        }
+        compacted_history_entries.extend(retained_history_entries);
+        compacted_history_entries.push(derived_entry(task_snapshot_message));
+        compacted_history_entries.push(derived_entry(Item::tool_call(
+            "compact-tasklist",
+            "TaskList",
+            "{}",
+        )));
+        compacted_history_entries.push(derived_entry(Item::tool_result_with_content(
+            "compact-tasklist",
+            self.task_feature.snapshot_overview(),
+            task_snapshot_text.clone(),
+        )));
+        let new_history = compacted_history_entries
             .iter()
-            .cloned()
-            .enumerate()
-            .map(|(index, item)| {
-                if index == 0 {
-                    HistoryEntry::new(item, summary_entry.metadata.clone())
-                } else if let Some(context) = frozen_context.get(index - 1) {
-                    HistoryEntry::new(item, context.metadata.clone())
-                } else if let Some((offset, original)) = original_entries[original_cursor..]
-                    .iter()
-                    .enumerate()
-                    .find(|(_, original)| original.item == item)
-                {
-                    original_cursor += offset + 1;
-                    HistoryEntry::new(item, original.annotation.clone())
-                } else {
-                    let mut metadata = new_history_metadata(
-                        WorkerHistoryProvenance::DerivedSummary,
-                        Some(SessionHistoryDerivation {
-                            sources: derived_sources.clone(),
-                        }),
-                    );
-                    metadata.input_metadata = Some(
-                        session_store::HistoryInputMetadata::new(
-                            session_store::HistoryInputUsePolicy {
-                                recording_material: session_store::InputEvidenceUse::Exclude,
-                                memory_evidence: session_store::InputEvidenceUse::Exclude,
-                                observation: session_store::InputObservationUse::Hidden,
-                                compaction: session_store::InputCompactionUse::Retain,
-                            },
-                            None,
-                            None,
-                        )
-                        .expect("bounded private derived context policy"),
-                    );
-                    HistoryEntry::new(item, metadata)
-                }
-            })
+            .map(|entry| entry.item.clone())
             .collect::<Vec<_>>();
+        let result_estimate = agen::token_counter::total_tokens(&new_history, &[]);
+        if result_context_max_tokens > 0 && result_estimate.tokens > result_context_max_tokens {
+            // This history estimate includes retained items and auto-read files, not
+            // just the summary. Treat the configured result target as advisory;
+            // request-time context safety checks still apply after activation.
+            warn!(
+                result_tokens = result_estimate.tokens,
+                warning_threshold = result_context_max_tokens,
+                retained_tokens = retained_estimate.tokens,
+                summary_tokens,
+                auto_read_tokens,
+                "compacted result context exceeds warning threshold; continuing"
+            );
+            self.alert(
+                AlertLevel::Warn,
+                AlertSource::Compactor,
+                format!(
+                    "compacted result context is larger than expected (≈{} tokens; warning threshold {}); continuing compaction",
+                    result_estimate.tokens, result_context_max_tokens
+                ),
+            );
+        }
 
         let retained_user_segments = self
             .user_segments
@@ -9238,13 +9234,14 @@ fn project_compactor_capture_attachments<A>(entries: &mut [HistoryEntry<A>]) -> 
 
 /// Remove every durable binary attachment from the compacted tail and preserve
 /// re-readable ViewImage origins as related-file references.
-fn project_compaction_attachments(
-    items: &mut [Item],
+fn project_compaction_attachments<'a>(
+    items: impl IntoIterator<Item = &'a mut Item>,
     default_workdir_alias: Option<&str>,
 ) -> Vec<CompactionImageReference> {
+    let items = items.into_iter().collect::<Vec<_>>();
     let view_image_calls = items
         .iter()
-        .filter_map(|item| match item {
+        .filter_map(|item| match &**item {
             Item::ToolCall {
                 call_id,
                 name,
@@ -10870,7 +10867,7 @@ mod build_summary_prompt_tests {
             Item::ToolResult { attachments, .. } if attachments.is_empty()
         ));
 
-        let references = project_compaction_attachments(&mut items, Some("main"));
+        let references = project_compaction_attachments(items.iter_mut(), Some("main"));
 
         assert_eq!(
             references,

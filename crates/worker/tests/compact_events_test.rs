@@ -3655,3 +3655,132 @@ async fn journal_snapshot_counts_against_compactor_hard_input_cap_without_mutati
         );
     }
 }
+#[tokio::test]
+async fn identical_reference_and_retained_inputs_preserve_distinct_metadata_after_compaction() {
+    use session_store::*;
+    let client = MockClient::new(vec![
+        single_text_events("fixture"),
+        single_text_events("fork checkpoint"),
+        write_summary_tool_use_events("review-summary", "replacement summary"),
+        single_text_events("done"),
+        single_text_events("restore checkpoint"),
+    ]);
+    let mut fixture = SummaryInputFixture::new(MANUAL_ONLY_MANIFEST_TOML, client).await;
+    let make = |producer: &str, compaction| {
+        LoggedSystemHistoryEntry::from_input(
+            LoggedSessionHistoryOrigin::Provided {
+                producer: producer.into(),
+            },
+            None,
+            SystemInputEnvelope::new(
+                "identical model context",
+                HistoryInputMetadata::new(
+                    HistoryInputUsePolicy {
+                        recording_material: InputEvidenceUse::Exclude,
+                        memory_evidence: InputEvidenceUse::Exclude,
+                        observation: InputObservationUse::Hidden,
+                        compaction,
+                    },
+                    Some(
+                        FeatureInputPayload::encode(
+                            "review:owner",
+                            1,
+                            &serde_json::json!({"producer": producer}),
+                        )
+                        .unwrap(),
+                    ),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .to_history_entry()
+    };
+    let historical = make("old-reference", InputCompactionUse::ReferenceInput);
+    let retained = make("retained-context", InputCompactionUse::Retain);
+    let repeated = make("second-retained-context", InputCompactionUse::Retain);
+    assert_ne!(historical.metadata.entry_id, retained.metadata.entry_id);
+    fixture
+        .restore_seed(
+            vec![historical.clone(), retained.clone(), repeated.clone()],
+            false,
+        )
+        .await;
+    let session = fixture.worker.session_id();
+    let original = fixture.worker.segment_id();
+    fixture
+        .worker
+        .store()
+        .append(
+            session,
+            original,
+            &LogEntry::Extension {
+                ts: 2,
+                domain: "test.fork_drift".into(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .unwrap();
+    fixture.worker.run_text("fork checkpoint").await.unwrap();
+    let fork = fixture.worker.segment_id();
+    assert_ne!(fork, original);
+    let forked = replacement_seed(&fixture.worker);
+    for expected in [&historical, &retained, &repeated] {
+        assert!(forked.contains(expected));
+    }
+    fixture.worker.compact(1_000_000).await.unwrap();
+    let seed = replacement_seed(&fixture.worker);
+    let matching: Vec<_> = seed.iter().filter(|e| e.item == retained.item).collect();
+    assert_eq!(matching.len(), 2);
+    assert_eq!(
+        matching[0].metadata, retained.metadata,
+        "a retained logical entry must not inherit identity/policy/payload from an equal-body reference that was removed"
+    );
+
+    assert_eq!(matching[1].metadata, repeated.metadata);
+    let compacted = fixture.worker.segment_id();
+    let reopened = FsStore::new(fixture._store_dir.path()).unwrap();
+    let records = reopened.read_all(session, compacted).unwrap();
+    assert!(
+        matches!(&records[0], LogEntry::AnnotatedSegmentStart { compacted_from: Some(source), .. } if source.segment_id == fork)
+    );
+    fixture.worker.run_text("restore checkpoint").await.unwrap();
+    let records = fixture.worker.store().read_all(session, compacted).unwrap();
+    let snapshot = public_snapshot::project_current_session_snapshot(&records);
+    let checkpoint = snapshot
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| {
+            matches!(
+                entry.data,
+                protocol::SessionSnapshotEntryData::UserInput { .. }
+            )
+        })
+        .unwrap();
+    fixture
+        .worker
+        .rewind_to(checkpoint.entry_id.clone())
+        .await
+        .unwrap();
+    for expected in [&retained, &repeated] {
+        assert!(
+            fixture
+                .worker
+                .session_history()
+                .entries()
+                .iter()
+                .any(|entry| entry.annotation == expected.metadata
+                    && entry.item == Item::from(expected.item.clone()))
+        );
+    }
+    assert!(
+        !fixture
+            .worker
+            .session_history()
+            .entries()
+            .iter()
+            .any(|entry| entry.annotation.entry_id == historical.metadata.entry_id)
+    );
+}
