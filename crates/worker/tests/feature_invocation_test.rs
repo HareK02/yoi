@@ -231,7 +231,7 @@ fn results(worker: &Worker<Trace, TestStore>) -> Vec<FeatureInvocationResult> {
                 }
                 entry
                     .metadata
-                    .system_input
+                    .input_metadata
                     .as_ref()?
                     .feature_payload()?
                     .decode::<SavedResult>("feature:invocation-result", 1)

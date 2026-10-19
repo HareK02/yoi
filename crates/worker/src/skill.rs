@@ -16,7 +16,7 @@ pub(crate) struct SkillActivationInput {
 
 pub(crate) fn activation_input(
     activation: &SkillActivationResponse,
-) -> Result<session_store::LoggedSystemHistoryEntry, session_store::SystemInputError> {
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::InputMetadataError> {
     use session_store::*;
     let body = format!(
         "Agent Skill `{}` activated from {}.\n\n{}",
@@ -29,8 +29,8 @@ pub(crate) fn activation_input(
             name: activation.name.clone(),
         },
     )?;
-    let metadata = SystemInputMetadata::new(
-        SystemInputUsePolicy {
+    let metadata = HistoryInputMetadata::new(
+        HistoryInputUsePolicy {
             recording_material: InputEvidenceUse::Exclude,
             memory_evidence: InputEvidenceUse::Exclude,
             observation: InputObservationUse::Hidden,

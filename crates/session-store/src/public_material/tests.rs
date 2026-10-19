@@ -9,7 +9,7 @@ fn entry(id: &str, item: LoggedItem) -> LoggedHistoryEntry {
     LoggedHistoryEntry {
         item,
         metadata: LoggedSessionHistoryMetadata {
-            system_input: None,
+            input_metadata: None,
             entry_id: LoggedSessionHistoryEntryId(id.into()),
             origin: LoggedSessionHistoryOrigin::LocalHumanInput,
             derivation: None,
@@ -31,9 +31,9 @@ fn system_context(
     compaction: crate::InputCompactionUse,
 ) -> LoggedHistoryEntry {
     let mut entry = message(id, LoggedRole::System, text);
-    entry.metadata.system_input = Some(
-        crate::SystemInputMetadata::new(
-            crate::SystemInputUsePolicy {
+    entry.metadata.input_metadata = Some(
+        crate::HistoryInputMetadata::new(
+            crate::HistoryInputUsePolicy {
                 recording_material: crate::InputEvidenceUse::Exclude,
                 memory_evidence: crate::InputEvidenceUse::Exclude,
                 observation: crate::InputObservationUse::Hidden,
@@ -613,9 +613,9 @@ fn reasoning_proves_rollback_safety_but_private_and_derived_items_are_not_materi
                             body: "previous Journal must not become new recording material".into(),
                         },
                         metadata: LoggedSessionHistoryMetadata {
-                            system_input: Some(
-                                crate::SystemInputMetadata::new(
-                                    crate::SystemInputUsePolicy {
+                            input_metadata: Some(
+                                crate::HistoryInputMetadata::new(
+                                    crate::HistoryInputUsePolicy {
                                         recording_material: crate::InputEvidenceUse::Exclude,
                                         memory_evidence: crate::InputEvidenceUse::Exclude,
                                         observation: crate::InputObservationUse::Hidden,
@@ -812,9 +812,9 @@ fn schema_v3_compaction_migrates_persistently_and_strict_reader_keeps_original_i
             panic!()
         };
         summary.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
-        summary.metadata.system_input = Some(
-            crate::SystemInputMetadata::new(
-                crate::SystemInputUsePolicy {
+        summary.metadata.input_metadata = Some(
+            crate::HistoryInputMetadata::new(
+                crate::HistoryInputUsePolicy {
                     recording_material: crate::InputEvidenceUse::Exclude,
                     memory_evidence: crate::InputEvidenceUse::Exclude,
                     observation: crate::InputObservationUse::Hidden,
@@ -878,7 +878,9 @@ fn midturn_compaction_uses_exact_source_ids_and_preserves_discarded_originals() 
         "never use as original",
         crate::InputCompactionUse::OpeningSummary,
     );
-    summary.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
+    summary.metadata.origin = LoggedSessionHistoryOrigin::Provided {
+        producer: "renamed-summary-owner".into(),
+    };
     summary.metadata.derivation = Some(crate::LoggedHistoryDerivation {
         sources: vec![
             LoggedSessionHistoryEntryId("u".into()),
@@ -1311,8 +1313,8 @@ fn compaction_without_exact_derivation_or_with_invalid_turn_is_rejected() {
 #[test]
 fn generic_system_material_uses_explicit_evidence_purpose_not_producer_or_body() {
     use crate::{
-        FeatureInputPayload, InputCompactionUse, InputEvidenceUse, InputObservationUse,
-        LoggedSystemHistoryEntry, SystemInputEnvelope, SystemInputMetadata, SystemInputUsePolicy,
+        FeatureInputPayload, HistoryInputMetadata, HistoryInputUsePolicy, InputCompactionUse,
+        InputEvidenceUse, InputObservationUse, LoggedSystemHistoryEntry, SystemInputEnvelope,
     };
     for worker_layout in [false, true] {
         let temp = tempfile::tempdir().unwrap();
@@ -1328,8 +1330,8 @@ fn generic_system_material_uses_explicit_evidence_purpose_not_producer_or_body()
                     None,
                     SystemInputEnvelope::new(
                         format!("private model text: {body}"),
-                        SystemInputMetadata::new(
-                            SystemInputUsePolicy {
+                        HistoryInputMetadata::new(
+                            HistoryInputUsePolicy {
                                 recording_material,
                                 memory_evidence,
                                 observation: InputObservationUse::Hidden,

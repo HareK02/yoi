@@ -1033,7 +1033,7 @@ mod tests {
             metadata: &crate::session_history::SessionHistoryMetadata,
         ) {
             if let Some(input) = metadata
-                .system_input
+                .input_metadata
                 .as_ref()
                 .and_then(|input| input.feature_payload())
                 .and_then(|payload| {

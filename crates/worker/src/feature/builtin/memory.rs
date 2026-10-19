@@ -61,12 +61,12 @@ fn resident_input(
     schema: &str,
     payload: &impl serde::Serialize,
     kind: &str,
-) -> Result<session_store::LoggedSystemHistoryEntry, session_store::SystemInputError> {
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::InputMetadataError> {
     use session_store::*;
     let input = SystemInputEnvelope::new(
         body.clone(),
-        SystemInputMetadata::new(
-            SystemInputUsePolicy {
+        HistoryInputMetadata::new(
+            HistoryInputUsePolicy {
                 recording_material: InputEvidenceUse::Exclude,
                 memory_evidence: InputEvidenceUse::Exclude,
                 observation: InputObservationUse::Hidden,
@@ -93,7 +93,7 @@ pub(crate) fn subject_behavior_input(
     body: String,
     behavior_md: String,
     prompt_provenance: Option<session_store::PromptRenderProvenance>,
-) -> Result<session_store::LoggedSystemHistoryEntry, session_store::SystemInputError> {
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::InputMetadataError> {
     resident_input(
         body,
         "subject:behavior",
@@ -108,7 +108,7 @@ pub(crate) fn subject_behavior_input(
 pub(crate) fn resident_summary_input(
     body: String,
     prompt_provenance: Option<session_store::PromptRenderProvenance>,
-) -> Result<session_store::LoggedSystemHistoryEntry, session_store::SystemInputError> {
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::InputMetadataError> {
     resident_input(
         body,
         "memory:resident-summary",
@@ -891,7 +891,7 @@ impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource 
         metadata: &crate::session_history::SessionHistoryMetadata,
     ) {
         if let Some(input) = metadata
-            .system_input
+            .input_metadata
             .as_ref()
             .and_then(|input| input.feature_payload())
             .and_then(|payload| {

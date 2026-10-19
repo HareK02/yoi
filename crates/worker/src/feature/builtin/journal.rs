@@ -79,8 +79,8 @@ fn journal_input(
         body: body.clone(),
         presentation: PublicSystemPresentation::Context,
     };
-    let metadata = SystemInputMetadata::new(
-        SystemInputUsePolicy {
+    let metadata = HistoryInputMetadata::new(
+        HistoryInputUsePolicy {
             recording_material: InputEvidenceUse::Exclude,
             memory_evidence: InputEvidenceUse::Exclude,
             observation: InputObservationUse::Hidden,

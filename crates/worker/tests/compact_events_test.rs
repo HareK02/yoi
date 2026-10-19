@@ -119,7 +119,7 @@ fn annotated(item: Item) -> session_store::LoggedHistoryEntry {
     session_store::LoggedHistoryEntry {
         item: session_store::LoggedItem::from(item),
         metadata: session_store::LoggedSessionHistoryMetadata {
-            system_input: None,
+            input_metadata: None,
             entry_id: session_store::LoggedSessionHistoryEntryId::new(),
             origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
             derivation: None,
@@ -2220,7 +2220,7 @@ fn summary_entry(
     origin: session_store::LoggedSessionHistoryOrigin,
 ) -> session_store::LoggedHistoryEntry {
     let mut entry = annotated(item);
-    entry.metadata.system_input = matches!(
+    entry.metadata.input_metadata = matches!(
         &entry.item,
         session_store::LoggedItem::Message {
             role: session_store::LoggedRole::System,
@@ -2228,8 +2228,8 @@ fn summary_entry(
         }
     )
     .then(|| {
-        session_store::SystemInputMetadata::new(
-            session_store::SystemInputUsePolicy {
+        session_store::HistoryInputMetadata::new(
+            session_store::HistoryInputUsePolicy {
                 recording_material: session_store::InputEvidenceUse::Exclude,
                 memory_evidence: session_store::InputEvidenceUse::Exclude,
                 observation: session_store::InputObservationUse::Hidden,
@@ -2256,7 +2256,7 @@ fn compaction_use(
     metadata: &session_store::LoggedSessionHistoryMetadata,
 ) -> session_store::InputCompactionUse {
     metadata
-        .system_input
+        .input_metadata
         .as_ref()
         .map(|input| input.usage().compaction)
         .unwrap_or(session_store::InputCompactionUse::Retain)
@@ -3167,8 +3167,8 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
         None,
         session_store::SystemInputEnvelope::new(
             "OLD_TYPED_STARTUP_JOURNAL",
-            session_store::SystemInputMetadata::new(
-                session_store::SystemInputUsePolicy {
+            session_store::HistoryInputMetadata::new(
+                session_store::HistoryInputUsePolicy {
                     recording_material: session_store::InputEvidenceUse::Exclude,
                     memory_evidence: session_store::InputEvidenceUse::Exclude,
                     observation: session_store::InputObservationUse::Hidden,

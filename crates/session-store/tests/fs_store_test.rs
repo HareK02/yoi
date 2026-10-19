@@ -11,7 +11,7 @@ fn annotated(item: Item) -> LoggedHistoryEntry {
     LoggedHistoryEntry {
         item: LoggedItem::from(item),
         metadata: LoggedSessionHistoryMetadata {
-            system_input: None,
+            input_metadata: None,
             entry_id: LoggedSessionHistoryEntryId::new(),
             origin: LoggedSessionHistoryOrigin::LegacyUnknown,
             derivation: None,
@@ -428,10 +428,9 @@ fn lookup_session_of_finds_owning_session() {
 #[test]
 fn generic_system_append_and_fork_preserve_metadata_without_public_payload_leak() {
     use session_store::{
-        FeatureInputPayload, InputCompactionUse, InputEvidenceUse, InputObservationUse,
-        LoggedHistoryDerivation, LoggedSystemHistoryEntry, PublicSystemItem,
-        PublicSystemPresentation, SystemInputEnvelope, SystemInputMetadata, SystemInputUsePolicy,
-        WorkerSessionStore,
+        FeatureInputPayload, HistoryInputMetadata, HistoryInputUsePolicy, InputCompactionUse,
+        InputEvidenceUse, InputObservationUse, LoggedHistoryDerivation, LoggedSystemHistoryEntry,
+        PublicSystemItem, PublicSystemPresentation, SystemInputEnvelope, WorkerSessionStore,
     };
     for worker_layout in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -455,8 +454,8 @@ fn generic_system_append_and_fork_preserve_metadata_without_public_payload_leak(
             }),
             SystemInputEnvelope::new(
                 "private model body",
-                SystemInputMetadata::new(
-                    SystemInputUsePolicy {
+                HistoryInputMetadata::new(
+                    HistoryInputUsePolicy {
                         recording_material: InputEvidenceUse::Exclude,
                         memory_evidence: InputEvidenceUse::Exclude,
                         observation: InputObservationUse::Hidden,
@@ -584,11 +583,11 @@ fn invalid_generic_system_input_rejects_append_create_and_external_json_without_
         };
         assert!(matches!(
             store.append(sid, segment, &invalid),
-            Err(StoreError::InvalidSystemInput(_))
+            Err(StoreError::InvalidInputMetadata(_))
         ));
         assert!(matches!(
             store.create_segment(sid, segment, &[seed, invalid.clone()]),
-            Err(StoreError::InvalidSystemInput(_))
+            Err(StoreError::InvalidInputMetadata(_))
         ));
         assert!(
             serde_json::from_value::<LogEntry>(serde_json::to_value(invalid).unwrap()).is_err()

@@ -371,11 +371,10 @@ impl SessionPublicMaterialReader {
             let source_ids: Option<Vec<String>> = if compact {
                 let summaries: Vec<_> = history
                     .iter()
-                    .filter(|e| {
-                        matches!(
-                            e.metadata.origin,
-                            LoggedSessionHistoryOrigin::CompactionSummary
-                        )
+                    .filter(|entry| {
+                        entry.metadata.input_metadata.as_ref().is_some_and(|input| {
+                            input.usage().compaction == crate::InputCompactionUse::OpeningSummary
+                        })
                     })
                     .collect();
                 if summaries.len() != 1 {
@@ -895,7 +894,7 @@ fn canonical_body(
     entry: &LoggedHistoryEntry,
     purpose: PublicMaterialUse,
 ) -> Option<CanonicalBody<'_>> {
-    if let Some(input) = &entry.metadata.system_input {
+    if let Some(input) = &entry.metadata.input_metadata {
         let usage = input.usage();
         let allowed = match purpose {
             PublicMaterialUse::Recording => usage.recording_material,

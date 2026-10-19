@@ -255,18 +255,18 @@ pub struct SegmentOrigin {
 
 impl LogEntry {
     /// Validate generic System records before a Store publishes any bytes.
-    pub fn validate_system_inputs(&self) -> Result<(), crate::SystemInputError> {
+    pub fn validate_input_metadata(&self) -> Result<(), crate::InputMetadataError> {
         match self {
             Self::AnnotatedSegmentStart { history, .. }
             | Self::AnnotatedUserInput { history, .. } => {
                 for entry in history {
-                    entry.validate_system_input()?;
+                    entry.validate_input_metadata()?;
                 }
             }
             Self::AnnotatedAssistantItem { entry, .. }
             | Self::AnnotatedToolResult { entry, .. }
-            | Self::ToolResultCorrected { entry, .. } => entry.validate_system_input()?,
-            Self::AnnotatedSystemItem { entry, .. } => entry.validate_system_input()?,
+            | Self::ToolResultCorrected { entry, .. } => entry.validate_input_metadata()?,
+            Self::AnnotatedSystemItem { entry, .. } => entry.validate_input_metadata()?,
             _ => {}
         }
         Ok(())
@@ -554,7 +554,7 @@ mod tests {
         LoggedHistoryEntry {
             item: LoggedItem::from(item),
             metadata: LoggedSessionHistoryMetadata {
-                system_input: None,
+                input_metadata: None,
                 entry_id: LoggedSessionHistoryEntryId::new(),
                 origin: LoggedSessionHistoryOrigin::LegacyUnknown,
                 derivation: None,

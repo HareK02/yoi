@@ -44108,7 +44108,7 @@ mod tests {
                     content: vec![LoggedContentPart::Text { text: text.into() }],
                 },
                 metadata: LoggedSessionHistoryMetadata {
-                    system_input: None,
+                    input_metadata: None,
                     entry_id: LoggedSessionHistoryEntryId(id.to_string()),
                     origin: LoggedSessionHistoryOrigin::HumanInput {
                         account_id: "account-1".to_string(),
@@ -44298,7 +44298,7 @@ mod tests {
                     content: vec![LoggedContentPart::Text { text: text.into() }],
                 },
                 metadata: LoggedSessionHistoryMetadata {
-                    system_input: None,
+                    input_metadata: None,
                     entry_id: LoggedSessionHistoryEntryId(id.to_string()),
                     origin: LoggedSessionHistoryOrigin::HumanInput {
                         account_id: "account-1".to_string(),
@@ -48550,21 +48550,25 @@ mod tests {
         let worker_root = root
             .join(".test-embedded-runtime-store/workers")
             .join(&worker.worker_id);
-        fs::create_dir_all(worker_root.join("session/segments")).unwrap();
-        fs::write(
-            worker_root.join("session/session.json"),
-            serde_json::to_vec_pretty(&json!({
-                "schema_version": 1,
-                "session_id": session_store::new_session_id()
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            worker_root.join("session/segments/segment-a.jsonl"),
-            b"backend job retained session evidence\n",
-        )
-        .unwrap();
+        use session_store::Store;
+        let store = session_store::WorkerSessionStore::new(worker_root.join("session")).unwrap();
+        let session = session_store::new_session_id();
+        let segment = session_store::new_segment_id();
+        store
+            .create_segment(
+                session,
+                segment,
+                &[session_store::LogEntry::AnnotatedSegmentStart {
+                    ts: 1,
+                    session_id: session,
+                    system_prompt: Some("backend job retained session evidence".into()),
+                    config: Default::default(),
+                    history: vec![],
+                    forked_from: None,
+                    compacted_from: None,
+                }],
+            )
+            .unwrap();
     }
 
     fn job_notification_evidence(

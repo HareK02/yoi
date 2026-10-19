@@ -36,7 +36,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-const SESSION_SCHEMA_VERSION: u32 = 5;
+const SESSION_SCHEMA_VERSION: u32 = 6;
+const SYSTEM_INPUT_SESSION_SCHEMA_VERSION: u32 = 5;
 const COMPACTION_SESSION_SCHEMA_VERSION: u32 = 4;
 const ANNOTATED_SESSION_SCHEMA_VERSION: u32 = 3;
 const PREVIOUS_SESSION_SCHEMA_VERSION: u32 = 2;
@@ -225,8 +226,9 @@ impl WorkerSessionStore {
                     LEGACY_SESSION_SCHEMA_VERSION
                     | PREVIOUS_SESSION_SCHEMA_VERSION
                     | ANNOTATED_SESSION_SCHEMA_VERSION
-                    | COMPACTION_SESSION_SCHEMA_VERSION => {
-                        migrate_segment_logs_to_v5(
+                    | COMPACTION_SESSION_SCHEMA_VERSION
+                    | SYSTEM_INPUT_SESSION_SCHEMA_VERSION => {
+                        migrate_segment_logs_to_current(
                             segment_log_paths(&root)?,
                             manifest.session_id,
                             manifest.schema_version,
@@ -753,7 +755,7 @@ impl Store for WorkerSessionStore {
         segment_id: SegmentId,
         entry: &LogEntry,
     ) -> Result<(), StoreError> {
-        entry.validate_system_inputs()?;
+        entry.validate_input_metadata()?;
         let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, true)?;
         self.append_log_entry(&self.log_path(segment_id), entry)
@@ -813,7 +815,7 @@ impl Store for WorkerSessionStore {
         entries: &[LogEntry],
     ) -> Result<(), StoreError> {
         for entry in entries {
-            entry.validate_system_inputs()?;
+            entry.validate_input_metadata()?;
         }
         let _retention = self.lock_publication(session_id)?;
         self.ensure_session(session_id, true)?;
@@ -1173,7 +1175,7 @@ fn segment_log_paths_in_directory(
     Ok(paths)
 }
 
-fn migrate_segment_logs_to_v5(
+fn migrate_segment_logs_to_current(
     paths: Vec<(SegmentId, PathBuf)>,
     session_id: SessionId,
     source_schema_version: u32,
@@ -1220,7 +1222,7 @@ fn migrate_segment_logs_to_v5(
         crate::legacy_session_log::migrate_compaction_origins(&mut plan.entries, &summaries);
         for mut entry in std::mem::take(&mut plan.entries) {
             crate::legacy_session_log::migrate_system_inputs(&mut entry)?;
-            entry.validate_system_inputs()?;
+            entry.validate_input_metadata()?;
             serde_json::to_writer(&mut plan.output, &entry)?;
             plan.output.push(b'\n');
         }
@@ -1265,8 +1267,9 @@ pub(crate) fn migrate_fs_session(root: &Path, session_id: SessionId) -> Result<(
         LEGACY_SESSION_SCHEMA_VERSION
         | PREVIOUS_SESSION_SCHEMA_VERSION
         | ANNOTATED_SESSION_SCHEMA_VERSION
-        | COMPACTION_SESSION_SCHEMA_VERSION => {
-            migrate_segment_logs_to_v5(
+        | COMPACTION_SESSION_SCHEMA_VERSION
+        | SYSTEM_INPUT_SESSION_SCHEMA_VERSION => {
+            migrate_segment_logs_to_current(
                 segment_log_paths_in_directory(root)?,
                 session_id,
                 version,
@@ -1289,7 +1292,7 @@ fn validate_canonical_segment_paths(paths: Vec<(SegmentId, PathBuf)>) -> Result<
     for (_, path) in paths {
         let entries: Vec<LogEntry> = parse_jsonl(&fs::read(&path)?)?;
         for entry in entries {
-            entry.validate_system_inputs()?;
+            entry.validate_input_metadata()?;
         }
     }
     Ok(())
@@ -1470,7 +1473,7 @@ mod tests {
         LoggedHistoryEntry {
             item: LoggedItem::from(item),
             metadata: LoggedSessionHistoryMetadata {
-                system_input: None,
+                input_metadata: None,
                 entry_id: LoggedSessionHistoryEntryId::new(),
                 origin: LoggedSessionHistoryOrigin::LegacyUnknown,
                 derivation: None,
@@ -2162,7 +2165,7 @@ mod tests {
         assert_eq!(fs::read(&marker_path).unwrap(), old_marker);
         let updated_first: Vec<LogEntry> = parse_jsonl(&first_published).unwrap();
         for entry in &updated_first {
-            entry.validate_system_inputs().unwrap();
+            entry.validate_input_metadata().unwrap();
         }
         assert!(matches!(
             &updated_first[0],
@@ -2184,7 +2187,7 @@ mod tests {
         assert_eq!(identity_and_body(&first), first_identity);
         assert_eq!(identity_and_body(&second), second_identity);
         for entry in first.iter().chain(second.iter()) {
-            entry.validate_system_inputs().unwrap();
+            entry.validate_input_metadata().unwrap();
         }
         assert_eq!(fs::read(&first_path).unwrap(), first_published);
         let second_published = fs::read(&second_path).unwrap();

@@ -155,7 +155,7 @@ fn assert_generic(root: &Path, session: SessionId, segment: SegmentId) {
             entry.item.history_text(),
             old["entry"]["item"]["body"].as_str().unwrap()
         );
-        let input = entry.metadata.system_input.as_ref().unwrap();
+        let input = entry.metadata.input_metadata.as_ref().unwrap();
         let usage = input.usage();
         assert_eq!(usage.recording_material, InputEvidenceUse::Exclude);
         assert_eq!(usage.memory_evidence, InputEvidenceUse::Exclude);
@@ -556,4 +556,79 @@ fn current_runtime_session_migration_still_rejects_live_worker_sockets() {
     fs::remove_dir_all(runs).unwrap();
     assert_eq!(tree_bytes(&root), before);
     assert!(!temp.path().join(".runtime.schema-v12-staging").exists());
+}
+
+#[test]
+fn current_runtime_upgrades_v5_role_metadata_through_staging_without_reserializing_owner_evidence()
+{
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("runtime");
+    let (worker, session, segment) = runtime_fixture(&root, 12);
+    let aggregate = root.join("workers").join(worker.to_string());
+    let path = aggregate
+        .join("session/segments")
+        .join(format!("{segment}.jsonl"));
+    let old = fs::read_to_string(&path).unwrap();
+    let header = old.lines().next().unwrap();
+    let source = include_str!(
+        "../../../session-store/src/legacy_session_log/tests/fixtures/v5-role-metadata.jsonl"
+    );
+    fs::write(&path, format!("{header}\n{source}")).unwrap();
+    write_json(
+        &aggregate.join("session/session.json"),
+        &json!({"schema_version":5, "session_id": session}),
+    );
+    let owner_before = fs::read(root.join("runtime.json")).unwrap();
+    let worker_before = fs::read(aggregate.join("worker.json")).unwrap();
+    let metadata_before = fs::read(aggregate.join("metadata.json")).unwrap();
+    assert!(WorkerSessionStore::open_read_only(aggregate.join("session")).is_err());
+    let options = FsRuntimeStoreOptions::new(&root).with_runtime_id("runtime-a");
+    assert!(
+        FsRuntimeStore::migration_plan(&options)
+            .unwrap()
+            .migration_required
+    );
+    FsRuntimeStore::migrate(&options).unwrap();
+    let store = WorkerSessionStore::open_read_only(aggregate.join("session")).unwrap();
+    let entries = store.read_all_read_only(session, segment).unwrap();
+    assert_eq!(entries.len(), 6);
+    for (current, old) in entries[1..].iter().zip(source.lines()) {
+        let current = serde_json::to_value(current).unwrap();
+        let old: Value = serde_json::from_str(old).unwrap();
+        assert_eq!(current["ts"], old["ts"]);
+        assert_eq!(current["entry"]["item"], old["entry"]["item"]);
+        for field in ["entry_id", "origin", "derivation"] {
+            assert_eq!(
+                current["entry"]["metadata"][field],
+                old["entry"]["metadata"][field]
+            );
+        }
+        if current["entry"]["metadata"]["origin"]["kind"] == "derived_summary" {
+            assert_eq!(
+                current["entry"]["metadata"]["input_metadata"]["usage"]["recording_material"],
+                "exclude"
+            );
+            assert_eq!(
+                current["entry"]["metadata"]["input_metadata"]["usage"]["memory_evidence"],
+                "exclude"
+            );
+        }
+    }
+    assert_eq!(fs::read(root.join("runtime.json")).unwrap(), owner_before);
+    assert_eq!(
+        fs::read(aggregate.join("worker.json")).unwrap(),
+        worker_before
+    );
+    assert_eq!(
+        fs::read(aggregate.join("metadata.json")).unwrap(),
+        metadata_before
+    );
+    let once = tree_bytes(&aggregate.join("session"));
+    assert!(
+        !FsRuntimeStore::migration_plan(&options)
+            .unwrap()
+            .migration_required
+    );
+    FsRuntimeStore::migrate(&options).unwrap();
+    assert_eq!(tree_bytes(&aggregate.join("session")), once);
 }

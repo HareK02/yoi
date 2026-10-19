@@ -1156,7 +1156,7 @@ enabled = true
                 LogEntry::AnnotatedSystemItem { entry, .. }
                     if entry
                         .metadata
-                        .system_input
+                        .input_metadata
                         .as_ref()
                         .and_then(|input| input.feature_payload())
                         .is_some_and(|payload| payload.schema() == "journal:startup") =>
@@ -1178,7 +1178,7 @@ enabled = true
                 };
                 let payload = journal
                     .metadata
-                    .system_input
+                    .input_metadata
                     .as_ref()
                     .unwrap()
                     .feature_payload()
@@ -1277,7 +1277,7 @@ enabled = true
             }
             assert_eq!(host.startup_calls.load(Ordering::SeqCst), 1);
             let logs = store.read_all(session, segment).unwrap();
-            assert_eq!(logs.iter().filter(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if entry.metadata.system_input.as_ref().and_then(|input| input.feature_payload()).is_some_and(|payload| payload.schema() == "journal:startup"))).count(), usize::from(contributes_context));
+            assert_eq!(logs.iter().filter(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if entry.metadata.input_metadata.as_ref().and_then(|input| input.feature_payload()).is_some_and(|payload| payload.schema() == "journal:startup"))).count(), usize::from(contributes_context));
             controller
                 .handle
                 .send(Method::Shutdown {

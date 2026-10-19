@@ -215,6 +215,7 @@ async fn public_mid_turn_compactions_preserve_originals_and_drain_after_cancel_a
                 }
                 protocol::Event::TextDelta { text } if text.contains(PARTIAL) => break,
                 protocol::Event::RunEnd { .. } => panic!("dialog ended before cancellation"),
+                protocol::Event::SessionEntryCommitted { entry } if matches!(entry.data, protocol::SessionSnapshotEntryData::RunError { .. }) => panic!("dialog failed before cancellation: {entry:?}"),
                 protocol::Event::Error { code, message } => panic!("{code:?}: {message}"),
                 _ => {}
             }
@@ -294,6 +295,32 @@ async fn public_mid_turn_compactions_preserve_originals_and_drain_after_cancel_a
             .iter()
             .flat_map(|segment| source_store.read_all(session, *segment).unwrap())
             .collect();
+        for history in raw.iter().filter_map(|record| match record {
+            session_store::LogEntry::AnnotatedSegmentStart { history, compacted_from: Some(_), .. } => Some(history),
+            _ => None,
+        }) {
+            let mut calls = std::collections::HashSet::new();
+            let mut results = 0;
+            for entry in history {
+                let is_tool = matches!(entry.item, session_store::LoggedItem::ToolCall { .. } | session_store::LoggedItem::ToolResult { .. });
+                let Some(metadata) = entry.metadata.input_metadata.as_ref().filter(|_| is_tool) else { continue; };
+                assert_eq!(metadata.usage().recording_material, session_store::InputEvidenceUse::Exclude);
+                assert_eq!(metadata.usage().memory_evidence, session_store::InputEvidenceUse::Exclude);
+                assert_eq!(metadata.usage().observation, session_store::InputObservationUse::Hidden);
+                assert!(metadata.public_item().is_none());
+                assert!(entry.metadata.derivation.is_some());
+                match &entry.item {
+                    session_store::LoggedItem::ToolCall { call_id, .. } => { calls.insert(call_id.clone()); }
+                    session_store::LoggedItem::ToolResult { call_id, .. } => {
+                        assert!(calls.contains(call_id), "derived Tool result must follow its real logical call");
+                        results += 1;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert!(!calls.is_empty());
+            assert!(results >= calls.len());
+        }
         assert_eq!(
             raw.iter()
                 .filter(|entry| matches!(

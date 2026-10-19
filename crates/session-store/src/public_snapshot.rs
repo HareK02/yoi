@@ -1625,9 +1625,9 @@ pub(crate) fn project_session_snapshot_for_segment(
                 derivation_ids(entry),
                 entry
                     .metadata
-                    .system_input
+                    .input_metadata
                     .as_ref()
-                    .map(crate::SystemInputMetadata::public_use_policy),
+                    .map(crate::HistoryInputMetadata::public_use_policy),
             )),
             LogEntry::RunYielded {
                 ts,
@@ -1797,9 +1797,9 @@ fn history_entry(
     SessionSnapshotEntry {
         use_policy: entry
             .metadata
-            .system_input
+            .input_metadata
             .as_ref()
-            .map(crate::SystemInputMetadata::public_use_policy),
+            .map(crate::HistoryInputMetadata::public_use_policy),
         entry_id: entry.metadata.entry_id.0.clone(),
         timestamp,
         provenance: provenance(&entry.metadata.origin),
@@ -1926,7 +1926,16 @@ pub fn session_tool_attachment_id(
 }
 
 fn project_history_item(entry: &LoggedHistoryEntry) -> Option<SessionSnapshotEntryData> {
-    if let Some(input) = &entry.metadata.system_input {
+    if let Some(input) = &entry.metadata.input_metadata {
+        if !matches!(
+            entry.item,
+            LoggedItem::Message {
+                role: LoggedRole::System,
+                ..
+            }
+        ) {
+            return None;
+        }
         let public = input.public_projection();
         return Some(SessionSnapshotEntryData::SystemItem {
             item_kind: public.kind.clone(),
@@ -2310,7 +2319,7 @@ mod tests {
                 content: vec![LoggedContentPart::Text { text: text.into() }],
             },
             metadata: LoggedSessionHistoryMetadata {
-                system_input: None,
+                input_metadata: None,
                 entry_id: LoggedSessionHistoryEntryId(entry_id.into()),
                 origin,
                 derivation: None,
@@ -3609,7 +3618,7 @@ mod tests {
             .map(|item| LoggedHistoryEntry {
                 item,
                 metadata: LoggedSessionHistoryMetadata {
-                    system_input: None,
+                    input_metadata: None,
                     entry_id: LoggedSessionHistoryEntryId::new(),
                     origin: LoggedSessionHistoryOrigin::LegacyUnknown,
                     derivation: None,
@@ -3664,7 +3673,7 @@ mod tests {
                         }],
                     },
                     metadata: LoggedSessionHistoryMetadata {
-                        system_input: None,
+                        input_metadata: None,
                         entry_id: user_entry_id,
                         origin: LoggedSessionHistoryOrigin::HumanInput {
                             account_id: "account-1".into(),
@@ -3734,7 +3743,7 @@ mod tests {
                                 }],
                             },
                             metadata: LoggedSessionHistoryMetadata {
-                                system_input: None,
+                                input_metadata: None,
                                 entry_id: LoggedSessionHistoryEntryId::new(),
                                 origin: LoggedSessionHistoryOrigin::FlowInstruction {
                                     selector: "builtin:coder-review".into(),
@@ -3754,7 +3763,7 @@ mod tests {
                                 }],
                             },
                             metadata: LoggedSessionHistoryMetadata {
-                                system_input: None,
+                                input_metadata: None,
                                 entry_id: user_entry_id.clone(),
                                 origin: origin.clone(),
                                 derivation: Some(LoggedHistoryDerivation {
@@ -3785,7 +3794,7 @@ mod tests {
     fn annotated_projection_preserves_identity_and_provenance() {
         let session_id = crate::new_session_id();
         let metadata = LoggedSessionHistoryMetadata {
-            system_input: None,
+            input_metadata: None,
             entry_id: LoggedSessionHistoryEntryId::new(),
             origin: LoggedSessionHistoryOrigin::ModelOutput {
                 worker: LoggedWorkerSubject {
@@ -4348,7 +4357,7 @@ mod tests {
                 is_error: false,
             },
             metadata: LoggedSessionHistoryMetadata {
-                system_input: None,
+                input_metadata: None,
                 entry_id: LoggedSessionHistoryEntryId("ancestor-image".into()),
                 origin: LoggedSessionHistoryOrigin::LegacyUnknown,
                 derivation: None,
@@ -4443,7 +4452,7 @@ mod tests {
                 is_error: false,
             },
             metadata: LoggedSessionHistoryMetadata {
-                system_input: None,
+                input_metadata: None,
                 entry_id: LoggedSessionHistoryEntryId("tool-images".into()),
                 origin: LoggedSessionHistoryOrigin::LegacyUnknown,
                 derivation: None,

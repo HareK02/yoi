@@ -2739,7 +2739,7 @@ pub trait SystemItemCommitter: Send + Sync {
         extensions: Vec<SessionExtension>,
         after_commit: &mut dyn FnMut(&HistoryEntry<SessionHistoryMetadata>),
     ) -> Result<HistoryEntry<SessionHistoryMetadata>, StoreError> {
-        entry.validate_system_input()?;
+        entry.validate_input_metadata()?;
         let history = HistoryEntry::new(entry.item.to_history_item(), entry.metadata.clone());
         self.commit_usage_boundary(
             LogEntry::AnnotatedSystemItem {
@@ -6950,7 +6950,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         };
         for entry in &frozen_context {
             entry
-                .validate_system_input()
+                .validate_input_metadata()
                 .map_err(|e| WorkerError::InvalidState(e.to_string()))?;
         }
         let history_entries = self.session.history().entries();
@@ -7469,8 +7469,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             new_history[0]
                 .as_text()
                 .expect("compaction summary is text"),
-            session_store::SystemInputMetadata::new(
-                session_store::SystemInputUsePolicy {
+            session_store::HistoryInputMetadata::new(
+                session_store::HistoryInputUsePolicy {
                     recording_material: session_store::InputEvidenceUse::Exclude,
                     memory_evidence: session_store::InputEvidenceUse::Exclude,
                     observation: session_store::InputObservationUse::Hidden,
@@ -7509,15 +7509,26 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     original_cursor += offset + 1;
                     HistoryEntry::new(item, original.annotation.clone())
                 } else {
-                    HistoryEntry::new(
-                        item,
-                        new_history_metadata(
-                            WorkerHistoryProvenance::DerivedSummary,
-                            Some(SessionHistoryDerivation {
-                                sources: derived_sources.clone(),
-                            }),
-                        ),
-                    )
+                    let mut metadata = new_history_metadata(
+                        WorkerHistoryProvenance::DerivedSummary,
+                        Some(SessionHistoryDerivation {
+                            sources: derived_sources.clone(),
+                        }),
+                    );
+                    metadata.input_metadata = Some(
+                        session_store::HistoryInputMetadata::new(
+                            session_store::HistoryInputUsePolicy {
+                                recording_material: session_store::InputEvidenceUse::Exclude,
+                                memory_evidence: session_store::InputEvidenceUse::Exclude,
+                                observation: session_store::InputObservationUse::Hidden,
+                                compaction: session_store::InputCompactionUse::Retain,
+                            },
+                            None,
+                            None,
+                        )
+                        .expect("bounded private derived context policy"),
+                    );
+                    HistoryEntry::new(item, metadata)
                 }
             })
             .collect::<Vec<_>>();
@@ -10790,9 +10801,9 @@ mod build_summary_prompt_tests {
                     producer: "arbitrary-summary-source".into(),
                 },
             );
-            entry.annotation.system_input = Some(
-                session_store::SystemInputMetadata::new(
-                    session_store::SystemInputUsePolicy {
+            entry.annotation.input_metadata = Some(
+                session_store::HistoryInputMetadata::new(
+                    session_store::HistoryInputUsePolicy {
                         recording_material: session_store::InputEvidenceUse::Exclude,
                         memory_evidence: session_store::InputEvidenceUse::Exclude,
                         observation: session_store::InputObservationUse::Hidden,
@@ -14631,7 +14642,7 @@ permission = "write"
             matches!(
                 entry,
                 LogEntry::AnnotatedSystemItem { entry, .. }
-                    if entry.metadata.system_input.as_ref().and_then(|input| input.feature_payload()).and_then(|payload| payload.decode::<crate::skill::SkillActivationInput>("skill:activation", 1).ok()).is_some_and(|payload| payload.name == "triage-errors")
+                    if entry.metadata.input_metadata.as_ref().and_then(|input| input.feature_payload()).and_then(|payload| payload.decode::<crate::skill::SkillActivationInput>("skill:activation", 1).ok()).is_some_and(|payload| payload.name == "triage-errors")
                     && entry.item.history_text().contains("# Triage Errors")
                     && entry.item.history_text() == history_text
             )
@@ -16919,7 +16930,7 @@ permission = "write"
     fn input_schema(entry: &session_store::LoggedSystemHistoryEntry) -> Option<&str> {
         entry
             .metadata
-            .system_input
+            .input_metadata
             .as_ref()?
             .feature_payload()
             .map(|payload| payload.schema())
@@ -16953,8 +16964,8 @@ permission = "write"
             None,
             SystemInputEnvelope::new(
                 "PRIOR_JOURNAL_REFERENCE",
-                SystemInputMetadata::new(
-                    SystemInputUsePolicy {
+                HistoryInputMetadata::new(
+                    HistoryInputUsePolicy {
                         recording_material: InputEvidenceUse::Exclude,
                         memory_evidence: InputEvidenceUse::Exclude,
                         observation: InputObservationUse::Hidden,

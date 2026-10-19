@@ -5502,7 +5502,7 @@ mod tests {
             entry: session_store::LoggedHistoryEntry {
                 item: session_store::LoggedItem::from(saved),
                 metadata: session_store::LoggedSessionHistoryMetadata {
-                    system_input: None,
+                    input_metadata: None,
                     entry_id: session_store::LoggedSessionHistoryEntryId::new(),
                     origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
                     derivation: None,

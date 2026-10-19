@@ -27,8 +27,8 @@ pub enum StoreError {
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
-    #[error("invalid system input: {0}")]
-    InvalidSystemInput(#[from] crate::SystemInputError),
+    #[error("invalid history input metadata: {0}")]
+    InvalidInputMetadata(#[from] crate::InputMetadataError),
 
     #[error("segment not found: {0}")]
     NotFound(SegmentId),

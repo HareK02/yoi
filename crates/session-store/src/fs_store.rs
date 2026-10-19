@@ -361,7 +361,7 @@ impl Store for FsStore {
         segment_id: SegmentId,
         entry: &LogEntry,
     ) -> Result<(), StoreError> {
-        entry.validate_system_inputs()?;
+        entry.validate_input_metadata()?;
         let _retention = self.retention().lock_live(session_id)?;
         let line = serde_json::to_string(entry)?;
         self.append_line(&self.log_path(session_id, segment_id), &line)
@@ -450,7 +450,7 @@ impl Store for FsStore {
         entries: &[LogEntry],
     ) -> Result<(), StoreError> {
         for entry in entries {
-            entry.validate_system_inputs()?;
+            entry.validate_input_metadata()?;
         }
         let _retention = self.retention().lock_live(session_id)?;
         let path = self.log_path(session_id, segment_id);

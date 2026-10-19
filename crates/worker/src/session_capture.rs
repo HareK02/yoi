@@ -352,11 +352,19 @@ impl SessionCapture {
         let entries = entries
             .into_iter()
             .map(|entry| {
-                let (item, use_policy) = if let Some(input) = &entry.annotation.system_input {
-                    (
-                        Item::system_message(input.public_projection().body),
-                        Some(input.public_use_policy()),
-                    )
+                let (item, use_policy) = if let Some(input) = &entry.annotation.input_metadata {
+                    let item = if matches!(
+                        entry.item,
+                        Item::Message {
+                            role: Role::System,
+                            ..
+                        }
+                    ) {
+                        Item::system_message(input.public_projection().body)
+                    } else {
+                        entry.item
+                    };
+                    (item, Some(input.public_use_policy()))
                 } else {
                     (entry.item, None)
                 };
@@ -982,10 +990,10 @@ mod tests {
     #[test]
     fn generic_public_input_observation_and_memory_policies_survive_store_restore_independently() {
         use session_store::{
-            FeatureInputPayload, FsStore, InputCompactionUse, InputEvidenceUse,
-            InputObservationUse, LogEntry, LoggedSystemHistoryEntry, PublicSystemItem,
-            PublicSystemPresentation, Store, SystemInputEnvelope, SystemInputMetadata,
-            SystemInputUsePolicy,
+            FeatureInputPayload, FsStore, HistoryInputMetadata, HistoryInputUsePolicy,
+            InputCompactionUse, InputEvidenceUse, InputObservationUse, LogEntry,
+            LoggedSystemHistoryEntry, PublicSystemItem, PublicSystemPresentation, Store,
+            SystemInputEnvelope,
         };
         let root = tempfile::tempdir().unwrap();
         let store = FsStore::new(root.path()).unwrap();
@@ -1046,8 +1054,8 @@ mod tests {
                 None,
                 SystemInputEnvelope::new(
                     "private model text",
-                    SystemInputMetadata::new(
-                        SystemInputUsePolicy {
+                    HistoryInputMetadata::new(
+                        HistoryInputUsePolicy {
                             recording_material: InputEvidenceUse::Exclude,
                             memory_evidence,
                             observation,
@@ -1118,6 +1126,152 @@ mod tests {
                     assert!(!text.contains("future:owner"));
                 }
             }
+        }
+    }
+
+    // Real FsStore seed/fork/reopen -> ordinary history replay, public snapshot,
+    // capture and both evidence consumers; no Feature or Tool execution occurs.
+    #[test]
+    fn derived_tool_context_keeps_roles_identity_and_policy_through_fork_without_becoming_evidence()
+    {
+        use session_store::public_material::{
+            PublicMaterialLimits, PublicMaterialUse, SessionPublicMaterialReader,
+        };
+        use session_store::*;
+        let root = tempfile::tempdir().unwrap();
+        let store = FsStore::new(root.path()).unwrap();
+        let session = new_session_id();
+        let first = new_segment_id();
+        let fork = new_segment_id();
+        let items = vec![
+            Item::tool_call("original", "ArbitraryTool", "{}"),
+            Item::tool_result("original", "original result"),
+            Item::tool_call("derived", "ArbitraryTool", "PRIVATE_SYNTHETIC_CONTEXT"),
+            Item::tool_result("derived", "PRIVATE_SYNTHETIC_RESULT"),
+        ];
+        let mut history: Vec<_> = items
+            .iter()
+            .cloned()
+            .map(|item| LoggedHistoryEntry {
+                item: LoggedItem::from(item),
+                metadata: LoggedSessionHistoryMetadata::legacy_unknown(),
+            })
+            .collect();
+        let sources = history[..2]
+            .iter()
+            .map(|entry| entry.metadata.entry_id.clone())
+            .collect::<Vec<_>>();
+        for entry in &mut history[2..] {
+            entry.metadata.derivation = Some(LoggedHistoryDerivation {
+                sources: sources.clone(),
+            });
+            entry.metadata.input_metadata = Some(
+                HistoryInputMetadata::new(
+                    HistoryInputUsePolicy {
+                        recording_material: InputEvidenceUse::Exclude,
+                        memory_evidence: InputEvidenceUse::Exclude,
+                        observation: InputObservationUse::Hidden,
+                        compaction: InputCompactionUse::Retain,
+                    },
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        for segment in [first, fork] {
+            store
+                .create_segment(
+                    session,
+                    segment,
+                    &[LogEntry::AnnotatedSegmentStart {
+                        ts: 1,
+                        session_id: session,
+                        system_prompt: None,
+                        config: Default::default(),
+                        history: history.clone(),
+                        forked_from: (segment == fork).then_some(SegmentOrigin {
+                            segment_id: first,
+                            at_turn_index: 0,
+                        }),
+                        compacted_from: None,
+                    }],
+                )
+                .unwrap();
+        }
+        let reopened = FsStore::new(root.path()).unwrap();
+        let saved = reopened.read_all(session, fork).unwrap();
+        let restored =
+            crate::session_history::restore_history_entries(session, fork, &saved).unwrap();
+        for (index, entry) in restored.iter().enumerate() {
+            assert_eq!(entry.item, items[index]);
+            assert_eq!(entry.annotation, history[index].metadata);
+        }
+        let capture = SessionCapture::from_history_entries(fork.to_string(), restored);
+        assert!(
+            matches!(&capture.entries[2].item, Item::ToolCall { call_id, .. } if call_id == "derived")
+        );
+        assert!(
+            matches!(&capture.entries[3].item, Item::ToolResult { call_id, .. } if call_id == "derived")
+        );
+        let snapshot = public_snapshot::project_session_snapshot(session, &saved);
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("PRIVATE_SYNTHETIC")
+        );
+        for capture in [
+            capture,
+            SessionCapture::from_session_snapshot(fork.to_string(), snapshot),
+        ] {
+            assert_eq!(
+                capture
+                    .search(&SearchOptions {
+                        kind: Some(ReferenceKind::Tool),
+                        ..Default::default()
+                    })
+                    .len(),
+                2
+            );
+            for (index, entry) in history.iter().enumerate() {
+                let reference = SessionEntryRef::from_history_entry_id(&entry.metadata.entry_id);
+                assert_eq!(
+                    !capture
+                        .read(ReadSelector::Id(reference.as_str()), ReadOptions::default())
+                        .entries
+                        .is_empty(),
+                    index < 2
+                );
+                assert_eq!(
+                    capture.evidence_for(reference.as_str()).is_some(),
+                    index < 2
+                );
+            }
+        }
+        for purpose in [
+            PublicMaterialUse::Recording,
+            PublicMaterialUse::MemoryEvidence,
+        ] {
+            let reader = SessionPublicMaterialReader::open_fs_for_use(
+                root.path(),
+                session,
+                fork,
+                PublicMaterialLimits::default(),
+                reopened.retention(),
+                purpose,
+            )
+            .unwrap();
+            let ids = reader
+                .descriptors()
+                .map(|entry| entry.identity.entry_ref.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ids,
+                sources
+                    .iter()
+                    .map(|id| format!("E{}", id.0))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 

@@ -24,7 +24,7 @@ pub(crate) fn test_logged_history_entry(item: impl Into<Item>) -> LoggedHistoryE
     LoggedHistoryEntry {
         item: session_store::LoggedItem::from(item.into()),
         metadata: LoggedSessionHistoryMetadata {
-            system_input: None,
+            input_metadata: None,
             entry_id: LoggedSessionHistoryEntryId::new(),
             origin: LoggedSessionHistoryOrigin::LegacyUnknown,
             derivation: None,
@@ -39,7 +39,7 @@ pub(crate) fn test_logged_system_entry(
     session_store::LoggedSystemHistoryEntry {
         item,
         metadata: LoggedSessionHistoryMetadata {
-            system_input: None,
+            input_metadata: None,
             entry_id: LoggedSessionHistoryEntryId::new(),
             origin: LoggedSessionHistoryOrigin::LegacyUnknown,
             derivation: None,
@@ -60,7 +60,7 @@ pub(crate) fn metadata(
     derivation: Option<SessionHistoryDerivation>,
 ) -> SessionHistoryMetadata {
     SessionHistoryMetadata {
-        system_input: None,
+        input_metadata: None,
         entry_id: SessionHistoryEntryId::new(),
         origin,
         derivation,
@@ -71,7 +71,7 @@ pub(crate) fn compaction_use(
     metadata: &SessionHistoryMetadata,
 ) -> session_store::InputCompactionUse {
     metadata
-        .system_input
+        .input_metadata
         .as_ref()
         .map(|input| input.usage().compaction)
         .unwrap_or(session_store::InputCompactionUse::Retain)
@@ -93,7 +93,7 @@ pub(crate) fn history_entry_with_id(
     HistoryEntry::new(
         item,
         SessionHistoryMetadata {
-            system_input: None,
+            input_metadata: None,
             entry_id,
             origin,
             derivation: None,

@@ -48,15 +48,15 @@ pub(crate) struct InvocationResultInput {
 pub(crate) fn result_input(
     result: FeatureInvocationResult,
     body: String,
-) -> Result<session_store::LoggedSystemHistoryEntry, session_store::SystemInputError> {
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::InputMetadataError> {
     use session_store::*;
     let payload = FeatureInputPayload::encode(
         "feature:invocation-result",
         1,
         &InvocationResultInput { result },
     )?;
-    let metadata = SystemInputMetadata::new(
-        SystemInputUsePolicy {
+    let metadata = HistoryInputMetadata::new(
+        HistoryInputUsePolicy {
             recording_material: InputEvidenceUse::Exclude,
             memory_evidence: InputEvidenceUse::Exclude,
             observation: InputObservationUse::Hidden,

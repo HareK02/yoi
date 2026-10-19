@@ -562,7 +562,7 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
             };
             let payload = entry
                 .metadata
-                .system_input
+                .input_metadata
                 .as_ref()?
                 .feature_payload()?
                 .decode::<SavedJournal>("journal:startup", 1)

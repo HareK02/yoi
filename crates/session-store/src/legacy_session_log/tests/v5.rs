@@ -27,7 +27,7 @@ fn encode(entries: &[LogEntry]) -> Vec<u8> {
 fn migrate(entries: &mut [LogEntry]) {
     for entry in entries {
         migrate_system_inputs(entry).unwrap();
-        entry.validate_system_inputs().unwrap();
+        entry.validate_input_metadata().unwrap();
     }
 }
 
@@ -100,7 +100,7 @@ fn v4_fixed_wire_preserves_identity_body_payload_public_and_independent_policy()
         assert_eq!(entry.metadata.entry_id, old_metadata.entry_id);
         assert_eq!(entry.metadata.origin, old_metadata.origin);
         assert_eq!(entry.metadata.derivation, old_metadata.derivation);
-        let metadata = entry.metadata.system_input.as_ref().unwrap();
+        let metadata = entry.metadata.input_metadata.as_ref().unwrap();
         let public = metadata.public_item().unwrap();
         assert_eq!(public.kind, old_item["kind"].as_str().unwrap());
         assert_eq!(public.body, old_item["body"].as_str().unwrap());
@@ -182,7 +182,7 @@ fn v4_fixed_wire_preserves_identity_body_payload_public_and_independent_policy()
             history[index].metadata.derivation,
             old[index].metadata.derivation
         );
-        let metadata = history[index].metadata.system_input.as_ref().unwrap();
+        let metadata = history[index].metadata.input_metadata.as_ref().unwrap();
         assert_eq!(metadata.usage(), migration_policy(compaction));
         assert!(metadata.public_item().is_none());
         assert!(metadata.feature_payload().is_none());
@@ -225,7 +225,7 @@ fn v1_through_v4_worker_migration_reopen_and_mixed_file_retry() {
         fs::write(&old_path, source).unwrap();
 
         let store = WorkerSessionStore::new(root.path()).unwrap();
-        assert_marker(root.path(), 5);
+        assert_marker(root.path(), 6);
         let restored = store.read_all(session, segment).unwrap();
         assert_eq!(encode(&restored), new_bytes);
         assert_eq!(fs::read(&new_path).unwrap(), new_bytes);
@@ -243,7 +243,7 @@ fn v1_through_v4_worker_migration_reopen_and_mixed_file_retry() {
 fn all_segments_preflight_keeps_old_bytes_on_decode_or_conversion_failure() {
     let mut oversized: Value = serde_json::from_str(V4.lines().next().unwrap()).unwrap();
     oversized["entry"]["item"]["snapshot"] =
-        json!({"large": "x".repeat(crate::system_input::MAX_FEATURE_PAYLOAD_BYTES + 1)});
+        json!({"large": "x".repeat(crate::input_metadata::MAX_FEATURE_PAYLOAD_BYTES + 1)});
     let mut unknown: Value = serde_json::from_str(V4.lines().next().unwrap()).unwrap();
     unknown["entry"]["item"]["kind"] = json!("unsupported_future_feature");
     let mut malformed = unknown.clone();
@@ -295,7 +295,7 @@ fn all_segments_preflight_keeps_old_bytes_on_decode_or_conversion_failure() {
 
 #[test]
 fn unsupported_schema_preserves_all_old_bytes() {
-    for version in [0, 6, 99] {
+    for version in [0, 7, 99] {
         let root = tempfile::tempdir().unwrap();
         let (_, segment) = write_worker(root.path(), version, V4.as_bytes());
         let path = root
@@ -331,13 +331,13 @@ fn standalone_store_uses_same_v1_through_v4_migration_and_reopens() {
         let store = FsStore::new(root.path()).unwrap();
         let entries = store.read_all(session, segment).unwrap();
         for entry in entries {
-            entry.validate_system_inputs().unwrap();
+            entry.validate_input_metadata().unwrap();
         }
         assert_eq!(
             fs::read_to_string(dir.join("session-schema.json"))
                 .unwrap()
                 .trim(),
-            "5"
+            "6"
         );
         let once = fs::read(&path).unwrap();
         drop(store);
@@ -381,7 +381,7 @@ fn compaction_origin_upgrade_is_retained_only_for_pre_v4_sources() {
                 }
             );
             assert_eq!(
-                metadata.system_input.as_ref().unwrap().usage().compaction,
+                metadata.input_metadata.as_ref().unwrap().usage().compaction,
                 if version == 3 {
                     InputCompactionUse::OpeningSummary
                 } else {
@@ -423,7 +423,7 @@ fn current_v5_rejects_all_legacy_feature_kinds_without_rewriting_sources() {
         assert!(serde_json::from_str::<LogEntry>(line).is_err());
         let bytes = format!("{line}\n");
         let root = tempfile::tempdir().unwrap();
-        let (session, segment) = write_worker(root.path(), 5, bytes.as_bytes());
+        let (session, segment) = write_worker(root.path(), 6, bytes.as_bytes());
         let path = root
             .path()
             .join("segments")
@@ -495,7 +495,7 @@ fn v1_v2_feature_wire_uses_the_same_typed_payloads_and_stable_legacy_identity() 
             else {
                 panic!()
             };
-            assert_eq!(entry.metadata.system_input, v4.metadata.system_input);
+            assert_eq!(entry.metadata.input_metadata, v4.metadata.input_metadata);
         }
     }
 }
@@ -555,7 +555,7 @@ fn frozen_behavior_counter_is_accepted_only_at_the_old_schema_boundary() {
         assert_eq!(entry.item.history_text(), "exact archived body");
         let payload = entry
             .metadata
-            .system_input
+            .input_metadata
             .as_ref()
             .unwrap()
             .feature_payload()
@@ -573,7 +573,7 @@ fn frozen_behavior_counter_is_accepted_only_at_the_old_schema_boundary() {
 }
 
 #[test]
-fn current_v5_rejects_generic_input_without_metadata_instead_of_migrating_it() {
+fn current_schema_rejects_generic_input_without_metadata_instead_of_migrating_it() {
     let mut missing: Value = serde_json::from_str(V4.lines().last().unwrap()).unwrap();
     missing["entry"]["metadata"]
         .as_object_mut()
@@ -581,7 +581,7 @@ fn current_v5_rejects_generic_input_without_metadata_instead_of_migrating_it() {
         .remove("system_input");
     let bytes = format!("{}\n", missing);
     let root = tempfile::tempdir().unwrap();
-    let (_, segment) = write_worker(root.path(), 5, bytes.as_bytes());
+    let (_, segment) = write_worker(root.path(), 6, bytes.as_bytes());
     assert!(WorkerSessionStore::new(root.path()).is_err());
     assert_eq!(
         fs::read(
@@ -592,5 +592,112 @@ fn current_v5_rejects_generic_input_without_metadata_instead_of_migrating_it() {
         .unwrap(),
         bytes.as_bytes()
     );
-    assert_marker(root.path(), 5);
+    assert_marker(root.path(), 6);
+}
+
+const V5: &str = include_str!("fixtures/v5-role-metadata.jsonl");
+
+#[test]
+fn v5_metadata_and_derived_tool_context_upgrade_without_changing_roles_or_original_evidence() {
+    for standalone in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (session, segment) = if standalone {
+            let session = SessionId::now_v7();
+            let segment = SegmentId::now_v7();
+            let dir = root.path().join(session.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("session-schema.json"), b"5").unwrap();
+            fs::write(dir.join(format!("{segment}.jsonl")), V5).unwrap();
+            (session, segment)
+        } else {
+            write_worker(root.path(), 5, V5.as_bytes())
+        };
+        let entries = if standalone {
+            FsStore::new(root.path())
+                .unwrap()
+                .read_all(session, segment)
+                .unwrap()
+        } else {
+            WorkerSessionStore::new(root.path())
+                .unwrap()
+                .read_all(session, segment)
+                .unwrap()
+        };
+        let originals: Vec<Value> = V5
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(entries.len(), originals.len());
+        for (index, (entry, old)) in entries.iter().zip(originals).enumerate() {
+            let wire = serde_json::to_value(entry).unwrap();
+            assert_eq!(wire["ts"], old["ts"]);
+            assert_eq!(wire["entry"]["item"], old["entry"]["item"]);
+            for field in ["entry_id", "origin", "derivation"] {
+                assert_eq!(
+                    wire["entry"]["metadata"][field],
+                    old["entry"]["metadata"][field]
+                );
+            }
+            let metadata = &wire["entry"]["metadata"];
+            if index == 0 {
+                assert_eq!(
+                    metadata["input_metadata"],
+                    old["entry"]["metadata"]["system_input"]
+                );
+                assert_eq!(
+                    metadata["input_metadata"]["feature_payload"]["value"]["system_input"],
+                    "opaque owner field must not be renamed"
+                );
+            } else if index < 3 {
+                assert!(
+                    metadata.get("input_metadata").is_none(),
+                    "ordinary model Tool originals must not acquire exclusion policy"
+                );
+            } else {
+                assert_eq!(
+                    metadata["input_metadata"]["usage"],
+                    json!({
+                        "recording_material":"exclude", "memory_evidence":"exclude", "observation":"hidden", "compaction":"retain"
+                    })
+                );
+            }
+        }
+        let before = encode(&entries);
+        let reopened = if standalone {
+            FsStore::new(root.path())
+                .unwrap()
+                .read_all(session, segment)
+                .unwrap()
+        } else {
+            WorkerSessionStore::new(root.path())
+                .unwrap()
+                .read_all(session, segment)
+                .unwrap()
+        };
+        assert_eq!(encode(&reopened), before);
+    }
+}
+
+#[test]
+fn legacy_metadata_alias_conflict_fails_preflight_without_dropping_either_value() {
+    let mut bad: Value = serde_json::from_str(V5.lines().next().unwrap()).unwrap();
+    bad["entry"]["metadata"]["input_metadata"] = bad["entry"]["metadata"]["system_input"].clone();
+    for version in [4, 5] {
+        let root = tempfile::tempdir().unwrap();
+        let (_, segment) = write_worker(root.path(), version, V5.as_bytes());
+        let path = root
+            .path()
+            .join("segments")
+            .join(format!("{segment}.jsonl"));
+        let later = root
+            .path()
+            .join("segments")
+            .join(format!("{}.jsonl", SegmentId::from_u128(2)));
+        let bad_bytes = format!("{bad}\n");
+        fs::write(&later, &bad_bytes).unwrap();
+        assert!(WorkerSessionStore::new(root.path()).is_err());
+        assert_eq!(fs::read(path).unwrap(), V5.as_bytes());
+        assert_eq!(fs::read(later).unwrap(), bad_bytes.as_bytes());
+        assert_marker(root.path(), version);
+    }
 }

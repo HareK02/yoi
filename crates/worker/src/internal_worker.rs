@@ -1499,7 +1499,7 @@ permission = "write"
                     is_error: false,
                 },
                 metadata: session_store::LoggedSessionHistoryMetadata {
-                    system_input: None,
+                    input_metadata: None,
                     entry_id: session_store::LoggedSessionHistoryEntryId(entry_id.into()),
                     origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
                     derivation: None,
