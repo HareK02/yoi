@@ -691,6 +691,13 @@ impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
 }
 
 impl WorkspaceSubjektivResidentSummarySource {
+    fn confirm_resident_context_behavior(&self, behavior_md: &str) {
+        self.behavior_state
+            .lock()
+            .expect("subject behavior state poisoned")
+            .applied = Some(behavior_md.to_owned());
+    }
+
     async fn fetch(
         &self,
     ) -> Result<server_api::SubjektivResidentContextOutput, SubjektivHostError> {
@@ -788,11 +795,14 @@ impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource 
         }))
     }
 
-    fn confirm_resident_context_behavior(&self, behavior_md: &str) {
-        self.behavior_state
-            .lock()
-            .expect("subject behavior state poisoned")
-            .applied = Some(behavior_md.to_owned());
+    fn system_item_committed(
+        &self,
+        item: &session_store::SystemItem,
+        _metadata: &crate::session_history::SessionHistoryMetadata,
+    ) {
+        if let session_store::SystemItem::SubjectBehaviorRefresh { behavior_md, .. } = item {
+            self.confirm_resident_context_behavior(behavior_md);
+        }
     }
 
     fn invalidate_resident_context_representation(&self) {
@@ -1741,7 +1751,14 @@ permission = "write"
             .expect("changed behavior must produce one refresh");
         assert_eq!(refresh.behavior_md, "Ask when uncertain.");
         assert!(refresh.body.contains("Ask when uncertain."));
-        source.confirm_resident_context_behavior(&refresh.behavior_md);
+        source.system_item_committed(
+            &session_store::SystemItem::SubjectBehaviorRefresh {
+                body: refresh.body.clone(),
+                behavior_md: refresh.behavior_md.clone(),
+                prompt_provenance: None,
+            },
+            &session_store::LoggedSessionHistoryMetadata::legacy_unknown(),
+        );
         assert!(
             source
                 .load_changed_resident_context()
@@ -1758,7 +1775,14 @@ permission = "write"
             .expect("cleared behavior must produce one refresh");
         assert_eq!(cleared.behavior_md, "");
         assert!(cleared.body.contains("No user-managed behavior is set"));
-        source.confirm_resident_context_behavior(&cleared.behavior_md);
+        source.system_item_committed(
+            &session_store::SystemItem::SubjectBehaviorRefresh {
+                body: cleared.body.clone(),
+                behavior_md: cleared.behavior_md.clone(),
+                prompt_provenance: None,
+            },
+            &session_store::LoggedSessionHistoryMetadata::legacy_unknown(),
+        );
         assert!(
             source
                 .load_changed_resident_context()
@@ -1816,7 +1840,14 @@ permission = "write"
             .await
             .unwrap()
             .unwrap();
-        source.confirm_resident_context_behavior(&first.behavior_md);
+        source.system_item_committed(
+            &session_store::SystemItem::SubjectBehaviorRefresh {
+                body: first.body.clone(),
+                behavior_md: first.behavior_md.clone(),
+                prompt_provenance: None,
+            },
+            &session_store::LoggedSessionHistoryMetadata::legacy_unknown(),
+        );
         assert_eq!(
             source
                 .load_changed_resident_context()
@@ -1825,7 +1856,14 @@ permission = "write"
                 .unwrap(),
             second
         );
-        source.confirm_resident_context_behavior(&second.behavior_md);
+        source.system_item_committed(
+            &session_store::SystemItem::SubjectBehaviorRefresh {
+                body: second.body.clone(),
+                behavior_md: second.behavior_md.clone(),
+                prompt_provenance: None,
+            },
+            &session_store::LoggedSessionHistoryMetadata::legacy_unknown(),
+        );
         assert!(
             source
                 .load_changed_resident_context()

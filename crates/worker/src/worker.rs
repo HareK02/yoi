@@ -2734,21 +2734,39 @@ pub trait SystemItemCommitter: Send + Sync {
         extensions: Vec<SessionExtension>,
         history_provenance: Option<WorkerHistoryProvenance>,
     ) -> Result<HistoryEntry<SessionHistoryMetadata>, StoreError> {
+        self.commit_system_item_with_extensions_then(
+            item,
+            extensions,
+            history_provenance,
+            &mut |_| {},
+        )
+    }
+
+    /// Notify the producer inside the publication barrier, after the durable
+    /// append and before a rewrite can invalidate its representation.
+    fn commit_system_item_with_extensions_then(
+        &self,
+        item: SystemItem,
+        extensions: Vec<SessionExtension>,
+        history_provenance: Option<WorkerHistoryProvenance>,
+        after_commit: &mut dyn FnMut(&HistoryEntry<SessionHistoryMetadata>),
+    ) -> Result<HistoryEntry<SessionHistoryMetadata>, StoreError> {
         let metadata = new_history_metadata(
             history_provenance
                 .unwrap_or(WorkerHistoryProvenance::BackendInstruction { operation_id: None }),
             None,
         );
-        let history_item = item.to_history_item();
-        self.commit_log_entry(LogEntry::AnnotatedSystemItem {
-            ts: segment_log::now_millis(),
-            entry: session_store::LoggedSystemHistoryEntry {
-                item,
-                metadata: metadata.clone(),
+        let history = HistoryEntry::new(item.to_history_item(), metadata.clone());
+        self.commit_usage_boundary(
+            LogEntry::AnnotatedSystemItem {
+                ts: segment_log::now_millis(),
+                entry: session_store::LoggedSystemHistoryEntry { item, metadata },
+                extensions,
             },
-            extensions,
-        })?;
-        Ok(HistoryEntry::new(history_item, metadata))
+            &mut || after_commit(&history),
+            &[],
+        )?;
+        Ok(history)
     }
 }
 
@@ -2937,8 +2955,11 @@ pub(crate) trait SystemPromptContributionSource: Send + Sync {
         Ok(None)
     }
 
-    /// Acknowledges the exact behavior represented by a durably committed refresh.
-    fn confirm_resident_context_behavior(&self, _behavior_md: &str) {}
+    /// Reports a live durable system-input commit to its producer. Interpretation
+    /// belongs to the Feature; restoration never invokes this notification.
+    /// Runs under the publication barrier: only bounded local state updates are
+    /// allowed, without Host I/O or reentry into history mutation.
+    fn system_item_committed(&self, _item: &SystemItem, _metadata: &SessionHistoryMetadata) {}
 
     /// Invalidates the in-memory representation fence before history may be
     /// compacted or rewound.
@@ -17434,6 +17455,57 @@ permission = "write"
                 attribution
             );
         }
+    }
+
+    #[test]
+    fn system_input_completion_observes_durable_identity_under_publication_barrier() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(temp.path()).unwrap();
+        let session_id = SessionId::now_v7();
+        let segment_id = SegmentId::now_v7();
+        let start = LogEntry::AnnotatedSegmentStart {
+            ts: 1,
+            session_id,
+            system_prompt: None,
+            config: agen::llm_client::RequestConfig::default(),
+            history: vec![],
+            forked_from: None,
+            compacted_from: None,
+        };
+        store
+            .create_segment(session_id, segment_id, std::slice::from_ref(&start))
+            .unwrap();
+        let writer = LogWriterHandle {
+            store: store.clone(),
+            state: SegmentState::new(session_id, segment_id, 1),
+            sink: SegmentLogSink::with_initial(vec![start]),
+            in_flight: None,
+        };
+        let mut receipt = None;
+        let committed = writer
+            .commit_system_item_with_extensions_then(
+                SystemItem::Notification {
+                    message: "message".into(),
+                    body: "exact committed system body".into(),
+                    prompt_provenance: None,
+                },
+                vec![],
+                None,
+                &mut |history| {
+                    assert!(writer.state.append_lock.try_lock().is_err());
+                    let durable = store.read_all(session_id, segment_id).unwrap();
+                    let Some(LogEntry::AnnotatedSystemItem { entry, .. }) = durable.last() else {
+                        panic!("completion must follow actual storage append");
+                    };
+                    assert_eq!(entry.metadata, history.annotation);
+                    assert_eq!(entry.item.to_history_item(), history.item);
+                    assert_eq!(history.item.as_text(), Some("exact committed system body"));
+                    receipt = Some(history.annotation.entry_id.clone());
+                },
+            )
+            .unwrap();
+        assert_eq!(receipt, Some(committed.annotation.entry_id));
+        assert!(writer.state.append_lock.try_lock().is_ok());
     }
 
     fn minimal_manifest() -> WorkerManifest {
