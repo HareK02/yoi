@@ -468,3 +468,43 @@ async fn common_read_and_search_permissions_are_independent_from_bash_execution(
     );
     assert!(!f._dir.path().join("denied").exists());
 }
+
+#[tokio::test]
+async fn multibyte_long_line_search_refuses_instead_of_skipping_an_unread_suffix() {
+    let f = Fixture::new();
+    let result = f
+        .run("printf '雪%.0s' {1..22000}; printf 'needle\nnext\n'")
+        .await;
+    let path = result["stdout_entry"].as_str().unwrap();
+    let error = invoke(
+        &f.runtime,
+        path,
+        Contract::SearchText,
+        "search",
+        json!({"pattern":"needle","offset":0,"limit":1}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("ResourceLimitExceeded"),
+        "{error}"
+    );
+    // No successful page claims to advance past a partial line. Raw bytes can still
+    // retrieve its unread suffix using the same common file contract.
+    let suffix = invoke(
+        &f.runtime,
+        path,
+        Contract::ReadBytes,
+        "read",
+        json!({"offset":66000,"limit":7}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(suffix["data"].as_str().unwrap())
+            .unwrap(),
+        b"needle\n"
+    );
+    assert_eq!(suffix["next_offset"], 66007);
+}
