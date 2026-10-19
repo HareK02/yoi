@@ -2934,10 +2934,10 @@ fn repository_api_rejection(path: &str, status: StatusCode, message: &str) -> Re
     if path.starts_with("/api/w/") && path.contains("/drive/") {
         return (status, Json(drive::failure(status.as_u16()))).into_response();
     }
-    if path == "/api/repositories"
-        || path.starts_with("/api/repositories/")
-        || (path.starts_with("/api/w/") && path.contains("/repositories"))
-    {
+    // Generated Workspace API clients share this error envelope, not only
+    // repository endpoints. A bare 401 here becomes a response-decode failure
+    // and incorrectly turns a known auth rejection into an unknown outcome.
+    if path.starts_with("/api/") {
         return (
             status,
             Json(server_api::RepositoryApiError::new(
@@ -5484,6 +5484,12 @@ impl WorkspaceApi {
         let subject = singleton_key
             .as_deref()
             .and_then(|key| key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX));
+        if let Some(subject) = subject
+            && let Err(error) = subjektiv_journal::recover_failed_subject_create(self, subject)
+        {
+            let diagnostics = cleanup_spawn_created_workdirs(self, &spawned_workdir_ids);
+            return Err(ApiError::with_diagnostics(error, diagnostics));
+        }
         let subject_gate = subject
             .map(|s| subjektiv_journal::lifecycle_lock(self, s))
             .transpose()?;
@@ -22372,15 +22378,12 @@ async fn scoped_record_subjektiv_session(
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let attribution = if request.create_if_missing {
-                let attribution = subjektiv_session_attribution(
+                subjektiv_session_attribution(
                     &api,
                     &path.workspace_id,
                     &context,
                     &request.session_id,
-                )?;
-                open_subjektiv_store(&api)?
-                    .record_session_attribution(attribution)
-                    .map_err(|error| Error::InvalidInput(error.to_string()))?
+                )?
             } else {
                 require_existing_subjektiv_session_attribution(
                     &api,
@@ -47939,6 +47942,9 @@ mod tests {
         >,
         materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
+        recovery_failure: std::sync::Mutex<Option<String>>,
+        recovery_requests: std::sync::Mutex<Vec<runtime_api::SubjectCreateRecoveryRequest>>,
+        recovery_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
         input_failure: std::sync::Mutex<Option<String>>,
         cancel_failure: std::sync::Mutex<Option<String>>,
         input_hook: std::sync::Mutex<
@@ -47974,6 +47980,9 @@ mod tests {
                     std::env::temp_dir().join(unique),
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
+                recovery_failure: std::sync::Mutex::new(None),
+                recovery_requests: std::sync::Mutex::new(Vec::new()),
+                recovery_hook: std::sync::Mutex::new(None),
                 input_failure: std::sync::Mutex::new(None),
                 cancel_failure: std::sync::Mutex::new(None),
                 input_hook: std::sync::Mutex::new(None),
@@ -48066,6 +48075,29 @@ mod tests {
     impl worker_runtime::execution::WorkerExecutionBackend for DeterministicExecutionBackend {
         fn backend_id(&self) -> &str {
             "deterministic-workspace-server-test"
+        }
+
+        fn recover_subject_create(
+            &self,
+            request: &runtime_api::SubjectCreateRecoveryRequest,
+        ) -> std::result::Result<(), String> {
+            self.recovery_requests.lock().unwrap().push(request.clone());
+            if let Some(hook) = self.recovery_hook.lock().unwrap().take() {
+                hook();
+            }
+            if let Some(error) = self.recovery_failure.lock().unwrap().take() {
+                return Err(error);
+            }
+            if self
+                .contexts
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|worker| worker.worker_id == request.worker_id)
+            {
+                return Err("actual execution remains".into());
+            }
+            Ok(())
         }
 
         fn create_working_directory(

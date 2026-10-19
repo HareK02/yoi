@@ -11298,6 +11298,7 @@ mod build_summary_prompt_tests {
     enum AttributionOutcome {
         Success,
         Rejected,
+        Unauthorized,
         TransportUnknown,
     }
 
@@ -11344,6 +11345,16 @@ mod build_summary_prompt_tests {
                 AttributionOutcome::TransportUnknown => Err(WorkspaceClientError::Request(
                     "connection closed after request send".to_string(),
                 )),
+                AttributionOutcome::Unauthorized => Ok(WorkspaceResponse {
+                    status: 401,
+                    body: serde_json::to_string(&server_api::RepositoryApiError::new(
+                        401,
+                        "Unauthorized",
+                        "invalid runtime request proof",
+                        Vec::new(),
+                    ))
+                    .unwrap(),
+                }),
                 AttributionOutcome::Rejected => Ok(WorkspaceResponse {
                     status: 503,
                     body: "temporarily unavailable".to_string(),
@@ -11576,6 +11587,7 @@ mod build_summary_prompt_tests {
         for (first, expected_state) in [
             (AttributionOutcome::TransportUnknown, "outcome_unknown"),
             (AttributionOutcome::Rejected, "failed"),
+            (AttributionOutcome::Unauthorized, "failed"),
         ] {
             let client = Arc::new(AttributionLifecycleClient::new([
                 first,
@@ -11589,6 +11601,15 @@ mod build_summary_prompt_tests {
                 )
                 .unwrap_err();
             assert!(error.to_string().contains(expected_state));
+            if matches!(first, AttributionOutcome::Unauthorized) {
+                assert!(error.to_string().contains("rejected with HTTP 401"));
+                assert!(!error.to_string().contains("outcome_unknown"));
+                assert_eq!(
+                    client.requests.lock().unwrap().len(),
+                    1,
+                    "no automatic retry after auth rejection"
+                );
+            }
             let incomplete = store
                 .read_by_name(&worker.manifest().worker.name)
                 .unwrap()

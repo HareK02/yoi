@@ -330,7 +330,7 @@ async fn rejected_create_releases_key_but_retains_subject_occupancy_without_rele
         .reserve_worker_create(
             TEST_WORKSPACE_ID,
             EMBEDDED_RUNTIME_ID,
-            "rejected-create",
+            "manual:rejected-create",
             &"f".repeat(64),
             Some("subjektiv:rejected-create"),
             &memory,
@@ -378,5 +378,274 @@ async fn rejected_create_releases_key_but_retains_subject_occupancy_without_rele
                 .worker,
             worker,
         );
+        // Retained Subject occupancy is not a live create reservation. A new
+        // manual request must not send the terminal Worker's identity to Runtime.
+        let retry = api.config_store.reserve_worker_create(
+            TEST_WORKSPACE_ID,
+            EMBEDDED_RUNTIME_ID,
+            "manual:retry-rejected-create",
+            &"f".repeat(64),
+            Some("subjektiv:rejected-create"),
+            &memory,
+        );
+        assert!(
+            matches!(retry, Err(Error::RepositoryConflict(ref message))
+                if message.contains("worker_singleton_release_required")),
+            "terminal reservation must fail before Runtime dispatch: {retry:?}"
+        );
     }
+}
+
+async fn unpublished_recovery_fixture(
+    root: &std::path::Path,
+) -> (
+    WorkspaceApi,
+    Arc<DeterministicExecutionBackend>,
+    String,
+    crate::store::WorkerCreateReservation,
+) {
+    let (api, backend) = test_api_with_recording_backend(root).await;
+    let subject = open_subjektiv_store(&api)
+        .unwrap()
+        .create_subject(crate::subjektiv::SubjectRole::new("recovery-test").unwrap())
+        .unwrap();
+    let key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
+    let memory = api
+        .config_store
+        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+        .unwrap();
+    let old = api
+        .config_store
+        .reserve_worker_create(
+            TEST_WORKSPACE_ID,
+            EMBEDDED_RUNTIME_ID,
+            "manual:failed-subject",
+            &"f".repeat(64),
+            Some(&key),
+            &memory,
+        )
+        .unwrap();
+    api.config_store
+        .fail_worker_create_reservation(
+            TEST_WORKSPACE_ID,
+            EMBEDDED_RUNTIME_ID,
+            old.worker_id,
+            &old.create_fingerprint,
+        )
+        .unwrap();
+    (api, backend, subject.id, old)
+}
+
+fn recovery_spawn_request(subject: &str) -> WorkerSpawnRequest {
+    serde_json::from_value(json!({
+        "intent": WorkerSpawnIntent::WorkspaceCompanion,
+        "acceptance": WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments: 0 },
+        "profile": worker_runtime::catalog::ProfileSelector::Builtin("builtin:companion".into()),
+        "singleton_key": crate::subjektiv::subject_worker_singleton_key(subject).unwrap(),
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn unpublished_create_recovery_retries_same_fence_then_creates_new_worker() {
+    let root = tempfile::tempdir().unwrap();
+    let (api, backend, subject, old) = unpublished_recovery_fixture(root.path()).await;
+    let old_worker = RuntimeWorkerRef::new(EMBEDDED_RUNTIME_ID, old.worker_id.to_string());
+    let lease = old.singleton.as_ref().unwrap();
+    let late = crate::subjektiv::SubjectSessionAttribution::new(
+        &subject,
+        EMBEDDED_RUNTIME_ID,
+        old.worker_id.to_string(),
+        session_store::new_session_id().to_string(),
+    )
+    .unwrap();
+    let late_session = late.session_id.clone();
+    // Models an already-authorized callback arriving while Runtime fencing is
+    // in flight. The Host intent must reject it BEFORE attribution insertion.
+    let callback_api = api.clone();
+    *backend.recovery_hook.lock().unwrap() = Some(Box::new(move || {
+        assert!(subjektiv_journal::bind_host_session(&callback_api, late).is_err());
+    }));
+    *backend.recovery_failure.lock().unwrap() = Some("unconfirmed execution absence".into());
+    assert!(
+        api.spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject))
+            .is_err()
+    );
+    assert!(
+        api.config_store
+            .subject_release_pending(TEST_WORKSPACE_ID, &old_worker)
+            .unwrap()
+    );
+    assert_eq!(
+        api.config_store
+            .current_worker_singleton_owner(TEST_WORKSPACE_ID, &lease.key)
+            .unwrap(),
+        Some(lease.clone())
+    );
+    let store = open_subjektiv_store(&api).unwrap();
+    assert!(store.session_attribution(&late_session).unwrap().is_none());
+    assert!(
+        store
+            .journal_body_is_unpublished(&subject, EMBEDDED_RUNTIME_ID, &old_worker.worker_id)
+            .unwrap()
+    );
+
+    let replacement = api
+        .spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject))
+        .unwrap();
+    assert_eq!(replacement.state, InternalWorkerOperationState::Accepted);
+    let replacement = replacement.worker.unwrap().worker;
+    assert_ne!(replacement, old_worker);
+    let current = api
+        .config_store
+        .current_worker_singleton_owner(TEST_WORKSPACE_ID, &lease.key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.worker, replacement);
+    assert_eq!(current.generation, lease.generation + 1);
+    let requests = backend.recovery_requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0], requests[1],
+        "unknown result must reuse exact recovery identity"
+    );
+    // A stale completion cannot release the replacement generation.
+    api.config_store
+        .complete_subject_create_recovery(
+            TEST_WORKSPACE_ID,
+            lease,
+            &requests[0].operation_id,
+            &old.create_fingerprint,
+        )
+        .unwrap();
+    assert_eq!(
+        api.config_store
+            .current_worker_singleton_owner(TEST_WORKSPACE_ID, &lease.key)
+            .unwrap(),
+        Some(current)
+    );
+}
+
+#[tokio::test]
+async fn unpublished_create_recovery_refuses_any_attribution_or_orphan_writer() {
+    for orphan_writer in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (api, backend, subject, old) = unpublished_recovery_fixture(root.path()).await;
+        let store = open_subjektiv_store(&api).unwrap();
+        if orphan_writer {
+            store
+                .claim_journal_writer(&subject, EMBEDDED_RUNTIME_ID, &old.worker_id.to_string())
+                .unwrap();
+        } else {
+            store
+                .record_session_attribution(
+                    crate::subjektiv::SubjectSessionAttribution::new(
+                        &subject,
+                        EMBEDDED_RUNTIME_ID,
+                        old.worker_id.to_string(),
+                        session_store::new_session_id().to_string(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        assert!(
+            api.spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject))
+                .is_err()
+        );
+        assert!(backend.recovery_requests.lock().unwrap().is_empty());
+        assert_eq!(
+            api.config_store
+                .current_worker_singleton_owner(
+                    TEST_WORKSPACE_ID,
+                    &old.singleton.as_ref().unwrap().key
+                )
+                .unwrap(),
+            old.singleton
+        );
+    }
+}
+
+#[tokio::test]
+async fn unpublished_create_recovery_resumes_after_runtime_proof_before_host_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let (api, backend, subject, old) = unpublished_recovery_fixture(root.path()).await;
+    let lease = old.singleton.as_ref().unwrap();
+    let op = format!(
+        "subject-create-recovery:{}:{}",
+        old.worker_id, lease.generation
+    );
+    let fingerprint = api
+        .config_store
+        .prepare_subject_create_recovery(TEST_WORKSPACE_ID, lease, &op)
+        .unwrap();
+    let request = runtime_api::SubjectCreateRecoveryRequest {
+        workspace_id: TEST_WORKSPACE_ID.into(),
+        worker_id: old.worker_id,
+        create_fingerprint: fingerprint,
+        operation_id: op,
+    };
+    api.runtime
+        .recover_subject_create(EMBEDDED_RUNTIME_ID, request)
+        .unwrap();
+    // Simulate loss of the receipt before Host completion. The Host must not
+    // infer completion from missing catalog state, and can retry the exact op.
+    assert_eq!(
+        api.config_store
+            .current_worker_singleton_owner(TEST_WORKSPACE_ID, &lease.key)
+            .unwrap(),
+        old.singleton
+    );
+    subjektiv_journal::recover_failed_subject_create(&api, &subject).unwrap();
+    assert!(
+        api.config_store
+            .current_worker_singleton_owner(TEST_WORKSPACE_ID, &lease.key)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(backend.recovery_requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn failed_subject_spawn_can_recover_on_next_explicit_create() {
+    let root = tempfile::tempdir().unwrap();
+    let (api, backend) = test_api_with_recording_backend(root.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(crate::subjektiv::SubjectRole::new("failed-spawn").unwrap())
+        .unwrap();
+    let key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
+    *backend.spawn_failure.lock().unwrap() =
+        Some("Session registration failed before publication".into());
+    let rejected = api
+        .spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject.id))
+        .unwrap();
+    assert_eq!(rejected.state, InternalWorkerOperationState::Rejected);
+    let old = api
+        .config_store
+        .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
+        .unwrap()
+        .unwrap();
+    assert!(
+        api.config_store
+            .subject_create_recovery_candidate(TEST_WORKSPACE_ID, &old)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        backend.recovery_requests.lock().unwrap().is_empty(),
+        "failure alone must not release occupancy"
+    );
+    let result = api
+        .spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject.id))
+        .unwrap();
+    assert_eq!(result.state, InternalWorkerOperationState::Accepted);
+    let current = api
+        .config_store
+        .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
+        .unwrap()
+        .unwrap();
+    assert_ne!(current.worker, old.worker);
+    assert_eq!(current.generation, old.generation + 1);
+    assert_eq!(backend.recovery_requests.lock().unwrap().len(), 1);
 }

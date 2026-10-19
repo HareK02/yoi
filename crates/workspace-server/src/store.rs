@@ -119,7 +119,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 101;
+const LATEST_SCHEMA_VERSION: i64 = 102;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -431,6 +431,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 101,
         name: "Durable explicit Subject body release",
         apply: migrate_subject_release_v100_to_v101,
+    },
+    Migration {
+        version: 102,
+        name: "Durable failed Subject creation recovery",
+        apply: migrate_subject_create_recovery_v101_to_v102,
     },
 ];
 
@@ -2997,7 +3002,7 @@ impl SqliteWorkspaceStore {
                     .query_row(
                         "SELECT allocation_key, request_fingerprint, create_fingerprint, \
                                 memory_language, singleton_key, \
-                                singleton_generation \
+                                singleton_generation, state \
                          FROM worker_create_reservations \
                          WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3",
                         params![
@@ -3013,11 +3018,21 @@ impl SqliteWorkspaceStore {
                                 row.get::<_, Option<String>>(3)?,
                                 row.get::<_, Option<String>>(4)?,
                                 row.get::<_, Option<i64>>(5)?,
+                                row.get::<_, String>(6)?,
                             ))
                         },
                     )
                     .optional()?;
-                if let Some((stored_allocation_key, stored_request_fingerprint, create_fingerprint, language, stored_singleton_key, stored_generation)) = stored
+                // Subject occupancy survives removal until an explicit release
+                // proof. It must not resurrect the removed creation reservation:
+                // Runtime callbacks require a live reservation or catalog member.
+                if stored.as_ref().is_some_and(|row| row.6 == "removed") {
+                    return Err(Error::RepositoryConflict(format!(
+                        "worker_singleton_release_required: Worker {}:{} has a terminal create reservation but still owns the Subject; complete Subject release before creating a replacement",
+                        owner.worker.runtime_id, owner.worker.worker_id
+                    )));
+                }
+                if let Some((stored_allocation_key, stored_request_fingerprint, create_fingerprint, language, stored_singleton_key, stored_generation, _)) = stored
                     && allocation_key.starts_with("manual:")
                     && stored_allocation_key.starts_with("manual:")
                     && owner.worker.runtime_id == runtime_id
@@ -3199,6 +3214,99 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    /// Eligibility is Backend evidence only. The Host must separately prove that Subjektiv
+    /// never published this body and obtain the Runtime's exact create-fence receipt.
+    pub(crate) fn subject_create_recovery_candidate(
+        &self,
+        workspace: &str,
+        lease: &WorkerSingletonLease,
+    ) -> Result<Option<String>> {
+        self.with_conn(|conn| subject_create_recovery_candidate(conn, workspace, lease))
+    }
+
+    pub(crate) fn prepare_subject_create_recovery(
+        &self,
+        workspace: &str,
+        lease: &WorkerSingletonLease,
+        operation_id: &str,
+    ) -> Result<String> {
+        if operation_id.trim().is_empty() || operation_id.len() > 512 {
+            return Err(Error::InvalidInput(
+                "invalid Subject create recovery operation".into(),
+            ));
+        }
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let fingerprint = subject_create_recovery_candidate(&tx, workspace, lease)?
+                .ok_or_else(|| Error::RepositoryConflict("Subject create recovery requires the current removed reservation without a registry row".into()))?;
+            let saved: Option<(String, String, String, u64, String)> = tx.query_row(
+                "SELECT runtime_id,worker_id,singleton_key,singleton_generation,create_fingerprint FROM subject_create_recoveries WHERE workspace_id=?1 AND operation_id=?2",
+                params![workspace, operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            ).optional()?;
+            if let Some(saved) = saved {
+                if saved != (lease.worker.runtime_id.clone(), lease.worker.worker_id.clone(), lease.key.clone(), lease.generation, fingerprint.clone()) {
+                    return Err(Error::RepositoryConflict("Subject create recovery operation was used with different input".into()));
+                }
+                return Ok(fingerprint);
+            }
+            let busy: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM subject_create_recoveries WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND singleton_key=?4 AND singleton_generation=?5)",
+                params![workspace, lease.worker.runtime_id, lease.worker.worker_id, lease.key, lease.generation as i64],
+                |row| row.get(0),
+            )?;
+            if busy {
+                return Err(Error::RepositoryConflict("Subject create recovery already has a durable operation".into()));
+            }
+            tx.execute(
+                "INSERT INTO subject_create_recoveries(workspace_id,runtime_id,worker_id,singleton_key,singleton_generation,operation_id,create_fingerprint) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![workspace, lease.worker.runtime_id, lease.worker.worker_id, lease.key, lease.generation as i64, operation_id, fingerprint],
+            )?;
+            tx.commit()?;
+            Ok(fingerprint)
+        })
+    }
+
+    /// Called only after the Host verifies the Runtime's typed receipt for this exact create.
+    /// The completed bit records that proof; it neither creates a writer binding nor rewrites
+    /// the reservation. An exact completed replay is a receipt, not authority over a successor.
+    pub(crate) fn complete_subject_create_recovery(
+        &self,
+        workspace: &str,
+        lease: &WorkerSingletonLease,
+        operation_id: &str,
+        create_fingerprint: &str,
+    ) -> Result<()> {
+        let generation = i64::try_from(lease.generation)
+            .map_err(|_| Error::InvalidInput("invalid singleton generation".into()))?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let completed: Option<bool> = tx.query_row(
+                "SELECT completed FROM subject_create_recoveries WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND singleton_key=?4 AND singleton_generation=?5 AND operation_id=?6 AND create_fingerprint=?7",
+                params![workspace, lease.worker.runtime_id, lease.worker.worker_id, lease.key, generation, operation_id, create_fingerprint],
+                |row| row.get(0),
+            ).optional()?;
+            match completed {
+                Some(true) => return Ok(()),
+                Some(false) => {},
+                None => return Err(Error::RepositoryConflict("Subject create recovery intent absent or mismatched".into())),
+            }
+            let current = subject_create_recovery_candidate(&tx, workspace, lease)?;
+            if current.as_deref() != Some(create_fingerprint) {
+                return Err(Error::RepositoryConflict("Subject create recovery reservation or singleton ownership changed".into()));
+            }
+            let changed = tx.execute(
+                "UPDATE subject_create_recoveries SET completed=1 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND singleton_key=?4 AND singleton_generation=?5 AND operation_id=?6 AND create_fingerprint=?7 AND completed=0",
+                params![workspace, lease.worker.runtime_id, lease.worker.worker_id, lease.key, generation, operation_id, create_fingerprint],
+            )?;
+            if changed != 1 {
+                return Err(Error::RepositoryConflict("Subject create recovery completion lost its exact intent".into()));
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub(crate) fn retained_subject_release_operation(
         &self,
         workspace: &str,
@@ -3213,7 +3321,7 @@ impl SqliteWorkspaceStore {
         workspace: &str,
         worker: &RuntimeWorkerRef,
     ) -> Result<bool> {
-        self.with_conn(|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM subject_worker_releases WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND cancelled=0 AND completed=0)",params![workspace,worker.runtime_id,worker.worker_id],|r|r.get(0))?))
+        self.with_conn(|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM subject_worker_releases WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND cancelled=0 AND completed=0) OR EXISTS(SELECT 1 FROM subject_create_recoveries WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND completed=0)",params![workspace,worker.runtime_id,worker.worker_id],|r|r.get(0))?))
     }
 
     pub(crate) fn require_subject_release_intent(
@@ -15012,6 +15120,34 @@ fn migrate_result_reports_v97_to_v98(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_subject_create_recovery_v101_to_v102(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 101 {
+        return Err(Error::Store(
+            "Subject create recovery migration requires schema 101".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("CREATE TABLE subject_create_recoveries (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    singleton_key TEXT NOT NULL,
+    singleton_generation INTEGER NOT NULL CHECK (singleton_generation > 0),
+    operation_id TEXT NOT NULL CHECK (length(operation_id) > 0),
+    create_fingerprint TEXT NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0,1)),
+    PRIMARY KEY (workspace_id, operation_id),
+    UNIQUE (workspace_id, runtime_id, worker_id, singleton_key, singleton_generation),
+    FOREIGN KEY (workspace_id, worker_id) REFERENCES worker_create_reservations(workspace_id, worker_id) ON DELETE CASCADE
+);")?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(102,?1)",
+        ["Durable failed Subject creation recovery"],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_subject_release_v100_to_v101(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 100 {
         return Err(Error::Store(
@@ -15702,6 +15838,33 @@ pub(crate) fn validate_worker_singleton_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+fn subject_create_recovery_candidate(
+    conn: &Connection,
+    workspace: &str,
+    lease: &WorkerSingletonLease,
+) -> Result<Option<String>> {
+    if !lease
+        .key
+        .starts_with(crate::subjektiv::SUBJECT_WORKER_SINGLETON_PREFIX)
+    {
+        return Err(Error::InvalidInput("not a Subject singleton".into()));
+    }
+    let generation = i64::try_from(lease.generation)
+        .map_err(|_| Error::InvalidInput("invalid singleton generation".into()))?;
+    Ok(conn.query_row(
+        "SELECT r.create_fingerprint FROM worker_create_reservations r
+         JOIN worker_singleton_owners o ON o.workspace_id=r.workspace_id
+           AND o.runtime_id=r.runtime_id AND o.worker_id=r.worker_id
+           AND o.singleton_key=r.singleton_key AND o.generation=r.singleton_generation
+         WHERE r.workspace_id=?1 AND r.runtime_id=?2 AND r.worker_id=?3
+           AND r.singleton_key=?4 AND r.singleton_generation=?5 AND r.state='removed'
+           AND NOT EXISTS(SELECT 1 FROM worker_registry w
+             WHERE w.workspace_id=r.workspace_id AND w.runtime_id=r.runtime_id AND w.worker_id=r.worker_id)",
+        params![workspace, lease.worker.runtime_id, lease.worker.worker_id, lease.key, generation],
+        |row| row.get(0),
+    ).optional()?)
+}
+
 fn current_worker_singleton_owner(
     conn: &Connection,
     workspace_id: &str,
@@ -15712,6 +15875,7 @@ fn current_worker_singleton_owner(
             "SELECT owner.runtime_id, owner.worker_id, owner.generation, \
                     CASE WHEN substr(owner.singleton_key,1,10)='subjektiv:' AND reservation.state='removed' \
                       AND NOT EXISTS(SELECT 1 FROM subject_worker_releases r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.completed=1) \
+                      AND NOT EXISTS(SELECT 1 FROM subject_create_recoveries r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.create_fingerprint=reservation.create_fingerprint AND r.completed=1) \
                     THEN 'created' ELSE reservation.state END \
              FROM worker_singleton_owners owner \
              LEFT JOIN worker_create_reservations reservation \
@@ -18739,6 +18903,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:99, name:"Explicit hosting administrators and self-registration policy".into()},
                 WorkspaceSchemaMigrationStep {version:100, name:"Provisional users and scoped passkey activation".into()},
                 WorkspaceSchemaMigrationStep {version:101, name:"Durable explicit Subject body release".into()},
+                WorkspaceSchemaMigrationStep {version:102, name:"Durable failed Subject creation recovery".into()},
             ]
         );
 
@@ -18850,6 +19015,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (99, "Explicit hosting administrators and self-registration policy".to_string()),
 (100, "Provisional users and scoped passkey activation".to_string()),
 (101, "Durable explicit Subject body release".to_string()),
+(102, "Durable failed Subject creation recovery".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -20907,6 +21073,47 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             conflict,
             Error::RepositoryConflict(message) if message.contains("worker_singleton_owned")
         ));
+
+        reopened
+            .fail_worker_create_reservation(
+                "workspace-a",
+                "runtime-a",
+                reserved.worker_id,
+                &reserved.create_fingerprint,
+            )
+            .unwrap();
+        drop(reopened);
+        let reopened = SqliteWorkspaceStore::open_for_test(&database).unwrap();
+        let conflict = reopened
+            .reserve_worker_create(
+                "workspace-a",
+                "runtime-a",
+                "manual:retry-after-terminal-failure",
+                &stable_fingerprint,
+                Some("subjektiv:restart-retry"),
+                &memory,
+            )
+            .unwrap_err();
+        assert!(matches!(conflict, Error::RepositoryConflict(message)
+            if message.contains("worker_singleton_release_required")));
+        let worker = RuntimeWorkerRef::new("runtime-a", reserved.worker_id.to_string());
+        assert!(
+            !reopened
+                .has_active_worker_create_reservation("workspace-a", &worker)
+                .unwrap()
+        );
+        assert!(
+            reopened
+                .worker_resource_key("workspace-a", &worker)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            reopened
+                .current_worker_singleton_owner("workspace-a", "subjektiv:restart-retry")
+                .unwrap(),
+            reserved.singleton
+        );
     }
 
     #[tokio::test]
@@ -21037,6 +21244,383 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     }
 
     #[test]
+    fn subject_create_recovery_migration_is_atomic_and_matches_fresh_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("server.db");
+        prepare_retained_schema(&database, 101);
+        let conn = Connection::open(&database).unwrap();
+        configure_sqlite(&conn).unwrap();
+        conn.execute_batch("CREATE TRIGGER interrupt_create_recovery BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=102 BEGIN SELECT RAISE(ABORT,'injected recovery migration interruption'); END;").unwrap();
+        assert!(migrate_subject_create_recovery_v101_to_v102(&conn).is_err());
+        assert_eq!(current_schema_version(&conn).unwrap(), 101);
+        assert!(!table_exists(&conn, "subject_create_recoveries").unwrap());
+        conn.execute_batch("DROP TRIGGER interrupt_create_recovery")
+            .unwrap();
+        migrate_subject_create_recovery_v101_to_v102(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 102);
+        assert!(migrate_subject_create_recovery_v101_to_v102(&conn).is_err());
+        let fresh = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+        let schema = |c: &Connection| -> Result<String> {
+            Ok(c.query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='subject_create_recoveries'",
+                [],
+                |r| r.get::<_, String>(0),
+            )?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "))
+        };
+        assert_eq!(schema(&conn).unwrap(), fresh.with_conn(schema).unwrap());
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        drop(conn);
+        let reopened = SqliteWorkspaceStore::open_for_test(&database).unwrap();
+        reopened
+            .with_conn(|c| verify_schema_history(c, 102))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn subject_create_recovery_is_durable_exact_and_cannot_release_a_new_generation() {
+        for baseline in [None, Some(52), Some(101)] {
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("server.db");
+            if let Some(baseline) = baseline {
+                prepare_retained_schema(&database, baseline);
+            }
+            let store = SqliteWorkspaceStore::open_api_fixture(&database).unwrap();
+            store
+                .upsert_workspace(&WorkspaceRecord {
+                    workspace_id: "workspace-a".into(),
+                    owner_account_id: "owner-account".into(),
+                    display_name: "Workspace A".into(),
+                    state: "active".into(),
+                    created_at: "2026-10-01T00:00:00Z".into(),
+                    updated_at: "2026-10-01T00:00:00Z".into(),
+                })
+                .await
+                .unwrap();
+            let memory = store.get_workspace_memory_settings("workspace-a").unwrap();
+            let key = "subjektiv:failed-create";
+            let first = store
+                .reserve_worker_create(
+                    "workspace-a",
+                    "runtime-a",
+                    "manual:first",
+                    "sha256:first",
+                    Some(key),
+                    &memory,
+                )
+                .unwrap();
+            let lease = first.singleton.unwrap();
+            let fingerprint = first.create_fingerprint;
+            assert_eq!(
+                store
+                    .subject_create_recovery_candidate("workspace-a", &lease)
+                    .unwrap(),
+                None
+            );
+            assert!(
+                store
+                    .prepare_subject_create_recovery("workspace-a", &lease, "recover-first")
+                    .is_err()
+            );
+            store
+                .fail_worker_create_reservation(
+                    "workspace-a",
+                    "runtime-a",
+                    first.worker_id,
+                    &fingerprint,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .subject_create_recovery_candidate("workspace-a", &lease)
+                    .unwrap(),
+                Some(fingerprint.clone())
+            );
+            assert!(
+                store
+                    .prepare_subject_create_recovery("workspace-b", &lease, "recover-first")
+                    .is_err()
+            );
+            for wrong in [
+                WorkerSingletonLease {
+                    generation: lease.generation + 1,
+                    ..lease.clone()
+                },
+                WorkerSingletonLease {
+                    key: "subjektiv:other".into(),
+                    ..lease.clone()
+                },
+                WorkerSingletonLease {
+                    worker: RuntimeWorkerRef::new("runtime-b", &lease.worker.worker_id),
+                    ..lease.clone()
+                },
+                WorkerSingletonLease {
+                    worker: RuntimeWorkerRef::new("runtime-a", "other-worker"),
+                    ..lease.clone()
+                },
+            ] {
+                assert_eq!(
+                    store
+                        .subject_create_recovery_candidate("workspace-a", &wrong)
+                        .unwrap(),
+                    None
+                );
+                assert!(
+                    store
+                        .prepare_subject_create_recovery("workspace-a", &wrong, "recover-first")
+                        .is_err()
+                );
+            }
+            assert!(
+                store
+                    .complete_subject_create_recovery(
+                        "workspace-a",
+                        &lease,
+                        "recover-first",
+                        &fingerprint
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .prepare_subject_create_recovery("workspace-a", &lease, "recover-first")
+                    .unwrap(),
+                fingerprint
+            );
+            assert!(
+                store
+                    .subject_release_pending("workspace-a", &lease.worker)
+                    .unwrap()
+            );
+            assert_eq!(
+                store
+                    .current_worker_singleton_owner("workspace-a", key)
+                    .unwrap(),
+                Some(lease.clone())
+            );
+            assert!(
+                store
+                    .reserve_worker_create(
+                        "workspace-a",
+                        "runtime-a",
+                        "manual:retry",
+                        "sha256:first",
+                        Some(key),
+                        &memory
+                    )
+                    .is_err()
+            );
+            drop(store);
+            let store = SqliteWorkspaceStore::open_for_test(&database).unwrap();
+            assert_eq!(
+                store
+                    .prepare_subject_create_recovery("workspace-a", &lease, "recover-first")
+                    .unwrap(),
+                fingerprint
+            );
+            assert!(
+                store
+                    .prepare_subject_create_recovery("workspace-a", &lease, "different-operation")
+                    .is_err()
+            );
+            assert!(
+                store
+                    .complete_subject_create_recovery(
+                        "workspace-a",
+                        &lease,
+                        "recover-first",
+                        "different-fingerprint"
+                    )
+                    .is_err()
+            );
+            assert!(
+                store
+                    .complete_subject_create_recovery(
+                        "workspace-a",
+                        &lease,
+                        "different-operation",
+                        &fingerprint
+                    )
+                    .is_err()
+            );
+            assert!(
+                store
+                    .complete_subject_create_recovery(
+                        "workspace-b",
+                        &lease,
+                        "recover-first",
+                        &fingerprint
+                    )
+                    .is_err()
+            );
+            // A registry row appearing after prepare must block both replay and completion.
+            store.with_conn(|c| {
+                c.execute("INSERT INTO worker_registry(workspace_id,runtime_id,worker_id,display_name,retention_state,created_at,updated_at) VALUES('workspace-a',?1,?2,'body','normal','now','now')", params![lease.worker.runtime_id, lease.worker.worker_id])?;
+                Ok(())
+            }).unwrap();
+            assert_eq!(
+                store
+                    .subject_create_recovery_candidate("workspace-a", &lease)
+                    .unwrap(),
+                None
+            );
+            assert!(
+                store
+                    .prepare_subject_create_recovery("workspace-a", &lease, "recover-first")
+                    .is_err()
+            );
+            assert!(
+                store
+                    .complete_subject_create_recovery(
+                        "workspace-a",
+                        &lease,
+                        "recover-first",
+                        &fingerprint
+                    )
+                    .is_err()
+            );
+            store.with_conn(|c| {
+                c.execute("DELETE FROM worker_registry WHERE workspace_id='workspace-a' AND runtime_id=?1 AND worker_id=?2", params![lease.worker.runtime_id, lease.worker.worker_id])?;
+                // Exercise a current-generation change while the operation is incomplete.
+                c.execute("UPDATE worker_singleton_owners SET generation=generation+1 WHERE workspace_id='workspace-a' AND singleton_key=?1", [key])?;
+                Ok(())
+            }).unwrap();
+            assert!(
+                store
+                    .complete_subject_create_recovery(
+                        "workspace-a",
+                        &lease,
+                        "recover-first",
+                        &fingerprint
+                    )
+                    .is_err()
+            );
+            assert!(
+                store
+                    .subject_release_pending("workspace-a", &lease.worker)
+                    .unwrap()
+            );
+            store.with_conn(|c| {
+                c.execute("UPDATE worker_singleton_owners SET generation=?2 WHERE workspace_id='workspace-a' AND singleton_key=?1", params![key, lease.generation as i64])?;
+                Ok(())
+            }).unwrap();
+            store
+                .complete_subject_create_recovery(
+                    "workspace-a",
+                    &lease,
+                    "recover-first",
+                    &fingerprint,
+                )
+                .unwrap();
+            drop(store);
+            let store = SqliteWorkspaceStore::open_for_test(&database).unwrap();
+            store
+                .complete_subject_create_recovery(
+                    "workspace-a",
+                    &lease,
+                    "recover-first",
+                    &fingerprint,
+                )
+                .unwrap();
+            assert!(
+                !store
+                    .subject_release_pending("workspace-a", &lease.worker)
+                    .unwrap()
+            );
+            assert_eq!(
+                store
+                    .current_worker_singleton_owner("workspace-a", key)
+                    .unwrap(),
+                None
+            );
+            let next = store
+                .reserve_worker_create(
+                    "workspace-a",
+                    "runtime-b",
+                    "manual:next",
+                    "sha256:next",
+                    Some(key),
+                    &memory,
+                )
+                .unwrap();
+            let next_lease = next.singleton.unwrap();
+            assert_eq!(next_lease.generation, lease.generation + 1);
+            store
+                .complete_subject_create_recovery(
+                    "workspace-a",
+                    &lease,
+                    "recover-first",
+                    &fingerprint,
+                )
+                .unwrap();
+            assert!(
+                store
+                    .prepare_subject_create_recovery("workspace-a", &lease, "recover-first")
+                    .is_err()
+            );
+            assert!(
+                store
+                    .complete_subject_create_recovery(
+                        "workspace-a",
+                        &next_lease,
+                        "recover-first",
+                        &fingerprint
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .current_worker_singleton_owner("workspace-a", key)
+                    .unwrap(),
+                Some(next_lease.clone())
+            );
+            // The old completed proof cannot release the next removed generation.
+            store
+                .fail_worker_create_reservation(
+                    "workspace-a",
+                    "runtime-b",
+                    next.worker_id,
+                    &next.create_fingerprint,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .current_worker_singleton_owner("workspace-a", key)
+                    .unwrap(),
+                Some(next_lease.clone())
+            );
+            assert!(
+                store
+                    .prepare_subject_create_recovery("workspace-a", &next_lease, "recover-first")
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .prepare_subject_create_recovery("workspace-a", &next_lease, "recover-next")
+                    .unwrap(),
+                next.create_fingerprint
+            );
+            store.with_conn(|c| {
+                assert_eq!(c.query_row("SELECT count(*) FROM subject_worker_releases", [], |r| r.get::<_, i64>(0))?, 0);
+                assert_eq!(c.query_row("SELECT state FROM worker_create_reservations WHERE workspace_id='workspace-a' AND worker_id=?1", [&lease.worker.worker_id], |r| r.get::<_, String>(0))?, "removed");
+                assert!(c.execute("UPDATE subject_create_recoveries SET completed=2", []).is_err());
+                assert!(c.execute("UPDATE subject_create_recoveries SET singleton_generation=0", []).is_err());
+                assert_eq!(c.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get::<_, i64>(0))?, 0);
+                Ok(())
+            }).unwrap();
+        }
+    }
+
+    #[test]
     fn subject_release_migration_rolls_back_schema_and_marker_then_reopens() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("server.db");
@@ -21056,7 +21640,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         drop(conn);
         let reopened = SqliteWorkspaceStore::open_for_test(database).unwrap();
         reopened
-            .with_conn(|conn| verify_schema_history(conn, 101))
+            .with_conn(|conn| verify_schema_history(conn, LATEST_SCHEMA_VERSION))
             .unwrap();
     }
 
@@ -21636,7 +22220,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (98, "Assignment-independent implementation reports".into()),
                          (99, "Explicit hosting administrators and self-registration policy".into()),
                          (100, "Provisional users and scoped passkey activation".into()),
-                         (101, "Durable explicit Subject body release".into())]);
+                         (101, "Durable explicit Subject body release".into()),
+                         (102, "Durable failed Subject creation recovery".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

@@ -1087,6 +1087,54 @@ async fn canonical_http_rejects_replay_tampered_body_and_workspace_mismatch() {
 }
 
 #[tokio::test]
+async fn subject_create_recovery_signed_http_requires_delete_and_matching_workspace() {
+    let f = Fixture::new();
+    let identity = RuntimeIdentityMaterial::generate("recovery-key").unwrap();
+    let trust = workspace_trust(&identity);
+    let app = runtime_http_router_with_workspace_auth(
+        f.runtime.clone(),
+        None,
+        workspace_test_auth(vec![trust.clone()]),
+    );
+    let path = "/v1/subject-create-recovery";
+    let mut request = runtime_api::SubjectCreateRecoveryRequest {
+        workspace_id: f.scope.workspace_id.clone(),
+        worker_id: WorkerId::now_v7(),
+        create_fingerprint: "unpublished-create".into(),
+        operation_id: "recovery-1".into(),
+    };
+    for operation in ["workers:read", "workers:stop", "workers:create"] {
+        let body = serde_json::to_vec(&request).unwrap();
+        let mut claims = signed_claims(&trust, "POST", path, &body);
+        claims.operation = operation.into();
+        let response = signed_request(app.clone(), &identity, &claims, body, "workspace-a").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    request.workspace_id = "other-workspace".into();
+    let body = serde_json::to_vec(&request).unwrap();
+    let claims = signed_claims(&trust, "POST", path, &body);
+    let response = signed_request(app.clone(), &identity, &claims, body, "workspace-a").await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    request.workspace_id = f.scope.workspace_id.clone();
+    for _ in 0..2 {
+        let body = serde_json::to_vec(&request).unwrap();
+        let claims = signed_claims(&trust, "POST", path, &body);
+        assert_eq!(claims.operation, "workers:delete");
+        let response = signed_request(app.clone(), &identity, &claims, body, "workspace-a").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 16384)
+            .await
+            .unwrap();
+        let receipt: runtime_api::SubjectCreateRecoveryResponse =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(receipt.worker_id, request.worker_id);
+        assert_eq!(receipt.workspace_id, request.workspace_id);
+        assert_eq!(receipt.create_fingerprint, request.create_fingerprint);
+        assert_eq!(receipt.operation_id, request.operation_id);
+    }
+}
+
+#[tokio::test]
 async fn explicit_material_erasure_requires_delete_capability_and_matching_scope() {
     let f = Fixture::new();
     f.stop();

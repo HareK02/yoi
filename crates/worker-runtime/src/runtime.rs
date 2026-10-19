@@ -355,7 +355,92 @@ impl Drop for WorkerOperationLease {
     }
 }
 
+/// Irreversible admission exclusion, independent of the removable Worker aggregate.
+/// A saved response is historical: retries still require a fresh backend absence check.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SubjectCreateRecoveryFence {
+    pub(crate) request: runtime_api::SubjectCreateRecoveryRequest,
+    pub(crate) response: Option<runtime_api::SubjectCreateRecoveryResponse>,
+}
+
 impl Runtime {
+    pub fn recover_subject_create_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        request: runtime_api::SubjectCreateRecoveryRequest,
+    ) -> Result<runtime_api::SubjectCreateRecoveryResponse, RuntimeError> {
+        if request.workspace_id != scope.workspace_id
+            || request.create_fingerprint.trim().is_empty()
+            || request.operation_id.trim().is_empty()
+            || request.create_fingerprint.len() > 512
+            || request.operation_id.len() > 512
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "invalid Subject create recovery identity".into(),
+            ));
+        }
+        let lease = self.worker_operation_lock(request.worker_id)?;
+        let _operation = lease.lock().map_err(|_| RuntimeError::StatePoisoned)?;
+        let backend = {
+            let mut state = self.lock()?;
+            state.ensure_running()?;
+            // A memory-only Runtime cannot issue durable proof.
+            if state.backend == RuntimeBackendKind::Memory {
+                return Err(RuntimeError::InvalidRequest(
+                    "Subject create recovery requires durable storage".into(),
+                ));
+            }
+            state.ensure_workspace_owner(scope, false)?;
+            if state.workers.contains_key(&request.worker_id) {
+                return Err(RuntimeError::InvalidRequest(
+                    "Subject create catalog record is still present".into(),
+                ));
+            }
+            if let Some(saved) = state.subject_create_recovery_fences.get(&request.worker_id) {
+                if saved.request != request {
+                    return Err(RuntimeError::InvalidRequest(
+                        "different Subject create recovery is retained".into(),
+                    ));
+                }
+            } else {
+                state.ensure_workspace_owner(scope, true)?;
+                state.subject_create_recovery_fences.insert(
+                    request.worker_id,
+                    SubjectCreateRecoveryFence {
+                        request: request.clone(),
+                        response: None,
+                    },
+                );
+            }
+            // Never roll back admission exclusion, including uncertain persistence failures.
+            // Persist it before even checking backend availability.
+            state.persist_runtime_snapshot()?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::InvalidRequest(
+                    "Subject create execution absence cannot be confirmed".into(),
+                )
+            })?
+        };
+        backend
+            .recover_subject_create(&request)
+            .map_err(RuntimeError::InvalidRequest)?;
+        let response = runtime_api::SubjectCreateRecoveryResponse {
+            workspace_id: request.workspace_id.clone(),
+            worker_id: request.worker_id,
+            create_fingerprint: request.create_fingerprint.clone(),
+            operation_id: request.operation_id.clone(),
+        };
+        let mut state = self.lock()?;
+        state
+            .subject_create_recovery_fences
+            .get_mut(&request.worker_id)
+            .expect("recovery fence retained under Worker operation lock")
+            .response = Some(response.clone());
+        state.persist_runtime_snapshot()?;
+        Ok(response)
+    }
+
     /// Reserves the actual Controller while the Host reconciles final saved Journal material.
     /// A Runtime restart loses proof of a reservation, never reconstructs it from Worker status.
     pub fn subject_release_scoped(
@@ -1262,6 +1347,8 @@ impl Runtime {
         let _operation_guard = operation_lock
             .lock()
             .map_err(|_| RuntimeError::StatePoisoned)?;
+        self.lock()?
+            .ensure_subject_create_not_fenced(request.worker_id)?;
         if let Some(existing) = self.existing_worker_for_create(&request, scope)? {
             return Ok(existing);
         }
@@ -5482,6 +5569,7 @@ struct RuntimeState {
     #[cfg(feature = "fs-store")]
     next_diagnostic_id: u64,
     workers: BTreeMap<WorkerId, WorkerRecord>,
+    subject_create_recovery_fences: BTreeMap<WorkerId, SubjectCreateRecoveryFence>,
     subject_release_operations: BTreeMap<
         (WorkerId, String),
         (
@@ -5519,6 +5607,7 @@ impl RuntimeState {
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
+            subject_create_recovery_fences: BTreeMap::new(),
             subject_release_operations: BTreeMap::new(),
             workdir_operations: BTreeMap::new(),
             workspace_owners: BTreeMap::new(),
@@ -5551,6 +5640,7 @@ impl RuntimeState {
             #[cfg(feature = "fs-store")]
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
+            subject_create_recovery_fences: BTreeMap::new(),
             subject_release_operations: BTreeMap::new(),
             workdir_operations: BTreeMap::new(),
             workspace_owners: BTreeMap::new(),
@@ -5697,6 +5787,7 @@ impl RuntimeState {
             workspace_backend_resource_clients: BTreeMap::new(),
             next_diagnostic_id,
             workers,
+            subject_create_recovery_fences: persisted.subject_create_recovery_fences,
             subject_release_operations: persisted
                 .subject_releases
                 .into_iter()
@@ -5727,6 +5818,7 @@ impl RuntimeState {
     #[cfg(feature = "fs-store")]
     fn persisted_state(&self) -> PersistedRuntimeState {
         PersistedRuntimeState {
+            subject_create_recovery_fences: self.subject_create_recovery_fences.clone(),
             subject_releases: self.subject_release_operations.values().cloned().collect(),
             display_name: self.display_name.clone(),
             status: self.status,
@@ -5871,11 +5963,21 @@ impl RuntimeState {
         Ok(())
     }
 
+    fn ensure_subject_create_not_fenced(&self, worker_id: WorkerId) -> Result<(), RuntimeError> {
+        if self.subject_create_recovery_fences.contains_key(&worker_id) {
+            return Err(RuntimeError::InvalidRequest(
+                "Subject create identity is irreversibly fenced".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn ensure_subject_not_reserved(
         &self,
         worker: &WorkerRef,
         allow_disconnected: bool,
     ) -> Result<(), RuntimeError> {
+        self.ensure_subject_create_not_fenced(worker.worker_id)?;
         use runtime_api::SubjectReleaseState as State;
         if self
             .subject_release_operations
@@ -5945,6 +6047,13 @@ impl RuntimeState {
     }
 
     fn forget_workspace_owner_if_unused(&mut self, workspace_id: &str) -> bool {
+        if self
+            .subject_create_recovery_fences
+            .values()
+            .any(|fence| fence.request.workspace_id == workspace_id)
+        {
+            return false;
+        }
         if self
             .workers
             .values()
@@ -8293,6 +8402,8 @@ mod tests {
 
     #[derive(Default)]
     struct TestExecutionBackend {
+        recovery_absent: AtomicBool,
+        recovery_checks: std::sync::atomic::AtomicUsize,
         spawn_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         job_bindings: Mutex<Vec<Option<crate::catalog::BackendJobExecutionBinding>>>,
         dispatch_result: Mutex<Option<WorkerExecutionResult>>,
@@ -8367,6 +8478,18 @@ mod tests {
     }
 
     impl WorkerExecutionBackend for TestExecutionBackend {
+        fn recover_subject_create(
+            &self,
+            _request: &runtime_api::SubjectCreateRecoveryRequest,
+        ) -> Result<(), String> {
+            self.recovery_checks.fetch_add(1, Ordering::SeqCst);
+            if self.recovery_absent.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("execution absence is unconfirmed".into())
+            }
+        }
+
         fn subject_release(
             &self,
             request: &runtime_api::SubjectReleaseRequest,
@@ -13098,7 +13221,7 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains(
-            "unsupported Runtime store schema version 2; expected 6, 7, 8, 9, 10, or 11"
+            "unsupported Runtime store schema version 2; expected 6, 7, 8, 9, 10, 11, or 12"
         ));
 
         let _ = std::fs::remove_dir_all(root);
@@ -13140,7 +13263,7 @@ mod tests {
         let worker_aggregate: serde_json::Value =
             serde_json::from_slice(&std::fs::read(worker_store_dir.join("worker.json")).unwrap())
                 .unwrap();
-        assert_eq!(worker_aggregate["schema_version"], serde_json::json!(11));
+        assert_eq!(worker_aggregate["schema_version"], serde_json::json!(12));
         assert_eq!(worker_aggregate["status"], serde_json::json!("stopped"));
         assert_eq!(
             worker_aggregate["execution_state"]["state"],
@@ -13278,6 +13401,213 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn subject_create_recovery_is_durable_exact_and_rechecks_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let options = crate::fs_store::FsRuntimeStoreOptions::new(root.path())
+            .with_runtime_id("test-runtime");
+        let scoped = scope("workspace-a", "server-a");
+        let backend = Arc::new(TestExecutionBackend::default());
+        backend.recovery_absent.store(true, Ordering::SeqCst);
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        let create = scoped_task_request("unpublished create", "workspace-a");
+        let request = runtime_api::SubjectCreateRecoveryRequest {
+            workspace_id: scoped.workspace_id.clone(),
+            worker_id: create.worker_id,
+            create_fingerprint: create.create_fingerprint.clone(),
+            operation_id: "recovery-1".into(),
+        };
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        *backend.spawn_result.lock().unwrap() = Some(WorkerExecutionSpawnResult::RolledBack(
+            WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Spawn,
+                "create failed before publication",
+            ),
+        ));
+        assert!(
+            runtime
+                .create_worker_scoped(&scoped, create.clone())
+                .is_err()
+        );
+        assert!(
+            !runtime
+                .lock()
+                .unwrap()
+                .workers
+                .contains_key(&create.worker_id)
+        );
+        let response = runtime
+            .recover_subject_create_scoped(&scoped, request.clone())
+            .unwrap();
+        assert_eq!(response.worker_id, request.worker_id);
+        assert!(
+            runtime
+                .create_worker_scoped(&scoped, create.clone())
+                .is_err()
+        );
+        assert!(
+            !runtime
+                .lock()
+                .unwrap()
+                .forget_workspace_owner_if_unused("workspace-a")
+        );
+        assert_eq!(
+            runtime
+                .lock()
+                .unwrap()
+                .workspace_owners
+                .get("workspace-a")
+                .map(String::as_str),
+            Some("server-a")
+        );
+        assert_eq!(
+            runtime
+                .recover_subject_create_scoped(&scoped, request.clone())
+                .unwrap(),
+            response
+        );
+        assert_eq!(backend.recovery_checks.load(Ordering::SeqCst), 2);
+        for mut mismatch in [request.clone(), request.clone(), request.clone()]
+            .into_iter()
+            .enumerate()
+        {
+            match mismatch.0 {
+                0 => mismatch.1.create_fingerprint.push_str("-wrong"),
+                1 => mismatch.1.operation_id.push_str("-wrong"),
+                _ => mismatch.1.workspace_id.push_str("-wrong"),
+            }
+            assert!(
+                runtime
+                    .recover_subject_create_scoped(&scoped, mismatch.1)
+                    .is_err()
+            );
+        }
+        assert!(
+            runtime
+                .recover_subject_create_scoped(
+                    &scope("workspace-a", "other-server"),
+                    request.clone()
+                )
+                .is_err()
+        );
+        drop(runtime);
+        let backend = Arc::new(TestExecutionBackend::default());
+        let reopened =
+            Runtime::with_fs_store_and_execution_backend(options, backend.clone()).unwrap();
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        assert!(reopened.create_worker_scoped(&scoped, create).is_err());
+        assert!(
+            reopened
+                .recover_subject_create_scoped(&scoped, request.clone())
+                .is_err(),
+            "saved success cannot replace fresh absence proof"
+        );
+        backend.recovery_absent.store(true, Ordering::SeqCst);
+        assert_eq!(
+            reopened
+                .recover_subject_create_scoped(&scoped, request)
+                .unwrap(),
+            response
+        );
+        assert_eq!(backend.recovery_checks.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn subject_create_recovery_unknown_backend_retains_fence_and_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let options = crate::fs_store::FsRuntimeStoreOptions::new(root.path())
+            .with_runtime_id("test-runtime");
+        let scoped = scope("workspace-a", "server-a");
+        let runtime = Runtime::with_fs_store(options.clone()).unwrap();
+        let create = scoped_task_request("unpublished create", "workspace-a");
+        let request = runtime_api::SubjectCreateRecoveryRequest {
+            workspace_id: scoped.workspace_id.clone(),
+            worker_id: create.worker_id,
+            create_fingerprint: create.create_fingerprint.clone(),
+            operation_id: "recovery-unknown".into(),
+        };
+        assert!(
+            runtime
+                .recover_subject_create_scoped(&scoped, request.clone())
+                .is_err()
+        );
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .subject_create_recovery_fences
+                .get(&request.worker_id)
+                .unwrap()
+                .response
+                .is_none()
+        );
+        drop(runtime);
+        let backend = Arc::new(TestExecutionBackend::default());
+        let reopened =
+            Runtime::with_fs_store_and_execution_backend(options, backend.clone()).unwrap();
+        assert!(reopened.create_worker_scoped(&scoped, create).is_err());
+        assert!(
+            reopened
+                .recover_subject_create_scoped(
+                    &scope("workspace-a", "other-server"),
+                    request.clone()
+                )
+                .is_err()
+        );
+        assert!(
+            reopened
+                .recover_subject_create_scoped(&scoped, request.clone())
+                .is_err()
+        );
+        backend.recovery_absent.store(true, Ordering::SeqCst);
+        reopened
+            .recover_subject_create_scoped(&scoped, request)
+            .unwrap();
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn subject_create_recovery_rejects_existing_catalog_even_when_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(TestExecutionBackend::default());
+        backend.recovery_absent.store(true, Ordering::SeqCst);
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions::new(root.path())
+                .with_runtime_id("test-runtime"),
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let scoped = scope("workspace-a", "server-a");
+        let create = scoped_task_request("existing subject", "workspace-a");
+        let worker = runtime
+            .create_worker_scoped(&scoped, create.clone())
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let request = runtime_api::SubjectCreateRecoveryRequest {
+            workspace_id: scoped.workspace_id.clone(),
+            worker_id: create.worker_id,
+            create_fingerprint: create.create_fingerprint.clone(),
+            operation_id: "not-unpublished".into(),
+        };
+        assert!(
+            runtime
+                .recover_subject_create_scoped(&scoped, request)
+                .is_err()
+        );
+        assert_eq!(backend.recovery_checks.load(Ordering::SeqCst), 0);
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .subject_create_recovery_fences
+                .is_empty()
+        );
     }
 
     // Persistence component test; real Controller reservation has separate coverage.
@@ -14164,7 +14494,7 @@ mod tests {
         );
         let migrated_aggregate: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&worker_path).unwrap()).unwrap();
-        assert_eq!(migrated_aggregate["schema_version"], serde_json::json!(11));
+        assert_eq!(migrated_aggregate["schema_version"], serde_json::json!(12));
         assert!(migrated_aggregate.get("request").is_none());
         assert!(migrated_aggregate.get("execution").is_none());
         assert_eq!(

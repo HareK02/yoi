@@ -3369,6 +3369,42 @@ where
         &self.backend_id
     }
 
+    fn recover_subject_create(
+        &self,
+        request: &runtime_api::SubjectCreateRecoveryRequest,
+    ) -> Result<(), String> {
+        let worker_ref = WorkerRef::new(request.worker_id);
+        let lock = self.worker_lock(&worker_ref)?;
+        let _operation = lock.lock().map_err(|_| "worker operation lock poisoned")?;
+        if self
+            .runtime
+            .lock()
+            .map_err(|_| "adapter runtime poisoned")?
+            .is_none()
+        {
+            return Err("execution backend is unavailable".into());
+        }
+        if self
+            .pending_restores
+            .lock()
+            .map_err(|_| "restore registry poisoned")?
+            .contains_key(&worker_ref)
+        {
+            return Err("Subject create has a pending execution candidate".into());
+        }
+        if self
+            .workers
+            .lock()
+            .map_err(|_| "worker registry poisoned")?
+            .contains_key(&worker_ref)
+        {
+            // Even a closed protocol or stopped snapshot is residual execution,
+            // not absence. Recovery does not stop or remove anything.
+            return Err("Subject create execution is still present".into());
+        }
+        Ok(())
+    }
+
     fn subject_release(
         &self,
         request: &runtime_api::SubjectReleaseRequest,
@@ -6070,6 +6106,48 @@ mod tests {
     }
 
     #[test]
+    fn subject_create_recovery_checks_actual_absence_and_pending_candidates() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = WorkerRuntimeExecutionBackend::new(
+            ProfileRuntimeWorkerFactory::new(root.path())
+                .with_runtime_store_dir(root.path().join("runtime")),
+        )
+        .unwrap();
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let recovery = runtime_api::SubjectCreateRecoveryRequest {
+            workspace_id: "ws-test".into(),
+            worker_id: worker_ref.worker_id,
+            create_fingerprint: "failed-create".into(),
+            operation_id: "recovery-1".into(),
+        };
+        backend.recover_subject_create(&recovery).unwrap();
+        // No Controller exists, but unresolved task ownership is not absence.
+        backend.pending_restores.lock().unwrap().insert(
+            worker_ref.clone(),
+            Arc::new(PendingRuntimeRestore {
+                request: direct_restore_request(worker_ref.clone()),
+                task: tokio::sync::Mutex::new(None),
+                result: Mutex::new(None),
+                failure: Mutex::new(Some("task completion unknown".into())),
+            }),
+        );
+        assert!(
+            backend
+                .recover_subject_create(&recovery)
+                .unwrap_err()
+                .contains("pending")
+        );
+        assert!(
+            backend
+                .pending_restores
+                .lock()
+                .unwrap()
+                .contains_key(&worker_ref)
+        );
+        assert!(backend.workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn pending_restore_join_failure_never_becomes_absence_on_stop_retry() {
         let root = tempfile::tempdir().unwrap();
         let backend = WorkerRuntimeExecutionBackend::new(
@@ -6127,6 +6205,18 @@ mod tests {
     fn stop_joins_healthy_self_terminated_controller_with_closed_endpoint() {
         let root = tempfile::tempdir().unwrap();
         let (backend, request) = profile_stop_fixture(root.path());
+        let recovery = runtime_api::SubjectCreateRecoveryRequest {
+            workspace_id: "ws-test".into(),
+            worker_id: request.worker_ref.worker_id,
+            create_fingerprint: "failed-create".into(),
+            operation_id: "recovery-1".into(),
+        };
+        assert!(
+            backend
+                .recover_subject_create(&recovery)
+                .unwrap_err()
+                .contains("still present")
+        );
         let execution = backend
             .workers
             .lock()
@@ -6167,8 +6257,16 @@ mod tests {
             })
             .unwrap();
         assert!(!execution.shutdown_requested.load(Ordering::Acquire));
+        assert!(
+            backend
+                .recover_subject_create(&recovery)
+                .unwrap_err()
+                .contains("still present"),
+            "closed Controller is still residual execution"
+        );
         assert!(backend.stop_worker(&request.worker_ref).is_accepted());
         assert!(backend.workers.lock().unwrap().is_empty());
+        backend.recover_subject_create(&recovery).unwrap();
         assert!(execution.tasks.tasks.lock().unwrap().is_empty());
         assert!(backend.stop_worker(&request.worker_ref).is_accepted());
     }

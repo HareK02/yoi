@@ -406,6 +406,18 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         }
     }
 
+    async fn recover_subject_create(
+        &self,
+        request: runtime_api::SubjectCreateRecoveryRequest,
+    ) -> Result<runtime_api::SubjectCreateRecoveryResponse, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        self.state
+            .runtime
+            .recover_subject_create_scoped(&scope, request)
+            .map_err(RuntimeHttpRestError::runtime)
+            .map_err(api_error)
+    }
+
     async fn subject_release(
         &self,
         request: runtime_api::SubjectReleaseRequest,

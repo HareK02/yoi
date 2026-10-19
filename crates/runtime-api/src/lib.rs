@@ -1140,8 +1140,36 @@ pub struct SubjectReleaseResponse {
     pub state: SubjectReleaseState,
 }
 
+/// Irreversibly fence an unpublished failed Subject create. Exact retries must retain
+/// all four fields; this is distinct from releasing an existing Subject Controller.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectCreateRecoveryRequest {
+    pub workspace_id: String,
+    pub worker_id: WorkerId,
+    pub create_fingerprint: String,
+    pub operation_id: String,
+}
+
+/// Durable admission-fence proof plus freshly confirmed execution absence.
+/// An error (including a lost response) is never evidence of absence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectCreateRecoveryResponse {
+    pub workspace_id: String,
+    pub worker_id: WorkerId,
+    pub create_fingerprint: String,
+    pub operation_id: String,
+}
+
 #[api(reqwest, axum)]
 pub trait RuntimeApi {
+    #[post("/v1/subject-create-recovery", status = 200, error_status = 400)]
+    async fn recover_subject_create(
+        &self,
+        #[body] request: SubjectCreateRecoveryRequest,
+    ) -> Result<SubjectCreateRecoveryResponse, RuntimeApiError>;
+
     #[post("/v1/subject-release", status = 200, error_status = 400)]
     async fn subject_release(
         &self,
@@ -1675,6 +1703,18 @@ mod tests {
         ) -> Result<SessionMaterialPinResponse, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn recover_subject_create(
+            &self,
+            request: SubjectCreateRecoveryRequest,
+        ) -> Result<SubjectCreateRecoveryResponse, RuntimeApiError> {
+            Ok(SubjectCreateRecoveryResponse {
+                workspace_id: request.workspace_id,
+                worker_id: request.worker_id,
+                create_fingerprint: request.create_fingerprint,
+                operation_id: request.operation_id,
+            })
+        }
+
         async fn subject_release(
             &self,
             _request: SubjectReleaseRequest,
@@ -1819,6 +1859,21 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
+
+        let recovery = SubjectCreateRecoveryRequest {
+            workspace_id: "workspace-a".into(),
+            worker_id: WorkerId::now_v7(),
+            create_fingerprint: "failed-create-fingerprint".into(),
+            operation_id: "recovery-1".into(),
+        };
+        let response = client
+            .recover_subject_create(recovery.clone())
+            .await
+            .unwrap();
+        assert_eq!(response.workspace_id, recovery.workspace_id);
+        assert_eq!(response.worker_id, recovery.worker_id);
+        assert_eq!(response.create_fingerprint, recovery.create_fingerprint);
+        assert_eq!(response.operation_id, recovery.operation_id);
 
         let summary = client.runtime_summary().await.unwrap();
         assert_eq!(summary.runtime.display_name.as_deref(), Some("round-trip"));

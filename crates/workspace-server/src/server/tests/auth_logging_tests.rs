@@ -197,7 +197,20 @@ async fn rejected_runtime_proofs_log_reason_and_verification_without_secrets_on_
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{reason}");
             let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            assert!(response_body.is_empty(), "{response_body:?}");
+            let error: server_api::RepositoryApiError =
+                serde_json::from_slice(&response_body).unwrap();
+            assert_eq!(error.error, "Unauthorized");
+            assert_eq!(error.message, "invalid runtime request proof");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&response_body).unwrap(),
+                serde_json::to_value(server_api::RepositoryApiError::new(
+                    401,
+                    "Unauthorized",
+                    "invalid runtime request proof",
+                    Vec::new()
+                ))
+                .unwrap()
+            );
             let (event, text) = logs.event();
             assert_eq!(event["reason"], reason);
             assert_eq!(event["proof_verification"], verification);
@@ -335,6 +348,124 @@ async fn runtime_proof_setup_failure_logs_no_internal_error_and_bounds_request_m
     }
     for secret in [&proof, "private-workspace-secret", "query-secret"] {
         assert!(!text.contains(secret));
+    }
+}
+
+#[tokio::test]
+async fn common_api_rejections_use_json_without_changing_drive_or_non_api_contracts() {
+    for status in [
+        StatusCode::BAD_REQUEST,
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+        StatusCode::CONFLICT,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        for path in [
+            "/api/w/ws/subjektiv/sessions",
+            "/api/w/ws/workers/self/workdir-session/operations",
+            "/api/runtime/v1/workspaces/ws/resources/fetch",
+            "/api/repositories",
+        ] {
+            let response = repository_api_rejection(path, status, "request rejected");
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes).unwrap(),
+                serde_json::to_value(server_api::RepositoryApiError::new(
+                    status.as_u16(),
+                    status.canonical_reason().unwrap(),
+                    "request rejected",
+                    Vec::new()
+                ))
+                .unwrap()
+            );
+        }
+        let drive = repository_api_rejection("/api/w/ws/drive/mutate", status, "request rejected");
+        assert_eq!(drive.status(), status);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &to_bytes(drive.into_body(), usize::MAX).await.unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(drive::failure(status.as_u16())).unwrap()
+        );
+        let shell = repository_api_rejection("/w/ws", status, "request rejected");
+        assert_eq!(shell.status(), status);
+        assert!(
+            to_bytes(shell.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subjektiv_auth_rejection_survives_runtime_generated_client_on_both_routers() {
+    use worker::WorkspaceClient;
+    struct AbortServer(tokio::task::JoinHandle<()>);
+    impl Drop for AbortServer {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    let workspace = tempfile::tempdir().unwrap();
+    let mut api = test_api(workspace.path()).await;
+    let trusted = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
+    configure_runtime_request_auth(&mut api, &trusted, "runtime-test");
+    let untrusted = RuntimeIdentityMaterial::generate("runtime-test").unwrap();
+    for app in [
+        build_router(api.clone()),
+        workspace_server_router(WorkspaceServerApi::new_for_test(
+            api.config.clone(),
+            api.store.clone(),
+        )),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let _server = AbortServer(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        // Exercise missing authentication, signature rejection and a valid proof
+        // whose Worker has no catalog membership/reservation.
+        for identity in [None, Some(&untrusted), Some(&trusted)] {
+            let client = worker_runtime::worker_source::RuntimeOwnedWorkspaceClient::new(
+                TEST_WORKSPACE_ID,
+                &url,
+                "runtime-test",
+                "unregistered-worker",
+            );
+            let client = match identity {
+                Some(identity) => client.with_runtime_request_source(identity, "server-test"),
+                None => client,
+            };
+            let response = tokio::task::spawn_blocking(move || {
+                client.execute_server_operation(worker::WorkspaceServerOperation::SubjektivRecordSession(
+                    server_api::SubjektivRecordSessionRequest {
+                        session_id: session_store::new_session_id().to_string(), create_if_missing: true,
+                    },
+                ))
+            }).await.unwrap().expect("an explicit HTTP rejection must remain a WorkspaceResponse, not an unknown transport outcome");
+            assert_eq!(response.status, 401);
+            let error: server_api::RepositoryApiError =
+                serde_json::from_str(&response.body).unwrap();
+            assert_eq!(error.error, "Unauthorized");
+            assert_eq!(
+                error.message,
+                if identity.is_some() {
+                    "invalid runtime request proof"
+                } else {
+                    "authentication required"
+                }
+            );
+            assert!(!response.body.contains("unregistered-worker"));
+            if let Some(identity) = identity {
+                assert!(!response.body.contains(&identity.private_key));
+            }
+        }
     }
 }
 

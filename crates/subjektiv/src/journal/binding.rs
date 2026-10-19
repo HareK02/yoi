@@ -67,6 +67,27 @@ impl SubjektivStore {
         })
     }
 
+    /// Absence proof for failed body creation, including bindings never attached to a Session
+    /// and released lifetimes. The Host must hold its lifecycle fence across this observation
+    /// and recovery; absence alone does not fence a delayed Runtime create.
+    pub fn journal_body_is_unpublished(
+        &self,
+        subject: &str,
+        runtime: &str,
+        worker: &str,
+    ) -> JournalResult<bool> {
+        self.database.try_with_connection(|tx| {
+            Ok(tx.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM journal_writer_bindings
+                   WHERE subject_id=?1 AND runtime_id=?2 AND worker_id=?3)
+                 AND NOT EXISTS(SELECT 1 FROM subject_session_attributions
+                   WHERE subject_id=?1 AND runtime_id=?2 AND worker_id=?3)",
+                params![subject, runtime, worker],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     pub fn journal_worker_was_released(
         &self,
         subject: &str,
@@ -201,5 +222,84 @@ impl SubjektivStore {
             tx.execute("UPDATE journal_writer_bindings SET active=0 WHERE binding_id=?1 AND active=1",[&binding.binding_id])?;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unpublished_body_rejects_orphan_and_released_bindings_and_attribution_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_manager, _workspace, store) = crate::tests::open_store(temp.path(), "absence-tests");
+        let subject = store
+            .create_subject(crate::SubjectRole::new("companion").unwrap())
+            .unwrap();
+        let other_subject = store
+            .create_subject(crate::SubjectRole::new("companion").unwrap())
+            .unwrap();
+        assert!(
+            store
+                .journal_body_is_unpublished(&subject.id, "runtime", "worker")
+                .unwrap()
+        );
+        // No Session was attached: an orphan binding is still published body evidence.
+        let binding = store
+            .claim_journal_writer(&subject.id, "runtime", "worker")
+            .unwrap();
+        assert!(
+            !store
+                .journal_body_is_unpublished(&subject.id, "runtime", "worker")
+                .unwrap()
+        );
+        for (subject_id, runtime, worker) in [
+            (other_subject.id.as_str(), "runtime", "worker"),
+            (subject.id.as_str(), "other-runtime", "worker"),
+            (subject.id.as_str(), "runtime", "other-worker"),
+        ] {
+            assert!(
+                store
+                    .journal_body_is_unpublished(subject_id, runtime, worker)
+                    .unwrap()
+            );
+        }
+        store.release_journal_writer(&binding).unwrap();
+        assert!(
+            !store
+                .journal_body_is_unpublished(&subject.id, "runtime", "worker")
+                .unwrap()
+        );
+        store
+            .record_session_attribution(
+                SubjectSessionAttribution::new(
+                    &subject.id,
+                    "runtime",
+                    "attribution-only",
+                    "session",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            !store
+                .journal_body_is_unpublished(&subject.id, "runtime", "attribution-only")
+                .unwrap()
+        );
+        assert!(
+            store
+                .journal_body_is_unpublished(&subject.id, "other-runtime", "attribution-only")
+                .unwrap()
+        );
+        assert!(
+            store
+                .journal_body_is_unpublished(&other_subject.id, "runtime", "attribution-only")
+                .unwrap()
+        );
+        assert!(
+            store
+                .journal_body_is_unpublished(&subject.id, "runtime", "never-published")
+                .unwrap()
+        );
     }
 }

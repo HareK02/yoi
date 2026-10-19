@@ -95,6 +95,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "workdir_removal_operations",
     "worker_control_grants",
     "subject_worker_releases",
+    "subject_create_recoveries",
     "worker_create_reservations",
     "worker_diagnostics_archives",
     "worker_mutation_source_proof_jtis",

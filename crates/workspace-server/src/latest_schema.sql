@@ -699,6 +699,19 @@ CREATE TABLE worker_create_reservations (
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
             CHECK ((singleton_key IS NULL) = (singleton_generation IS NULL))
         );
+CREATE TABLE subject_create_recoveries (
+    workspace_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    singleton_key TEXT NOT NULL,
+    singleton_generation INTEGER NOT NULL CHECK (singleton_generation > 0),
+    operation_id TEXT NOT NULL CHECK (length(operation_id) > 0),
+    create_fingerprint TEXT NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0 CHECK (completed IN (0,1)),
+    PRIMARY KEY (workspace_id, operation_id),
+    UNIQUE (workspace_id, runtime_id, worker_id, singleton_key, singleton_generation),
+    FOREIGN KEY (workspace_id, worker_id) REFERENCES worker_create_reservations(workspace_id, worker_id) ON DELETE CASCADE
+);
 CREATE TABLE subject_worker_releases (
     workspace_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,

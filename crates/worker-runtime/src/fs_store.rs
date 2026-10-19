@@ -39,9 +39,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-const SCHEMA_VERSION: u32 = 11;
-const EXECUTION_SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 12;
 // Frozen source schemas: do not move their meaning when adding a migration.
+const SOURCE_SCHEMA_VERSION: u32 = 11;
+const EXECUTION_SCHEMA_VERSION: u32 = 10;
 const AGGREGATE_SCHEMA_VERSION: u32 = 9;
 const PREVIOUS_SCHEMA_VERSION: u32 = 8;
 const LEGACY_SCHEMA_VERSION: u32 = 7;
@@ -480,6 +481,8 @@ pub(crate) struct OpenedFsRuntimeStore {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PersistedRuntimeState {
+    pub(crate) subject_create_recovery_fences:
+        BTreeMap<WorkerId, crate::runtime::SubjectCreateRecoveryFence>,
     pub(crate) subject_releases: Vec<(
         runtime_api::SubjectReleaseRequest,
         runtime_api::SubjectReleaseState,
@@ -641,8 +644,8 @@ fn plan_runtime_store_migration(
             format!("Runtime store schema version {schema_version} is out of range"),
         )
     })?;
-    let staging = migration_sibling(root, "schema-v11-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v11-backup")?;
+    let staging = migration_sibling(root, "schema-v12-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v12-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -676,11 +679,12 @@ fn plan_runtime_store_migration(
             | PREVIOUS_SCHEMA_VERSION
             | AGGREGATE_SCHEMA_VERSION
             | EXECUTION_SCHEMA_VERSION
+            | SOURCE_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -1010,11 +1014,16 @@ fn migrate_worker_record(
     mapping: Option<&LegacyWorkerIdentityMapping>,
     identity_path: &Path,
 ) -> Result<WorkerAggregateRecord, RuntimeError> {
-    if source_schema_version == EXECUTION_SCHEMA_VERSION {
+    if matches!(
+        source_schema_version,
+        EXECUTION_SCHEMA_VERSION | SOURCE_SCHEMA_VERSION
+    ) {
+        // Schemas 10 and 11 already use the current Worker aggregate layout.
+        // Only advance its version; never regenerate Restore admission identity.
         if identity_document
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
-            != Some(u64::from(EXECUTION_SCHEMA_VERSION))
+            != Some(u64::from(source_schema_version))
         {
             return Err(runtime_store_corrupt(
                 identity_path,
@@ -1405,11 +1414,18 @@ fn migrate_runtime_document(
         "schema_version".to_string(),
         serde_json::Value::from(SCHEMA_VERSION),
     );
-    object.remove("workers");
-    // This legacy cache is not Runtime lifecycle or restore authority. Bundles
-    // are reacquired from Workspace content authority, never renumbered/rehash-pinned here.
-    object.remove("config_bundles");
-    object.remove("next_worker_sequence");
+    // Intermediate schema-11 writers may already have saved irreversible fences.
+    // Default only a missing field; malformed or existing fences must not be erased.
+    object
+        .entry("subject_create_recovery_fences")
+        .or_insert_with(|| serde_json::json!({}));
+    if source_schema_version != SOURCE_SCHEMA_VERSION {
+        object.remove("workers");
+        // This legacy cache is not Runtime lifecycle or restore authority. Bundles
+        // are reacquired from Workspace content authority, never renumbered/rehash-pinned here.
+        object.remove("config_bundles");
+        object.remove("next_worker_sequence");
+    }
     let snapshot: RuntimeSnapshot = serde_json::from_value(document.clone()).map_err(|error| {
         runtime_store_corrupt(
             runtime_path,
@@ -1523,14 +1539,16 @@ fn recover_runtime_store_migration(root: &Path) -> Result<(), RuntimeError> {
         "pre-schema-v9-backup",
         "schema-v10-staging",
         "pre-schema-v10-backup",
+        "schema-v11-staging",
+        "pre-schema-v11-backup",
     ] {
         let earlier = migration_sibling(root, suffix)?;
         if earlier.exists() {
-            return Err(runtime_store_corrupt(root, "unfinished earlier Runtime migration requires explicit recovery before schema-v11 startup".into()));
+            return Err(runtime_store_corrupt(root, "unfinished earlier Runtime migration requires explicit recovery before schema-v12 startup".into()));
         }
     }
-    let staging = migration_sibling(root, "schema-v11-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v11-backup")?;
+    let staging = migration_sibling(root, "schema-v12-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v12-backup")?;
     let root_exists = migration_directory_exists(root)?;
     let staging_exists = migration_directory_exists(&staging)?;
     let backup_exists = migration_directory_exists(&backup)?;
@@ -1732,8 +1750,8 @@ fn migrate_runtime_store(
     if !plan.migration_required {
         return Ok(plan);
     }
-    let staging = migration_sibling(root, "schema-v11-staging")?;
-    let backup = migration_sibling(root, "pre-schema-v11-backup")?;
+    let staging = migration_sibling(root, "schema-v12-staging")?;
+    let backup = migration_sibling(root, "pre-schema-v12-backup")?;
     if staging.exists() || backup.exists() {
         return Err(runtime_store_corrupt(
             root,
@@ -1908,7 +1926,10 @@ fn migrate_runtime_store_in_place(
                 ));
             }
         }
-        if let Some(metadata) = metadata {
+        // Schema 11 metadata was validated above but needs no conversion.
+        if let Some(metadata) = metadata
+            && plan.current_schema_version != SOURCE_SCHEMA_VERSION
+        {
             atomic_write_json(
                 &migrated_dir.join(WORKER_METADATA_FILE),
                 &metadata,
@@ -1927,7 +1948,11 @@ fn migrate_runtime_store_in_place(
             ),
         ));
     }
-    crate::retention::migrate_staged_sessions(root)?;
+    // Schema 11 already migrated Sessions; the recovery-fence bump must not
+    // rewrite retained history or archive attestations.
+    if plan.current_schema_version != SOURCE_SCHEMA_VERSION {
+        crate::retention::migrate_staged_sessions(root)?;
+    }
     let (document, _) = migrate_runtime_document(
         document,
         plan.current_schema_version,
@@ -1944,6 +1969,8 @@ fn migrate_runtime_store_in_place(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RuntimeSnapshot {
+    #[serde(default)]
+    subject_create_recovery_fences: BTreeMap<WorkerId, crate::runtime::SubjectCreateRecoveryFence>,
     #[serde(default)]
     subject_releases: Vec<(
         runtime_api::SubjectReleaseRequest,
@@ -1980,6 +2007,7 @@ fn record_worker_load_diagnostic(
 impl RuntimeSnapshot {
     fn from_persisted(state: &PersistedRuntimeState) -> Self {
         Self {
+            subject_create_recovery_fences: state.subject_create_recovery_fences.clone(),
             subject_releases: state.subject_releases.clone(),
             schema_version: SCHEMA_VERSION,
             display_name: state.display_name.clone(),
@@ -2003,6 +2031,33 @@ impl RuntimeSnapshot {
                 ),
             });
         }
+        for (worker_id, fence) in &self.subject_create_recovery_fences {
+            let request = &fence.request;
+            let response_matches = fence.response.as_ref().is_none_or(|response| {
+                response.worker_id == request.worker_id
+                    && response.workspace_id == request.workspace_id
+                    && response.create_fingerprint == request.create_fingerprint
+                    && response.operation_id == request.operation_id
+            });
+            if *worker_id != request.worker_id
+                || request.workspace_id.trim().is_empty()
+                || request.create_fingerprint.trim().is_empty()
+                || request.create_fingerprint.len() > 512
+                || request.operation_id.trim().is_empty()
+                || request.operation_id.len() > 512
+                || self
+                    .workspace_owners
+                    .get(&request.workspace_id)
+                    .is_none_or(|owner| owner.trim().is_empty())
+                || !response_matches
+            {
+                return Err(RuntimeError::StoreCorrupt {
+                    operation: "read Subject create recovery fence",
+                    path: path.to_path_buf(),
+                    message: "invalid recovery identity, receipt or Workspace owner".into(),
+                });
+            }
+        }
         if self.backend != RuntimeBackendKind::FsStore {
             return Err(RuntimeError::StoreCorrupt {
                 operation: "read runtime snapshot",
@@ -2018,6 +2073,7 @@ impl RuntimeSnapshot {
         workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
     ) -> PersistedRuntimeState {
         PersistedRuntimeState {
+            subject_create_recovery_fences: self.subject_create_recovery_fences,
             subject_releases: self.subject_releases,
             display_name: self.display_name,
             status: self.status,
@@ -2709,6 +2765,199 @@ mod tests {
     }
 
     #[test]
+    fn schema_v11_migration_preserves_identity_history_and_recovery_fences_on_reopen() {
+        // Cover the released schema (no field) and intermediate writers with
+        // either a pending fence or a completed recovery receipt.
+        for fence_state in ["absent", "pending", "completed"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("runtime");
+            let worker_id = WorkerId::now_v7();
+            let fenced_worker_id = WorkerId::now_v7();
+            let worker_dir = root.join(WORKERS_DIR).join(worker_id.to_string());
+            fs::create_dir_all(worker_dir.join("session")).unwrap();
+            let runtime_path = root.join(RUNTIME_FILE);
+            let worker_path = worker_dir.join(WORKER_FILE);
+            let metadata_path = worker_dir.join(WORKER_METADATA_FILE);
+            let history_path = worker_dir.join("session/history.json");
+            let history = b"[{\"role\":\"user\",\"content\":\"retained history\"}]\n";
+            fs::write(&history_path, history).unwrap();
+            let metadata = serde_json::to_vec(&serde_json::json!({
+                "worker_name": runtime_worker_name(worker_id),
+                "workspace_id": "workspace-a",
+                "retained_extension": {"history": "must not be rewritten"}
+            }))
+            .unwrap();
+            fs::write(&metadata_path, &metadata).unwrap();
+
+            let mut runtime = serde_json::json!({
+                "schema_version": 11,
+                "display_name": "schema-11 Runtime",
+                "backend": "fs_store",
+                "status": "running",
+                "next_diagnostic_id": 2,
+                "config_bundles": {},
+                "workspace_owners": {"workspace-a": "owner-a"},
+                "subject_releases": [],
+                "diagnostics": [{
+                    "id": 1, "worker_ref": {"worker_id": worker_id},
+                    "severity": "warning", "code": "retained_history",
+                    "message": "preserve diagnostic identity"
+                }]
+            });
+            let recovery_identity = serde_json::json!({
+                "workspace_id": "workspace-a", "worker_id": fenced_worker_id,
+                "create_fingerprint": "failed-create", "operation_id": "recover-a"
+            });
+            if fence_state != "absent" {
+                runtime["subject_create_recovery_fences"] = serde_json::json!({
+                    fenced_worker_id.to_string(): {
+                        "request": recovery_identity,
+                        "response": if fence_state == "completed" {
+                            recovery_identity.clone()
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    }
+                });
+            }
+            atomic_write_json(&runtime_path, &runtime, "write schema-11 fixture").unwrap();
+            let runtime_before = fs::read(&runtime_path).unwrap();
+
+            let mut request = schema_v7_worker_document(worker_id)["request"].clone();
+            request["workspace_api"] = serde_json::json!({
+                "workspace_id": "workspace-a", "base_url": "https://workspace.invalid"
+            });
+            // Serialize defaults as a schema-11 writer would, without running
+            // a migration or generating a fresh Restore guard for the fixture.
+            let request: CreateWorkerRequest = serde_json::from_value(request).unwrap();
+            let worker: WorkerAggregateRecord = serde_json::from_value(serde_json::json!({
+                "schema_version": 11,
+                "restore_guard": {
+                    "observation_token": "retained-restore-token",
+                    "active_request_id": null, "owners": {}
+                },
+                "worker_ref": {"worker_id": worker_id}, "worker_id": worker_id,
+                "profile": request.profile,
+                "display_name": null,
+                "profile_source": request.profile_source.reference(),
+                "config_bundle": null,
+                "created_at_ms": 1234,
+                "status": "running",
+                "last_finished_submission_request_id": "finished-submission",
+                "workspace_id": "workspace-a",
+                "execution_state": {"state": "available", "execution": {
+                    "request": request, "binding": {}, "restore_intent": "automatic"
+                }}
+            }))
+            .unwrap();
+            let mut expected_worker = serde_json::to_value(&worker).unwrap();
+            atomic_write_json(&worker_path, &worker, "write schema-11 Worker").unwrap();
+            let worker_before = fs::read(&worker_path).unwrap();
+            let options = FsRuntimeStoreOptions::new(&root).with_runtime_id("runtime-test");
+            let plan = FsRuntimeStore::migration_plan(&options).unwrap();
+            assert_eq!(plan.current_schema_version, 11);
+            assert_eq!(plan.target_schema_version, 12);
+            assert!(plan.migration_required);
+            assert_eq!(plan.worker_count, 1);
+            assert_eq!(plan.migrated_worker_aggregate_count, 0);
+            assert!(plan.mappings.is_empty());
+            assert_eq!(fs::read(&runtime_path).unwrap(), runtime_before);
+            assert_eq!(fs::read(&worker_path).unwrap(), worker_before);
+            // The direct reader still rejects a previous schema: migration is
+            // explicit, not permissive deserialization of a newer format.
+            let snapshot: RuntimeSnapshot = serde_json::from_value(runtime.clone()).unwrap();
+            assert!(snapshot.validate(&runtime_path).is_err());
+
+            let opened = FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap();
+            let state = opened.state.as_ref().unwrap();
+            let persisted_worker = state.workers.get(&worker_id).unwrap();
+            expected_worker["schema_version"] = serde_json::json!(12);
+            assert_eq!(
+                serde_json::to_value(WorkerAggregateRecord::from_persisted(persisted_worker))
+                    .unwrap(),
+                expected_worker
+            );
+            runtime["schema_version"] = serde_json::json!(12);
+            if fence_state == "absent" {
+                runtime["subject_create_recovery_fences"] = serde_json::json!({});
+            }
+            assert_eq!(
+                serde_json::to_value(&state.subject_create_recovery_fences).unwrap(),
+                runtime["subject_create_recovery_fences"]
+            );
+            assert_eq!(
+                read_json::<serde_json::Value>(&runtime_path, "read migrated Runtime").unwrap(),
+                runtime
+            );
+            assert_eq!(
+                read_json::<serde_json::Value>(&worker_path, "read migrated Worker").unwrap(),
+                expected_worker
+            );
+            // Exercise the normal writer too: it must retain intermediate fences.
+            opened.store.write_runtime_snapshot(state).unwrap();
+            drop(opened);
+            let runtime_once = fs::read(&runtime_path).unwrap();
+            let worker_once = fs::read(&worker_path).unwrap();
+            let reopened = FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    &reopened
+                        .state
+                        .as_ref()
+                        .unwrap()
+                        .subject_create_recovery_fences
+                )
+                .unwrap(),
+                runtime["subject_create_recovery_fences"]
+            );
+            drop(reopened);
+            let plan = FsRuntimeStore::migrate(&options).unwrap();
+            assert!(!plan.migration_required);
+            assert_eq!(plan.current_schema_version, 12);
+            assert_eq!(plan.target_schema_version, 12);
+            assert!(
+                !FsRuntimeStore::migration_plan(&options)
+                    .unwrap()
+                    .migration_required
+            );
+            assert_eq!(fs::read(&runtime_path).unwrap(), runtime_once);
+            assert_eq!(fs::read(&worker_path).unwrap(), worker_once);
+            assert_eq!(fs::read(&metadata_path).unwrap(), metadata);
+            assert_eq!(fs::read(&history_path).unwrap(), history);
+            assert!(
+                !migration_sibling(&root, "schema-v12-staging")
+                    .unwrap()
+                    .exists()
+            );
+            assert!(
+                !migration_sibling(&root, "pre-schema-v12-backup")
+                    .unwrap()
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn schema_v11_migration_rejects_invalid_fences_without_replacing_them() {
+        for fences in [
+            serde_json::Value::Null,
+            serde_json::json!({"invalid-worker": {}}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("runtime");
+            write_empty_schema_v8_store(&root);
+            let path = root.join(RUNTIME_FILE);
+            let mut runtime: serde_json::Value = read_json(&path, "read fixture").unwrap();
+            runtime["schema_version"] = serde_json::json!(11);
+            runtime["subject_create_recovery_fences"] = fences;
+            atomic_write_json(&path, &runtime, "write invalid fence fixture").unwrap();
+            let before = fs::read(&path).unwrap();
+            assert!(FsRuntimeStore::open_or_create(root, "runtime-test").is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn schema_v10_startup_migrates_stopped_sessions_atomically() {
         for corrupt in [false, true] {
             let temp = tempfile::tempdir().unwrap();
@@ -2761,7 +3010,7 @@ mod tests {
                 assert_eq!(record["schema_version"], 10);
             } else {
                 drop(result.unwrap());
-                assert_eq!(stored_schema_version(&root), 11);
+                assert_eq!(stored_schema_version(&root), u64::from(SCHEMA_VERSION));
                 let manifest: serde_json::Value =
                     read_json(&session.join("session.json"), "test").unwrap();
                 assert_eq!(manifest["schema_version"], 4);
@@ -3151,7 +3400,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
-        let staging = migration_sibling(&root, "schema-v11-staging").unwrap();
+        let staging = migration_sibling(&root, "schema-v12-staging").unwrap();
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("partial"), b"partial").unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
@@ -3166,7 +3415,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
-        let backup = migration_sibling(&root, "pre-schema-v11-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v12-backup").unwrap();
         fs::rename(&root, &backup).unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
 
@@ -3180,10 +3429,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
-        let staging = migration_sibling(&root, "schema-v11-staging").unwrap();
+        let staging = migration_sibling(&root, "schema-v12-staging").unwrap();
         copy_runtime_tree(&root, &root, &staging).unwrap();
         migrate_runtime_store_in_place(&staging, "test-runtime").unwrap();
-        let backup = migration_sibling(&root, "pre-schema-v11-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v12-backup").unwrap();
         fs::rename(&root, &backup).unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
 
@@ -3198,10 +3447,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
-        let staging = migration_sibling(&root, "schema-v11-staging").unwrap();
+        let staging = migration_sibling(&root, "schema-v12-staging").unwrap();
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join(RUNTIME_FILE), b"{\"schema_version\":8}").unwrap();
-        let backup = migration_sibling(&root, "pre-schema-v11-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v12-backup").unwrap();
         fs::rename(&root, &backup).unwrap();
 
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
@@ -3218,7 +3467,7 @@ mod tests {
         let root = temp.path().join("runtime-store");
         write_empty_schema_v8_store(&root);
         migrate_runtime_store_in_place(&root, "test-runtime").unwrap();
-        let backup = migration_sibling(&root, "pre-schema-v11-backup").unwrap();
+        let backup = migration_sibling(&root, "pre-schema-v12-backup").unwrap();
         write_empty_schema_v8_store(&backup);
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
 
@@ -3228,14 +3477,21 @@ mod tests {
 
     #[test]
     fn earlier_migration_backup_cannot_be_mistaken_for_a_fresh_runtime() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("runtime-store");
-        let backup = migration_sibling(&root, "pre-schema-v9-backup").unwrap();
-        write_empty_schema_v8_store(&backup);
-        let error = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap_err();
-        assert!(error.to_string().contains("explicit recovery"));
-        assert!(!root.exists());
-        assert!(backup.join(RUNTIME_FILE).exists());
+        for suffix in [
+            "pre-schema-v9-backup",
+            "pre-schema-v10-backup",
+            "schema-v11-staging",
+            "pre-schema-v11-backup",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("runtime-store");
+            let backup = migration_sibling(&root, suffix).unwrap();
+            write_empty_schema_v8_store(&backup);
+            let error = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap_err();
+            assert!(error.to_string().contains("explicit recovery"));
+            assert!(!root.exists());
+            assert!(backup.join(RUNTIME_FILE).exists());
+        }
     }
 
     #[test]

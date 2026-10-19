@@ -2102,6 +2102,9 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     {
         return Some("workers:input");
     }
+    if path == "/v1/subject-create-recovery" && *method == Method::POST {
+        return Some("workers:delete");
+    }
     if path.ends_with("/stop")
         || path.ends_with("/cancel")
         || (path == "/v1/subject-release" && *method == Method::POST)
@@ -2974,6 +2977,19 @@ mod tests {
     }
 
     #[test]
+    fn subject_create_recovery_requires_worker_delete_permission() {
+        assert_eq!(
+            required_runtime_permission(&Method::POST, "/v1/subject-create-recovery"),
+            Some("workers:delete")
+        );
+        // Existing ordinary release authorization is unchanged.
+        assert_eq!(
+            required_runtime_permission(&Method::POST, "/v1/subject-release"),
+            Some("workers:stop")
+        );
+    }
+
+    #[test]
     fn retention_routes_require_worker_delete_permission() {
         assert_eq!(
             required_runtime_permission(&Method::GET, "/v1/workers/worker-1/retention/inventory",),
@@ -3197,6 +3213,14 @@ mod tests {
     struct AcceptingBackend;
 
     impl WorkerExecutionBackend for AcceptingBackend {
+        fn recover_subject_create(
+            &self,
+            _request: &runtime_api::SubjectCreateRecoveryRequest,
+        ) -> Result<(), String> {
+            // This test backend owns no real executions.
+            Ok(())
+        }
+
         fn backend_id(&self) -> &str {
             "http-test"
         }

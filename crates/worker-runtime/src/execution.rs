@@ -567,6 +567,15 @@ impl fmt::Debug for WorkerProtocolTransport {
 pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn backend_id(&self) -> &str;
 
+    /// Confirm actual absence under the backend Worker operation lock. Runtime has
+    /// already durably fenced admission; unsupported or uncertain backends must fail.
+    fn recover_subject_create(
+        &self,
+        _request: &runtime_api::SubjectCreateRecoveryRequest,
+    ) -> Result<(), String> {
+        Err("execution backend cannot confirm Subject create execution absence".into())
+    }
+
     /// Must reserve the actual Controller, not infer Idle from a catalog snapshot.
     fn subject_release(
         &self,
@@ -837,6 +846,13 @@ impl WorkerExecutionBackendRef {
         request: WorkspaceConfigFetchRequest,
     ) -> Result<WorkspaceConfigFetchResult, String> {
         self.backend.fetch_workspace_config(request)
+    }
+
+    pub(crate) fn recover_subject_create(
+        &self,
+        request: &runtime_api::SubjectCreateRecoveryRequest,
+    ) -> Result<(), String> {
+        self.backend.recover_subject_create(request)
     }
 
     pub(crate) fn subject_release(

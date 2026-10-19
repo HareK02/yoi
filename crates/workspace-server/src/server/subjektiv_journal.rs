@@ -346,6 +346,11 @@ pub(super) fn bind_host_session(
             }
         }
     }
+    // Publication (including attribution) shares the recovery gate. A callback
+    // authenticated before a recovery intent must not leave a late attribution.
+    let attr = store
+        .record_session_attribution(attr)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
     let writer = store
         .claim_journal_writer(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
         .map_err(domain)?;
@@ -384,6 +389,93 @@ pub(super) fn check_start_allowed(api: &WorkspaceApi, subject: &str) -> Result<(
         }
     }
     Ok(())
+}
+
+/// Explicit creation can reconcile an earlier failed, never-published body.
+/// No missing catalog/status observation is treated as a Runtime fencing receipt.
+pub(super) fn recover_failed_subject_create(api: &WorkspaceApi, subject: &str) -> Result<()> {
+    let continuation = lifecycle_lock(api, &format!("release-continuation:{subject}"))?;
+    let _continuation = continuation
+        .lock()
+        .map_err(|_| Error::Store("release continuation poisoned".into()))?;
+    let gate = lifecycle_lock(api, subject)?;
+    let subject_key = crate::subjektiv::subject_worker_singleton_key(subject)
+        .map_err(|e| Error::InvalidInput(e.to_string()))?;
+    let store = store(api)?;
+    let (lease, request) = {
+        let _guard = gate
+            .lock()
+            .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
+        let Some(lease) = api
+            .config_store
+            .current_worker_singleton_owner(api.workspace_id(), &subject_key)?
+        else {
+            return Ok(());
+        };
+        if api
+            .config_store
+            .subject_create_recovery_candidate(api.workspace_id(), &lease)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        if !store
+            .journal_body_is_unpublished(subject, &lease.worker.runtime_id, &lease.worker.worker_id)
+            .map_err(domain)?
+        {
+            // Published history must go through the ordinary continuity release.
+            return Ok(());
+        }
+        let operation_id = format!(
+            "subject-create-recovery:{}:{}",
+            lease.worker.worker_id, lease.generation
+        );
+        let fingerprint = api.config_store.prepare_subject_create_recovery(
+            api.workspace_id(),
+            &lease,
+            &operation_id,
+        )?;
+        let request = runtime_api::SubjectCreateRecoveryRequest {
+            workspace_id: api.workspace_id().into(),
+            worker_id: worker_runtime::identity::WorkerId::parse(&lease.worker.worker_id)
+                .ok_or_else(|| Error::Store("invalid retained Worker ID".into()))?,
+            operation_id,
+            create_fingerprint: fingerprint,
+        };
+        (lease, request)
+    };
+    // Never hold the callback lane/gate across Runtime I/O. Unknown outcome
+    // leaves the durable intent in place and reuses the exact identity next time.
+    let response = api
+        .runtime
+        .recover_subject_create(&lease.worker.runtime_id, request.clone())
+        .map_err(RuntimeRegistryError::into_error)?;
+    if response.workspace_id != request.workspace_id
+        || response.worker_id != request.worker_id
+        || response.operation_id != request.operation_id
+        || response.create_fingerprint != request.create_fingerprint
+    {
+        return Err(Error::RepositoryConflict(
+            "Subject create recovery acknowledgment mismatch; retain occupancy".into(),
+        ));
+    }
+    let _guard = gate
+        .lock()
+        .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
+    if !store
+        .journal_body_is_unpublished(subject, &lease.worker.runtime_id, &lease.worker.worker_id)
+        .map_err(domain)?
+    {
+        return Err(Error::RepositoryConflict(
+            "Subject publication appeared during recovery; retain occupancy".into(),
+        ));
+    }
+    api.config_store.complete_subject_create_recovery(
+        api.workspace_id(),
+        &lease,
+        &request.operation_id,
+        &request.create_fingerprint,
+    )
 }
 
 pub(super) fn lifecycle_lock(api: &WorkspaceApi, subject: &str) -> Result<Arc<Mutex<()>>> {
