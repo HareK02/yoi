@@ -103,11 +103,12 @@ impl WorkdirSession for CommandFailureSession {
 }
 fn command() -> CommandRequest {
     CommandRequest {
+        transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
         command: "fake command, never executed".into(),
         timeout_secs: 1,
-        output_limit: 100,
+
         cwd: WorkdirPath::root(),
-        spill_dir: None,
+
         tool_call_id: None,
     }
 }

@@ -618,3 +618,6 @@ mod capability_tests {
         assert_eq!(bits(WorkdirSessionCapabilities::ALL), 63);
     }
 }
+
+#[cfg(test)]
+mod command_test_support;

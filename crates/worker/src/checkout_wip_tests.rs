@@ -446,7 +446,11 @@ async fn checkout_wip_policy_is_not_feature_authority_and_compatibility_is_repla
     let mut registry = WipMountRegistry::new();
     crate::checkout::mount_checkouts(&mut registry, router.clone(), tools::Tracker::new(), None)
         .unwrap();
-    for def in tools::routed_builtin_tools(router, tools::Tracker::new(), dir.path().join("bash")) {
+    for def in tools::routed_builtin_tools(
+        router,
+        tools::Tracker::new(),
+        tools::bash_output::BashOutputView::new(),
+    ) {
         let (meta, tool) = def();
         let p = compatibility_projection(meta, tool, None).unwrap();
         registry.mount(p).unwrap();

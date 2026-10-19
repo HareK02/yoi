@@ -310,7 +310,7 @@ pub struct SubWorkerSpawnTool {
     /// Runtime-owned root used for Internal Worker controller state.
     runtime_base: PathBuf,
     /// Parent Worker-owned temporary root used for bounded Bash spill output.
-    bash_output_dir: PathBuf,
+
     /// Inherited runtime workspace root for Profile/project/Ticket/workflow/
     /// memory context. SubWorkerSpawn `cwd` must not affect this value.
     workspace_root: PathBuf,
@@ -345,7 +345,7 @@ impl SubWorkerSpawnTool {
         workspace_context: crate::worker::WorkerWorkspaceContext,
         parent_notifications: ParentNotificationTarget,
         runtime_base: PathBuf,
-        bash_output_dir: PathBuf,
+
         workspace_root: PathBuf,
         workdir_tool_broker: Option<WorkdirToolBrokerRouter>,
         registry: Arc<SpawnedWorkerRegistry>,
@@ -358,7 +358,7 @@ impl SubWorkerSpawnTool {
             workspace_context,
             parent_notifications,
             runtime_base,
-            bash_output_dir,
+
             workspace_root,
             workdir_tool_broker,
             registry,
@@ -430,15 +430,6 @@ impl Tool for SubWorkerSpawnTool {
             .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
 
         let workdir_rules = parse_workdir_scope(&input.scope)?;
-        let child_bash_output_dir = self.bash_output_dir.join("sub-workers").join(&input.name);
-        tokio::fs::create_dir_all(&child_bash_output_dir)
-            .await
-            .map_err(|error| {
-                ToolError::ExecutionFailed(format!(
-                    "create Internal Worker Bash output directory {}: {error}",
-                    child_bash_output_dir.display()
-                ))
-            })?;
         let workdir_tool_broker = require_workdir_tool_broker(self.workdir_tool_broker.as_ref())?;
         let tool_scopes = routed_workdir_tool_scopes(
             workdir_tool_broker,
@@ -452,6 +443,7 @@ impl Tool for SubWorkerSpawnTool {
             .map_err(|error| {
                 ToolError::InvalidArgument(format!("scope parent-owned Workdir tools: {error}"))
             })?;
+        let workdir_scope = Arc::new(workdir_scope);
         let child_workdir_tool_broker = workdir_scope.broker_router();
 
         let spawn_selector =
@@ -552,24 +544,17 @@ impl Tool for SubWorkerSpawnTool {
         )
         .await
         .map_err(|error| ToolError::ExecutionFailed(format!("build Internal Worker: {error}")))?;
-        child
-            .add_scope_rules([ScopeRule {
-                target: child_bash_output_dir.clone(),
-                permission: manifest::Permission::Read,
-                recursive: true,
-                symlink_policy: Default::default(),
-            }])
-            .map_err(|error| {
-                ToolError::ExecutionFailed(format!(
-                    "grant Internal Worker Bash output scope: {error}"
-                ))
-            })?;
         let child_scope = child.scope().clone();
         child.bind_workdir_sessions(workdir_scope.session_router());
         let child_registry = SpawnedWorkerRegistry::new_internal(input.name.clone(), child_scope);
+        let output_lease = workdir_scope.clone();
+        child_registry.inherit_bash_output(
+            self.registry
+                .bash_output()
+                .child(Arc::new(move || output_lease.is_active())),
+        );
         register_worker_tools(
             &mut child,
-            child_bash_output_dir,
             self.runtime_base.clone(),
             child_registry.clone(),
             None,
@@ -1052,7 +1037,7 @@ pub(crate) fn sub_worker_spawn_tool(
     workspace_context: crate::worker::WorkerWorkspaceContext,
     parent_notifications: ParentNotificationTarget,
     runtime_base: PathBuf,
-    bash_output_dir: PathBuf,
+
     workspace_root: PathBuf,
     workdir_tool_broker: Option<WorkdirToolBrokerRouter>,
     registry: Arc<SpawnedWorkerRegistry>,
@@ -1064,7 +1049,6 @@ pub(crate) fn sub_worker_spawn_tool(
         workspace_context,
         parent_notifications,
         runtime_base,
-        bash_output_dir,
         workspace_root,
         workdir_tool_broker,
         registry,
@@ -1078,7 +1062,7 @@ fn sub_worker_spawn_tool_impl(
     workspace_context: crate::worker::WorkerWorkspaceContext,
     parent_notifications: ParentNotificationTarget,
     runtime_base: PathBuf,
-    bash_output_dir: PathBuf,
+
     workspace_root: PathBuf,
     workdir_tool_broker: Option<WorkdirToolBrokerRouter>,
     registry: Arc<SpawnedWorkerRegistry>,
@@ -1110,7 +1094,6 @@ fn sub_worker_spawn_tool_impl(
             workspace_context.clone(),
             parent_notifications.clone(),
             runtime_base.clone(),
-            bash_output_dir.clone(),
             workspace_root.clone(),
             workdir_tool_broker.clone(),
             registry.clone(),
@@ -1374,7 +1357,6 @@ enabled = false
                 ParentNotificationTarget::Durable(Arc::new(|_| {})),
             ),
             runtime.path().to_path_buf(),
-            bash_output_dir.clone(),
             workspace_root.clone(),
             Some(workdir_tool_broker),
             registry.clone(),
@@ -1425,12 +1407,7 @@ enabled = false
             .await
             .expect("spawn project reviewer as Internal Worker");
         assert!(output.summary.contains("internal worker `reviewer-child`"));
-        assert!(
-            bash_output_dir
-                .join("sub-workers")
-                .join("reviewer-child")
-                .is_dir()
-        );
+        assert!(!bash_output_dir.join("sub-workers").exists());
         assert!(spawner_scope.snapshot().is_writable(&workspace_root));
         let record = registry
             .get_internal("reviewer-child")
@@ -1459,6 +1436,27 @@ enabled = false
         assert_eq!(
             record.session.wait_until_idle().await,
             crate::internal_worker::InternalWorkerSessionStatus::Idle
+        );
+        let child_output_view = record.child_registry.bash_output();
+        let child_bash = tools::BashTool::new(
+            record.workdir_tool_scope.session_router(),
+            child_output_view.clone(),
+        );
+        let child_output = child_bash
+            .execute_result(
+                r#"{"command":"printf retained-child-evidence","cwd":"."}"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let output_id = child_output.metadata.id.clone();
+        assert!(child_output_view.metadata(&output_id).is_some());
+        assert_eq!(
+            registry
+                .bash_output()
+                .read(&output_id, workdir::CommandStream::Stdout, 0, 65536)
+                .unwrap(),
+            b"retained-child-evidence"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(!observed_parent_write_revoked.load(Ordering::SeqCst));
@@ -1563,6 +1561,8 @@ enabled = false
             !record.workdir_tool_scope.is_active(),
             "stopped child must revoke cloned scoped sessions"
         );
+        assert!(child_output_view.metadata(&output_id).is_none());
+        assert!(registry.bash_output().metadata(&output_id).is_some());
         assert!(registry.get_internal("reviewer-child").is_some());
 
         assert!(
@@ -1573,6 +1573,7 @@ enabled = false
                 .is_some()
         );
         assert!(registry.get_internal("reviewer-child").is_none());
+        assert!(registry.bash_output().metadata(&output_id).is_some());
         assert!(spawner_scope.snapshot().is_writable(&workspace_root));
 
         fail_requests.store(false, Ordering::SeqCst);
@@ -1672,7 +1673,6 @@ enabled = false
                 ),
                 ParentNotificationTarget::Durable(Arc::new(|_| {})),
                 runtime.path().to_path_buf(),
-                bash_output_dir,
                 workspace_root.clone(),
                 Some(workdir_tool_broker),
                 registry.clone(),
@@ -1805,7 +1805,6 @@ enabled = false
                 ParentNotificationTarget::Durable(Arc::new(|_| {})),
             ),
             runtime.path().to_path_buf(),
-            bash_output_dir.clone(),
             workspace_root.clone(),
             Some(workdir_tool_broker),
             registry.clone(),

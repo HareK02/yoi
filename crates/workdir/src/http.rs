@@ -822,6 +822,7 @@ mod client {
             &self,
             request: CommandRequest,
         ) -> Result<CommandHandle, WorkdirError> {
+            request.validate()?;
             match self
                 .operate(WorkdirSessionOperation::CommandStart(request))
                 .await?
@@ -848,17 +849,39 @@ mod client {
             &self,
             request: CommandOutputRequest,
         ) -> Result<CommandOutput, WorkdirError> {
+            if !(1..=crate::MAX_COMMAND_READ_BYTES).contains(&request.limit) {
+                return Err(WorkdirError::InvalidArgument(
+                    "command byte limit is outside transport bounds".into(),
+                ));
+            }
             let wait = request.wait;
-            loop {
-                match self
-                    .operate(WorkdirSessionOperation::CommandOutput(request.clone()))
-                    .await?
-                {
-                    WorkdirSessionOperationResult::CommandOutput(result)
-                        if wait && result.status == CommandStatus::Running => {}
-                    WorkdirSessionOperationResult::CommandOutput(result) => return Ok(result),
-                    _ => return Err(Self::mismatch("command_output")),
+            match self
+                .operate(WorkdirSessionOperation::CommandOutput(request.clone()))
+                .await?
+            {
+                WorkdirSessionOperationResult::CommandOutput(result) => {
+                    let size = result
+                        .chunks
+                        .iter()
+                        .try_fold(0usize, |size, chunk| size.checked_add(chunk.bytes.len()));
+                    if !result.transport_bounds_valid()
+                        || size.is_none_or(|size| {
+                            size > request.limit
+                                || request.cursor.checked_add(size as u64)
+                                    != Some(result.next_cursor)
+                        })
+                    {
+                        return Err(Self::mismatch("bounded command byte page"));
+                    }
+                    if wait && result.chunks.is_empty() && result.terminal.is_none() {
+                        // A waiting request must block at the provider. Never spin HTTP
+                        // requests against an immediate empty response. A caller may retry
+                        // this exact cursor with its own bounded transport retry policy.
+                        return Err(Self::mismatch("waiting command byte page"));
+                    }
+                    return Ok(result);
                 }
+                _ => return Err(Self::mismatch("command_output")),
             }
         }
 
@@ -917,20 +940,47 @@ mod client {
         response: reqwest::Response,
     ) -> Result<T, WorkdirError> {
         if response.status().is_success() {
-            response.json().await.map_err(http_unavailable)
+            let bytes = bounded_response_bytes(response).await?;
+            serde_json::from_slice(&bytes)
+                .map_err(|_| WorkdirError::Transport("Runtime Workdir response was invalid".into()))
         } else {
             Err(decode_error(response).await)
         }
     }
 
+    async fn bounded_response_bytes(
+        mut response: reqwest::Response,
+    ) -> Result<Vec<u8>, WorkdirError> {
+        const MAX_RESPONSE_BYTES: usize = crate::external::MAX_EXTERNAL_PROVIDER_FRAME_BYTES;
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(WorkdirError::Transport(
+                "Runtime Workdir response exceeded transport bound".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(http_unavailable)? {
+            if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+                return Err(WorkdirError::Transport(
+                    "Runtime Workdir response exceeded transport bound".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
     async fn decode_error(response: reqwest::Response) -> WorkdirError {
-        response
-            .json::<WorkdirTransportError>()
-            .await
-            .map(WorkdirTransportError::into_workdir_error)
-            .unwrap_or_else(|_| {
-                WorkdirError::Transport("Runtime Workdir error response was invalid".to_string())
-            })
+        match bounded_response_bytes(response).await {
+            Ok(bytes) => serde_json::from_slice::<WorkdirTransportError>(&bytes)
+                .map(WorkdirTransportError::into_workdir_error)
+                .unwrap_or_else(|_| {
+                    WorkdirError::Transport("Runtime Workdir error response was invalid".into())
+                }),
+            Err(error) => error,
+        }
     }
 
     fn http_unavailable(_error: reqwest::Error) -> WorkdirError {

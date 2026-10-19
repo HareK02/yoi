@@ -9,7 +9,8 @@
 //! COMMAND remains separate explicit authority. General session capability intersections may form
 //! subsets independently of this grant hierarchy; the codec never implicitly expands nonhierarchical
 //! grants. Commands run with the shared host's OS permissions, not a sandbox confining processes
-//! to a directory. Output is bounded and inline; provider-local spill paths are not exposed.
+//! to a directory. Output uses bounded byte pages with cursor acknowledgements;
+//! providers never receive caller-selected output paths.
 
 use std::path::{Component, Path};
 
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::http::{WorkdirSessionOperation, WorkdirSessionOperationResult, WorkdirTransportError};
 use crate::{BoundedReadLimits, WorkdirId, WorkdirPath, WorkdirSessionCapabilities};
 
-pub const EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION: u16 = 2;
+pub const EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION: u16 = 3;
 /// Maximum serialized Backend-to-provider command frame size.
 pub const MAX_EXTERNAL_SERVER_FRAME_BYTES: usize = 1024 * 1024;
 /// Maximum serialized provider-to-Backend result frame size. Read bytes are
@@ -33,9 +34,9 @@ const MAX_EXTERNAL_GREP_CONTEXT: usize = 100;
 const MAX_EXTERNAL_SCOPE_RULES: usize = 64;
 pub const MAX_EXTERNAL_WRITE_BYTES: usize = 512 * 1024;
 pub const MAX_EXTERNAL_COMMAND_BYTES: usize = 64 * 1024;
-pub const MAX_EXTERNAL_COMMAND_OUTPUT_BYTES: usize = 512 * 1024;
+pub const MAX_EXTERNAL_COMMAND_OUTPUT_BYTES: usize = crate::MAX_COMMAND_READ_BYTES;
 pub const MAX_EXTERNAL_COMMAND_TIMEOUT_SECS: u64 = 600;
-const MAX_EXTERNAL_COMMAND_CURSOR: usize = 1_000_000;
+const MAX_EXTERNAL_COMMAND_CURSOR: u64 = crate::MAX_COMMAND_TRANSPORT_BYTES;
 
 fn valid_command_handle(handle: &crate::CommandHandle) -> bool {
     !handle.0.is_empty()
@@ -267,11 +268,10 @@ fn validate_external_operation(operation: &WorkdirSessionOperation) -> Result<()
         }
         WorkdirSessionOperation::CommandStart(request) => {
             !request.command.is_empty()
+                && request.validate().is_ok()
                 && request.command.len() <= MAX_EXTERNAL_COMMAND_BYTES
                 && (1..=MAX_EXTERNAL_COMMAND_TIMEOUT_SECS).contains(&request.timeout_secs)
-                && (1..=MAX_EXTERNAL_COMMAND_OUTPUT_BYTES).contains(&request.output_limit)
                 && is_root_relative(&request.cwd)
-                && request.spill_dir.is_none()
                 && request.tool_call_id.as_ref().is_none_or(|tool_call_id| {
                     !tool_call_id.is_empty()
                         && tool_call_id.len() <= MAX_PROTOCOL_ID_BYTES
@@ -450,11 +450,19 @@ fn validate_external_result(result: &WorkdirSessionOperationResult) -> Result<()
         WorkdirSessionOperationResult::CommandStart(handle) => valid_command_handle(handle),
         WorkdirSessionOperationResult::CommandStatus(_) => true,
         WorkdirSessionOperationResult::CommandOutput(output) => {
-            output.content.len() <= MAX_EXTERNAL_COMMAND_OUTPUT_BYTES
+            output.transport_bounds_valid()
+                && output.chunks.len() <= MAX_EXTERNAL_COMMAND_OUTPUT_BYTES
                 && output
-                    .next_cursor
-                    .is_none_or(|cursor| cursor <= MAX_EXTERNAL_COMMAND_CURSOR)
-                && output.output_path.is_none()
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.bytes.len())
+                    .sum::<usize>()
+                    <= MAX_EXTERNAL_COMMAND_OUTPUT_BYTES
+                && output.next_cursor <= MAX_EXTERNAL_COMMAND_CURSOR
+                && output
+                    .terminal
+                    .as_ref()
+                    .is_none_or(|terminal| terminal.status != crate::CommandStatus::Running)
         }
         WorkdirSessionOperationResult::CommandCancel => true,
     };
@@ -801,11 +809,16 @@ mod tests {
 
     #[test]
     fn unsupported_protocol_versions_and_invalid_read_limits_fail_closed() {
-        let future = r#"{
-            "version": 3,
-            "message": {"kind": "heartbeat", "generation": 1, "sequence": 1}
-        }"#;
-        assert!(serde_json::from_str::<ExternalWorkdirServerFrame>(future).is_err());
+        for version in [
+            EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION - 1,
+            EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION + 1,
+        ] {
+            let unsupported = serde_json::json!({
+                "version": version,
+                "message": {"kind": "heartbeat", "generation": 1, "sequence": 1}
+            });
+            assert!(serde_json::from_value::<ExternalWorkdirServerFrame>(unsupported).is_err());
+        }
 
         let invalid_limits = r#"{
             "max_source_bytes": 1024,
@@ -825,32 +838,35 @@ mod tests {
         assert!(ExternalWorkdirOperation::try_from(absolute).is_err());
 
         let command = WorkdirSessionOperation::CommandStart(CommandRequest {
-            command: "cat /home/operator/private/session.log".to_string(),
+            transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
+            command: "printf unsafe".to_string(),
             timeout_secs: 1,
-            output_limit: 1024,
-            cwd: WorkdirPath::root(),
-            spill_dir: Some("/home/operator/private/output".into()),
+
+            cwd: serde_json::from_value(serde_json::json!("/absolute")).unwrap(),
+
             tool_call_id: None,
         });
         assert!(ExternalWorkdirOperation::try_from(command).is_err());
 
         let command = WorkdirSessionOperation::CommandStart(CommandRequest {
+            transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
             command: "printf bounded".to_string(),
             timeout_secs: 30,
-            output_limit: 12 * 1024,
+
             cwd: WorkdirPath::root(),
-            spill_dir: None,
+
             tool_call_id: Some("tool-call-1".to_string()),
         });
         assert!(ExternalWorkdirOperation::try_from(command).is_ok());
         assert!(
             ExternalWorkdirOperation::try_from(WorkdirSessionOperation::CommandStart(
                 CommandRequest {
+                    transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                     command: "x".repeat(MAX_EXTERNAL_COMMAND_BYTES + 1),
                     timeout_secs: 30,
-                    output_limit: 12 * 1024,
+
                     cwd: WorkdirPath::root(),
-                    spill_dir: None,
+
                     tool_call_id: None,
                 }
             ))
@@ -887,13 +903,17 @@ mod tests {
         assert!(
             ExternalWorkdirOperationResult::try_from(WorkdirSessionOperationResult::CommandOutput(
                 crate::CommandOutput {
-                    status: crate::CommandStatus::Completed,
-                    exit_code: Some(0),
-                    timed_out: false,
-                    content: "bounded".to_string(),
-                    next_cursor: None,
-                    truncated: false,
-                    output_path: None,
+                    chunks: vec![],
+                    next_cursor: 0,
+                    terminal: Some(crate::CommandTerminal {
+                        status: crate::CommandStatus::Completed,
+                        exit_code: Some(0),
+                        stdout_bytes: 0,
+                        stderr_bytes: 0,
+                        stdout_delivered_bytes: 0,
+                        stderr_delivered_bytes: 0,
+                        truncation_reason: None,
+                    })
                 }
             ))
             .is_ok()
@@ -901,13 +921,14 @@ mod tests {
         assert!(
             ExternalWorkdirOperationResult::try_from(WorkdirSessionOperationResult::CommandOutput(
                 crate::CommandOutput {
-                    status: crate::CommandStatus::Completed,
-                    exit_code: Some(0),
-                    timed_out: false,
-                    content: "bounded".to_string(),
-                    next_cursor: None,
-                    truncated: true,
-                    output_path: Some("/provider/private/output".into()),
+                    chunks: vec![crate::CommandByteChunk {
+                        sequence: 0,
+                        stream: crate::CommandStream::Stdout,
+                        offset: 0,
+                        bytes: vec![0; MAX_EXTERNAL_COMMAND_OUTPUT_BYTES + 1]
+                    }],
+                    next_cursor: 0,
+                    terminal: None
                 }
             ))
             .is_err()
@@ -958,7 +979,7 @@ mod tests {
     #[test]
     fn protocol_rejects_unknown_nested_fields_and_unbounded_requests() {
         let unknown = r#"{
-            "version": 2,
+            "version": 3,
             "message": {
                 "kind": "heartbeat",
                 "generation": 1,
@@ -1011,5 +1032,82 @@ mod tests {
         assert!(ExternalWorkdirOperationId::new("operation\n1").is_err());
         assert!(ExternalWorkdirOperationId::new("x".repeat(129)).is_err());
         assert!(ExternalWorkdirOperationId::new("operation-1").is_ok());
+    }
+
+    #[test]
+    fn command_budget_and_page_metadata_obey_external_hard_bounds() {
+        fn request(budget: u64) -> WorkdirSessionOperation {
+            WorkdirSessionOperation::CommandStart(CommandRequest {
+                command: "true".into(),
+                timeout_secs: 1,
+                cwd: WorkdirPath::root(),
+                transport_byte_budget: budget,
+                tool_call_id: None,
+            })
+        }
+        for budget in [0, crate::MAX_COMMAND_TRANSPORT_BYTES] {
+            let operation = ExternalWorkdirOperation::try_from(request(budget)).unwrap();
+            let wire = serde_json::to_value(operation).unwrap();
+            assert!(serde_json::from_value::<ExternalWorkdirOperation>(wire).is_ok());
+        }
+        assert!(
+            ExternalWorkdirOperation::try_from(request(crate::MAX_COMMAND_TRANSPORT_BYTES + 1))
+                .is_err()
+        );
+        fn page() -> crate::CommandOutput {
+            crate::CommandOutput {
+                chunks: vec![crate::CommandByteChunk {
+                    sequence: 0,
+                    stream: crate::CommandStream::Stdout,
+                    offset: 0,
+                    bytes: b"abc".to_vec(),
+                }],
+                next_cursor: 3,
+                terminal: Some(crate::CommandTerminal {
+                    status: crate::CommandStatus::Completed,
+                    exit_code: Some(0),
+                    stdout_bytes: 100 * 1024 * 1024,
+                    stderr_bytes: 7,
+                    stdout_delivered_bytes: 3,
+                    stderr_delivered_bytes: 0,
+                    truncation_reason: Some(crate::CommandOutputTruncation::ByteBudget),
+                }),
+            }
+        }
+        let accepted = ExternalWorkdirOperationResult::try_from(
+            WorkdirSessionOperationResult::CommandOutput(page()),
+        )
+        .unwrap();
+        assert!(
+            serde_json::from_value::<ExternalWorkdirOperationResult>(
+                serde_json::to_value(accepted).unwrap()
+            )
+            .is_ok()
+        );
+        for mutate in [
+            |p: &mut crate::CommandOutput| p.next_cursor = crate::MAX_COMMAND_TRANSPORT_BYTES + 1,
+            |p: &mut crate::CommandOutput| p.chunks[0].offset = crate::MAX_COMMAND_TRANSPORT_BYTES,
+            |p: &mut crate::CommandOutput| p.chunks[0].sequence = u64::MAX,
+            |p: &mut crate::CommandOutput| p.terminal.as_mut().unwrap().stdout_delivered_bytes = 4,
+            |p: &mut crate::CommandOutput| p.terminal.as_mut().unwrap().stdout_bytes = 2,
+            |p: &mut crate::CommandOutput| p.terminal.as_mut().unwrap().truncation_reason = None,
+        ] {
+            let mut invalid = page();
+            mutate(&mut invalid);
+            let wire = serde_json::to_value(WorkdirSessionOperationResult::CommandOutput(invalid))
+                .unwrap();
+            assert!(serde_json::from_value::<ExternalWorkdirOperationResult>(wire).is_err());
+        }
+        assert!(
+            ExternalWorkdirOperation::try_from(WorkdirSessionOperation::CommandOutput(
+                crate::CommandOutputRequest {
+                    handle: crate::CommandHandle("command-1".into()),
+                    cursor: crate::MAX_COMMAND_TRANSPORT_BYTES + 1,
+                    limit: 1,
+                    wait: false,
+                }
+            ))
+            .is_err()
+        );
     }
 }

@@ -13,7 +13,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+#[cfg(test)]
+use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -54,15 +55,8 @@ fn command_observed_at_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-#[derive(Debug)]
-enum LocalCommand {
-    Running {
-        task: JoinHandle<Result<CommandOutput, WorkdirError>>,
-        completion: watch::Receiver<bool>,
-        cancel: watch::Sender<bool>,
-    },
-    Completed(CommandOutput),
-}
+mod command_transport;
+use command_transport::LocalCommand;
 
 #[derive(Debug, Clone)]
 struct CommandTelemetry {
@@ -643,7 +637,6 @@ struct LocalWorkdirSessionInner {
     root: PathBuf,
     pinned_root: Option<Arc<std::fs::File>>,
     scope: SharedScope,
-    command_output_scope: SharedScope,
     cwd: PathBuf,
     capabilities: WorkdirSessionCapabilities,
     read_limits: Option<BoundedReadLimits>,
@@ -662,9 +655,7 @@ impl Drop for LocalWorkdirSessionInner {
     fn drop(&mut self) {
         if let Ok(mut commands) = self.commands.try_lock() {
             for (_, command) in commands.drain() {
-                if let LocalCommand::Running { task, .. } = command {
-                    task.abort();
-                }
+                command.task.abort();
             }
         }
     }
@@ -865,36 +856,11 @@ impl LocalWorkdirSession {
         command_environment: BTreeMap<String, String>,
         resources: Vec<Arc<dyn WorkdirSessionResource>>,
     ) -> Self {
-        Self::materialized_bound_with_environment_and_command_output_scope(
-            workdir,
-            root,
-            cwd,
-            scope.clone(),
-            scope,
-            capabilities,
-            command_environment,
-            resources,
-        )
-    }
-
-    /// Construct a local provider session whose Workdir filesystem authority is
-    /// independent from the provider-owned command output authority.
-    pub fn materialized_bound_with_environment_and_command_output_scope(
-        workdir: Workdir,
-        root: PathBuf,
-        cwd: PathBuf,
-        scope: SharedScope,
-        command_output_scope: SharedScope,
-        capabilities: WorkdirSessionCapabilities,
-        command_environment: BTreeMap<String, String>,
-        resources: Vec<Arc<dyn WorkdirSessionResource>>,
-    ) -> Self {
         Self::materialized_bound_with_policy(
             workdir,
             root,
             cwd,
             scope,
-            command_output_scope,
             capabilities,
             command_environment,
             resources,
@@ -1024,7 +990,6 @@ impl LocalWorkdirSession {
             workdir,
             root.clone(),
             root,
-            scope.clone(),
             scope,
             capabilities,
             BTreeMap::new(),
@@ -1052,7 +1017,6 @@ impl LocalWorkdirSession {
         root: PathBuf,
         cwd: PathBuf,
         scope: SharedScope,
-        command_output_scope: SharedScope,
         capabilities: WorkdirSessionCapabilities,
         command_environment: BTreeMap<String, String>,
         resources: Vec<Arc<dyn WorkdirSessionResource>>,
@@ -1066,7 +1030,6 @@ impl LocalWorkdirSession {
                 root,
                 pinned_root,
                 scope,
-                command_output_scope,
                 cwd,
                 capabilities,
                 read_limits,
@@ -1831,20 +1794,12 @@ impl WorkdirSession for LocalWorkdirSession {
     }
 
     async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
+        request.validate()?;
         self.ensure_capability(WorkdirSessionCapability::Command)?;
         // Command admission, resource capture and registration must be atomic
         // with terminal close, which drains commands and releases resources.
         let _admission = self.inner.close_lock.lock().await;
         self.ensure_open()?;
-        if let Some(spill_dir) = request.spill_dir.as_deref()
-            && !self
-                .inner
-                .command_output_scope
-                .snapshot()
-                .is_readable(spill_dir)
-        {
-            return Err(WorkdirError::OutOfScope(spill_dir.to_path_buf()));
-        }
         let cwd = self.resolve(&request.cwd);
         let scope = self.inner.scope.snapshot();
         if !scope.is_readable(&cwd)
@@ -1854,48 +1809,45 @@ impl WorkdirSession for LocalWorkdirSession {
         }
         let id = self.inner.next_command_id.fetch_add(1, Ordering::Relaxed);
         let handle = CommandHandle(format!("command-{id}"));
-        let (completion_tx, completion) = watch::channel(false);
-        let command_id = handle.0.clone();
-        let telemetry = self.inner.command_telemetry.clone();
-        let command_environment = self.inner.command_environment.clone();
-        let (cancel, cancel_rx) = watch::channel(false);
-        // A session drop only schedules command cancellation. Keep its Runtime
-        // resources (including cleanup exclusion) alive until the task actually
-        // finishes or its future is dropped, not just until the handle disappears.
+        let mut commands = self.inner.commands.lock().await;
+        // Retain bounded retry tombstones, evicting only fully delivered output.
+        if commands.len() >= command_transport::MAX_COMMANDS {
+            let mut evict = None;
+            for (id, command) in commands.iter() {
+                if command.task.is_finished()
+                    && command
+                        .transport
+                        .try_lock()
+                        .is_ok_and(|state| state.terminal_delivered())
+                {
+                    evict = Some(id.clone());
+                    break;
+                }
+            }
+            if let Some(id) = evict {
+                commands.remove(&id);
+                self.inner.command_telemetry.remove(&id);
+            } else {
+                return Err(WorkdirError::Unavailable(
+                    "command transport capacity reached; drain existing commands".into(),
+                ));
+            }
+        }
         let resources = self
             .inner
             .resources
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        let task = tokio::spawn(async move {
-            let output = run_command(
-                cwd,
-                request,
-                command_id,
-                telemetry,
-                command_environment,
-                cancel_rx,
-                resources,
-            )
-            .await;
-            let _ = completion_tx.send(true);
-            output
-        });
-        let mut commands = self.inner.commands.lock().await;
-        if let Err(error) = self.ensure_open() {
-            let _ = cancel.send(true);
-            task.abort();
-            return Err(error);
-        }
-        commands.insert(
+        let command = command_transport::start(
+            cwd,
+            request,
             handle.0.clone(),
-            LocalCommand::Running {
-                task,
-                completion,
-                cancel,
-            },
+            self.inner.command_telemetry.clone(),
+            self.inner.command_environment.clone(),
+            resources,
         );
+        commands.insert(handle.0.clone(), command);
         Ok(handle)
     }
 
@@ -1905,17 +1857,11 @@ impl WorkdirSession for LocalWorkdirSession {
         let command = commands
             .get(&handle.0)
             .ok_or_else(|| WorkdirError::UnknownCommand(handle.0.clone()))?;
-        Ok(match command {
-            LocalCommand::Running { task, .. } if !task.is_finished() => CommandStatus::Running,
-            LocalCommand::Running { .. } => self
-                .inner
-                .command_telemetry
-                .snapshot()
-                .into_iter()
-                .find(|snapshot| snapshot.command_id == handle.0)
-                .map_or(CommandStatus::Completed, |snapshot| snapshot.status),
-            LocalCommand::Completed(output) => output.status,
-        })
+        Ok(command
+            .status
+            .borrow()
+            .as_ref()
+            .map_or(CommandStatus::Running, |terminal| terminal.status))
     }
 
     async fn command_output(
@@ -1923,70 +1869,22 @@ impl WorkdirSession for LocalWorkdirSession {
         request: CommandOutputRequest,
     ) -> Result<CommandOutput, WorkdirError> {
         self.ensure_capability(WorkdirSessionCapability::Command)?;
-        let command = loop {
-            self.ensure_open()?;
-            let mut commands = self.inner.commands.lock().await;
-            let Some(command) = commands.get(&request.handle.0) else {
-                return Err(WorkdirError::UnknownCommand(request.handle.0.clone()));
-            };
-            let completion = match command {
-                LocalCommand::Running { completion, .. }
-                    if !*completion.borrow() && completion.has_changed().is_ok() =>
-                {
-                    Some(completion.clone())
-                }
-                _ => None,
-            };
-            if let Some(mut completion) = completion {
-                if !request.wait {
-                    return Ok(CommandOutput {
-                        status: CommandStatus::Running,
-                        exit_code: None,
-                        timed_out: false,
-                        content: String::new(),
-                        next_cursor: None,
-                        truncated: false,
-                        output_path: None,
-                    });
-                }
-                drop(commands);
-                let _ = completion.changed().await;
-                continue;
-            }
-            if !request.wait
-                && matches!(command, LocalCommand::Running { task, .. } if !task.is_finished())
-            {
-                return Ok(CommandOutput {
-                    status: CommandStatus::Running,
-                    exit_code: None,
-                    timed_out: false,
-                    content: String::new(),
-                    next_cursor: None,
-                    truncated: false,
-                    output_path: None,
-                });
-            }
-            break commands
-                .remove(&request.handle.0)
-                .expect("command checked above");
-        };
-
-        let output = match command {
-            LocalCommand::Running { task, .. } => task
-                .await
-                .map_err(|error| WorkdirError::Unavailable(error.to_string()))??,
-            LocalCommand::Completed(output) => output,
-        };
-        let page = command_output_page(&output, request.cursor, request.limit);
-        if page.next_cursor.is_some() {
-            let mut commands = self.inner.commands.lock().await;
-            if !self.inner.closed.load(Ordering::Acquire) {
-                commands.insert(request.handle.0, LocalCommand::Completed(output));
-            }
-        } else {
+        self.ensure_open()?;
+        let transport = self
+            .inner
+            .commands
+            .lock()
+            .await
+            .get(&request.handle.0)
+            .ok_or_else(|| WorkdirError::UnknownCommand(request.handle.0.clone()))?
+            .transport
+            .clone();
+        let result = transport.lock().await.read(&request).await;
+        self.ensure_open()?;
+        if result.as_ref().is_ok_and(|page| page.terminal.is_some()) {
             self.inner.command_telemetry.remove(&request.handle.0);
         }
-        Ok(page)
+        result
     }
 
     async fn cancel_command(&self, handle: CommandHandle) -> Result<(), WorkdirError> {
@@ -1996,12 +1894,7 @@ impl WorkdirSession for LocalWorkdirSession {
             let command = commands
                 .get(&handle.0)
                 .ok_or_else(|| WorkdirError::UnknownCommand(handle.0.clone()))?;
-            match command {
-                LocalCommand::Running { task, cancel, .. } if !task.is_finished() => {
-                    Some(cancel.clone())
-                }
-                _ => None,
-            }
+            Some(command.cancel.clone())
         };
         if let Some(cancel) = cancel {
             let _ = cancel.send(true);
@@ -2041,39 +1934,14 @@ impl WorkdirSession for LocalWorkdirSession {
                 .collect::<Vec<_>>()
         };
         for command in commands {
-            match command {
-                LocalCommand::Running { task, cancel, .. } => {
-                    let _ = cancel.send(true);
-                    let _ = task.await;
-                }
-                LocalCommand::Completed(_) => {}
-            }
+            let _ = command.cancel.send(true);
+            command.transport.lock().await.close();
+            let _ = command.task.await;
         }
         if let Ok(mut resources) = self.inner.resources.lock() {
             resources.clear();
         }
         Ok(())
-    }
-}
-
-fn command_output_page(output: &CommandOutput, cursor: usize, limit: usize) -> CommandOutput {
-    let total_chars = output.content.chars().count();
-    let start = cursor.min(total_chars);
-    let content = output
-        .content
-        .chars()
-        .skip(start)
-        .take(limit.max(1))
-        .collect::<String>();
-    let end = start + content.chars().count();
-    CommandOutput {
-        status: output.status,
-        exit_code: output.exit_code,
-        timed_out: output.timed_out,
-        content,
-        next_cursor: (end < total_chars).then_some(end),
-        truncated: output.truncated || end < total_chars,
-        output_path: output.output_path.clone(),
     }
 }
 
@@ -2202,204 +2070,11 @@ fn terminate_process_group(process_group_id: u32) {
 #[cfg(not(unix))]
 fn terminate_process_group(_process_group_id: u32) {}
 
-async fn run_command(
-    cwd: PathBuf,
-    request: CommandRequest,
-    command_id: String,
-    telemetry: CommandTelemetry,
-    command_environment: BTreeMap<String, String>,
-    mut cancel: watch::Receiver<bool>,
-    resources: Vec<Arc<dyn WorkdirSessionResource>>,
-) -> Result<CommandOutput, WorkdirError> {
-    let stdout = tempfile::NamedTempFile::new().map_err(|error| WorkdirError::io(&cwd, error))?;
-    let stderr = tempfile::NamedTempFile::new().map_err(|error| WorkdirError::io(&cwd, error))?;
-    let stdout_path = stdout.into_temp_path();
-    let stderr_path = stderr.into_temp_path();
-    let stdout_file = std::fs::File::create(&stdout_path)
-        .map_err(|error| WorkdirError::io(&stdout_path, error))?;
-    let stderr_file = std::fs::File::create(&stderr_path)
-        .map_err(|error| WorkdirError::io(&stderr_path, error))?;
-
-    telemetry.started(&command_id, request.tool_call_id.clone());
-    let mut command = Command::new("bash");
-    command
-        .arg("-c")
-        .arg(&request.command)
-        .current_dir(&cwd)
-        .envs(command_environment)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.as_std_mut().process_group(0);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            telemetry.terminal(&command_id, CommandStatus::Failed, None);
-            return Err(WorkdirError::io(&cwd, error));
-        }
-    };
-    let mut process_group = CommandProcessGroupGuard::new(child.id());
-
-    let mut stdout_reader =
-        std::fs::File::open(&stdout_path).map_err(|error| WorkdirError::io(&stdout_path, error))?;
-    let mut stderr_reader =
-        std::fs::File::open(&stderr_path).map_err(|error| WorkdirError::io(&stderr_path, error))?;
-    let mut stdout_decoder = CommandOutputDecoder::default();
-    let mut stderr_decoder = CommandOutputDecoder::default();
-    let mut timeout = Box::pin(tokio::time::sleep(Duration::from_secs(
-        request.timeout_secs.max(1),
-    )));
-    let mut interval = tokio::time::interval(Duration::from_millis(50));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await;
-
-    let (status, exit_code) = loop {
-        tokio::select! {
-            exit = child.wait() => {
-                let exit = exit.map_err(|error| WorkdirError::io(&cwd, error))?;
-                process_group.terminate();
-                break (
-                    if exit.success() { CommandStatus::Completed } else { CommandStatus::Failed },
-                    exit.code(),
-                );
-            }
-            _ = &mut timeout => {
-                process_group.terminate();
-                let _ = child.start_kill();
-                let exit_code = child.wait().await.ok().and_then(|status| status.code());
-                break (CommandStatus::TimedOut, exit_code);
-            }
-            changed = cancel.changed() => {
-                if changed.is_err() || *cancel.borrow() {
-                    process_group.terminate();
-                    let _ = child.start_kill();
-                    let exit_code = child.wait().await.ok().and_then(|status| status.code());
-                    break (CommandStatus::Cancelled, exit_code);
-                }
-            }
-            _ = interval.tick() => {
-                publish_available_output(
-                    &mut stdout_reader,
-                    &mut stdout_decoder,
-                    &telemetry,
-                    &command_id,
-                    CommandStream::Stdout,
-                    &stdout_path,
-                    false,
-                )?;
-                publish_available_output(
-                    &mut stderr_reader,
-                    &mut stderr_decoder,
-                    &telemetry,
-                    &command_id,
-                    CommandStream::Stderr,
-                    &stderr_path,
-                    false,
-                )?;
-            }
-        }
-    };
-
-    publish_available_output(
-        &mut stdout_reader,
-        &mut stdout_decoder,
-        &telemetry,
-        &command_id,
-        CommandStream::Stdout,
-        &stdout_path,
-        true,
-    )?;
-    publish_available_output(
-        &mut stderr_reader,
-        &mut stderr_decoder,
-        &telemetry,
-        &command_id,
-        CommandStream::Stderr,
-        &stderr_path,
-        true,
-    )?;
-    telemetry.terminal(&command_id, status, exit_code);
-
-    let (content, truncated) =
-        read_command_output_files(&stdout_path, &stderr_path, request.output_limit.max(1))?;
-    let output_path = match (truncated, request.spill_dir) {
-        (true, Some(spill_dir)) => {
-            let stdout_path = stdout_path.to_path_buf();
-            let stderr_path = stderr_path.to_path_buf();
-            Some(
-                spawn_resource_owned_blocking(resources.clone(), move || {
-                    persist_command_output(&stdout_path, &stderr_path, &spill_dir)
-                })
-                .await
-                .map_err(|error| {
-                    WorkdirError::Unavailable(format!("Bash output spill task failed: {error}"))
-                })??,
-            )
-        }
-        _ => None,
-    };
-    Ok(CommandOutput {
-        status,
-        exit_code,
-        timed_out: status == CommandStatus::TimedOut,
-        content,
-        next_cursor: None,
-        truncated,
-        output_path,
-    })
-}
-
-// Blocking spills cannot be aborted with their async waiter. Transfer resource
-// ownership into the actual filesystem task so cleanup waits for its completion.
-fn spawn_resource_owned_blocking<T: Send + 'static>(
-    resources: Vec<Arc<dyn WorkdirSessionResource>>,
-    effect: impl FnOnce() -> T + Send + 'static,
-) -> JoinHandle<T> {
-    tokio::task::spawn_blocking(move || {
-        let _resources = resources;
-        effect()
-    })
-}
-
 #[derive(Debug, Default)]
 struct CommandOutputDecoder {
     read_offset: u64,
     emitted_offset: u64,
     pending: Vec<u8>,
-}
-
-fn publish_available_output(
-    file: &mut std::fs::File,
-    decoder: &mut CommandOutputDecoder,
-    telemetry: &CommandTelemetry,
-    command_id: &str,
-    stream: CommandStream,
-    path: &Path,
-    flush: bool,
-) -> Result<(), WorkdirError> {
-    file.seek(SeekFrom::Start(decoder.read_offset))
-        .map_err(|error| WorkdirError::io(path, error))?;
-    loop {
-        let mut buffer = vec![0; COMMAND_EVENT_CHUNK_BYTES];
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| WorkdirError::io(path, error))?;
-        if read == 0 {
-            publish_decoded_output(decoder, telemetry, command_id, stream, flush);
-            return Ok(());
-        }
-        decoder.pending.extend_from_slice(&buffer[..read]);
-        decoder.read_offset = decoder.read_offset.saturating_add(read as u64);
-        publish_decoded_output(decoder, telemetry, command_id, stream, false);
-        if read < COMMAND_EVENT_CHUNK_BYTES {
-            if flush {
-                publish_decoded_output(decoder, telemetry, command_id, stream, true);
-            }
-            return Ok(());
-        }
-    }
 }
 
 fn publish_decoded_output(
@@ -2428,7 +2103,7 @@ fn publish_decoded_output(
 }
 
 /// Return the byte prefix that can be decoded now without replacing a valid
-/// UTF-8 scalar whose remaining bytes may arrive in a later file read. Definite
+/// UTF-8 scalar whose remaining bytes may arrive in a later pipe read. Definite
 /// invalid sequences remain in the prefix and are rendered lossily, preserving
 /// the existing arbitrary-byte output behavior.
 fn stable_utf8_prefix_len(bytes: &[u8]) -> usize {
@@ -2446,110 +2121,6 @@ fn stable_utf8_prefix_len(bytes: &[u8]) -> usize {
         }
     }
     inspected
-}
-
-fn persist_command_output(
-    stdout_path: &Path,
-    stderr_path: &Path,
-    spill_dir: &Path,
-) -> Result<PathBuf, WorkdirError> {
-    std::fs::create_dir_all(spill_dir).map_err(|error| WorkdirError::io(spill_dir, error))?;
-    let mut artifact = tempfile::Builder::new()
-        .prefix("bash-")
-        .suffix(".log")
-        .tempfile_in(spill_dir)
-        .map_err(|error| WorkdirError::io(spill_dir, error))?;
-    let artifact_path = artifact.path().to_path_buf();
-
-    let mut stdout =
-        std::fs::File::open(stdout_path).map_err(|error| WorkdirError::io(stdout_path, error))?;
-    let stdout_len = stdout
-        .metadata()
-        .map_err(|error| WorkdirError::io(stdout_path, error))?
-        .len();
-    std::io::copy(&mut stdout, &mut artifact)
-        .map_err(|error| WorkdirError::io(&artifact_path, error))?;
-
-    let mut stderr =
-        std::fs::File::open(stderr_path).map_err(|error| WorkdirError::io(stderr_path, error))?;
-    let stderr_len = stderr
-        .metadata()
-        .map_err(|error| WorkdirError::io(stderr_path, error))?
-        .len();
-    if stdout_len > 0 && stderr_len > 0 {
-        stdout
-            .seek(SeekFrom::End(-1))
-            .map_err(|error| WorkdirError::io(stdout_path, error))?;
-        let mut last = [0_u8; 1];
-        stdout
-            .read_exact(&mut last)
-            .map_err(|error| WorkdirError::io(stdout_path, error))?;
-        if last[0] != b'\n' {
-            artifact
-                .write_all(b"\n")
-                .map_err(|error| WorkdirError::io(&artifact_path, error))?;
-        }
-    }
-    std::io::copy(&mut stderr, &mut artifact)
-        .map_err(|error| WorkdirError::io(&artifact_path, error))?;
-    artifact
-        .flush()
-        .map_err(|error| WorkdirError::io(&artifact_path, error))?;
-    artifact
-        .keep()
-        .map(|(_, path)| path)
-        .map_err(|error| WorkdirError::io(&artifact_path, error.error))
-}
-
-fn read_command_output_files(
-    stdout_path: &Path,
-    stderr_path: &Path,
-    limit: usize,
-) -> Result<(String, bool), WorkdirError> {
-    let stdout_size = std::fs::metadata(stdout_path)
-        .map_err(|error| WorkdirError::io(stdout_path, error))?
-        .len() as usize;
-    let stderr_size = std::fs::metadata(stderr_path)
-        .map_err(|error| WorkdirError::io(stderr_path, error))?
-        .len() as usize;
-    let total = stdout_size.saturating_add(stderr_size);
-    let stderr_budget = stderr_size.min(limit / 2);
-    let stdout_budget = stdout_size.min(limit.saturating_sub(stderr_budget));
-    let remaining = limit.saturating_sub(stdout_budget + stderr_budget);
-    let stdout_budget = (stdout_budget + remaining.min(stdout_size - stdout_budget)).min(limit);
-    let stderr_budget = limit.saturating_sub(stdout_budget).min(stderr_size);
-
-    let stdout = read_tail(stdout_path, stdout_budget)?;
-    let stderr = read_tail(stderr_path, stderr_budget)?;
-    let mut content = String::new();
-    if !stdout.is_empty() {
-        content.push_str(&String::from_utf8_lossy(&stdout));
-    }
-    if !stderr.is_empty() {
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str(&String::from_utf8_lossy(&stderr));
-    }
-    Ok((content, total > limit))
-}
-
-fn read_tail(path: &Path, limit: usize) -> Result<Vec<u8>, WorkdirError> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let mut file = std::fs::File::open(path).map_err(|error| WorkdirError::io(path, error))?;
-    let len = file
-        .metadata()
-        .map_err(|error| WorkdirError::io(path, error))?
-        .len();
-    let start = len.saturating_sub(limit as u64);
-    file.seek(SeekFrom::Start(start))
-        .map_err(|error| WorkdirError::io(path, error))?;
-    let mut bytes = Vec::with_capacity((len - start) as usize);
-    file.read_to_end(&mut bytes)
-        .map_err(|error| WorkdirError::io(path, error))?;
-    Ok(bytes)
 }
 
 /// Return the first symlink component in `path`, if one exists.
@@ -2928,11 +2499,12 @@ mod tests {
         let command = WorkdirSession::start_command(
             &session,
             CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "sleep 30".to_owned(),
                 timeout_secs: 60,
-                output_limit: 1024,
+
                 cwd: WorkdirPath::root(),
-                spill_dir: None,
+
                 tool_call_id: None,
             },
         )
@@ -2941,7 +2513,7 @@ mod tests {
         let waiting_session = session.clone();
         let waiting_command = command.clone();
         let waiter = tokio::spawn(async move {
-            WorkdirSession::command_output(
+            crate::command_test_support::CollectCommand::collect_command_output(
                 &waiting_session,
                 CommandOutputRequest {
                     handle: waiting_command,
@@ -3626,17 +3198,18 @@ mod tests {
         let handle = WorkdirSession::start_command(
             &workdir,
             CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "pwd && printf provider-command".into(),
                 timeout_secs: 5,
-                output_limit: 4096,
+
                 cwd: WorkdirPath::root(),
-                spill_dir: None,
+
                 tool_call_id: None,
             },
         )
         .await
         .unwrap();
-        let output = WorkdirSession::command_output(
+        let output = crate::command_test_support::CollectCommand::collect_command_output(
             &workdir,
             CommandOutputRequest {
                 handle,
@@ -3728,11 +3301,12 @@ mod tests {
         let error = WorkdirSession::start_command(
             &workdir,
             CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "printf hidden".into(),
                 timeout_secs: 5,
-                output_limit: 1024,
+
                 cwd,
-                spill_dir: None,
+
                 tool_call_id: None,
             },
         )
@@ -3740,319 +3314,6 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, WorkdirError::OutOfScope(path) if path == outside.path()));
-    }
-
-    #[tokio::test]
-    async fn command_rejects_spill_directory_without_read_scope() {
-        let dir = TempDir::new().unwrap();
-        let spill = TempDir::new().unwrap();
-        let workdir = make_fs(&dir);
-
-        let error = WorkdirSession::start_command(
-            &workdir,
-            CommandRequest {
-                command: "printf hidden".into(),
-                timeout_secs: 5,
-                output_limit: 1,
-                cwd: WorkdirPath::root(),
-                spill_dir: Some(spill.path().to_path_buf()),
-                tool_call_id: None,
-            },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(error, WorkdirError::OutOfScope(path) if path == spill.path()));
-    }
-
-    #[tokio::test]
-    async fn truncated_command_output_is_retained_in_the_requested_spill_directory() {
-        let dir = TempDir::new().unwrap();
-        let spill = TempDir::new().unwrap();
-        let scope = Scope::from_config(&ScopeConfig {
-            allow: vec![
-                ScopeRule {
-                    target: dir.path().to_path_buf(),
-                    permission: Permission::Write,
-                    recursive: true,
-                    symlink_policy: Default::default(),
-                },
-                ScopeRule {
-                    target: spill.path().to_path_buf(),
-                    permission: Permission::Read,
-                    recursive: true,
-                    symlink_policy: Default::default(),
-                },
-            ],
-            deny: Vec::new(),
-        })
-        .unwrap();
-        let workdir = LocalWorkdirSession::new(scope, dir.path().to_path_buf());
-        let handle = WorkdirSession::start_command(
-            &workdir,
-            CommandRequest {
-                command: "i=0; while [ $i -lt 200 ]; do printf 'line-%03d\\n' \"$i\"; i=$((i+1)); done; printf 'FINAL-NEEDLE\\n'".into(),
-                timeout_secs: 5,
-                output_limit: 64,
-                cwd: WorkdirPath::root(),
-                spill_dir: Some(spill.path().to_path_buf()),
-                tool_call_id: None,
-            },
-        )
-        .await
-        .unwrap();
-        let output = WorkdirSession::command_output(
-            &workdir,
-            CommandOutputRequest {
-                handle,
-                cursor: 0,
-                limit: 4096,
-                wait: true,
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(output.truncated);
-        let output_path = output.output_path.expect("retained output path");
-        assert_eq!(output_path.parent(), Some(spill.path()));
-        let retained = std::fs::read_to_string(&output_path).unwrap();
-        assert!(retained.starts_with("line-000\n"));
-        assert!(retained.ends_with("FINAL-NEEDLE\n"));
-        assert_eq!(retained.lines().count(), 201);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(
-                std::fs::metadata(output_path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn completed_command_output_can_be_read_in_bounded_unicode_pages() {
-        let dir = TempDir::new().unwrap();
-        let workdir = make_fs(&dir);
-        let handle = WorkdirSession::start_command(
-            &workdir,
-            CommandRequest {
-                command: "printf 'aéz'".into(),
-                timeout_secs: 5,
-                output_limit: 1024,
-                cwd: WorkdirPath::root(),
-                spill_dir: None,
-                tool_call_id: None,
-            },
-        )
-        .await
-        .unwrap();
-        let first = WorkdirSession::command_output(
-            &workdir,
-            CommandOutputRequest {
-                handle: handle.clone(),
-                cursor: 0,
-                limit: 2,
-                wait: true,
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(first.content, "aé");
-        assert_eq!(first.next_cursor, Some(2));
-
-        let second = WorkdirSession::command_output(
-            &workdir,
-            CommandOutputRequest {
-                handle: handle.clone(),
-                cursor: first.next_cursor.unwrap(),
-                limit: 2,
-                wait: false,
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(second.content, "z");
-        assert_eq!(second.next_cursor, None);
-        assert!(matches!(
-            WorkdirSession::command_status(&workdir, handle).await,
-            Err(WorkdirError::UnknownCommand(_))
-        ));
-    }
-
-    #[test]
-    fn command_output_decoder_preserves_utf8_split_across_file_reads() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("command.out");
-        let mut first_write = vec![b'a'; COMMAND_EVENT_CHUNK_BYTES - 1];
-        first_write.push(0xe2);
-        std::fs::write(&path, first_write).unwrap();
-
-        let telemetry = CommandTelemetry::new();
-        let mut events = telemetry.subscribe();
-        telemetry.started("command-utf8", None);
-        let mut decoder = CommandOutputDecoder::default();
-        let mut reader = std::fs::File::open(&path).unwrap();
-        publish_available_output(
-            &mut reader,
-            &mut decoder,
-            &telemetry,
-            "command-utf8",
-            CommandStream::Stdout,
-            &path,
-            false,
-        )
-        .unwrap();
-        assert_eq!(decoder.pending, vec![0xe2]);
-
-        let mut writer = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        writer.write_all(&[0x82, 0xac]).unwrap();
-        writer.flush().unwrap();
-        publish_available_output(
-            &mut reader,
-            &mut decoder,
-            &telemetry,
-            "command-utf8",
-            CommandStream::Stdout,
-            &path,
-            false,
-        )
-        .unwrap();
-
-        let output = std::iter::from_fn(|| events.try_recv().ok())
-            .filter_map(|event| match event {
-                CommandEvent::Output {
-                    stream: CommandStream::Stdout,
-                    content,
-                    ..
-                } => Some(content),
-                _ => None,
-            })
-            .collect::<String>();
-        assert_eq!(output.len(), COMMAND_EVENT_CHUNK_BYTES - 1 + "€".len());
-        assert!(output.ends_with('€'));
-        assert!(!output.contains('\u{fffd}'));
-        assert!(decoder.pending.is_empty());
-    }
-
-    #[tokio::test]
-    async fn command_output_does_not_rewait_before_join_handle_finishes() {
-        let dir = TempDir::new().unwrap();
-        let workdir = make_fs(&dir);
-        let handle = CommandHandle("command-completion-race".into());
-        let (completion_tx, completion) = watch::channel(false);
-        let completion_observer = completion_tx.clone();
-        let (cancel, _cancel_rx) = watch::channel(false);
-        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
-        let (completion_sent_tx, completion_sent_rx) = tokio::sync::oneshot::channel::<()>();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
-            start_rx.await.unwrap();
-            completion_tx.send(true).unwrap();
-            completion_sent_tx.send(()).unwrap();
-            release_rx.await.unwrap();
-            Ok(CommandOutput {
-                status: CommandStatus::Completed,
-                exit_code: Some(0),
-                timed_out: false,
-                content: "done".into(),
-                next_cursor: None,
-                truncated: false,
-                output_path: None,
-            })
-        });
-        workdir.inner.commands.lock().await.insert(
-            handle.0.clone(),
-            LocalCommand::Running {
-                task,
-                completion,
-                cancel,
-            },
-        );
-
-        let waiting_workdir = workdir.clone();
-        let waiting_handle = handle.clone();
-        let waiter = tokio::spawn(async move {
-            WorkdirSession::command_output(
-                &waiting_workdir,
-                CommandOutputRequest {
-                    handle: waiting_handle,
-                    cursor: 0,
-                    limit: 1024,
-                    wait: true,
-                },
-            )
-            .await
-        });
-        for _ in 0..100 {
-            if completion_observer.receiver_count() >= 2 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            completion_observer.receiver_count(),
-            2,
-            "waiter must subscribe before completion is published"
-        );
-
-        start_tx.send(()).unwrap();
-        completion_sent_rx.await.unwrap();
-        tokio::task::yield_now().await;
-        assert!(
-            !waiter.is_finished(),
-            "command_output should await the task after observing completion state"
-        );
-        release_tx.send(()).unwrap();
-
-        let output = tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("command output must not wait for a second completion notification")
-            .unwrap()
-            .unwrap();
-        assert_eq!(output.status, CommandStatus::Completed);
-        assert_eq!(output.content, "done");
-    }
-
-    #[tokio::test]
-    async fn command_output_does_not_wait_forever_when_completion_sender_drops() {
-        let dir = TempDir::new().unwrap();
-        let workdir = make_fs(&dir);
-        let handle = CommandHandle("command-completion-drop".into());
-        let (completion_tx, completion) = watch::channel(false);
-        let (cancel, _cancel_rx) = watch::channel(false);
-        let task: JoinHandle<Result<CommandOutput, WorkdirError>> = tokio::spawn(async move {
-            drop(completion_tx);
-            panic!("simulated command task panic");
-        });
-        workdir.inner.commands.lock().await.insert(
-            handle.0.clone(),
-            LocalCommand::Running {
-                task,
-                completion,
-                cancel,
-            },
-        );
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            WorkdirSession::command_output(
-                &workdir,
-                CommandOutputRequest {
-                    handle,
-                    cursor: 0,
-                    limit: 1024,
-                    wait: true,
-                },
-            ),
-        )
-        .await
-        .expect("closed completion channel must wake the waiter");
-        assert!(matches!(result, Err(WorkdirError::Unavailable(_))));
     }
 
     #[tokio::test]
@@ -4064,11 +3325,12 @@ mod tests {
         let handle = WorkdirSession::start_command(
             &workdir,
             CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "printf ready; printf warning >&2; sleep 0.2; printf done".into(),
                 timeout_secs: 5,
-                output_limit: 1024,
+
                 cwd: WorkdirPath::root(),
-                spill_dir: None,
+
                 tool_call_id: Some("tool-7".into()),
             },
         )
@@ -4146,7 +3408,7 @@ mod tests {
         assert_eq!(snapshot[0].stdout.content, "readydone");
         assert_eq!(snapshot[0].stderr.content, "warning");
 
-        let output = WorkdirSession::command_output(
+        let output = crate::command_test_support::CollectCommand::collect_command_output(
             &workdir,
             CommandOutputRequest {
                 handle,
@@ -4169,17 +3431,18 @@ mod tests {
         let handle = WorkdirSession::start_command(
             &workdir,
             CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "sleep 30".into(),
                 timeout_secs: 1,
-                output_limit: 1024,
+
                 cwd: WorkdirPath::root(),
-                spill_dir: None,
+
                 tool_call_id: None,
             },
         )
         .await
         .unwrap();
-        let output = WorkdirSession::command_output(
+        let output = crate::command_test_support::CollectCommand::collect_command_output(
             &workdir,
             CommandOutputRequest {
                 handle: handle.clone(),
@@ -4227,11 +3490,12 @@ mod tests {
             WorkdirSession::start_command(
                 start_session.as_ref(),
                 CommandRequest {
+                    transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                     command: "true".into(),
                     timeout_secs: 5,
-                    output_limit: 1024,
+
                     cwd: WorkdirPath::root(),
-                    spill_dir: None,
+
                     tool_call_id: None,
                 },
             )
@@ -4261,50 +3525,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn blocking_output_spill_retains_resources_after_waiter_is_cancelled() {
-        #[derive(Debug)]
-        struct Resource(Option<tokio::sync::oneshot::Sender<()>>);
-        impl Drop for Resource {
-            fn drop(&mut self) {
-                let _ = self.0.take().unwrap().send(());
-            }
-        }
-        let (released, mut release) = tokio::sync::oneshot::channel();
-        let resources: Vec<Arc<dyn WorkdirSessionResource>> =
-            vec![Arc::new(Resource(Some(released)))];
-        let (entered, started) = tokio::sync::oneshot::channel();
-        let (finish, wait) = std::sync::mpsc::channel();
-        // Exercise the resource-transfer policy at the same blocking boundary
-        // used by output persistence, without filesystem timing assumptions.
-        let waiter = tokio::spawn(async move {
-            spawn_resource_owned_blocking(resources, move || {
-                entered.send(()).unwrap();
-                wait.recv_timeout(Duration::from_secs(5)).unwrap();
-            })
-            .await
-            .unwrap();
-        });
-        tokio::time::timeout(Duration::from_secs(5), started)
-            .await
-            .unwrap()
-            .unwrap();
-        waiter.abort();
-        assert!(waiter.await.unwrap_err().is_cancelled());
-        assert!(
-            matches!(
-                release.try_recv(),
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-            ),
-            "blocking spill lost its resources when the waiter was cancelled"
-        );
-        finish.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), release)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn session_drop_retains_resources_until_command_task_cancellation_completes() {
         #[derive(Debug)]
@@ -4328,11 +3548,12 @@ mod tests {
         WorkdirSession::start_command(
             &session,
             CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "true".into(),
                 timeout_secs: 5,
-                output_limit: 1024,
+
                 cwd: WorkdirPath::root(),
-                spill_dir: None,
+
                 tool_call_id: None,
             },
         )
@@ -4387,12 +3608,13 @@ mod tests {
         let handle = WorkdirSession::start_command(
             &workdir,
             CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "(sleep 0.4; echo leaked > child-marker) & echo ready > child-ready; wait"
                     .into(),
                 timeout_secs: 60,
-                output_limit: 1024,
+
                 cwd: WorkdirPath::root(),
-                spill_dir: None,
+
                 tool_call_id: None,
             },
         )
@@ -4409,7 +3631,7 @@ mod tests {
         WorkdirSession::cancel_command(&workdir, handle.clone())
             .await
             .unwrap();
-        let output = WorkdirSession::command_output(
+        let output = crate::command_test_support::CollectCommand::collect_command_output(
             &workdir,
             CommandOutputRequest {
                 handle,
@@ -4435,11 +3657,12 @@ mod tests {
         let handle = WorkdirSession::start_command(
             &workdir,
             CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "sleep 30".into(),
                 timeout_secs: 60,
-                output_limit: 1024,
+
                 cwd: WorkdirPath::root(),
-                spill_dir: None,
+
                 tool_call_id: None,
             },
         )
@@ -4454,7 +3677,7 @@ mod tests {
         let waiting_workdir = workdir.clone();
         let waiting_handle = handle.clone();
         let waiter = tokio::spawn(async move {
-            WorkdirSession::command_output(
+            crate::command_test_support::CollectCommand::collect_command_output(
                 &waiting_workdir,
                 CommandOutputRequest {
                     handle: waiting_handle,
@@ -4475,9 +3698,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(output.status, CommandStatus::Cancelled);
-        assert!(matches!(
-            WorkdirSession::command_status(&workdir, handle).await,
-            Err(WorkdirError::UnknownCommand(_))
-        ));
+        assert_eq!(
+            WorkdirSession::command_status(&workdir, handle)
+                .await
+                .unwrap(),
+            CommandStatus::Cancelled
+        );
     }
 }
