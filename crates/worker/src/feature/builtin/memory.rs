@@ -725,7 +725,7 @@ struct SubjectBehaviorRefreshState {
 struct WorkspaceSubjektivResidentSummarySource {
     host: SubjektivHostConnection,
     prompts: Arc<ArcSwap<PromptCatalog>>,
-    behavior_state: Mutex<SubjectBehaviorRefreshState>,
+    behavior_state: Arc<Mutex<SubjectBehaviorRefreshState>>,
 }
 
 fn resident_summary_contribution(
@@ -816,44 +816,49 @@ impl WorkspaceSubjektivResidentSummarySource {
             },
         ))
     }
-
-    fn remember_behavior(&self, output: &server_api::SubjektivResidentContextOutput) {
-        let mut state = self
-            .behavior_state
-            .lock()
-            .expect("subject behavior state poisoned");
-        state.applied = Some(output.behavior_md.clone());
-    }
 }
 
 /// Detect behavior changes against the state reflected in history, not the fetched state.
 ///
-/// Initial load builds a prompt contribution; change refresh does not advance applied on fetch/render alone.
-/// The interceptor confirms after durably appending a system item, allowing refetch if append fails.
-/// Invalidate applied before rewrite so even identical bodies can be presented in the new history.
+/// Fetch/render never advances applied state. Initial preparation captures a
+/// source-local completion, invoked only after its prompt and active pointer commit.
+/// Later refreshes are acknowledged by the interceptor after durable append.
+/// Invalidate applied before rewrite so identical bodies can be represented again.
 #[async_trait]
 impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource {
     async fn load(&self) -> SystemPromptContribution {
+        self.load_initial().await.0
+    }
+
+    async fn load_initial(
+        &self,
+    ) -> (
+        SystemPromptContribution,
+        Option<crate::worker::PromptContributionCompletion>,
+    ) {
         match self.fetch().await {
             Ok(output) => match self.render(&output) {
                 Ok((rendered, _)) => {
-                    self.remember_behavior(&output);
-                    SystemPromptContribution::Ready(rendered)
+                    let state = self.behavior_state.clone();
+                    let behavior = output.behavior_md;
+                    (
+                        SystemPromptContribution::Ready(rendered),
+                        Some(Box::new(move || {
+                            state
+                                .lock()
+                                .expect("subject behavior state poisoned")
+                                .applied = Some(behavior);
+                        })),
+                    )
                 }
                 Err(error) => {
                     tracing::error!(%error, "subject resident context render failed");
-                    SystemPromptContribution::Ready(
-                        "The Host could not render the Subject resident context. Do not treat this as unset behavior or infer replacement behavior from Memory."
-                            .to_string(),
-                    )
+                    (SystemPromptContribution::Ready("The Host could not render the Subject resident context. Do not treat this as unset behavior or infer replacement behavior from Memory.".into()), None)
                 }
             },
             Err(error) => {
                 tracing::error!(%error, "subject resident context fetch failed");
-                SystemPromptContribution::Ready(
-                    "The Host could not fetch the Subject resident context. Do not treat this as unset behavior or infer replacement behavior from Memory."
-                        .to_string(),
-                )
+                (SystemPromptContribution::Ready("The Host could not fetch the Subject resident context. Do not treat this as unset behavior or infer replacement behavior from Memory.".into()), None)
             }
         }
     }
@@ -1218,7 +1223,7 @@ pub(crate) fn ordinary_subjektiv_resident_summary_source(
     Ok(Some(Arc::new(WorkspaceSubjektivResidentSummarySource {
         host: host.expect("checked explicit connection"),
         prompts,
-        behavior_state: Mutex::new(SubjectBehaviorRefreshState::default()),
+        behavior_state: Arc::new(Mutex::new(SubjectBehaviorRefreshState::default())),
     })))
 }
 
@@ -1835,8 +1840,16 @@ permission = "write"
             .unwrap()
             .unwrap();
 
-        let initial = source.load().await;
+        let (initial, completion) = source.load_initial().await;
         assert!(matches!(initial, SystemPromptContribution::Ready(_)));
+        assert!(
+            source
+                .load_changed_resident_context()
+                .await
+                .unwrap()
+                .is_some()
+        );
+        completion.expect("successful initial contribution must provide completion")();
         assert!(
             source
                 .load_changed_resident_context()
@@ -1907,7 +1920,7 @@ permission = "write"
         // target-side bounded resident request contract.
         assert_eq!(
             client.timeouts.lock().unwrap().as_slice(),
-            &[RESIDENT_SUMMARY_REQUEST_TIMEOUT; 7]
+            &[RESIDENT_SUMMARY_REQUEST_TIMEOUT; 8]
         );
     }
 

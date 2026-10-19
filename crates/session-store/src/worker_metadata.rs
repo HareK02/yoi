@@ -210,18 +210,6 @@ impl WorkerMetadata {
     }
 }
 
-fn replace_active_session(metadata: &mut WorkerMetadata, active: Option<WorkerActiveSegmentRef>) {
-    if let Some(session_id) = active.as_ref().map(|active| active.session_id)
-        && metadata
-            .subjektiv_session_attribution
-            .as_ref()
-            .is_some_and(|state| state.session_id() != session_id)
-    {
-        metadata.subjektiv_session_attribution = None;
-    }
-    metadata.active = active;
-}
-
 /// Sync persistence backend for Worker metadata.
 pub trait WorkerMetadataStore: Send + Sync {
     /// Create or replace metadata for its `worker_name` key.
@@ -297,7 +285,7 @@ pub trait WorkerMetadataStore: Send + Sync {
         workspace_root: Option<PathBuf>,
     ) -> Result<WorkerMetadata, WorkerStoreError> {
         self.update_by_name(worker_name, |metadata| {
-            replace_active_session(metadata, active);
+            metadata.active = active;
             metadata.resolved_manifest_snapshot = resolved_manifest_snapshot;
             if let Some(workspace_id) = workspace_id {
                 metadata.workspace_id = Some(workspace_id);
@@ -317,7 +305,7 @@ pub trait WorkerMetadataStore: Send + Sync {
         workspace_id: Option<String>,
     ) -> Result<WorkerMetadata, WorkerStoreError> {
         self.update_by_name(worker_name, |metadata| {
-            replace_active_session(metadata, active);
+            metadata.active = active;
             metadata.resolved_manifest_snapshot = resolved_manifest_snapshot;
             if let Some(workspace_id) = workspace_id {
                 metadata.workspace_id = Some(workspace_id);
@@ -334,23 +322,11 @@ pub trait WorkerMetadataStore: Send + Sync {
         workspace_root: Option<PathBuf>,
     ) -> Result<WorkerMetadata, WorkerStoreError> {
         self.update_by_name(worker_name, |metadata| {
-            replace_active_session(metadata, active);
+            metadata.active = active;
             metadata.resolved_manifest_snapshot = resolved_manifest_snapshot;
             if let Some(workspace_root) = workspace_root {
                 metadata.workspace_root = Some(workspace_root);
             }
-        })
-    }
-
-    /// Set the Host-owned Subjektiv Session attribution lifecycle state while
-    /// preserving the active Session pointer and every unrelated field.
-    fn set_subjektiv_session_attribution(
-        &self,
-        worker_name: &str,
-        state: SubjektivSessionAttributionState,
-    ) -> Result<WorkerMetadata, WorkerStoreError> {
-        self.update_by_name(worker_name, |metadata| {
-            metadata.subjektiv_session_attribution = Some(state);
         })
     }
 
@@ -1087,13 +1063,13 @@ mod tests {
             ))
             .unwrap();
         store
-            .set_subjektiv_session_attribution(
-                "subject-worker",
-                SubjektivSessionAttributionState::OutcomeUnknown {
-                    session_id,
-                    diagnostic: "request interrupted".to_string(),
-                },
-            )
+            .update_by_name("subject-worker", |metadata| {
+                metadata.subjektiv_session_attribution =
+                    Some(SubjektivSessionAttributionState::OutcomeUnknown {
+                        session_id,
+                        diagnostic: "request interrupted".to_string(),
+                    });
+            })
             .unwrap();
         store
             .set_active(
@@ -1117,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn new_active_session_clears_prior_session_attribution_state() {
+    fn generic_active_update_does_not_interpret_host_attribution() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = FsWorkerStore::new(tmp.path()).unwrap();
         let old_session_id = crate::new_session_id();
@@ -1129,13 +1105,13 @@ mod tests {
             ))
             .unwrap();
         store
-            .set_subjektiv_session_attribution(
-                "subject-worker",
-                SubjektivSessionAttributionState::Confirmed {
-                    session_id: old_session_id,
-                    subject_id: "subject-1".to_string(),
-                },
-            )
+            .update_by_name("subject-worker", |metadata| {
+                metadata.subjektiv_session_attribution =
+                    Some(SubjektivSessionAttributionState::Confirmed {
+                        session_id: old_session_id,
+                        subject_id: "subject-1".to_string(),
+                    });
+            })
             .unwrap();
 
         store
@@ -1151,7 +1127,9 @@ mod tests {
             restored.active,
             Some(WorkerActiveSegmentRef::pending_segment(new_session_id))
         );
-        assert!(restored.subjektiv_session_attribution.is_none());
+        assert!(
+            matches!(restored.subjektiv_session_attribution, Some(SubjektivSessionAttributionState::Confirmed { session_id, .. }) if session_id == old_session_id)
+        );
     }
 
     #[test]

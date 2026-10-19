@@ -1676,41 +1676,10 @@ pub struct SegmentLocation {
     pub segment_id: SegmentId,
 }
 
-type WorkerMetadataWriter =
-    Arc<dyn Fn(WorkerMetadata) -> Result<(), WorkerStoreError> + Send + Sync>;
-type WorkerMetadataSegmentCas = Arc<
-    dyn Fn(&str, &WorkerActiveSegmentRef, WorkerActiveSegmentRef) -> Result<bool, WorkerStoreError>
-        + Send
-        + Sync,
->;
-
-fn worker_metadata_writer_for_store<St>(store: &St) -> WorkerMetadataWriter
-where
-    St: WorkerMetadataStore + Clone + Send + Sync + 'static,
-{
-    let store = store.clone();
-    Arc::new(move |metadata| {
-        store
-            .set_active_with_workspace_context(
-                &metadata.worker_name,
-                metadata.active,
-                metadata.resolved_manifest_snapshot,
-                metadata.workspace_id,
-                metadata.workspace_root,
-            )
-            .map(|_| ())
-    })
-}
-
-fn worker_metadata_segment_cas_for_store<St>(store: &St) -> WorkerMetadataSegmentCas
-where
-    St: WorkerMetadataStore + Clone + Send + Sync + 'static,
-{
-    let store = store.clone();
-    Arc::new(move |worker_name, expected, replacement| {
-        store.compare_and_swap_active(worker_name, expected, replacement)
-    })
-}
+use crate::metadata_lifecycle::{
+    WorkerMetadataSegmentCas, WorkerMetadataWriter, worker_metadata_segment_cas_for_store,
+    worker_metadata_writer_for_store,
+};
 
 /// Lock-free shared session/segment pointer.
 ///
@@ -2938,6 +2907,8 @@ impl WorkerSession {
     }
 }
 
+pub(crate) type PromptContributionCompletion = Box<dyn FnOnce() + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SystemPromptContribution {
     Ready(String),
@@ -2969,8 +2940,21 @@ pub(crate) trait SessionContextSource: Send + Sync {
 pub(crate) trait SystemPromptContributionSource: Send + Sync {
     async fn load(&self) -> SystemPromptContribution;
 
-    /// Returns a durable model-visible refresh only when user-managed resident
-    /// context changed since the last successful load.
+    /// Prepare an initial contribution with an optional source-bound completion.
+    /// Completion runs only after its exact prompt and active pointer commit,
+    /// under the publication/release fence. It must perform bounded local updates
+    /// only; no I/O, store reentry, or authority grants. Restore never replays it.
+    async fn load_initial(
+        &self,
+    ) -> (
+        SystemPromptContribution,
+        Option<PromptContributionCompletion>,
+    ) {
+        (self.load().await, None)
+    }
+
+    /// Returns a model-visible refresh only when user-managed resident context
+    /// changed since its last committed representation.
     async fn load_changed_resident_context(
         &self,
     ) -> Result<Option<ResidentContextRefresh>, String> {
@@ -3157,6 +3141,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// Exact complete seed retained across ambiguous Store responses. The committed
     /// segment remains authoritative; metadata must be repaired before accepting input.
     prepared_initial_seed: Option<Vec<LogEntry>>,
+    prepared_initial_prompt_completion: Option<(String, PromptContributionCompletion)>,
     subjektiv_host: Option<Arc<dyn crate::subjektiv::SubjektivHost>>,
     /// One-shot generic Feature lifecycle notification required after restore.
     restore_feature_lifecycle_pending: bool,
@@ -3427,6 +3412,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             feature_resident_summary_source: None,
             session_context_source: None,
             prepared_initial_seed: None,
+            prepared_initial_prompt_completion: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
@@ -3482,6 +3468,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         resident_summary_source: Option<Arc<dyn SystemPromptContributionSource>>,
         system_prompt_override: Option<String>,
     ) {
+        self.prepared_initial_prompt_completion = None;
         self.feature_resident_summary_source = resident_summary_source;
         self.feature_system_prompt_override = system_prompt_override;
     }
@@ -4671,16 +4658,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 }
             }
         }
+        let mut completion = None;
         let resident_summary = if self.inject_resident_summary {
             match &self.feature_resident_summary_source {
-                Some(source) => match source.load().await {
-                    SystemPromptContribution::Ready(summary) if !summary.is_empty() => {
-                        Some(summary)
+                Some(source) => {
+                    let (value, prepared) = source.load_initial().await;
+                    match value {
+                        SystemPromptContribution::Ready(summary) if !summary.is_empty() => {
+                            completion = prepared;
+                            Some(summary)
+                        }
+                        _ => None,
                     }
-                    SystemPromptContribution::Ready(_) | SystemPromptContribution::Unavailable => {
-                        None
-                    }
-                },
+                }
                 None => None,
             }
         } else {
@@ -4707,6 +4697,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let rendered = template
             .render(&ctx)
             .map_err(|source| WorkerError::SystemPromptRender { source })?;
+        self.prepared_initial_prompt_completion = completion.and_then(|complete| {
+            resident_summary
+                .as_ref()
+                .filter(|body| rendered.contains(body.as_str()))
+                .map(|_| (rendered.clone(), complete))
+        });
         self.engine
             .as_mut()
             .expect("worker present")
@@ -5959,6 +5955,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.system_prompt_template = None;
         self.feature_system_prompt_override = None;
         self.prepared_initial_seed = None;
+        if let Some((prepared, complete)) = self.prepared_initial_prompt_completion.take() {
+            if system_prompt.as_ref() == Some(&prepared) {
+                complete();
+            }
+        }
         Ok(())
     }
 
@@ -7999,6 +8000,7 @@ where
             feature_resident_summary_source: None,
             session_context_source: None,
             prepared_initial_seed: None,
+            prepared_initial_prompt_completion: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
@@ -8029,6 +8031,7 @@ where
         subjektiv_attached: bool,
         lifecycle: SubjektivSessionAttributionLifecycle,
     ) -> Result<(), WorkerError> {
+        let _admission = self.segment_state.mutation_authority.enter()?;
         let worker_name = self.manifest.worker.name.as_str();
         let metadata = self.store.read_by_name(worker_name)?.ok_or_else(|| {
             WorkerError::SubjektivSessionAttribution {
@@ -8107,11 +8110,15 @@ where
         } else {
             "legacy Session has no local attribution evidence; immutable Backend verification started"
         };
-        self.persist_subjektiv_session_attribution(incomplete_subjektiv_attribution_state(
+        let pending_attribution = incomplete_subjektiv_attribution_state(
             session_id,
             create_if_missing,
             initial_diagnostic.to_string(),
-        ))?;
+        );
+        self.persist_subjektiv_session_attribution(
+            metadata.subjektiv_session_attribution.as_ref(),
+            pending_attribution.clone(),
+        )?;
         let output = if self.subjektiv_host.is_some() {
             let connection = self
                 .subjektiv_host_connection()
@@ -8144,7 +8151,7 @@ where
                             message.clone(),
                         )
                     };
-                    self.persist_subjektiv_session_attribution(state)?;
+                    self.persist_subjektiv_session_attribution(Some(&pending_attribution), state)?;
                     return Err(WorkerError::SubjektivSessionAttribution {
                         state: if create_if_missing && rejected {
                             "failed"
@@ -8170,6 +8177,7 @@ where
                         "Session attribution transport outcome is unknown: {error}"
                     ));
                     self.persist_subjektiv_session_attribution(
+                        Some(&pending_attribution),
                         incomplete_subjektiv_attribution_state(
                             session_id,
                             create_if_missing,
@@ -8198,7 +8206,7 @@ where
                         diagnostic: message.clone(),
                     }
                 };
-                self.persist_subjektiv_session_attribution(state)?;
+                self.persist_subjektiv_session_attribution(Some(&pending_attribution), state)?;
                 return Err(WorkerError::SubjektivSessionAttribution {
                     state: if create_if_missing {
                         "failed"
@@ -8216,6 +8224,7 @@ where
                             "Session attribution response outcome is unknown: {error}"
                         ));
                         self.persist_subjektiv_session_attribution(
+                            Some(&pending_attribution),
                             incomplete_subjektiv_attribution_state(
                                 session_id,
                                 create_if_missing,
@@ -8237,20 +8246,26 @@ where
             let message =
                 "Session attribution response did not confirm the requested immutable identity"
                     .to_string();
-            self.persist_subjektiv_session_attribution(incomplete_subjektiv_attribution_state(
-                session_id,
-                create_if_missing,
-                message.clone(),
-            ))?;
+            self.persist_subjektiv_session_attribution(
+                Some(&pending_attribution),
+                incomplete_subjektiv_attribution_state(
+                    session_id,
+                    create_if_missing,
+                    message.clone(),
+                ),
+            )?;
             return Err(WorkerError::SubjektivSessionAttribution {
                 state: incomplete_subjektiv_attribution_label(create_if_missing),
                 message,
             });
         }
-        self.persist_subjektiv_session_attribution(SubjektivSessionAttributionState::Confirmed {
-            session_id,
-            subject_id: output.subject_id.clone(),
-        })?;
+        self.persist_subjektiv_session_attribution(
+            Some(&pending_attribution),
+            SubjektivSessionAttributionState::Confirmed {
+                session_id,
+                subject_id: output.subject_id.clone(),
+            },
+        )?;
         self.retain_journal_source_before_publication(session_id, &output.subject_id)
     }
 
@@ -8291,11 +8306,16 @@ where
 
     fn persist_subjektiv_session_attribution(
         &self,
+        expected: Option<&SubjektivSessionAttributionState>,
         state: SubjektivSessionAttributionState,
     ) -> Result<(), WorkerError> {
-        self.store
-            .set_subjektiv_session_attribution(&self.manifest.worker.name, state)?;
-        Ok(())
+        crate::subjektiv_metadata::compare_and_swap_attribution(
+            &self.store,
+            &self.manifest.worker.name,
+            self.session_id(),
+            expected,
+            state,
+        )
     }
 
     /// Build an in-process Internal Worker without machine-wide allocation or durable Worker metadata.
@@ -8380,6 +8400,7 @@ where
             feature_resident_summary_source: None,
             session_context_source: None,
             prepared_initial_seed: None,
+            prepared_initial_prompt_completion: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
@@ -8512,6 +8533,7 @@ where
             feature_resident_summary_source: None,
             session_context_source: None,
             prepared_initial_seed: None,
+            prepared_initial_prompt_completion: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
@@ -8923,6 +8945,7 @@ where
             feature_resident_summary_source: None,
             session_context_source: None,
             prepared_initial_seed: None,
+            prepared_initial_prompt_completion: None,
             subjektiv_host: None,
             restore_feature_lifecycle_pending: true,
             feature_system_prompt_override: None,
@@ -11358,9 +11381,9 @@ mod build_summary_prompt_tests {
         TransportUnknown,
     }
 
-    #[derive(Debug)]
     struct AttributionLifecycleClient {
         outcomes: Mutex<VecDeque<AttributionOutcome>>,
+        before_response: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         requests: Mutex<Vec<WorkspaceRequest>>,
     }
 
@@ -11368,8 +11391,15 @@ mod build_summary_prompt_tests {
         fn new(outcomes: impl IntoIterator<Item = AttributionOutcome>) -> Self {
             Self {
                 outcomes: Mutex::new(outcomes.into_iter().collect()),
+                before_response: Mutex::new(None),
                 requests: Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    impl std::fmt::Debug for AttributionLifecycleClient {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("AttributionLifecycleClient")
         }
     }
 
@@ -11391,6 +11421,9 @@ mod build_summary_prompt_tests {
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             self.requests.lock().unwrap().push(request.clone());
+            if let Some(change) = self.before_response.lock().unwrap().take() {
+                change();
+            }
             match self
                 .outcomes
                 .lock()
@@ -11638,6 +11671,110 @@ mod build_summary_prompt_tests {
         ));
     }
 
+    // Production lifecycle, atomic Host CAS, and filesystem metadata store. Only
+    // the external Workspace transport is substituted to interleave a newer owner.
+    #[tokio::test]
+    async fn delayed_attribution_response_cannot_overwrite_new_session_or_subject_evidence() {
+        for switch_session in [true, false] {
+            let client = Arc::new(AttributionLifecycleClient::new([
+                AttributionOutcome::Success,
+            ]));
+            let (worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+            let worker_name = worker.manifest().worker.name.clone();
+            let replacement_session = if switch_session {
+                session_store::new_session_id()
+            } else {
+                worker.session_id()
+            };
+            let changed = store.clone();
+            let name = worker_name.clone();
+            *client.before_response.lock().unwrap() = Some(Box::new(move || {
+                if switch_session {
+                    worker_metadata_writer_for_store(&changed)(WorkerMetadata::new(
+                        name,
+                        Some(WorkerActiveSegmentRef::pending_segment(replacement_session)),
+                    ))
+                    .unwrap();
+                } else {
+                    changed
+                        .update_by_name(&name, |metadata| {
+                            metadata.subjektiv_session_attribution =
+                                Some(SubjektivSessionAttributionState::Confirmed {
+                                    session_id: replacement_session,
+                                    subject_id: "new-subject".into(),
+                                });
+                        })
+                        .unwrap();
+                }
+            }));
+            let error = worker
+                .finalize_subjektiv_session_attribution(
+                    true,
+                    SubjektivSessionAttributionLifecycle::NewSession,
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("attribution_conflict"),
+                "{error}"
+            );
+            let saved = store.read_by_name(&worker_name).unwrap().unwrap();
+            assert_eq!(
+                saved.active.as_ref().unwrap().session_id,
+                replacement_session
+            );
+            assert_eq!(
+                saved.subjektiv_session_attribution,
+                if switch_session {
+                    None
+                } else {
+                    Some(SubjektivSessionAttributionState::Confirmed {
+                        session_id: replacement_session,
+                        subject_id: "new-subject".into(),
+                    })
+                }
+            );
+            assert_eq!(client.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn released_body_cannot_reconfirm_attribution_or_contact_host() {
+        let client = Arc::new(AttributionLifecycleClient::new([
+            AttributionOutcome::Success,
+        ]));
+        let (worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+        let before = store
+            .read_by_name(&worker.manifest().worker.name)
+            .unwrap()
+            .unwrap();
+        let control = crate::subject_release::ReleaseControl::new(worker.mutation_authority());
+        let request = tokio::spawn({
+            let control = control.clone();
+            async move { control.request().await }
+        });
+        control.notified().await;
+        control.respond(|| Ok(()));
+        let mut reservation = request.await.unwrap().unwrap();
+        reservation.commit_disconnect().unwrap();
+        drop(reservation);
+        assert!(
+            worker
+                .finalize_subjektiv_session_attribution(
+                    true,
+                    SubjektivSessionAttributionLifecycle::NewSession
+                )
+                .is_err()
+        );
+        assert!(client.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            store
+                .read_by_name(&worker.manifest().worker.name)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+    }
+
     #[tokio::test]
     async fn unknown_and_failed_attribution_remain_incomplete_until_lifecycle_retry() {
         for (first, expected_state) in [
@@ -11750,13 +11887,13 @@ mod build_summary_prompt_tests {
             )
             .unwrap();
         store
-            .set_subjektiv_session_attribution(
-                &manifest.worker.name,
-                SubjektivSessionAttributionState::OutcomeUnknown {
-                    session_id,
-                    diagnostic: "response lost before restart".to_string(),
-                },
-            )
+            .update_by_name(&manifest.worker.name, |metadata| {
+                metadata.subjektiv_session_attribution =
+                    Some(SubjektivSessionAttributionState::OutcomeUnknown {
+                        session_id,
+                        diagnostic: "response lost before restart".to_string(),
+                    });
+            })
             .unwrap();
         let client = Arc::new(AttributionLifecycleClient::new([
             AttributionOutcome::Success,
@@ -17022,6 +17159,110 @@ permission = "write"
         worker.materialize_durable_session_head().await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(worker.history().len(), 1);
+    }
+
+    struct PreparedPromptSource {
+        loads: Arc<AtomicUsize>,
+        completions: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl SystemPromptContributionSource for PreparedPromptSource {
+        async fn load(&self) -> SystemPromptContribution {
+            panic!("initial load must use its prepared completion")
+        }
+        async fn load_initial(
+            &self,
+        ) -> (
+            SystemPromptContribution,
+            Option<PromptContributionCompletion>,
+        ) {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            let completed = self.completions.clone();
+            (
+                SystemPromptContribution::Ready("PREPARED_RESIDENT_BODY".into()),
+                Some(Box::new(move || {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                })),
+            )
+        }
+    }
+
+    // Production initial-head preparation/create/reconciliation and real FsStore.
+    // Only returned write failures and the Feature completion counter are injected.
+    #[tokio::test]
+    async fn initial_prompt_completion_waits_for_commit_and_reconciliation_and_never_replays_to_replacement()
+     {
+        for failure in [3, 4, 0] {
+            for replace_source in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let store = FailRunTerminalStore {
+                    inner: session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+                    fail_run_terminal: Arc::new(AtomicBool::new(false)),
+                    invocation_failure: Arc::new(AtomicUsize::new(failure)),
+                };
+                let mut worker = Worker::new(
+                    minimal_manifest(),
+                    Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+                    store.clone(),
+                    WorkerWorkspaceContext::no_workspace(),
+                    WorkerFilesystemAuthority::None,
+                    Scope::empty(),
+                )
+                .await
+                .unwrap();
+                worker.set_system_prompt_template(
+                    SystemPromptTemplate::parse("default", PromptCatalogSource::builtins_only())
+                        .unwrap(),
+                );
+                let loads = Arc::new(AtomicUsize::new(0));
+                let completed = Arc::new(AtomicUsize::new(0));
+                worker.install_system_prompt_contribution(
+                    Some(Arc::new(PreparedPromptSource {
+                        loads: loads.clone(),
+                        completions: completed.clone(),
+                    })),
+                    None,
+                );
+                if failure == 0 {
+                    let fail = Arc::new(AtomicBool::new(true));
+                    worker.worker_metadata_writer = Some(Arc::new(move |_| {
+                        if fail.swap(false, Ordering::SeqCst) {
+                            Err(std::io::Error::other("initial active pointer write failed").into())
+                        } else {
+                            Ok(())
+                        }
+                    }));
+                }
+                assert!(worker.materialize_durable_session_head().await.is_err());
+                assert_eq!(completed.load(Ordering::SeqCst), 0);
+                let new_completed = Arc::new(AtomicUsize::new(0));
+                let new_loads = Arc::new(AtomicUsize::new(0));
+                if replace_source {
+                    worker.install_system_prompt_contribution(
+                        Some(Arc::new(PreparedPromptSource {
+                            loads: new_loads.clone(),
+                            completions: new_completed.clone(),
+                        })),
+                        None,
+                    );
+                }
+                worker.materialize_durable_session_head().await.unwrap();
+                worker.materialize_durable_session_head().await.unwrap();
+                assert_eq!(loads.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    completed.load(Ordering::SeqCst),
+                    usize::from(!replace_source)
+                );
+                assert_eq!(new_completed.load(Ordering::SeqCst), 0);
+                assert_eq!(new_loads.load(Ordering::SeqCst), 0);
+                let saved = store
+                    .read_all(worker.session_id(), worker.segment_id())
+                    .unwrap();
+                assert!(
+                    matches!(&saved[0], LogEntry::AnnotatedSegmentStart { system_prompt: Some(prompt), .. } if prompt.contains("PREPARED_RESIDENT_BODY"))
+                );
+            }
+        }
     }
 
     #[tokio::test]
