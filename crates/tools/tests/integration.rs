@@ -546,9 +546,10 @@ impl workdir::WorkdirSession for ExternalValidatingSession {
                 .is_ok()
         {
             // The production provider has committed a page, but its response is lost.
-            return Err(workdir::WorkdirError::Transport(
-                "injected lost response".into(),
-            ));
+            return Err(
+                workdir::WorkdirError::Transport("injected lost response".into())
+                    .with_failure_reason(workdir::WorkdirFailureReason::HttpTimeout),
+            );
         }
         Ok(output)
     }

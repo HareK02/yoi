@@ -525,6 +525,8 @@ pub struct ExternalWorkdirOperationError {
     code: crate::http::WorkdirTransportErrorCode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     denial_reason: Option<crate::WorkdirDenialReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<crate::WorkdirFailureReason>,
 }
 
 impl ExternalWorkdirOperationError {
@@ -534,11 +536,13 @@ impl ExternalWorkdirOperationError {
         Self {
             code: error.code,
             denial_reason: error.denial_reason,
+            failure_reason: error.failure_reason,
         }
     }
 
     pub fn into_transport_error(self) -> WorkdirTransportError {
         WorkdirTransportError {
+            failure_reason: self.failure_reason,
             code: self.code,
             denial_reason: self.denial_reason,
             message: format!("External Workdir provider reported {}", self.code.as_str()),
@@ -762,6 +766,7 @@ mod tests {
         ] {
             let external =
                 ExternalWorkdirOperationError::from_transport_error(WorkdirTransportError {
+                    failure_reason: None,
                     code: Code::Denied,
                     message: "/home/operator/private provider-secret".repeat(4096),
                     denial_reason: reason,
@@ -788,6 +793,7 @@ mod tests {
     #[test]
     fn provider_failures_are_closed_and_drop_provider_authored_diagnostics() {
         let error = ExternalWorkdirOperationError::from_transport_error(WorkdirTransportError {
+            failure_reason: None,
             code: crate::http::WorkdirTransportErrorCode::Internal,
             denial_reason: None,
             message: "/home/operator/private provider-secret\ncontrol".to_string(),

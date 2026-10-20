@@ -158,11 +158,15 @@ async fn command_page(
 ) -> Result<workdir::CommandOutput, workdir::WorkdirError> {
     for attempt in 0..3 {
         match session.command_output(request.clone()).await {
-            Err(
-                workdir::WorkdirError::Transport(_)
-                | workdir::WorkdirError::Unavailable(_)
-                | workdir::WorkdirError::OutcomeUnknown(_),
-            ) if attempt < 2 => {
+            Err(error)
+                if attempt < 2
+                    && matches!(
+                        error.classification_source(),
+                        workdir::WorkdirError::Transport(_)
+                            | workdir::WorkdirError::Unavailable(_)
+                            | workdir::WorkdirError::OutcomeUnknown(_)
+                    ) =>
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(100 << attempt)).await;
             }
             result => return result,

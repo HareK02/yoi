@@ -113,6 +113,7 @@ impl Transport {
                         WorkdirError::Unavailable(
                             "command transport ended before terminal fence".into(),
                         )
+                        .with_failure_reason(crate::WorkdirFailureReason::CommandTerminalMissing)
                     })?;
                     self.terminal = Some(terminal.clone());
                     page.terminal = Some(terminal);

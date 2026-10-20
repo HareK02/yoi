@@ -1411,6 +1411,10 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
                 let outcome = workdir::WorkdirError::OutcomeUnknown(
                     "checkout provider response lost; inspect effects before retry".into(),
                 );
+                let outcome = match error.failure_reason() {
+                    Some(reason) => outcome.with_failure_reason(reason),
+                    None => outcome,
+                };
                 Err(match error.denial_reason() {
                     Some(reason) => workdir::WorkdirError::DenialContext {
                         reason,
@@ -13501,6 +13505,7 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
             attachment_alias_hash = context.map(|ctx| ctx.attachment_alias_hash.as_str()),
             request_token_id_hash = context.and(request_token_id_hash.as_deref()),
             denial_reason = error.and_then(|error| error.denial_reason).map(|reason| reason.as_str()),
+            failure_reason = error.and_then(|error| error.failure_reason).map(|reason| reason.as_str()),
             status = event.status,
             kind = event.kind.unwrap_or("unknown"),
             message = event.message.unwrap_or(""),
@@ -20989,9 +20994,14 @@ impl InternalWorkdirOperationError {
                     Error::WorkdirSessionOpenFailed { transport, .. } => transport.denial_reason,
                     _ => None,
                 };
+                let failure_reason = match &error.error {
+                    Error::WorkdirSessionOpenFailed { transport, .. } => transport.failure_reason,
+                    _ => None,
+                };
                 let mut error =
                     server_api::WorkdirOperationApiError::api(error.into_repository_api_error());
                 error.denial_reason = reason;
+                error.failure_reason = failure_reason;
                 error
             }
             Self::Provider(error) => server_api::WorkdirOperationApiError::provider(error),
@@ -27162,6 +27172,7 @@ async fn serve_external_workdir_provider(
                 Some(ExternalProviderCommand::Operation { operation_id, operation, response }) => {
                     if revoking {
                         let _ = response.send(Err(WorkdirTransportError {
+                            failure_reason: None,
                             denial_reason: None,
                             code: workdir::http::WorkdirTransportErrorCode::Unavailable,
                             message: "External Workdir provider shutdown is in progress".to_string(),
@@ -27175,6 +27186,7 @@ async fn serve_external_workdir_provider(
                     };
                     if pending.len() >= pending_limit {
                         let _ = response.send(Err(WorkdirTransportError {
+                            failure_reason: None,
                             denial_reason: None,
                             code: workdir::http::WorkdirTransportErrorCode::Unavailable,
                             message: "External Workdir provider is at its in-flight operation limit".to_string(),
@@ -27186,6 +27198,7 @@ async fn serve_external_workdir_provider(
                         Ok(operation) => operation,
                         Err(message) => {
                             let _ = response.send(Err(WorkdirTransportError {
+                                failure_reason: None,
                                 denial_reason: None,
                                 code: workdir::http::WorkdirTransportErrorCode::InvalidRequest,
                                 message,
@@ -27243,6 +27256,7 @@ async fn serve_external_workdir_provider(
                                             Err(error.into_transport_error())
                                         }
                                         ExternalWorkdirOperationOutcome::Cancelled => Err(WorkdirTransportError {
+                                            failure_reason: None,
                                             denial_reason: None,
                                             code: workdir::http::WorkdirTransportErrorCode::Unavailable,
                                             message: "External Workdir operation was cancelled".to_string(),
@@ -36896,6 +36910,7 @@ struct ApiErrorLog {
     diagnostics: Vec<RuntimeDiagnostic>,
     workdir_log: Option<server_api::WorkdirOperationLogContext>,
     denial_reason: Option<workdir::WorkdirDenialReason>,
+    failure_reason: Option<workdir::WorkdirFailureReason>,
 }
 
 impl ApiErrorLog {
@@ -36910,6 +36925,7 @@ impl ApiErrorLog {
                 diagnostics: Vec::new(),
                 workdir_log: error.workdir_log.clone(),
                 denial_reason: error.denial_reason,
+                failure_reason: error.failure_reason,
             };
         }
         let mut log = Self::from_repository_error(&server_api::RepositoryApiError::new(
@@ -36924,6 +36940,7 @@ impl ApiErrorLog {
         ));
         log.workdir_log = error.workdir_log.clone();
         log.denial_reason = error.denial_reason;
+        log.failure_reason = error.failure_reason;
         if log.workdir_log.is_some() {
             // Existing public API details are unchanged; do not copy request-derived
             // alias/handle text or session-open errors into operational diagnostics.
@@ -36940,6 +36957,7 @@ impl ApiErrorLog {
         Self {
             workdir_log: None,
             denial_reason: None,
+            failure_reason: None,
             kind: error
                 .diagnostics
                 .first()
@@ -37254,6 +37272,7 @@ impl IntoResponse for ApiError {
         let log = ApiErrorLog {
             workdir_log: None,
             denial_reason: None,
+            failure_reason: None,
             kind: self
                 .diagnostics
                 .first()
@@ -37601,6 +37620,7 @@ mod tests {
         assert!(matches!(operation, WorkdirSessionOperation::Read(_)));
         response
             .send(Err(WorkdirTransportError {
+                failure_reason: None,
                 denial_reason: None,
                 code: workdir::http::WorkdirTransportErrorCode::NotFound,
                 message: "logical file was not found".to_string(),
@@ -41788,6 +41808,7 @@ mod tests {
         let error = ApiErrorLog {
             workdir_log: None,
             denial_reason: None,
+            failure_reason: None,
             kind: "ticket_backend_error".to_string(),
             message: "sqlite error: FOREIGN KEY constraint failed".to_string(),
             diagnostics: vec![RuntimeDiagnostic {
@@ -41929,6 +41950,7 @@ mod tests {
             ),
         ] {
             let response = InternalWorkdirOperationError::Provider(WorkdirTransportError {
+                failure_reason: None,
                 denial_reason: None,
                 code,
                 message: "safe provider message".to_string(),
@@ -41953,6 +41975,7 @@ mod tests {
             workdir_operation_transport_error(workdir::WorkdirError::InvalidGlob("[".to_string()));
         let remote = workdir_operation_transport_error(
             WorkdirTransportError {
+                failure_reason: None,
                 denial_reason: None,
                 code: workdir::http::WorkdirTransportErrorCode::InvalidRequest,
                 message: "Workdir operation request is invalid".to_string(),

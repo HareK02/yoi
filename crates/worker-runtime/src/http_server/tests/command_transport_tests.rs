@@ -157,6 +157,42 @@ impl Harness {
 }
 
 #[tokio::test]
+async fn real_http_closed_session_retains_failure_reason() {
+    let harness = Harness::new().await;
+    let handle = harness
+        .remote
+        .start_command(CommandRequest {
+            transport_byte_budget: 1024,
+            command: "printf done".into(),
+            timeout_secs: 5,
+            cwd: WorkdirPath::root(),
+            tool_call_id: None,
+        })
+        .await
+        .unwrap();
+    // Keep the HTTP session identity registered, but close the underlying provider.
+    harness.session.close().await.unwrap();
+    let error = harness
+        .remote
+        .command_output(CommandOutputRequest {
+            handle,
+            cursor: 0,
+            limit: 16,
+            wait: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.failure_reason(),
+        Some(workdir::WorkdirFailureReason::SessionClosed)
+    );
+    assert!(matches!(
+        error.classification_source(),
+        workdir::WorkdirError::Unavailable(_)
+    ));
+}
+
+#[tokio::test]
 async fn real_http_command_pages_preserve_binary_streams_replay_and_nonzero_exit() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let harness = Harness::new().await;

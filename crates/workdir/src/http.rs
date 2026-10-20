@@ -275,6 +275,8 @@ pub struct WorkdirTransportError {
     /// Internal provider diagnostics. Public response boundaries may omit this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denial_reason: Option<crate::WorkdirDenialReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<crate::WorkdirFailureReason>,
 }
 
 impl WorkdirTransportError {
@@ -282,6 +284,11 @@ impl WorkdirTransportError {
     pub fn from_workdir_error(error: &WorkdirError) -> Self {
         use WorkdirTransportErrorCode as Code;
         let (code, message) = match error {
+            WorkdirError::FailureContext { reason, source } => {
+                let mut transport = Self::from_workdir_error(source);
+                transport.failure_reason = Some(*reason);
+                return transport;
+            }
             WorkdirError::DenialContext { reason, source } => {
                 let mut transport = Self::from_workdir_error(source);
                 transport.denial_reason = Some(*reason);
@@ -301,6 +308,7 @@ impl WorkdirTransportError {
                     code: Code::Unsupported,
                     message: format!("Workdir capability {capability:?} is not available"),
                     denial_reason: None,
+                    failure_reason: None,
                 };
             }
             WorkdirError::UnsupportedOperation(_) => {
@@ -359,6 +367,7 @@ impl WorkdirTransportError {
             code,
             message: message.to_string(),
             denial_reason: error.denial_reason(),
+            failure_reason: error.failure_reason(),
         }
     }
 
@@ -407,6 +416,11 @@ impl WorkdirTransportError {
             },
             Code::Transport => WorkdirError::Transport(self.message),
             Code::Internal => WorkdirError::OperationFailed,
+        };
+        let error = if let Some(reason) = self.failure_reason {
+            error.with_failure_reason(reason)
+        } else {
+            error
         };
         // Preserve any supplied reason independently of the public classification.
         // Without a reason, retain the existing classification's deliberate fallback.
@@ -557,9 +571,10 @@ mod client {
             operation: WorkdirSessionOperation,
         ) -> Result<WorkdirSessionOperationResult, WorkdirError> {
             if self.closed.load(Ordering::Acquire) {
-                return Err(WorkdirError::Unavailable(
-                    "Workdir session is closed".to_string(),
-                ));
+                return Err(
+                    WorkdirError::Unavailable("Workdir session is closed".to_string())
+                        .with_failure_reason(crate::WorkdirFailureReason::SessionClosed),
+                );
             }
             let url = endpoint(
                 &self.base_url,
@@ -767,6 +782,10 @@ mod client {
                     let outcome = WorkdirError::OutcomeUnknown(
                         "checkout transport failed; effects may have occurred".into(),
                     );
+                    let outcome = match error.failure_reason() {
+                        Some(reason) => outcome.with_failure_reason(reason),
+                        None => outcome,
+                    };
                     Err(match error.denial_reason() {
                         Some(reason) => WorkdirError::DenialContext {
                             reason,
@@ -966,8 +985,10 @@ mod client {
     ) -> Result<T, WorkdirError> {
         if response.status().is_success() {
             let bytes = bounded_response_bytes(response).await?;
-            serde_json::from_slice(&bytes)
-                .map_err(|_| WorkdirError::Transport("Runtime Workdir response was invalid".into()))
+            serde_json::from_slice(&bytes).map_err(|_| {
+                WorkdirError::Transport("Runtime Workdir response was invalid".into())
+                    .with_failure_reason(crate::WorkdirFailureReason::HttpResponseInvalid)
+            })
         } else {
             Err(decode_error(response).await)
         }
@@ -983,14 +1004,16 @@ mod client {
         {
             return Err(WorkdirError::Transport(
                 "Runtime Workdir response exceeded transport bound".into(),
-            ));
+            )
+            .with_failure_reason(crate::WorkdirFailureReason::HttpResponseTooLarge));
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(http_unavailable)? {
             if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
                 return Err(WorkdirError::Transport(
                     "Runtime Workdir response exceeded transport bound".into(),
-                ));
+                )
+                .with_failure_reason(crate::WorkdirFailureReason::HttpResponseTooLarge));
             }
             bytes.extend_from_slice(&chunk);
         }
@@ -1003,19 +1026,62 @@ mod client {
                 .map(WorkdirTransportError::into_workdir_error)
                 .unwrap_or_else(|_| {
                     WorkdirError::Transport("Runtime Workdir error response was invalid".into())
+                        .with_failure_reason(crate::WorkdirFailureReason::HttpResponseInvalid)
                 }),
             Err(error) => error,
         }
     }
 
-    fn http_unavailable(_error: reqwest::Error) -> WorkdirError {
+    fn http_unavailable(error: reqwest::Error) -> WorkdirError {
+        let reason = if error.is_timeout() {
+            crate::WorkdirFailureReason::HttpTimeout
+        } else if error.is_connect() {
+            crate::WorkdirFailureReason::HttpConnect
+        } else {
+            crate::WorkdirFailureReason::HttpTransfer
+        };
         WorkdirError::Transport("Runtime Workdir HTTP request failed".to_string())
+            .with_failure_reason(reason)
     }
 
     #[cfg(test)]
     mod authorization_tests {
         use super::*;
         use std::sync::Mutex;
+
+        #[tokio::test]
+        async fn http_failure_reasons_do_not_copy_urls_or_credentials() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = Client::builder().no_proxy().build().unwrap();
+            // A listening socket that never replies makes a real HTTP timeout.
+            let error = client
+                .get(format!("http://{address}/private?token=secret"))
+                .timeout(std::time::Duration::from_millis(25))
+                .send()
+                .await
+                .unwrap_err();
+            assert!(error.is_timeout());
+            let error = http_unavailable(error);
+            assert_eq!(
+                error.failure_reason(),
+                Some(crate::WorkdirFailureReason::HttpTimeout)
+            );
+            assert!(!format!("{error:?}").contains("secret"));
+            assert!(!format!("{error:?}").contains("/private"));
+            drop(listener);
+            let error = client
+                .get(format!("http://{address}/private?token=secret"))
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+                .unwrap_err();
+            assert!(error.is_connect());
+            assert_eq!(
+                http_unavailable(error).failure_reason(),
+                Some(crate::WorkdirFailureReason::HttpConnect)
+            );
+        }
 
         #[derive(Debug, Default)]
         struct RejectAuthorization {
@@ -1193,6 +1259,7 @@ mod tests {
             (WorkdirTransportErrorCode::Internal, 500, "operation failed"),
         ] {
             let transport = WorkdirTransportError {
+                failure_reason: None,
                 code,
                 denial_reason: None,
                 message: if code == WorkdirTransportErrorCode::Conflict {

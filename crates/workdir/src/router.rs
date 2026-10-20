@@ -842,7 +842,7 @@ mod tests {
         assert!(router.is_empty());
         assert!(matches!(
             underlying.command_status(handle).await,
-            Err(WorkdirError::Unavailable(_))
+            Err(ref error) if matches!(error.classification_source(), WorkdirError::Unavailable(_))
         ));
     }
 

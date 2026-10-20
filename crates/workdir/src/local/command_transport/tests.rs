@@ -4,6 +4,38 @@
 use super::*;
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn missing_terminal_is_diagnosed_without_changing_error_classification() {
+    let (sender, receiver) = mpsc::channel(1);
+    let (_status, terminal_status) = watch::channel(None);
+    drop(sender);
+    let mut transport = Transport {
+        receiver,
+        pending: None,
+        cursor: 0,
+        replay: None,
+        terminal: None,
+        terminal_status,
+    };
+    let error = transport
+        .read(&CommandOutputRequest {
+            handle: CommandHandle("diagnostic-test".into()),
+            cursor: 0,
+            limit: 16,
+            wait: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.failure_reason(),
+        Some(crate::WorkdirFailureReason::CommandTerminalMissing)
+    );
+    assert!(matches!(
+        error.classification_source(),
+        WorkdirError::Unavailable(_)
+    ));
+}
+
 struct Harness {
     session: LocalWorkdirSession,
     _root: TempDir,

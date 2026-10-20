@@ -57,6 +57,7 @@ impl ProviderState {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 AxumJson(WorkdirTransportError {
+                    failure_reason: None,
                     denial_reason: None,
                     code: WorkdirTransportErrorCode::Denied,
                     message: "provider authorization denied".into(),

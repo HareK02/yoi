@@ -1210,7 +1210,8 @@ impl LocalWorkdirSession {
             Err(WorkdirError::Unavailable(format!(
                 "Workdir session for {} is closed",
                 self.inner.workdir.id()
-            )))
+            ))
+            .with_failure_reason(crate::WorkdirFailureReason::SessionClosed))
         } else {
             Ok(())
         }
@@ -2546,11 +2547,18 @@ mod tests {
             .expect("close should wake command output waiters")
             .unwrap()
             .unwrap_err();
-        assert!(matches!(waiter_error, WorkdirError::Unavailable(_)));
+        assert!(matches!(
+            waiter_error.classification_source(),
+            WorkdirError::Unavailable(_)
+        ));
+        assert_eq!(
+            waiter_error.failure_reason(),
+            Some(crate::WorkdirFailureReason::SessionClosed)
+        );
 
         assert!(matches!(
             WorkdirSession::command_status(&session, command).await,
-            Err(WorkdirError::Unavailable(_))
+            Err(ref error) if matches!(error.classification_source(), WorkdirError::Unavailable(_))
         ));
         assert!(matches!(
             WorkdirSession::read(
@@ -2563,7 +2571,7 @@ mod tests {
                 },
             )
             .await,
-            Err(WorkdirError::Unavailable(_))
+            Err(ref error) if matches!(error.classification_source(), WorkdirError::Unavailable(_))
         ));
 
         let restored = LocalWorkdirSession::materialized_bound(
@@ -3531,7 +3539,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            Err(WorkdirError::Unavailable(message)) if message.contains("is closed")
+            Err(ref error) if matches!(error.classification_source(), WorkdirError::Unavailable(message) if message.contains("is closed"))
         ));
         assert!(
             session.command_snapshot().is_empty(),

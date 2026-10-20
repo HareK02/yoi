@@ -409,10 +409,20 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
                 "mismatched checkout mutation response".into(),
             )),
             Ok(_) => Err(Self::mismatch("checkout_execute")),
-            Err(WorkdirError::Transport(_) | WorkdirError::Unavailable(_)) if mutation => {
-                Err(WorkdirError::OutcomeUnknown(
+            Err(error)
+                if mutation
+                    && matches!(
+                        error.classification_source(),
+                        WorkdirError::Transport(_) | WorkdirError::Unavailable(_)
+                    ) =>
+            {
+                let outcome = WorkdirError::OutcomeUnknown(
                     "checkout mutation response lost; inspect effects before retry".into(),
-                ))
+                );
+                Err(match error.failure_reason() {
+                    Some(reason) => outcome.with_failure_reason(reason),
+                    None => outcome,
+                })
             }
             Err(error) => Err(error),
         }
@@ -1230,6 +1240,7 @@ mod tests {
         WorkspaceResponse {
             status,
             body: serde_json::to_string(&workdir::http::WorkdirTransportError {
+                failure_reason: None,
                 denial_reason: None,
                 code,
                 message: message.to_string(),
