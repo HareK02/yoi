@@ -119,6 +119,51 @@ pub enum WorkdirSessionOperationResult {
     CommandCancel,
 }
 
+/// Audit persistence is independent of the provider result and never authorizes a resend.
+/// Only server-generated correlation and closed classifications cross this boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkdirAuditFailure {
+    pub operation_id: String,
+    pub stage: WorkdirAuditStage,
+    pub operation_outcome: WorkdirAuditOperationOutcome,
+    pub reason: WorkdirAuditFailureReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkdirAuditStage {
+    BeforeDispatch,
+    DispatchRejected,
+    ResponseReceived,
+    ResponseUnknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkdirAuditOperationOutcome {
+    NotDispatched,
+    Succeeded,
+    Failed { code: WorkdirTransportErrorCode },
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkdirAuditFailureReason {
+    AuditStoreUnavailable,
+}
+
+/// A successful operation can still have failed audit persistence. Consumers must
+/// surface that degradation separately, without discarding the result or resending.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkdirSessionOperationResponse {
+    #[serde(flatten)]
+    pub result: WorkdirSessionOperationResult,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_failures: Vec<WorkdirAuditFailure>,
+}
+
 /// Dispatch one typed operation against any provider-neutral Workdir session.
 ///
 /// Runtime HTTP handlers, outbound External providers, and Backend brokers can
@@ -208,6 +253,7 @@ pub enum WorkdirTransportErrorCode {
     NotFound,
     Conflict,
     OutcomeUnknown,
+    NotDispatched,
     Unsupported,
     InvalidRequest,
     Denied,
@@ -231,6 +277,7 @@ impl WorkdirTransportErrorCode {
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
             Self::OutcomeUnknown => "outcome_unknown",
+            Self::NotDispatched => "not_dispatched",
             Self::Unsupported => "unsupported",
             Self::InvalidRequest => "invalid_request",
             Self::Denied => "denied",
@@ -261,7 +308,7 @@ impl WorkdirTransportErrorCode {
             | Self::SymlinkTargetIsDirectory
             | Self::IsDirectory
             | Self::SymlinkDirectoryNotTraversed => 400,
-            Self::Unavailable => 503,
+            Self::Unavailable | Self::NotDispatched => 503,
             Self::Io | Self::Internal | Self::OutcomeUnknown => 500,
             Self::Transport => 502,
         }
@@ -298,6 +345,9 @@ impl WorkdirTransportError {
                 Code::OutcomeUnknown,
                 "Workdir operation may have effects; inspect before retrying",
             ),
+            WorkdirError::NotDispatched => {
+                (Code::NotDispatched, "Workdir operation was not dispatched")
+            }
             WorkdirError::NotFound(_) => (Code::NotFound, "Workdir path was not found"),
             WorkdirError::Conflict(_) => (
                 Code::Conflict,
@@ -410,6 +460,7 @@ impl WorkdirTransportError {
             },
             Code::UnknownCommand => WorkdirError::UnknownCommand("<remote>".to_string()),
             Code::Unavailable => WorkdirError::Unavailable(self.message),
+            Code::NotDispatched => WorkdirError::NotDispatched,
             Code::Io => WorkdirError::Io {
                 path: "<remote>".into(),
                 source: std::io::Error::other(self.message),
@@ -1211,6 +1262,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn operation_response_keeps_success_and_independent_audit_failure() {
+        let original =
+            WorkdirSessionOperationResult::CommandStart(crate::CommandHandle("command-a".into()));
+        let response = WorkdirSessionOperationResponse {
+            result: original.clone(),
+            audit_failures: vec![WorkdirAuditFailure {
+                operation_id: "op-00000000-0000-7000-8000-000000000001".into(),
+                stage: WorkdirAuditStage::ResponseReceived,
+                operation_outcome: WorkdirAuditOperationOutcome::Succeeded,
+                reason: WorkdirAuditFailureReason::AuditStoreUnavailable,
+            }],
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["operation"], "command_start");
+        assert_eq!(json["result"], "command-a");
+        assert_eq!(
+            json["audit_failures"][0]["operation_outcome"]["kind"],
+            "succeeded"
+        );
+        assert_eq!(
+            serde_json::from_value::<WorkdirSessionOperationResponse>(json).unwrap(),
+            response
+        );
+        let normal = serde_json::to_value(&original).unwrap();
+        let decoded: WorkdirSessionOperationResponse =
+            serde_json::from_value(normal.clone()).unwrap();
+        assert!(decoded.audit_failures.is_empty());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), normal);
+    }
+
+    #[test]
     fn transport_error_round_trip_keeps_public_classification() {
         for (code, expected_status, expected_error) in [
             (
@@ -1228,6 +1310,11 @@ mod tests {
                 WorkdirTransportErrorCode::Conflict,
                 409,
                 "The target file's content or existence changed since it was last observed",
+            ),
+            (
+                WorkdirTransportErrorCode::NotDispatched,
+                503,
+                "not dispatched",
             ),
             (WorkdirTransportErrorCode::Unsupported, 400, "unsupported"),
             (WorkdirTransportErrorCode::Denied, 403, "denied"),

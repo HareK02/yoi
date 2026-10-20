@@ -26,6 +26,7 @@
 
 use subjektiv::api::*;
 mod backend_job_profile;
+mod external_operation_audit;
 mod subject_authorization;
 mod subjektiv_job;
 mod subjektiv_journal;
@@ -933,6 +934,10 @@ struct ExternalProviderAuditContext {
 /// output confirmation from the old connection; unconfirmed cleanup is not reported as success.
 /// Only confirmed provider shutdown can replace per-command confirmation. Reconnection does
 /// not prove that missing commands have stopped.
+///
+/// Required request auditing fails closed before dispatch. Completion audit failure cannot
+/// undo a provider result: it is emitted independently and retained in the current API
+/// response, including successful command handles. Audit loss never triggers a resend.
 struct ExternalProviderWorkdirSession {
     workdir: workdir::Workdir,
     connection: Arc<ExternalProviderConnection>,
@@ -991,18 +996,22 @@ impl ExternalProviderWorkdirSession {
     async fn audit_operation(
         &self,
         operation_id: &ExternalWorkdirOperationId,
-        operation_kind: &str,
+        operation_kind: &'static str,
         outcome: &str,
-    ) -> std::result::Result<(), workdir::WorkdirError> {
+        stage: workdir::http::WorkdirAuditStage,
+        operation_outcome: workdir::http::WorkdirAuditOperationOutcome,
+    ) -> std::result::Result<(), workdir::http::WorkdirAuditFailure> {
         let Some(audit) = &self.audit else {
             return Ok(());
         };
         let audit = audit.clone();
+        let operation_id_for_notification = operation_id.as_str().to_owned();
+        let operation_kind_for_notification = operation_kind;
         let operation_id = operation_id.clone();
         let operation_kind = operation_kind.to_owned();
         let outcome = outcome.to_owned();
         let connection = self.connection.clone();
-        audit
+        let result = audit
             .store
             .db_executor()
             .run(move || {
@@ -1024,12 +1033,17 @@ impl ExternalProviderWorkdirSession {
                     &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
                 )
             })
-            .await
-            .map_err(|error| {
-                workdir::WorkdirError::Unavailable(format!(
-                    "External Workdir operation audit failed: {error}"
-                ))
-            })
+            .await;
+        result.map_err(|_| {
+            let failure = workdir::http::WorkdirAuditFailure {
+                operation_id: operation_id_for_notification,
+                stage,
+                operation_outcome,
+                reason: workdir::http::WorkdirAuditFailureReason::AuditStoreUnavailable,
+            };
+            external_operation_audit::notify(failure.clone(), operation_kind_for_notification);
+            failure
+        })
     }
 
     async fn operate(
@@ -1079,8 +1093,19 @@ impl ExternalProviderWorkdirSession {
         }
         let operation_id = ExternalWorkdirOperationId::new(format!("op-{}", Uuid::now_v7()))
             .map_err(workdir::WorkdirError::InvalidArgument)?;
-        self.audit_operation(&operation_id, operation_kind, "requested")
-            .await?;
+        use workdir::http::{WorkdirAuditOperationOutcome as Outcome, WorkdirAuditStage as Stage};
+        self.audit_operation(
+            &operation_id,
+            operation_kind,
+            "requested",
+            Stage::BeforeDispatch,
+            Outcome::NotDispatched,
+        )
+        .await
+        .map_err(|_| {
+            workdir::WorkdirError::NotDispatched
+                .with_failure_reason(workdir::WorkdirFailureReason::AuditStoreUnavailable)
+        })?;
         let (response, receive) = tokio::sync::oneshot::channel();
         let mut cancel_guard = ExternalOperationCancelGuard {
             sender: self.connection.sender.clone(),
@@ -1097,39 +1122,72 @@ impl ExternalProviderWorkdirSession {
             .await
             .is_err()
         {
-            self.audit_operation(&operation_id, operation_kind, "provider_unavailable")
-                .await?;
-            return Err(workdir::WorkdirError::Unavailable(
-                "External Workdir provider disconnected".to_string(),
-            ));
+            cancel_guard.disarm();
+            // A rejected channel send proves there was no provider dispatch.
+            let _audit_result = self
+                .audit_operation(
+                    &operation_id,
+                    operation_kind,
+                    "not_dispatched",
+                    Stage::DispatchRejected,
+                    Outcome::NotDispatched,
+                )
+                .await;
+            return Err(workdir::WorkdirError::NotDispatched
+                .with_failure_reason(workdir::WorkdirFailureReason::ProviderUnavailable));
         }
-        let result = match tokio::time::timeout(operation_timeout, receive).await {
+        let (result, stage) = match tokio::time::timeout(operation_timeout, receive).await {
             Ok(result) => {
                 cancel_guard.disarm();
                 match result {
-                    Ok(result) => result.map_err(WorkdirTransportError::into_workdir_error),
-                    Err(_) => Err(workdir::WorkdirError::Unavailable(
-                        "External Workdir provider disconnected".to_string(),
-                    )),
+                    Ok(result) => (
+                        result.map_err(WorkdirTransportError::into_workdir_error),
+                        Stage::ResponseReceived,
+                    ),
+                    Err(_) => (
+                        Err(workdir::WorkdirError::OutcomeUnknown(
+                            "External Workdir provider response lost; inspect before retrying"
+                                .to_string(),
+                        )),
+                        Stage::ResponseUnknown,
+                    ),
                 }
             }
             Err(_) => {
                 cancel_guard.cancel();
-                Err(workdir::WorkdirError::Unavailable(
-                    "External Workdir provider operation timed out".to_string(),
-                ))
+                (
+                    Err(workdir::WorkdirError::OutcomeUnknown(
+                        "External Workdir provider response timed out; inspect before retrying"
+                            .to_string(),
+                    )),
+                    Stage::ResponseUnknown,
+                )
             }
         };
-        self.audit_operation(
-            &operation_id,
-            operation_kind,
-            if result.is_ok() {
-                "completed"
-            } else {
-                "failed"
+        let outcome = match &result {
+            Ok(_) => Outcome::Succeeded,
+            Err(error)
+                if matches!(
+                    error.classification_source(),
+                    workdir::WorkdirError::OutcomeUnknown(_)
+                ) =>
+            {
+                Outcome::Unknown
+            }
+            Err(error) => Outcome::Failed {
+                code: WorkdirTransportError::from_workdir_error(error).code,
             },
-        )
-        .await?;
+        };
+        let audit_outcome = match outcome {
+            Outcome::Succeeded => "completed",
+            Outcome::Failed { .. } => "failed",
+            Outcome::Unknown => "outcome_unknown",
+            Outcome::NotDispatched => unreachable!("provider result follows dispatch"),
+        };
+        // Failure is notified independently, never substituted for the provider result.
+        let _audit_result = self
+            .audit_operation(&operation_id, operation_kind, audit_outcome, stage, outcome)
+            .await;
         result
     }
 
@@ -13169,26 +13227,38 @@ impl server_api::ServerApi for ServerApiContractService {
             ),
             ..Default::default()
         };
-        let Json(response) = scoped_execute_current_worker_workdir_operation(
-            State(
-                self.workspace_api()
-                    .map_err(server_api::WorkdirOperationApiError::api)?
-                    .clone(),
-            ),
-            AxumPath(ScopedWorkspacePath { workspace_id }),
-            current_worker_contract_headers(&context).map_err(|error| {
-                let mut error = server_api::WorkdirOperationApiError::api(error);
-                error.workdir_log = Some(fallback_log);
-                error
-            })?,
-            Json(WorkspaceWorkdirSessionOperationRequest {
-                target_workdir: request.target_workdir,
-                operation: request.operation,
-            }),
-        )
-        .await
-        .map_err(InternalWorkdirOperationError::into_contract_error)?;
-        Ok(server_api::CurrentWorkerWorkdirOperationResponse(response))
+        let (result, audit_failures) =
+            external_operation_audit::capture(scoped_execute_current_worker_workdir_operation(
+                State(
+                    self.workspace_api()
+                        .map_err(server_api::WorkdirOperationApiError::api)?
+                        .clone(),
+                ),
+                AxumPath(ScopedWorkspacePath { workspace_id }),
+                current_worker_contract_headers(&context).map_err(|error| {
+                    let mut error = server_api::WorkdirOperationApiError::api(error);
+                    error.workdir_log = Some(fallback_log);
+                    error
+                })?,
+                Json(WorkspaceWorkdirSessionOperationRequest {
+                    target_workdir: request.target_workdir,
+                    operation: request.operation,
+                }),
+            ))
+            .await;
+        match result {
+            Ok(Json(result)) => Ok(server_api::CurrentWorkerWorkdirOperationResponse(
+                workdir::http::WorkdirSessionOperationResponse {
+                    result,
+                    audit_failures,
+                },
+            )),
+            Err(error) => {
+                let mut error = error.into_contract_error();
+                error.audit_failures = audit_failures;
+                Err(error)
+            }
+        }
     }
 
     async fn external_workdir_grant_create(
