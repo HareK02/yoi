@@ -1062,7 +1062,8 @@ impl ExternalProviderWorkdirSession {
         {
             return Err(workdir::WorkdirError::Unavailable(
                 "External Workdir grant has expired".to_string(),
-            ));
+            )
+            .with_failure_reason(workdir::WorkdirFailureReason::ProviderGrantExpired));
         }
         // Cancellation must reach the provider even when waiting output readers
         // occupy every data-operation slot. The socket separately bounds control requests.
@@ -1079,6 +1080,7 @@ impl ExternalProviderWorkdirSession {
                         workdir::WorkdirError::Unavailable(
                             "External Workdir provider admission is closed".to_string(),
                         )
+                        .with_failure_reason(workdir::WorkdirFailureReason::ProviderAdmissionClosed)
                     })?,
             )
         };
@@ -1089,7 +1091,8 @@ impl ExternalProviderWorkdirSession {
         {
             return Err(workdir::WorkdirError::Unavailable(
                 "External Workdir grant has expired".to_string(),
-            ));
+            )
+            .with_failure_reason(workdir::WorkdirFailureReason::ProviderGrantExpired));
         }
         let operation_id = ExternalWorkdirOperationId::new(format!("op-{}", Uuid::now_v7()))
             .map_err(workdir::WorkdirError::InvalidArgument)?;
@@ -1134,7 +1137,7 @@ impl ExternalProviderWorkdirSession {
                 )
                 .await;
             return Err(workdir::WorkdirError::NotDispatched
-                .with_failure_reason(workdir::WorkdirFailureReason::ProviderUnavailable));
+                .with_failure_reason(workdir::WorkdirFailureReason::ProviderDispatchRejected));
         }
         let (result, stage) = match tokio::time::timeout(operation_timeout, receive).await {
             Ok(result) => {
@@ -1148,7 +1151,8 @@ impl ExternalProviderWorkdirSession {
                         Err(workdir::WorkdirError::OutcomeUnknown(
                             "External Workdir provider response lost; inspect before retrying"
                                 .to_string(),
-                        )),
+                        )
+                        .with_failure_reason(workdir::WorkdirFailureReason::ProviderResponseLost)),
                         Stage::ResponseUnknown,
                     ),
                 }
@@ -1159,7 +1163,8 @@ impl ExternalProviderWorkdirSession {
                     Err(workdir::WorkdirError::OutcomeUnknown(
                         "External Workdir provider response timed out; inspect before retrying"
                             .to_string(),
-                    )),
+                    )
+                    .with_failure_reason(workdir::WorkdirFailureReason::ProviderOperationTimeout)),
                     Stage::ResponseUnknown,
                 )
             }
@@ -1328,6 +1333,7 @@ impl ExternalProviderWorkdirSession {
         workdir::WorkdirError::Unavailable(format!(
             "External Workdir provider returned a mismatched result; expected {expected}"
         ))
+        .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch)
     }
 }
 
@@ -1457,7 +1463,8 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
             }
             Ok(_) if mutation => Err(workdir::WorkdirError::OutcomeUnknown(
                 "mismatched checkout mutation response".into(),
-            )),
+            )
+            .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch)),
             Ok(_) => Err(Self::mismatch("checkout_execute")),
             Err(error)
                 if mutation
@@ -37863,10 +37870,19 @@ mod tests {
                     )))
                     .unwrap();
             }
+            let error = write.await.unwrap().unwrap_err();
             assert!(matches!(
-                write.await.unwrap(),
-                Err(workdir::WorkdirError::OutcomeUnknown(_))
+                error.classification_source(),
+                workdir::WorkdirError::OutcomeUnknown(_)
             ));
+            assert_eq!(
+                error.failure_reason(),
+                Some(if lose_response {
+                    workdir::WorkdirFailureReason::ProviderResponseLost
+                } else {
+                    workdir::WorkdirFailureReason::OperationResultMismatch
+                })
+            );
         }
     }
 

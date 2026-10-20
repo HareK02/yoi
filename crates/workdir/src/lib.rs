@@ -408,6 +408,11 @@ impl From<&str> for WorkdirDenial {
 pub enum WorkdirFailureReason {
     SessionClosed,
     ProviderUnavailable,
+    ProviderGrantExpired,
+    ProviderAdmissionClosed,
+    ProviderDispatchRejected,
+    ProviderResponseLost,
+    ProviderOperationTimeout,
     CommandTerminalMissing,
     AuditStoreUnavailable,
     HttpTimeout,
@@ -440,6 +445,11 @@ impl WorkdirFailureReason {
         match self {
             Self::SessionClosed => "session_closed",
             Self::ProviderUnavailable => "provider_unavailable",
+            Self::ProviderGrantExpired => "provider_grant_expired",
+            Self::ProviderAdmissionClosed => "provider_admission_closed",
+            Self::ProviderDispatchRejected => "provider_dispatch_rejected",
+            Self::ProviderResponseLost => "provider_response_lost",
+            Self::ProviderOperationTimeout => "provider_operation_timeout",
             Self::CommandTerminalMissing => "command_terminal_missing",
             Self::AuditStoreUnavailable => "audit_store_unavailable",
             Self::HttpTimeout => "http_timeout",
@@ -474,6 +484,10 @@ impl WorkdirFailureReason {
         match self {
             Self::SessionClosed => Stage::Session,
             Self::ProviderUnavailable => Stage::Provider,
+            Self::ProviderGrantExpired | Self::ProviderAdmissionClosed => Stage::ProviderAdmission,
+            Self::ProviderDispatchRejected => Stage::ProviderDispatch,
+            Self::ProviderResponseLost | Self::ProviderOperationTimeout => Stage::ProviderResponse,
+            Self::AuditStoreUnavailable => Stage::Audit,
             Self::CommandTerminalMissing => Stage::Command,
             Self::HttpTimeout | Self::HttpConnect | Self::HttpTransfer => Stage::Http,
             Self::HttpResponseInvalid
@@ -505,6 +519,10 @@ impl WorkdirFailureReason {
 pub enum WorkdirFailureStage {
     Session,
     Provider,
+    ProviderAdmission,
+    ProviderDispatch,
+    ProviderResponse,
+    Audit,
     Command,
     Http,
     ResponseValidation,
@@ -518,6 +536,10 @@ impl WorkdirFailureStage {
         match self {
             Self::Session => "session",
             Self::Provider => "provider",
+            Self::ProviderAdmission => "provider_admission",
+            Self::ProviderDispatch => "provider_dispatch",
+            Self::ProviderResponse => "provider_response",
+            Self::Audit => "audit",
             Self::Command => "command",
             Self::Http => "http",
             Self::ResponseValidation => "response_validation",

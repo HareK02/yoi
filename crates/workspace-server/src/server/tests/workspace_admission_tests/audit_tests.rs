@@ -260,6 +260,9 @@ impl AuditHttpFixture {
                 PATH_SECRET,
                 PROVIDER_SECRET,
                 pending.proof.as_str(),
+                worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+                self.fixture.identity.private_key.as_str(),
+                self.fixture.identity.public_key.as_str(),
                 self.fixture._root.path().to_str().unwrap(),
             ] {
                 assert!(!output.contains(secret), "sensitive data escaped: {output}");
@@ -363,13 +366,33 @@ fn assert_audit_failure(
     operation_id.to_owned()
 }
 
-fn assert_failure_reason(events: &[Value], reason: &str) {
+fn assert_failure_reason(events: &[Value], reason: &str, stage: &str) {
     let errors: Vec<&Value> = events
         .iter()
         .filter(|event| event["event"] == "api_error")
         .collect();
     assert_eq!(errors.len(), 1, "{events:?}");
     assert_eq!(errors[0]["failure_reason"], reason, "{events:?}");
+    assert_eq!(errors[0]["failure_stage"], stage, "{events:?}");
+}
+
+fn assert_operational_failure(
+    body: &Value,
+    events: &[Value],
+    reason: &str,
+    stage: &str,
+    code: &str,
+    message: &str,
+) {
+    assert_failure_reason(events, reason, stage);
+    assert_eq!(body["code"], code, "{body}");
+    assert_eq!(body["message"], message, "{body}");
+    for field in ["failure_reason", "failure_stage"] {
+        assert!(
+            body.get(field).is_none(),
+            "internal diagnostic escaped: {body}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -436,7 +459,14 @@ async fn lost_write_response_after_audit_failure_stays_unknown_without_repeating
     // The provider applied the effect, but the server cannot infer that from response loss.
     drop(reply);
     let (body, events) = h.finish(pending, StatusCode::INTERNAL_SERVER_ERROR).await;
-    assert_eq!(body["code"], "outcome_unknown");
+    assert_operational_failure(
+        &body,
+        &events,
+        "provider_response_lost",
+        "provider_response",
+        "outcome_unknown",
+        "Workdir operation may have effects; inspect before retrying",
+    );
     let receipt_id = assert_audit_failure(
         &body,
         &events,
@@ -467,7 +497,7 @@ async fn before_write_audit_failure_is_not_dispatched_and_has_no_provider_effect
         json!({"kind":"not_dispatched"}),
         "NotDispatched",
     );
-    assert_failure_reason(&events, "audit_store_unavailable");
+    assert_failure_reason(&events, "audit_store_unavailable", "audit");
     assert!(
         body.get("failure_reason").is_none(),
         "internal reason leaked: {body}"
@@ -494,10 +524,133 @@ async fn rejected_write_send_with_audit_failure_is_not_dispatched_not_unknown() 
         json!({"kind":"not_dispatched"}),
         "NotDispatched",
     );
-    assert_failure_reason(&events, "provider_unavailable");
+    assert_operational_failure(
+        &body,
+        &events,
+        "provider_dispatch_rejected",
+        "provider_dispatch",
+        "not_dispatched",
+        "Workdir operation was not dispatched",
+    );
     assert!(!h.effect_path().exists());
     provider.assert_dispatches(0);
     h.assert_audits(&[(&receipt_id, "requested")]);
+}
+
+#[tokio::test]
+async fn expired_connection_grant_is_not_dispatched_and_logs_admission_reason() {
+    let (h, mut provider) = AuditHttpFixture::new().await;
+    {
+        let mut registry = h.fixture.api.external_workdir_providers.lock().unwrap();
+        let connection = registry.connections.get_mut("external-1").unwrap();
+        // Keep the persisted grant online so the real handler reaches operate's
+        // connection-expiry fence rather than the separate session-open fence.
+        Arc::get_mut(connection).unwrap().expires_at =
+            Some(Utc::now() - chrono::Duration::seconds(1));
+    }
+    h.fail_audit(false);
+    let (body, events) = h
+        .finish(h.start_write(), StatusCode::SERVICE_UNAVAILABLE)
+        .await;
+    assert_operational_failure(
+        &body,
+        &events,
+        "provider_grant_expired",
+        "provider_admission",
+        "unavailable",
+        "Workdir session is unavailable",
+    );
+    assert!(body.get("audit_failures").is_none(), "{body}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["event"] != "external_workdir_audit_failed")
+    );
+    assert!(!h.effect_path().exists());
+    provider.assert_dispatches(0);
+    h.assert_audits(&[]);
+}
+
+#[tokio::test]
+async fn closed_provider_admission_is_not_dispatched_and_logs_admission_reason() {
+    let (h, mut provider) = AuditHttpFixture::new().await;
+    h.fixture
+        .api
+        .external_workdir_providers
+        .lock()
+        .unwrap()
+        .connection("external-1")
+        .unwrap()
+        .admission
+        .close();
+    h.fail_audit(false);
+    let (body, events) = h
+        .finish(h.start_write(), StatusCode::SERVICE_UNAVAILABLE)
+        .await;
+    assert_operational_failure(
+        &body,
+        &events,
+        "provider_admission_closed",
+        "provider_admission",
+        "unavailable",
+        "Workdir session is unavailable",
+    );
+    assert!(body.get("audit_failures").is_none(), "{body}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["event"] != "external_workdir_audit_failed")
+    );
+    assert!(!h.effect_path().exists());
+    provider.assert_dispatches(0);
+    h.assert_audits(&[]);
+}
+
+#[tokio::test]
+async fn timed_out_write_after_audit_failure_stays_unknown_and_logs_timeout_reason() {
+    let (mut h, mut provider) = AuditHttpFixture::new().await;
+    // Keep the HTTP client's independent deadline beyond the unchanged 30s
+    // provider timeout. Pause only after the signed HTTP request was dispatched,
+    // avoiding automatic virtual-time advancement during socket/SQLite setup.
+    h.client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(40))
+        .build()
+        .unwrap();
+    h.fail_audit(false);
+    let mut pending = h.start_write();
+    let (dispatched_id, reply) = provider.receive_write(&mut pending).await;
+    h.apply_provider_write();
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    tokio::time::resume();
+    let (body, events) = h.finish(pending, StatusCode::INTERNAL_SERVER_ERROR).await;
+    assert_operational_failure(
+        &body,
+        &events,
+        "provider_operation_timeout",
+        "provider_response",
+        "outcome_unknown",
+        "Workdir operation may have effects; inspect before retrying",
+    );
+    let receipt_id = assert_audit_failure(
+        &body,
+        &events,
+        "response_unknown",
+        "ResponseUnknown",
+        json!({"kind":"unknown"}),
+        "Unknown",
+    );
+    assert_eq!(receipt_id, dispatched_id);
+    assert!(reply.is_closed(), "timeout retained its response receiver");
+    assert!(matches!(
+        provider.receiver.try_recv().unwrap(),
+        ExternalProviderCommand::Cancel { operation_id }
+            if operation_id.as_str() == dispatched_id.as_str()
+    ));
+    assert_eq!(std::fs::read(h.effect_path()).unwrap(), WRITE_SECRET);
+    provider.assert_dispatches(1);
+    h.assert_audits(&[(&dispatched_id, "requested")]);
 }
 
 #[tokio::test]

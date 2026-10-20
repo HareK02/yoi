@@ -6854,9 +6854,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(
-            error,
-            WorkdirError::Unavailable(message) if message == Error::DbCapacityExceeded.to_string()
+            error.classification_source(),
+            WorkdirError::Unavailable(_)
         ));
+        assert_eq!(
+            error.failure_reason(),
+            Some(workdir::WorkdirFailureReason::AuthorizationUnavailable)
+        );
+        let transport = workdir::http::WorkdirTransportError::from_workdir_error(&error);
+        assert_eq!(transport.message, "Workdir session is unavailable");
+        assert!(!format!("{error:?}").contains(&Error::DbCapacityExceeded.to_string()));
         drop(release);
         executor.drain().await.unwrap();
     }
