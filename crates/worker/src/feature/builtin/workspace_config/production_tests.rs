@@ -1,8 +1,10 @@
-//! Worker-side E2E across real Feature invocation, WIP Client/Host and typed
-//! Workspace transport. Canonical persistence/projection tests live in Backend;
-//! this deterministic router models its published auth/CAS/response contract.
+//! Worker-side integration across real Feature invocation, WIP Client/Host and the production
+//! WorkspaceConfigBackend. Only WorkspaceClient transport is substituted by a deterministic router
+//! retaining applied effects and modeling the published auth/CAS/response contract. These ordinary
+//! worker lib tests do not replace canonical persistence/projection tests owned by Backend.
 use super::*;
 use crate::feature::FeatureRegistryBuilder;
+use crate::feature::builtin::backend_diagnostic::tests::Capture;
 use crate::hook::HookRegistryBuilder;
 use crate::wip::{WipMountRegistry, WipRuntime};
 use crate::worker::{
@@ -16,6 +18,7 @@ use serde_json::{Value as Json, json};
 use server_api::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use tracing::instrument::WithSubscriber;
 
 #[derive(Debug)]
 struct State {
@@ -26,6 +29,10 @@ struct State {
     entries: BTreeMap<String, (ConfigContentType, String)>,
     commits: Vec<WorkspaceConfigCommitRequest>,
     requests: Vec<WorkspaceRequest>,
+    applied_commits: usize,
+    malformed_read_reply: Option<&'static str>,
+    malformed_observe_reply: Option<&'static str>,
+    lose_postcommit_observe_reply: bool,
     fail_commit: bool,
     fail_current: bool,
     lose_commit_reply: bool,
@@ -58,6 +65,10 @@ impl Router {
                 ]),
                 commits: Vec::new(),
                 requests: Vec::new(),
+                applied_commits: 0,
+                malformed_read_reply: None,
+                malformed_observe_reply: None,
+                lose_postcommit_observe_reply: false,
                 fail_commit: false,
                 fail_current: false,
                 lose_commit_reply: false,
@@ -222,6 +233,11 @@ impl WorkspaceClient for Router {
         }
         match suffix {
             "/observe" => {
+                if state.lose_postcommit_observe_reply && state.applied_commits > 0 {
+                    return Err(WorkspaceClientError::Request(
+                        "secret-token /private/host/config".into(),
+                    ));
+                }
                 let request: WorkspaceConfigObserveRequest = serde_json::from_value(input).unwrap();
                 assert!(request.depth <= 8 && request.paths.len() <= 256);
                 let mut kinds =
@@ -268,13 +284,23 @@ impl WorkspaceClient for Router {
                         )
                     })
                     .collect();
-                Ok(response(&WorkspaceConfigObserveResponse {
+                let mut result = WorkspaceConfigObserveResponse {
                     connection_id: state.active.as_ref().unwrap().connection_id.clone(),
                     validator: state.validator(""),
                     digest: state.tree_digest(),
                     entrypoints: vec!["main.dcdl".into()],
                     nodes,
-                }))
+                };
+                match state.malformed_observe_reply {
+                    Some("connection") => {
+                        result.connection_id = "secret-token /private/host/config".into()
+                    }
+                    Some("entrypoints") => result.entrypoints.clear(),
+                    Some("scope") => result.nodes[0].path = "outside/path.dcdl".into(),
+                    None => {}
+                    Some(_) => unreachable!(),
+                }
+                Ok(response(&result))
             }
             "/read" => {
                 let request: WorkspaceConfigReadRequest = serde_json::from_value(input).unwrap();
@@ -290,13 +316,20 @@ impl WorkspaceClient for Router {
                         WorkspaceConfigFailureClassification::NotCommitted,
                     ));
                 };
-                Ok(response(&WorkspaceConfigReadResponse {
+                let mut result = WorkspaceConfigReadResponse {
                     path: request.path.clone(),
                     content: content.clone(),
                     content_type: *content_type,
                     digest: digest(content),
                     validator: state.validator(&request.path),
-                }))
+                };
+                match state.malformed_read_reply {
+                    Some("identity") => result.path = "secret-token /private/host/config".into(),
+                    Some("size") => result.content = "x".repeat(256 * 1024 + 1),
+                    None => {}
+                    Some(_) => unreachable!(),
+                }
+                Ok(response(&result))
             }
             "/commit" => {
                 let request: WorkspaceConfigCommitRequest = serde_json::from_value(input).unwrap();
@@ -403,6 +436,7 @@ impl WorkspaceClient for Router {
                     ));
                 }
                 state.entries = entries;
+                state.applied_commits += 1;
                 if state.lose_commit_reply {
                     state.lose_commit_reply = false;
                     return Err(WorkspaceClientError::Request(
@@ -797,14 +831,20 @@ async fn post_commit_observation_mismatch_reports_unknown_without_replaying_writ
         let path = "/workspace-config/main.dcdl";
         observe_interface(&runtime, path, true).await;
         client.state.lock().unwrap().mismatched_commit_reply = Some(field);
+        let capture = Capture::default();
         let error = call(&runtime, path, "write", json!({"content":"saved"}))
+            .with_subscriber(capture.dispatch())
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("unknown"), "{field}: {error}");
+        assert!(capture.text().contains("stage=Reconcile"));
+        assert!(capture.text().contains("reason=Identity"));
+        assert!(!capture.text().contains("saved"));
         let state = client.state.lock().unwrap();
         assert_eq!(state.commits.len(), 1);
         assert_eq!(state.entries["main.dcdl"].1, "saved");
+        assert_eq!(state.applied_commits, 1);
     }
 }
 
@@ -1154,4 +1194,111 @@ async fn workspace_config_backend_validators_reject_path_and_connection_transpla
         .unwrap();
     assert!(result.content.unwrap().contains("model = updated"));
     assert_eq!(client.state.lock().unwrap().commits.len(), 1);
+}
+
+#[tokio::test]
+async fn production_read_validation_retains_reason_without_committing() {
+    for (fault, reason) in [("identity", "Identity"), ("size", "ResponseSize")] {
+        let client = Router::new();
+        let (feature, runtime) = runtime(client.clone());
+        feature.attach("initial", None).await.unwrap();
+        let path = "/workspace-config/main.dcdl";
+        observe_interface(&runtime, path, true).await;
+        client.state.lock().unwrap().malformed_read_reply = Some(fault);
+        let capture = Capture::default();
+        let error = call(&runtime, path, "read", json!({}))
+            .with_subscriber(capture.dispatch())
+            .await
+            .unwrap_err()
+            .to_string();
+        let text = capture.text();
+        assert!(text.contains(&format!("reason={reason}")), "{text}");
+        assert!(text.contains("stage=Response"));
+        assert!(!error.contains("unknown"));
+        assert!(!text.contains("secret-token") && !text.contains("/private/host"));
+        assert!(!error.contains("secret-token") && !error.contains("/private/host"));
+        let state = client.state.lock().unwrap();
+        assert_eq!(state.applied_commits, 0);
+        assert_eq!(state.entries["main.dcdl"].1, "model = old");
+    }
+}
+
+#[tokio::test]
+async fn production_observation_validation_retains_reason_without_committing() {
+    for (fault, reason) in [
+        ("connection", "Identity"),
+        ("entrypoints", "InvalidMetadata"),
+        ("scope", "InvalidMetadata"),
+    ] {
+        let client = Router::new();
+        let (feature, runtime) = runtime(client.clone());
+        feature.attach("initial", None).await.unwrap();
+        client.state.lock().unwrap().malformed_observe_reply = Some(fault);
+        let capture = Capture::default();
+        let error = runtime
+            .tree("/workspace-config/main.dcdl".into(), 0, true)
+            .with_subscriber(capture.dispatch())
+            .await
+            .unwrap_err()
+            .to_string();
+        let text = capture.text();
+        assert!(text.contains(&format!("reason={reason}")), "{text}");
+        assert!(text.contains("stage=Response"));
+        assert!(!text.contains("secret-token") && !text.contains("/private/host"));
+        assert!(!error.contains("secret-token") && !error.contains("/private/host"));
+        assert_eq!(client.state.lock().unwrap().applied_commits, 0);
+    }
+}
+
+#[tokio::test]
+async fn production_postcommit_transport_loss_retains_cause_and_unknown_without_retry() {
+    let client = Router::new();
+    let (feature, runtime) = runtime(client.clone());
+    feature.attach("initial", None).await.unwrap();
+    let path = "/workspace-config/main.dcdl";
+    observe_interface(&runtime, path, true).await;
+    client.state.lock().unwrap().lose_postcommit_observe_reply = true;
+    let capture = Capture::default();
+    let error = call(
+        &runtime,
+        path,
+        "write",
+        json!({"content":"saved-before-observation-loss"}),
+    )
+    .with_subscriber(capture.dispatch())
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("unknown"));
+    let text = capture.text();
+    assert!(
+        text.lines().any(
+            |event| event.contains("reason=Communication") && event.contains("stage=Reconcile")
+        ),
+        "{text}"
+    );
+    assert!(
+        !text.contains("reason=UnrecognizedResponse"),
+        "must not invent a response-decode cause for transport loss"
+    );
+    assert!(!text.contains("secret-token") && !text.contains("/private/host"));
+    assert!(!text.contains("saved-before-observation-loss"));
+    assert!(!error.contains("secret-token") && !error.contains("/private/host"));
+    let correlations: BTreeSet<_> = text
+        .lines()
+        .filter_map(|line| line.split("correlation=").nth(1))
+        .filter_map(|tail| tail.split(';').next())
+        .collect();
+    assert_eq!(
+        correlations.len(),
+        1,
+        "lost postcommit observation must correlate to original commit"
+    );
+    let state = client.state.lock().unwrap();
+    assert_eq!(state.commits.len(), 1);
+    assert_eq!(state.applied_commits, 1);
+    assert_eq!(
+        state.entries["main.dcdl"].1,
+        "saved-before-observation-loss"
+    );
 }
