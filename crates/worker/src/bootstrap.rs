@@ -185,13 +185,6 @@ where
             .await
             .map_err(WorkerBootstrapError::Worker)?;
 
-        crate::feature::authorize_requested_manifest(
-            worker.workspace_client_handle().as_ref(),
-            worker.manifest(),
-        )
-        .map_err(|error| {
-            WorkerBootstrapError::Worker(WorkerError::FeatureLifecycle(error.to_string()))
-        })?;
         if let Some(workdir_session) = self.workdir_session {
             worker.bind_single_workdir_session(Some(workdir_session));
         }

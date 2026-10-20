@@ -822,14 +822,15 @@ impl FeatureModule for TicketFeature {
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
         let workspace_client = self.workspace_client();
-        // Direct registry installs do not necessarily have a matching manifest
-        // switch. The public module identity still requires live activation
-        // authority before any Tool, instruction or service contribution.
-        workspace_client
-            .authorize_feature_activation(FEATURE_ID)
-            .map_err(|error| {
-                FeatureInstallError::Install(format!("Ticket activation rejected: {error}"))
-            })?;
+        // Direct new registry installs may not have a matching manifest switch.
+        // Restore retains saved composition; operations still require live authority.
+        if !context.is_restoring() {
+            workspace_client
+                .authorize_feature_activation(FEATURE_ID)
+                .map_err(|error| {
+                    FeatureInstallError::Install(format!("Ticket activation rejected: {error}"))
+                })?;
+        }
         let ticket_service: Arc<dyn TicketService> = Arc::new(WorkspaceTicketService {
             backend: WorkspaceHttpTicketBackend::new(workspace_client.clone()),
             access: self.access,
@@ -4368,6 +4369,42 @@ mod tests {
             assert!(report.services.providers().is_empty());
             assert_eq!(client.requests.lock().unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn restored_ticket_keeps_tools_and_services_but_rejects_revoked_operation() {
+        let client = Arc::new(CreateAuthorizationClient {
+            workspace: Some("workspace"),
+            activation_allowed: false,
+            allowed: false,
+            backend_status: 200,
+            requests: Default::default(),
+        });
+        let mut tools = Vec::new();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ticket_tools_feature(
+                client.clone(),
+                TicketFeatureAccess::workspace_authoring(),
+            ))
+            .with_installation(crate::feature::FeatureInstallation::Restore)
+            .install_into_pending(&mut tools, &mut HookRegistryBuilder::default());
+        assert!(!report.has_errors(), "{}", report.error_message());
+        assert!(tools.iter().any(|tool| tool().0.name == "TicketCreate"));
+        assert!(!report.installed_instruction_contributions().is_empty());
+        assert!(client.requests.lock().unwrap().is_empty());
+        let service = report
+            .services
+            .service::<dyn TicketService>(&ServiceId::builtin(TICKET_SERVICE_ID))
+            .unwrap();
+        let error = service
+            .create(NewTicket::new("Revoked operation"))
+            .unwrap_err();
+        assert!(error.to_string().contains("HTTP status 403"), "{error}");
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "denial must precede the backend effect");
+        assert!(requests[0].path.ends_with("/authorization/check"));
+        let body: Value = serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["operation"], "ticket.create");
     }
 
     #[test]

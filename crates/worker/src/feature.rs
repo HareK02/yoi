@@ -1534,8 +1534,18 @@ impl ProtocolProviderRegistrar<'_> {
     }
 }
 
+/// Restore preserves the saved Feature composition; only new activation asks
+/// for admission. Neither mode grants authority for protected operations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FeatureInstallation {
+    #[default]
+    Activate,
+    Restore,
+}
+
 /// Install-time context provided to a feature module.
 pub struct FeatureInstallContext<'a> {
+    installation: FeatureInstallation,
     feature_id: &'a FeatureId,
     declarations: &'a FeatureContributionDeclarations,
     pending_tools: &'a mut Vec<ToolDefinition>,
@@ -1548,6 +1558,10 @@ pub struct FeatureInstallContext<'a> {
 }
 
 impl FeatureInstallContext<'_> {
+    pub(crate) fn is_restoring(&self) -> bool {
+        self.installation == FeatureInstallation::Restore
+    }
+
     pub fn feature_id(&self) -> &FeatureId {
         self.feature_id
     }
@@ -1751,6 +1765,7 @@ pub enum FeaturePlanError {
 /// Builder/installer for enabled feature modules.
 pub struct FeatureRegistryBuilder {
     modules: Vec<Arc<dyn FeatureModule>>,
+    installation: FeatureInstallation,
     activation_guard: Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
 }
 
@@ -1998,6 +2013,7 @@ impl Default for FeatureRegistryBuilder {
     fn default() -> Self {
         Self {
             modules: Vec::new(),
+            installation: FeatureInstallation::Activate,
             activation_guard: None,
         }
     }
@@ -2008,7 +2024,13 @@ impl FeatureRegistryBuilder {
         Self::default()
     }
 
-    /// Add a trusted, live preflight that runs before *any* module install. Worker
+    pub(crate) fn with_installation(mut self, installation: FeatureInstallation) -> Self {
+        self.installation = installation;
+        self
+    }
+
+    /// Add a trusted, live preflight that runs before *any* new module activation.
+    /// Restoring saved composition does not repeat admission checks. Worker
     /// hosts use this in addition to the earlier pre-construction preflight.
     pub fn with_activation_guard(
         mut self,
@@ -2095,10 +2117,11 @@ impl FeatureRegistryBuilder {
         hook_builder: &mut HookRegistryBuilder,
         mut installed_tool_names: HashMap<String, FeatureId>,
     ) -> FeatureRegistryInstallReport {
-        if let Some(error) = self
-            .activation_guard
-            .as_ref()
-            .and_then(|guard| guard().err())
+        if self.installation == FeatureInstallation::Activate
+            && let Some(error) = self
+                .activation_guard
+                .as_ref()
+                .and_then(|guard| guard().err())
         {
             return FeatureRegistryInstallReport {
                 reports: {
@@ -2231,6 +2254,7 @@ impl FeatureRegistryBuilder {
 
             let install_result = {
                 let mut context = FeatureInstallContext {
+                    installation: self.installation,
                     feature_id: &descriptor.id,
                     declarations: &declarations,
                     pending_tools,

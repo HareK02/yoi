@@ -3488,6 +3488,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     prepared_initial_seed: Option<Vec<LogEntry>>,
     prepared_initial_prompt_completion: Option<(String, PromptContributionCompletion)>,
     subjektiv_host: Option<Arc<dyn crate::subjektiv::SubjektivHost>>,
+    feature_installation: crate::feature::FeatureInstallation,
     /// One-shot generic Feature lifecycle notification required after restore.
     restore_feature_lifecycle_pending: bool,
     /// Complete system prompt replacement installed by an enabled Feature.
@@ -3759,6 +3760,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             prepared_initial_seed: None,
             prepared_initial_prompt_completion: None,
             subjektiv_host: None,
+            feature_installation: crate::feature::FeatureInstallation::Activate,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
@@ -4202,6 +4204,18 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.feature_invocations.clone()
     }
 
+    pub(crate) fn authorize_feature_configuration(&self) -> Result<(), WorkspaceClientError> {
+        match self.feature_installation {
+            crate::feature::FeatureInstallation::Activate => {
+                crate::feature::authorize_requested_manifest(
+                    self.workspace_client_handle().as_ref(),
+                    self.manifest(),
+                )
+            }
+            crate::feature::FeatureInstallation::Restore => Ok(()),
+        }
+    }
+
     /// Install enabled feature modules into the Worker host surfaces.
     pub fn install_features(
         &mut self,
@@ -4210,10 +4224,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.backend_job.get_or_init(|| None);
         let client = self.workspace_client_handle();
         let manifest = self.manifest().clone();
-        let registry = registry.with_activation_guard(move || {
-            crate::feature::authorize_requested_manifest(client.as_ref(), &manifest)
-                .map_err(|error| error.to_string())
-        });
+        let registry = registry
+            .with_installation(self.feature_installation)
+            .with_activation_guard(move || {
+                crate::feature::authorize_requested_manifest(client.as_ref(), &manifest)
+                    .map_err(|error| error.to_string())
+            });
         let worker = self.engine.as_mut().expect("worker taken during run");
         let report = registry.install_into_engine(worker, &mut self.hook_builder);
         if report.has_errors() {
@@ -8277,6 +8293,11 @@ where
         // session_id + segment_id are allocated here so the worker-allocation
         // registration can record them from the start. Pending lifecycle
         // recovery reuses its already persisted Session identity.
+        let feature_installation = if existing_session_id.is_some() {
+            crate::feature::FeatureInstallation::Restore
+        } else {
+            crate::feature::FeatureInstallation::Activate
+        };
         let session_id = existing_session_id.unwrap_or_else(session_store::new_session_id);
         let segment_id = session_store::new_segment_id();
 
@@ -8360,6 +8381,7 @@ where
             prepared_initial_seed: None,
             prepared_initial_prompt_completion: None,
             subjektiv_host: None,
+            feature_installation,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
@@ -8760,6 +8782,7 @@ where
             prepared_initial_seed: None,
             prepared_initial_prompt_completion: None,
             subjektiv_host: None,
+            feature_installation: crate::feature::FeatureInstallation::Activate,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
@@ -8893,6 +8916,7 @@ where
             prepared_initial_seed: None,
             prepared_initial_prompt_completion: None,
             subjektiv_host: None,
+            feature_installation: crate::feature::FeatureInstallation::Activate,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
@@ -9305,6 +9329,7 @@ where
             prepared_initial_seed: None,
             prepared_initial_prompt_completion: None,
             subjektiv_host: None,
+            feature_installation: crate::feature::FeatureInstallation::Restore,
             restore_feature_lifecycle_pending: true,
             feature_system_prompt_override: None,
             user_segments: state.user_segments,
@@ -18193,6 +18218,234 @@ permission = "write"
             .unwrap();
         assert_eq!(receipt, Some(committed.annotation.entry_id));
         assert!(writer.state.append_lock.try_lock().is_ok());
+    }
+
+    // Production bootstrap, Controller registration, and durable stores; only the
+    // Workspace transport and model are replaced. No live Server is needed.
+    #[derive(Debug, Default)]
+    struct FeatureAdmissionClient {
+        requests: Mutex<Vec<WorkspaceRequest>>,
+        response_status: Mutex<Option<u16>>,
+    }
+
+    impl WorkspaceClient for FeatureAdmissionClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("feature-restore-workspace")
+        }
+
+        fn kind(&self) -> &str {
+            "feature-admission-test"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            assert!(request.path.ends_with("/authorization/check"));
+            self.requests.lock().unwrap().push(request);
+            match *self.response_status.lock().unwrap() {
+                Some(status) => Ok(WorkspaceResponse {
+                    status,
+                    body: if status == 200 {
+                        r#"{"scope":null}"#.into()
+                    } else {
+                        r#"{"message":"current grant denied"}"#.into()
+                    },
+                }),
+                None => Err(WorkspaceClientError::Unavailable("Host not serving".into())),
+            }
+        }
+    }
+
+    fn feature_restore_bootstrap(
+        temp: &tempfile::TempDir,
+        manifest: WorkerManifest,
+        store: BodyPublicationStore,
+        client: Arc<FeatureAdmissionClient>,
+    ) -> crate::WorkerBootstrap<BodyPublicationStore> {
+        crate::WorkerBootstrap::new(
+            manifest,
+            store,
+            PromptCatalogSource::builtins_only(),
+            WorkerWorkspaceContext::with_client(
+                Some(WorkspaceId::new("feature-restore-workspace").unwrap()),
+                client,
+            ),
+            WorkerFilesystemAuthority::None,
+            crate::WorkerBootstrapLayout::RuntimeManagedRun {
+                run_dir: temp
+                    .path()
+                    .join("runtime/runs")
+                    .join(uuid::Uuid::now_v7().to_string()),
+            },
+            crate::WorkerControllerTransport::InProcess,
+        )
+        .with_model_client(NoopClient)
+    }
+
+    fn feature_restore_fixture(temp: &tempfile::TempDir) -> (WorkerManifest, BodyPublicationStore) {
+        let mut manifest = minimal_manifest();
+        manifest.worker.name = format!("feature-restore-{}", uuid::Uuid::now_v7());
+        manifest.scope.allow.clear();
+        manifest.feature.task.enabled = true;
+        manifest.feature.ticket.enabled = true;
+        manifest.profile = Some(manifest::ProfileManifestSnapshot {
+            source: manifest::ProfileSource::Registry {
+                source: manifest::ProfileRegistrySource::Builtin,
+                name: "default".into(),
+                path: None,
+                provenance: None,
+            },
+            profile: None,
+        });
+        let store = session_store::CombinedStore::new(
+            session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+            session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+        );
+        (manifest, store)
+    }
+
+    #[tokio::test]
+    async fn new_worker_rejects_denied_feature_before_persisting_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+        let (manifest, store) = feature_restore_fixture(&temp);
+        let client = Arc::new(FeatureAdmissionClient::default());
+        *client.response_status.lock().unwrap() = Some(403);
+        let result =
+            feature_restore_bootstrap(&temp, manifest.clone(), store.clone(), client.clone())
+                .prepare()
+                .await;
+        assert!(matches!(
+            result,
+            Err(crate::WorkerBootstrapError::Worker(
+                WorkerError::FeatureLifecycle(_)
+            ))
+        ));
+        assert!(store.read_by_name(&manifest.worker.name).unwrap().is_none());
+        assert!(!client.requests.lock().unwrap().is_empty());
+        assert!(!temp.path().join("runtime").exists());
+    }
+
+    #[tokio::test]
+    async fn new_worker_rechecks_feature_admission_before_controller_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+        let (manifest, store) = feature_restore_fixture(&temp);
+        let client = Arc::new(FeatureAdmissionClient::default());
+        *client.response_status.lock().unwrap() = Some(200);
+        let prepared = feature_restore_bootstrap(&temp, manifest, store, client.clone())
+            .prepare()
+            .await
+            .unwrap();
+        client.requests.lock().unwrap().clear();
+        *client.response_status.lock().unwrap() = Some(403);
+        match prepared.start().await {
+            Err(crate::WorkerBootstrapError::Controller { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(source.to_string().contains("HTTP status 403"));
+            }
+            Err(other) => panic!("unexpected rejection: {other:?}"),
+            Ok(controller) => {
+                stop_body_publication_controller(controller).await;
+                panic!("new activation must not bypass admission");
+            }
+        }
+        assert!(!client.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_preserves_saved_features_and_prompt_without_feature_readmission() {
+        for materialized in [false, true] {
+            for response_status in [Some(403), None] {
+                let temp = tempfile::tempdir().unwrap();
+                let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+                let (manifest, store) = feature_restore_fixture(&temp);
+                let client = Arc::new(FeatureAdmissionClient::default());
+                *client.response_status.lock().unwrap() = Some(200);
+                let prepared = feature_restore_bootstrap(
+                    &temp,
+                    manifest.clone(),
+                    store.clone(),
+                    client.clone(),
+                )
+                .prepare()
+                .await
+                .unwrap();
+                let session = prepared.worker().session_id();
+                let mut saved = Vec::new();
+                let mut saved_prompt = None;
+                let mut saved_segment = None;
+                if materialized {
+                    let segment = prepared.worker().segment_id();
+                    let controller = prepared.start().await.unwrap();
+                    saved = store.read_all(session, segment).unwrap();
+                    saved_prompt = session_store::collect_state(&saved).system_prompt;
+                    assert!(saved_prompt.is_some());
+                    saved_segment = Some(segment);
+                    stop_body_publication_controller(controller).await;
+                } else {
+                    drop(prepared);
+                    assert!(store.list_segments(session).unwrap().is_empty());
+                }
+                client.requests.lock().unwrap().clear();
+                *client.response_status.lock().unwrap() = response_status;
+                let mut fallback = manifest.clone();
+                fallback.feature.task.enabled = false;
+                fallback.feature.ticket.enabled = false;
+                fallback.feature.workdir_catalog.enabled = false;
+                fallback.engine.instruction = "must not replace saved instructions".into();
+                let restored =
+                    feature_restore_bootstrap(&temp, fallback, store.clone(), client.clone())
+                        .prepare_restored(&manifest.worker.name)
+                        .await
+                        .unwrap();
+                assert_eq!(restored.worker().session_id(), session);
+                assert_eq!(restored.worker().manifest().feature, manifest.feature);
+                assert_eq!(
+                    restored.worker().manifest().engine.instruction,
+                    manifest.engine.instruction
+                );
+                if let Some(prompt) = &saved_prompt {
+                    assert_eq!(
+                        restored.worker().engine().get_system_prompt(),
+                        Some(prompt.as_str())
+                    );
+                    assert_eq!(Some(restored.worker().segment_id()), saved_segment);
+                }
+                assert!(client.requests.lock().unwrap().is_empty());
+                let controller = restored.start().await.unwrap();
+                let installed: WorkerManifest =
+                    toml::from_str(&controller.handle.shared_state.manifest_toml).unwrap();
+                assert_eq!(installed.feature, manifest.feature);
+                let committed = controller.handle.committed_entries();
+                if materialized {
+                    assert_eq!(
+                        serde_json::to_value(&committed[..saved.len()]).unwrap(),
+                        serde_json::to_value(&saved).unwrap(),
+                    );
+                    assert_eq!(
+                        session_store::collect_state(&committed).system_prompt,
+                        saved_prompt
+                    );
+                } else {
+                    assert!(
+                        session_store::collect_state(&committed)
+                            .system_prompt
+                            .is_some()
+                    );
+                }
+                assert!(
+                    client.requests.lock().unwrap().is_empty(),
+                    "restore must not ask for Feature admission"
+                );
+                stop_body_publication_controller(controller).await;
+            }
+        }
     }
 
     fn minimal_manifest() -> WorkerManifest {

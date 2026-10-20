@@ -1403,14 +1403,11 @@ where
     // Worker-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `worker`.
     let feature_config = worker.manifest().feature.clone();
-    // First boundary: before any Feature initialization, Tool/WIP/service
-    // registration, prompt contribution, or discovery side effect. Host derives
-    // the live caller grant; the Profile only requests these switches.
-    crate::feature::authorize_requested_manifest(
-        worker.workspace_client_handle().as_ref(),
-        worker.manifest(),
-    )
-    .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
+    // New activation requires admission before any initialization side effect.
+    // Restore reconstructs saved composition; operation authority stays live.
+    worker
+        .authorize_feature_configuration()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
     let workdir_sessions = worker.workdir_sessions();
     let restrict_workdir_tools_to_current_capabilities = inherited_workdir_tool_broker.is_some();
     let workdir_tool_broker = Some(
