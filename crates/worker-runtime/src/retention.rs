@@ -1258,8 +1258,11 @@ fn for_each_live_session(
             let session_id = match identity {
                 Ok(Some(session_id)) => session_id,
                 Ok(None) => continue,
-                Err(_) if is_archive => {
-                    warn_unavailable_archive(&aggregate);
+                Err(error) if is_archive => {
+                    warn_unavailable_archive(
+                        &aggregate,
+                        ArchiveMigrationFailure::runtime("session_identity", &error),
+                    );
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -1271,9 +1274,11 @@ fn for_each_live_session(
                 Err(session_store::StoreError::SessionErased(_)) => continue,
                 Err(error) => return Err(retention_error(error)),
             }
-            if is_archive && validate_archive_migration(&aggregate).is_err() {
-                warn_unavailable_archive(&aggregate);
-                continue;
+            if is_archive {
+                if let Err(failure) = validate_archive_migration(&aggregate) {
+                    warn_unavailable_archive(&aggregate, failure);
+                    continue;
+                }
             }
             // Publication failures still abort the outer staging transaction.
             visit(&aggregate, is_archive)?;
@@ -1282,7 +1287,75 @@ fn for_each_live_session(
     Ok(())
 }
 
-fn validate_archive_migration(aggregate: &Path) -> Result<(), RuntimeError> {
+struct ArchiveMigrationFailure {
+    stage: &'static str,
+    reason: &'static str,
+}
+
+impl ArchiveMigrationFailure {
+    fn runtime(stage: &'static str, error: &RuntimeError) -> Self {
+        let reason = match error {
+            RuntimeError::StoreIo { source, .. } => safe_io_reason(source),
+            RuntimeError::StoreCorrupt { message, .. } => match message.as_str() {
+                "archive manifest identity mismatch" => "archive_identity_mismatch",
+                "archive id collision or manifest mismatch" => "archive_manifest_mismatch",
+                "archive checksum or content summary mismatch" => "archive_checksum_mismatch",
+                "archive storage attestation does not match ingestion receipt" => {
+                    "archive_storage_attestation_mismatch"
+                }
+                _ => "invalid_stored_data",
+            },
+            RuntimeError::InvalidRequest(_) => "invalid_identity",
+            _ => "archive_validation_failed",
+        };
+        Self { stage, reason }
+    }
+
+    fn conversion(error: session_store::StoreError) -> Self {
+        use session_store::StoreError;
+        let reason = match error {
+            StoreError::Io(error) => safe_io_reason(&error),
+            StoreError::Serde(_) => "invalid_session_manifest",
+            StoreError::Corrupt { message, .. }
+                if message.starts_with("unsupported Worker Session schema version ") =>
+            {
+                "unsupported_session_schema"
+            }
+            // The legacy decoder wraps InputMetadataError in a path-bearing Corrupt
+            // message. Recognize only its fixed cause; never publish that wrapper.
+            StoreError::Corrupt { message, .. }
+                if message.ends_with(&format!(
+                    ": {}",
+                    session_store::InputMetadataError::ResourceLimit
+                )) =>
+            {
+                "input_resource_limit_exceeded"
+            }
+            StoreError::Corrupt { .. } => "invalid_session_log",
+            StoreError::InvalidInputMetadata(session_store::InputMetadataError::ResourceLimit) => {
+                "input_resource_limit_exceeded"
+            }
+            StoreError::InvalidInputMetadata(_) => "invalid_input_metadata",
+            StoreError::ReadLimitExceeded => "read_limit_exceeded",
+            _ => "session_conversion_failed",
+        };
+        Self {
+            stage: "session_conversion",
+            reason,
+        }
+    }
+}
+
+fn safe_io_reason(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::InvalidData => "invalid_data",
+        _ => "io_error",
+    }
+}
+
+fn validate_archive_migration(aggregate: &Path) -> Result<(), ArchiveMigrationFailure> {
     let session = aggregate.join("session");
     // Current archives need no conversion. Their payload integrity is checked
     // on access, not by scanning every retained byte during Runtime startup.
@@ -1292,16 +1365,21 @@ fn validate_archive_migration(aggregate: &Path) -> Result<(), RuntimeError> {
     let manifest: WorkerSessionArchiveManifest = read_json(
         &aggregate.join("manifest.json"),
         "read archive before Session migration",
-    )?;
-    validate_existing_archive(aggregate, &manifest, false)?;
-    session_store::WorkerSessionStore::validate_migration(&session).map_err(retention_error)
+    )
+    .map_err(|error| ArchiveMigrationFailure::runtime("archive_manifest", &error))?;
+    validate_existing_archive(aggregate, &manifest, false)
+        .map_err(|error| ArchiveMigrationFailure::runtime("archive_integrity", &error))?;
+    session_store::WorkerSessionStore::validate_migration(&session)
+        .map_err(ArchiveMigrationFailure::conversion)
 }
 
-fn warn_unavailable_archive(aggregate: &Path) {
+fn warn_unavailable_archive(aggregate: &Path, failure: ArchiveMigrationFailure) {
     let archive_id = aggregate.file_name().unwrap_or_default().to_string_lossy();
     tracing::warn!(
         archive_id = %bounded_diagnostic_id(&archive_id),
         code = "session_archive_unavailable",
+        stage = failure.stage,
+        reason = failure.reason,
         "Retained Session archive could not be admitted for migration; original bytes retained"
     );
 }
@@ -2115,6 +2193,160 @@ mod tests {
         migrate_staged_sessions(temp.path()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"corrupt\n");
         assert!(!archive.join(ARCHIVE_STORAGE_FILE).exists());
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn archive_admission_logs_safe_causes_and_startup_preserves_original_bytes() {
+        // Exercise FsRuntimeStore startup, real archive admission and Session conversion;
+        // only the tracing sink is substituted, and all storage is temporary.
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        use crate::fs_store::FsRuntimeStore;
+        const PRIVATE: &str = "private-session-content-token=/private/host/session";
+        for (case, stage, reason) in [
+            ("identity_json", "session_identity", "invalid_stored_data"),
+            ("identity_value", "session_identity", "invalid_identity"),
+            ("manifest_json", "archive_manifest", "invalid_stored_data"),
+            (
+                "manifest_identity",
+                "archive_integrity",
+                "archive_identity_mismatch",
+            ),
+            ("storage_json", "archive_integrity", "invalid_stored_data"),
+            ("checksum", "archive_integrity", "archive_checksum_mismatch"),
+            ("schema", "session_conversion", "unsupported_session_schema"),
+            ("log", "session_conversion", "invalid_session_log"),
+            (
+                "resource_limit",
+                "session_conversion",
+                "input_resource_limit_exceeded",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("private-runtime-root");
+            drop(
+                crate::Runtime::with_fs_store(
+                    crate::fs_store::FsRuntimeStoreOptions::new(&root).with_runtime_id("runtime-a"),
+                )
+                .unwrap(),
+            );
+            let worker = WorkerId::now_v7();
+            let segment = old_compacted_source(&root, worker);
+            let provider = FsWorkerRetentionProvider::new(&root);
+            let worker_dir = provider.worker_dir(worker);
+            let log = worker_dir
+                .join("session/segments")
+                .join(format!("{segment}.jsonl"));
+            if case == "log" {
+                fs::write(&log, format!("{{\"type\":\"{PRIVATE}\"}}\n")).unwrap();
+            } else if case == "schema" {
+                let path = worker_dir.join("session/session.json");
+                let mut manifest: serde_json::Value = read_json(&path, "test").unwrap();
+                manifest["schema_version"] = serde_json::json!(999);
+                write_json(&path, &manifest);
+            } else if case == "resource_limit" {
+                let mut bytes = fs::read_to_string(&log).unwrap();
+                for line in include_str!("retention/fixtures/system-input-v4.jsonl").lines() {
+                    let mut entry: serde_json::Value = serde_json::from_str(line).unwrap();
+                    if let Some(item) = entry.pointer_mut("/entry/item")
+                        && item.get("snapshot").is_some()
+                    {
+                        item["snapshot"] = serde_json::json!({
+                            "private": PRIVATE.repeat(128 * 1024 / PRIVATE.len() + 1)
+                        });
+                    }
+                    bytes.push_str(&serde_json::to_string(&entry).unwrap());
+                    bytes.push('\n');
+                }
+                fs::write(&log, bytes).unwrap();
+            }
+            commit_session_archive(
+                &provider,
+                &request(worker, SessionDisposition::Archive),
+                &worker_dir,
+            )
+            .unwrap();
+            fs::remove_dir_all(worker_dir).unwrap();
+            let archive = provider.archive_dir("archive-a").unwrap();
+            match case {
+                "identity_json" => write_json(
+                    &archive.join("session/session.json"),
+                    &serde_json::json!({"session_id": [PRIVATE]}),
+                ),
+                "identity_value" => write_json(
+                    &archive.join("session/session.json"),
+                    &serde_json::json!({"session_id": PRIVATE}),
+                ),
+                "manifest_json" => write_json(
+                    &archive.join("manifest.json"),
+                    &serde_json::json!({"schema_version": PRIVATE}),
+                ),
+                "manifest_identity" => {
+                    let path = archive.join("manifest.json");
+                    let mut manifest: WorkerSessionArchiveManifest =
+                        read_json(&path, "test").unwrap();
+                    manifest.archive_id = PRIVATE.into();
+                    write_json(&path, &manifest);
+                }
+                "storage_json" => write_json(
+                    &archive.join(ARCHIVE_STORAGE_FILE),
+                    &serde_json::json!({"schema_version": PRIVATE}),
+                ),
+                "checksum" => fs::write(
+                    archive
+                        .join("session/segments")
+                        .join(format!("{segment}.jsonl")),
+                    PRIVATE,
+                )
+                .unwrap(),
+                _ => {}
+            }
+            let snapshot = || {
+                collect_files(&archive, "test")
+                    .unwrap()
+                    .into_iter()
+                    .map(|(relative, path)| (relative, fs::read(path).unwrap()))
+                    .collect::<Vec<_>>()
+            };
+            let before = snapshot();
+            for _ in 0..2 {
+                let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let writer = Capture(output.clone());
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .without_time()
+                    .with_writer(move || writer.clone())
+                    .finish();
+                tracing::subscriber::with_default(subscriber, || {
+                    tracing::callsite::rebuild_interest_cache();
+                    drop(FsRuntimeStore::open_or_create(root.clone(), "runtime-a").unwrap());
+                });
+                let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+                assert!(log.contains("session_archive_unavailable"), "{case}: {log}");
+                assert!(log.contains("archive_id=archive-a"), "{case}: {log}");
+                assert!(log.contains(&format!("stage=\"{stage}\"")), "{case}: {log}");
+                assert!(
+                    log.contains(&format!("reason=\"{reason}\"")),
+                    "{case}: {log}"
+                );
+                assert!(log.contains("original bytes retained"), "{case}: {log}");
+                assert!(!log.contains("private-session-content"), "{case}: {log}");
+                assert!(!log.contains("/private"), "{case}: {log}");
+                assert!(!log.contains("private-runtime-root"), "{case}: {log}");
+                assert_eq!(snapshot(), before, "{case}");
+                assert!(!archive.join(ARCHIVE_STORAGE_FILE).exists() || case == "storage_json");
+            }
+        }
     }
 
     #[test]

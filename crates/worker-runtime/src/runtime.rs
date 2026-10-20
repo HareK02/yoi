@@ -2893,7 +2893,7 @@ impl Runtime {
                 Ok(receipt)
             }
             WorkerExecutionSpawnResult::ReconciliationRequired {
-                result: _result,
+                result,
                 worker_state,
                 workdir_attachments,
             } => {
@@ -2922,7 +2922,11 @@ impl Runtime {
                 Ok(RuntimeWorkerRestoreResult::failed(
                     WorkerRestoreState::ReconciliationRequired,
                     "worker_restore_reconciliation_required",
-                    "Worker restore result is uncertain; reread or retry the Worker restore",
+                    sanitize_worker_create_failure_message(&format!(
+                        "Worker restore requires reconciliation ({:?}): {}",
+                        result.outcome,
+                        result.message_or_default(),
+                    )),
                 ))
             }
             WorkerExecutionSpawnResult::Errored(_result) => {
@@ -13736,6 +13740,129 @@ mod tests {
             .unwrap();
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_reconciliation_exposes_bounded_redacted_backend_reason() {
+        for has_state in [false, true] {
+            let (runtime, backend) = runtime_and_backend();
+            let worker = runtime
+                .create_worker(task_request("restore diagnosis"))
+                .unwrap();
+            let worker_state = if has_state {
+                runtime
+                    .worker_detail(&worker.worker_ref)
+                    .unwrap()
+                    .worker_state
+            } else {
+                None
+            };
+            runtime.stop_worker(&worker.worker_ref, None).unwrap();
+            *backend.restore_result.lock().unwrap() = Some(
+                WorkerExecutionSpawnResult::ReconciliationRequired {
+                    result: WorkerExecutionResult::busy(
+                        WorkerExecutionOperation::Restore,
+                        format!(
+                            "controller acknowledgement timed out at /private/runtime/worker.sock token=restore-token password hidden-value {}",
+                            "x".repeat(512),
+                        ),
+                    ),
+                    worker_state,
+                    workdir_attachments: Vec::new(),
+                },
+            );
+            let result = runtime
+                .restore_worker_operation(
+                    &worker.worker_ref,
+                    runtime.test_restore_request(&worker.worker_ref),
+                )
+                .unwrap();
+            assert_eq!(result.state, WorkerRestoreState::ReconciliationRequired);
+            assert_eq!(
+                result.reason_code.as_deref(),
+                Some("worker_restore_reconciliation_required")
+            );
+            let message = result.message.unwrap();
+            assert!(
+                message.contains("controller acknowledgement timed out"),
+                "{message}"
+            );
+            assert!(message.contains("Busy"), "{message}");
+            assert!(!message.contains("/private"), "{message}");
+            assert!(!message.contains("restore-token"), "{message}");
+            assert!(!message.contains("hidden-value"), "{message}");
+            assert!(message.chars().count() <= WORKER_CREATE_FAILURE_MESSAGE_LIMIT + 1);
+            assert!(
+                runtime
+                    .lock()
+                    .unwrap()
+                    .worker(&worker.worker_ref)
+                    .unwrap()
+                    .pending_restore
+                    .is_some()
+            );
+            assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        }
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn startup_restore_persists_redacted_reconciliation_reason() {
+        // Real Runtime startup and durable diagnostics; only execution is substituted.
+        let dir = tempfile::tempdir().unwrap();
+        let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
+            .with_runtime_id("restore-diagnostics");
+        let initial = Runtime::with_fs_store_and_execution_backend(
+            options.clone(),
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        initial.store_config_bundle(test_bundle()).unwrap();
+        let worker = initial
+            .create_worker(task_request("startup diagnosis"))
+            .unwrap();
+        drop(initial);
+        let backend = Arc::new(TestExecutionBackend::default());
+        *backend.restore_result.lock().unwrap() =
+            Some(WorkerExecutionSpawnResult::ReconciliationRequired {
+                result: WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Restore,
+                    "controller connection timed out at /private/worker.sock token=hidden-token",
+                ),
+                worker_state: None,
+                workdir_attachments: Vec::new(),
+            });
+        let restored =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        assert!(
+            restored
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .pending_restore
+                .is_some()
+        );
+        drop(restored);
+        let reopened = Runtime::with_fs_store(options).unwrap();
+        let state = reopened.lock().unwrap();
+        let diagnostic = state
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "worker_execution_restore_failed"
+                    && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
+            })
+            .unwrap();
+        assert!(
+            diagnostic
+                .message
+                .contains("controller connection timed out")
+        );
+        assert!(diagnostic.message.contains("Errored"));
+        assert!(!diagnostic.message.contains("/private"));
+        assert!(!diagnostic.message.contains("hidden-token"));
     }
 
     #[test]
