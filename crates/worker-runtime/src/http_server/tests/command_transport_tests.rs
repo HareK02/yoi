@@ -157,6 +157,72 @@ impl Harness {
 }
 
 #[tokio::test]
+async fn real_http_waiting_command_survives_long_poll_expiry() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let harness = Harness::new().await;
+        let handle = harness
+            .remote
+            .start_command(CommandRequest {
+                transport_byte_budget: 1024,
+                command: "printf ready; while [ ! -e release ]; do sleep 0.05; done; printf after; printf err >&2; exit 7".into(),
+                timeout_secs: 40,
+                cwd: WorkdirPath::root(),
+                tool_call_id: None,
+            })
+            .await
+            .unwrap();
+        let mut request = CommandOutputRequest {
+            handle,
+            cursor: 0,
+            limit: 1024,
+            wait: true,
+        };
+        let ready = harness.remote.command_output(request.clone()).await.unwrap();
+        assert_eq!(ready.chunks.iter().flat_map(|c| c.bytes.iter().copied()).collect::<Vec<_>>(), b"ready");
+        assert!(ready.terminal.is_none());
+        request.cursor = ready.next_cursor;
+
+        // Keep the command silent until the production HTTP handler has expired
+        // its 20-second long poll. The client must keep waiting, not fail or
+        // expose an empty page as completed output.
+        let waiting = harness.remote.command_output(request.clone());
+        tokio::pin!(waiting);
+        tokio::select! {
+            result = &mut waiting => panic!("waiting read ended before release: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(21)) => {}
+        }
+        std::fs::write(harness._root.path().join("release"), b"").unwrap();
+        let mut page = waiting.await.unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let terminal = loop {
+            // The retry cursor still replays the exact nonempty/terminal page.
+            assert_eq!(harness.remote.command_output(request.clone()).await.unwrap(), page);
+            for chunk in &page.chunks {
+                assert_eq!(chunk.sequence, request.cursor);
+                request.cursor += chunk.bytes.len() as u64;
+                match chunk.stream {
+                    CommandStream::Stdout => stdout.extend_from_slice(&chunk.bytes),
+                    CommandStream::Stderr => stderr.extend_from_slice(&chunk.bytes),
+                }
+            }
+            assert_eq!(page.next_cursor, request.cursor);
+            if let Some(terminal) = page.terminal {
+                break terminal;
+            }
+            page = harness.remote.command_output(request.clone()).await.unwrap();
+        };
+        assert_eq!(stdout, b"after");
+        assert_eq!(stderr, b"err");
+        assert_eq!(terminal.status, workdir::CommandStatus::Failed);
+        assert_eq!(terminal.exit_code, Some(7));
+        harness.remote.close().await.unwrap();
+    })
+    .await
+    .expect("bounded long-poll continuation over HTTP");
+}
+
+#[tokio::test]
 async fn real_http_closed_session_retains_failure_reason() {
     let harness = Harness::new().await;
     let handle = harness

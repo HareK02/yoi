@@ -898,34 +898,43 @@ mod client {
                     "command byte limit is outside transport bounds".into(),
                 ));
             }
-            let wait = request.wait;
-            match self
-                .operate(WorkdirSessionOperation::CommandOutput(request.clone()))
-                .await?
-            {
-                WorkdirSessionOperationResult::CommandOutput(result) => {
-                    let size = result
-                        .chunks
-                        .iter()
-                        .try_fold(0usize, |size, chunk| size.checked_add(chunk.bytes.len()));
-                    if !result.transport_bounds_valid()
-                        || size.is_none_or(|size| {
-                            size > request.limit
-                                || request.cursor.checked_add(size as u64)
-                                    != Some(result.next_cursor)
-                        })
-                    {
-                        return Err(Self::mismatch("bounded command byte page"));
+            loop {
+                let started = tokio::time::Instant::now();
+                match self
+                    .operate(WorkdirSessionOperation::CommandOutput(request.clone()))
+                    .await?
+                {
+                    WorkdirSessionOperationResult::CommandOutput(result) => {
+                        let size = result
+                            .chunks
+                            .iter()
+                            .try_fold(0usize, |size, chunk| size.checked_add(chunk.bytes.len()));
+                        if !result.transport_bounds_valid()
+                            || size.is_none_or(|size| {
+                                size > request.limit
+                                    || request.cursor.checked_add(size as u64)
+                                        != Some(result.next_cursor)
+                            })
+                        {
+                            return Err(Self::mismatch("bounded command byte page"));
+                        }
+                        if request.wait && result.chunks.is_empty() && result.terminal.is_none() {
+                            // A normal long-poll expiry is not a transport failure.
+                            // Continue at the same cursor, without spending the caller's
+                            // error retry budget or acknowledging any bytes. Pace peers
+                            // that return empty pages immediately; a real long poll has
+                            // already consumed this delay. The caller owns cancellation
+                            // and the overall deadline.
+                            tokio::time::sleep_until(
+                                started + std::time::Duration::from_millis(100),
+                            )
+                            .await;
+                            continue;
+                        }
+                        return Ok(result);
                     }
-                    if wait && result.chunks.is_empty() && result.terminal.is_none() {
-                        // A waiting request must block at the provider. Never spin HTTP
-                        // requests against an immediate empty response. A caller may retry
-                        // this exact cursor with its own bounded transport retry policy.
-                        return Err(Self::mismatch("waiting command byte page"));
-                    }
-                    return Ok(result);
+                    _ => return Err(Self::mismatch("command_output")),
                 }
-                _ => return Err(Self::mismatch("command_output")),
             }
         }
 

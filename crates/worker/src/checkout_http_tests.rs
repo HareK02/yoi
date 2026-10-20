@@ -886,21 +886,32 @@ async fn remote_native_bash_retains_streams_quota_and_replays_lost_terminal_thro
 }
 
 #[tokio::test]
-async fn waiting_remote_command_rejects_empty_response_without_http_busy_loop() {
+async fn waiting_remote_command_paces_empty_responses_and_keeps_cursor_until_output() {
     watchdog(async {
         let f = HttpFixture::new(WorkdirSessionCapabilities::ALL).await;
         let remote = f.open(TOKEN).await.unwrap();
-        *f.state.command_fault.lock().unwrap() = Some(CommandResponseFault::EmptyWaiting);
-        let error = remote
-            .command_output(workdir::CommandOutputRequest {
-                handle: workdir::CommandHandle("unused".into()),
-                cursor: 0,
-                limit: 1024,
-                wait: true,
+        let handle = remote
+            .start_command(workdir::CommandRequest {
+                command: "printf done; exit 7".into(),
+                cwd: WorkdirPath::root(),
+                timeout_secs: 5,
+                transport_byte_budget: 1024,
+                tool_call_id: None,
             })
             .await
-            .unwrap_err();
-        assert!(matches!(error, WorkdirError::Unavailable(_)));
+            .unwrap();
+        *f.state.command_fault.lock().unwrap() = Some(CommandResponseFault::EmptyWaiting);
+        let mut request = workdir::CommandOutputRequest {
+            handle,
+            cursor: 0,
+            limit: 1024,
+            wait: false,
+        };
+        // Nonwaiting polls still return their empty page after one HTTP request.
+        let page = remote.command_output(request.clone()).await.unwrap();
+        assert!(page.chunks.is_empty());
+        assert!(page.terminal.is_none());
+        assert_eq!(page.next_cursor, 0);
         assert_eq!(
             f.state
                 .operations
@@ -911,6 +922,57 @@ async fn waiting_remote_command_rejects_empty_response_without_http_busy_loop() 
                 .count(),
             1
         );
+        f.state.operations.lock().unwrap().clear();
+
+        request.wait = true;
+        // Repeated immediate empty responses remain pending, are paced rather
+        // than spun, and can still be stopped by the caller's deadline.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(350),
+                remote.command_output(request.clone()),
+            )
+            .await
+            .is_err()
+        );
+        let operations = f.state.operations.lock().unwrap().clone();
+        assert!(
+            (1..=4).contains(&operations.len()),
+            "empty polls were not paced: {}",
+            operations.len()
+        );
+        for operation in &operations {
+            let WorkdirSessionOperation::CommandOutput(output) = operation else {
+                panic!("unexpected operation: {operation:?}");
+            };
+            assert_eq!(output, &request);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            f.state.operations.lock().unwrap().len(),
+            operations.len(),
+            "dropped waiting read kept polling"
+        );
+
+        // After the empty replies stop, the exact same cursor still retrieves
+        // the bytes and terminal from the original command, without a restart.
+        *f.state.command_fault.lock().unwrap() = None;
+        let mut bytes = Vec::new();
+        loop {
+            let page = remote.command_output(request.clone()).await.unwrap();
+            assert_eq!(remote.command_output(request.clone()).await.unwrap(), page);
+            for chunk in page.chunks {
+                assert_eq!(chunk.sequence, request.cursor);
+                request.cursor += chunk.bytes.len() as u64;
+                bytes.extend(chunk.bytes);
+            }
+            assert_eq!(page.next_cursor, request.cursor);
+            if let Some(terminal) = page.terminal {
+                assert_eq!(terminal.exit_code, Some(7));
+                break;
+            }
+        }
+        assert_eq!(bytes, b"done");
         remote.close().await.unwrap();
     })
     .await;
