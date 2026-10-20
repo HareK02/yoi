@@ -6497,6 +6497,7 @@ name = "workdir"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "fs-operation",
  "libc",
  "manifest",
@@ -6597,6 +6598,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.29.0",
  "toml",
+ "tools",
  "tower",
  "tracing",
  "tracing-subscriber",

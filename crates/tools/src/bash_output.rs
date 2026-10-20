@@ -68,8 +68,10 @@ pub struct OutputRange {
 pub struct OutputTerminal {
     pub status: Option<CommandStatus>,
     pub exit_code: Option<i32>,
-    /// False on a forcibly dropped collector or failed transport: received bytes are retained,
-    /// but they are not a claim about the unobserved process tail.
+    pub process_failure: Option<workdir::CommandFailure>,
+    pub output_collection: Option<workdir::CommandOutputCollection>,
+    /// True only for confirmed EOF collection (quota is reported separately). A terminal
+    /// fence or exit zero alone does not confirm the unobserved process tail.
     pub transport_complete: bool,
 }
 
@@ -405,12 +407,9 @@ impl BashOutputWriter {
         terminal: &workdir::CommandTerminal,
     ) -> Result<BashOutputMetadata, String> {
         let mut r = self.record.lock().unwrap();
-        if terminal.stdout_delivered_bytes != r.stdout_seen
+        if !terminal.metadata_valid()
+            || terminal.stdout_delivered_bytes != r.stdout_seen
             || terminal.stderr_delivered_bytes != r.stderr_seen
-            || terminal.stdout_bytes < r.stdout_seen
-            || terminal.stderr_bytes < r.stderr_seen
-            || ((terminal.stdout_bytes != r.stdout_seen || terminal.stderr_bytes != r.stderr_seen)
-                != terminal.truncation_reason.is_some())
         {
             return Err("command terminal counts do not fence delivered bytes".into());
         }
@@ -419,7 +418,12 @@ impl BashOutputWriter {
         r.terminal = Some(OutputTerminal {
             status: Some(terminal.status),
             exit_code: terminal.exit_code,
-            transport_complete: true,
+            transport_complete: matches!(
+                terminal.output_collection,
+                workdir::CommandOutputCollection::Complete
+            ),
+            process_failure: terminal.process_failure,
+            output_collection: Some(terminal.output_collection),
         });
         Ok(r.metadata())
     }
@@ -439,6 +443,8 @@ impl Drop for BashOutputWriter {
                 status: None,
                 exit_code: None,
                 transport_complete: false,
+                process_failure: None,
+                output_collection: None,
             });
         }
     }
@@ -456,6 +462,8 @@ mod tests {
                 status: Some(CommandStatus::Completed),
                 exit_code: Some(0),
                 transport_complete: true,
+                process_failure: None,
+                output_collection: Some(workdir::CommandOutputCollection::Complete),
             })
             .id
     }
@@ -514,6 +522,8 @@ mod tests {
             status: Some(CommandStatus::Completed),
             exit_code: Some(0),
             transport_complete: true,
+            process_failure: None,
+            output_collection: Some(workdir::CommandOutputCollection::Complete),
         });
         assert!(root.metadata(&metadata.id).is_some());
         let _replacement = sibling.begin().unwrap();
@@ -582,7 +592,7 @@ mod tests {
         let root = BashOutputView::new();
         let mut writer = root.begin().unwrap();
         writer.append(CommandStream::Stdout, b"abc");
-        let mut terminal = serde_json::json!({"status":"completed","exit_code":0,"stdout_bytes":9,"stderr_bytes":0,"stdout_delivered_bytes":4,"stderr_delivered_bytes":0,"truncation_reason":"byte_budget"});
+        let mut terminal = serde_json::json!({"status":"completed","exit_code":0,"process_failure":null,"output_collection":{"state":"complete"},"stdout_bytes":9,"stderr_bytes":0,"stdout_delivered_bytes":4,"stderr_delivered_bytes":0,"truncation_reason":"byte_budget"});
         assert!(
             writer
                 .finish_transport(&serde_json::from_value(terminal.clone()).unwrap())

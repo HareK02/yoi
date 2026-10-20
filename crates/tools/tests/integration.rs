@@ -416,6 +416,7 @@ struct ExternalValidatingSession {
     truncate_first_binary_response: bool,
     command_response_losses: std::sync::atomic::AtomicUsize,
     lose_terminal_only: bool,
+    collection_override: Option<workdir::CommandOutputCollection>,
     mutate_after_first_binary_response: Option<std::path::PathBuf>,
 }
 
@@ -534,7 +535,11 @@ impl workdir::WorkdirSession for ExternalValidatingSession {
         &self,
         request: workdir::CommandOutputRequest,
     ) -> Result<workdir::CommandOutput, workdir::WorkdirError> {
-        let output = self.inner.command_output(request).await?;
+        let mut output = self.inner.command_output(request).await?;
+        if let (Some(collection), Some(terminal)) = (self.collection_override, &mut output.terminal)
+        {
+            terminal.output_collection = collection;
+        }
         if (!self.lose_terminal_only || output.terminal.is_some())
             && self
                 .command_response_losses
@@ -575,6 +580,7 @@ async fn external_view_image_uses_a_protocol_bounded_request() {
         truncate_first_binary_response: false,
         command_response_losses: std::sync::atomic::AtomicUsize::new(0),
         lose_terminal_only: false,
+        collection_override: None,
         mutate_after_first_binary_response: None,
     });
     let png = include_bytes!("fixtures/view-image/valid.png");
@@ -600,6 +606,7 @@ async fn external_view_image_rejects_truncated_and_cross_version_chunks() {
         truncate_first_binary_response: true,
         command_response_losses: std::sync::atomic::AtomicUsize::new(0),
         lose_terminal_only: false,
+        collection_override: None,
         mutate_after_first_binary_response: None,
     });
     let (_meta, tool) = view_image_tool(truncated)();
@@ -618,6 +625,7 @@ async fn external_view_image_rejects_truncated_and_cross_version_chunks() {
         truncate_first_binary_response: false,
         command_response_losses: std::sync::atomic::AtomicUsize::new(0),
         lose_terminal_only: false,
+        collection_override: None,
         mutate_after_first_binary_response: Some(image_path),
     });
     let (_meta, tool) = view_image_tool(changing)();
@@ -1104,7 +1112,20 @@ async fn bash_cancellation_returns_bounded_progress_as_terminal_output() {
     let execution = tokio::spawn(async move {
         executing.execute(r#"{"command":"printf 'before'; printf 'err-before' >&2; while :; do :; done","cwd":"."}"#, execution_context).await
     });
-    await_command_output(&mut events).await;
+    // Cancellation must follow both writes, not merely the first stdout chunk.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut ready = [false; 2];
+        while !ready.iter().all(|seen| *seen) {
+            if let workdir::CommandEvent::Output { stream, .. } = events.recv().await.unwrap() {
+                ready[match stream {
+                    workdir::CommandStream::Stdout => 0,
+                    workdir::CommandStream::Stderr => 1,
+                }] = true;
+            }
+        }
+    })
+    .await
+    .expect("both streams written before cancellation");
     bash.cancel_execution(&context).await.unwrap();
     let ToolError::Cancelled(output) =
         tokio::time::timeout(std::time::Duration::from_secs(5), execution)
@@ -1281,6 +1302,7 @@ async fn lost_page_and_terminal_responses_replay_without_restarting_or_double_ap
             mutate_after_first_binary_response: None,
             command_response_losses: std::sync::atomic::AtomicUsize::new(1),
             lose_terminal_only,
+            collection_override: None,
         });
         let view = tools::bash_output::BashOutputView::new();
         let definitions = core_builtin_tools(session.clone(), Tracker::new(), view.clone());
@@ -1312,6 +1334,83 @@ async fn lost_page_and_terminal_responses_replay_without_restarting_or_double_ap
             );
         }
         use workdir::WorkdirSession as _;
+        session.close().await.unwrap();
+    }
+}
+
+// Provider metadata is the fixture here; actual read/drain injection and HTTP
+// forwarding are tested by workdir's production-supervisor suite.
+#[tokio::test]
+async fn exit_zero_with_incomplete_output_keeps_partial_bytes_and_safe_failure_in_retained_evidence()
+ {
+    use workdir::{
+        CommandFailure, CommandFailureStage as Stage, CommandIoErrorKind, CommandOutputCollection,
+    };
+    for stage in [
+        Stage::StdoutRead,
+        Stage::StderrRead,
+        Stage::StdoutDrain,
+        Stage::StderrDrain,
+        Stage::OutputDelivery,
+    ] {
+        let root = TempDir::new().unwrap();
+        let failure = CommandFailure {
+            stage,
+            reason: CommandIoErrorKind::PermissionDenied,
+            os_code: None,
+        };
+        let collection = CommandOutputCollection::Incomplete { failure };
+        let session: WorkdirSessionHandle = Arc::new(ExternalValidatingSession {
+            inner: LocalWorkdirSession::new(
+                Scope::writable(root.path()).unwrap(),
+                root.path().into(),
+            ),
+            truncate_first_binary_response: false,
+            mutate_after_first_binary_response: None,
+            command_response_losses: std::sync::atomic::AtomicUsize::new(0),
+            lose_terminal_only: false,
+            collection_override: Some(collection),
+        });
+        let view = tools::bash_output::BashOutputView::new();
+        let (_, bash) = tools::bash_tool(session.clone(), view.clone())();
+        let out = call(
+            &bash,
+            json!({"cwd":".","command":"printf partial; printf err >&2"}),
+        )
+        .await;
+        assert!(out.summary.ends_with("(output incomplete)"));
+        let body: serde_json::Value = serde_json::from_str(&out.content.unwrap()).unwrap();
+        let metadata = &body["output"];
+        assert_eq!(body["stdout_preview"], "partial");
+        assert_eq!(body["stderr_preview"], "err");
+        assert_eq!(body["preview_omitted"], false);
+        assert_eq!(metadata["terminal"]["exit_code"], 0);
+        assert_eq!(metadata["terminal"]["status"], "completed");
+        assert_eq!(metadata["terminal"]["transport_complete"], false);
+        assert_eq!(
+            metadata["terminal"]["output_collection"],
+            serde_json::to_value(collection).unwrap()
+        );
+        assert_eq!(metadata["storage_truncated"], false);
+        assert_eq!(metadata["transport_truncation"], serde_json::Value::Null);
+        assert_eq!(metadata["stdout_seen"], 7);
+        assert_eq!(metadata["stdout_delivered"], 7);
+        let id = metadata["id"].as_str().unwrap();
+        assert_eq!(
+            serde_json::to_value(view.metadata(id).unwrap()).unwrap(),
+            *metadata
+        );
+        assert_eq!(
+            view.read(id, workdir::CommandStream::Stdout, 0, 100)
+                .unwrap(),
+            b"partial"
+        );
+        assert_eq!(
+            view.read(id, workdir::CommandStream::Stderr, 0, 100)
+                .unwrap(),
+            b"err"
+        );
+        assert!(!metadata.to_string().contains(root.path().to_str().unwrap()));
         session.close().await.unwrap();
     }
 }

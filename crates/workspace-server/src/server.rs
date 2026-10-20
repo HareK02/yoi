@@ -38045,6 +38045,8 @@ mod tests {
                     chunks: Vec::new(),
                     next_cursor: 0,
                     terminal: Some(workdir::CommandTerminal {
+                        process_failure: None,
+                        output_collection: workdir::CommandOutputCollection::Complete,
                         status: workdir::CommandStatus::Cancelled,
                         exit_code: None,
 
@@ -38147,6 +38149,8 @@ mod tests {
                     chunks: Vec::new(),
                     next_cursor: 0,
                     terminal: Some(workdir::CommandTerminal {
+                        process_failure: None,
+                        output_collection: workdir::CommandOutputCollection::Complete,
                         status: workdir::CommandStatus::Cancelled,
                         exit_code: None,
 
@@ -39239,6 +39243,8 @@ mod tests {
                         chunks: Vec::new(),
                         next_cursor: 0,
                         terminal: Some(workdir::CommandTerminal {
+                            process_failure: None,
+                            output_collection: workdir::CommandOutputCollection::Complete,
                             status: workdir::CommandStatus::Cancelled,
                             exit_code: None,
 
