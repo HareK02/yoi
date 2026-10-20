@@ -4,6 +4,7 @@
 //! same descriptor-approved registry path used by feature modules. They are not
 //! an external plugin-loading surface.
 
+mod backend_diagnostic;
 pub mod backend_job_result;
 pub(crate) mod bash;
 

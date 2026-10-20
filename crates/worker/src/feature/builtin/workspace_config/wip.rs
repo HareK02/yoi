@@ -161,7 +161,14 @@ impl WipOperationHandler for AttachHandler {
             "attachment_path": format!("/workdir-attachments/{}", encode_identity(&result.connection_id)),
             "content_path": CONTENT_ROOT,
             "already_attached": result.already_attached,
-        })).map_err(|_| WipOperationError::OutcomeUnknown("Completed config attachment response unavailable".into()))?;
+        })).map_err(|_| {
+            super::backend::diagnostic("attach_output", true).record(
+                crate::feature::builtin::backend_diagnostic::Stage::Attach,
+                crate::feature::builtin::backend_diagnostic::Reason::Decode,
+                None,
+            );
+            WipOperationError::OutcomeUnknown("Completed config attachment response unavailable".into())
+        })?;
         Ok(WipOperationOutput::native(value))
     }
 }
