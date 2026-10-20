@@ -6559,6 +6559,7 @@ dependencies = [
  "toml",
  "tools",
  "tracing",
+ "tracing-subscriber",
  "tungstenite 0.28.0",
  "uuid",
  "wip-client",

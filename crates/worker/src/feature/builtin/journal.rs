@@ -59,6 +59,53 @@ impl JournalReadStatus {
     }
 }
 
+// Only bounded classifications cross into diagnostics. Host messages/codes and
+// io::Error payloads can contain Journal text, credentials, proofs or host paths.
+// These diagnostics belong to the Feature, not persisted/model-visible input.
+enum JournalCompactionFailure {
+    Connection(std::io::ErrorKind),
+    SnapshotConflict,
+    SnapshotInvalidArgument,
+    SnapshotUnavailable,
+    Serialization,
+    ByteBudget,
+}
+
+impl JournalCompactionFailure {
+    fn snapshot(error: SubjektivHostError) -> Self {
+        match error {
+            SubjektivHostError::Conflict { .. } => Self::SnapshotConflict,
+            SubjektivHostError::InvalidArgument(_) => Self::SnapshotInvalidArgument,
+            SubjektivHostError::Unavailable(_) => Self::SnapshotUnavailable,
+        }
+    }
+
+    fn stage(&self) -> &'static str {
+        match self {
+            Self::Connection(_) => "connection",
+            Self::SnapshotConflict | Self::SnapshotInvalidArgument | Self::SnapshotUnavailable => {
+                "snapshot"
+            }
+            Self::Serialization => "serialization",
+            Self::ByteBudget => "byte_budget",
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Connection(std::io::ErrorKind::PermissionDenied) => "permission_denied",
+            Self::Connection(std::io::ErrorKind::InvalidInput) => "invalid_input",
+            Self::Connection(std::io::ErrorKind::NotConnected) => "not_connected",
+            Self::Connection(_) => "io_error",
+            Self::SnapshotConflict => "host_conflict",
+            Self::SnapshotInvalidArgument => "host_invalid_argument",
+            Self::SnapshotUnavailable => "host_unavailable",
+            Self::Serialization => "json_serialization_failed",
+            Self::ByteBudget => "startup_max_bytes_exceeded",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JournalCompactionInput {
@@ -203,33 +250,46 @@ pub(crate) fn freeze_compaction_journal(
             .and_then(|connection| connection.host.workspace_id())
     });
     let read = match connection {
-        Ok(Some(connection)) if connection.host.journal_compaction_granted() => {
-            Some(connection.journal_compaction_context().map_err(|_| ()))
-        }
+        Ok(Some(connection)) if connection.host.journal_compaction_granted() => Some(
+            connection
+                .journal_compaction_context()
+                .map_err(JournalCompactionFailure::snapshot),
+        ),
         Ok(_) => None,
-        Err(_) => Some(Err(())),
+        Err(error) => Some(Err(JournalCompactionFailure::Connection(error.kind()))),
     };
     let snapshot = read.as_ref().and_then(|read| read.as_ref().ok()).cloned();
-    let (status, json) = match read {
-        None => (Disabled, String::new()),
+    let prepared = match read {
+        None => Ok((Disabled, String::new())),
         Some(Ok(snapshot)) => {
             let status = if snapshot.journals.is_empty() {
                 Absent
             } else {
                 Available
             };
-            match serde_json::to_string(&snapshot) {
-                Ok(json) if json.len() <= subjektiv::journal::startup::STARTUP_MAX_BYTES => {
-                    (status, json)
-                }
-                _ => (Unavailable, String::new()),
-            }
+            // The current snapshot has only derived, JSON-safe fields (strings,
+            // integers, vectors, enums and a UUID). There is no known serialization
+            // failure fixture; retain this guard if the domain type changes.
+            serde_json::to_string(&snapshot)
+                .map_err(|_| JournalCompactionFailure::Serialization)
+                .and_then(|json| {
+                    if json.len() <= subjektiv::journal::startup::STARTUP_MAX_BYTES {
+                        Ok((status, json))
+                    } else {
+                        Err(JournalCompactionFailure::ByteBudget)
+                    }
+                })
         }
-        Some(Err(())) => (Unavailable, String::new()),
+        Some(Err(failure)) => Err(failure),
     };
-    if status == Unavailable {
-        tracing::warn!("Journal compaction snapshot unavailable; continuing without Journal");
-    }
+    let (status, json) = prepared.unwrap_or_else(|failure| {
+        tracing::warn!(
+            stage = failure.stage(),
+            reason = failure.reason(),
+            "Journal compaction snapshot unavailable; continuing without Journal"
+        );
+        (Unavailable, String::new())
+    });
     use sha2::{Digest, Sha256};
     let snapshot_sha256: Option<String> = (!json.is_empty()).then(|| {
         Sha256::digest(json.as_bytes())
@@ -727,10 +787,70 @@ fn tool_schema(name: &str) -> Value {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/common/diagnostics.rs"]
+mod diagnostic_test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
     use subjektiv::journal::JournalReceipt;
+
+    #[test]
+    fn compaction_connection_failure_keeps_safe_reason_without_exposing_error_or_changing_input() {
+        let prompts = crate::prompt::catalog::PromptCatalog::builtins_only().unwrap();
+        for (kind, reason) in [
+            (std::io::ErrorKind::PermissionDenied, "permission_denied"),
+            (std::io::ErrorKind::InvalidInput, "invalid_input"),
+            (std::io::ErrorKind::NotConnected, "not_connected"),
+            (std::io::ErrorKind::Other, "io_error"),
+        ] {
+            let logs = diagnostic_test_support::CapturedWarnings::default();
+            let input = tracing::subscriber::with_default(logs.subscriber(), || {
+                freeze_compaction_journal(
+                    Err(std::io::Error::new(
+                        kind,
+                        "PRIVATE_JOURNAL_BODY /private/host/path proof=PRIVATE_PROOF credential=PRIVATE_CREDENTIAL raw_error=PRIVATE_ERROR",
+                    )),
+                    &prompts,
+                )
+                .unwrap()
+            });
+            let log = logs.text();
+            assert!(log.contains("stage=\"connection\""), "{log}");
+            assert!(log.contains(&format!("reason=\"{reason}\"")), "{log}");
+            assert_eq!(log.matches("continuing without Journal").count(), 1);
+            assert!(!log.contains("PRIVATE_"));
+            assert!(!log.contains("/private/host/path"));
+            assert!(input.body().contains("Journal read status: unavailable."));
+            let persisted = serde_json::to_string(&input).unwrap();
+            assert!(!persisted.contains("PRIVATE_"));
+            assert!(!persisted.contains("/private/host/path"));
+            assert!(!persisted.contains(reason));
+            let payload: JournalCompactionInput = input
+                .metadata()
+                .feature_payload()
+                .unwrap()
+                .decode("journal:compaction", 1)
+                .unwrap();
+            assert!(payload.snapshot.is_none());
+            assert!(payload.snapshot_sha256.is_none());
+            assert_eq!(
+                payload.prompt_provenance.source_digest,
+                prompts.projection().source_digest
+            );
+            assert_eq!(
+                payload.prompt_provenance.projection_digest,
+                prompts.projection().catalog_digest
+            );
+        }
+        let logs = diagnostic_test_support::CapturedWarnings::default();
+        let input = tracing::subscriber::with_default(logs.subscriber(), || {
+            freeze_compaction_journal(Ok(None), &prompts).unwrap()
+        });
+        assert!(input.body().contains("Journal read status: disabled."));
+        assert!(logs.text().is_empty());
+    }
 
     #[derive(Default)]
     struct Host {
