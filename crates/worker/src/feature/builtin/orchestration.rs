@@ -21,7 +21,7 @@ use crate::feature::{
 
 const FEATURE_ID: &str = "orchestration";
 const TOOL_NAME: &str = "SpawnTicketWorker";
-const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. Profile is optional (defaults to builtin:ticket-worker); Flow and repository/Workdir attachments are optional. Results and return choices follow user intent, not a universal approval or MR gate. Orchestrator starts must supply the observed orchestrator_assignment_id; stale delegations cannot start new work. Assign is enough (no Queue/ready); unresolved dependencies are diagnostics for partial work and never start implicitly. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
+const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. Profile is optional (defaults to builtin:ticket-worker); repository/Workdir attachments are optional. For builtin:coder (or coder), omitted flow defaults to builtin:coder-review so the Coder owns the Reviewer SubWorker cycle and MR verdict. Explicit flow: null disables Flow; a string selects another Flow. Other profiles get no default Flow. Results and return choices follow user intent, not a universal approval or MR gate. Orchestrator starts must supply the observed orchestrator_assignment_id; stale delegations cannot start new work. Assign is enough (no Queue/ready); unresolved dependencies are diagnostics for partial work and never start implicitly. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
 
 #[derive(Debug, Default)]
 pub struct OrchestrationFeature;
@@ -88,13 +88,24 @@ struct SpawnTicketWorkerInput {
     profile: Option<String>,
     /// Initial user request delivered through the normal typed submission path.
     initial_request: String,
-    /// Optional Flow selector, delivered as a typed Flow segment before the request.
-    #[serde(default)]
-    flow: Option<String>,
+    /// Flow selector, delivered before the request. Omission defaults to
+    /// builtin:coder-review for builtin:coder (or coder); other profiles get no Flow.
+    /// Explicit null disables Flow; an explicit string selects that Flow instead.
+    #[serde(default, deserialize_with = "deserialize_present_flow")]
+    flow: Option<Option<String>>,
     /// Alias-keyed Workdir selections; omit or leave empty for a Worker without
     /// Workdirs. Backend derives effective capabilities; callers cannot request them.
     #[serde(default)]
     workdir_attachments: Vec<SpawnTicketWorkerWorkdirInput>,
+}
+
+// Serde's ordinary Option would collapse explicit null and an absent field.
+// Only an absent field selects the profile-specific default.
+fn deserialize_present_flow<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 struct SpawnTicketWorkerTool {
@@ -125,7 +136,13 @@ impl Tool for SpawnTicketWorkerTool {
             .transpose()?
             .unwrap_or_else(|| "builtin:ticket-worker".into());
         let initial_request = non_empty(input.initial_request, "initial_request")?;
-        let flow = input.flow.map(|flow| non_empty(flow, "flow")).transpose()?;
+        let flow = match input.flow {
+            Some(flow) => flow.map(|flow| non_empty(flow, "flow")).transpose()?,
+            None if matches!(profile.as_str(), "builtin:coder" | "coder") => {
+                Some("builtin:coder-review".to_string())
+            }
+            None => None,
+        };
         let workdir_attachments = validate_workdir_attachments(input.workdir_attachments)?;
         let mut initial_submit = Vec::new();
         if let Some(selector) = flow {
@@ -443,6 +460,107 @@ mod tests {
                 )]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn spawn_ticket_worker_defaults_coder_flow_but_preserves_explicit_selection() {
+        // Exercise the LLM JSON boundary and the typed request passed to lifecycle.
+        // Lifecycle/network execution is recorded, not launched by this test.
+        let cases = [
+            ("builtin:coder", None, Some("builtin:coder-review")),
+            ("coder", None, Some("builtin:coder-review")),
+            (" builtin:coder ", None, Some("builtin:coder-review")),
+            ("builtin:coder", Some(serde_json::Value::Null), None),
+            ("coder", Some(serde_json::Value::Null), None),
+            (
+                "builtin:coder",
+                Some(serde_json::json!(" project:investigation ")),
+                Some("project:investigation"),
+            ),
+            (
+                "builtin:coder",
+                Some(serde_json::json!("builtin:coder-review")),
+                Some("builtin:coder-review"),
+            ),
+            ("builtin:ticket-worker", None, None),
+            ("builtin:intake", None, None),
+            ("project:coder", None, None),
+            (
+                "project:coder",
+                Some(serde_json::json!("builtin:coder-review")),
+                Some("builtin:coder-review"),
+            ),
+        ];
+        for (profile, flow, expected_flow) in cases {
+            let service = Arc::new(RecordingService::default());
+            let (meta, tool) = definition(
+                Arc::new(FixedTicketService(TicketState::Open)),
+                service.clone(),
+            )();
+            let mut input = input();
+            input["profile"] = serde_json::json!(profile);
+            input["orchestrator_assignment_id"] = serde_json::json!("delegation-742");
+            if let Some(flow) = flow {
+                input["flow"] = flow;
+            }
+            assert!(jsonschema::is_valid(&meta.input_schema, &input));
+            tool.execute(
+                &input.to_string(),
+                ToolExecutionContext::new("call-coder-flow", "batch-1", 0),
+            )
+            .await
+            .unwrap();
+            let requests = service.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            let mut expected = Vec::new();
+            if let Some(selector) = expected_flow {
+                expected.push(Segment::Flow {
+                    selector: selector.into(),
+                });
+            }
+            expected.push(Segment::text("Investigate Ticket T-719."));
+            assert_eq!(
+                request.initial_submit, expected,
+                "profile={profile}, input={input}"
+            );
+            assert_eq!(request.profile, profile.trim());
+            assert_eq!(
+                request.orchestrator_assignment_id.as_deref(),
+                Some("delegation-742")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_ticket_worker_rejects_invalid_coder_flow_without_falling_back() {
+        let service = Arc::new(RecordingService::default());
+        let (meta, tool) = definition(
+            Arc::new(FixedTicketService(TicketState::Open)),
+            service.clone(),
+        )();
+        for flow in [
+            serde_json::json!(" "),
+            serde_json::json!(false),
+            serde_json::json!({"selector": "builtin:coder-review"}),
+            serde_json::json!([]),
+        ] {
+            let mut input = input();
+            input["profile"] = serde_json::json!("builtin:coder");
+            input["flow"] = flow.clone();
+            if !flow.is_string() {
+                assert!(!jsonschema::is_valid(&meta.input_schema, &input));
+            }
+            let error = tool
+                .execute(
+                    &input.to_string(),
+                    ToolExecutionContext::new("call-invalid-flow", "batch-1", 0),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArgument(_)), "{error}");
+        }
+        assert!(service.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
