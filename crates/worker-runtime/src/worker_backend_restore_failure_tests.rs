@@ -216,6 +216,31 @@ impl ProfileFailureFixture {
         );
     }
 
+    fn assert_closed_deferred_sessions(&self, pending: &PendingRuntimeRestore) {
+        let sessions = pending.request.deferred_workdir_sessions.clone();
+        assert!(!sessions.is_empty());
+        self.backend
+            .run_on_adapter_runtime(async move {
+                for (alias, session) in sessions {
+                    let read = session
+                        .read(workdir::ReadRequest {
+                            path: workdir::WorkdirPath::new("README.md").unwrap(),
+                            offset: 0,
+                            limit: 10,
+                            max_bytes: 1024,
+                        })
+                        .await;
+                    assert!(
+                        matches!(read, Err(workdir::WorkdirError::SessionClosed)),
+                        "raw deferred attachment {alias} remained usable: {read:?}"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(self.provider_opens.load(Ordering::SeqCst), 0);
+    }
+
     fn fresh_restore_and_old_replay(
         &self,
         request: runtime_api::WorkerRestoreRequest,
@@ -464,31 +489,143 @@ fn profile_restore_cleanup_failure_retains_owner_and_cause_without_opening_defer
             .all(|sessions| sessions.aliases().is_empty())
     );
     fixture.assert_released();
-    let unopened = pending.request.deferred_workdir_sessions.clone();
-    fixture
-        .backend
-        .run_on_adapter_runtime(async move {
-            for session in unopened.values() {
-                assert!(matches!(
-                    session
-                        .read(workdir::ReadRequest {
-                            path: workdir::WorkdirPath::new("README.md").unwrap(),
-                            offset: 0,
-                            limit: 10,
-                            max_bytes: 1024,
-                        })
-                        .await,
-                    Err(workdir::WorkdirError::SessionClosed)
-                ));
-            }
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 0);
+    fixture.assert_closed_deferred_sessions(&pending);
     eprintln!(
         "restore-fault cleanup=Workdir owner-retained=true retry=same-operation outcome=RolledBack"
     );
     fixture.fresh_restore_and_old_replay(request, result);
+}
+
+#[test]
+#[serial_test::serial(worker_allocation)]
+fn profile_restore_failure_before_router_binding_closes_unattached_raw_sessions() {
+    for stage in [
+        RuntimeRestoreStage::Metadata,
+        RuntimeRestoreStage::Reconstruction,
+        RuntimeRestoreStage::Binding,
+    ] {
+        let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
+        fixture.fail(stage);
+        fixture
+            .backend
+            .factory
+            .restore_faults
+            .cleanup_fail
+            .store(true, Ordering::SeqCst);
+        let request = fixture
+            .runtime
+            .test_restore_request(&fixture.worker.worker_ref);
+        let failed = fixture
+            .runtime
+            .restore_worker_operation(&fixture.worker.worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(
+            failed.state,
+            server_api::WorkerRestoreState::ReconciliationRequired
+        );
+        let pending = fixture
+            .backend
+            .pending_restore(&fixture.worker.worker_ref)
+            .unwrap()
+            .unwrap();
+        assert!(pending.request.workdir_attachments.is_empty());
+        assert!(!pending.request.logical_workdir_attachments.is_empty());
+        assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 0);
+        fixture
+            .backend
+            .factory
+            .restore_faults
+            .cleanup_fail
+            .store(false, Ordering::SeqCst);
+        let rolled_back = fixture
+            .runtime
+            .restore_worker_operation(&fixture.worker.worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(
+            rolled_back.state,
+            server_api::WorkerRestoreState::RolledBack,
+            "{stage:?}: {rolled_back:?}"
+        );
+        fixture.assert_released();
+        fixture.assert_closed_deferred_sessions(&pending);
+        fixture.fresh_restore_and_old_replay(request, rolled_back);
+        // Retained old cleanup authority must not become the fresh execution's
+        // same-alias connection, even after the new execution has stopped.
+        fixture.assert_closed_deferred_sessions(&pending);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(worker_allocation)]
+async fn failed_restore_raw_cleanup_is_operation_bound_and_does_not_follow_reused_alias() {
+    let root = restore_failure_tempdir();
+    let factory = ProfileRuntimeWorkerFactory::new(root.path()).with_runtime_store_dir(root.path());
+    let worker_ref = WorkerRef::new(WorkerId::now_v7());
+    let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
+    let opens = Arc::new(AtomicUsize::new(0));
+    let raw = |opens: Arc<AtomicUsize>| {
+        deferred_workdir::DeferredWorkdirSession::handle(
+            "same-workdir",
+            workdir::WorkdirSessionCapabilities::READ_ONLY,
+            move || {
+                opens.fetch_add(1, Ordering::SeqCst);
+                Err("offline fixture".into())
+            },
+        )
+    };
+    let mut old = direct_restore_request(worker_ref.clone());
+    old.deferred_workdir_sessions
+        .insert(alias.clone(), raw(opens.clone()));
+    let mut current = direct_restore_request(worker_ref.clone());
+    current
+        .deferred_workdir_sessions
+        .insert(alias.clone(), raw(opens.clone()));
+    factory.failed_restore_resources.lock().unwrap().insert(
+        worker_ref.clone(),
+        FailedRestoreResources {
+            operation_id: current.operation_id,
+            sessions: Vec::new(),
+            allocation: None,
+            feature_tasks: None,
+        },
+    );
+    assert_eq!(
+        factory.cleanup_failed_restore(&old).await,
+        Err(RuntimeRestoreCleanupFailure::Ownership)
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        factory.failed_restore_resources.lock().unwrap()[&worker_ref].operation_id,
+        current.operation_id
+    );
+    factory.cleanup_failed_restore(&current).await.unwrap();
+    assert_eq!(opens.load(Ordering::SeqCst), 0);
+    // Old raw ownership was not routed into, or closed with, the newer operation.
+    let request = workdir::ReadRequest {
+        path: workdir::WorkdirPath::new("README.md").unwrap(),
+        offset: 0,
+        limit: 10,
+        max_bytes: 1024,
+    };
+    assert!(matches!(
+        current.deferred_workdir_sessions[&alias]
+            .read(request.clone())
+            .await,
+        Err(workdir::WorkdirError::SessionClosed)
+    ));
+    assert!(matches!(
+        old.deferred_workdir_sessions[&alias]
+            .read(request.clone())
+            .await,
+        Err(workdir::WorkdirError::Unavailable(_))
+    ));
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    factory.cleanup_failed_restore(&old).await.unwrap();
+    assert!(matches!(
+        old.deferred_workdir_sessions[&alias].read(request).await,
+        Err(workdir::WorkdirError::SessionClosed)
+    ));
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
 }
 
 #[test]

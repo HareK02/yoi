@@ -2051,6 +2051,9 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         // Reconstruction can write before failing; only the resource owner can
         // confirm cleanup, even when no Worker value was returned.
         let result: Result<RuntimeWorkerController, &'static str> = async {
+            #[cfg(test)]
+            self.restore_checkpoint(stage)
+                .map_err(|_| "injected restore boundary failure")?;
             let worker_name = Self::runtime_worker_name_for_ref(&request.worker_ref);
             let only_binding = (request.workdir_attachments.len() == 1)
                 .then(|| request.workdir_attachments.values().next())
@@ -2351,22 +2354,34 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .map_err(|_| RuntimeRestoreCleanupFailure::Ownership)?
             .get(&request.worker_ref)
             .cloned();
-        if let Some(resources) = retained {
+        if let Some(resources) = retained.as_ref() {
             if resources.operation_id != request.operation_id {
                 return Err(RuntimeRestoreCleanupFailure::Ownership);
             }
-            if let Some(feature_tasks) = resources.feature_tasks {
+            if let Some(feature_tasks) = resources.feature_tasks.as_ref() {
                 feature_tasks
                     .shutdown()
                     .await
                     .map_err(|_| RuntimeRestoreCleanupFailure::Feature)?;
             }
-            for sessions in resources.sessions {
+            for sessions in &resources.sessions {
                 sessions
                     .close_all()
                     .await
                     .map_err(|_| RuntimeRestoreCleanupFailure::Workdir)?;
             }
+        }
+        // Logical attachments can route through a different Workspace session,
+        // and reconstruction can fail before any router exists. Close the exact
+        // raw handles retained by this operation, never a current alias lookup.
+        // An unopened Deferred session closes without contacting its provider.
+        for session in request.deferred_workdir_sessions.values() {
+            session
+                .close()
+                .await
+                .map_err(|_| RuntimeRestoreCleanupFailure::Workdir)?;
+        }
+        if let Some(resources) = retained {
             if let Some(allocation) = resources.allocation {
                 allocation
                     .release()
