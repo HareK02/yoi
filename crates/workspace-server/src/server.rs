@@ -37791,10 +37791,15 @@ mod tests {
                     )))
                     .unwrap();
             }
+            let error = write.await.unwrap().unwrap_err();
             assert!(matches!(
-                write.await.unwrap(),
-                Err(workdir::WorkdirError::OutcomeUnknown(_))
+                error.classification_source(),
+                workdir::WorkdirError::OutcomeUnknown(_)
             ));
+            assert_eq!(
+                error.failure_reason(),
+                lose_response.then_some(workdir::WorkdirFailureReason::ProviderUnavailable)
+            );
         }
     }
 
