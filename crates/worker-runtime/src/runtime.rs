@@ -1865,20 +1865,23 @@ impl Runtime {
         if let Some(scope) = scope {
             self.ensure_worker_in_workspace(scope, worker_ref)?;
         }
-        self.replace_worker_workdir_attachments_under_lock(worker_ref, attachments)
+        self.replace_worker_workdir_attachments_under_lock(worker_ref, attachments, false)
     }
 
     fn replace_worker_workdir_attachments_under_lock(
         &self,
         worker_ref: &WorkerRef,
         mut attachments: Vec<LogicalWorkdirAttachment>,
+        restoring: bool,
     ) -> Result<WorkerDetail, RuntimeError> {
         validate_logical_workdir_attachments(&attachments)?;
         attachments.sort_by(|left, right| left.alias.cmp(&right.alias));
 
         let mut state = self.lock()?;
-        for attachment in &attachments {
-            state.ensure_workdir_not_removing(&attachment.working_directory_id)?;
+        if !restoring {
+            for attachment in &attachments {
+                state.ensure_workdir_not_removing(&attachment.working_directory_id)?;
+            }
         }
         let previous = state.worker(worker_ref)?.clone();
         {
@@ -2146,7 +2149,6 @@ impl Runtime {
         ),
         RuntimeError,
     > {
-        let mut preparation_authorized = !coordinate && request.preparation.is_some();
         let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
         let _operation_guard = operation_lock
             .lock()
@@ -2191,7 +2193,7 @@ impl Runtime {
             let conflict = || RuntimeError::RestoreObservationConflict {
                 worker_id: worker_ref.worker_id,
             };
-            if let Some(mut owner) = candidate
+            if let Some(owner) = candidate
                 .restore_guard
                 .owners
                 .get(&request.request_id)
@@ -2204,164 +2206,12 @@ impl Runtime {
                 if let Some(receipt) = &owner.receipt {
                     return Ok((Some(receipt.clone()), None));
                 }
-                if let Some(preparation) = &owner.request.preparation {
-                    for id in
-                        preparation_workdir_ids(preparation, state.runtime_identity.as_deref())
-                    {
-                        state.ensure_workdir_not_removing(id)?;
-                    }
-                }
                 if candidate.restore_guard.active_request_id.as_deref() != Some(&request.request_id)
                     || candidate
                         .pending_restore
                         .is_none_or(|pending| pending.operation_id != owner.operation_id)
                 {
                     return Err(conflict());
-                }
-                if coordinate && !owner.preparation_applied {
-                    if let Some(preparation) = owner.request.preparation.as_mut() {
-                        if preparation.repository_access_workdirs.is_empty()
-                            && !preparation.repository_access.is_empty()
-                        {
-                            preparation.repository_access_workdirs = preparation
-                                .repository_access
-                                .iter()
-                                .map(|access| runtime_api::RepositoryAccessWorkdirReference {
-                                    runtime_id: access.materialization.runtime_id.clone(),
-                                    working_directory_id: access.working_directory_id.clone(),
-                                })
-                                .collect();
-                            candidate
-                                .restore_guard
-                                .owners
-                                .insert(request.request_id.clone(), owner.clone());
-                            match state.persist_worker_record(&candidate) {
-                                Ok(()) => {
-                                    state
-                                        .workers
-                                        .insert(worker_ref.worker_id, candidate.clone());
-                                }
-                                Err(error @ RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
-                                    state.workers.insert(worker_ref.worker_id, candidate);
-                                    return Ok((
-                                        Some(RuntimeWorkerRestoreResult::failed(
-                                            WorkerRestoreState::ReconciliationRequired,
-                                            "worker_restore_preparation_commit_unknown",
-                                            sanitize_worker_create_failure_message(
-                                                &error.to_string(),
-                                            ),
-                                        )),
-                                        None,
-                                    ));
-                                }
-                                Err(error) => {
-                                    return Ok((
-                                        Some(RuntimeWorkerRestoreResult::failed(
-                                            WorkerRestoreState::ReconciliationRequired,
-                                            "worker_restore_preparation_commit_failed",
-                                            sanitize_worker_create_failure_message(
-                                                &error.to_string(),
-                                            ),
-                                        )),
-                                        None,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-                if !owner.preparation_applied {
-                    if let (Some(original), Some(incoming)) =
-                        (&owner.request.preparation, &request.preparation)
-                    {
-                        // Server-regenerated bindings are not part of the public fingerprint.
-                        // Reuse admitted bindings and accept only resource completion for those references.
-                        let references_match = incoming.repository_access.len()
-                            == original.repository_access_workdirs.len()
-                            && original.repository_access_workdirs.iter().all(|reference| {
-                                incoming
-                                    .repository_access
-                                    .iter()
-                                    .filter(|access| {
-                                        reference.working_directory_id
-                                            == access.working_directory_id
-                                            && reference.runtime_id
-                                                == access.materialization.runtime_id
-                                    })
-                                    .count()
-                                    == 1
-                            });
-                        let snapshot_matches = original.repository_access.is_empty()
-                            || (original.repository_access.len()
-                                == incoming.repository_access.len()
-                                && original
-                                    .repository_access
-                                    .iter()
-                                    .zip(&incoming.repository_access)
-                                    .all(|(original, incoming)| {
-                                        let mut normalized = incoming.clone();
-                                        if let (Some(old), Some(new)) = (
-                                            &original.materialization.ssh,
-                                            &mut normalized.materialization.ssh,
-                                        ) {
-                                            new.secret_resource = old.secret_resource.clone();
-                                            new.expires_at_epoch_seconds =
-                                                old.expires_at_epoch_seconds;
-                                        }
-                                        &normalized == original
-                                    }));
-                        if !original.repository_access_workdirs.is_empty() {
-                            preparation_authorized =
-                                !coordinate && references_match && snapshot_matches;
-                        }
-                        if references_match
-                            && snapshot_matches
-                            && original.repository_access != incoming.repository_access
-                        {
-                            candidate
-                                .restore_guard
-                                .owners
-                                .get_mut(&request.request_id)
-                                .unwrap()
-                                .request
-                                .preparation
-                                .as_mut()
-                                .unwrap()
-                                .repository_access = incoming.repository_access.clone();
-                            match state.persist_worker_record(&candidate) {
-                                Ok(()) => {
-                                    state
-                                        .workers
-                                        .insert(worker_ref.worker_id, candidate.clone());
-                                }
-                                Err(error @ RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
-                                    state.workers.insert(worker_ref.worker_id, candidate);
-                                    return Ok((
-                                        Some(RuntimeWorkerRestoreResult::failed(
-                                            WorkerRestoreState::ReconciliationRequired,
-                                            "worker_restore_preparation_commit_unknown",
-                                            sanitize_worker_create_failure_message(
-                                                &error.to_string(),
-                                            ),
-                                        )),
-                                        None,
-                                    ));
-                                }
-                                Err(error) => {
-                                    return Ok((
-                                        Some(RuntimeWorkerRestoreResult::failed(
-                                            WorkerRestoreState::ReconciliationRequired,
-                                            "worker_restore_preparation_commit_failed",
-                                            sanitize_worker_create_failure_message(
-                                                &error.to_string(),
-                                            ),
-                                        )),
-                                        None,
-                                    ));
-                                }
-                            }
-                        }
-                    }
                 }
             } else {
                 // Startup/older persisted pending operations have a lifecycle
@@ -2416,13 +2266,6 @@ impl Runtime {
                 // publishing the owner; unrelated cleanup must not reject recovery.
                 if recovering_pending {
                     request.preparation = None;
-                }
-                if let Some(preparation) = &request.preparation {
-                    for id in
-                        preparation_workdir_ids(preparation, state.runtime_identity.as_deref())
-                    {
-                        state.ensure_workdir_not_removing(id)?;
-                    }
                 }
                 let pending = candidate
                     .pending_restore
@@ -2481,12 +2324,8 @@ impl Runtime {
                 return Ok((None, owner.request.preparation.clone()));
             }
         }
-        self.restore_admitted_worker_under_lock_with_preparation(
-            worker_ref,
-            WorkerRestoreMode::Explicit,
-            preparation_authorized,
-        )
-        .map(|result| (Some(result), None))
+        self.restore_admitted_worker_under_lock(worker_ref, WorkerRestoreMode::Explicit)
+            .map(|result| (Some(result), None))
     }
 
     #[cfg(test)]
@@ -2514,15 +2353,6 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
         mode: WorkerRestoreMode,
-    ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
-        self.restore_admitted_worker_under_lock_with_preparation(worker_ref, mode, false)
-    }
-
-    fn restore_admitted_worker_under_lock_with_preparation(
-        &self,
-        worker_ref: &WorkerRef,
-        mode: WorkerRestoreMode,
-        preparation_authorized: bool,
     ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
         self.lock()?
             .ensure_subject_not_reserved(worker_ref, false)?;
@@ -2587,15 +2417,7 @@ impl Runtime {
                         message,
                     )
                 };
-                if owner.request.preparation.as_ref().is_some_and(|prep| {
-                    prep.repository_access.len() < prep.repository_access_workdirs.len()
-                        || (!prep.repository_access_workdirs.is_empty() && !preparation_authorized)
-                }) {
-                    return Ok(uncertain(
-                        "Admitted Restore is awaiting Workspace resource completion".into(),
-                    ));
-                }
-                // Complete idempotent binding/access effects under the original pending_restore ID.
+                // Apply reference updates under the original pending_restore ID; no provider is opened.
                 let mut effects_started = false;
                 if let Err(error) = self.apply_restore_preparation_under_lock(
                     worker_ref,
@@ -2736,42 +2558,10 @@ impl Runtime {
             .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?;
             validate_logical_workdir_attachments(&attachments)?;
             *effects_started = true;
-            self.replace_worker_workdir_attachments_under_lock(worker_ref, attachments)?;
+            self.replace_worker_workdir_attachments_under_lock(worker_ref, attachments, true)?;
         }
-        for access in preparation.repository_access {
-            if preparation
-                .repository_access_workdirs
-                .iter()
-                .any(|reference| {
-                    reference.working_directory_id == access.working_directory_id
-                        && reference.runtime_id == access.materialization.runtime_id
-                })
-            {
-                // Workspace completed these at the Workdir owner Runtime after snapshot persistence.
-                // Never send cross-Runtime credentials to this Worker's Runtime.
-                continue;
-            }
-            let access: WorkingDirectoryRepositoryAccessRequest = serde_json::from_value(
-                serde_json::to_value(access)
-                    .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?,
-            )
-            .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?;
-            *effects_started = true;
-            let runtime = self.clone();
-            // The public embedded interface is synchronous. A separate IO executor
-            // avoids nested Tokio block_on while retaining the lifecycle lock.
-            std::thread::spawn(move || {
-                let executor = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?;
-                executor.block_on(
-                    runtime.authorize_working_directory_repository_access_from_resource(access),
-                )
-            })
-            .join()
-            .map_err(|_| RuntimeError::StatePoisoned)??;
-        }
+        // Retained legacy SSH preparation is not a prerequisite or an effect
+        // of restoring a Worker. Sessions resolve live access when used.
         Ok(())
     }
 
@@ -2856,6 +2646,7 @@ impl Runtime {
                 previous_workdir_attachments: worker.workdir_attachments.clone(),
                 logical_workdir_attachments: worker.logical_workdir_attachments.clone(),
                 workdir_attachments: BTreeMap::new(),
+                deferred_workdir_sessions: BTreeMap::new(),
                 config_bundle: None,
             };
             (
@@ -2868,28 +2659,6 @@ impl Runtime {
             )
         };
 
-        let _workdir_operation = self.reserve_workdir_use(
-            requested_workdir_ids(&request.request)
-                .into_iter()
-                .chain(
-                    request
-                        .previous_workdir_attachments
-                        .iter()
-                        .map(|attachment| {
-                            attachment
-                                .working_directory
-                                .summary
-                                .working_directory_id
-                                .as_str()
-                        }),
-                )
-                .chain(
-                    request
-                        .logical_workdir_attachments
-                        .iter()
-                        .map(|attachment| attachment.working_directory_id.as_str()),
-                ),
-        )?;
         if !reconcile && let Err(result) = backend.preflight_restore(&request) {
             // A preflight may attest an already-connected Controller snapshot.
             // Repeated restore is read-only; do not replace its operation owner.
@@ -8932,7 +8701,7 @@ mod tests {
     }
 
     #[test]
-    fn active_workdir_cleanup_rejects_same_id_admissions_without_blocking_other_workers() {
+    fn active_workdir_cleanup_blocks_access_but_allows_reference_only_restore() {
         let (runtime, backend) = runtime_and_backend();
         let owner = scope("workspace-a", "server-a");
         let worker = runtime
@@ -8992,36 +8761,43 @@ mod tests {
             .stop_worker_scoped(&owner, &worker.worker_ref, None)
             .unwrap();
         let restore = runtime.test_restore_request(&worker.worker_ref);
-        assert_workdir_busy(
-            runtime
-                .coordinate_worker_restore_operation(
-                    &worker.worker_ref,
-                    runtime_api::WorkerRestoreCoordinationRequest {
-                        expected_observation_token: restore.expected_observation_token,
-                        request_id: restore.request_id,
-                        preparation: Some(runtime_api::WorkerRestorePreparation {
-                            workdir_attachments: Some(vec![
-                                runtime_api::LogicalWorkdirAttachment {
-                                    alias: attachment.alias,
-                                    working_directory_id: attachment.working_directory_id,
-                                    capabilities: attachment.capabilities,
-                                },
-                            ]),
-                            ..Default::default()
-                        }),
-                    },
-                    Some(&owner),
-                )
-                .unwrap_err(),
-        );
-        assert!(
+        let (result, preparation) = runtime
+            .coordinate_worker_restore_operation(
+                &worker.worker_ref,
+                runtime_api::WorkerRestoreCoordinationRequest {
+                    expected_observation_token: restore.expected_observation_token.clone(),
+                    request_id: restore.request_id.clone(),
+                    preparation: Some(runtime_api::WorkerRestorePreparation {
+                        workdir_attachments: Some(vec![runtime_api::LogicalWorkdirAttachment {
+                            alias: attachment.alias.clone(),
+                            working_directory_id: attachment.working_directory_id.clone(),
+                            capabilities: attachment.capabilities,
+                        }]),
+                        ..Default::default()
+                    }),
+                },
+                Some(&owner),
+            )
+            .unwrap();
+        assert!(result.is_none());
+        assert!(preparation.is_some());
+        let restored = runtime
+            .restore_worker_operation_scoped(&owner, &worker.worker_ref, restore)
+            .unwrap();
+        assert_eq!(restored.state, WorkerRestoreState::Accepted);
+        assert_eq!(
             runtime
                 .lock()
                 .unwrap()
                 .worker(&worker.worker_ref)
                 .unwrap()
-                .pending_restore
-                .is_none()
+                .logical_workdir_attachments,
+            vec![attachment]
+        );
+        assert_workdir_busy(
+            runtime
+                .open_workdir_session_scoped(&owner, id, None)
+                .unwrap_err(),
         );
         assert_eq!(runtime.list_workers_scoped(&owner).unwrap().len(), 1);
         // Different IDs and Worker creation remain available during cleanup.
@@ -10783,102 +10559,68 @@ mod tests {
     }
 
     #[test]
-    fn restore_guard_resource_snapshot_requires_workspace_completion_before_execution() {
-        let (runtime, backend) = runtime_and_backend();
-        let scope = scope("workspace-a", "server-a");
-        let worker = runtime
-            .create_worker_scoped(
-                &scope,
-                scoped_task_request("resource coordination", "workspace-a"),
-            )
-            .unwrap();
-        runtime.stop_worker(&worker.worker_ref, None).unwrap();
-        let mut request = runtime.test_restore_request(&worker.worker_ref);
-        let mut preparation = runtime_api::WorkerRestorePreparation::default();
-        preparation.repository_access_workdirs.push(
-            runtime_api::RepositoryAccessWorkdirReference {
-                runtime_id: "peer-runtime".into(),
-                working_directory_id: "peer-workdir".into(),
-            },
-        );
-        let mut coordination = runtime_api::WorkerRestoreCoordinationRequest {
-            expected_observation_token: request.expected_observation_token.clone(),
-            request_id: request.request_id.clone(),
-            preparation: Some(preparation.clone()),
-        };
-        runtime
-            .coordinate_worker_restore_operation(
-                &worker.worker_ref,
-                coordination.clone(),
-                Some(&scope),
-            )
-            .unwrap();
-        let operation_id = runtime
-            .lock()
-            .unwrap()
-            .worker(&worker.worker_ref)
-            .unwrap()
-            .pending_restore
-            .unwrap()
-            .operation_id;
-        // Model a retained resource snapshot before the peer authorization callback completes.
-        preparation
-            .repository_access
-            .push(runtime_api::WorkingDirectoryRepositoryAccessRequest {
-                working_directory_id: "peer-workdir".into(),
-                materialization: runtime_api::RepositoryMaterializationContext {
-                    workspace_id: "workspace-a".into(),
-                    runtime_id: "peer-runtime".into(),
-                    operation_id: format!("worker-restore:{}", request.request_id),
-                    config_projection_digest: "snapshot".into(),
-                    ssh: None,
+    fn retained_restore_resource_snapshot_does_not_require_workspace_completion() {
+        for completed in [false, true] {
+            let (runtime, backend) = runtime_and_backend();
+            let scope = scope("workspace-a", "server-a");
+            let worker = runtime
+                .create_worker_scoped(
+                    &scope,
+                    scoped_task_request("resource coordination", "workspace-a"),
+                )
+                .unwrap();
+            runtime.stop_worker(&worker.worker_ref, None).unwrap();
+            let mut request = runtime.test_restore_request(&worker.worker_ref);
+            let mut preparation = runtime_api::WorkerRestorePreparation::default();
+            preparation.repository_access_workdirs.push(
+                runtime_api::RepositoryAccessWorkdirReference {
+                    runtime_id: "offline-peer".into(),
+                    working_directory_id: "peer-workdir".into(),
                 },
-            });
-        coordination.preparation = Some(preparation.clone());
-        assert!(
-            runtime
-                .coordinate_worker_restore_operation(&worker.worker_ref, coordination, Some(&scope))
-                .unwrap()
-                .1
-                .is_some()
-        );
-        request.preparation = None;
-        assert_eq!(
-            runtime
+            );
+            if completed {
+                preparation.repository_access.push(
+                    runtime_api::WorkingDirectoryRepositoryAccessRequest {
+                        working_directory_id: "peer-workdir".into(),
+                        materialization: runtime_api::RepositoryMaterializationContext {
+                            workspace_id: "workspace-a".into(),
+                            runtime_id: "offline-peer".into(),
+                            operation_id: format!("worker-restore:{}", request.request_id),
+                            config_projection_digest: "snapshot".into(),
+                            ssh: None,
+                        },
+                    },
+                );
+            }
+            for include_resources in [false, completed] {
+                let mut admitted = preparation.clone();
+                if !include_resources {
+                    admitted.repository_access.clear();
+                }
+                runtime
+                    .coordinate_worker_restore_operation(
+                        &worker.worker_ref,
+                        runtime_api::WorkerRestoreCoordinationRequest {
+                            expected_observation_token: request.expected_observation_token.clone(),
+                            request_id: request.request_id.clone(),
+                            preparation: Some(admitted),
+                        },
+                        Some(&scope),
+                    )
+                    .unwrap();
+            }
+            request.preparation = None;
+            let restored = runtime
                 .restore_worker_operation_scoped(&scope, &worker.worker_ref, request.clone())
-                .unwrap()
-                .state,
-            WorkerRestoreState::ReconciliationRequired
-        );
-        assert_eq!(
-            runtime
-                .restore_admitted_worker_under_lock(&worker.worker_ref, WorkerRestoreMode::Explicit)
-                .unwrap()
-                .state,
-            WorkerRestoreState::ReconciliationRequired
-        );
-        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
-        request.preparation = Some(runtime_api::WorkerRestorePreparation::default());
-        assert_eq!(
-            runtime
-                .restore_worker_operation_scoped(&scope, &worker.worker_ref, request.clone())
-                .unwrap()
-                .state,
-            WorkerRestoreState::ReconciliationRequired
-        );
-        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
-        request.preparation = Some(preparation);
-        assert_eq!(
-            runtime
+                .unwrap();
+            assert_eq!(restored.state, WorkerRestoreState::Accepted);
+            let replay = runtime
                 .restore_worker_operation_scoped(&scope, &worker.worker_ref, request)
-                .unwrap()
-                .state,
-            WorkerRestoreState::Accepted
-        );
-        assert_eq!(
-            backend.restore_operation_ids.lock().unwrap().as_slice(),
-            &[operation_id]
-        );
+                .unwrap();
+            assert_eq!(replay, restored);
+            assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+            assert!(backend.repository_accesses.lock().unwrap().is_empty());
+        }
     }
 
     #[test]

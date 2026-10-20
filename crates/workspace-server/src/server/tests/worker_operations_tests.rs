@@ -1593,7 +1593,7 @@ async fn restore_guard_workspace_interrupted_preparation_recovers_admitted_snaps
 }
 
 #[tokio::test]
-async fn restore_guard_cross_runtime_ssh_completion_retries_pinned_snapshot_at_workdir_owner() {
+async fn restore_keeps_cross_runtime_ssh_attachment_without_issuing_repository_access() {
     let workspace = tempfile::tempdir().unwrap();
     let mut config = test_server_config(workspace.path());
     let source = server_api::RepositorySource {
@@ -1619,39 +1619,6 @@ async fn restore_guard_cross_runtime_ssh_completion_retries_pinned_snapshot_at_w
         .stop(&WorkerOperationContext::Backend, operation_lifecycle())
         .await
         .unwrap();
-    let original_key = api
-        .repository_secrets
-        .generate_credential(
-            api.workspace_id(),
-            GenerateRepositorySshCredentialRequest {
-                operation_id: "cross-runtime-default-key".into(),
-                credential_id:
-                    crate::repository_access::WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID.into(),
-                name: "Restore default".into(),
-            },
-            "owner-account",
-        )
-        .unwrap();
-    let public_key = api
-        .repository_secrets
-        .credential_public_key(api.workspace_id(), &original_key.credential_id)
-        .unwrap()
-        .unwrap()
-        .public_key;
-    api.repository_secrets
-        .put_host_trust(
-            api.workspace_id(),
-            PutRepositorySshHostTrustRequest {
-                operation_id: "cross-runtime-trust".into(),
-                host_trust_id: "cross-runtime-host".into(),
-                hostname: "example.invalid".into(),
-                port: 22,
-                host_key: public_key,
-                expected_fingerprint: None,
-            },
-            "owner-account",
-        )
-        .unwrap();
     let record = restore_test_workdir(
         &api,
         "cross-runtime-restore-workdir",
@@ -1663,102 +1630,27 @@ async fn restore_guard_cross_runtime_ssh_completion_retries_pinned_snapshot_at_w
     peer.set_workdir_repository(&record.workdir_id, &test_repository_id(&api));
     api.store.upsert_workdir_registry(&record).unwrap();
     attach_restore_test_workdir(&api, &identity, &record);
+    let links = api
+        .store
+        .list_worker_workdir_links(api.workspace_id(), &identity)
+        .unwrap();
     let request = restore_request_for(&api, &identity, "cross-runtime-restore-request");
-    assert_eq!(
-        handle
-            .restore(&WorkerOperationContext::Backend, request.clone())
-            .await
-            .unwrap()
-            .state,
-        server_api::WorkerRestoreState::ReconciliationRequired
-    );
-    assert!(
-        execution.restore_operations.lock().unwrap().is_empty(),
-        "credential completion must precede execution"
-    );
-    let first = peer.repository_access_requests.lock().unwrap()[0].clone();
-    assert_eq!(
-        first.materialization.runtime_id,
-        WorkdirlessFixtureRuntime::RUNTIME_ID
-    );
-    assert_ne!(first.materialization.runtime_id, identity.runtime_id);
-    // Rotate current host trust while the accepted operation is uncertain. Its
-    // original credential/trust fingerprints, source and binding must remain pinned.
-    let alternate = api
-        .repository_secrets
-        .generate_credential(
-            api.workspace_id(),
-            GenerateRepositorySshCredentialRequest {
-                operation_id: "cross-runtime-alternate-key".into(),
-                credential_id: "cross-runtime-alternate".into(),
-                name: "Alternate".into(),
-            },
-            "owner-account",
-        )
-        .unwrap();
-    let alternate_public = api
-        .repository_secrets
-        .credential_public_key(api.workspace_id(), &alternate.credential_id)
-        .unwrap()
-        .unwrap()
-        .public_key;
-    let original_trust_fingerprint = first
-        .materialization
-        .ssh
-        .as_ref()
-        .unwrap()
-        .host_key_fingerprint
-        .clone();
-    api.repository_secrets
-        .put_host_trust(
-            api.workspace_id(),
-            PutRepositorySshHostTrustRequest {
-                operation_id: "cross-runtime-trust-rotate".into(),
-                host_trust_id: "cross-runtime-host".into(),
-                hostname: "example.invalid".into(),
-                port: 22,
-                host_key: alternate_public,
-                expected_fingerprint: Some(original_trust_fingerprint),
-            },
-            "owner-account",
-        )
-        .unwrap();
-    *peer.reject_repository_access.lock().unwrap() = false;
-    assert_eq!(
-        handle
-            .restore(&WorkerOperationContext::Backend, request.clone())
-            .await
-            .unwrap()
-            .state,
-        server_api::WorkerRestoreState::Accepted
-    );
-    let attempts = peer.repository_access_requests.lock().unwrap();
-    assert_eq!(attempts.len(), 2);
-    let second = &attempts[1];
-    assert_eq!(
-        second.materialization.operation_id,
-        first.materialization.operation_id
-    );
-    let mut normalized = second.clone();
-    let old_ssh = first.materialization.ssh.as_ref().unwrap();
-    let new_ssh = normalized.materialization.ssh.as_mut().unwrap();
-    assert_ne!(new_ssh.secret_resource.nonce, old_ssh.secret_resource.nonce);
-    new_ssh.secret_resource = old_ssh.secret_resource.clone();
-    new_ssh.expires_at_epoch_seconds = old_ssh.expires_at_epoch_seconds;
-    assert_eq!(normalized, first, "only opaque handle and expiry may renew");
-    drop(attempts);
-    assert_eq!(execution.restore_operations.lock().unwrap().len(), 1);
-    assert_eq!(
-        handle
-            .restore(&WorkerOperationContext::Backend, request)
-            .await
-            .unwrap()
-            .state,
-        server_api::WorkerRestoreState::Accepted
-    );
-    assert_eq!(
-        peer.repository_access_requests.lock().unwrap().len(),
-        2,
-        "terminal receipt must not renew access"
-    );
+    for _ in 0..2 {
+        assert_eq!(
+            handle
+                .restore(&WorkerOperationContext::Backend, request.clone())
+                .await
+                .unwrap()
+                .state,
+            server_api::WorkerRestoreState::Accepted
+        );
+        assert!(peer.repository_access_requests.lock().unwrap().is_empty());
+        assert_eq!(execution.restore_operations.lock().unwrap().len(), 1);
+        assert_eq!(
+            api.store
+                .list_worker_workdir_links(api.workspace_id(), &identity)
+                .unwrap(),
+            links
+        );
+    }
 }

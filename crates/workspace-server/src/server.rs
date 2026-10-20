@@ -6079,12 +6079,11 @@ impl WorkspaceApi {
 
     /// Binds observation-based Restore intent to a Runtime-owned operation.
     ///
-    /// First queries existing owners/receipts without preparation, handling replay and recovery
-    /// before new-launch eligibility. New intent rereads singleton, Workdir, and External grants
-    /// to build references. SSH resources are issued only after Runtime admits the same observation
-    /// token under its operation lock. Replay does not replace saved preparation; incomplete auth
-    /// preparation remains ReconciliationRequired. Runtime owns lifecycle settlement, while the
-    /// returned summary comes from current observation.
+    /// Existing owners reach receipts/recovery before new-launch eligibility.
+    /// Restore retains attachment references without opening providers, resolving
+    /// Repository credentials, or requiring materialization. Workdir operations
+    /// validate current authority and availability when a session is used.
+    /// Runtime owns lifecycle settlement; summaries come from current observation.
     fn restore_workspace_worker(
         &self,
         worker: &RuntimeWorkerRef,
@@ -6117,82 +6116,11 @@ impl WorkspaceApi {
             result.worker = self.current_restore_summary(worker, result.worker.is_some());
             return Ok(result);
         }
-        let mut preparation = if let Some(preparation) = owned_preparation {
+        let preparation = if let Some(preparation) = owned_preparation {
             preparation
         } else {
             self.store
                 .require_current_worker_singleton_owner(&self.config.workspace_id, worker)?;
-            let mut repository_access_workdirs = Vec::new();
-            for link in self
-                .store
-                .list_worker_workdir_links(&self.config.workspace_id, worker)?
-                .into_iter()
-                .filter(|link| link.unlinked_at.is_none())
-            {
-                let record = self
-                    .store
-                    .get_workdir_registry(&self.config.workspace_id, &link.workdir_id)?
-                    .ok_or_else(|| Error::RuntimeOperationFailed {
-                        runtime_id: "workspace-backend".to_string(),
-                        code: "working_directory_not_found".to_string(),
-                        message: format!("Unknown Workdir `{}`", link.workdir_id),
-                    })?;
-                match record.source {
-                    WorkdirRegistrySource::Repository {
-                        runtime_id,
-                        repository_id,
-                    } => {
-                        if self
-                            .require_configured_workspace_repository(&repository_id)?
-                            .source
-                            .kind
-                            == server_api::RepositorySourceKind::Ssh
-                        {
-                            repository_access_workdirs.push(
-                                runtime_api::RepositoryAccessWorkdirReference {
-                                    runtime_id,
-                                    working_directory_id: link.workdir_id.clone(),
-                                },
-                            );
-                        }
-                    }
-                    WorkdirRegistrySource::WorkspaceConfig { .. } => continue,
-                    WorkdirRegistrySource::ExternalGrant { grant_id } => {
-                        let grant = self
-                            .store
-                            .get_external_workdir_grant(&self.config.workspace_id, &grant_id)?
-                            .ok_or_else(|| Error::RuntimeOperationFailed {
-                                runtime_id: "external-workdir-provider".to_string(),
-                                code: "external_workdir_unavailable".to_string(),
-                                message: "External Workdir grant is unavailable".to_string(),
-                            })?;
-                        let grant_expired = external_workdir_grant_is_expired(&grant)?;
-                        let connection = self
-                            .external_workdir_providers
-                            .lock()
-                            .expect("External Workdir provider registry poisoned")
-                            .connection(&grant_id);
-                        if grant.status != "online"
-                            || grant_expired
-                            || !connection.is_some_and(|connection| {
-                                connection.generation == grant.generation
-                                    && connection.provider_instance_id == grant.provider_instance_id
-                                    && connection.workdir_id == link.workdir_id
-                                    && connection
-                                        .expires_at
-                                        .is_none_or(|expires_at| expires_at > Utc::now())
-                            })
-                        {
-                            return Err(Error::RuntimeOperationFailed {
-                                runtime_id: "external-workdir-provider".to_string(),
-                                code: "external_workdir_unavailable".to_string(),
-                                message: "External Workdir provider is offline".to_string(),
-                            }
-                            .into());
-                        }
-                    }
-                }
-            }
             let preparation = runtime_api::WorkerRestorePreparation {
                 workspace_api: Some(runtime_contract_restore(
                     self.workspace_api_ref(&worker.runtime_id),
@@ -6201,7 +6129,7 @@ impl WorkspaceApi {
                     restore_logical_workdir_attachments(self, worker)?,
                 )?),
                 repository_access: Vec::new(),
-                repository_access_workdirs,
+                repository_access_workdirs: Vec::new(),
             };
             let (result, preparation) = self
                 .runtime
@@ -6222,60 +6150,6 @@ impl WorkspaceApi {
                 Error::Config("Runtime did not retain admitted Restore preparation".into())
             })?
         };
-        // Only the admitted operation may issue SSH handles. Reissue from the pinned
-        // credential snapshot after interruption; never renew candidate bindings.
-        let completion =
-            complete_restore_repository_access(self, &request.request_id, &mut preparation);
-        if let Err(error) = completion {
-            return Ok(InternalWorkerRestoreResult {
-                state: server_api::WorkerRestoreState::ReconciliationRequired,
-                worker: None,
-                diagnostics: vec![RuntimeDiagnostic::new(
-                    "worker_restore_preparation_pending",
-                    "warning",
-                    sanitize_backend_error(&error.error.to_string()),
-                )],
-            });
-        }
-        // Persist the first resource snapshot at the admitted owner BEFORE any
-        // Workdir Runtime authorization effect. Replays renew only its opaque handles.
-        let (result, retained) = self
-            .runtime
-            .coordinate_worker_restore(
-                worker,
-                runtime_api::WorkerRestoreCoordinationRequest {
-                    expected_observation_token: request.expected_observation_token.clone(),
-                    request_id: request.request_id.clone(),
-                    preparation: Some(preparation),
-                },
-            )
-            .map_err(RuntimeRegistryError::into_error)?;
-        if let Some(mut result) = result {
-            result.worker = self.current_restore_summary(worker, result.worker.is_some());
-            return Ok(result);
-        }
-        let preparation = retained.ok_or_else(|| {
-            Error::Config("Runtime did not retain Restore resource snapshot".into())
-        })?;
-        for access in &preparation.repository_access {
-            let access: worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest =
-                runtime_contract_restore(access.clone())?;
-            let runtime_id = access.materialization.runtime_id.clone();
-            if let Err(error) = self
-                .runtime
-                .authorize_working_directory_repository_access(&runtime_id, access)
-            {
-                return Ok(InternalWorkerRestoreResult {
-                    state: server_api::WorkerRestoreState::ReconciliationRequired,
-                    worker: None,
-                    diagnostics: vec![RuntimeDiagnostic::new(
-                        "worker_restore_repository_access_pending",
-                        "warning",
-                        sanitize_backend_error(&error.message()),
-                    )],
-                });
-            }
-        }
         let mut restored = self
             .runtime
             .restore_worker(
@@ -20315,44 +20189,30 @@ fn restore_logical_workdir_attachments(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> ApiResult<Vec<LogicalWorkdirAttachment>> {
-    api.store
+    let mut attachments = Vec::new();
+    for link in api
+        .store
         .list_worker_workdir_links(&api.config.workspace_id, worker)?
         .into_iter()
         .filter(|link| link.unlinked_at.is_none())
-        .filter(|link| {
-            api.store
-                .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)
-                .ok()
-                .flatten()
-                .is_none_or(|record| {
-                    !matches!(record.source, WorkdirRegistrySource::WorkspaceConfig { .. })
-                })
-        })
-        .map(|link| {
-            let workdir = api
-                .store
-                .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)?
-                .ok_or_else(|| {
-                    Error::RegistryInconsistency(format!(
-                        "Worker attachment references unknown Workdir {}",
-                        link.workdir_id
-                    ))
-                })?;
-            let capabilities = link
-                .capabilities
-                .intersection(workdir_source_capabilities(api, &workdir)?)
-                .intersection(ticket_target_capabilities_for_workdir(
-                    api, worker, &workdir,
-                )?);
-            Ok(LogicalWorkdirAttachment {
-                alias: workdir::WorkdirAttachmentAlias::new(link.alias)
-                    .map_err(|error| Error::InvalidInput(error.to_string()))?,
-                working_directory_id: link.workdir_id,
-                capabilities,
+    {
+        if api
+            .store
+            .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)?
+            .is_some_and(|record| {
+                matches!(record.source, WorkdirRegistrySource::WorkspaceConfig { .. })
             })
-        })
-        .collect::<Result<Vec<_>>>()
-        .map_err(ApiError::from)
+        {
+            continue;
+        }
+        attachments.push(LogicalWorkdirAttachment {
+            alias: workdir::WorkdirAttachmentAlias::new(link.alias)
+                .map_err(|error| Error::InvalidInput(error.to_string()))?,
+            working_directory_id: link.workdir_id,
+            capabilities: link.capabilities,
+        });
+    }
+    Ok(attachments)
 }
 
 fn prepare_runtime_worker_workdir_attachments(
@@ -36648,81 +36508,6 @@ fn authorize_repository_materialization(
     Ok(())
 }
 
-fn complete_restore_repository_access(
-    api: &WorkspaceApi,
-    request_id: &str,
-    preparation: &mut runtime_api::WorkerRestorePreparation,
-) -> ApiResult<()> {
-    if preparation.repository_access.is_empty() {
-        for reference in &preparation.repository_access_workdirs {
-            if let Some(access) = repository_access_request_for_workdir(
-                api,
-                &reference.runtime_id,
-                &reference.working_directory_id,
-                &format!("worker-restore:{request_id}"),
-            )? {
-                preparation
-                    .repository_access
-                    .push(runtime_contract_restore(access)?);
-            }
-        }
-        return Ok(());
-    }
-    for prepared in &mut preparation.repository_access {
-        let mut access: worker_runtime::catalog::WorkingDirectoryRepositoryAccessRequest =
-            runtime_contract_restore(prepared.clone())?;
-        let Some(ssh) = access.materialization.ssh.as_mut() else {
-            continue;
-        };
-        let mut leases = Vec::new();
-        for candidate in &ssh.credential_candidates {
-            leases.push(
-                api.repository_secrets
-                    .lease_ssh_materialization_access_fingerprints(
-                        api.workspace_id(),
-                        &candidate.credential_id,
-                        &candidate.public_key_fingerprint,
-                        &ssh.host_trust_id,
-                        &ssh.host_key_fingerprint,
-                    )?,
-            );
-        }
-        let known_hosts_entry = leases
-            .first()
-            .ok_or_else(|| Error::Config("Admitted SSH snapshot has no candidates".into()))?
-            .known_hosts_entry
-            .clone();
-        ssh.expires_at_epoch_seconds = repository_access_expiry();
-        ssh.secret_resource = api
-            .resource_broker
-            .issue_repository_ssh_access_handle(
-                api.workspace_id(),
-                &access.materialization.runtime_id,
-                format!(
-                    "repository-ssh-access:{}",
-                    access.materialization.operation_id
-                ),
-                i64::try_from(ssh.expires_at_epoch_seconds).unwrap_or(i64::MAX),
-                worker_runtime::resource::RepositorySshAccessSecret {
-                    credential_candidates: leases
-                        .into_iter()
-                        .map(
-                            |lease| worker_runtime::resource::RepositorySshAccessSecretCandidate {
-                                credential_id: lease.credential_id,
-                                public_key_fingerprint: lease.credential_fingerprint.clone(),
-                                private_key: lease.private_key.as_str().to_owned(),
-                            },
-                        )
-                        .collect(),
-                    known_hosts_entry,
-                },
-            )
-            .map_err(|error| Error::Config(error.to_string()))?;
-        *prepared = runtime_contract_restore(access)?;
-    }
-    Ok(())
-}
-
 fn repository_access_request_for_workdir(
     api: &WorkspaceApi,
     runtime_id: &str,
@@ -37544,6 +37329,7 @@ mod tests {
     mod embedded_owned_execution_tests;
     mod external_checkout_tests;
     mod protocol_backpressure_tests;
+    mod restore_workdir_tests;
     mod restored_parent_control_tests;
     mod subject_authorization_tests;
     mod subject_spawn_tests;
