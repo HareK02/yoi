@@ -58,6 +58,7 @@ wip-protocol = { workspace = true }
 wip-text-view = { workspace = true }
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 axum = { workspace = true }
 workdir = { workspace = true, features = ["http-client"] }
 dotenv = "0.15.0"
