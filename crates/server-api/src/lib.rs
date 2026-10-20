@@ -132,6 +132,8 @@ pub struct WorkdirOperationApiError {
     pub workdir_log: Option<WorkdirOperationLogContext>,
     #[serde(skip)]
     pub denial_reason: Option<workdir::WorkdirDenialReason>,
+    #[serde(skip)]
+    pub failure_reason: Option<workdir::WorkdirFailureReason>,
 }
 
 /// Internal operational correlation. Producers supply fixed-length ID fingerprints and
@@ -157,6 +159,7 @@ impl WorkdirOperationApiError {
             status: error.status,
             workdir_log: None,
             denial_reason: None,
+            failure_reason: None,
         }
     }
 
@@ -170,6 +173,7 @@ impl WorkdirOperationApiError {
             status,
             workdir_log: None,
             denial_reason: error.denial_reason,
+            failure_reason: error.failure_reason,
         }
     }
 }
@@ -15047,10 +15051,12 @@ mod workdir_error_diagnostic_tests {
     #[test]
     fn workdir_internal_diagnostics_never_enter_public_error_body_or_schema() {
         let mut error = WorkdirOperationApiError::provider(workdir::http::WorkdirTransportError {
+            failure_reason: None,
             code: workdir::http::WorkdirTransportErrorCode::Denied,
             message: "Workdir operation was denied".to_string(),
             denial_reason: Some(workdir::WorkdirDenialReason::OsPermissionDenied),
         });
+        error.failure_reason = Some(workdir::WorkdirFailureReason::HttpTimeout);
         error.workdir_log = Some(WorkdirOperationLogContext {
             operation: "write",
             workspace_id_hash: "internal-workspace-fingerprint".to_string(),
@@ -15064,10 +15070,12 @@ mod workdir_error_diagnostic_tests {
         assert_eq!(api_macros::HttpError::status_code(&error), 403);
         let decoded: WorkdirOperationApiError = serde_json::from_value(wire).unwrap();
         assert!(decoded.denial_reason.is_none());
+        assert!(decoded.failure_reason.is_none());
         assert!(decoded.workdir_log.is_none());
         let schema = serde_json::to_value(schemars::schema_for!(WorkdirOperationApiError)).unwrap();
         assert!(schema["properties"].get("workdir_log").is_none());
         assert!(schema["properties"].get("denial_reason").is_none());
+        assert!(schema["properties"].get("failure_reason").is_none());
     }
 }
 

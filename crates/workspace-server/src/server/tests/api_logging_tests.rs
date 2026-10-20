@@ -563,6 +563,7 @@ async fn generated_workdir_provider_errors_preserve_response_and_log_details() {
             ));
             response
                 .send(Err(WorkdirTransportError {
+                    failure_reason: None,
                     denial_reason: reason,
                     code,
                     message: "body-secret /private/provider/path".to_string(),
@@ -599,6 +600,64 @@ async fn generated_workdir_provider_errors_preserve_response_and_log_details() {
             events[0]["request_token_id_hash"].as_str().unwrap().len(),
             64
         );
+    }
+    for reason in [
+        workdir::WorkdirFailureReason::SessionClosed,
+        workdir::WorkdirFailureReason::CommandTerminalMissing,
+        workdir::WorkdirFailureReason::HttpTimeout,
+    ] {
+        let request = runtime_source_request(
+            &identity,
+            Some(&fixture.worker.worker_id),
+            "POST",
+            &path,
+            serde_json::to_vec(&server_api::CurrentWorkerWorkdirOperationRequest {
+                target_workdir: "checkout".into(),
+                operation: WorkdirSessionOperation::CommandOutput(workdir::CommandOutputRequest {
+                    handle: handle.clone(),
+                    cursor: 0,
+                    limit: 16,
+                    wait: true,
+                }),
+            })
+            .unwrap(),
+        );
+        let provider = async {
+            let Some(ExternalProviderCommand::Operation {
+                operation,
+                response,
+                ..
+            }) = commands.recv().await
+            else {
+                panic!("expected output request")
+            };
+            assert!(matches!(
+                operation,
+                WorkdirSessionOperation::CommandOutput(_)
+            ));
+            response
+                .send(Err(WorkdirTransportError {
+                    code: Code::Unavailable,
+                    message: "body-secret /private/provider/path".into(),
+                    denial_reason: None,
+                    failure_reason: Some(reason),
+                }))
+                .unwrap();
+        };
+        let ((status, body, events), ()) =
+            tokio::join!(request_with_logs(app.clone(), request), provider);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            json!({"code":"unavailable", "message":"Workdir session is unavailable"})
+        );
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["failure_reason"], reason.as_str());
+        assert_eq!(events[0]["operation"], "command_output");
+        assert_eq!(events[0]["workdir_stage"], "provider_dispatch");
+        let log = serde_json::to_string(&events).unwrap();
+        assert!(!log.contains("body-secret"));
+        assert!(!log.contains("/private/provider/path"));
     }
     let provider = async {
         let Some(ExternalProviderCommand::Operation { response, .. }) = commands.recv().await

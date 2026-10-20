@@ -480,7 +480,7 @@ async fn shutdown_closes_bound_workdir_session() {
 
     assert!(matches!(
         session.command_status(command).await,
-        Err(WorkdirError::Unavailable(_))
+        Err(ref error) if matches!(error.classification_source(), WorkdirError::Unavailable(_))
     ));
 }
 
@@ -758,7 +758,7 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
                 tool_call_id: None,
             })
             .await,
-        Err(WorkdirError::Unavailable(_))
+        Err(ref error) if matches!(error.classification_source(), WorkdirError::Unavailable(_))
     ));
 }
 
