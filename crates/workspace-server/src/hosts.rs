@@ -8888,7 +8888,14 @@ mod tests {
             })
             .await
             .expect_err("closed session must reject local operation without another request");
-        assert!(matches!(error, WorkdirError::Unavailable(_)));
+        assert!(matches!(
+            error.classification_source(),
+            WorkdirError::Unavailable(_)
+        ));
+        assert_eq!(
+            error.failure_reason(),
+            Some(workdir::WorkdirFailureReason::SessionClosed)
+        );
         server.join().expect("mock remote server finished");
     }
 
