@@ -612,4 +612,41 @@ mod tests {
             Some(workdir::CommandOutputTruncation::ByteBudget)
         );
     }
+
+    #[test]
+    fn incomplete_collection_with_quota_retains_both_causes_without_claiming_complete_output() {
+        let root = BashOutputView::new();
+        let mut writer = root.begin().unwrap();
+        writer.append(CommandStream::Stdout, b"abc");
+        let terminal: workdir::CommandTerminal = serde_json::from_value(serde_json::json!({
+            "status":"completed", "exit_code":0, "process_failure":null,
+            "output_collection":{"state":"incomplete","failure":{"stage":"stdout_drain","reason":"other","os_code":null}},
+            "stdout_bytes":9, "stderr_bytes":0, "stdout_delivered_bytes":3, "stderr_delivered_bytes":0,
+            "truncation_reason":"byte_budget"
+        })).unwrap();
+        let metadata = writer.finish_transport(&terminal).unwrap();
+        assert!(!metadata.terminal.transport_complete);
+        assert_eq!(metadata.terminal.exit_code, Some(0));
+        assert_eq!(
+            metadata.terminal.output_collection,
+            Some(terminal.output_collection)
+        );
+        assert_eq!(
+            metadata.transport_truncation,
+            Some(workdir::CommandOutputTruncation::ByteBudget)
+        );
+        assert_eq!(metadata.stdout_seen, 9);
+        assert_eq!(metadata.stdout_saved, 3);
+        assert!(metadata.storage_truncated);
+        assert!(metadata.retention_limit.is_none());
+        assert_eq!(
+            root.read(&metadata.id, CommandStream::Stdout, 0, 100)
+                .unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            serde_json::to_value(root.metadata(&metadata.id).unwrap()).unwrap(),
+            serde_json::to_value(metadata).unwrap()
+        );
+    }
 }

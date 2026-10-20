@@ -783,3 +783,86 @@ async fn spawn_fault_retains_safe_reason_without_claiming_output_collection() {
 
 #[cfg(feature = "http-client")]
 mod http;
+
+#[tokio::test]
+async fn drain_failure_and_byte_budget_keep_independent_loss_diagnostics() {
+    for stream in [CommandStream::Stdout, CommandStream::Stderr] {
+        let ready = Gate::default();
+        let exited = Gate::default();
+        let process = FaultProcess {
+            ready: ready.clone(),
+            exited: exited.clone(),
+            wait_error: None,
+        };
+        let reader = FaultReader {
+            prefix: b"partial",
+            prefix_read: ready,
+            fail_ready: exited,
+        };
+        let (sender, mut receiver) = mpsc::channel(QUEUE_CHUNKS);
+        let (_cancel, cancel_rx) = watch::channel(false);
+        let telemetry = CommandTelemetry::new();
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            match stream {
+                CommandStream::Stdout => {
+                    supervise(
+                        process,
+                        reader,
+                        &b""[..],
+                        10,
+                        3,
+                        "quota-fault",
+                        &telemetry,
+                        cancel_rx,
+                        &sender,
+                    )
+                    .await
+                }
+                CommandStream::Stderr => {
+                    supervise(
+                        process,
+                        &b""[..],
+                        reader,
+                        10,
+                        3,
+                        "quota-fault",
+                        &telemetry,
+                        cancel_rx,
+                        &sender,
+                    )
+                    .await
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let Message::Bytes(chunk) = receiver.recv().await.unwrap();
+        assert_eq!(chunk.stream, stream);
+        assert_eq!(chunk.bytes, b"par");
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(terminal.exit_code, Some(0));
+        assert_eq!(terminal.stdout_bytes + terminal.stderr_bytes, 7);
+        assert_eq!(
+            terminal.stdout_delivered_bytes + terminal.stderr_delivered_bytes,
+            3
+        );
+        assert_eq!(
+            terminal.truncation_reason,
+            Some(crate::CommandOutputTruncation::ByteBudget)
+        );
+        assert_eq!(
+            terminal.output_collection,
+            CommandOutputCollection::Incomplete {
+                failure: CommandFailure {
+                    stage: match stream {
+                        CommandStream::Stdout => CommandFailureStage::StdoutDrain,
+                        CommandStream::Stderr => CommandFailureStage::StderrDrain,
+                    },
+                    reason: CommandIoErrorKind::PermissionDenied,
+                    os_code: None,
+                },
+            }
+        );
+        assert!(terminal.metadata_valid());
+    }
+}

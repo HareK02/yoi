@@ -3206,9 +3206,13 @@ mod tests {
             .await
             .expect_err("close must be terminal");
         assert!(matches!(
-            closed_error,
+            closed_error.classification_source(),
             workdir::WorkdirError::Unavailable(_)
         ));
+        assert_eq!(
+            closed_error.failure_reason(),
+            Some(workdir::WorkdirFailureReason::SessionClosed)
+        );
         assert!(
             state
                 .workdir_sessions
