@@ -181,7 +181,7 @@ for (const admin of [false, true]) {
     else {expect(screen.queryByRole("link", { name: "Hosting settings" }))
         .toBeNull();}
     state.signedIn = false;
-    await fireEvent(window, new Event(SESSION_CHANGED_EVENT));
+    await browserSession.refresh();
     await screen.findByRole("link", { name: "Log in" });
     expect(screen.queryByRole("link", { name: "Hosting settings" })).toBeNull();
   });
@@ -233,7 +233,7 @@ test("dashboard removes private content on session change and ignores old catalo
   render(Dashboard);
   await screen.findByText("Loading Workspaces…");
   state.signedIn = false;
-  await fireEvent(window, new Event(SESSION_CHANGED_EVENT));
+  await browserSession.refresh();
   await screen.findByText("Log in to select or create a Workspace.");
   state.catalogGate.resolve(Response.json([createdWorkspace]));
   expect(screen.queryByText("New Workspace")).toBeNull();
@@ -246,6 +246,7 @@ test("dashboard does not contact catalog for anonymous or unknown session", asyn
   expect(workspaceCalls()).toEqual([]);
   view.unmount();
   state.whoamiStatus = 503;
+  browserSession.invalidate();
   render(Dashboard);
   await screen.findByRole("alert");
   expect(workspaceCalls()).toEqual([]);
@@ -268,7 +269,7 @@ const creationBodies = (fetcher: ReturnType<typeof boundary>["fetcher"]) =>
     [, init],
   ) => JSON.parse(String(init!.body)));
 
-test("same actor focus retains creation disclosure, repository fields, errors and exact retry key through unknown session", async () => {
+test("focus retains creation inputs, errors and retry key without a session request", async () => {
   const { state, fetcher } = boundary();
   state.signedIn = true;
   state.createStatus = 503;
@@ -288,16 +289,15 @@ test("same actor focus retains creation disclosure, repository fields, errors an
   );
   await submitCreation();
   await screen.findByRole("alert");
-  state.sessionGate = deferred<Response>();
+  const sessionCalls = () =>
+    fetcher.mock.calls.filter(([path]) => path === "/api/auth/whoami").length;
+  const count = sessionCalls();
   await fireEvent(window, new Event("focus"));
-  await screen.findByText("Loading session…");
-  expect(screen.queryByLabelText("Workspace display name")).toBeNull();
-  state.sessionGate.resolve(
-    Response.json({
-      session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
-      actor: { ...authUser, auth_method: "browser_session" },
-    }),
-  );
+  await fireEvent(window, new Event("pageshow"));
+  await fireEvent(document, new Event("visibilitychange"));
+  await fireEvent(window, new Event(SESSION_CHANGED_EVENT));
+  expect(sessionCalls()).toBe(count);
+  expect(screen.queryByText("Loading session…")).toBeNull();
   expect(
     (await screen.findByLabelText("Workspace display name") as HTMLInputElement)
       .value,
@@ -315,7 +315,7 @@ test("same actor focus retains creation disclosure, repository fields, errors an
   expect(creationBodies(fetcher)[0]).toEqual(creationBodies(fetcher)[1]);
 });
 
-test("pending create remains single across focus and a success during unknown session becomes an explicit confirmed-result link", async () => {
+test("pending create remains single during an explicit authentication change and retains its result", async () => {
   const { state, fetcher } = boundary();
   state.signedIn = true;
   state.creationGate = deferred<Response>();
@@ -324,7 +324,8 @@ test("pending create remains single across focus and a success during unknown se
   await submitCreation();
   await screen.findByRole("button", { name: "Creating…" });
   state.sessionGate = deferred<Response>();
-  await fireEvent(window, new Event("focus"));
+  browserSession.invalidate();
+  const checking = browserSession.refresh();
   await screen.findByText("Loading session…");
   const response = Response.json(creationResponse());
   state.creationGate.resolve(response);
@@ -336,6 +337,7 @@ test("pending create remains single across focus and a success during unknown se
       actor: { ...authUser, auth_method: "browser_session" },
     }),
   );
+  await checking;
   expect(
     (await screen.findByRole("link", { name: "Open created Workspace" }))
       .getAttribute("href"),
@@ -351,7 +353,7 @@ test("same actor session error retains draft privately until retry; confirmed di
   render(Dashboard);
   await openCreation();
   state.whoamiStatus = 503;
-  await fireEvent(window, new Event(SESSION_CHANGED_EVENT));
+  await browserSession.refresh();
   await screen.findByRole("alert");
   expect(screen.queryByLabelText("Workspace display name")).toBeNull();
   state.whoamiStatus = 200;
@@ -361,7 +363,7 @@ test("same actor session error retains draft privately until retry; confirmed di
       .value,
   ).toBe("Retained draft");
   state.accountId = "different-account";
-  await fireEvent(window, new Event(SESSION_CHANGED_EVENT));
+  await browserSession.refresh();
   await screen.findByText("No accessible Workspaces");
   await fireEvent.click(
     screen.getByText("Create Workspace", { selector: "summary" }),
@@ -380,14 +382,14 @@ test("late creation result after confirmed logout or actor change never navigate
   await submitCreation();
   await screen.findByRole("button", { name: "Creating…" });
   state.signedIn = false;
-  await fireEvent(window, new Event(SESSION_CHANGED_EVENT));
+  await browserSession.refresh();
   await screen.findByRole("link", { name: "Log in" });
   const response = Response.json(creationResponse());
   state.creationGate.resolve(response);
   await waitFor(() => expect(response.bodyUsed).toBe(true));
   expect(goto).not.toHaveBeenCalled();
   state.signedIn = true;
-  await fireEvent(window, new Event(SESSION_CHANGED_EVENT));
+  await browserSession.refresh();
   await screen.findByText("No accessible Workspaces");
   expect(screen.queryByRole("link", { name: "Open created Workspace" }))
     .toBeNull();

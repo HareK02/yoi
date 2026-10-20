@@ -19,7 +19,10 @@ import Layout from "./+layout.svelte";
 
 vi.mock(
   "$app/state",
-  () => ({ page: { url: new URL("https://example.test/w/example") } }),
+  () => ({
+    page: { url: new URL("https://example.test/w/example") },
+    navigating: { to: null },
+  }),
 );
 const storageKey = "yoi.sidebar.mode.v1";
 const legacyKey = "yoi.sidebar.folded.v1";

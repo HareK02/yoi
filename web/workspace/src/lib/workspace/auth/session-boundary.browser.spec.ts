@@ -9,13 +9,15 @@ import { goto } from "$app/navigation";
 const page = vi.hoisted(() => ({
   url: new URL("http://localhost:3000/w/team/tickets?q=mine#entry"),
 }));
-vi.mock("$app/state", () => ({ page }));
+const navigation = vi.hoisted(() => ({ to: null as { url: URL } | null }));
+vi.mock("$app/state", () => ({ page, navigating: navigation }));
 vi.mock(
   "$app/navigation",
   () => ({ goto: vi.fn(async () => {}), invalidate: vi.fn(async () => {}) }),
 );
 afterEach(() => {
   cleanup();
+  navigation.to = null;
   browserSession.invalidate();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -54,7 +56,23 @@ test("active expired state removes private content and preserves browser query a
   );
 });
 
-test("unknown state hides and inerts admitted content instead of declaring anonymous", async () => {
+test("navigation admission does not redirect to the old page return URL", async () => {
+  await admitted();
+  navigation.to = { url: new URL("http://localhost/dashboard") };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () =>
+      Response.json({ actor: null, session: { kind: "expired" } })
+    ),
+  );
+  await browserSession.refresh();
+  await waitFor(() =>
+    expect(screen.queryByText("Private fragment")).toBeNull()
+  );
+  expect(goto).not.toHaveBeenCalled();
+});
+
+test("page access keeps admitted content visible while checking, but a failed check is unknown", async () => {
   await admitted();
   let release!: (response: Response) => void;
   vi.stubGlobal(
@@ -66,9 +84,9 @@ test("unknown state hides and inerts admitted content instead of declaring anony
     ),
   );
   const checking = browserSession.refresh();
-  await screen.findByText("Loading session…");
-  expect(screen.getByText("Private fragment").closest("[hidden][inert]"))
-    .toBeTruthy();
+  expect(screen.queryByText("Loading session…")).toBeNull();
+  expect(screen.getByText("Private fragment").closest("[hidden]"))
+    .toBeNull();
   release(new Response(null, { status: 503 }));
   await checking;
   await screen.findByText(
@@ -99,7 +117,7 @@ test("another tab changing actor cannot reveal content loaded for the old actor"
   expect(screen.queryByText("Private fragment")).toBeNull();
 });
 
-test("a child mount session recheck does not unmount and restart its own loader", async () => {
+test("a child mount reuses the page session without another request or remount", async () => {
   window.history.replaceState({}, "", "/w/team/tickets?q=mine#entry");
   const fetcher = vi.fn(async () => Response.json(whoamiPayload(actor)));
   vi.stubGlobal("fetch", fetcher);
@@ -109,7 +127,7 @@ test("a child mount session recheck does not unmount and restart its own loader"
     render: () => "<p>Mounted session reader</p>",
     setup: () => {
       ++mounts;
-      void browserSession.refresh();
+      void browserSession.ensure();
     },
   }));
   render(SessionBoundary, { children: checkingChild });
@@ -117,5 +135,5 @@ test("a child mount session recheck does not unmount and restart its own loader"
   expect(screen.getByText("Mounted session reader").closest("[hidden]"))
     .toBeNull();
   expect(mounts).toBe(1);
-  expect(fetcher).toHaveBeenCalledTimes(2);
+  expect(fetcher).toHaveBeenCalledTimes(1);
 });

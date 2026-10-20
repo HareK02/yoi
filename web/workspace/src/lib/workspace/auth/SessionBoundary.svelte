@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, type Snippet } from 'svelte';
   import { goto, invalidate } from '$app/navigation';
-  import { page } from '$app/state';
+  import { page, navigating as navigation } from '$app/state';
   import { browserSession, observeBrowserSession, type SessionSnapshot } from './session-state.ts';
   import { isPublicPage, loginUrl } from './routes.ts';
   import './auth-page.css';
@@ -27,7 +27,9 @@
     });
   });
   $effect(() => {
-    if (!protectedPage || session.kind !== 'ready') return;
+    // The destination loader owns admission during navigation, including returnTo.
+    // Do not race it with a redirect for the page being left.
+    if (navigation.to || !protectedPage || session.kind !== 'ready') return;
     const state = session.value.session.kind;
     if (state === 'authenticated') {
       if (!sameActor) {
@@ -47,7 +49,6 @@
     void goto(target, { replaceState: true }).finally(() => { navigating = false; });
   });
   async function retry() {
-    await browserSession.refresh();
     await invalidate('auth:session');
   }
 </script>

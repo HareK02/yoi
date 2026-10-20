@@ -79,16 +79,45 @@ test("storage generation fences responses even before the other tab storage even
   expect(session.snapshot).toEqual({ kind: "ready", value: authenticated() });
 });
 
-test("active deadline rechecks the server and reports failures as unknown, never inferred expiry", async () => {
+test("deadline does not recheck; the next page check reads the server", async () => {
   vi.useFakeTimers();
   const read = vi.fn<() => Promise<WhoamiResponse>>().mockResolvedValueOnce(
     authenticated(new Date(Date.now() + 5_000).toISOString()),
   ).mockRejectedValueOnce(new Error("network")).mockResolvedValue(expired);
   const session = state(read);
   await session.refresh();
-  await vi.advanceTimersByTimeAsync(5_000);
+  const admitted = session.snapshot;
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(session.snapshot).toBe(admitted);
+  await session.refresh();
   expect(session.snapshot).toEqual({ kind: "error" });
   await session.refresh();
+  expect(session.snapshot).toEqual({ kind: "ready", value: expired });
+});
+
+test("mounted readers reuse the page check and page access still refreshes", async () => {
+  const read = vi.fn(async () => authenticated());
+  const session = state(read);
+  await session.refresh();
+  await session.ensure();
+  await session.ensure();
+  expect(read).toHaveBeenCalledTimes(1);
+  await session.refresh();
+  expect(read).toHaveBeenCalledTimes(2);
+});
+
+test("an admitted page remains ready while its next page check is pending", async () => {
+  const next = gate<WhoamiResponse>();
+  const read = vi.fn<() => Promise<WhoamiResponse>>()
+    .mockResolvedValueOnce(authenticated()).mockReturnValueOnce(next.promise);
+  const session = state(read);
+  await session.refresh();
+  const previous = session.snapshot;
+  const checking = session.refresh();
+  expect(session.snapshot).toBe(previous);
+  next.resolve(expired);
+  await checking;
   expect(session.snapshot).toEqual({ kind: "ready", value: expired });
 });
 

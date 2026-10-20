@@ -61,6 +61,11 @@ export class BrowserAuth {
     return this.session.kind === "ready" ? this.session.actor : null;
   }
 
+  async ensure(): Promise<void> {
+    if (this.busy || this.disposed) return;
+    await browserSession.ensure();
+  }
+
   async refresh(): Promise<void> {
     if (this.busy || this.disposed) return;
     await browserSession.refresh();

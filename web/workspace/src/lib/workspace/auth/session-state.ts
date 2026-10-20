@@ -15,7 +15,7 @@ export class SessionState {
   private generation = 0;
   private pending: Promise<SessionSnapshot> | null = null;
   private listeners = new Set<(state: SessionSnapshot) => void>();
-  private timer: ReturnType<typeof setTimeout> | undefined;
+  private stale = true;
 
   get authenticationGeneration(): number {
     return this.generation;
@@ -31,34 +31,29 @@ export class SessionState {
 
   private publish(snapshot: SessionSnapshot): void {
     this.snapshot = snapshot;
-    clearTimeout(this.timer);
-    if (
-      snapshot.kind === "ready" &&
-      snapshot.value.session.kind === "authenticated"
-    ) {
-      const expiry = snapshot.value.session.expires_at;
-      if (expiry !== null) {
-        // Timerは再照会の契機。local clockだけで期限切れと断定しない。
-        const remaining = Date.parse(expiry) - Date.now();
-        this.timer = setTimeout(() => {
-          void this.refresh();
-        }, Math.min(2_147_483_647, Math.max(1_000, remaining)));
-      }
-    }
     for (const listener of this.listeners) listener(snapshot);
   }
 
-  invalidate(): void {
+  invalidate(preserveSnapshot = false): void {
     ++this.generation;
     this.pending = null;
-    this.publish({ kind: "loading" });
+    this.stale = true;
+    if (!preserveSnapshot) this.publish({ kind: "loading" });
+  }
+
+  // Page load owns freshness. Components mounted after it reuse that result.
+  async ensure(): Promise<SessionSnapshot> {
+    if (this.pending) return this.pending;
+    if (!this.stale && this.snapshot.kind === "ready") return this.snapshot;
+    return this.refresh();
   }
 
   async refresh(): Promise<SessionSnapshot> {
     if (this.pending) return this.pending;
     const generation = this.generation;
     const stamp = storageStamp();
-    this.publish({ kind: "loading" });
+    // Keep the admitted page visible while a new page access is checked.
+    if (this.snapshot.kind !== "ready") this.publish({ kind: "loading" });
     const pending = (async () => {
       let result: SessionSnapshot;
       try {
@@ -70,13 +65,16 @@ export class SessionState {
         // 新世代が既に確定していれば再取得すら不要。古い完了で確定結果を巻き戻さない。
         if (generation !== this.generation) {
           if (this.pending) return await this.pending;
-          if (this.snapshot.kind !== "loading") return this.snapshot;
+          if (!this.stale && this.snapshot.kind !== "loading") {
+            return this.snapshot;
+          }
         }
         // 別tabの操作がstorage eventより先に完了していても古い応答を採用しない。
         if (generation === this.generation) this.invalidate();
         return await this.refresh();
       }
       this.pending = null;
+      this.stale = false;
       this.publish(result);
       return result;
     })();
@@ -85,7 +83,6 @@ export class SessionState {
   }
 
   dispose(): void {
-    clearTimeout(this.timer);
     this.listeners.clear();
     ++this.generation;
   }
@@ -120,34 +117,18 @@ function clearReturnTo(): void {
 }
 
 let installed = false;
-export function recheckAfterUnauthorized(
-  authenticationGeneration: number,
-): void {
-  if (
-    installed &&
-    authenticationGeneration === browserSession.authenticationGeneration
-  ) void browserSession.refresh();
-}
 export function observeBrowserSession(): void {
   if (installed || typeof window === "undefined") return;
   installed = true;
-  const refresh = () => {
-    void browserSession.refresh();
-  };
-  window.addEventListener("focus", refresh);
-  window.addEventListener("pageshow", refresh);
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) refresh();
-  });
   window.addEventListener("storage", (event) => {
     if (event.key !== GENERATION_KEY && event.key !== null) return;
-    browserSession.invalidate();
+    // Fence old responses, but leave this page alone until the next page access.
+    browserSession.invalidate(true);
     try {
       if (
         event.key === null ||
         JSON.parse(event.newValue ?? "null")?.reason === "logout"
       ) clearReturnTo();
-    } catch { /* 不明な通知も権限ではなく再照会だけ。 */ }
-    refresh();
+    } catch { /* 不明な通知でも次のページアクセス時に確認する。 */ }
   });
 }

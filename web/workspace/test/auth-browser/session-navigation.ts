@@ -230,7 +230,7 @@ export async function sessionNavigation(
   for (const active of [false, true]) {
     await step(
       `real HTTP Max-Age cookie disappears and ${
-        active ? "active expiry" : "reload"
+        active ? "next page access after expiry" : "reload"
       } returns through login`,
       async ({ page, go }) => {
         const target = "/account?tab=keys#after-cookie-expiry";
@@ -247,11 +247,14 @@ export async function sessionNavigation(
         assert(cookie?.httpOnly);
         assert(cookie.expires > Date.now() / 1000);
         if (active) {
-          // whoamiのexpires_atを製品timerへ渡す。テスト側clockの前進やcookie削除はしない。
+          // 明示的な操作で期限を取得する。期限の経過だけでは再確認しない。
           const refreshed = page.waitForResponse((r) =>
             new URL(r.url()).pathname === "/api/auth/whoami"
           );
-          await focus(page);
+          await page.getByRole("button", {
+            name: "Refresh session",
+            exact: true,
+          }).click();
           const wire = await (await refreshed).json();
           assertEquals(wire.session.kind, "authenticated");
           assertEquals(
@@ -283,7 +286,17 @@ export async function sessionNavigation(
             c.name === "auth-fixture"
           ),
         );
-        if (!active) await page.reload();
+        if (active) {
+          await at(page, target);
+          assertEquals(await page.getByText("Loading session…").count(), 0);
+          await page.getByRole("link", { name: "Dashboard / Workspaces" })
+            .click();
+          await at(page, loginTarget("/dashboard"));
+          await login(page);
+          await at(page, "/dashboard");
+          return;
+        }
+        await page.reload();
         await at(page, loginTarget(target));
         await page.reload();
         await login(page);
@@ -296,7 +309,7 @@ export async function sessionNavigation(
     );
   }
   await step(
-    "concurrent API 401 and repeated session checks cannot overwrite the original expired return URL",
+    "concurrent API 401 leaves the page alone; the next page access detects expiry",
     async ({ page, go }) => {
       const target = "/w/private/tickets?view=thread#concurrent-expiry";
       let release!: () => void;
@@ -322,16 +335,15 @@ export async function sessionNavigation(
         await requests;
         await control(page, "expire");
         release();
-        // focus等の外部契機なしに、同時401がwhoami再照会へ接続すること。
-        await at(page, loginTarget(target));
+        // API failure stays on this page; only the next page access checks whoami.
+        await page.getByRole("alert").filter({
+          hasText: /request failed with HTTP 401/,
+        }).waitFor();
         assert(statuses.length >= 2);
-        for (let i = 0; i < 2; i++) {
-          const response = page.waitForResponse((r) =>
-            new URL(r.url()).pathname === "/api/auth/whoami"
-          );
-          await focus(page);
-          await (await response).finished();
-        }
+        await at(page, target);
+        await focus(page);
+        assertEquals(await page.getByText("Loading session…").count(), 0);
+        await page.reload();
         await at(page, loginTarget(target));
         await page.unroute("**/api/w/private/**");
         await login(page);
@@ -375,7 +387,8 @@ export async function sessionNavigation(
         const observed = page.waitForRequest((r) =>
           new URL(r.url()).pathname === "/api/auth/whoami"
         );
-        await focus(page);
+        await page.getByRole("button", { name: "Refresh session", exact: true })
+          .click();
         await observed;
         await requested;
         // 他tabの本物の製品logoutでgeneration/storage eventも通す。
@@ -462,9 +475,9 @@ export async function sessionNavigation(
       assertEquals(new URL(page.url()).searchParams.has("returnTo"), false);
     },
   );
-  for (const event of ["pageshow", "visibilitychange"] as const) {
+  for (const event of ["focus", "pageshow", "visibilitychange"] as const) {
     await step(
-      `${event} rechecks active session and preserves expired return URL`,
+      `${event} leaves the page visible; reload detects expiry`,
       async ({ page, go }) => {
         const target = "/account?tab=keys#lifecycle";
         await go(target, "account");
@@ -473,6 +486,10 @@ export async function sessionNavigation(
           exact: true,
         }).waitFor();
         await control(page, "expire");
+        let checks = 0;
+        page.on("request", (request) => {
+          if (new URL(request.url()).pathname === "/api/auth/whoami") checks++;
+        });
         await page.evaluate((event) => {
           if (event === "visibilitychange") {
             if (document.hidden) {
@@ -481,6 +498,15 @@ export async function sessionNavigation(
             document.dispatchEvent(new Event(event));
           } else window.dispatchEvent(new Event(event));
         }, event);
+        await page.evaluate(() =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+          )
+        );
+        assertEquals(checks, 0);
+        await at(page, target);
+        assertEquals(await page.getByText("Loading session…").count(), 0);
+        await page.reload();
         await at(page, loginTarget(target));
       },
     );
@@ -557,7 +583,7 @@ export async function sessionNavigation(
       }
     },
   );
-  for (const status of [403, 404]) {
+  for (const status of [401, 403, 404]) {
     await step(
       `post-login resource ${status} remains a resource failure, never a relogin loop`,
       async ({ page, go }) => {

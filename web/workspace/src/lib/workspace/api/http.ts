@@ -1,7 +1,3 @@
-import {
-  browserSession,
-  recheckAfterUnauthorized,
-} from "#lib/workspace/auth/session-state.ts";
 import { SKILL_API_LIMITS } from "#lib/generated/skill-api.ts";
 import type {
   SkillCatalogResponse,
@@ -106,11 +102,7 @@ export async function loadJson<T>(
 ): Promise<ApiResult<T>> {
   let stage: "request" | "decode" | "validate" = "request";
   try {
-    const authenticationGeneration = browserSession.authenticationGeneration;
     const response = await fetchFn(path, init);
-    if (response.status === 401) {
-      recheckAfterUnauthorized(authenticationGeneration);
-    }
     if (!response.ok) {
       if (policy) {
         await response.body?.cancel();

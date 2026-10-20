@@ -19,7 +19,7 @@
     const confirmed = await auth.run('Logging out…', 'Logged out.', logout, 'logout');
     if (confirmed && !auth.actor) await goto('/', { replaceState: true });
   }
-  onMount(() => { void refresh(); return () => auth.dispose(); });
+  onMount(() => { void auth.ensure(); return () => auth.dispose(); });
 </script>
 
 <svelte:head><title>Account · Yoi</title></svelte:head>
