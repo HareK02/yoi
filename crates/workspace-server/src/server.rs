@@ -13506,6 +13506,7 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
             request_token_id_hash = context.and(request_token_id_hash.as_deref()),
             denial_reason = error.and_then(|error| error.denial_reason).map(|reason| reason.as_str()),
             failure_reason = error.and_then(|error| error.failure_reason).map(|reason| reason.as_str()),
+            failure_stage = error.and_then(|error| error.failure_reason).map(|reason| reason.stage().as_str()),
             status = event.status,
             kind = event.kind.unwrap_or("unknown"),
             message = event.message.unwrap_or(""),
@@ -36942,8 +36943,9 @@ impl ApiErrorLog {
         log.denial_reason = error.denial_reason;
         log.failure_reason = error.failure_reason;
         if log.workdir_log.is_some() {
-            // Existing public API details are unchanged; do not copy request-derived
-            // alias/handle text or session-open errors into operational diagnostics.
+            // Public classification and arbitrary diagnostic text are not safe
+            // operational causes. Keep only the separately typed reason/stage;
+            // never infer a reason by parsing request- or provider-authored text.
             log.kind = format!("workdir_session_operation_api_{}", status.as_u16());
             // This can also fail after a command was dispatched. Do not claim
             // a pre-dispatch refusal or absence of effects in the safe message.

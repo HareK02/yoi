@@ -2187,7 +2187,25 @@ impl RuntimeHttpWorkdirError {
     }
 
     fn runtime(error: RuntimeError) -> Self {
-        match error {
+        use workdir::WorkdirFailureReason as Reason;
+        let reason = match &error {
+            RuntimeError::WorkingDirectory(diagnostic) => match diagnostic.code.as_str() {
+                "working_directory_not_found" => Reason::WorkingDirectoryNotFound,
+                "working_directory_not_active" => Reason::WorkingDirectoryNotActive,
+                "working_directory_record_invalid" => Reason::WorkingDirectoryRecordInvalid,
+                "working_directory_repository_access_unavailable" => {
+                    Reason::WorkingDirectoryAccessUnavailable
+                }
+                _ => Reason::SessionOpenFailed,
+            },
+            RuntimeError::RuntimeStopped => Reason::RuntimeStopped,
+            RuntimeError::StatePoisoned => Reason::RuntimeStateUnavailable,
+            RuntimeError::ExecutionBackendUnavailable { .. } => Reason::RuntimeBackendUnavailable,
+            RuntimeError::WorkspaceOwnerMismatch { .. } => Reason::RuntimeOwnerMismatch,
+            RuntimeError::InvalidRequest(_) => Reason::RuntimeInvalidRequest,
+            _ => Reason::SessionOpenFailed,
+        };
+        let mut response = match error {
             RuntimeError::WorkingDirectory(diagnostic)
                 if diagnostic.code == "working_directory_not_found" =>
             {
@@ -2200,7 +2218,9 @@ impl RuntimeHttpWorkdirError {
                 WorkdirTransportErrorCode::Unavailable,
                 "Workdir session is unavailable",
             ),
-        }
+        };
+        response.payload.failure_reason = Some(reason);
+        response
     }
 }
 
@@ -2222,6 +2242,7 @@ impl IntoResponse for RuntimeHttpWorkdirError {
                 status = self.status.as_u16(),
                 code = self.payload.code.as_str(),
                 failure_reason = reason.as_str(),
+                failure_stage = reason.stage().as_str(),
                 "Workdir provider operation failed"
             );
         }
@@ -2434,6 +2455,7 @@ pub enum RuntimeHttpServerError {
 #[cfg(test)]
 mod tests {
     mod command_transport_tests;
+    mod runtime_workdir_failure_tests;
     #[cfg(feature = "fs-store")]
     mod session_material_tests;
 

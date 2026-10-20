@@ -3995,12 +3995,27 @@ impl WorkdirHttpAuthorization for RemoteWorkdirAuthorization {
                 return authorizer
                     .issue_async(method, path_and_query, operation, None, body)
                     .await
-                    .map_err(|error| WorkdirError::Unavailable(error.message));
+                    .map_err(|error| {
+                        use workdir::WorkdirFailureReason as Reason;
+                        let reason = match error.code.as_str() {
+                            "workspace_runtime_authorization_stale" => Reason::AuthorizationStale,
+                            "workspace_signing_identity_unavailable" => {
+                                Reason::SigningIdentityUnavailable
+                            }
+                            "workspace_runtime_authorization_sign_failed" => {
+                                Reason::AuthorizationSignFailed
+                            }
+                            _ => Reason::AuthorizationUnavailable,
+                        };
+                        WorkdirError::Unavailable("Workdir authorization is unavailable".into())
+                            .with_failure_reason(reason)
+                    });
             }
             authorization.fallback_bearer_token.ok_or_else(|| {
                 WorkdirError::Unavailable(
                     "remote Runtime does not have bearer authorization configured".to_string(),
                 )
+                .with_failure_reason(workdir::WorkdirFailureReason::AuthorizationMissing)
             })
         })
     }

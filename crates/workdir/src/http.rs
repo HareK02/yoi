@@ -375,12 +375,14 @@ impl WorkdirTransportError {
         use WorkdirTransportErrorCode as Code;
         let error = match self.code {
             Code::NotFound => WorkdirError::NotFound("<remote>".into()),
-            Code::Conflict => WorkdirError::Conflict(self.message),
+            Code::Conflict => WorkdirError::Conflict(
+                "The target file's content or existence changed since it was last observed; read the file again before retrying".into(),
+            ),
             Code::OutcomeUnknown => WorkdirError::OutcomeUnknown(
                 "Workdir operation may have effects; inspect before retrying".into(),
             ),
-            Code::Unsupported => WorkdirError::UnsupportedOperation(self.message),
-            Code::InvalidRequest => WorkdirError::InvalidArgument(self.message),
+            Code::Unsupported => WorkdirError::UnsupportedOperation("Workdir operation is not supported".into()),
+            Code::InvalidRequest => WorkdirError::InvalidArgument("Workdir operation request is invalid".into()),
             Code::Denied => WorkdirError::Denied(crate::WorkdirDenial {
                 reason: self.denial_reason,
                 // Provider-authored text is not trusted diagnostic data.
@@ -409,12 +411,12 @@ impl WorkdirTransportError {
                 target: "<remote-target>".into(),
             },
             Code::UnknownCommand => WorkdirError::UnknownCommand("<remote>".to_string()),
-            Code::Unavailable => WorkdirError::Unavailable(self.message),
+            Code::Unavailable => WorkdirError::Unavailable("Workdir session is unavailable".into()),
             Code::Io => WorkdirError::Io {
                 path: "<remote>".into(),
-                source: std::io::Error::other(self.message),
+                source: std::io::Error::other("Workdir I/O operation failed"),
             },
-            Code::Transport => WorkdirError::Transport(self.message),
+            Code::Transport => WorkdirError::Transport("Workdir transport failed".into()),
             Code::Internal => WorkdirError::OperationFailed,
         };
         let error = if let Some(reason) = self.failure_reason {
@@ -549,7 +551,8 @@ mod client {
             if opened.workdir_id.as_str() != workdir_id.as_str() {
                 return Err(WorkdirError::Unavailable(
                     "Runtime opened a session for a different Workdir".to_string(),
-                ));
+                )
+                .with_failure_reason(crate::WorkdirFailureReason::SessionIdentityMismatch));
             }
             Ok(Self {
                 client,
@@ -608,6 +611,7 @@ mod client {
             WorkdirError::Unavailable(format!(
                 "Runtime returned a mismatched Workdir operation result; expected {expected}"
             ))
+            .with_failure_reason(crate::WorkdirFailureReason::OperationResultMismatch)
         }
     }
 
@@ -770,7 +774,8 @@ mod client {
                 }
                 Ok(_) if mutation => Err(WorkdirError::OutcomeUnknown(
                     "mismatched response after checkout mutation".into(),
-                )),
+                )
+                .with_failure_reason(crate::WorkdirFailureReason::OperationResultMismatch)),
                 Ok(_) => Err(Self::mismatch("checkout_execute")),
                 Err(error)
                     if mutation

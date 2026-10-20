@@ -605,6 +605,10 @@ async fn generated_workdir_provider_errors_preserve_response_and_log_details() {
         workdir::WorkdirFailureReason::SessionClosed,
         workdir::WorkdirFailureReason::CommandTerminalMissing,
         workdir::WorkdirFailureReason::HttpTimeout,
+        workdir::WorkdirFailureReason::OperationResultMismatch,
+        workdir::WorkdirFailureReason::SessionOpenTaskFailed,
+        workdir::WorkdirFailureReason::AuthorizationStale,
+        workdir::WorkdirFailureReason::RuntimeStopped,
     ] {
         let request = runtime_source_request(
             &identity,
@@ -653,6 +657,7 @@ async fn generated_workdir_provider_errors_preserve_response_and_log_details() {
         );
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["failure_reason"], reason.as_str());
+        assert_eq!(events[0]["failure_stage"], reason.stage().as_str());
         assert_eq!(events[0]["operation"], "command_output");
         assert_eq!(events[0]["workdir_stage"], "provider_dispatch");
         let log = serde_json::to_string(&events).unwrap();
@@ -1248,4 +1253,55 @@ async fn non_api_workspace_paths_are_not_logged_as_ticket_api_errors() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(events.is_empty());
+}
+
+#[tokio::test]
+async fn session_open_failure_causes_survive_registry_api_conversion_without_raw_diagnostics() {
+    use workdir::WorkdirFailureReason as Reason;
+    for reason in [
+        Reason::SessionOpenFailed,
+        Reason::SessionOpenTaskFailed,
+        Reason::SessionIdentityMismatch,
+        Reason::AuthorizationStale,
+        Reason::AuthorizationUnavailable,
+        Reason::RuntimeStopped,
+        Reason::WorkingDirectoryRecordInvalid,
+        Reason::OperationResultMismatch,
+    ] {
+        let mut fixture = manual_worker_assignment_fixture().await;
+        fixture.runtime.workdir_session_factory = Some(Arc::new(move |_| {
+            Err(workdir::WorkdirError::Unavailable(
+                "/host/private body-secret proof-secret key-secret credential-secret".into(),
+            )
+            .with_failure_reason(reason))
+        }));
+        fixture
+            .api
+            .runtime
+            .register_or_replace(fixture.runtime.clone());
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+                .unwrap();
+        configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
+        let request = runtime_source_request(&identity, Some(&fixture.worker.worker_id), "POST", &path, serde_json::to_vec(&json!({
+            "target_workdir": "checkout",
+            "operation": {"operation": "read", "request": {"path":"README.md", "offset":0, "limit":10, "max_bytes":1024}}
+        })).unwrap());
+        let (status, body, events) =
+            request_with_logs(build_router(fixture.api.clone()), request).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(
+            body["message"],
+            "workdir_session_open_failed: Workdir session is unavailable"
+        );
+        assert!(body.get("failure_reason").is_none(), "{body}");
+        assert!(!body.to_string().contains("secret"));
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["workdir_stage"], "session_open");
+        assert_eq!(events[0]["failure_reason"], reason.as_str());
+        assert_eq!(events[0]["failure_stage"], reason.stage().as_str());
+        assert_eq!(events[0]["message"], "Workdir operation failed");
+        assert_eq!(events[0]["diagnostics"], "[]");
+    }
 }
