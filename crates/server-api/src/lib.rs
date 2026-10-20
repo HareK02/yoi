@@ -125,6 +125,8 @@ pub struct WorkdirOperationApiError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<Vec<Diagnostic>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_failures: Vec<workdir::http::WorkdirAuditFailure>,
     #[serde(skip, default = "default_repository_error_status")]
     status: u16,
     /// Server-local metadata retained by generated error response extensions, never the wire body.
@@ -156,6 +158,7 @@ impl WorkdirOperationApiError {
             code: None,
             message: error.message,
             diagnostics: Some(error.diagnostics),
+            audit_failures: Vec::new(),
             status: error.status,
             workdir_log: None,
             denial_reason: None,
@@ -170,6 +173,7 @@ impl WorkdirOperationApiError {
             code: Some(error.code),
             message: error.message,
             diagnostics: None,
+            audit_failures: Vec::new(),
             status,
             workdir_log: None,
             denial_reason: error.denial_reason,
@@ -7522,7 +7526,9 @@ pub struct CurrentWorkerWorkdirOperationRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(transparent)]
-pub struct CurrentWorkerWorkdirOperationResponse(pub workdir::http::WorkdirSessionOperationResult);
+pub struct CurrentWorkerWorkdirOperationResponse(
+    pub workdir::http::WorkdirSessionOperationResponse,
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]

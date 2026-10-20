@@ -409,6 +409,7 @@ pub enum WorkdirFailureReason {
     SessionClosed,
     ProviderUnavailable,
     CommandTerminalMissing,
+    AuditStoreUnavailable,
     HttpTimeout,
     HttpConnect,
     HttpTransfer,
@@ -440,6 +441,7 @@ impl WorkdirFailureReason {
             Self::SessionClosed => "session_closed",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::CommandTerminalMissing => "command_terminal_missing",
+            Self::AuditStoreUnavailable => "audit_store_unavailable",
             Self::HttpTimeout => "http_timeout",
             Self::HttpConnect => "http_connect",
             Self::HttpTransfer => "http_transfer",
@@ -560,6 +562,10 @@ pub enum WorkdirError {
 
     #[error("Workdir session is unavailable: {0}")]
     Unavailable(String),
+
+    /// The broker has proof that this operation never reached the provider.
+    #[error("Workdir operation was not dispatched")]
+    NotDispatched,
 
     #[error("Workdir operation failed")]
     OperationFailed,
