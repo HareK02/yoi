@@ -48,6 +48,10 @@ pub struct CheckoutRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CheckoutOperation {
+    ReadBytes {
+        offset: u64,
+        max_bytes: usize,
+    },
     Read {
         offset: usize,
         limit: usize,
@@ -71,7 +75,7 @@ pub enum CheckoutOperation {
 impl CheckoutOperation {
     pub fn capability(&self) -> WorkdirSessionCapability {
         match self {
-            Self::Read { .. } => WorkdirSessionCapability::Read,
+            Self::Read { .. } | Self::ReadBytes { .. } => WorkdirSessionCapability::Read,
             Self::Edit { .. } => WorkdirSessionCapability::Edit,
             Self::Write { .. } | Self::Create { .. } => WorkdirSessionCapability::Write,
         }
@@ -86,6 +90,7 @@ impl CheckoutOperation {
 )]
 pub enum CheckoutOutput {
     Read(ReadResult),
+    ReadBytes(crate::ReadBytesResult),
     Write(WriteResult),
     Edit(EditResult),
 }

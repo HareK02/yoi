@@ -657,18 +657,32 @@ fn plan_runtime_store_migration(
         ));
     }
     if current_schema_version == SCHEMA_VERSION {
+        // Runtime and Session schemas evolve independently. Probe only through
+        // Session Store's non-mutating current-schema admission boundary; any
+        // conversion still runs on the existing owner-locked staging tree.
+        let migration_required = crate::retention::sessions_require_migration(root)?;
+        let excluded_ephemeral_paths = if migration_required {
+            runtime_tree_exclusions(root)?
+        } else {
+            Vec::new()
+        };
+        let archived_orphan_worker_count = if migration_required {
+            orphaned_worker_directories(root)?.len()
+        } else {
+            0
+        };
         let plan = FsRuntimeStoreMigrationPlan {
             current_schema_version,
             target_schema_version: SCHEMA_VERSION,
-            migration_required: false,
+            migration_required,
             worker_count: 0,
-            archived_orphan_worker_count: 0,
+            archived_orphan_worker_count,
             migrated_worker_aggregate_count: 0,
             migrated_diagnostic_worker_ref_count: 0,
             cleared_diagnostic_worker_ref_count: 0,
             mapping_digest: legacy_worker_identity_mapping_digest(&[]),
             mappings: Vec::new(),
-            excluded_ephemeral_paths: Vec::new(),
+            excluded_ephemeral_paths,
         };
         return Ok((plan, Vec::new()));
     }
@@ -1808,7 +1822,9 @@ fn migrate_runtime_store(
     Ok(plan)
 }
 
-fn archive_orphaned_worker_directories(root: &Path) -> Result<usize, RuntimeError> {
+fn orphaned_worker_directories(
+    root: &Path,
+) -> Result<Vec<(std::ffi::OsString, PathBuf)>, RuntimeError> {
     let workers_dir = root.join(WORKERS_DIR);
     let mut orphaned = fs::read_dir(&workers_dir)
         .map_err(|source| runtime_io_error("read Worker records", &workers_dir, source))?
@@ -1821,6 +1837,11 @@ fn archive_orphaned_worker_directories(root: &Path) -> Result<usize, RuntimeErro
         })
         .collect::<Vec<_>>();
     orphaned.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Ok(orphaned)
+}
+
+fn archive_orphaned_worker_directories(root: &Path) -> Result<usize, RuntimeError> {
+    let orphaned = orphaned_worker_directories(root)?;
     if orphaned.is_empty() {
         return Ok(0);
     }
@@ -1853,6 +1874,21 @@ fn migrate_runtime_store_in_place(
 ) -> Result<FsRuntimeStoreMigrationPlan, RuntimeError> {
     let (plan, planned_workers) = plan_runtime_store_migration(root, runtime_id)?;
     if !plan.migration_required {
+        return Ok(plan);
+    }
+    if plan.current_schema_version == SCHEMA_VERSION {
+        // Session-only migration: do not reserialize Runtime/Worker identity,
+        // Restore guards, recovery fences, or retained execution receipts.
+        // As in a Runtime schema migration, retain orphan trees outside the
+        // Worker catalog before validating the completed staging tree.
+        let archived = archive_orphaned_worker_directories(root)?;
+        if archived != plan.archived_orphan_worker_count {
+            return Err(runtime_store_corrupt(
+                root,
+                "orphan count changed during Session migration".into(),
+            ));
+        }
+        crate::retention::migrate_staged_sessions(root)?;
         return Ok(plan);
     }
     let runtime_path = root.join(RUNTIME_FILE);
@@ -1948,11 +1984,9 @@ fn migrate_runtime_store_in_place(
             ),
         ));
     }
-    // Schema 11 already migrated Sessions; the recovery-fence bump must not
-    // rewrite retained history or archive attestations.
-    if plan.current_schema_version != SOURCE_SCHEMA_VERSION {
-        crate::retention::migrate_staged_sessions(root)?;
-    }
+    // A Runtime schema bump says nothing about the retained Session schema.
+    // Session Store owns versioned conversion, including v4 -> generic v5.
+    crate::retention::migrate_staged_sessions(root)?;
     let (document, _) = migrate_runtime_document(
         document,
         plan.current_schema_version,
@@ -3011,9 +3045,8 @@ mod tests {
             } else {
                 drop(result.unwrap());
                 assert_eq!(stored_schema_version(&root), u64::from(SCHEMA_VERSION));
-                let manifest: serde_json::Value =
-                    read_json(&session.join("session.json"), "test").unwrap();
-                assert_eq!(manifest["schema_version"], 4);
+                session_store::WorkerSessionStore::open_read_only(&session)
+                    .expect("startup migration must admit the current Session schema");
                 let once = fs::read(session.join("session.json")).unwrap();
                 drop(FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap());
                 assert_eq!(fs::read(session.join("session.json")).unwrap(), once);

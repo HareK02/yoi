@@ -418,13 +418,22 @@ struct MountedProjection {
 impl MountedProjection {
     fn resolved(&self) -> WipProjection {
         let mut projection = self.projection.clone();
+        let mut handlers: BTreeMap<_, _> = self
+            .operation_handlers
+            .iter()
+            .map(|(op, (_, h))| (op.clone(), h.clone()))
+            .collect();
+        for reference in &projection.object.interfaces {
+            if let Some(contract) = crate::file_operation::Contract::from_reference(reference) {
+                handlers.insert(
+                    contract.handler_operation().into(),
+                    self.projection.handler.clone(),
+                );
+            }
+        }
         projection.handler = Arc::new(OperationDispatchHandler {
             owner: Arc::clone(&self.projection.handler),
-            handlers: self
-                .operation_handlers
-                .iter()
-                .map(|(operation, (_, handler))| (operation.clone(), Arc::clone(handler)))
-                .collect(),
+            handlers,
         });
         projection
     }
@@ -1017,6 +1026,10 @@ impl WipMountRegistry {
         descriptor: &InterfaceDescriptor,
         validator: Option<&[u8]>,
     ) -> bool {
+        if let Some(contract) = crate::file_operation::Contract::from_reference(interface) {
+            return *descriptor != contract.descriptor()
+                || validator != Some(contract.validator().as_slice());
+        }
         self.mounts.values().any(|mounted| {
             mounted.projection.interface == *interface
                 && (mounted.projection.descriptor != *descriptor
@@ -1082,6 +1095,10 @@ impl WipMountRegistry {
         validator: Option<&[u8]>,
         replacing_route: Option<&str>,
     ) -> bool {
+        if let Some(contract) = crate::file_operation::Contract::from_reference(interface) {
+            return *descriptor != contract.descriptor()
+                || validator != Some(contract.validator().as_slice());
+        }
         self.additional_interfaces.iter().any(|(route, all)| {
             Some(route.as_str()) != replacing_route
                 && all.iter().any(|p| {
@@ -1188,10 +1205,24 @@ fn validate_projection(projection: &WipProjection) -> Result<(), WipMountError> 
             route: projection.route.clone(),
             message: error.to_string(),
         })?;
-    if projection.object.interfaces != [projection.interface.clone()] {
+    if !projection.object.interfaces.contains(&projection.interface)
+        || projection.object.interfaces.iter().any(|reference| {
+            *reference != projection.interface
+                && crate::file_operation::Contract::from_reference(reference).is_none()
+        })
+    {
         return Err(WipMountError::InvalidProjection {
             route: projection.route.clone(),
-            message: "projected object must expose exactly its declared interface".into(),
+            message: "projected object must expose its declared interface and only known common contracts".into(),
+        });
+    }
+    if let Some(contract) = crate::file_operation::Contract::from_reference(&projection.interface)
+        && (projection.descriptor != contract.descriptor()
+            || projection.interface_validator.as_deref() != Some(contract.validator().as_slice()))
+    {
+        return Err(WipMountError::InvalidProjection {
+            route: projection.route.clone(),
+            message: "common contract descriptor/validator differs from its definition".into(),
         });
     }
     projection
@@ -1304,9 +1335,13 @@ impl WipHost {
         path: &str,
         reference: &InterfaceReference,
     ) -> Result<Option<WipPublication>, ProtocolError> {
-        let Some(owner) = self.publication_live(path).await? else {
+        let Some(mut owner) = self.publication_live(path).await? else {
             return Ok(None);
         };
+        if crate::file_operation::select(&mut owner.projection, reference) {
+            owner.scope = self.object_at(&reference.scope);
+            return Ok(Some(owner));
+        }
         // A live provider owns all its publication metadata; static additional
         // Interface registrations must not survive its scope lifetime changes.
         if owner.projection.interface == *reference || self.subtree(path).is_some() {
@@ -1333,6 +1368,20 @@ impl WipHost {
         reference
             .validate()
             .map_err(|e| protocol_error(ProtocolErrorCode::InvalidRequest, e.to_string()))?;
+        if let Some(contract) = crate::file_operation::Contract::from_reference(reference) {
+            let scope = self.object_at("/").ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::InterfaceNotFound,
+                    "root scope unavailable",
+                )
+            })?;
+            return Ok(FetchInterfaceResponse {
+                interface: reference.clone(),
+                scope_ref: scope.r#ref,
+                descriptor: contract.descriptor(),
+                validator: Some(contract.validator()),
+            });
+        }
         let target = if let Some(mount) = self.subtree(&reference.scope) {
             let target = mount.provider.interface_target(reference).ok_or_else(|| {
                 protocol_error(
@@ -1496,6 +1545,9 @@ impl WipHost {
         &self,
         reference: &InterfaceReference,
     ) -> Option<(InterfaceDescriptor, Option<Vec<u8>>)> {
+        if let Some(contract) = crate::file_operation::Contract::from_reference(reference) {
+            return Some((contract.descriptor(), Some(contract.validator())));
+        }
         for (path, all) in &self.registry.additional_interfaces {
             if self.projection(path).is_none() {
                 continue;
@@ -1559,6 +1611,18 @@ impl WipHost {
         }
         if let Some(validator) = projection.handler.object_validator() {
             projection.object.validator = Some(validator);
+        }
+        if let Some(contract) =
+            crate::file_operation::Contract::from_reference(&projection.interface)
+        {
+            if !projection
+                .handler
+                .operation_available(contract.handler_operation())
+            {
+                return None;
+            }
+            // Common descriptor identity never varies with subject or capability filtering.
+            return Some(projection);
         }
         let contextual = contextual_family || projection.handler.contextual_interface();
         let original_len = projection.descriptor.operations.len();
@@ -5502,6 +5566,7 @@ mod tests {
             entry: session_store::LoggedHistoryEntry {
                 item: session_store::LoggedItem::from(saved),
                 metadata: session_store::LoggedSessionHistoryMetadata {
+                    input_metadata: None,
                     entry_id: session_store::LoggedSessionHistoryEntryId::new(),
                     origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
                     derivation: None,
@@ -6044,6 +6109,10 @@ mod tests {
         };
         let authoring_client = Arc::new(ScriptedWorkspaceClient::new([
             query_response,
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({"scope": null}).to_string(),
+            },
             create_response,
             comment_response,
         ]));
@@ -6125,11 +6194,12 @@ mod tests {
             .await
             .unwrap();
         let authoring_requests = authoring_client.requests();
-        assert_eq!(authoring_requests.len(), 3);
+        assert_eq!(authoring_requests.len(), 4);
         assert!(authoring_requests[0].path.ends_with("/tickets/query"));
-        assert!(authoring_requests[1].path.ends_with("/tickets"));
+        assert!(authoring_requests[1].path.ends_with("/authorization/check"));
+        assert!(authoring_requests[2].path.ends_with("/tickets"));
         assert!(
-            authoring_requests[2]
+            authoring_requests[3]
                 .path
                 .ends_with("/tickets/T-9/thread-events")
         );
@@ -7057,3 +7127,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
+
+#[cfg(test)]
+mod bash_output_tests;

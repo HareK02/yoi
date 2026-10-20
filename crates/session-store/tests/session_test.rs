@@ -24,6 +24,7 @@ fn annotated(items: &[Item]) -> Vec<session_store::LoggedHistoryEntry> {
         .map(|item| session_store::LoggedHistoryEntry {
             item: session_store::LoggedItem::from(item),
             metadata: session_store::LoggedSessionHistoryMetadata {
+                input_metadata: None,
                 entry_id: session_store::LoggedSessionHistoryEntryId::new(),
                 origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
                 derivation: None,

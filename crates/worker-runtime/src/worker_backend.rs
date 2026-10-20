@@ -7,13 +7,15 @@
 //!
 //! Opens Session and metadata stores within the aggregate through trusted WorkerRef, with no
 //! process-global root fallback. Restore preserves identity while rebuilding Workspace connections
-//! and Workdir bindings. Candidate controller observation registration waits for activation after
+//! and deferred Workdir references. Candidate controller observation registration waits for activation after
 //! catalog commit. Cleanup checks the actual controller and session resources, deleting only
 //! operation-owned disposable run artifacts. It implies neither Session/metadata deletion nor
 //! retention of all past runs.
 //!
 //! WorkerHandle is owned internally; external operations take WorkerRef. Socket/session paths,
 //! Manifests, credentials, and handles are not passed to browser/API projections.
+
+mod deferred_workdir;
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -147,7 +149,6 @@ use worker::{
     Worker, WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout,
     WorkerControllerTransport, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
     WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
-    bash_output_dir_for_worker_id,
 };
 
 #[cfg(feature = "ws-server")]
@@ -190,7 +191,6 @@ pub enum RuntimeRestoreStage {
 pub enum RuntimeRestoreResources {
     None,
     WorkerStartup,
-    WorkdirBinding,
     Unproven,
 }
 
@@ -312,14 +312,7 @@ async fn finish_restore_failure<F: RuntimeWorkerFactory>(
     mut failure: RuntimeRestoreFailure,
 ) -> RuntimeRestoreFailure {
     if failure.needs_cleanup() {
-        let cleanup = if failure.resources == RuntimeRestoreResources::WorkdirBinding {
-            // Mutable materialization is outside the factory's cleanup authority.
-            // Preserve the exact accepted operation for its resource owner; never
-            // infer rollback from a factory that did not acquire these bindings.
-            Err(RuntimeRestoreCleanupFailure::Unsupported)
-        } else {
-            factory.cleanup_failed_restore(request).await
-        };
+        let cleanup = factory.cleanup_failed_restore(request).await;
         failure.cleanup = match cleanup {
             Ok(()) => RuntimeRestoreCleanup::Confirmed,
             Err(error) => {
@@ -1302,29 +1295,25 @@ fn runtime_local_workdir_session(
     root: &Path,
     cwd: &Path,
     scope: manifest::SharedScope,
-    command_output_scope: manifest::SharedScope,
     capabilities: WorkdirSessionCapabilities,
     command_environment: std::collections::BTreeMap<String, String>,
     resources: Vec<Arc<dyn workdir::WorkdirSessionResource>>,
 ) -> WorkdirSessionHandle {
-    Arc::new(
-        LocalWorkdirSession::materialized_bound_with_environment_and_command_output_scope(
-            Workdir::new(workdir_id),
-            root.to_path_buf(),
-            cwd.to_path_buf(),
-            scope,
-            command_output_scope,
-            capabilities,
-            command_environment,
-            resources,
-        ),
-    )
+    Arc::new(LocalWorkdirSession::materialized_bound_with_environment(
+        Workdir::new(workdir_id),
+        root.to_path_buf(),
+        cwd.to_path_buf(),
+        scope,
+        capabilities,
+        command_environment,
+        resources,
+    ))
 }
 
 fn runtime_local_workdir_router(
     attachments: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
     capabilities: &BTreeMap<WorkdirAttachmentAlias, WorkdirSessionCapabilities>,
-    command_output_scope: manifest::SharedScope,
+    authorization_client: Option<Arc<dyn WorkspaceClient>>,
 ) -> Result<Arc<WorkdirSessionRouter>, String> {
     let router = Arc::new(WorkdirSessionRouter::new());
     for (alias, binding) in attachments {
@@ -1333,22 +1322,27 @@ fn runtime_local_workdir_router(
             .copied()
             .unwrap_or(WorkdirSessionCapabilities::READ_ONLY);
         let scope = runtime_attachment_scope(binding.root(), capabilities)?;
+        let source = runtime_local_workdir_session(
+            &binding.working_directory.id,
+            binding.root(),
+            binding.cwd(),
+            scope,
+            capabilities,
+            binding.command_environment(),
+            binding
+                .session_resources()
+                .map_err(|error| format!("open Workdir attachment `{alias}` resources: {error}"))?,
+        );
+        let source = match authorization_client.as_ref() {
+            Some(client) => worker::authorized_workdir::authorized_workdir_session(
+                source,
+                client.clone(),
+                binding.working_directory.id.clone(),
+            ),
+            None => source,
+        };
         router
-            .attach(
-                alias.clone(),
-                runtime_local_workdir_session(
-                    &binding.working_directory.id,
-                    binding.root(),
-                    binding.cwd(),
-                    scope,
-                    command_output_scope.clone(),
-                    capabilities,
-                    binding.command_environment(),
-                    binding.session_resources().map_err(|error| {
-                        format!("open Workdir attachment `{alias}` resources: {error}")
-                    })?,
-                ),
-            )
+            .attach(alias.clone(), source)
             .map_err(|error| format!("bind Workdir attachment `{alias}`: {error}"))?;
     }
     Ok(router)
@@ -1357,8 +1351,8 @@ fn runtime_local_workdir_router(
 fn restored_workdir_router(
     local_attachments: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
     logical_attachments: &[crate::catalog::LogicalWorkdirAttachment],
+    deferred_sessions: &BTreeMap<WorkdirAttachmentAlias, WorkdirSessionHandle>,
     claims: &[crate::catalog::WorkingDirectoryAttachmentClaim],
-    scope: manifest::SharedScope,
     workspace_client: Arc<dyn WorkspaceClient>,
 ) -> Result<Arc<WorkdirSessionRouter>, String> {
     let mut local_capabilities = local_attachments
@@ -1375,13 +1369,38 @@ fn restored_workdir_router(
             local_capabilities.insert(attachment.alias.clone(), attachment.capabilities);
         }
     }
-    let router = runtime_local_workdir_router(local_attachments, &local_capabilities, scope)?;
+    let router = runtime_local_workdir_router(
+        local_attachments,
+        &local_capabilities,
+        Some(workspace_client.clone()),
+    )?;
+    for (alias, session) in deferred_sessions {
+        if let Some(attachment) = logical_attachments.iter().find(|item| &item.alias == alias) {
+            if session.workdir().id().as_str() != attachment.working_directory_id {
+                return Err(format!("conflicting restored Workdir attachment {alias}"));
+            }
+            // Workspace sessions reacquire live Repository access at operation time.
+            // A Runtime-local opener cannot renew Host-owned SSH credentials.
+            continue;
+        }
+        if local_attachments.contains_key(alias) {
+            return Err(format!("duplicate restored Workdir attachment {alias}"));
+        }
+        let source = worker::authorized_workdir::authorized_workdir_session(
+            session.clone(),
+            workspace_client.clone(),
+            session.workdir().id().to_string(),
+        );
+        router
+            .attach(alias.clone(), source)
+            .map_err(|error| error.to_string())?;
+    }
     for attachment in logical_attachments {
-        if let Some(local) = local_attachments.get(&attachment.alias) {
-            if local.working_directory.id != attachment.working_directory_id {
+        if let Some(session) = router.session(&attachment.alias) {
+            if session.workdir().id().as_str() != attachment.working_directory_id {
                 return Err(format!(
-                    "logical Workdir attachment `{}` conflicts with Runtime-local Workdir {}",
-                    attachment.alias, local.working_directory.id
+                    "conflicting restored Workdir attachment {}",
+                    attachment.alias
                 ));
             }
             continue;
@@ -1404,6 +1423,104 @@ fn restored_workdir_router(
             })?;
     }
     Ok(router)
+}
+
+fn workdir_attachment_statuses(
+    bindings: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
+) -> Vec<WorkingDirectoryAttachmentStatus> {
+    bindings
+        .iter()
+        .map(|(alias, binding)| WorkingDirectoryAttachmentStatus {
+            alias: alias.clone(),
+            working_directory: binding.status(),
+        })
+        .collect()
+}
+
+fn deferred_restore_workdir_sessions(
+    request: &WorkerExecutionRestoreRequest,
+    materializer: Option<Arc<dyn WorkingDirectoryMaterializer>>,
+) -> Result<BTreeMap<WorkdirAttachmentAlias, WorkdirSessionHandle>, String> {
+    let mut references = BTreeMap::new();
+    for previous in &request.previous_workdir_attachments {
+        if references
+            .insert(
+                previous.alias.clone(),
+                previous
+                    .working_directory
+                    .summary
+                    .working_directory_id
+                    .clone(),
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate persisted Workdir alias `{}`",
+                previous.alias
+            ));
+        }
+    }
+    for claim in &request.request.workdir_attachments {
+        if let Some(previous) = references.get(&claim.alias) {
+            if previous != &claim.working_directory_id {
+                return Err(format!(
+                    "conflicting persisted Workdir alias `{}`",
+                    claim.alias
+                ));
+            }
+        } else {
+            references.insert(claim.alias.clone(), claim.working_directory_id.clone());
+        }
+    }
+    references
+        .into_iter()
+        .map(|(alias, workdir_id)| {
+            let capabilities = request
+                .logical_workdir_attachments
+                .iter()
+                .find(|attachment| attachment.alias == alias)
+                .map(|attachment| attachment.capabilities)
+                .unwrap_or_else(|| {
+                    initial_workdir_session_capabilities(
+                        &alias,
+                        &request.request.workdir_attachments,
+                    )
+                });
+            let relative_cwd = request
+                .request
+                .workdir_attachments
+                .iter()
+                .find(|claim| claim.alias == alias)
+                .and_then(|claim| claim.relative_cwd.clone());
+            let materializer = materializer.clone();
+            let id = workdir_id.clone();
+            let session = deferred_workdir::DeferredWorkdirSession::handle(
+                &workdir_id,
+                capabilities,
+                move || {
+                    let materializer = materializer
+                        .as_ref()
+                        .ok_or_else(|| "Workdir provider is not configured".to_string())?;
+                    let binding = materializer
+                        .bind_working_directory(&id, relative_cwd.as_deref())
+                        .map_err(|error| error.to_string())?;
+                    let scope = runtime_attachment_scope(binding.root(), capabilities)?;
+                    Ok(runtime_local_workdir_session(
+                        &id,
+                        binding.root(),
+                        binding.cwd(),
+                        scope,
+                        capabilities,
+                        binding.command_environment(),
+                        binding
+                            .session_resources()
+                            .map_err(|error| error.to_string())?,
+                    ))
+                },
+            );
+            Ok((alias, session))
+        })
+        .collect()
 }
 
 fn validate_backend_job_profile(
@@ -1729,7 +1846,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let store = CombinedStore::new(session_store, worker_metadata_store);
 
         let run_dir = self.worker_run_dir(&request.worker_ref)?;
-        let bash_output_dir = bash_output_dir_for_worker_id(&request.worker_ref.worker_id);
         let bootstrap = WorkerBootstrap::new(
             manifest,
             store,
@@ -1738,7 +1854,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             filesystem_authority,
             WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: run_dir.clone(),
-                bash_output_dir,
             },
             self.controller_transport,
         );
@@ -1783,7 +1898,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         worker.bind_workdir_sessions(runtime_local_workdir_router(
             &request.workdir_attachments,
             &workdir_capabilities,
-            worker.scope().clone(),
+            Some(worker.workspace_client_handle()),
         )?);
         if let (Some(runtime_id), Some(workspace_id)) =
             (observation_runtime_id, observation_workspace_id.clone())
@@ -2108,8 +2223,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             let workdir_sessions = restored_workdir_router(
                 &request.workdir_attachments,
                 &request.logical_workdir_attachments,
+                &request.deferred_workdir_sessions,
                 &request.request.workdir_attachments,
-                worker.scope().clone(),
                 worker.workspace_client_handle(),
             )
             .map_err(|_| "restored Workdir binding failed")?;
@@ -2166,7 +2281,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             let run_dir = self
                 .worker_restore_run_dir(&request.worker_ref, request.operation_id)
                 .map_err(|_| "restore run directory unavailable")?;
-            let bash_output_dir = bash_output_dir_for_worker_id(&request.worker_ref.worker_id);
             let transport = self.controller_transport;
             #[cfg(test)]
             let transport = if self.restore_faults.socket_failure.load(Ordering::SeqCst) {
@@ -2178,7 +2292,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 worker,
                 WorkerBootstrapLayout::RuntimeManagedRun {
                     run_dir: run_dir.clone(),
-                    bash_output_dir,
                 },
                 transport,
             )
@@ -2892,54 +3005,6 @@ where
         &self,
         request: &WorkerExecutionRestoreRequest,
     ) -> Result<(), WorkerExecutionResult> {
-        if !request.previous_workdir_attachments.is_empty() {
-            let materializer = self
-                .working_directory_materializer
-                .as_ref()
-                .ok_or_else(|| {
-                    WorkerExecutionResult::rejected(
-                        WorkerExecutionOperation::Restore,
-                        "Persisted Worker Workdir attachments cannot be restored by this Runtime",
-                    )
-                })?;
-            for previous in &request.previous_workdir_attachments {
-                let relative_cwd = request
-                    .request
-                    .workdir_attachments
-                    .iter()
-                    .find(|claim| claim.alias == previous.alias)
-                    .and_then(|claim| claim.relative_cwd.as_deref());
-                // Recovery attachments remain CleanupPending across restart.
-                // Validate current bindability/identity, not the old state name.
-                // Preflight is read-only; actual restore binds again below.
-                materializer.preflight_bind_working_directory(
-                    &previous.working_directory.summary.working_directory_id,
-                    relative_cwd,
-                ).map_err(|message| {
-                    WorkerExecutionResult::rejected(
-                        WorkerExecutionOperation::Restore,
-                        format!("Persisted Worker Workdir attachment `{}` is unavailable: {message}", previous.alias),
-                    )
-                })?;
-            }
-        }
-        if request.previous_workdir_attachments.is_empty()
-            && !request.request.workdir_attachment_requests.is_empty()
-        {
-            return Err(WorkerExecutionResult::rejected(
-                WorkerExecutionOperation::Restore,
-                "Persisted Worker Workdir allocations are unavailable",
-            ));
-        }
-        if request.previous_workdir_attachments.is_empty()
-            && !request.request.workdir_attachments.is_empty()
-            && self.working_directory_materializer.is_none()
-        {
-            return Err(WorkerExecutionResult::rejected(
-                WorkerExecutionOperation::Restore,
-                "Persisted Worker Workdir claims cannot be restored by this Runtime",
-            ));
-        }
         if let Some(workspace_api) = request.request.workspace_api.as_ref() {
             let Some(scope) = request.workspace_scope.as_ref() else {
                 return Err(WorkerExecutionResult::rejected(
@@ -2994,43 +3059,6 @@ where
                 None => message,
             }
         })
-    }
-
-    // Binding failures cannot borrow the factory's cleanup proof. Retain the
-    // exact operation and any already acquired bindings for their actual owner.
-    fn retain_restore_binding_failure(
-        &self,
-        mut request: WorkerExecutionRestoreRequest,
-        bindings: BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
-    ) -> WorkerExecutionSpawnResult {
-        request.workdir_attachments = bindings;
-        let mut failure = RuntimeRestoreFailure::unproven(
-            RuntimeRestoreStage::Binding,
-            "restore Workdir binding failed; materializer reconciliation required",
-        );
-        failure.resources = RuntimeRestoreResources::WorkdirBinding;
-        failure.cleanup = RuntimeRestoreCleanup::Failed(RuntimeRestoreCleanupFailure::Unsupported);
-        failure.cleanup_failure = Some(RuntimeRestoreCleanupFailure::Unsupported);
-        self.pending_restores
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                request.worker_ref.clone(),
-                Arc::new(PendingRuntimeRestore {
-                    request,
-                    task: tokio::sync::Mutex::new(None),
-                    result: Mutex::new(Some(Err(failure.clone()))),
-                    failure: Mutex::new(None),
-                }),
-            );
-        WorkerExecutionSpawnResult::ReconciliationRequired {
-            result: WorkerExecutionResult::errored(
-                WorkerExecutionOperation::Restore,
-                failure.to_string(),
-            ),
-            worker_state: None,
-            workdir_attachments: Vec::new(),
-        }
     }
 
     // Called only after joining the previous owned task, under the Worker lock.
@@ -3457,7 +3485,7 @@ where
         shutdown: Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
         controller_task: tokio::task::JoinHandle<()>,
         restore_operation_id: Option<crate::execution::WorkerLifecycleOperationId>,
-        workdir_attachments: BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
+        workdir_attachment_statuses: Vec<WorkingDirectoryAttachmentStatus>,
         workspace_client: Option<Arc<dyn WorkspaceClient>>,
     ) -> WorkerExecutionSpawnResult {
         self.connect_controller_scope(
@@ -3469,7 +3497,7 @@ where
             RuntimeExecutionTaskScope::new(controller_task),
             Arc::new(AtomicBool::new(false)),
             restore_operation_id,
-            workdir_attachments,
+            workdir_attachment_statuses,
             workspace_client,
         )
     }
@@ -3487,7 +3515,7 @@ where
         tasks: RuntimeExecutionTaskScope,
         shutdown_requested: Arc<AtomicBool>,
         restore_operation_id: Option<crate::execution::WorkerLifecycleOperationId>,
-        workdir_attachments: BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
+        workdir_attachment_statuses: Vec<WorkingDirectoryAttachmentStatus>,
         workspace_client: Option<Arc<dyn WorkspaceClient>>,
     ) -> WorkerExecutionSpawnResult {
         #[cfg(feature = "ws-server")]
@@ -3500,15 +3528,6 @@ where
         #[cfg(not(feature = "ws-server"))]
         let worker_state_snapshot = handle.shared_state.snapshot();
         let worker_state = Arc::new(RwLock::new(worker_state_snapshot));
-        let workdir_attachment_statuses = workdir_attachments
-            .iter()
-            .map(
-                |(alias, binding)| crate::catalog::WorkingDirectoryAttachmentStatus {
-                    alias: alias.clone(),
-                    working_directory: binding.status(),
-                },
-            )
-            .collect::<Vec<_>>();
         let mut workers = self
             .workers
             .lock()
@@ -4287,7 +4306,6 @@ where
             working_directory_id,
             binding.root(),
             binding.cwd(),
-            scope.clone(),
             scope,
             WorkdirSessionCapabilities::ALL,
             binding.command_environment(),
@@ -4397,7 +4415,7 @@ where
                     controller.shutdown,
                     controller.controller_task,
                     None,
-                    BTreeMap::new(),
+                    Vec::new(),
                     Some(controller.workspace_client),
                 );
             }
@@ -4525,7 +4543,7 @@ where
             controller.shutdown,
             controller.controller_task,
             None,
-            workdir_attachments,
+            workdir_attachment_statuses(&workdir_attachments),
             Some(controller.workspace_client),
         )
     }
@@ -4731,95 +4749,21 @@ where
             if let Err(result) = self.preflight_restore_inputs(&request) {
                 return WorkerExecutionSpawnResult::Rejected(result);
             }
-            let aliases = if request.previous_workdir_attachments.is_empty() {
-                request
-                    .request
-                    .workdir_attachments
-                    .iter()
-                    .map(|claim| &claim.alias)
-                    .collect::<Vec<_>>()
-            } else {
-                request
-                    .previous_workdir_attachments
-                    .iter()
-                    .map(|status| &status.alias)
-                    .collect::<Vec<_>>()
+
+            request.deferred_workdir_sessions = match deferred_restore_workdir_sessions(
+                &request,
+                self.working_directory_materializer.clone(),
+            ) {
+                Ok(sessions) => sessions,
+                Err(message) => {
+                    return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Restore,
+                        message,
+                    ));
+                }
             };
-            if aliases
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                != aliases.len()
-            {
-                return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
-                    WorkerExecutionOperation::Restore,
-                    "duplicate restore Workdir attachment alias",
-                ));
-            }
-            let mut workdir_attachments = BTreeMap::new();
-            if !request.previous_workdir_attachments.is_empty() {
-                let Some(materializer) = self.working_directory_materializer.as_ref() else {
-                    return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
-                        WorkerExecutionOperation::Restore,
-                        "persisted Worker has Workdir attachments, but no materializer is configured for this Runtime backend",
-                    ));
-                };
-                for status in request.previous_workdir_attachments.clone() {
-                    let relative_cwd = request
-                        .request
-                        .workdir_attachments
-                        .iter()
-                        .find(|claim| claim.alias == status.alias)
-                        .and_then(|claim| claim.relative_cwd.as_deref());
-                    match materializer.bind_working_directory(
-                        &status.working_directory.summary.working_directory_id,
-                        relative_cwd,
-                    ) {
-                        Ok(binding) => {
-                            if workdir_attachments
-                                .insert(status.alias.clone(), binding)
-                                .is_some()
-                            {
-                                return self
-                                    .retain_restore_binding_failure(request, workdir_attachments);
-                            }
-                        }
-                        Err(_) => {
-                            return self
-                                .retain_restore_binding_failure(request, workdir_attachments);
-                        }
-                    }
-                }
-            } else if !request.request.workdir_attachments.is_empty() {
-                let Some(materializer) = self.working_directory_materializer.as_ref() else {
-                    return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
-                        WorkerExecutionOperation::Restore,
-                        "persisted Worker has Workdir claims, but no materializer is configured for this Runtime backend",
-                    ));
-                };
-                for claim in request.request.workdir_attachments.clone() {
-                    match materializer.bind_working_directory(
-                        &claim.working_directory_id,
-                        claim.relative_cwd.as_deref(),
-                    ) {
-                        Ok(binding) => {
-                            if workdir_attachments
-                                .insert(claim.alias.clone(), binding)
-                                .is_some()
-                            {
-                                return self
-                                    .retain_restore_binding_failure(request, workdir_attachments);
-                            }
-                        }
-                        Err(_) => {
-                            return self
-                                .retain_restore_binding_failure(request, workdir_attachments);
-                        }
-                    }
-                }
-            }
-            request.workdir_attachments = workdir_attachments.clone();
         }
+
         let worker_ref = request.worker_ref.clone();
         let operation_id = request.operation_id;
         let mut existing_pending = false;
@@ -4866,13 +4810,7 @@ where
                 let task = self.spawn_on_adapter_runtime(async move {
                     let result = match factory.restore_controller(request.clone()).await {
                         Ok(controller) => Ok(controller),
-                        Err(mut failure) => {
-                            if failure.resources == RuntimeRestoreResources::None
-                                && !request.workdir_attachments.is_empty()
-                            {
-                                failure.resources = RuntimeRestoreResources::WorkdirBinding;
-                                failure.cleanup = RuntimeRestoreCleanup::Required;
-                            }
+                        Err(failure) => {
                             *result_owner
                                 .result
                                 .lock()
@@ -5014,7 +4952,7 @@ where
             controller.shutdown,
             controller.controller_task,
             Some(operation_id),
-            pending.request.workdir_attachments.clone(),
+            pending.request.previous_workdir_attachments.clone(),
             Some(controller.workspace_client),
         );
         if let Err(message) = self.remove_pending_restore(&worker_ref) {
@@ -5620,6 +5558,7 @@ mod tests {
                     }],
                 },
                 metadata: LoggedSessionHistoryMetadata {
+                    input_metadata: None,
                     entry_id,
                     origin: LoggedSessionHistoryOrigin::LegacyUnknown,
                     derivation: None,
@@ -5636,6 +5575,65 @@ mod tests {
     }
 
     const SAVED_SUBJEKTIV_SYSTEM_PROMPT: &str = "Committed saved Subject Worker system prompt";
+
+    // Substituted Host transport for restore/controller component tests. This
+    // fixture has exactly the two activation grants requested by the saved
+    // Manifest; it grants no protected operations or resources. It does not
+    // exercise authenticated source derivation, Subject policy, or revocation
+    // in the real Workspace Host.
+    fn saved_subjektiv_authorization_fixture(
+        input: server_api::authorization::OperationAuthorizationRequest,
+    ) -> Result<server_api::authorization::OperationAuthorizationResponse, &'static str> {
+        use server_api::authorization::{OperationAuthorizationResponse, PermissionResource};
+        if input.validate().is_ok()
+            && matches!(input.operation.as_str(), "subjektiv" | "workdir_catalog")
+            && input.resource == PermissionResource::Feature
+        {
+            Ok(OperationAuthorizationResponse {
+                scope: Some(PermissionResource::Feature),
+            })
+        } else {
+            Err("saved Subject fixture has no matching exact Feature grant")
+        }
+    }
+
+    #[test]
+    fn saved_subjektiv_authorization_fixture_grants_only_exact_feature_activation() {
+        use server_api::authorization::{OperationAuthorizationRequest, PermissionResource};
+        for operation in ["subjektiv", "workdir_catalog"] {
+            let response = saved_subjektiv_authorization_fixture(OperationAuthorizationRequest {
+                operation: operation.into(),
+                resource: PermissionResource::Feature,
+            })
+            .unwrap();
+            assert_eq!(response.scope, Some(PermissionResource::Feature));
+        }
+        for (operation, resource) in [
+            ("ticket", PermissionResource::Feature),
+            ("subjektiv.journal", PermissionResource::Feature),
+            ("subjektiv.*", PermissionResource::Feature),
+            (
+                "subjektiv",
+                PermissionResource::Workspace {
+                    workspace_id: "workspace-saved-subjektiv".into(),
+                },
+            ),
+            (
+                "subjektiv.journal",
+                PermissionResource::Workspace {
+                    workspace_id: "workspace-saved-subjektiv".into(),
+                },
+            ),
+        ] {
+            assert!(
+                saved_subjektiv_authorization_fixture(OperationAuthorizationRequest {
+                    operation: operation.into(),
+                    resource,
+                })
+                .is_err()
+            );
+        }
+    }
 
     fn saved_subjektiv_policy(
         root: &Path,
@@ -5801,6 +5799,25 @@ mod tests {
                     }))
                 }),
             );
+            let app = app.route(
+                "/api/w/workspace-saved-subjektiv/authorization/check",
+                axum::routing::post(
+                    |axum::Json(input): axum::Json<
+                        server_api::authorization::OperationAuthorizationRequest,
+                    >| async move {
+                        match saved_subjektiv_authorization_fixture(input) {
+                            Ok(response) => (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::to_value(response).unwrap()),
+                            ),
+                            Err(message) => (
+                                axum::http::StatusCode::FORBIDDEN,
+                                axum::Json(serde_json::json!({ "message": message })),
+                            ),
+                        }
+                    },
+                ),
+            );
             tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
@@ -5823,6 +5840,7 @@ mod tests {
             previous_workdir_attachments: Vec::new(),
             logical_workdir_attachments: Vec::new(),
             workdir_attachments: BTreeMap::new(),
+            deferred_workdir_sessions: BTreeMap::new(),
             config_bundle: None,
         }
     }
@@ -6502,7 +6520,7 @@ mod tests {
                     candidate.tasks.clone(),
                     candidate.shutdown_requested.clone(),
                     Some(request.operation_id),
-                    BTreeMap::new(),
+                    Vec::new(),
                     candidate.workspace_client.clone(),
                 )
             };
@@ -6633,7 +6651,7 @@ mod tests {
                 candidate.tasks.clone(),
                 candidate.shutdown_requested.clone(),
                 Some(request.operation_id),
-                BTreeMap::new(),
+                Vec::new(),
                 candidate.workspace_client.clone(),
             )
         };
@@ -7003,6 +7021,67 @@ mod tests {
             request.operation_id = crate::execution::WorkerLifecycleOperationId::new();
         }
         assert!(!root.path().join("nonexistent-current-profiles").exists());
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn profile_backend_restores_saved_workdir_reference_without_a_materializer() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("runtime");
+        let setup = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut request = setup.block_on(saved_subjektiv_restore_fixture(&store, true));
+        let alias = WorkdirAttachmentAlias::new("offline").unwrap();
+        request
+            .request
+            .workdir_attachments
+            .push(WorkingDirectoryAttachmentClaim {
+                alias,
+                working_directory_id: "unavailable-checkout".into(),
+                relative_cwd: Some("unavailable-cwd".into()),
+                capabilities: WorkdirSessionCapabilities::READ_ONLY,
+            });
+        let backend = WorkerRuntimeExecutionBackend::new(
+            ProfileRuntimeWorkerFactory::new(root.path().join("missing-profiles"))
+                .with_runtime_store_dir(&store)
+                .with_runtime_id("runtime-subjektiv-test")
+                .with_controller_transport(WorkerControllerTransport::InProcess),
+        )
+        .unwrap();
+        backend.preflight_restore(&request).unwrap();
+        let restored = backend.restore_worker(request.clone());
+        assert!(
+            matches!(restored, WorkerExecutionSpawnResult::Connected { .. }),
+            "{restored:?}"
+        );
+        let session = backend.workers.lock().unwrap()[&request.worker_ref]
+            .handle
+            .shared_state
+            .fs_view()
+            .unwrap()
+            .session()
+            .clone();
+        assert_eq!(session.workdir().id().as_str(), "unavailable-checkout");
+        backend
+            .run_on_adapter_runtime(async move {
+                assert!(
+                    session
+                        .read(workdir::ReadRequest {
+                            path: workdir::WorkdirPath::new("README.md").unwrap(),
+                            offset: 0,
+                            limit: 10,
+                            max_bytes: 1024,
+                        })
+                        .await
+                        .is_err()
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(backend.stop_worker(&request.worker_ref).is_accepted());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7388,8 +7467,6 @@ mod tests {
 
     #[test]
     fn restored_router_uses_workspace_proxy_for_logical_only_attachment() {
-        let root = tempfile::tempdir().unwrap();
-        let scope = manifest::SharedScope::new(manifest::Scope::writable(root.path()).unwrap());
         let client = WorkerWorkspaceContext::local_filesystem(Some(
             WorkspaceId::new("workspace-a").unwrap(),
         ))
@@ -7403,8 +7480,8 @@ mod tests {
                 working_directory_id: "remote-workdir".to_string(),
                 capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
             }],
+            &BTreeMap::new(),
             &[],
-            scope,
             client,
         )
         .unwrap();
@@ -7414,6 +7491,77 @@ mod tests {
         assert_eq!(
             session.capabilities(),
             workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_workspace_attachment_uses_host_operations_instead_of_local_opener() {
+        #[derive(Debug, Default)]
+        struct OfflineWorkspaceClient(Mutex<Vec<worker::WorkspaceRequest>>);
+
+        impl WorkspaceClient for OfflineWorkspaceClient {
+            fn workspace_id(&self) -> Option<&str> {
+                Some("workspace-a")
+            }
+            fn kind(&self) -> &str {
+                "offline-test"
+            }
+            fn is_available(&self) -> bool {
+                false
+            }
+            fn execute(
+                &self,
+                request: worker::WorkspaceRequest,
+            ) -> Result<worker::WorkspaceResponse, worker::WorkspaceClientError> {
+                self.0.lock().unwrap().push(request);
+                Err(worker::WorkspaceClientError::Unavailable(
+                    "provider offline".into(),
+                ))
+            }
+        }
+
+        let client = Arc::new(OfflineWorkspaceClient::default());
+        let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
+        let deferred = deferred_workdir::DeferredWorkdirSession::handle(
+            "saved-ssh-workdir",
+            WorkdirSessionCapabilities::READ_ONLY,
+            || panic!("Host-owned Repository access must not use the local opener"),
+        );
+        let router = restored_workdir_router(
+            &BTreeMap::new(),
+            &[LogicalWorkdirAttachment {
+                alias: alias.clone(),
+                working_directory_id: "saved-ssh-workdir".into(),
+                capabilities: WorkdirSessionCapabilities::READ_ONLY,
+            }],
+            &BTreeMap::from([(alias.clone(), deferred)]),
+            &[],
+            client.clone(),
+        )
+        .unwrap();
+        assert!(client.0.lock().unwrap().is_empty());
+        let session = router.session(&alias).unwrap();
+        assert_eq!(session.workdir().id().as_str(), "saved-ssh-workdir");
+        assert_eq!(
+            session.capabilities(),
+            WorkdirSessionCapabilities::READ_ONLY
+        );
+        assert!(
+            session
+                .read(workdir::ReadRequest {
+                    path: workdir::WorkdirPath::new("README.md").unwrap(),
+                    offset: 0,
+                    limit: 10,
+                    max_bytes: 1024,
+                })
+                .await
+                .is_err()
+        );
+        let requests = client.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path,
+            "/api/w/workspace-a/workers/self/workdir-session/operations"
         );
     }
 
@@ -7449,21 +7597,19 @@ mod tests {
             .unwrap();
         let alias = WorkdirAttachmentAlias::new("docs").unwrap();
         let workdir_id = binding.working_directory.id.clone();
-        let command_output_scope = manifest::SharedScope::new(manifest::Scope::empty());
         let attachments = BTreeMap::from([(alias.clone(), binding)]);
         let logical = [LogicalWorkdirAttachment {
             alias: alias.clone(),
             working_directory_id: workdir_id,
             capabilities: WorkdirSessionCapabilities::READ_ONLY,
         }];
-        let client = WorkerWorkspaceContext::local_filesystem(Some(
-            WorkspaceId::new("workspace-a").unwrap(),
-        ))
-        .client_handle();
+        // Direct local-router capability test: no Workspace Host transport is
+        // installed. Use an explicit standalone binding, not an unavailable
+        // Workspace-bound client pretending to authorize operations.
+        let client = WorkerWorkspaceContext::no_workspace().client_handle();
 
         let router =
-            restored_workdir_router(&attachments, &logical, &[], command_output_scope, client)
-                .unwrap();
+            restored_workdir_router(&attachments, &logical, &BTreeMap::new(), &[], client).unwrap();
 
         let session = router.session(&alias).unwrap();
         assert_eq!(
@@ -8066,6 +8212,91 @@ mod tests {
         );
     }
 
+    // Generic controller tests explicitly substitute the Host's non-Subject
+    // legacy decision. No Subject authority is modeled here; all other requests
+    // still use the original transport and its Backend/provider checks.
+    #[derive(Debug)]
+    struct LegacyNonSubjectAuthorizationClient(Arc<dyn WorkspaceClient>);
+
+    impl WorkspaceClient for LegacyNonSubjectAuthorizationClient {
+        fn workspace_id(&self) -> Option<&str> {
+            self.0.workspace_id()
+        }
+
+        fn kind(&self) -> &str {
+            self.0.kind()
+        }
+
+        fn is_available(&self) -> bool {
+            self.0.is_available()
+        }
+
+        fn execute(
+            &self,
+            request: worker::WorkspaceRequest,
+        ) -> Result<worker::WorkspaceResponse, worker::WorkspaceClientError> {
+            if request.method == worker::WorkspaceRequestMethod::Post
+                && request.path
+                    == format!(
+                        "/api/w/{}/authorization/check",
+                        self.workspace_id()
+                            .expect("legacy fixture needs Workspace identity")
+                    )
+            {
+                let input: server_api::authorization::OperationAuthorizationRequest =
+                    serde_json::from_str(request.body.as_deref().unwrap_or_default()).map_err(
+                        |error| worker::WorkspaceClientError::Request(error.to_string()),
+                    )?;
+                input
+                    .validate()
+                    .map_err(worker::WorkspaceClientError::Request)?;
+                return Ok(worker::WorkspaceResponse {
+                    status: 200,
+                    body: serde_json::to_string(
+                        &server_api::authorization::OperationAuthorizationResponse { scope: None },
+                    )
+                    .unwrap(),
+                });
+            }
+            self.0.execute(request)
+        }
+    }
+
+    #[test]
+    fn legacy_non_subject_authorization_fixture_preserves_other_transport_failures() {
+        use server_api::authorization::PermissionResource;
+        let client = LegacyNonSubjectAuthorizationClient(
+            WorkerWorkspaceContext::local_filesystem(Some(WorkspaceId::new("ws-test").unwrap()))
+                .client_handle(),
+        );
+        assert_eq!(
+            client
+                .authorize_operation_scope("workdir_catalog", &PermissionResource::Feature)
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            client
+                .authorize_operation_scope(
+                    "ticket.create",
+                    &PermissionResource::Workspace {
+                        workspace_id: "ws-test".into(),
+                    }
+                )
+                .unwrap(),
+            None,
+        );
+        assert!(
+            client
+                .authorize_operation("ticket.*", &PermissionResource::Feature)
+                .is_err()
+        );
+        assert!(matches!(
+            client.execute(worker::WorkspaceRequest::get("/api/w/ws-test/tickets")),
+            Err(worker::WorkspaceClientError::Unavailable(_)),
+        ));
+    }
+
     struct MockFactory {
         client: MockClient,
         runtime_base: PathBuf,
@@ -8085,7 +8316,7 @@ mod tests {
             let manifest = WorkerManifest::from_toml(
                 r#"
                 [worker]
-                name = "runtime-adapter-test"
+                name = "r"
                 pwd = "./"
 
                 [model]
@@ -8131,6 +8362,22 @@ mod tests {
                 None,
                 None,
             );
+            let workspace_context = if workspace_context.client().is_available()
+                && workspace_context.workspace_id().is_some()
+            {
+                assert!(
+                    !request.request.subjektiv_attached,
+                    "generic legacy fixture must never authorize a Subject Worker"
+                );
+                WorkerWorkspaceContext::with_client(
+                    workspace_context.workspace_id().cloned(),
+                    Arc::new(LegacyNonSubjectAuthorizationClient(
+                        workspace_context.client_handle(),
+                    )),
+                )
+            } else {
+                workspace_context
+            };
             let workspace_client = workspace_context.client_handle();
             self.observed_workspace_clients.lock().unwrap().push((
                 workspace_client.kind().to_string(),
@@ -8150,14 +8397,10 @@ mod tests {
             )
             .await
             .map_err(|err| err.to_string())?;
-            let bash_output_dir = self.runtime_base.join("bash-output");
-            let (handle, shutdown_rx) = WorkerController::spawn_runtime_managed(
-                worker,
-                &self.runtime_base,
-                &bash_output_dir,
-            )
-            .await
-            .map_err(|err| err.to_string())?;
+            let (handle, shutdown_rx) =
+                WorkerController::spawn_runtime_managed(worker, &self.runtime_base)
+                    .await
+                    .map_err(|err| err.to_string())?;
             Ok(RuntimeWorkerController {
                 handle,
                 shutdown: Arc::new(tokio::sync::Mutex::new(Some(shutdown_rx))),
@@ -8854,6 +9097,7 @@ mod tests {
             previous_workdir_attachments: Vec::new(),
             logical_workdir_attachments: Vec::new(),
             workdir_attachments: BTreeMap::new(),
+            deferred_workdir_sessions: BTreeMap::new(),
             config_bundle: None,
         }
     }
@@ -9295,7 +9539,6 @@ mod tests {
             "working-directory-42",
             root.path(),
             root.path(),
-            spawned_scope.clone(),
             spawned_scope,
             WorkdirSessionCapabilities::READ_ONLY,
             Default::default(),
@@ -9306,7 +9549,6 @@ mod tests {
             "working-directory-42",
             root.path(),
             root.path(),
-            restored_scope.clone(),
             restored_scope,
             WorkdirSessionCapabilities::READ_ONLY,
             Default::default(),
@@ -9422,6 +9664,7 @@ mod tests {
                 previous_workdir_attachments: Vec::new(),
                 logical_workdir_attachments: Vec::new(),
                 workdir_attachments: BTreeMap::new(),
+                deferred_workdir_sessions: BTreeMap::new(),
                 config_bundle: None,
             })
             .await
@@ -9515,6 +9758,7 @@ mod tests {
                 previous_workdir_attachments: Vec::new(),
                 logical_workdir_attachments: Vec::new(),
                 workdir_attachments: BTreeMap::new(),
+                deferred_workdir_sessions: BTreeMap::new(),
                 config_bundle: None,
             })
             .await
@@ -9738,6 +9982,7 @@ mod tests {
             previous_workdir_attachments: Vec::new(),
             logical_workdir_attachments: Vec::new(),
             workdir_attachments: BTreeMap::new(),
+            deferred_workdir_sessions: BTreeMap::new(),
             config_bundle: None,
         };
 
@@ -10126,6 +10371,7 @@ mod tests {
             previous_workdir_attachments: detail.workdir_attachments,
             logical_workdir_attachments: Vec::new(),
             workdir_attachments: BTreeMap::new(),
+            deferred_workdir_sessions: BTreeMap::new(),
             config_bundle: None,
         };
         drop(runtime);
@@ -10139,7 +10385,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cleanup_pending_owner_restores_after_restart_with_validated_dirty_checkout() {
+    fn cleanup_pending_owner_restores_without_opening_dirty_checkout() {
         let (root, backend, request, checkout, observed) = pending_owner_restore_fixture();
         let before = persisted_files(&root.path().join("workdirs"));
         backend.preflight_restore(&request).unwrap();
@@ -10164,10 +10410,7 @@ mod tests {
             restored[0].working_directory.summary.cleanliness.as_deref(),
             Some("dirty")
         );
-        assert_eq!(
-            observed.lock().unwrap().as_slice(),
-            &[checkout.clone(), checkout.clone()]
-        );
+        assert_eq!(observed.lock().unwrap().as_slice(), &[checkout.clone()]);
         assert_eq!(
             fs::read_to_string(checkout.join("README.md")).unwrap(),
             "owner recovery in progress"
@@ -10177,7 +10420,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn cleanup_pending_owner_restore_rejects_incomplete_replaced_and_raced_checkouts() {
+    fn damaged_checkout_does_not_block_restore_but_is_rejected_when_used() {
         for damage in ["missing_git", "replacement", "missing_after_preflight"] {
             let (root, backend, request, checkout, observed) = pending_owner_restore_fixture();
             if damage == "missing_after_preflight" {
@@ -10190,36 +10433,48 @@ mod tests {
             } else {
                 fs::remove_dir_all(checkout.join(".git")).unwrap();
             }
-            let before = persisted_files(root.path());
-            let error = backend.preflight_restore(&request).unwrap_err();
-            assert_eq!(
-                error.outcome,
-                crate::execution::WorkerExecutionOutcome::Rejected,
-                "{damage}"
-            );
+            let before = persisted_files(&root.path().join("workdirs"));
+            backend.preflight_restore(&request).unwrap();
+            let sessions = deferred_restore_workdir_sessions(
+                &request,
+                backend.working_directory_materializer.clone(),
+            )
+            .unwrap();
+            let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
+            let session = sessions[&alias].clone();
+            assert!(matches!(
+                backend.restore_worker(request.clone()),
+                WorkerExecutionSpawnResult::Connected { .. }
+            ));
+            let error = backend
+                .run_on_adapter_runtime(async move {
+                    let result = session
+                        .read(workdir::ReadRequest {
+                            path: workdir::WorkdirPath::new("README.md").unwrap(),
+                            offset: 0,
+                            limit: 10,
+                            max_bytes: 1024,
+                        })
+                        .await;
+                    session.close().await.unwrap();
+                    Ok(result.unwrap_err().to_string())
+                })
+                .unwrap();
             assert!(
-                error
-                    .message_or_default()
-                    .contains("working_directory_cleanup_"),
-                "{error:?}"
-            );
-            assert!(
-                matches!(
-                    backend.restore_worker(request),
-                    WorkerExecutionSpawnResult::Rejected(_)
-                ),
-                "{damage}"
+                error.contains("working_directory_cleanup_"),
+                "{damage}: {error}"
             );
             assert_eq!(
                 observed.lock().unwrap().len(),
                 1,
-                "must not start a Controller on invalid checkout: {damage}"
+                "restore must not bind a cwd"
             );
             assert_eq!(
-                persisted_files(root.path()),
+                persisted_files(&root.path().join("workdirs")),
                 before,
-                "must preserve damaged/replaced checkout: {damage}"
+                "damaged checkout must be retained"
             );
+            assert!(backend.stop_worker(&request.worker_ref).is_accepted());
         }
     }
 
@@ -10831,8 +11086,7 @@ mod tests {
 
         let alias = WorkdirAttachmentAlias::new("checkout").unwrap();
         let attachments = BTreeMap::from([(alias, binding.clone())]);
-        let scope = manifest::SharedScope::new(manifest::Scope::writable(binding.root()).unwrap());
-        let router = runtime_local_workdir_router(&attachments, &BTreeMap::new(), scope).unwrap();
+        let router = runtime_local_workdir_router(&attachments, &BTreeMap::new(), None).unwrap();
         session_clone.close().await.unwrap();
         assert_eq!(
             materializer.cleanup_working_directory(id).unwrap_err().code,

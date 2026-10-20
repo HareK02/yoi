@@ -156,6 +156,7 @@ async fn spawn_pair_member(api: &WorkspaceApi, name: &str) -> RuntimeWorkerRef {
             workdir_attachments: vec![],
             feature_connections: Default::default(),
             control_operation_id: None,
+            execution_grant: None,
         }),
     )
     .await

@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { BrowserAuth } from '#lib/workspace/auth/browser-session.svelte.ts';
-  import { SESSION_CHANGED_EVENT } from '#lib/workspace/auth/hosting.ts';
   import { loginUrl } from '#lib/workspace/auth/routes.ts';
   import AccountNavigation from '#lib/workspace/auth/AccountNavigation.svelte';
   import WorkspaceCatalog from './WorkspaceCatalog.svelte';
@@ -23,15 +22,10 @@
   });
   onMount(() => {
     mounted = true;
-    const refresh = () => { void auth.refresh(); };
-    refresh();
-    window.addEventListener('focus', refresh);
-    window.addEventListener(SESSION_CHANGED_EVENT, refresh);
+    void auth.ensure();
     return () => {
       mounted = false;
       auth.dispose();
-      window.removeEventListener('focus', refresh);
-      window.removeEventListener(SESSION_CHANGED_EVENT, refresh);
     };
   });
 </script>

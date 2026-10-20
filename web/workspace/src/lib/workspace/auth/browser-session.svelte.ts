@@ -1,16 +1,21 @@
-import { AuthRequestError, loadWhoami } from "./api.ts";
+import { AuthRequestError } from "./api.ts";
+import {
+  browserSession,
+  observeBrowserSession,
+  sessionMutation,
+} from "./session-state.ts";
 import { notifySessionChanged } from "./hosting.ts";
-import type { RequestActor } from "./model.ts";
+import type { RequestActor, WhoamiResponse } from "./model.ts";
 
 export type BrowserSession =
   | { kind: "loading" }
   | { kind: "error" }
-  | { kind: "ready"; actor: RequestActor | null };
+  | ({ kind: "ready" } & WhoamiResponse);
 
 export function authErrorMessage(error: unknown): string {
   if (error instanceof AuthRequestError) {
     if (error.status === 401) {
-      return "Your session or authentication challenge expired. Log in again or restart the Passkey operation.";
+      return "Authentication request was rejected. Check your session or restart the Passkey operation.";
     }
     if (error.status === 400 || error.status === 410) {
       return "The request or authentication challenge is invalid or expired. Restart the operation.";
@@ -35,61 +40,82 @@ export class BrowserAuth {
   busy = $state(false);
   error = $state("");
   status = $state("");
-  private request = 0;
+  private unsubscribe: () => void;
   private disposed = false;
   private controller: AbortController | null = null;
+
+  constructor() {
+    observeBrowserSession();
+    this.unsubscribe = browserSession.subscribe((snapshot) => {
+      // 操作pendingはsession確認中と別。formを消してfocus/入力を失わず、busyで再操作を止める。
+      if (this.busy && snapshot.kind === "loading") return;
+      if (!this.disposed) {
+        this.session = snapshot.kind === "ready"
+          ? { kind: "ready", ...snapshot.value }
+          : snapshot;
+      }
+    });
+  }
 
   get actor(): RequestActor | null {
     return this.session.kind === "ready" ? this.session.actor : null;
   }
 
-  async refresh(): Promise<void> {
+  async ensure(): Promise<void> {
     if (this.busy || this.disposed) return;
-    await this.readSession();
+    await browserSession.ensure();
   }
 
-  private async readSession(): Promise<void> {
-    const current = ++this.request;
-    this.session = { kind: "loading" };
-    try {
-      const result = await loadWhoami();
-      if (this.disposed || current !== this.request) return;
-      this.session = { kind: "ready", actor: result.actor };
-    } catch {
-      if (this.disposed || current !== this.request) return;
-      this.session = { kind: "error" };
-    }
+  async refresh(): Promise<void> {
+    if (this.busy || this.disposed) return;
+    await browserSession.refresh();
   }
 
   async run(
     pending: string,
     success: string,
     operation: (signal: AbortSignal) => Promise<unknown>,
+    intent: "authentication" | "logout" = "authentication",
   ): Promise<boolean> {
-    if (this.busy || this.disposed || this.session.kind !== "ready") {
+    if (
+      this.busy || this.disposed ||
+      (intent !== "logout" && this.session.kind !== "ready")
+    ) {
       return false;
     }
     this.busy = true;
-    ++this.request;
+    sessionMutation(intent);
+    const authenticationGeneration = browserSession.authenticationGeneration;
     const controller = new AbortController();
     this.controller = controller;
     this.error = "";
     this.status = pending;
     try {
       await operation(controller.signal);
-      if (this.disposed) return false;
+      const superseded =
+        authenticationGeneration !== browserSession.authenticationGeneration;
+      sessionMutation(intent);
+      const confirmationGeneration = browserSession.authenticationGeneration;
+      await browserSession.refresh();
+      if (
+        this.disposed || superseded ||
+        confirmationGeneration !== browserSession.authenticationGeneration
+      ) {
+        if (!this.disposed) this.status = "";
+        return false;
+      }
       notifySessionChanged();
-      await this.readSession();
-      if (this.disposed) return false;
       const confirmed = this.session.kind === "ready";
       this.status = confirmed ? success : "";
       return confirmed;
     } catch (error) {
-      if (this.disposed) return false;
-      this.error = authErrorMessage(error);
-      this.status = "";
+      if (!this.disposed) {
+        this.error = authErrorMessage(error);
+        this.status = "";
+      }
       // 失効/応答不明でも既存actorを操作権限として保持せず、正本を読み直す。
-      await this.readSession();
+      sessionMutation(intent);
+      await browserSession.refresh();
       return false;
     } finally {
       if (!this.disposed) {
@@ -101,7 +127,7 @@ export class BrowserAuth {
 
   dispose(): void {
     this.disposed = true;
-    ++this.request;
+    this.unsubscribe();
     this.controller?.abort();
   }
 }

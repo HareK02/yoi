@@ -68,6 +68,7 @@ async function loadPageWithFailure(failedSuffix: string): Promise<LoadedPage> {
   };
   const envelope = loadRepositoryAccessPage(
     {
+      parent: async () => ({}),
       fetch: fetcher as typeof fetch,
       params: { workspaceId: "workspace-1" },
       url: new URL(

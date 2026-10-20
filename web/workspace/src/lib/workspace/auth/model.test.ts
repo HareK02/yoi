@@ -118,10 +118,14 @@ Deno.test("prepareLoginOptions decodes challenge and allowed credential ids", ()
 });
 
 Deno.test("whoami rejects unknown auth methods and extra fields", () => {
-  assertEquals(parseWhoamiResponse({ actor: null }), { actor: null });
+  assertEquals(
+    parseWhoamiResponse({ actor: null, session: { kind: "anonymous" } }),
+    { actor: null, session: { kind: "anonymous" } },
+  );
   assertThrows(
     () =>
       parseWhoamiResponse({
+        session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
         actor: {
           user_id: "user-1",
           account_id: "account-1",
@@ -231,5 +235,36 @@ Deno.test("passkey credential conversion fails closed on malformed payloads", ()
     () =>
       authenticationCredentialToJson({ ...registration, type: "future-key" }),
     "unknown credential type",
+  );
+});
+
+Deno.test("whoami fails closed on actor-state mismatch and malformed expiry", () => {
+  const actor = {
+    user_id: "u",
+    account_id: "a",
+    handle: "alice",
+    display_name: "Alice",
+    auth_method: "browser_session",
+  };
+  for (
+    const payload of [
+      { actor, session: { kind: "anonymous" } },
+      { actor, session: { kind: "expired" } },
+      {
+        actor: null,
+        session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+      },
+      { actor, session: { kind: "authenticated", expires_at: null } },
+      { actor, session: { kind: "authenticated", expires_at: "tomorrow" } },
+      { actor: null, session: { kind: "future" } },
+      {
+        actor: null,
+        session: { kind: "expired", expires_at: "2099-01-01T00:00:00Z" },
+      },
+    ]
+  ) assertThrows(() => parseWhoamiResponse(payload), "inconsistent whoami");
+  assertEquals(
+    parseWhoamiResponse({ actor: null, session: { kind: "expired" } }),
+    { actor: null, session: { kind: "expired" } },
   );
 });

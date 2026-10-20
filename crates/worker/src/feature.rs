@@ -1534,8 +1534,18 @@ impl ProtocolProviderRegistrar<'_> {
     }
 }
 
+/// Restore preserves the saved Feature composition; only new activation asks
+/// for admission. Neither mode grants authority for protected operations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FeatureInstallation {
+    #[default]
+    Activate,
+    Restore,
+}
+
 /// Install-time context provided to a feature module.
 pub struct FeatureInstallContext<'a> {
+    installation: FeatureInstallation,
     feature_id: &'a FeatureId,
     declarations: &'a FeatureContributionDeclarations,
     pending_tools: &'a mut Vec<ToolDefinition>,
@@ -1548,6 +1558,10 @@ pub struct FeatureInstallContext<'a> {
 }
 
 impl FeatureInstallContext<'_> {
+    pub(crate) fn is_restoring(&self) -> bool {
+        self.installation == FeatureInstallation::Restore
+    }
+
     pub fn feature_id(&self) -> &FeatureId {
         self.feature_id
     }
@@ -1751,6 +1765,60 @@ pub enum FeaturePlanError {
 /// Builder/installer for enabled feature modules.
 pub struct FeatureRegistryBuilder {
     modules: Vec<Arc<dyn FeatureModule>>,
+    installation: FeatureInstallation,
+    activation_guard: Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
+}
+
+/// Profile switches request activation, not authority. Names are the actual
+/// public config keys (not internal module ids such as `builtin:sub-worker-control`).
+/// Check even switches whose runtime prerequisites will later make them inert.
+/// No parent/child permission inheritance is performed here.
+pub(crate) fn authorize_requested_features(
+    client: &dyn crate::worker::WorkspaceClient,
+    config: &manifest::FeatureConfig,
+) -> Result<(), crate::worker::WorkspaceClientError> {
+    for (name, enabled) in [
+        ("task", config.task.enabled),
+        ("memory", config.memory.enabled()),
+        ("subjektiv", config.subjektiv.enabled()),
+        ("web", config.web.enabled),
+        ("image", config.image.enabled),
+        ("sub_worker", config.sub_worker.enabled),
+        ("flow", config.flow.enabled),
+        ("worker", config.worker.enabled),
+        (
+            "workspace_worker_discovery",
+            config.workspace_worker_discovery.enabled,
+        ),
+        ("objective", config.objective.enabled),
+        ("manage_workdir", config.manage_workdir.enabled),
+        ("workdir_catalog", config.workdir_catalog.enabled),
+        ("workspace_config", config.workspace_config.enabled),
+        ("drive", config.drive.enabled),
+        ("ticket", config.ticket.enabled),
+        ("merge_request", config.merge_request.any()),
+        ("orchestration", config.orchestration.enabled),
+    ] {
+        if enabled {
+            client.authorize_feature_activation(name).map_err(|error| {
+                crate::worker::WorkspaceClientError::Request(format!(
+                    "Feature `{name}` activation rejected: {error}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn authorize_requested_manifest(
+    client: &dyn crate::worker::WorkspaceClient,
+    manifest: &manifest::WorkerManifest,
+) -> Result<(), crate::worker::WorkspaceClientError> {
+    authorize_requested_features(client, &manifest.feature)?;
+    if !manifest.mcp.stdio_servers.is_empty() {
+        client.authorize_feature_activation("mcp")?;
+    }
+    Ok(())
 }
 
 fn build_feature_install_plan(
@@ -1945,6 +2013,8 @@ impl Default for FeatureRegistryBuilder {
     fn default() -> Self {
         Self {
             modules: Vec::new(),
+            installation: FeatureInstallation::Activate,
+            activation_guard: None,
         }
     }
 }
@@ -1952,6 +2022,28 @@ impl Default for FeatureRegistryBuilder {
 impl FeatureRegistryBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_installation(mut self, installation: FeatureInstallation) -> Self {
+        self.installation = installation;
+        self
+    }
+
+    /// Add a trusted, live preflight that runs before *any* new module activation.
+    /// Restoring saved composition does not repeat admission checks. Worker
+    /// hosts use this in addition to the earlier pre-construction preflight.
+    pub fn with_activation_guard(
+        mut self,
+        guard: impl Fn() -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        let previous = self.activation_guard.take();
+        self.activation_guard = Some(Arc::new(move || {
+            if let Some(previous) = &previous {
+                previous()?;
+            }
+            guard()
+        }));
+        self
     }
 
     pub fn add_module<M>(&mut self, module: M) -> &mut Self
@@ -2025,6 +2117,43 @@ impl FeatureRegistryBuilder {
         hook_builder: &mut HookRegistryBuilder,
         mut installed_tool_names: HashMap<String, FeatureId>,
     ) -> FeatureRegistryInstallReport {
+        if self.installation == FeatureInstallation::Activate
+            && let Some(error) = self
+                .activation_guard
+                .as_ref()
+                .and_then(|guard| guard().err())
+        {
+            return FeatureRegistryInstallReport {
+                reports: {
+                    let mut descriptors = self.descriptors();
+                    if descriptors.is_empty() {
+                        descriptors.push(FeatureDescriptor::builtin(
+                            "activation",
+                            "Feature activation",
+                        ));
+                    }
+                    descriptors
+                        .iter()
+                        .map(|descriptor| {
+                            let mut report = FeatureInstallReport::new(descriptor);
+                            report
+                                .diagnostics
+                                .push(FeatureDiagnostic::error(error.clone()));
+                            report.mark_skipped(
+                                FeatureContributionKind::Diagnostic,
+                                descriptor.id.to_string(),
+                                "Feature activation rejected before installation",
+                            );
+                            report
+                        })
+                        .collect()
+                },
+                services: FeatureServiceRegistry::default(),
+                background_tasks: FeatureBackgroundTaskRegistry::default(),
+                chat_invocations: FeatureInvocationRegistry::default(),
+                plan_error: None,
+            };
+        }
         let descriptors: Vec<_> = self
             .modules
             .iter()
@@ -2125,6 +2254,7 @@ impl FeatureRegistryBuilder {
 
             let install_result = {
                 let mut context = FeatureInstallContext {
+                    installation: self.installation,
                     feature_id: &descriptor.id,
                     declarations: &declarations,
                     pending_tools,
@@ -2299,6 +2429,170 @@ mod tests {
     use futures::stream;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct ActivationClient {
+        allowed: Vec<String>,
+        requested: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::worker::WorkspaceClient for ActivationClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace")
+        }
+        fn kind(&self) -> &str {
+            "activation-fixture"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            request: crate::worker::WorkspaceRequest,
+        ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            use server_api::authorization::{OperationAuthorizationRequest, PermissionResource};
+            assert_eq!(request.path, "/api/w/workspace/authorization/check");
+            let input: OperationAuthorizationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            assert_eq!(input.resource, PermissionResource::Feature);
+            self.requested.lock().unwrap().push(input.operation.clone());
+            Ok(crate::worker::WorkspaceResponse {
+                status: if self.allowed.contains(&input.operation) {
+                    200
+                } else {
+                    403
+                },
+                body: "{}".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn requested_activation_uses_exact_public_config_names_before_install() {
+        let mut config = manifest::FeatureConfig::default();
+        config.workdir_catalog.enabled = false;
+        // Enabling each config key independently also detects default-on flags.
+        for name in [
+            "task",
+            "memory",
+            "subjektiv",
+            "web",
+            "image",
+            "sub_worker",
+            "flow",
+            "worker",
+            "workspace_worker_discovery",
+            "objective",
+            "manage_workdir",
+            "workdir_catalog",
+            "workspace_config",
+            "drive",
+            "ticket",
+            "merge_request",
+            "orchestration",
+        ] {
+            let mut value = serde_json::to_value(&config).unwrap();
+            if name == "memory" || name == "subjektiv" {
+                value[name]["profile"]["enabled"] = json!(true);
+            } else if name == "merge_request" {
+                value[name]["show"] = json!(true);
+            } else {
+                value[name]["enabled"] = json!(true);
+            }
+            let requested: manifest::FeatureConfig = serde_json::from_value(value).unwrap();
+            let client = ActivationClient {
+                allowed: vec![name.into()],
+                requested: Default::default(),
+            };
+            authorize_requested_features(&client, &requested).unwrap();
+            assert_eq!(*client.requested.lock().unwrap(), [name], "{name}");
+        }
+    }
+
+    #[test]
+    fn ticket_operation_permission_does_not_enable_feature_or_install_services() {
+        let mut config = manifest::FeatureConfig::default();
+        config.workdir_catalog.enabled = false;
+        config.ticket.enabled = true;
+        for allowed in [vec![], vec!["ticket.create"], vec!["ticket"]] {
+            let client = Arc::new(ActivationClient {
+                allowed: allowed.iter().map(|name| name.to_string()).collect(),
+                requested: Default::default(),
+            });
+            let module = PlannedServiceFeature::new(
+                FeatureDescriptor::builtin("ticket", "Ticket")
+                    .with_provided_service(provided_service("ticket.test", "1")),
+            );
+            let calls = module.install_calls.clone();
+            let config = config.clone();
+            let registry = FeatureRegistryBuilder::new()
+                .with_module(module)
+                .with_activation_guard(move || {
+                    authorize_requested_features(client.as_ref(), &config)
+                        .map_err(|error| error.to_string())
+                });
+            let mut tools = Vec::new();
+            let report = registry.install_into_pending(&mut tools, &mut HookRegistryBuilder::new());
+            let permitted = allowed == ["ticket"];
+            assert_eq!(report.has_errors(), !permitted);
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(permitted));
+            assert!(tools.is_empty());
+            if !permitted {
+                assert!(report.error_message().contains("ticket"));
+            }
+        }
+    }
+
+    #[test]
+    fn local_compatibility_is_explicit_and_never_grants_workspace_operations() {
+        use crate::worker::{WorkspaceClient, unavailable_workspace_client};
+        use server_api::authorization::PermissionResource;
+        let local = unavailable_workspace_client(None, "standalone");
+        assert!(local.authorize_feature_activation("task").is_ok());
+        assert!(
+            local
+                .authorize_operation(
+                    "ticket.create",
+                    &PermissionResource::Workspace {
+                        workspace_id: "workspace".into()
+                    }
+                )
+                .is_err()
+        );
+        let unbound = ActivationClient {
+            allowed: vec!["ticket".into()],
+            requested: Default::default(),
+        };
+        assert!(unbound.authorize_feature_activation("ticket").is_ok());
+        let local_files = crate::worker::WorkerWorkspaceContext::local_filesystem(None);
+        assert!(
+            local_files
+                .client_handle()
+                .authorize_feature_activation("task")
+                .is_ok()
+        );
+        assert!(
+            local_files
+                .client_handle()
+                .authorize_operation(
+                    "ticket.create",
+                    &PermissionResource::Workspace {
+                        workspace_id: "workspace".into()
+                    }
+                )
+                .is_err()
+        );
+        let marker = crate::worker::marker_workspace_client(None, "local-filesystem");
+        assert!(
+            marker.authorize_feature_activation("task").is_err(),
+            "display kind is not authority"
+        );
+        let missing = unavailable_workspace_client(
+            Some(&crate::worker::WorkspaceId::new("workspace").unwrap()),
+            "Host unavailable",
+        );
+        assert!(missing.authorize_feature_activation("ticket").is_err());
+    }
 
     #[test]
     fn worker_feature_composition_has_no_dynamic_plugin_install_path() {

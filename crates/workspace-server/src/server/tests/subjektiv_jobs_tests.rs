@@ -527,6 +527,7 @@ async fn subjektiv_job_legacy_cutover_waits_foreground_then_removes_only_owned_c
                 resolved_worker_observation_enabled: false,
                 resolved_worker_observation_grants: vec![],
                 resolved_control_operation: None,
+                resolved_execution_grant: None,
             },
         )
         .unwrap()

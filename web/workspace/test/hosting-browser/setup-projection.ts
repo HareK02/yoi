@@ -29,7 +29,12 @@ export function setupProjectionResponse(
   }
   if (path === "/api/auth/whoami") {
     return Response.json({
-      actor: stages.get(mode) === "login" ? { ...user, auth_method: "browser_session" } : null,
+      session: stages.get(mode) === "login"
+        ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
+        : { kind: "anonymous" },
+      actor: stages.get(mode) === "login"
+        ? { ...user, auth_method: "browser_session" }
+        : null,
     });
   }
   if (path === "/api/hosting/access") {
@@ -54,7 +59,10 @@ export function setupProjectionResponse(
     return Response.json({ user });
   }
   if (path === "/api/auth/passkeys/login/options") {
-    return Response.json({ challenge_id: "fixture-login", public_key: { challenge: "dWk" } });
+    return Response.json({
+      challenge_id: "fixture-login",
+      public_key: { challenge: "dWk" },
+    });
   }
   if (path === "/api/auth/passkeys/login/complete") {
     stages.set(mode, "login");

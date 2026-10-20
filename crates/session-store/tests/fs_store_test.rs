@@ -11,6 +11,7 @@ fn annotated(item: Item) -> LoggedHistoryEntry {
     LoggedHistoryEntry {
         item: LoggedItem::from(item),
         metadata: LoggedSessionHistoryMetadata {
+            input_metadata: None,
             entry_id: LoggedSessionHistoryEntryId::new(),
             origin: LoggedSessionHistoryOrigin::LegacyUnknown,
             derivation: None,
@@ -420,4 +421,178 @@ fn lookup_session_of_finds_owning_session() {
         .unwrap();
 
     assert_eq!(store.lookup_session_of(segid).unwrap(), Some(sid));
+}
+
+// Storage/projection component test: both production layouts, temporary originals,
+// no Feature, model, runtime or Host authority is substituted into this boundary.
+#[test]
+fn generic_system_append_and_fork_preserve_metadata_without_public_payload_leak() {
+    use session_store::{
+        FeatureInputPayload, HistoryInputMetadata, HistoryInputUsePolicy, InputCompactionUse,
+        InputEvidenceUse, InputObservationUse, LoggedHistoryDerivation, LoggedSystemHistoryEntry,
+        PublicSystemItem, PublicSystemPresentation, SystemInputEnvelope, WorkerSessionStore,
+    };
+    for worker_layout in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = new_session_id();
+        let segment = new_segment_id();
+        let fork = new_segment_id();
+        let store: Box<dyn Store> = if worker_layout {
+            Box::new(WorkerSessionStore::new(dir.path()).unwrap())
+        } else {
+            Box::new(FsStore::new(dir.path()).unwrap())
+        };
+        store
+            .create_segment(sid, segment, &[nil_session_start(1, sid)])
+            .unwrap();
+        let entry = LoggedSystemHistoryEntry::from_input(
+            LoggedSessionHistoryOrigin::Provided {
+                producer: "new-feature".into(),
+            },
+            Some(LoggedHistoryDerivation {
+                sources: vec![LoggedSessionHistoryEntryId("source-entry".into())],
+            }),
+            SystemInputEnvelope::new(
+                "private model body",
+                HistoryInputMetadata::new(
+                    HistoryInputUsePolicy {
+                        recording_material: InputEvidenceUse::Exclude,
+                        memory_evidence: InputEvidenceUse::Exclude,
+                        observation: InputObservationUse::Hidden,
+                        compaction: InputCompactionUse::ReferenceInput,
+                    },
+                    Some(
+                        FeatureInputPayload::encode(
+                            "new-feature:context",
+                            101,
+                            &serde_json::json!({"private": "secret-detail"}),
+                        )
+                        .unwrap(),
+                    ),
+                    Some(PublicSystemItem {
+                        kind: "context".into(),
+                        body: "explicit public body".into(),
+                        presentation: PublicSystemPresentation::Context,
+                    }),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        store
+            .append(
+                sid,
+                segment,
+                &LogEntry::AnnotatedSystemItem {
+                    ts: 2,
+                    entry: entry.clone(),
+                    extensions: vec![],
+                },
+            )
+            .unwrap();
+        let saved = store.read_all(sid, segment).unwrap();
+        let LogEntry::AnnotatedSystemItem {
+            entry: restored, ..
+        } = &saved[1]
+        else {
+            panic!("missing system input")
+        };
+        assert_eq!(restored.to_history_entry(), entry.to_history_entry());
+        assert_eq!(
+            collect_state(&saved).history[0].as_text(),
+            Some("private model body")
+        );
+        let mut fork_seed = nil_session_start(3, sid);
+        if let LogEntry::AnnotatedSegmentStart {
+            history,
+            forked_from,
+            ..
+        } = &mut fork_seed
+        {
+            history.push(restored.to_history_entry());
+            *forked_from = Some(session_store::SegmentOrigin {
+                segment_id: segment,
+                at_turn_index: 0,
+            });
+        }
+        store.create_segment(sid, fork, &[fork_seed]).unwrap();
+        let fork_saved = store.read_all(sid, fork).unwrap();
+        let LogEntry::AnnotatedSegmentStart { history, .. } = &fork_saved[0] else {
+            unreachable!()
+        };
+        assert_eq!(history, &[entry.to_history_entry()]);
+        let original = session_store::public_snapshot::project_session_snapshot(sid, &saved);
+        let inherited = session_store::public_snapshot::project_session_snapshot(sid, &fork_saved);
+        let public = serde_json::to_string(&original.entries).unwrap();
+        assert!(public.contains("explicit public body"));
+        for private in ["private model body", "secret-detail", "new-feature:context"] {
+            assert!(!public.contains(private), "private field leaked: {private}");
+        }
+        assert_eq!(original.entries.len(), 1);
+        assert_eq!(inherited.entries.len(), 1);
+        assert_eq!(original.entries[0].entry_id, inherited.entries[0].entry_id);
+        assert_eq!(
+            original.entries[0].derived_from,
+            inherited.entries[0].derived_from
+        );
+        assert_eq!(
+            original.entries[0].provenance,
+            inherited.entries[0].provenance
+        );
+        assert_eq!(
+            serde_json::to_value(&original.entries[0].data).unwrap(),
+            serde_json::to_value(&inherited.entries[0].data).unwrap()
+        );
+    }
+}
+
+#[test]
+fn invalid_generic_system_input_rejects_append_create_and_external_json_without_changing_originals()
+{
+    use session_store::{StoreError, SystemItem, WorkerSessionStore};
+    for worker_layout in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = new_session_id();
+        let segment = new_segment_id();
+        let store: Box<dyn Store> = if worker_layout {
+            Box::new(WorkerSessionStore::new(dir.path()).unwrap())
+        } else {
+            Box::new(FsStore::new(dir.path()).unwrap())
+        };
+        let seed = nil_session_start(1, sid);
+        store
+            .create_segment(sid, segment, std::slice::from_ref(&seed))
+            .unwrap();
+        let path = if worker_layout {
+            dir.path().join("segments").join(format!("{segment}.jsonl"))
+        } else {
+            dir.path()
+                .join(sid.to_string())
+                .join(format!("{segment}.jsonl"))
+        };
+        let before = std::fs::read(&path).unwrap();
+        let invalid = LogEntry::AnnotatedSystemItem {
+            ts: 2,
+            extensions: vec![],
+            entry: session_store::LoggedSystemHistoryEntry {
+                item: SystemItem::Input {
+                    body: "no policy".into(),
+                },
+                metadata: LoggedSessionHistoryMetadata::legacy_unknown(),
+            },
+        };
+        assert!(matches!(
+            store.append(sid, segment, &invalid),
+            Err(StoreError::InvalidInputMetadata(_))
+        ));
+        assert!(matches!(
+            store.create_segment(sid, segment, &[seed, invalid.clone()]),
+            Err(StoreError::InvalidInputMetadata(_))
+        ));
+        assert!(
+            serde_json::from_value::<LogEntry>(serde_json::to_value(invalid).unwrap()).is_err()
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(store.read_all(sid, segment).unwrap().len(), 1);
+    }
 }

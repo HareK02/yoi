@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { BrowserAuth } from '#lib/workspace/auth/browser-session.svelte.ts';
-  import { SESSION_CHANGED_EVENT } from '#lib/workspace/auth/hosting.ts';
   import { AUTHENTICATED_HOME } from '#lib/workspace/auth/routes.ts';
   import RegistrationLink from '#lib/workspace/auth/RegistrationLink.svelte';
   import AccountNavigation from '#lib/workspace/auth/AccountNavigation.svelte';
@@ -9,15 +8,8 @@
 
   const auth = new BrowserAuth();
   onMount(() => {
-    const refresh = () => { void auth.refresh(); };
-    refresh();
-    window.addEventListener('focus', refresh);
-    window.addEventListener(SESSION_CHANGED_EVENT, refresh);
-    return () => {
-      auth.dispose();
-      window.removeEventListener('focus', refresh);
-      window.removeEventListener(SESSION_CHANGED_EVENT, refresh);
-    };
+    void auth.refresh();
+    return () => auth.dispose();
   });
 </script>
 

@@ -2,33 +2,137 @@
 // Worker/bootstrap, local Git Workdir provider, and allocation table. Model I/O
 // is not invoked; this is a deterministic ordinary suite, not product E2E.
 
+fn restore_failure_tempdir() -> tempfile::TempDir {
+    // Explicitly stay inside this checkout, even when TMPDIR points elsewhere.
+    // Keep fixture components short; no symlink/alias to evade socket limits.
+    let target = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target");
+    fs::create_dir_all(&target).unwrap();
+    tempfile::Builder::new()
+        .prefix("r")
+        .rand_bytes(3)
+        .tempdir_in(target)
+        .unwrap()
+}
+
+struct RestoreOpenCountingMaterializer {
+    inner: RuntimeGitMaterializer,
+    opens: Arc<AtomicUsize>,
+}
+
+impl WorkingDirectoryMaterializer for RestoreOpenCountingMaterializer {
+    fn materialize(
+        &self,
+        worker_ref: &WorkerRef,
+        request: &WorkingDirectoryRequest,
+    ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
+        self.inner.materialize(worker_ref, request)
+    }
+
+    fn create(
+        &self,
+        request: &WorkingDirectoryRequest,
+    ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
+        self.inner.create(request)
+    }
+
+    fn authorize_repository_access(
+        &self,
+        request: &WorkingDirectoryRepositoryAccessRequest,
+    ) -> Result<(), WorkingDirectoryDiagnostic> {
+        self.inner.authorize_repository_access(request)
+    }
+
+    fn observe_repository_ref(
+        &self,
+        request: &RepositoryRefObservationRequest,
+    ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic> {
+        self.inner.observe_repository_ref(request)
+    }
+
+    fn bind_working_directory(
+        &self,
+        id: &str,
+        relative_cwd: Option<&str>,
+    ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        self.inner.bind_working_directory(id, relative_cwd)
+    }
+
+    fn preflight_bind_working_directory(
+        &self,
+        id: &str,
+        relative_cwd: Option<&str>,
+    ) -> Result<(), WorkingDirectoryDiagnostic> {
+        self.inner
+            .preflight_bind_working_directory(id, relative_cwd)
+    }
+
+    fn list_working_directories(
+        &self,
+    ) -> Result<Vec<WorkingDirectoryStatus>, WorkingDirectoryDiagnostic> {
+        self.inner.list_working_directories()
+    }
+
+    fn working_directory_status(
+        &self,
+        id: &str,
+    ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+        self.inner.working_directory_status(id)
+    }
+
+    fn cleanup_working_directory(
+        &self,
+        id: &str,
+    ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+        self.inner.cleanup_working_directory(id)
+    }
+
+    fn cleanup(&self, binding: &WorkingDirectoryBinding) -> Result<(), WorkingDirectoryDiagnostic> {
+        self.inner.cleanup(binding)
+    }
+}
+
 struct ProfileFailureFixture {
     runtime: EmbeddedRuntime,
     backend: Arc<WorkerRuntimeExecutionBackend>,
     worker: crate::catalog::WorkerDetail,
-    _repo: tempfile::TempDir,
+    provider_opens: Arc<AtomicUsize>,
     root: tempfile::TempDir,
 }
 
 impl ProfileFailureFixture {
     fn new(timeout: Duration) -> Self {
-        let root = tempfile::tempdir().unwrap();
-        let repo = create_clean_repo();
-        let store = root.path().join("private-restore-test/runtime");
+        let root = restore_failure_tempdir();
+        let repo = root.path().join("g");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init"]);
+        git(&repo, &["config", "user.email", "test@example.invalid"]);
+        git(&repo, &["config", "user.name", "Yoi Test"]);
+        fs::write(repo.join("README.md"), "clean\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "init"]);
+        let store = root.path().join("s");
+        let provider_opens = Arc::new(AtomicUsize::new(0));
         let backend = Arc::new(
             WorkerRuntimeExecutionBackend::new(
                 ProfileRuntimeWorkerFactory::new(root.path()).with_runtime_store_dir(&store),
             )
             .unwrap()
             .with_spawn_restore_timeout(timeout)
-            .with_working_directory_materializer(RuntimeGitMaterializer::new(
-                root.path().join("workdirs"),
-            )),
+            .with_working_directory_materializer(RestoreOpenCountingMaterializer {
+                inner: RuntimeGitMaterializer::new(root.path().join("w")),
+                opens: provider_opens.clone(),
+            }),
         );
         let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: store,
-                runtime_id: "restore-failure-test".into(),
+                runtime_id: "r".into(),
                 display_name: None,
             },
             backend.clone(),
@@ -39,13 +143,15 @@ impl ProfileFailureFixture {
         request.profile = ProfileSelector::Builtin("default".into());
         request.workdir_attachment_requests = vec![WorkingDirectoryAttachmentRequest {
             alias: WorkdirAttachmentAlias::new("checkout").unwrap(),
-            working_directory: working_directory_request(repo.path()),
+            working_directory: working_directory_request(&repo),
         }];
         let worker = runtime.create_worker(request).unwrap();
         runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        // Count restore provider access, not the initial create/stop setup.
+        provider_opens.store(0, Ordering::SeqCst);
         Self {
             root,
-            _repo: repo,
+            provider_opens,
             runtime,
             backend,
             worker,
@@ -57,6 +163,7 @@ impl ProfileFailureFixture {
     }
 
     fn assert_released(&self) {
+        assert_eq!(self.provider_opens.load(Ordering::SeqCst), 0);
         assert!(self.backend.pending_restores.lock().unwrap().is_empty());
         assert!(self.backend.workers.lock().unwrap().is_empty());
         assert!(
@@ -176,16 +283,22 @@ impl ProfileFailureFixture {
                 .load(Ordering::SeqCst),
             calls + 1
         );
+        // Restore/cleanup and old-request replay must not provider-open the
+        // retained attachment, including after a new execution was accepted.
+        assert_eq!(self.provider_opens.load(Ordering::SeqCst), 0);
         // Only tear down after the fresh explicit Restore has already succeeded.
         self.runtime
             .stop_worker(&self.worker.worker_ref, None)
             .unwrap();
+        assert_eq!(self.provider_opens.load(Ordering::SeqCst), 0);
     }
 }
 
 #[test]
 #[serial_test::serial(worker_allocation)]
 fn profile_restore_multistage_failure_cleans_then_fresh_restore_without_stop() {
+    // Binding means runtime Worker/attachment-router binding, not eager provider
+    // materialization. Provider access stays deferred through every boundary.
     for stage in [
         RuntimeRestoreStage::Reconstruction,
         RuntimeRestoreStage::Binding,
@@ -224,8 +337,7 @@ fn profile_restore_multistage_failure_cleans_then_fresh_restore_without_stop() {
 
 #[test]
 #[serial_test::serial(worker_allocation)]
-fn profile_restore_cleanup_failure_retains_owner_and_original_cause_until_same_operation_recovers()
-{
+fn profile_restore_cleanup_failure_retains_owner_and_cause_without_opening_deferred_provider() {
     let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
     fixture.fail(RuntimeRestoreStage::Feature);
     fixture
@@ -265,6 +377,20 @@ fn profile_restore_cleanup_failure_retains_owner_and_original_cause_until_same_o
         "{message}"
     );
     assert!(message.contains("Workdir"), "{message}");
+    {
+        let retained = pending.result.lock().unwrap();
+        let failure = retained.as_ref().unwrap().as_ref().err().unwrap();
+        assert_eq!(failure.stage, RuntimeRestoreStage::Feature);
+        assert_eq!(failure.resources, RuntimeRestoreResources::WorkerStartup);
+        assert_eq!(
+            failure.cleanup,
+            RuntimeRestoreCleanup::Failed(RuntimeRestoreCleanupFailure::Workdir)
+        );
+        assert_eq!(
+            failure.cleanup_failure,
+            Some(RuntimeRestoreCleanupFailure::Workdir)
+        );
+    }
     let owned = fixture
         .backend
         .factory
@@ -274,6 +400,9 @@ fn profile_restore_cleanup_failure_retains_owner_and_original_cause_until_same_o
         .get(&fixture.worker.worker_ref)
         .cloned()
         .unwrap();
+    assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 0);
+    assert!(pending.request.workdir_attachments.is_empty());
+    assert!(!pending.request.deferred_workdir_sessions.is_empty());
     assert_eq!(owned.operation_id, pending.request.operation_id);
     assert!(owned.allocation.is_some());
     assert!(
@@ -307,6 +436,7 @@ fn profile_restore_cleanup_failure_retains_owner_and_original_cause_until_same_o
             .load(Ordering::SeqCst),
         1
     );
+    assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 0);
     fixture
         .backend
         .factory
@@ -334,6 +464,27 @@ fn profile_restore_cleanup_failure_retains_owner_and_original_cause_until_same_o
             .all(|sessions| sessions.aliases().is_empty())
     );
     fixture.assert_released();
+    let unopened = pending.request.deferred_workdir_sessions.clone();
+    fixture
+        .backend
+        .run_on_adapter_runtime(async move {
+            for session in unopened.values() {
+                assert!(matches!(
+                    session
+                        .read(workdir::ReadRequest {
+                            path: workdir::WorkdirPath::new("README.md").unwrap(),
+                            offset: 0,
+                            limit: 10,
+                            max_bytes: 1024,
+                        })
+                        .await,
+                    Err(workdir::WorkdirError::SessionClosed)
+                ));
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 0);
     eprintln!(
         "restore-fault cleanup=Workdir owner-retained=true retry=same-operation outcome=RolledBack"
     );
@@ -466,7 +617,19 @@ fn profile_restore_real_socket_start_failure_removes_partial_run_and_allocation(
         "{diagnostic}"
     );
     assert!(diagnostic.contains("InvalidInput"), "{diagnostic}");
-    assert!(!diagnostic.contains("private-restore-test"));
+    // This case deliberately exercises the real Unix socket path-limit error;
+    // positive restore cases retain the factory's normal InProcess transport.
+    // Short fixture roots must not accidentally turn it into a successful bind.
+    let operation_id =
+        fixture.backend.completed_restore_failures.lock().unwrap()[&fixture.worker.worker_ref].0;
+    let socket = fixture
+        .backend
+        .factory
+        .worker_restore_run_dir(&fixture.worker.worker_ref, operation_id)
+        .unwrap()
+        .join("worker.sock");
+    assert!(socket.as_os_str().as_encoded_bytes().len() >= 108);
+    assert!(!diagnostic.contains(&fixture.root.path().to_string_lossy().to_string()));
     fixture.assert_released();
     fixture
         .backend
@@ -844,102 +1007,150 @@ fn profile_restore_failure_settlement_write_retry_preserves_completed_cause_with
     }
 }
 
-struct RacedBindingFactory {
-    changed_checkout: PathBuf,
-    preflights: AtomicUsize,
-}
-
-#[async_trait]
-impl RuntimeWorkerFactory for RacedBindingFactory {
-    async fn spawn_controller(
-        &self,
-        _: WorkerExecutionSpawnRequest,
-    ) -> Result<RuntimeWorkerController, String> {
-        panic!("binding-only failure must not create a controller")
-    }
-    async fn preflight_restore(&self, _: &WorkerExecutionRestoreRequest) -> Result<(), String> {
-        // Inject another owner's checkout change AFTER the real materializer's
-        // read-only checks, but before its mutable bind. Recovery stays real.
-        if self.preflights.fetch_add(1, Ordering::SeqCst) == 0 {
-            fs::remove_dir_all(&self.changed_checkout).unwrap();
-        }
-        Ok(())
-    }
-    async fn restore_controller(
-        &self,
-        _: WorkerExecutionRestoreRequest,
-    ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
-        panic!("factory execution must not run after partial binding failed")
-    }
-}
-
+// Preflight accepts the real retained Profile source, but reconstruction
+// discovers that its committed segment has no system prompt. No fault checkpoint
+// supplies this Err.
 #[test]
-fn partial_restore_binding_failure_keeps_exact_operation_without_factory_cleanup_claim() {
-    let root = tempfile::tempdir().unwrap();
-    let repo = create_clean_repo();
-    let materializer = RuntimeGitMaterializer::new(root.path());
-    let first = materializer
-        .create(&working_directory_request(repo.path()))
-        .unwrap();
-    let second = materializer
-        .create(&working_directory_request(repo.path()))
-        .unwrap();
-    let mut request = direct_restore_request(WorkerRef::new(WorkerId::now_v7()));
-    request.previous_workdir_attachments = vec![
-        WorkingDirectoryAttachmentStatus {
-            alias: WorkdirAttachmentAlias::new("first").unwrap(),
-            working_directory: first.status(),
-        },
-        WorkingDirectoryAttachmentStatus {
-            alias: WorkdirAttachmentAlias::new("second").unwrap(),
-            working_directory: second.status(),
-        },
-    ];
-    let backend = WorkerRuntimeExecutionBackend::new(RacedBindingFactory {
-        changed_checkout: second.root().to_path_buf(),
-        preflights: AtomicUsize::new(0),
-    })
-    .unwrap()
-    .with_working_directory_materializer(materializer);
-    assert!(matches!(
-        backend.restore_worker(request.clone()),
-        WorkerExecutionSpawnResult::ReconciliationRequired { .. }
-    ));
-    let pending = backend
-        .pending_restore(&request.worker_ref)
-        .unwrap()
-        .unwrap();
-    assert_eq!(pending.request.operation_id, request.operation_id);
-    assert_eq!(pending.request.workdir_attachments.len(), 1);
-    assert_eq!(
-        pending
-            .request
-            .workdir_attachments
-            .values()
-            .next()
-            .unwrap()
-            .root(),
-        first.root()
+#[serial_test::serial(worker_allocation)]
+fn profile_restore_missing_committed_system_prompt_rolls_back_and_replays_classified_cause() {
+    let root = restore_failure_tempdir();
+    let runtime_store = root.path().join("s");
+    let worker_ref = WorkerRef::new(WorkerId::now_v7());
+    let (session_id, segment_id, _) = write_retained_profile_worker(&runtime_store, &worker_ref);
+    let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
+    let aggregate_dir = runtime_store
+        .join("workers")
+        .join(worker_ref.worker_id.to_string());
+    let metadata_store = WorkerAggregateStore::new(&aggregate_dir, &worker_name).unwrap();
+    let mut metadata = metadata_store.read_by_name(&worker_name).unwrap().unwrap();
+    let manifest = WorkerManifest::from_toml(
+        r#"
+        [worker]
+        name = "r"
+        [scope]
+        allow = []
+        [model]
+        scheme = "anthropic"
+        model_id = "test"
+        auth = { kind = "none" }
+        [engine]
+        instruction = "default"
+        max_tokens = 100
+        [feature.memory.profile]
+        enabled = false
+        "#,
+    )
+    .unwrap();
+    metadata.resolved_manifest_snapshot =
+        Some(manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap());
+    metadata_store.write(&metadata).unwrap();
+    let session_store = WorkerSessionStore::new(aggregate_dir.join("session")).unwrap();
+    let entries_before = session_store.read_all(session_id, segment_id).unwrap();
+    assert!(
+        session_store::collect_state(&entries_before)
+            .system_prompt
+            .is_none()
     );
-    for _ in 0..2 {
-        assert!(matches!(
-            backend.reconcile_restore(request.clone()),
-            WorkerExecutionSpawnResult::ReconciliationRequired { .. }
-        ));
+
+    let backend = WorkerRuntimeExecutionBackend::new(
+        ProfileRuntimeWorkerFactory::new(root.path().join("p"))
+            .with_runtime_store_dir(&runtime_store),
+    )
+    .unwrap();
+    let request = direct_restore_request(worker_ref.clone());
+    backend.preflight_restore(&request).unwrap();
+    let first = match backend.restore_worker(request.clone()) {
+        WorkerExecutionSpawnResult::RolledBack(result) => result,
+        other => panic!("missing committed prompt must finish rollback: {other:?}"),
+    };
+    let diagnostic = first.message.as_deref().unwrap();
+    assert!(
+        diagnostic.contains("saved segment system prompt missing"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("Reconstruction"), "{diagnostic}");
+    assert!(diagnostic.contains("Confirmed"), "{diagnostic}");
+    assert!(diagnostic.len() < 512, "{diagnostic}");
+    for private in [
+        root.path().to_string_lossy().into_owned(),
+        session_id.to_string(),
+        segment_id.to_string(),
+        "retained response".into(),
+    ] {
+        assert!(!diagnostic.contains(&private), "{diagnostic}");
     }
-    assert_eq!(backend.factory.preflights.load(Ordering::SeqCst), 1);
-    assert!(!backend.stop_worker(&request.worker_ref).is_accepted());
-    assert!(Arc::ptr_eq(
-        &pending,
-        &backend
-            .pending_restore(&request.worker_ref)
-            .unwrap()
-            .unwrap()
-    ));
+    // A completed Err is not evidence of zero resources. Require the owner to
+    // attest cleanup, and independently check its allocation/artifact authority.
+    {
+        let completed = backend.completed_restore_failures.lock().unwrap();
+        let (operation_id, failure) = completed.get(&worker_ref).unwrap();
+        assert_eq!(*operation_id, request.operation_id);
+        assert_eq!(failure.stage, RuntimeRestoreStage::Reconstruction);
+        assert_eq!(failure.resources, RuntimeRestoreResources::WorkerStartup);
+        assert_eq!(failure.cleanup, RuntimeRestoreCleanup::Confirmed);
+        assert_eq!(failure.cleanup_failure, None);
+    }
+    assert!(backend.pending_restore(&worker_ref).unwrap().is_none());
     assert!(backend.workers.lock().unwrap().is_empty());
-    eprintln!(
-        "restore-fault stage=mutable-binding outcome=ReconciliationRequired partial-bindings=retained factory-executions=0"
+    assert!(
+        backend
+            .factory
+            .failed_restore_resources
+            .lock()
+            .unwrap()
+            .is_empty()
     );
-    // Fixture teardown drops the retained passive local binding. This is not
-    // evidence that credential/policy materialization has been rolled back.
+    assert!(
+        backend
+            .factory
+            .observation_hub
+            .workers
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !backend
+            .factory
+            .worker_restore_run_dir(&worker_ref, request.operation_id)
+            .unwrap()
+            .exists()
+    );
+    {
+        let table = worker::runtime::worker_allocation::LockFileGuard::open(
+            &worker::runtime::worker_allocation::default_allocation_path().unwrap(),
+        )
+        .unwrap();
+        assert!(table.data().find(&worker_name).is_none());
+        assert!(table.data().find("r").is_none());
+    }
+    for replay in [
+        backend.reconcile_restore(request.clone()),
+        backend.restore_worker(request),
+    ] {
+        let WorkerExecutionSpawnResult::RolledBack(result) = replay else {
+            panic!("same request must replay confirmed failure: {replay:?}");
+        };
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::to_value(&first).unwrap()
+        );
+    }
+    assert_eq!(
+        backend
+            .factory
+            .restore_faults
+            .executions
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert!(backend.pending_restore(&worker_ref).unwrap().is_none());
+    assert_eq!(
+        metadata_store.read_by_name(&worker_name).unwrap().unwrap(),
+        metadata
+    );
+    assert_eq!(
+        serde_json::to_value(session_store.read_all(session_id, segment_id).unwrap()).unwrap(),
+        serde_json::to_value(entries_before).unwrap()
+    );
 }

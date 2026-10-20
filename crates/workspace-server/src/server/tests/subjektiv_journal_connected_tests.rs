@@ -260,7 +260,7 @@ async fn connected_create(api: &WorkspaceApi, subject: &str, name: &str) -> Runt
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
                 subjektiv: Some(server_api::SubjektivWorkerConnectionRequest { subject_id: subject.into() }),
-            }, control_operation_id: None,
+            }, control_operation_id: None, execution_grant: None,
         }),
     ).await.unwrap();
     RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
@@ -386,6 +386,56 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     let subject = store
         .create_subject(crate::subjektiv::SubjectRole::new("connected-handoff").unwrap())
         .unwrap();
+    let owner =
+        seed_test_workspace_owner_token(api.store.as_ref(), "connected-journal-owner").await;
+    // This fixture exercises Journal continuity, not unset-policy refusal. Assign
+    // the companion's exact activation keys through authenticated administration;
+    // no filesystem, shell or delegation permission is granted to its body.
+    let update = server_api::authorization::SubjectPermissionsUpdate {
+        operation_id: "connected-journal-activation".into(),
+        expected_change_id: None,
+        execution: [
+            "task",
+            "subjektiv",
+            "web",
+            "image",
+            "sub_worker",
+            "worker",
+            "workspace_worker_discovery",
+            "objective",
+            "manage_workdir",
+            "workdir_catalog",
+            "drive",
+            "ticket",
+        ]
+        .into_iter()
+        .map(|name| server_api::authorization::ScopedPermission {
+            operation: name.into(),
+            resource: server_api::authorization::PermissionResource::Feature,
+        })
+        .collect(),
+        delegation: Vec::new(),
+    };
+    let response = build_router(api.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions",
+                    subject.id
+                ))
+                .header("authorization", format!("Bearer {owner}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&update).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let old = connected_create(&api, &subject.id, "connected-old-body").await;
     let old_attr = store
         .subject_session_attributions(&subject.id)
@@ -547,30 +597,40 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     let segments = session.list_segments(session_id).unwrap();
     assert_eq!(segments.len(), 1);
     let entries = session.read_all_read_only(session_id, segments[0]).unwrap();
+    #[derive(serde::Deserialize)]
+    struct SavedJournal {
+        snapshot: serde_json::Value,
+        snapshot_sha256: String,
+        prompt_provenance: session_store::PromptRenderProvenance,
+    }
     let startup: Vec<_> = entries
         .iter()
         .enumerate()
-        .filter_map(|(index, log)| match log {
-            session_store::LogEntry::AnnotatedSystemItem { entry, .. } => match &entry.item {
-                session_store::SystemItem::JournalStartup {
-                    snapshot,
-                    snapshot_sha256,
-                    body,
-                    prompt_provenance,
-                } => Some((index, snapshot, snapshot_sha256, body, prompt_provenance)),
-                _ => None,
-            },
-            _ => None,
+        .filter_map(|(index, log)| {
+            let session_store::LogEntry::AnnotatedSystemItem { entry, .. } = log else {
+                return None;
+            };
+            let payload = entry
+                .metadata
+                .input_metadata
+                .as_ref()?
+                .feature_payload()?
+                .decode::<SavedJournal>("journal:startup", 1)
+                .ok()?;
+            Some((index, payload, entry.item.history_text()))
         })
         .collect();
     assert_eq!(startup.len(), 1, "startup must be durably committed once");
-    let (startup_index, snapshot, digest, body, provenance) = startup[0];
+    let (startup_index, payload, body) = &startup[0];
+    let snapshot = &payload.snapshot;
+    let digest = &payload.snapshot_sha256;
+    let provenance = &payload.prompt_provenance;
     let first_input = entries
         .iter()
         .position(|entry| matches!(entry, session_store::LogEntry::AnnotatedUserInput { .. }))
         .expect("new body persisted its initial human input");
     assert!(
-        startup_index < first_input,
+        *startup_index < first_input,
         "startup reference must be persisted before the first human input/model request"
     );
     assert_eq!(snapshot["subject_id"], subject.id);

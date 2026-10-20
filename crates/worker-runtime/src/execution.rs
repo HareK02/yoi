@@ -432,6 +432,9 @@ pub struct WorkerExecutionRestoreRequest {
     pub previous_workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
     pub logical_workdir_attachments: Vec<crate::catalog::LogicalWorkdirAttachment>,
     pub workdir_attachments: BTreeMap<workdir::WorkdirAttachmentAlias, WorkingDirectoryBinding>,
+    /// Process-owned sessions that open providers only on a Workdir operation.
+    pub deferred_workdir_sessions:
+        BTreeMap<workdir::WorkdirAttachmentAlias, workdir::WorkdirSessionHandle>,
     pub config_bundle: Option<ConfigBundle>,
 }
 

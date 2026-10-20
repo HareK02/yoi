@@ -692,7 +692,6 @@ impl WorkerController {
     pub async fn spawn<C, St>(
         worker: Worker<C, St>,
         runtime_base: &Path,
-        bash_output_dir: &Path,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
@@ -701,7 +700,6 @@ impl WorkerController {
         let (handle, shutdown, _task) = Self::spawn_inner(
             worker,
             runtime_base,
-            bash_output_dir,
             false,
             None,
             WorkerControllerTransport::UnixSocket,
@@ -715,7 +713,7 @@ impl WorkerController {
     pub async fn spawn_with_transport<C, St>(
         worker: Worker<C, St>,
         runtime_base: &Path,
-        bash_output_dir: &Path,
+
         transport: WorkerControllerTransport,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
@@ -723,42 +721,32 @@ impl WorkerController {
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
         let (handle, shutdown, _task) =
-            Self::spawn_with_transport_owned(worker, runtime_base, bash_output_dir, transport)
-                .await?;
+            Self::spawn_with_transport_owned(worker, runtime_base, transport).await?;
         Ok((handle, shutdown))
     }
 
     pub(crate) async fn spawn_with_transport_owned<C, St>(
         worker: Worker<C, St>,
         runtime_base: &Path,
-        bash_output_dir: &Path,
+
         transport: WorkerControllerTransport,
     ) -> Result<(WorkerHandle, ShutdownReceiver, tokio::task::JoinHandle<()>), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
-        Self::spawn_inner(
-            worker,
-            runtime_base,
-            bash_output_dir,
-            false,
-            None,
-            transport,
-        )
-        .await
+        Self::spawn_inner(worker, runtime_base, false, None, transport).await
     }
 
     /// Spawn a Worker owned by `worker-runtime`.
     ///
-    /// The controller uses an ephemeral directory for Unix sockets while tool
-    /// spill artifacts use the separately supplied Worker-owned temporary path.
+    /// The controller uses an ephemeral directory for Unix sockets. Bash output is
+    /// owned by its live Feature instance, independently of filesystem layout.
     /// Runtime-managed Workers do not write legacy pid/status/manifest liveness
     /// projections.
     pub async fn spawn_runtime_managed<C, St>(
         worker: Worker<C, St>,
         runtime_base: &Path,
-        bash_output_dir: &Path,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
@@ -767,7 +755,6 @@ impl WorkerController {
         let (handle, shutdown, _task) = Self::spawn_inner(
             worker,
             runtime_base,
-            bash_output_dir,
             true,
             None,
             WorkerControllerTransport::UnixSocket,
@@ -780,7 +767,6 @@ impl WorkerController {
     pub async fn spawn_runtime_managed_run<C, St>(
         worker: Worker<C, St>,
         run_dir: &Path,
-        bash_output_dir: &Path,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
@@ -789,7 +775,6 @@ impl WorkerController {
         Self::spawn_runtime_managed_run_with_transport(
             worker,
             run_dir,
-            bash_output_dir,
             WorkerControllerTransport::UnixSocket,
         )
         .await
@@ -800,27 +785,23 @@ impl WorkerController {
     pub async fn spawn_runtime_managed_run_with_transport<C, St>(
         worker: Worker<C, St>,
         run_dir: &Path,
-        bash_output_dir: &Path,
+
         transport: WorkerControllerTransport,
     ) -> Result<(WorkerHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
-        let (handle, shutdown, _task) = Self::spawn_runtime_managed_run_with_transport_owned(
-            worker,
-            run_dir,
-            bash_output_dir,
-            transport,
-        )
-        .await?;
+        let (handle, shutdown, _task) =
+            Self::spawn_runtime_managed_run_with_transport_owned(worker, run_dir, transport)
+                .await?;
         Ok((handle, shutdown))
     }
 
     pub(crate) async fn spawn_runtime_managed_run_with_transport_owned<C, St>(
         worker: Worker<C, St>,
         run_dir: &Path,
-        bash_output_dir: &Path,
+
         transport: WorkerControllerTransport,
     ) -> Result<(WorkerHandle, ShutdownReceiver, tokio::task::JoinHandle<()>), std::io::Error>
     where
@@ -830,21 +811,13 @@ impl WorkerController {
         let parent = run_dir
             .parent()
             .ok_or_else(|| std::io::Error::other("run path has no parent"))?;
-        Self::spawn_inner(
-            worker,
-            parent,
-            bash_output_dir,
-            true,
-            Some(run_dir),
-            transport,
-        )
-        .await
+        Self::spawn_inner(worker, parent, true, Some(run_dir), transport).await
     }
 
     async fn spawn_inner<C, St>(
         worker: Worker<C, St>,
         runtime_base: &Path,
-        bash_output_dir: &Path,
+
         runtime_managed: bool,
         runtime_run: Option<&Path>,
         transport: WorkerControllerTransport,
@@ -858,7 +831,6 @@ impl WorkerController {
         let result = Self::spawn_initialized(
             worker,
             runtime_base,
-            bash_output_dir,
             runtime_managed,
             runtime_run,
             transport,
@@ -878,7 +850,7 @@ impl WorkerController {
     async fn spawn_initialized<C, St>(
         mut worker: Worker<C, St>,
         runtime_base: &Path,
-        bash_output_dir: &Path,
+
         runtime_managed: bool,
         runtime_run: Option<&Path>,
         transport: WorkerControllerTransport,
@@ -892,8 +864,7 @@ impl WorkerController {
             .map_err(std::io::Error::other)?;
 
         // === 1. Initialization (channels / RuntimeDir / worker-immutable
-        //         snapshots / SpawnedWorkerRegistry / alerter attach /
-        //         bash-output scope) ===
+        //         snapshots / SpawnedWorkerRegistry / alerter attach) ===
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (method_tx, method_rx) = mpsc::channel::<Method>(32);
         let (working_event_tx, _) = broadcast::channel::<Event>(256);
@@ -901,8 +872,8 @@ impl WorkerController {
         let in_flight = InFlightEvents::new(working_event_tx.clone());
         worker.attach_in_flight_events(in_flight.clone());
 
-        // Runtime directory is created before tool registration because it owns
-        // bounded tool artifacts, and before initial status/history writes consume
+        // Runtime directory is created before tool registration and before
+        // initial status/history writes consume
         // the greeting we build after registration is complete.
         let runtime_dir = Arc::new(if let Some(run_dir) = runtime_run {
             RuntimeDir::create_worker_run(run_dir).await?
@@ -939,26 +910,6 @@ impl WorkerController {
         worker.attach_internal_worker_registry(spawned_registry.clone());
         worker.attach_working_event_tx(working_event_tx.clone());
 
-        // Bash spill artifacts are owned by the stable Worker identity rather
-        // than a controller session/run generation. Push a recursive
-        // `allow(Read)` for the exact tool output path into the Worker's shared
-        // runtime scope so the Workdir session and system prompt stay aligned.
-        let bash_output_dir = bash_output_dir.to_path_buf();
-        std::fs::create_dir_all(&bash_output_dir).map_err(|e| {
-            std::io::Error::other(format!(
-                "create bash output dir {}: {e}",
-                bash_output_dir.display()
-            ))
-        })?;
-        worker
-            .add_scope_rules([manifest::ScopeRule {
-                target: bash_output_dir.clone(),
-                permission: manifest::Permission::Read,
-                recursive: true,
-                symlink_policy: Default::default(),
-            }])
-            .map_err(std::io::Error::other)?;
-
         // === 1.5. Direct writer wiring ===
         //
         // Engine callbacks fire `on_history_append` for each assistant
@@ -978,7 +929,6 @@ impl WorkerController {
         // === 3. Tool registration (builtin / memory / spawn-orchestration) ===
         let fs_for_view = register_worker_tools(
             &mut worker,
-            bash_output_dir,
             runtime_base.to_path_buf(),
             spawned_registry.clone(),
             Some(method_tx.downgrade()),
@@ -1445,7 +1395,7 @@ fn validate_memory_lifecycle_targets(
 /// the shared state.
 pub(crate) async fn register_worker_tools<C, St>(
     worker: &mut Worker<C, St>,
-    bash_output_dir: PathBuf,
+
     runtime_base: PathBuf,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
     parent_method_tx: Option<mpsc::WeakSender<Method>>,
@@ -1458,6 +1408,11 @@ where
     // Worker-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `worker`.
     let feature_config = worker.manifest().feature.clone();
+    // New activation requires admission before any initialization side effect.
+    // Restore reconstructs saved composition; operation authority stays live.
+    worker
+        .authorize_feature_configuration()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
     let workdir_sessions = worker.workdir_sessions();
     let restrict_workdir_tools_to_current_capabilities = inherited_workdir_tool_broker.is_some();
     let workdir_tool_broker = Some(
@@ -1490,6 +1445,7 @@ where
     let lifecycle_enabled = worker.manifest_lifecycle_features_enabled() && backend_job.is_none();
     let prompts = worker.prompts().clone();
     let tracker = tools::Tracker::new();
+    let bash_output = spawned_registry.bash_output();
     {
         let paste_store = worker.store().clone();
         let paste_session_id = worker.session_id();
@@ -1512,13 +1468,13 @@ where
             tools::routed_builtin_tools_for_current_capabilities(
                 workdir_sessions.clone(),
                 tracker.clone(),
-                bash_output_dir.clone(),
+                bash_output.clone(),
             )
         } else {
             tools::routed_builtin_tools(
                 workdir_sessions.clone(),
                 tracker.clone(),
-                bash_output_dir.clone(),
+                bash_output.clone(),
             )
         };
         worker.engine_mut().register_tools(workdir_tools);
@@ -1661,10 +1617,10 @@ where
     if ordinary_subjektiv_features_enabled
         && lifecycle_enabled
         && let Some(host) = subjektiv_host.as_ref()
-        && host.host.journal_startup_granted()
+        && (host.host.journal_startup_granted() || host.host.journal_compaction_granted())
     {
-        worker.install_initial_context_source(Arc::new(
-            crate::feature::builtin::journal::JournalStartupContextSource::new(
+        worker.install_session_context_source(Arc::new(
+            crate::feature::builtin::journal::JournalContextSource::new(
                 host.clone(),
                 worker.prompts(),
             ),
@@ -1915,6 +1871,20 @@ where
             )
         })?;
     }
+    if wip_mode {
+        crate::feature::builtin::bash::mount(
+            &mut wip_mount_registry,
+            worker.workdir_sessions(),
+            bash_output.clone(),
+            wip_permissions.clone(),
+        )
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("mount Bash output WIP projection: {error}"),
+            )
+        })?;
+    }
     if wip_mode && let Some(feature) = &workdir_wip_feature {
         crate::feature::builtin::manage_workdir::wip::mount_workspace_workdir_wip(
             &mut wip_mount_registry,
@@ -2045,7 +2015,6 @@ where
                 spawner_workspace_context,
                 parent_notifications,
                 runtime_base.clone(),
-                bash_output_dir.clone(),
                 spawner_workspace_root,
                 workdir_tool_broker,
                 spawned_registry.clone(),
@@ -3331,6 +3300,8 @@ async fn controller_loop<C, St>(
         }
     }
 
+    spawned_registry.bash_output().revoke();
+
     if let Some(observer) = command_observer.take() {
         observer.abort();
         let _ = observer.await;
@@ -4144,7 +4115,21 @@ mod tests {
                 request: crate::worker::WorkspaceRequest,
             ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError>
             {
-                // Native discovery must not enumerate or perform any mutation.
+                if request.path == "/api/w/workspace-1/authorization/check" {
+                    assert_eq!(request.method, crate::worker::WorkspaceRequestMethod::Post);
+                    return Ok(crate::worker::WorkspaceResponse {
+                        status: 200,
+                        body: serde_json::json!({"scope":null}).to_string(),
+                    });
+                }
+                // Native discovery reads metadata and the current caller's ceiling, never inventory or mutations.
+                assert_eq!(request.method, crate::worker::WorkspaceRequestMethod::Get);
+                if request.path == "/api/w/workspace-1/drive/capabilities" {
+                    return Ok(crate::worker::WorkspaceResponse {
+                        status: 200,
+                        body: serde_json::json!({"write":true}).to_string(),
+                    });
+                }
                 assert_eq!(request.path, "/api/w/workspace-1/drive/root");
                 Ok(crate::worker::WorkspaceResponse { status: 200, body: serde_json::json!({
                     "entry": {"workspace_id": "workspace-1", "node_id": "1"},
@@ -4215,16 +4200,23 @@ mod tests {
                         worker.workdir_sessions(),
                     )
                     .descriptor();
-                    register_worker_tools(
+                    let registered = register_worker_tools(
                         &mut worker,
-                        root.path().join("bash-output"),
                         root.path().join("runtime"),
                         SpawnedWorkerRegistry::new_for_internal_services(),
                         None,
                         None,
                     )
-                    .await
-                    .unwrap();
+                    .await;
+                    if enabled && (!available || workspace.is_none()) {
+                        assert_eq!(
+                            registered.unwrap_err().kind(),
+                            std::io::ErrorKind::PermissionDenied
+                        );
+                        assert!(requests.lock().unwrap().is_empty());
+                        continue;
+                    }
+                    registered.unwrap();
                     let configured = enabled && available && workspace.is_some();
                     let tools = worker.engine().tool_server_handle();
                     tools.flush_pending();
@@ -4429,6 +4421,21 @@ mod tests {
         assert!(feature_install < materialize_gate);
         assert!(materialize_gate < materialize);
         assert!(materialize < exposure);
+        let observer = startup.find("let command_observer = fs_for_view").unwrap();
+        let recover = startup.find(".recover_unfinished_compaction()").unwrap();
+        let files = startup
+            .find("runtime_dir.write_status(&shared_state).await?")
+            .unwrap();
+        let loop_start = startup.find("tokio::spawn(controller_loop(").unwrap();
+        assert!(recover < observer && files < observer && observer < loop_start);
+        let socket_startup = &startup[observer..loop_start];
+        let abort = socket_startup.find("observer.abort()").unwrap();
+        let join = socket_startup.find("observer.await").unwrap();
+        let failure = socket_startup.find("return Err(error)").unwrap();
+        assert!(
+            abort < join && join < failure,
+            "startup cannot detach its observer on error"
+        );
         assert!(
             startup[materialize_gate..materialize]
                 .contains("needs_initial_session_head_materialization")

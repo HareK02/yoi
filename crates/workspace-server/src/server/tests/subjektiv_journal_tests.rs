@@ -479,6 +479,7 @@ fn seed_session(
         vec![session_store::LoggedHistoryEntry {
             item,
             metadata: session_store::LoggedSessionHistoryMetadata {
+                input_metadata: None,
                 entry_id: session_store::LoggedSessionHistoryEntryId("read-source-original".into()),
                 origin,
                 derivation: None,
@@ -1686,6 +1687,7 @@ impl SubjectRemovalFixture {
                     }),
                 },
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -1706,6 +1708,7 @@ impl SubjectRemovalFixture {
                     .map(|text| session_store::LoggedHistoryEntry {
                         item: message(text),
                         metadata: session_store::LoggedSessionHistoryMetadata {
+                            input_metadata: None,
                             entry_id: session_store::LoggedSessionHistoryEntryId(text.into()),
                             origin: session_store::LoggedSessionHistoryOrigin::LocalHumanInput,
                             derivation: None,

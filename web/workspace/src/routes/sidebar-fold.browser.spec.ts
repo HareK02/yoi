@@ -4,34 +4,65 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createRawSnippet, tick } from "svelte";
 import { logout } from "#lib/workspace/auth/api.ts";
-import { clearWorkspaceAlerts, pushWorkspaceAlert } from '#lib/workspace/alerts/store.ts';
-import { page } from '$app/state';
-import { settle } from '#lib/workspace/navigation/deferred.ts';
+import {
+  clearWorkspaceAlerts,
+  pushWorkspaceAlert,
+} from "#lib/workspace/alerts/store.ts";
+import { page } from "$app/state";
+import { settle } from "#lib/workspace/navigation/deferred.ts";
+import { browserSession } from "#lib/workspace/auth/session-state.ts";
+import {
+  authUser,
+  whoamiPayload,
+} from "#lib/workspace/auth/api.test-fixtures.ts";
 import Layout from "./+layout.svelte";
 
-vi.mock("$app/state", () => ({ page: { url: new URL("https://example.test/w/example") } }));
+vi.mock(
+  "$app/state",
+  () => ({
+    page: { url: new URL("https://example.test/w/example") },
+    navigating: { to: null },
+  }),
+);
 const storageKey = "yoi.sidebar.mode.v1";
 const legacyKey = "yoi.sidebar.folded.v1";
 const props = {
   params: {},
   children: createRawSnippet(() => ({ render: () => "<p>Page content</p>" })),
-  data: { deferredCatalog: settle({ accessibleWorkspaces: [], workspaceCatalogError: null }) },
+  data: {
+    deferredCatalog: settle({
+      accessibleWorkspaces: [],
+      workspaceCatalogError: null,
+    }),
+  },
 };
 const frame = () => screen.getByRole("complementary", { name: "Sidebar" });
 const folded = () => frame().classList.contains("folded");
-const hoverRegion = () => frame().querySelector<HTMLElement>(".sidebar-hover-region")!;
-const enter = () => fireEvent.pointerEnter(hoverRegion(), { pointerType: "mouse" });
-const leave = () => fireEvent.pointerLeave(hoverRegion(), { pointerType: "mouse" });
+const hoverRegion = () =>
+  frame().querySelector<HTMLElement>(".sidebar-hover-region")!;
+const enter = () =>
+  fireEvent.pointerEnter(hoverRegion(), { pointerType: "mouse" });
+const leave = () =>
+  fireEvent.pointerLeave(hoverRegion(), { pointerType: "mouse" });
 const delay = () => vi.advanceTimersByTimeAsync(200);
 
 beforeEach(() => {
   localStorage.clear();
   clearWorkspaceAlerts();
-  vi.stubGlobal('fetch', vi.fn(async (input) => {
-    if (String(input) === '/api/auth/whoami') return Response.json({ actor: null });
-    throw new Error(`Unexpected request ${input}`);
-  }));
-  page.url = new URL('https://example.test/w/example');
+  browserSession.snapshot = {
+    kind: "ready",
+    value: whoamiPayload({ ...authUser, auth_method: "browser_session" }),
+  } as typeof browserSession.snapshot;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input) => {
+      if (String(input) === "/api/auth/whoami") {
+        return Response.json({ session: { kind: "anonymous" }, actor: null });
+      }
+      throw new Error(`Unexpected request ${input}`);
+    }),
+  );
+  page.url = new URL("https://example.test/w/example");
   vi.useFakeTimers();
 });
 afterEach(() => {
@@ -42,22 +73,36 @@ afterEach(() => {
   localStorage.clear();
 });
 
-test.each(['/', '/dashboard', '/login', '/register', '/account', '/hosting/settings'])(
-  'standalone %s never displays retained private Workspace notifications',
+test.each([
+  "/",
+  "/dashboard",
+  "/login",
+  "/register",
+  "/account",
+  "/hosting/settings",
+])(
+  "standalone %s never displays retained private Workspace notifications",
   (path) => {
-    pushWorkspaceAlert('error', 'Private Workspace Orion: worker deletion failed');
-    page.url = new URL(path, 'https://example.test');
+    pushWorkspaceAlert(
+      "error",
+      "Private Workspace Orion: worker deletion failed",
+    );
+    page.url = new URL(path, "https://example.test");
     render(Layout, { props });
-    expect(screen.getByText('Page content')).toBeTruthy();
-    expect(screen.queryByText('Private Workspace Orion: worker deletion failed')).toBeNull();
-    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText("Page content")).toBeTruthy();
+    expect(
+      screen.queryByText("Private Workspace Orion: worker deletion failed"),
+    ).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
   },
 );
 
-test('Workspace shell continues displaying Workspace action notifications', () => {
-  pushWorkspaceAlert('error', 'Worker deletion failed');
+test("Workspace shell continues displaying Workspace action notifications", () => {
+  pushWorkspaceAlert("error", "Worker deletion failed");
   render(Layout, { props });
-  expect(screen.getByRole('alert').textContent).toContain('Worker deletion failed');
+  expect(screen.getByRole("alert").textContent).toContain(
+    "Worker deletion failed",
+  );
 });
 
 test("Workspace catalog failure uses the shared alert without rendering diagnostics in the sidebar", async () => {
@@ -65,7 +110,10 @@ test("Workspace catalog failure uses the shared alert without rendering diagnost
     props: {
       ...props,
       data: {
-        deferredCatalog: settle({ accessibleWorkspaces: [], workspaceCatalogError: "Workspace catalog request failed" }),
+        deferredCatalog: settle({
+          accessibleWorkspaces: [],
+          workspaceCatalogError: "Workspace catalog request failed",
+        }),
       },
     },
   });
@@ -78,10 +126,16 @@ test("Workspace catalog failure uses the shared alert without rendering diagnost
 
 test("unpinning changes mode, and pointer departure closes the preview", async () => {
   render(Layout, { props });
-  expect(screen.getByRole("button", { name: "Unpin sidebar" }).getAttribute("aria-pressed")).toBe("true");
+  expect(
+    screen.getByRole("button", { name: "Unpin sidebar" }).getAttribute(
+      "aria-pressed",
+    ),
+  ).toBe("true");
   await enter();
   screen.getByRole("button", { name: "Unpin sidebar" }).focus();
-  await fireEvent.click(screen.getByRole("button", { name: "Unpin sidebar" }), { detail: 1 });
+  await fireEvent.click(screen.getByRole("button", { name: "Unpin sidebar" }), {
+    detail: 1,
+  });
   expect(localStorage.getItem(storageKey)).toBe("hover");
   expect(folded()).toBe(false);
   await leave();
@@ -107,7 +161,9 @@ test("footer pointer clicks release previous sidebar link focus before unpinning
   render(Layout, { props });
   frame().querySelector<HTMLAnchorElement>("a")!.focus();
   await tick();
-  await fireEvent.click(screen.getByRole("button", { name: "Unpin sidebar" }), { detail: 1 });
+  await fireEvent.click(screen.getByRole("button", { name: "Unpin sidebar" }), {
+    detail: 1,
+  });
   expect(folded()).toBe(true);
 });
 
@@ -121,12 +177,15 @@ test("keyboard mode switching preserves the focused preview", async () => {
   expect(folded()).toBe(false);
 });
 
-test.each(["pinned", "hover"])("restores %s mode without persisting a transient open state", (mode) => {
-  localStorage.setItem(storageKey, mode);
-  render(Layout, { props });
-  expect(folded()).toBe(mode === "hover");
-  expect(localStorage.getItem(storageKey)).toBe(mode);
-});
+test.each(["pinned", "hover"])(
+  "restores %s mode without persisting a transient open state",
+  (mode) => {
+    localStorage.setItem(storageKey, mode);
+    render(Layout, { props });
+    expect(folded()).toBe(mode === "hover");
+    expect(localStorage.getItem(storageKey)).toBe(mode);
+  },
+);
 
 test.each([true, false])("migrates legacy folded=%s to a mode", (value) => {
   localStorage.setItem(legacyKey, String(value));
@@ -171,7 +230,8 @@ test("footer hover does not open or hold the preview, but its button still chang
   render(Layout, { props });
   const footer = frame().querySelector<HTMLElement>(".sidebar-control-row")!;
   const button = screen.getByRole("button", { name: "Pin sidebar" });
-  expect(button.querySelector('[data-icon="panel-right-open"] rect')).not.toBeNull();
+  expect(button.querySelector('[data-icon="panel-right-open"] rect')).not
+    .toBeNull();
   await fireEvent.pointerEnter(footer, { pointerType: "mouse" });
   await fireEvent.pointerEnter(button, { pointerType: "mouse" });
   await delay();
@@ -184,7 +244,8 @@ test("footer hover does not open or hold the preview, but its button still chang
   expect(folded()).toBe(true);
   await fireEvent.click(button, { detail: 1 });
   expect(folded()).toBe(false);
-  expect(button.querySelector('[data-icon="panel-right-close"] rect')).not.toBeNull();
+  expect(button.querySelector('[data-icon="panel-right-close"] rect')).not
+    .toBeNull();
 });
 
 test("keyboard focus opens the preview and holds it until focus leaves", async () => {
@@ -206,7 +267,9 @@ test("pinning a preview keeps it open after pointer and focus leave", async () =
   localStorage.setItem(storageKey, "hover");
   render(Layout, { props });
   await enter();
-  await fireEvent.click(screen.getByRole("button", { name: "Pin sidebar" }), { detail: 1 });
+  await fireEvent.click(screen.getByRole("button", { name: "Pin sidebar" }), {
+    detail: 1,
+  });
   await leave();
   await delay();
   expect(folded()).toBe(false);
@@ -214,7 +277,10 @@ test("pinning a preview keeps it open after pointer and focus leave", async () =
 });
 
 test("mode survives logout and remount, but an open preview does not", async () => {
-  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ status: "logged_out" })));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => Response.json({ status: "logged_out" })),
+  );
   localStorage.setItem(storageKey, "hover");
   const view = render(Layout, { props });
   await enter();
@@ -229,7 +295,9 @@ test("touch does not hover; mobile header opens temporarily without changing mod
   const matchMedia = window.matchMedia.bind(window);
   vi.spyOn(window, "matchMedia").mockImplementation((query) => {
     const result = matchMedia(query);
-    Object.defineProperty(result, "matches", { value: query === "(max-width: 760px)" });
+    Object.defineProperty(result, "matches", {
+      value: query === "(max-width: 760px)",
+    });
     return result;
   });
   localStorage.setItem(storageKey, "hover");
@@ -255,7 +323,9 @@ test("invalid storage falls back to pinned", () => {
 });
 
 test("unavailable storage does not prevent mode switching", async () => {
-  vi.spyOn(window, "localStorage", "get").mockImplementation(() => { throw new DOMException("Blocked", "SecurityError"); });
+  vi.spyOn(window, "localStorage", "get").mockImplementation(() => {
+    throw new DOMException("Blocked", "SecurityError");
+  });
   render(Layout, { props });
   await fireEvent.click(screen.getByRole("button", { name: "Unpin sidebar" }));
   await delay();
@@ -266,7 +336,9 @@ test("unavailable storage does not prevent mode switching", async () => {
 
 test("full storage still restores the mode and allows changes", async () => {
   localStorage.setItem(storageKey, "hover");
-  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new DOMException("Full", "QuotaExceededError"); });
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    throw new DOMException("Full", "QuotaExceededError");
+  });
   render(Layout, { props });
   await fireEvent.click(screen.getByRole("button", { name: "Pin sidebar" }));
   expect(folded()).toBe(false);

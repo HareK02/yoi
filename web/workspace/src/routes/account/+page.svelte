@@ -9,9 +9,6 @@
   const auth = new BrowserAuth();
   async function refresh() {
     await auth.refresh();
-    if (auth.session.kind === 'ready' && !auth.actor) {
-      await goto(loginUrl('/account'), { replaceState: true });
-    }
   }
   async function add() {
     if (!auth.actor) return;
@@ -19,10 +16,10 @@
   }
   async function signOut() {
     if (!auth.actor) return;
-    const confirmed = await auth.run('Logging out…', 'Logged out.', logout);
-    if (confirmed && !auth.actor) await goto(loginUrl('/account'), { replaceState: true });
+    const confirmed = await auth.run('Logging out…', 'Logged out.', logout, 'logout');
+    if (confirmed && !auth.actor) await goto('/', { replaceState: true });
   }
-  onMount(() => { void refresh(); return () => auth.dispose(); });
+  onMount(() => { void auth.ensure(); return () => auth.dispose(); });
 </script>
 
 <svelte:head><title>Account · Yoi</title></svelte:head>

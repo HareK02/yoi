@@ -183,6 +183,7 @@ impl RealDriveFixture {
                     workdir_attachments: vec![],
                     feature_connections: Default::default(),
                     control_operation_id: None,
+                    execution_grant: None,
                 }),
             )
             .await

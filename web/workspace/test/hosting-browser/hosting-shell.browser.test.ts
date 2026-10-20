@@ -189,12 +189,14 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
             await page.goto(
               `http://127.0.0.1:15379/hosting/settings?fixture=${mode}`,
             );
-            await page.getByText(
-              mode === "ordinary"
-                ? "Hosting administrator access is required."
-                : "Sign in with a hosting administrator account to view these settings.",
-              { exact: true },
-            ).waitFor();
+            if (mode === "anonymous") {
+              await page.waitForURL("http://127.0.0.1:15379/");
+              await page.getByRole("heading", { name: "Yoi", exact: true })
+                .waitFor();
+            } else {await page.getByText(
+                "Hosting administrator access is required.",
+                { exact: true },
+              ).waitFor();}
             assertEquals(await edit.count(), 0);
             assertEquals(await checkbox.count(), 0);
             assertEquals(
@@ -285,16 +287,19 @@ Deno.test("hosting UI keyboard navigation, policy editing, denial and unknown sa
             await page.locator(ready).waitFor();
             await noOverflow(page);
           }
-          // Navigation may also cancel the shell's concurrent identity/access
-          // reads. Only an explicit browser cancellation of these reads is expected.
+          // 遷移でidentity/settingsの読み取りや遅延font取得がbrowserに取消されることはある。
+          // 通信失敗一般を許すのではなく、これらの明示的な取消だけを区別する。
           assert(
             failedRequests.every(({ url, error }) =>
-              error === "net::ERR_ABORTED" && [
+              error === "net::ERR_ABORTED" && ([
                 "/api/hosting/settings",
                 "/api/auth/registration-policy",
                 "/api/auth/whoami",
                 "/api/hosting/access",
-              ].some((path) => url.endsWith(path))
+              ].some((path) => url.endsWith(path)) ||
+                /^\/_app\/immutable\/assets\/[^/]+\.woff2$/.test(
+                  new URL(url).pathname,
+                ))
             ),
             JSON.stringify(failedRequests),
           );

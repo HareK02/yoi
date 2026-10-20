@@ -1299,6 +1299,14 @@ pub type OperationResult<T> = std::result::Result<T, OperationError>;
 
 pub fn subjektiv_store_error(error: crate::SubjektivError) -> OperationError {
     match error {
+        crate::SubjektivError::AuthorizationDenied(reason) => {
+            OperationError::PermissionDenied(reason)
+        }
+        crate::SubjektivError::SubjectPermissionsConflict(_)
+        | crate::SubjektivError::PermissionOperationConflict(_)
+        | crate::SubjektivError::WorkerExecutionGrantConflict(_) => {
+            OperationError::Conflict(error.to_string())
+        }
         crate::SubjektivError::SubjectScopeMismatch { .. } => {
             OperationError::PermissionDenied(format!("subject_scope_mismatch: {error}"))
         }

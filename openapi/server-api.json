@@ -443,6 +443,56 @@
         "additionalProperties": false,
         "type": "object"
       },
+      "BrowserSessionState": {
+        "description": "Browser navigation evidence, not an authorization grant or a generic 401 classification.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "anonymous",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "expires_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "const": "authenticated",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "expired",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "BrowserTicketState": {
         "enum": [
           "open",
@@ -1589,6 +1639,18 @@
           "display_name": {
             "type": "string"
           },
+          "execution_grant": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerDelegationRequest"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Requested least-authority child permissions. Host derives the origin; this\ninput cannot assert Subject identity or create a body/singleton attachment."
+          },
           "feature_connections": {
             "$ref": "#/components/schemas/WorkspaceWorkerFeatureConnectionsRequest",
             "description": "Explicit product Feature connections. Backend validation turns these into\ntrusted host attachments; Runtime and Profile inputs cannot self-attest them."
@@ -1950,6 +2012,19 @@
           "outcome_unknown"
         ],
         "type": "string"
+      },
+      "DriveCapabilities": {
+        "additionalProperties": false,
+        "description": "Current caller's advisory publication ceiling, never a grant or execution credential.",
+        "properties": {
+          "write": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "write"
+        ],
+        "type": "object"
       },
       "DriveDownloadQuery": {
         "additionalProperties": false,
@@ -6817,6 +6892,86 @@
         ],
         "type": "object"
       },
+      "PermissionResource": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "feature",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "workspace",
+                "type": "string"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "workdir",
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "recursive": {
+                "type": "boolean"
+              },
+              "working_directory_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "working_directory_id",
+              "path",
+              "recursive"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "worker",
+                "type": "string"
+              },
+              "runtime_id": {
+                "type": "string"
+              },
+              "worker_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "runtime_id",
+              "worker_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ProfileSettingsResponse": {
         "additionalProperties": false,
         "description": "Read-only Profile catalog projected from one active Workspace config tree.",
@@ -9514,6 +9669,22 @@
         ],
         "type": "object"
       },
+      "ScopedPermission": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string"
+          },
+          "resource": {
+            "$ref": "#/components/schemas/PermissionResource"
+          }
+        },
+        "required": [
+          "operation",
+          "resource"
+        ],
+        "type": "object"
+      },
       "Segment": {
         "oneOf": [
           {
@@ -10159,6 +10330,131 @@
         "required": [
           "id",
           "kind"
+        ],
+        "type": "object"
+      },
+      "SubjectPermissionInterruption": {
+        "additionalProperties": false,
+        "properties": {
+          "backend_command_sessions_closed": {
+            "type": "boolean"
+          },
+          "cancellation_accepted": {
+            "type": "boolean"
+          },
+          "diagnostics": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "worker_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "runtime_id",
+          "worker_id",
+          "cancellation_accepted",
+          "backend_command_sessions_closed",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
+      "SubjectPermissions": {
+        "additionalProperties": false,
+        "properties": {
+          "change_id": {
+            "type": "string"
+          },
+          "delegation": {
+            "items": {
+              "$ref": "#/components/schemas/ScopedPermission"
+            },
+            "type": "array"
+          },
+          "execution": {
+            "items": {
+              "$ref": "#/components/schemas/ScopedPermission"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "change_id",
+          "execution",
+          "delegation"
+        ],
+        "type": "object"
+      },
+      "SubjectPermissionsMutationResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "interruptions": {
+            "description": "New operations are already fenced. These are cancellation requests and\nBackend command cleanup evidence, not proof that a Runtime turn stopped.",
+            "items": {
+              "$ref": "#/components/schemas/SubjectPermissionInterruption"
+            },
+            "type": "array"
+          },
+          "permissions": {
+            "$ref": "#/components/schemas/SubjectPermissions"
+          }
+        },
+        "required": [
+          "permissions",
+          "interruptions"
+        ],
+        "type": "object"
+      },
+      "SubjectPermissionsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "permissions": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SubjectPermissions"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "SubjectPermissionsUpdate": {
+        "additionalProperties": false,
+        "properties": {
+          "delegation": {
+            "items": {
+              "$ref": "#/components/schemas/ScopedPermission"
+            },
+            "type": "array"
+          },
+          "execution": {
+            "items": {
+              "$ref": "#/components/schemas/ScopedPermission"
+            },
+            "type": "array"
+          },
+          "expected_change_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "execution",
+          "delegation"
         ],
         "type": "object"
       },
@@ -14846,8 +15142,14 @@
                 "type": "null"
               }
             ]
+          },
+          "session": {
+            "$ref": "#/components/schemas/BrowserSessionState"
           }
         },
+        "required": [
+          "session"
+        ],
         "type": "object"
       },
       "WorkerBusyState": {
@@ -14885,6 +15187,28 @@
             "type": "object"
           }
         ]
+      },
+      "WorkerDelegationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/ScopedPermission"
+            },
+            "type": "array"
+          },
+          "redelegation": {
+            "items": {
+              "$ref": "#/components/schemas/ScopedPermission"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "permissions",
+          "redelegation"
+        ],
+        "type": "object"
       },
       "WorkerFileDeleteResponse": {
         "additionalProperties": false,
@@ -17831,7 +18155,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:4e01d7dd0dab015ba3204045da33d7b87c9edc166b7dad464a8ab0d61e0f0e6d"
+    "x-yoi-source-digest": "sha256:5de3f3b716555717d3274b8c6a385fb66624585941628a53b8b3050cb58f8ab7"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -22212,6 +22536,113 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/drive/capabilities": {
+      "get": {
+        "operationId": "drive_capabilities",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveCapabilities"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveApiError"
                 }
               }
             },
@@ -34850,6 +35281,218 @@
             "description": "Error response"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/permissions": {
+      "get": {
+        "operationId": "subjektiv_subject_permissions_get",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "subject_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjectPermissionsResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "subjektiv_subject_permissions_set",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "subject_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubjectPermissionsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjectPermissionsMutationResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
             "content": {
               "application/json": {
                 "schema": {

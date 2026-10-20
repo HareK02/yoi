@@ -1052,6 +1052,116 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
         self.execute(request)
     }
 
+    /// Ask the Host using this client's authenticated source, never a model-supplied
+    /// identity. Trusted Features call this before protected effects on every surface.
+    /// This is not a universal Tool executor: a missing call is a Feature bug, and
+    /// operations not yet adapted to this seam retain only their existing checks.
+    fn authorize_operation(
+        &self,
+        operation: &str,
+        resource: &server_api::authorization::PermissionResource,
+    ) -> Result<(), WorkspaceClientError> {
+        self.authorize_operation_scope(operation, resource)
+            .map(|_| ())
+    }
+
+    /// Return the Host-selected matching scope for provider-resolved containment.
+    /// `None` is only the Host's explicit legacy decision, never a transport fallback.
+    fn authorize_operation_scope(
+        &self,
+        operation: &str,
+        resource: &server_api::authorization::PermissionResource,
+    ) -> Result<Option<server_api::authorization::PermissionResource>, WorkspaceClientError> {
+        use server_api::authorization::{
+            OperationAuthorizationRequest, OperationAuthorizationResponse, ScopedPermission,
+        };
+        if !self.is_available() {
+            return Err(WorkspaceClientError::Unavailable(
+                "operation authorization requires a Host-bound Workspace client".into(),
+            ));
+        }
+        let workspace_id = self
+            .workspace_id()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                WorkspaceClientError::Unavailable(
+                    "operation authorization requires Workspace identity".into(),
+                )
+            })?;
+        ScopedPermission {
+            operation: operation.into(),
+            resource: resource.clone(),
+        }
+        .validate()
+        .map_err(WorkspaceClientError::Request)?;
+        let request = workspace_server_json_request(
+            format!(
+                "/api/w/{}/authorization/check",
+                encode_workspace_path_segment(workspace_id)
+            ),
+            &OperationAuthorizationRequest {
+                operation: operation.into(),
+                resource: resource.clone(),
+            },
+        )?;
+        // Blocking transports must not run inside a Tokio runtime. The bound
+        // transport enforces this timeout; no authorization success is cached.
+        let execute = || self.execute_with_timeout(request, Duration::from_secs(10));
+        let response = if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::scope(|scope| scope.spawn(execute).join()).map_err(|_| {
+                WorkspaceClientError::Request("authorization request thread panicked".into())
+            })??
+        } else {
+            execute()?
+        };
+        if response.body.len() > 16 * 1024 {
+            return Err(WorkspaceClientError::Request(
+                "authorization response exceeded 16 KiB".into(),
+            ));
+        }
+        if !response.is_success() {
+            // Expose only the bounded public reason, not provider diagnostics or
+            // arbitrary response data. Keep status parseable by Feature adapters.
+            let value: serde_json::Value = serde_json::from_str(&response.body).unwrap_or_default();
+            let reason: String = value
+                .get("message")
+                .or_else(|| value.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Host rejected authorization")
+                .chars()
+                .take(1024)
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            return Err(WorkspaceClientError::Request(format!(
+                "authorization denied for {operation}: HTTP status {}: {reason}",
+                response.status
+            )));
+        }
+        let authorization = serde_json::from_str::<OperationAuthorizationResponse>(&response.body)
+            .map_err(|error| {
+                WorkspaceClientError::Request(format!("invalid authorization response: {error}"))
+            })?;
+        if authorization
+            .scope
+            .as_ref()
+            .is_some_and(|scope| !scope.covers(resource))
+        {
+            return Err(WorkspaceClientError::Request(
+                "Host authorization scope does not cover requested resource".into(),
+            ));
+        }
+        Ok(authorization.scope)
+    }
+
+    /// Activation is separate from operation authority. Only explicit standalone
+    /// contexts with no Workspace binding retain legacy activation without a Host.
+    fn authorize_feature_activation(&self, feature: &str) -> Result<(), WorkspaceClientError> {
+        self.authorize_operation(
+            feature,
+            &server_api::authorization::PermissionResource::Feature,
+        )
+    }
+
     /// Binary transport is unavailable unless a host-bound implementation opts in.
     fn execute_binary(
         &self,
@@ -1168,6 +1278,28 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
         &self,
     ) -> Result<Option<WorkspacePromptCatalogResolution>, WorkspaceClientError> {
         self.inner.current_prompt_projection()
+    }
+
+    fn authorize_operation(
+        &self,
+        operation: &str,
+        resource: &server_api::authorization::PermissionResource,
+    ) -> Result<(), WorkspaceClientError> {
+        // The query has no protected effect. Keep the review capability's
+        // mutation filter intact while asking the bound Host for live authority.
+        self.inner.authorize_operation(operation, resource)
+    }
+
+    fn authorize_operation_scope(
+        &self,
+        operation: &str,
+        resource: &server_api::authorization::PermissionResource,
+    ) -> Result<Option<server_api::authorization::PermissionResource>, WorkspaceClientError> {
+        self.inner.authorize_operation_scope(operation, resource)
+    }
+
+    fn authorize_feature_activation(&self, feature: &str) -> Result<(), WorkspaceClientError> {
+        self.inner.authorize_feature_activation(feature)
     }
 
     fn execute_binary(
@@ -1322,6 +1454,7 @@ struct MarkerWorkspaceClient {
     workspace_id: Option<String>,
     kind: String,
     available: bool,
+    legacy_local_activation: bool,
     reason: String,
 }
 
@@ -1338,11 +1471,213 @@ impl WorkspaceClient for MarkerWorkspaceClient {
         self.available
     }
 
+    fn authorize_feature_activation(&self, feature: &str) -> Result<(), WorkspaceClientError> {
+        // Explicit compatibility for standalone Workers with no Workspace binding.
+        // A missing/broken Workspace client must never become an implicit grant.
+        if self.workspace_id.is_none() && self.legacy_local_activation {
+            return Ok(());
+        }
+        self.authorize_operation(
+            feature,
+            &server_api::authorization::PermissionResource::Feature,
+        )
+    }
+
     fn execute(
         &self,
         _request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         Err(WorkspaceClientError::Unavailable(self.reason.clone()))
+    }
+}
+
+#[cfg(test)]
+mod operation_authorization_tests {
+    use super::*;
+    use server_api::authorization::PermissionResource;
+
+    #[derive(Debug)]
+    struct BoundClient {
+        response: Mutex<WorkspaceResponse>,
+        requests: Mutex<Vec<WorkspaceRequest>>,
+    }
+
+    impl WorkspaceClient for BoundClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace/test")
+        }
+        fn kind(&self) -> &str {
+            "bound-authorization-fixture"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn execute(&self, _: WorkspaceRequest) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            panic!("authorization must select the bounded transport")
+        }
+        fn execute_with_timeout(
+            &self,
+            request: WorkspaceRequest,
+            timeout: Duration,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            assert_eq!(timeout, Duration::from_secs(10));
+            self.requests.lock().unwrap().push(request);
+            Ok(self.response.lock().unwrap().clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_is_bounded_live_and_contains_no_caller_identity() {
+        let client = BoundClient {
+            response: Mutex::new(WorkspaceResponse {
+                status: 200,
+                body: "{}".into(),
+            }),
+            requests: Default::default(),
+        };
+        let resource = PermissionResource::Workspace {
+            workspace_id: "workspace/test".into(),
+        };
+        client
+            .authorize_operation("ticket.create", &resource)
+            .unwrap();
+        *client.response.lock().unwrap() = WorkspaceResponse {
+            status: 403,
+            body: r#"{"message":"permission revoked","diagnostics":[{"message":"private"}]}"#
+                .into(),
+        };
+        let reason = client
+            .authorize_operation("ticket.create", &resource)
+            .unwrap_err()
+            .to_string();
+        assert!(reason.contains("HTTP status 403"));
+        assert!(reason.contains("permission revoked"));
+        assert!(!reason.contains("private"));
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "success must not become a cached grant");
+        for request in requests.iter() {
+            assert_eq!(request.method, WorkspaceRequestMethod::Post);
+            assert_eq!(request.path, "/api/w/workspace%2Ftest/authorization/check");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(request.body.as_deref().unwrap())
+                    .unwrap(),
+                serde_json::json!({ "operation":"ticket.create", "resource":{"kind":"workspace", "workspace_id":"workspace/test"} })
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_authorization_preserves_matching_scope_and_rejects_cross_resource() {
+        let resource = PermissionResource::Workdir {
+            working_directory_id: "wd-1".into(),
+            path: "docs/file.md".into(),
+            recursive: false,
+        };
+        let granted = PermissionResource::Workdir {
+            working_directory_id: "wd-1".into(),
+            path: "docs".into(),
+            recursive: true,
+        };
+        let client = BoundClient {
+            response: Mutex::new(WorkspaceResponse {
+                status: 200,
+                body: serde_json::json!({"scope":granted}).to_string(),
+            }),
+            requests: Default::default(),
+        };
+        assert_eq!(
+            client
+                .authorize_operation_scope("filesystem.read", &resource)
+                .unwrap(),
+            Some(granted)
+        );
+        *client.response.lock().unwrap() = WorkspaceResponse {
+            status: 200,
+            body: serde_json::json!({"scope":{"kind":"workspace","workspace_id":"workspace/test"}})
+                .to_string(),
+        };
+        assert!(
+            client
+                .authorize_operation_scope("filesystem.read", &resource)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reviewer_query_preserves_host_scope_and_does_not_widen_mutation_access() {
+        let scope = PermissionResource::Workdir {
+            working_directory_id: "wd-1".into(),
+            path: "docs".into(),
+            recursive: true,
+        };
+        let inner = Arc::new(BoundClient {
+            response: Mutex::new(WorkspaceResponse {
+                status: 200,
+                body: serde_json::json!({"scope":scope}).to_string(),
+            }),
+            requests: Default::default(),
+        });
+        let reviewer = ReviewerChildWorkspaceClient::new(
+            inner.clone(),
+            ReviewerContext {
+                ticket_id: "T-1".into(),
+                merge_request_id: "MR-1".into(),
+            },
+            "capability".into(),
+        );
+        let requested = PermissionResource::Workdir {
+            working_directory_id: "wd-1".into(),
+            path: "docs/file.md".into(),
+            recursive: false,
+        };
+        assert_eq!(
+            reviewer
+                .authorize_operation_scope("filesystem.read", &requested)
+                .unwrap(),
+            Some(scope)
+        );
+        assert!(
+            reviewer
+                .execute(WorkspaceRequest::json(
+                    WorkspaceRequestMethod::Post,
+                    "/api/w/workspace%2Ftest/tickets",
+                    "{}"
+                ))
+                .is_err()
+        );
+        assert_eq!(
+            inner.requests.lock().unwrap().len(),
+            1,
+            "only the bounded authorization query reaches the Host"
+        );
+        *inner.response.lock().unwrap() = WorkspaceResponse {
+            status: 403,
+            body: "{}".into(),
+        };
+        assert!(
+            reviewer
+                .authorize_operation_scope("filesystem.read", &requested)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_and_oversized_authorization_responses_fail_closed() {
+        for body in [
+            "not-json".into(),
+            "{\"unexpected_grant\":true}".into(),
+            " ".repeat(16 * 1024 + 1),
+        ] {
+            let client = BoundClient {
+                response: Mutex::new(WorkspaceResponse { status: 200, body }),
+                requests: Default::default(),
+            };
+            assert!(
+                client
+                    .authorize_operation("ticket", &PermissionResource::Feature)
+                    .is_err()
+            );
+        }
     }
 }
 
@@ -1587,6 +1922,7 @@ pub fn unavailable_workspace_client(
         workspace_id: workspace_id.map(|id| id.as_str().to_string()),
         kind: "unavailable".to_string(),
         available: false,
+        legacy_local_activation: workspace_id.is_none(),
         reason: reason.into(),
     })
 }
@@ -1601,6 +1937,7 @@ pub fn marker_workspace_client(
         reason: format!("workspace client kind `{kind}` does not expose Workspace operations"),
         kind,
         available: true,
+        legacy_local_activation: false,
     })
 }
 
@@ -1649,7 +1986,15 @@ impl WorkerWorkspaceContext {
     }
 
     pub fn local_filesystem(workspace_id: Option<WorkspaceId>) -> Self {
-        let client = marker_workspace_client(workspace_id.as_ref(), "local-filesystem");
+        // This constructor explicitly selects legacy standalone activation only
+        // without Workspace identity; it never authorizes protected operations.
+        let client = Arc::new(MarkerWorkspaceClient {
+            workspace_id: workspace_id.as_ref().map(|id| id.as_str().to_string()),
+            kind: "local-filesystem".into(),
+            available: true,
+            legacy_local_activation: workspace_id.is_none(),
+            reason: "local filesystem context does not expose Workspace operations".into(),
+        });
         Self {
             workspace_id,
             client,
@@ -1676,41 +2021,10 @@ pub struct SegmentLocation {
     pub segment_id: SegmentId,
 }
 
-type WorkerMetadataWriter =
-    Arc<dyn Fn(WorkerMetadata) -> Result<(), WorkerStoreError> + Send + Sync>;
-type WorkerMetadataSegmentCas = Arc<
-    dyn Fn(&str, &WorkerActiveSegmentRef, WorkerActiveSegmentRef) -> Result<bool, WorkerStoreError>
-        + Send
-        + Sync,
->;
-
-fn worker_metadata_writer_for_store<St>(store: &St) -> WorkerMetadataWriter
-where
-    St: WorkerMetadataStore + Clone + Send + Sync + 'static,
-{
-    let store = store.clone();
-    Arc::new(move |metadata| {
-        store
-            .set_active_with_workspace_context(
-                &metadata.worker_name,
-                metadata.active,
-                metadata.resolved_manifest_snapshot,
-                metadata.workspace_id,
-                metadata.workspace_root,
-            )
-            .map(|_| ())
-    })
-}
-
-fn worker_metadata_segment_cas_for_store<St>(store: &St) -> WorkerMetadataSegmentCas
-where
-    St: WorkerMetadataStore + Clone + Send + Sync + 'static,
-{
-    let store = store.clone();
-    Arc::new(move |worker_name, expected, replacement| {
-        store.compare_and_swap_active(worker_name, expected, replacement)
-    })
-}
+use crate::metadata_lifecycle::{
+    WorkerMetadataSegmentCas, WorkerMetadataWriter, worker_metadata_segment_cas_for_store,
+    worker_metadata_writer_for_store,
+};
 
 /// Lock-free shared session/segment pointer.
 ///
@@ -2734,21 +3048,54 @@ pub trait SystemItemCommitter: Send + Sync {
         extensions: Vec<SessionExtension>,
         history_provenance: Option<WorkerHistoryProvenance>,
     ) -> Result<HistoryEntry<SessionHistoryMetadata>, StoreError> {
+        self.commit_system_item_with_extensions_then(
+            item,
+            extensions,
+            history_provenance,
+            &mut |_| {},
+        )
+    }
+
+    /// Notify after durable append through the writer's publication boundary.
+    /// Completion is a storage fact, not a grant of continuing Feature authority;
+    /// producers must separately fence their representation lifetime.
+    fn commit_system_item_with_extensions_then(
+        &self,
+        item: SystemItem,
+        extensions: Vec<SessionExtension>,
+        history_provenance: Option<WorkerHistoryProvenance>,
+        after_commit: &mut dyn FnMut(&HistoryEntry<SessionHistoryMetadata>),
+    ) -> Result<HistoryEntry<SessionHistoryMetadata>, StoreError> {
         let metadata = new_history_metadata(
             history_provenance
                 .unwrap_or(WorkerHistoryProvenance::BackendInstruction { operation_id: None }),
             None,
         );
-        let history_item = item.to_history_item();
-        self.commit_log_entry(LogEntry::AnnotatedSystemItem {
-            ts: segment_log::now_millis(),
-            entry: session_store::LoggedSystemHistoryEntry {
-                item,
-                metadata: metadata.clone(),
-            },
+        self.commit_annotated_system_item_then(
+            session_store::LoggedSystemHistoryEntry { item, metadata },
             extensions,
-        })?;
-        Ok(HistoryEntry::new(history_item, metadata))
+            after_commit,
+        )
+    }
+
+    fn commit_annotated_system_item_then(
+        &self,
+        entry: session_store::LoggedSystemHistoryEntry,
+        extensions: Vec<SessionExtension>,
+        after_commit: &mut dyn FnMut(&HistoryEntry<SessionHistoryMetadata>),
+    ) -> Result<HistoryEntry<SessionHistoryMetadata>, StoreError> {
+        entry.validate_input_metadata()?;
+        let history = HistoryEntry::new(entry.item.to_history_item(), entry.metadata.clone());
+        self.commit_usage_boundary(
+            LogEntry::AnnotatedSystemItem {
+                ts: segment_log::now_millis(),
+                entry,
+                extensions,
+            },
+            &mut || after_commit(&history),
+            &[],
+        )?;
+        Ok(history)
     }
 }
 
@@ -2905,6 +3252,8 @@ impl WorkerSession {
     }
 }
 
+pub(crate) type PromptContributionCompletion = Box<dyn FnOnce() + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SystemPromptContribution {
     Ready(String),
@@ -2915,30 +3264,53 @@ pub(crate) enum SystemPromptContribution {
 pub(crate) struct ResidentContextRefresh {
     pub body: String,
     pub behavior_md: String,
+    pub prompt_provenance: Option<session_store::PromptRenderProvenance>,
 }
 
-/// Initial-only System messages and Feature-owned metadata. Core persists and
-/// replays each pair unchanged; it does not infer provenance from the payload.
-/// Prepared with the head, never at restore/request hooks.
+/// Feature-owned System context at explicit creation and compaction boundaries.
+/// Core persists and replays each pair unchanged; normal restore never reloads it.
 #[async_trait::async_trait]
-pub(crate) trait InitialContextSource: Send + Sync {
+pub(crate) trait SessionContextSource: Send + Sync {
     async fn load(&self) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String>;
+
+    async fn load_compaction_context(
+        &self,
+        _session: SessionId,
+    ) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait::async_trait]
 pub(crate) trait SystemPromptContributionSource: Send + Sync {
     async fn load(&self) -> SystemPromptContribution;
 
-    /// Returns a durable model-visible refresh only when user-managed resident
-    /// context changed since the last successful load.
+    /// Prepare an initial contribution with an optional source-bound completion.
+    /// Completion runs only after its exact prompt and active pointer commit,
+    /// under the publication/release fence. It must perform bounded local updates
+    /// only; no I/O, store reentry, or authority grants. Restore never replays it.
+    async fn load_initial(
+        &self,
+    ) -> (
+        SystemPromptContribution,
+        Option<PromptContributionCompletion>,
+    ) {
+        (self.load().await, None)
+    }
+
+    /// Returns a model-visible refresh only when user-managed resident context
+    /// changed since its last committed representation.
     async fn load_changed_resident_context(
         &self,
     ) -> Result<Option<ResidentContextRefresh>, String> {
         Ok(None)
     }
 
-    /// Acknowledges the exact behavior represented by a durably committed refresh.
-    fn confirm_resident_context_behavior(&self, _behavior_md: &str) {}
+    /// Reports a live durable system-input commit to its producer. Interpretation
+    /// belongs to the Feature; restoration never invokes this notification.
+    /// Runs under the publication barrier: only bounded local state updates are
+    /// allowed, without Host I/O or reentry into history mutation.
+    fn system_item_committed(&self, _item: &SystemItem, _metadata: &SessionHistoryMetadata) {}
 
     /// Invalidates the in-memory representation fence before history may be
     /// compacted or rewound.
@@ -3174,11 +3546,13 @@ pub struct Worker<C: LlmClient, St: Store> {
     inject_resident_summary: bool,
     /// Deferred resident prompt source installed by an enabled Feature.
     feature_resident_summary_source: Option<Arc<dyn SystemPromptContributionSource>>,
-    initial_context_source: Option<Arc<dyn InitialContextSource>>,
+    session_context_source: Option<Arc<dyn SessionContextSource>>,
     /// Exact complete seed retained across ambiguous Store responses. The committed
     /// segment remains authoritative; metadata must be repaired before accepting input.
     prepared_initial_seed: Option<Vec<LogEntry>>,
+    prepared_initial_prompt_completion: Option<(String, PromptContributionCompletion)>,
     subjektiv_host: Option<Arc<dyn crate::subjektiv::SubjektivHost>>,
+    feature_installation: crate::feature::FeatureInstallation,
     /// One-shot generic Feature lifecycle notification required after restore.
     restore_feature_lifecycle_pending: bool,
     /// Complete system prompt replacement installed by an enabled Feature.
@@ -3488,9 +3862,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
-            initial_context_source: None,
+            session_context_source: None,
             prepared_initial_seed: None,
+            prepared_initial_prompt_completion: None,
             subjektiv_host: None,
+            feature_installation: crate::feature::FeatureInstallation::Activate,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
@@ -3536,8 +3912,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.inject_resident_summary = enabled;
     }
 
-    pub(crate) fn install_initial_context_source(&mut self, source: Arc<dyn InitialContextSource>) {
-        self.initial_context_source = Some(source);
+    pub(crate) fn install_session_context_source(&mut self, source: Arc<dyn SessionContextSource>) {
+        self.session_context_source = Some(source);
     }
 
     pub(crate) fn install_system_prompt_contribution(
@@ -3545,6 +3921,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         resident_summary_source: Option<Arc<dyn SystemPromptContributionSource>>,
         system_prompt_override: Option<String>,
     ) {
+        self.prepared_initial_prompt_completion = None;
         self.feature_resident_summary_source = resident_summary_source;
         self.feature_system_prompt_override = system_prompt_override;
     }
@@ -3713,10 +4090,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.workspace_context.client_handle()
     }
 
-    /// Bind a live capability before Feature installation. This is deliberately
-    /// separate from Workspace authority and is not inherited by SubWorkers.
-    pub fn bind_subjektiv_host(&mut self, host: Option<Arc<dyn crate::subjektiv::SubjektivHost>>) {
+    pub(crate) fn set_subjektiv_host(
+        &mut self,
+        host: Option<Arc<dyn crate::subjektiv::SubjektivHost>>,
+    ) {
         self.subjektiv_host = host;
+        self.session_context_source = None;
     }
 
     pub fn subjektiv_host_connection(
@@ -3784,26 +4163,13 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     {
         let activation = self.workspace_client().activate_skill(name)?;
         self.ensure_segment_head().await?;
-        let body = format!(
-            "Agent Skill `{}` activated from {}.\n\n{}",
-            activation.name, activation.provenance.id, activation.body
-        );
-        let skill_metadata = new_history_metadata(
-            WorkerHistoryProvenance::BackendInstruction { operation_id: None },
-            None,
-        );
+        let input = crate::skill::activation_input(&activation).map_err(StoreError::from)?;
+        let history_entry = HistoryEntry::new(input.item.to_history_item(), input.metadata.clone());
         self.commit_entry(LogEntry::AnnotatedSystemItem {
             ts: segment_log::now_millis(),
-            entry: session_store::LoggedSystemHistoryEntry {
-                item: SystemItem::SkillActivation {
-                    name: activation.name.clone(),
-                    body: body.clone(),
-                },
-                metadata: skill_metadata.clone(),
-            },
+            entry: input,
             extensions: Vec::new(),
         })?;
-        let history_entry = HistoryEntry::new(agen::Item::system_message(body), skill_metadata);
         let mut annotate = history_annotator(
             self.log_writer_handle(),
             vec![history_entry.clone()],
@@ -3944,12 +4310,32 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.feature_invocations.clone()
     }
 
+    pub(crate) fn authorize_feature_configuration(&self) -> Result<(), WorkspaceClientError> {
+        match self.feature_installation {
+            crate::feature::FeatureInstallation::Activate => {
+                crate::feature::authorize_requested_manifest(
+                    self.workspace_client_handle().as_ref(),
+                    self.manifest(),
+                )
+            }
+            crate::feature::FeatureInstallation::Restore => Ok(()),
+        }
+    }
+
     /// Install enabled feature modules into the Worker host surfaces.
     pub fn install_features(
         &mut self,
         registry: FeatureRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
         self.backend_job.get_or_init(|| None);
+        let client = self.workspace_client_handle();
+        let manifest = self.manifest().clone();
+        let registry = registry
+            .with_installation(self.feature_installation)
+            .with_activation_guard(move || {
+                crate::feature::authorize_requested_manifest(client.as_ref(), &manifest)
+                    .map_err(|error| error.to_string())
+            });
         let worker = self.engine.as_mut().expect("worker taken during run");
         let report = registry.install_into_engine(worker, &mut self.hook_builder);
         if report.has_errors() {
@@ -4681,18 +5067,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 .lock()
                 .expect("restore system-item queue poisoned"),
         );
-        for item in system_items {
-            let history_item = item.to_history_item();
-            let metadata = new_history_metadata(
-                WorkerHistoryProvenance::BackendInstruction { operation_id: None },
-                None,
-            );
+        for entry in system_items {
+            let history_item = entry.item.to_history_item();
+            let metadata = entry.metadata.clone();
             self.commit_entry(LogEntry::AnnotatedSystemItem {
                 ts: segment_log::now_millis(),
-                entry: session_store::LoggedSystemHistoryEntry {
-                    item,
-                    metadata: metadata.clone(),
-                },
+                entry,
                 extensions: Vec::new(),
             })?;
             let history_entry = HistoryEntry::new(history_item, metadata);
@@ -4754,16 +5134,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 }
             }
         }
+        let mut completion = None;
         let resident_summary = if self.inject_resident_summary {
             match &self.feature_resident_summary_source {
-                Some(source) => match source.load().await {
-                    SystemPromptContribution::Ready(summary) if !summary.is_empty() => {
-                        Some(summary)
+                Some(source) => {
+                    let (value, prepared) = source.load_initial().await;
+                    match value {
+                        SystemPromptContribution::Ready(summary) if !summary.is_empty() => {
+                            completion = prepared;
+                            Some(summary)
+                        }
+                        _ => None,
                     }
-                    SystemPromptContribution::Ready(_) | SystemPromptContribution::Unavailable => {
-                        None
-                    }
-                },
+                }
                 None => None,
             }
         } else {
@@ -4790,6 +5173,12 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let rendered = template
             .render(&ctx)
             .map_err(|source| WorkerError::SystemPromptRender { source })?;
+        self.prepared_initial_prompt_completion = completion.and_then(|complete| {
+            resident_summary
+                .as_ref()
+                .filter(|body| rendered.contains(body.as_str()))
+                .map(|_| (rendered.clone(), complete))
+        });
         self.engine
             .as_mut()
             .expect("worker present")
@@ -5455,17 +5844,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     .invocation_receipts
                     .push(InvocationReceipt::new(invocation, Some(result.clone())));
             }
-            let item = SystemItem::FeatureInvocationResult { result, body };
-            let metadata = new_history_metadata(
-                WorkerHistoryProvenance::BackendInstruction { operation_id: None },
-                None,
-            );
-            let history = HistoryEntry::new(item.to_history_item(), metadata.clone());
+            let input =
+                crate::feature::invocation::result_input(result, body).map_err(StoreError::from)?;
+            let history = HistoryEntry::new(input.item.to_history_item(), input.metadata.clone());
             handle
                 .writer
                 .append_entry_locked(LogEntry::AnnotatedSystemItem {
                     ts: segment_log::now_millis(),
-                    entry: session_store::LoggedSystemHistoryEntry { item, metadata },
+                    entry: input,
                     extensions: vec![pending_activation_extension(&completed)],
                 })?;
             *state = completed;
@@ -5969,7 +6355,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         } else {
             if self.prepared_initial_seed.is_none() {
                 self.ensure_system_prompt_materialized().await?;
-                let items = match &self.initial_context_source {
+                let items = match &self.session_context_source {
                     Some(source) => source.load().await.map_err(WorkerError::InvalidState)?,
                     None => Vec::new(),
                 };
@@ -6045,6 +6431,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.system_prompt_template = None;
         self.feature_system_prompt_override = None;
         self.prepared_initial_seed = None;
+        if let Some((prepared, complete)) = self.prepared_initial_prompt_completion.take() {
+            if system_prompt.as_ref() == Some(&prepared) {
+                complete();
+            }
+        }
         Ok(())
     }
 
@@ -7026,48 +7417,49 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
 
         // Freeze one Host-owned read before starting the compactor. Background recording
         // remains independent; never re-read when building the replacement segment.
-        let journal_context = crate::feature::builtin::journal::freeze_compaction_journal(
-            self.subjektiv_host_connection(),
-            &self.prompts.load_full(),
-        )
-        .map_err(WorkerError::PromptCatalog)?;
+        let frozen_context = match &self.session_context_source {
+            Some(source) => source
+                .load_compaction_context(self.session_id())
+                .await
+                .map_err(WorkerError::InvalidState)?,
+            None => Vec::new(),
+        };
+        for entry in &frozen_context {
+            entry
+                .validate_input_metadata()
+                .map_err(|e| WorkerError::InvalidState(e.to_string()))?;
+        }
         let history_entries = self.session.history().entries();
         let retain_from = cut.index.min(history_entries.len());
         let initial_summary = initial_compaction_summary(history_entries)?;
         // The old summary is consumed in full by the compaction service even when
         // the cut falls before it. The replacement summary supersedes it: retaining
         // it as well would duplicate inherited context on every compact.
-        let retained_history_entries = history_entries[retain_from..]
+        let mut retained_history_entries = history_entries[retain_from..]
             .iter()
             .filter(|entry| {
-                !matches!(
-                    entry.annotation.origin,
-                    WorkerHistoryProvenance::CompactionSummary
-                        | WorkerHistoryProvenance::JournalContext
-                )
+                crate::session_history::compaction_use(&entry.annotation)
+                    == session_store::InputCompactionUse::Retain
             })
             .cloned()
-            .collect::<Vec<_>>();
-        let mut retained_items = retained_history_entries
-            .iter()
-            .map(|entry| entry.item.clone())
             .collect::<Vec<_>>();
         let default_workdir_alias = (self.workdir_sessions.len() == 1)
             .then(|| self.workdir_sessions.aliases().into_iter().next())
             .flatten()
             .map(|alias| alias.as_str().to_string());
-        let retained_image_references =
-            project_compaction_attachments(&mut retained_items, default_workdir_alias.as_deref());
+        let retained_image_references = project_compaction_attachments(
+            retained_history_entries
+                .iter_mut()
+                .map(|entry| &mut entry.item),
+            default_workdir_alias.as_deref(),
+        );
         // The compactor explores summaries, text details, and ViewImage call arguments. It
         // never needs durable image bodies; relevant images are nominated with add_reference.
         let mut entries_to_summarise = history_entries[..retain_from]
             .iter()
             .filter(|entry| {
-                !matches!(
-                    entry.annotation.origin,
-                    WorkerHistoryProvenance::CompactionSummary
-                        | WorkerHistoryProvenance::JournalContext
-                )
+                crate::session_history::compaction_use(&entry.annotation)
+                    == session_store::InputCompactionUse::Retain
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -7154,24 +7546,29 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         // Journals. In particular, a failed/empty read must not silently lose context
         // that the previous summary intentionally delegated to its injected Journal.
         // Carry them only into the compactor, never alongside the new reference seed.
-        for entry in history_entries
-            .iter()
-            .filter(|entry| entry.annotation.origin == WorkerHistoryProvenance::JournalContext)
-        {
+        for entry in history_entries.iter().filter(|entry| {
+            crate::session_history::compaction_use(&entry.annotation)
+                == session_store::InputCompactionUse::ReferenceInput
+        }) {
             if let Some(body) = entry.item.as_text() {
                 summary_input.text.push_str(
-                    "\n\n## Previous Journal reference (historical, not automatically retained)\n",
+                    "\n\n## Previous reference input (historical, not automatically retained)\n",
                 );
                 summary_input.text.push_str(body);
                 summary_input
                     .text
-                    .push_str("\n## End previous Journal reference\n");
+                    .push_str("\n## End previous reference input\n");
             }
         }
         // Mandatory context, outside overview truncation. The internal Worker's normal
         // request budget checks include this exact body and the full previous summary.
         summary_input.text.push_str("\n\n");
-        summary_input.text.push_str(&journal_context);
+        for (index, entry) in frozen_context.iter().enumerate() {
+            if index != 0 {
+                summary_input.text.push_str("\n\n");
+            }
+            summary_input.text.push_str(&entry.item.history_text());
+        }
         if summary_input.warning_exceeded {
             self.alert(
                 AlertLevel::Warn,
@@ -7405,8 +7802,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             Vec::new()
         };
         let auto_read_tokens = agen::token_counter::total_tokens(&auto_read_messages, &[]).tokens;
-        let retained_estimate = agen::token_counter::total_tokens(&retained_items, &[]);
-        let retained_item_count = u64::try_from(retained_items.len()).unwrap_or(u64::MAX);
+        let retained_estimate = agen::token_counter::total_tokens(
+            &retained_history_entries
+                .iter()
+                .map(|entry| entry.item.clone())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        let retained_item_count = u64::try_from(retained_history_entries.len()).unwrap_or(u64::MAX);
         let summarized_item_count = u64::try_from(items_to_summarise.len()).unwrap_or(u64::MAX);
         let compactor_entries = handle.entries();
         let compactor_turns = compactor_entries
@@ -7461,25 +7864,19 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let reference_message =
             build_related_file_message(&final_ctx.references, &retained_image_references);
 
-        // Count surviving user_messages before consuming `retained_items`
+        // Count surviving user_messages before consuming the annotated retained tail
         // — needed to align `self.user_segments` after the swap below.
-        let retained_user_msgs = retained_items
+        let retained_user_msgs = retained_history_entries
             .iter()
-            .filter(|i| i.is_user_message())
+            .filter(|entry| entry.item.is_user_message())
             .count();
 
         // Build new history: [summary, ...auto-read, references, ...retained, task snapshot, TaskList synthetic call/result].
         // The TaskStore snapshot trails the retained items so that, on resume,
         // `replay_history` walks any pre-compact Task* calls preserved verbatim
-        // in retained_items first and the trailing snapshot's `replace_with`
+        // in the retained tail first and the trailing snapshot's `replace_with`
         // is the final word — pre-compact `TaskCreate` calls cannot leak as
         // duplicate entries.
-        let mut new_history = Vec::with_capacity(
-            1 + auto_read_messages.len()
-                + 3
-                + reference_message.is_some() as usize
-                + retained_items.len(),
-        );
         let mut compact_introduced_system_messages =
             Vec::with_capacity(2 + auto_read_messages.len() + reference_message.is_some() as usize);
         let summary_message = Item::system_message(format!(
@@ -7487,8 +7884,11 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             crate::session_history::COMPACTION_SUMMARY_HEADER
         ));
         compact_introduced_system_messages.push(summary_message.clone());
-        let journal_message = Item::system_message(journal_context);
-        compact_introduced_system_messages.push(journal_message.clone());
+        let context_messages = frozen_context
+            .iter()
+            .map(|entry| entry.item.to_history_item())
+            .collect::<Vec<_>>();
+        compact_introduced_system_messages.extend(context_messages.iter().cloned());
         compact_introduced_system_messages.extend(auto_read_messages.iter().cloned());
         if let Some(msg) = reference_message.as_ref() {
             compact_introduced_system_messages.push(msg.clone());
@@ -7500,20 +7900,88 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         ));
         compact_introduced_system_messages.push(task_snapshot_message.clone());
 
-        new_history.push(summary_message);
-        new_history.push(journal_message);
-        new_history.extend(auto_read_messages);
-        if let Some(msg) = reference_message {
-            new_history.push(msg);
+        let original_entries = self.session.history().entries();
+        let derived_sources = original_entries
+            .iter()
+            .map(|entry| entry.annotation.entry_id.clone())
+            .collect::<Vec<_>>();
+        let generic_summary_input = session_store::SystemInputEnvelope::new(
+            summary_message
+                .as_text()
+                .expect("compaction summary is text"),
+            session_store::HistoryInputMetadata::new(
+                session_store::HistoryInputUsePolicy {
+                    recording_material: session_store::InputEvidenceUse::Exclude,
+                    memory_evidence: session_store::InputEvidenceUse::Exclude,
+                    observation: session_store::InputObservationUse::Hidden,
+                    compaction: session_store::InputCompactionUse::OpeningSummary,
+                },
+                None,
+                None,
+            )
+            .map_err(|e| WorkerError::InvalidState(e.to_string()))?,
+        )
+        .map_err(|e| WorkerError::InvalidState(e.to_string()))?;
+        let summary_entry = session_store::LoggedSystemHistoryEntry::from_input(
+            WorkerHistoryProvenance::Provided {
+                producer: "worker.compaction".into(),
+            },
+            Some(SessionHistoryDerivation {
+                sources: derived_sources.clone(),
+            }),
+            generic_summary_input,
+        );
+        let derived_entry = |item| {
+            let mut metadata = new_history_metadata(
+                WorkerHistoryProvenance::DerivedSummary,
+                Some(SessionHistoryDerivation {
+                    sources: derived_sources.clone(),
+                }),
+            );
+            metadata.input_metadata = Some(
+                session_store::HistoryInputMetadata::new(
+                    session_store::HistoryInputUsePolicy {
+                        recording_material: session_store::InputEvidenceUse::Exclude,
+                        memory_evidence: session_store::InputEvidenceUse::Exclude,
+                        observation: session_store::InputObservationUse::Hidden,
+                        compaction: session_store::InputCompactionUse::Retain,
+                    },
+                    None,
+                    None,
+                )
+                .expect("bounded private derived context policy"),
+            );
+            HistoryEntry::new(item, metadata)
+        };
+        // Retained items and annotations travel together, including when attachment
+        // projection changes an item. Equal model text never selects an identity.
+        let mut compacted_history_entries =
+            vec![HistoryEntry::new(summary_message, summary_entry.metadata)];
+        compacted_history_entries.extend(
+            frozen_context.iter().map(|entry| {
+                HistoryEntry::new(entry.item.to_history_item(), entry.metadata.clone())
+            }),
+        );
+        compacted_history_entries.extend(auto_read_messages.into_iter().map(&derived_entry));
+        if let Some(item) = reference_message {
+            compacted_history_entries.push(derived_entry(item));
         }
-        new_history.extend(retained_items);
-        new_history.push(task_snapshot_message);
-        new_history.push(Item::tool_call("compact-tasklist", "TaskList", "{}"));
-        new_history.push(Item::tool_result_with_content(
+        compacted_history_entries.extend(retained_history_entries);
+        compacted_history_entries.push(derived_entry(task_snapshot_message));
+        compacted_history_entries.push(derived_entry(Item::tool_call(
+            "compact-tasklist",
+            "TaskList",
+            "{}",
+        )));
+        compacted_history_entries.push(derived_entry(Item::tool_result_with_content(
             "compact-tasklist",
             self.task_feature.snapshot_overview(),
             task_snapshot_text.clone(),
-        ));
+        )));
+        let new_history = compacted_history_entries
+            .iter()
+            .map(|entry| entry.item.clone())
+            .collect::<Vec<_>>();
         let result_estimate = agen::token_counter::total_tokens(&new_history, &[]);
         if result_context_max_tokens > 0 && result_estimate.tokens > result_context_max_tokens {
             // This history estimate includes retained items and auto-read files, not
@@ -7536,57 +8004,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 ),
             );
         }
-        let original_entries = self.session.history().entries();
-        let derived_sources = original_entries
-            .iter()
-            .map(|entry| entry.annotation.entry_id.clone())
-            .collect::<Vec<_>>();
-        let mut original_cursor = 0usize;
-        let compacted_history_entries = new_history
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(index, item)| {
-                if index == 0 {
-                    HistoryEntry::new(
-                        item,
-                        new_history_metadata(
-                            WorkerHistoryProvenance::CompactionSummary,
-                            Some(SessionHistoryDerivation {
-                                sources: derived_sources.clone(),
-                            }),
-                        ),
-                    )
-                } else if index == 1 {
-                    HistoryEntry::new(
-                        item,
-                        new_history_metadata(
-                            WorkerHistoryProvenance::JournalContext,
-                            Some(SessionHistoryDerivation {
-                                sources: derived_sources.clone(),
-                            }),
-                        ),
-                    )
-                } else if let Some((offset, original)) = original_entries[original_cursor..]
-                    .iter()
-                    .enumerate()
-                    .find(|(_, original)| original.item == item)
-                {
-                    original_cursor += offset + 1;
-                    HistoryEntry::new(item, original.annotation.clone())
-                } else {
-                    HistoryEntry::new(
-                        item,
-                        new_history_metadata(
-                            WorkerHistoryProvenance::DerivedSummary,
-                            Some(SessionHistoryDerivation {
-                                sources: derived_sources.clone(),
-                            }),
-                        ),
-                    )
-                }
-            })
-            .collect::<Vec<_>>();
 
         let retained_user_segments = self
             .user_segments
@@ -7985,6 +8402,11 @@ where
         // session_id + segment_id are allocated here so the worker-allocation
         // registration can record them from the start. Pending lifecycle
         // recovery reuses its already persisted Session identity.
+        let feature_installation = if existing_session_id.is_some() {
+            crate::feature::FeatureInstallation::Restore
+        } else {
+            crate::feature::FeatureInstallation::Activate
+        };
         let session_id = existing_session_id.unwrap_or_else(session_store::new_session_id);
         let segment_id = session_store::new_segment_id();
 
@@ -8065,9 +8487,11 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
-            initial_context_source: None,
+            session_context_source: None,
             prepared_initial_seed: None,
+            prepared_initial_prompt_completion: None,
             subjektiv_host: None,
+            feature_installation,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
@@ -8102,6 +8526,7 @@ where
         subjektiv_attached: bool,
         lifecycle: SubjektivSessionAttributionLifecycle,
     ) -> Result<(), WorkerError> {
+        let _admission = self.segment_state.mutation_authority.enter()?;
         let worker_name = self.manifest.worker.name.as_str();
         let metadata = self.store.read_by_name(worker_name)?.ok_or_else(|| {
             WorkerError::SubjektivSessionAttribution {
@@ -8180,11 +8605,15 @@ where
         } else {
             "legacy Session has no local attribution evidence; immutable Backend verification started"
         };
-        self.persist_subjektiv_session_attribution(incomplete_subjektiv_attribution_state(
+        let pending_attribution = incomplete_subjektiv_attribution_state(
             session_id,
             create_if_missing,
             initial_diagnostic.to_string(),
-        ))?;
+        );
+        self.persist_subjektiv_session_attribution(
+            metadata.subjektiv_session_attribution.as_ref(),
+            pending_attribution.clone(),
+        )?;
         let output = if self.subjektiv_host.is_some() {
             let connection = self
                 .subjektiv_host_connection()
@@ -8217,7 +8646,7 @@ where
                             message.clone(),
                         )
                     };
-                    self.persist_subjektiv_session_attribution(state)?;
+                    self.persist_subjektiv_session_attribution(Some(&pending_attribution), state)?;
                     return Err(WorkerError::SubjektivSessionAttribution {
                         state: if create_if_missing && rejected {
                             "failed"
@@ -8243,6 +8672,7 @@ where
                         "Session attribution transport outcome is unknown: {error}"
                     ));
                     self.persist_subjektiv_session_attribution(
+                        Some(&pending_attribution),
                         incomplete_subjektiv_attribution_state(
                             session_id,
                             create_if_missing,
@@ -8271,7 +8701,7 @@ where
                         diagnostic: message.clone(),
                     }
                 };
-                self.persist_subjektiv_session_attribution(state)?;
+                self.persist_subjektiv_session_attribution(Some(&pending_attribution), state)?;
                 return Err(WorkerError::SubjektivSessionAttribution {
                     state: if create_if_missing {
                         "failed"
@@ -8289,6 +8719,7 @@ where
                             "Session attribution response outcome is unknown: {error}"
                         ));
                         self.persist_subjektiv_session_attribution(
+                            Some(&pending_attribution),
                             incomplete_subjektiv_attribution_state(
                                 session_id,
                                 create_if_missing,
@@ -8310,20 +8741,26 @@ where
             let message =
                 "Session attribution response did not confirm the requested immutable identity"
                     .to_string();
-            self.persist_subjektiv_session_attribution(incomplete_subjektiv_attribution_state(
-                session_id,
-                create_if_missing,
-                message.clone(),
-            ))?;
+            self.persist_subjektiv_session_attribution(
+                Some(&pending_attribution),
+                incomplete_subjektiv_attribution_state(
+                    session_id,
+                    create_if_missing,
+                    message.clone(),
+                ),
+            )?;
             return Err(WorkerError::SubjektivSessionAttribution {
                 state: incomplete_subjektiv_attribution_label(create_if_missing),
                 message,
             });
         }
-        self.persist_subjektiv_session_attribution(SubjektivSessionAttributionState::Confirmed {
-            session_id,
-            subject_id: output.subject_id.clone(),
-        })?;
+        self.persist_subjektiv_session_attribution(
+            Some(&pending_attribution),
+            SubjektivSessionAttributionState::Confirmed {
+                session_id,
+                subject_id: output.subject_id.clone(),
+            },
+        )?;
         self.retain_journal_source_before_publication(session_id, &output.subject_id)
     }
 
@@ -8364,11 +8801,16 @@ where
 
     fn persist_subjektiv_session_attribution(
         &self,
+        expected: Option<&SubjektivSessionAttributionState>,
         state: SubjektivSessionAttributionState,
     ) -> Result<(), WorkerError> {
-        self.store
-            .set_subjektiv_session_attribution(&self.manifest.worker.name, state)?;
-        Ok(())
+        crate::subjektiv_metadata::compare_and_swap_attribution(
+            &self.store,
+            &self.manifest.worker.name,
+            self.session_id(),
+            expected,
+            state,
+        )
     }
 
     /// Build an in-process Internal Worker without machine-wide allocation or durable Worker metadata.
@@ -8452,9 +8894,11 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
-            initial_context_source: None,
+            session_context_source: None,
             prepared_initial_seed: None,
+            prepared_initial_prompt_completion: None,
             subjektiv_host: None,
+            feature_installation: crate::feature::FeatureInstallation::Activate,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
@@ -8585,9 +9029,11 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
-            initial_context_source: None,
+            session_context_source: None,
             prepared_initial_seed: None,
+            prepared_initial_prompt_completion: None,
             subjektiv_host: None,
+            feature_installation: crate::feature::FeatureInstallation::Activate,
             restore_feature_lifecycle_pending: false,
             feature_system_prompt_override: None,
             user_segments: Vec::new(),
@@ -8996,9 +9442,11 @@ where
             prompts: common.prompts,
             inject_resident_summary: true,
             feature_resident_summary_source: None,
-            initial_context_source: None,
+            session_context_source: None,
             prepared_initial_seed: None,
+            prepared_initial_prompt_completion: None,
             subjektiv_host: None,
+            feature_installation: crate::feature::FeatureInstallation::Restore,
             restore_feature_lifecycle_pending: true,
             feature_system_prompt_override: None,
             user_segments: state.user_segments,
@@ -9286,13 +9734,14 @@ fn project_compactor_capture_attachments<A>(entries: &mut [HistoryEntry<A>]) -> 
 
 /// Remove every durable binary attachment from the compacted tail and preserve
 /// re-readable ViewImage origins as related-file references.
-fn project_compaction_attachments(
-    items: &mut [Item],
+fn project_compaction_attachments<'a>(
+    items: impl IntoIterator<Item = &'a mut Item>,
     default_workdir_alias: Option<&str>,
 ) -> Vec<CompactionImageReference> {
+    let items = items.into_iter().collect::<Vec<_>>();
     let view_image_calls = items
         .iter()
-        .filter_map(|item| match item {
+        .filter_map(|item| match &**item {
             Item::ToolCall {
                 call_id,
                 name,
@@ -9398,9 +9847,10 @@ fn summary_shrink_prompt(
 fn initial_compaction_summary(
     entries: &[HistoryEntry<SessionHistoryMetadata>],
 ) -> Result<Option<String>, WorkerError> {
-    let mut summaries = entries
-        .iter()
-        .filter(|entry| entry.annotation.origin == WorkerHistoryProvenance::CompactionSummary);
+    let mut summaries = entries.iter().filter(|entry| {
+        crate::session_history::compaction_use(&entry.annotation)
+            == session_store::InputCompactionUse::OpeningSummary
+    });
     let Some(entry) = summaries.next() else {
         return Ok(None);
     };
@@ -10686,6 +11136,12 @@ mod build_summary_prompt_tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                return Ok(WorkspaceResponse {
+                    status: 200,
+                    body: "{}".into(),
+                });
+            }
             let request: server_api::MemoryBackendRequest =
                 serde_json::from_str(request.body.as_deref().unwrap_or_default()).unwrap();
             assert!(matches!(
@@ -10747,6 +11203,12 @@ mod build_summary_prompt_tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                return Ok(WorkspaceResponse {
+                    status: 200,
+                    body: "{}".into(),
+                });
+            }
             let request: server_api::SubjektivMemoryBackendRequest =
                 serde_json::from_str(request.body.as_deref().unwrap_or_default()).unwrap();
             assert!(matches!(
@@ -10851,13 +11313,32 @@ mod build_summary_prompt_tests {
     #[test]
     fn malformed_or_duplicate_host_summaries_fail_instead_of_omitting_context() {
         use crate::session_history::history_entry;
-        let valid = history_entry(
-            Item::system_message(format!(
-                "{}body",
-                crate::session_history::COMPACTION_SUMMARY_HEADER
-            )),
-            WorkerHistoryProvenance::CompactionSummary,
-        );
+        let opening = |item| {
+            let mut entry = history_entry(
+                item,
+                WorkerHistoryProvenance::Provided {
+                    producer: "arbitrary-summary-source".into(),
+                },
+            );
+            entry.annotation.input_metadata = Some(
+                session_store::HistoryInputMetadata::new(
+                    session_store::HistoryInputUsePolicy {
+                        recording_material: session_store::InputEvidenceUse::Exclude,
+                        memory_evidence: session_store::InputEvidenceUse::Exclude,
+                        observation: session_store::InputObservationUse::Hidden,
+                        compaction: session_store::InputCompactionUse::OpeningSummary,
+                    },
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+            entry
+        };
+        let valid = opening(Item::system_message(format!(
+            "{}body",
+            crate::session_history::COMPACTION_SUMMARY_HEADER
+        )));
         assert_eq!(
             initial_compaction_summary(std::slice::from_ref(&valid))
                 .unwrap()
@@ -10869,13 +11350,7 @@ mod build_summary_prompt_tests {
             Item::user_message("pasted"),
             Item::system_message("missing marker"),
         ] {
-            assert!(
-                initial_compaction_summary(&[history_entry(
-                    item,
-                    WorkerHistoryProvenance::CompactionSummary
-                )])
-                .is_err()
-            );
+            assert!(initial_compaction_summary(&[opening(item)]).is_err());
         }
     }
 
@@ -10914,7 +11389,7 @@ mod build_summary_prompt_tests {
             Item::ToolResult { attachments, .. } if attachments.is_empty()
         ));
 
-        let references = project_compaction_attachments(&mut items, Some("main"));
+        let references = project_compaction_attachments(items.iter_mut(), Some("main"));
 
         assert_eq!(
             references,
@@ -11087,6 +11562,12 @@ mod build_summary_prompt_tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                return Ok(WorkspaceResponse {
+                    status: 200,
+                    body: "{}".into(),
+                });
+            }
             self.requests
                 .lock()
                 .expect("recorded workspace requests lock")
@@ -11119,6 +11600,12 @@ mod build_summary_prompt_tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                return Ok(WorkspaceResponse {
+                    status: 200,
+                    body: "{}".into(),
+                });
+            }
             self.requests
                 .lock()
                 .expect("Flow source request lock")
@@ -11302,7 +11789,7 @@ mod build_summary_prompt_tests {
                     1
                 }
                 LogEntry::AnnotatedSystemItem { entry, .. }
-                    if matches!(entry.item, SystemItem::FeatureInvocationResult { .. }) =>
+                    if input_schema(entry) == Some("feature:invocation-result") =>
                 {
                     2
                 }
@@ -11436,9 +11923,9 @@ mod build_summary_prompt_tests {
         TransportUnknown,
     }
 
-    #[derive(Debug)]
     struct AttributionLifecycleClient {
         outcomes: Mutex<VecDeque<AttributionOutcome>>,
+        before_response: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         requests: Mutex<Vec<WorkspaceRequest>>,
     }
 
@@ -11446,8 +11933,15 @@ mod build_summary_prompt_tests {
         fn new(outcomes: impl IntoIterator<Item = AttributionOutcome>) -> Self {
             Self {
                 outcomes: Mutex::new(outcomes.into_iter().collect()),
+                before_response: Mutex::new(None),
                 requests: Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    impl std::fmt::Debug for AttributionLifecycleClient {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("AttributionLifecycleClient")
         }
     }
 
@@ -11469,6 +11963,9 @@ mod build_summary_prompt_tests {
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             self.requests.lock().unwrap().push(request.clone());
+            if let Some(change) = self.before_response.lock().unwrap().take() {
+                change();
+            }
             match self
                 .outcomes
                 .lock()
@@ -11716,6 +12213,110 @@ mod build_summary_prompt_tests {
         ));
     }
 
+    // Production lifecycle, atomic Host CAS, and filesystem metadata store. Only
+    // the external Workspace transport is substituted to interleave a newer owner.
+    #[tokio::test]
+    async fn delayed_attribution_response_cannot_overwrite_new_session_or_subject_evidence() {
+        for switch_session in [true, false] {
+            let client = Arc::new(AttributionLifecycleClient::new([
+                AttributionOutcome::Success,
+            ]));
+            let (worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+            let worker_name = worker.manifest().worker.name.clone();
+            let replacement_session = if switch_session {
+                session_store::new_session_id()
+            } else {
+                worker.session_id()
+            };
+            let changed = store.clone();
+            let name = worker_name.clone();
+            *client.before_response.lock().unwrap() = Some(Box::new(move || {
+                if switch_session {
+                    worker_metadata_writer_for_store(&changed)(WorkerMetadata::new(
+                        name,
+                        Some(WorkerActiveSegmentRef::pending_segment(replacement_session)),
+                    ))
+                    .unwrap();
+                } else {
+                    changed
+                        .update_by_name(&name, |metadata| {
+                            metadata.subjektiv_session_attribution =
+                                Some(SubjektivSessionAttributionState::Confirmed {
+                                    session_id: replacement_session,
+                                    subject_id: "new-subject".into(),
+                                });
+                        })
+                        .unwrap();
+                }
+            }));
+            let error = worker
+                .finalize_subjektiv_session_attribution(
+                    true,
+                    SubjektivSessionAttributionLifecycle::NewSession,
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("attribution_conflict"),
+                "{error}"
+            );
+            let saved = store.read_by_name(&worker_name).unwrap().unwrap();
+            assert_eq!(
+                saved.active.as_ref().unwrap().session_id,
+                replacement_session
+            );
+            assert_eq!(
+                saved.subjektiv_session_attribution,
+                if switch_session {
+                    None
+                } else {
+                    Some(SubjektivSessionAttributionState::Confirmed {
+                        session_id: replacement_session,
+                        subject_id: "new-subject".into(),
+                    })
+                }
+            );
+            assert_eq!(client.requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn released_body_cannot_reconfirm_attribution_or_contact_host() {
+        let client = Arc::new(AttributionLifecycleClient::new([
+            AttributionOutcome::Success,
+        ]));
+        let (worker, store, _temp) = attribution_lifecycle_worker(client.clone()).await;
+        let before = store
+            .read_by_name(&worker.manifest().worker.name)
+            .unwrap()
+            .unwrap();
+        let control = crate::subject_release::ReleaseControl::new(worker.mutation_authority());
+        let request = tokio::spawn({
+            let control = control.clone();
+            async move { control.request().await }
+        });
+        control.notified().await;
+        control.respond(|| Ok(()));
+        let mut reservation = request.await.unwrap().unwrap();
+        reservation.commit_disconnect().unwrap();
+        drop(reservation);
+        assert!(
+            worker
+                .finalize_subjektiv_session_attribution(
+                    true,
+                    SubjektivSessionAttributionLifecycle::NewSession
+                )
+                .is_err()
+        );
+        assert!(client.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            store
+                .read_by_name(&worker.manifest().worker.name)
+                .unwrap()
+                .unwrap(),
+            before
+        );
+    }
+
     #[tokio::test]
     async fn unknown_and_failed_attribution_remain_incomplete_until_lifecycle_retry() {
         for (first, expected_state) in [
@@ -11828,13 +12429,13 @@ mod build_summary_prompt_tests {
             )
             .unwrap();
         store
-            .set_subjektiv_session_attribution(
-                &manifest.worker.name,
-                SubjektivSessionAttributionState::OutcomeUnknown {
-                    session_id,
-                    diagnostic: "response lost before restart".to_string(),
-                },
-            )
+            .update_by_name(&manifest.worker.name, |metadata| {
+                metadata.subjektiv_session_attribution =
+                    Some(SubjektivSessionAttributionState::OutcomeUnknown {
+                        session_id,
+                        diagnostic: "response lost before restart".to_string(),
+                    });
+            })
             .unwrap();
         let client = Arc::new(AttributionLifecycleClient::new([
             AttributionOutcome::Success,
@@ -12755,8 +13356,8 @@ mod build_summary_prompt_tests {
         }
 
         async fn start(worker: &Worker<NoopClient, StartupStore>, signals: &TaskSignals) {
-            worker
-                .feature_background_tasks
+            let registry = worker.feature_background_tasks.clone();
+            registry
                 .start(
                     &FeatureId::builtin("startup-barrier"),
                     "barrier",
@@ -12770,6 +13371,9 @@ mod build_summary_prompt_tests {
                     },
                 )
                 .unwrap();
+            // A transient registry clone must not cancel or abort the task:
+            // the Worker and startup capture still own the shared registry.
+            drop(registry);
             tokio::time::timeout(Duration::from_secs(5), signals.entered.notified())
                 .await
                 .unwrap();
@@ -12811,7 +13415,6 @@ mod build_summary_prompt_tests {
                 worker,
                 crate::WorkerBootstrapLayout::RuntimeManagedRun {
                     run_dir: blocked_parent.join("1"),
-                    bash_output_dir: temp.path().join("spill"),
                 },
                 crate::WorkerControllerTransport::InProcess,
             )
@@ -12937,7 +13540,6 @@ mod build_summary_prompt_tests {
                 worker,
                 crate::WorkerBootstrapLayout::RuntimeManagedRun {
                     run_dir: temp.path().join("runs/1"),
-                    bash_output_dir: temp.path().join("spill"),
                 },
                 crate::WorkerControllerTransport::InProcess,
             )
@@ -14872,13 +15474,7 @@ permission = "write"
             let entries = store.read_all(session_id, segment_id).unwrap();
             assert!(matches!(
                 entries.last(),
-                Some(LogEntry::AnnotatedSystemItem {
-                    entry: session_store::LoggedSystemHistoryEntry {
-                        item: SystemItem::ResidentSummaryRefresh { .. },
-                        ..
-                    },
-                    ..
-                })
+                Some(LogEntry::AnnotatedSystemItem { entry, .. }) if input_schema(entry) == Some("memory:resident-summary")
             ));
         }
     }
@@ -15175,15 +15771,10 @@ permission = "write"
         assert!(entries.iter().any(|entry| {
             matches!(
                 entry,
-                LogEntry::AnnotatedSystemItem {
-                    entry: session_store::LoggedSystemHistoryEntry {
-                        item: SystemItem::SkillActivation { name, body },
-                        ..
-                    },
-                    ..
-                } if name == "triage-errors"
-                    && body.contains("# Triage Errors")
-                    && body == history_text
+                LogEntry::AnnotatedSystemItem { entry, .. }
+                    if entry.metadata.input_metadata.as_ref().and_then(|input| input.feature_payload()).and_then(|payload| payload.decode::<crate::skill::SkillActivationInput>("skill:activation", 1).ok()).is_some_and(|payload| payload.name == "triage-errors")
+                    && entry.item.history_text().contains("# Triage Errors")
+                    && entry.item.history_text() == history_text
             )
         }));
     }
@@ -16577,7 +17168,7 @@ permission = "write"
                 .position(|entry| {
                     matches!(entry,
                         LogEntry::AnnotatedSystemItem { entry, .. }
-                            if matches!(entry.item, SystemItem::FeatureInvocationResult { .. })
+                            if input_schema(entry) == Some("feature:invocation-result")
                     )
                 })
                 .expect("invocation result must be durable before the model request");
@@ -16586,7 +17177,7 @@ permission = "write"
                 .position(|entry| {
                     matches!(entry,
                         LogEntry::AnnotatedSystemItem { entry, .. }
-                            if matches!(entry.item, SystemItem::SubjectBehaviorRefresh { .. })
+                            if input_schema(entry) == Some("subject:behavior")
                     )
                 })
                 .expect("Subject behavior refresh must be durable before the model request");
@@ -16825,14 +17416,14 @@ permission = "write"
                 .iter()
                 .filter(|entry| matches!(entry,
                     LogEntry::AnnotatedSystemItem { entry, .. }
-                        if matches!(entry.item, SystemItem::FeatureInvocationResult { .. })
+                        if input_schema(entry) == Some("feature:invocation-result")
                 ))
                 .count(),
             2 // Explicit replay displays the cached result; it does not repeat the effect.
         );
         assert!(entries.iter().any(|entry| matches!(entry,
             LogEntry::AnnotatedSystemItem { entry, .. }
-                if matches!(entry.item, SystemItem::ResidentSummaryRefresh { .. })
+                if input_schema(entry) == Some("memory:resident-summary")
         )));
     }
 
@@ -16875,7 +17466,7 @@ permission = "write"
                     LogEntry::AnnotatedSystemItem {
                         entry, extensions, ..
                     } => {
-                        matches!(entry.item, SystemItem::FeatureInvocationResult { .. })
+                        input_schema(entry) == Some("feature:invocation-result")
                             && extensions.iter().any(|extension| {
                                 extension.domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN
                                     && serde_json::from_value::<PendingActivationState>(
@@ -17466,34 +18057,70 @@ permission = "write"
         }));
     }
 
-    fn startup_test_item() -> SystemItem {
-        SystemItem::JournalStartup {
-            body: "PRIOR_JOURNAL_REFERENCE".into(),
-            snapshot: serde_json::json!({"subject_id":"subject", "journals":[], "omitted":false}),
-            snapshot_sha256: "snapshot-digest".into(),
-            prompt_provenance: PromptRenderProvenance {
-                workspace_id: None,
-                source_digest: "source".into(),
-                projection_digest: "projection".into(),
-                logical_name: "internal.subjektiv_journal_startup".into(),
+    fn input_schema(entry: &session_store::LoggedSystemHistoryEntry) -> Option<&str> {
+        entry
+            .metadata
+            .input_metadata
+            .as_ref()?
+            .feature_payload()
+            .map(|payload| payload.schema())
+    }
+
+    fn startup_test_input() -> session_store::LoggedSystemHistoryEntry {
+        use session_store::*;
+        let payload = FeatureInputPayload::encode(
+            "journal:startup",
+            1,
+            &crate::feature::builtin::journal::JournalStartupInput {
+                snapshot: subjektiv::journal::startup::JournalStartupSnapshot {
+                    subject_id: "subject".into(),
+                    journals: vec![],
+                    omitted: false,
+                },
+                snapshot_sha256: "snapshot-digest".into(),
+                prompt_provenance: PromptRenderProvenance {
+                    workspace_id: None,
+                    source_digest: "source".into(),
+                    projection_digest: "projection".into(),
+                    logical_name: "internal.subjektiv_journal_startup".into(),
+                },
             },
-        }
+        )
+        .unwrap();
+        LoggedSystemHistoryEntry::from_input(
+            LoggedSessionHistoryOrigin::Provided {
+                producer: "arbitrary-context-provider".into(),
+            },
+            None,
+            SystemInputEnvelope::new(
+                "PRIOR_JOURNAL_REFERENCE",
+                HistoryInputMetadata::new(
+                    HistoryInputUsePolicy {
+                        recording_material: InputEvidenceUse::Exclude,
+                        memory_evidence: InputEvidenceUse::Exclude,
+                        observation: InputObservationUse::Hidden,
+                        compaction: InputCompactionUse::ReferenceInput,
+                    },
+                    Some(payload),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
     }
     struct StartupTestSource {
         calls: Arc<AtomicUsize>,
         fail: Arc<AtomicBool>,
     }
     #[async_trait]
-    impl InitialContextSource for StartupTestSource {
+    impl SessionContextSource for StartupTestSource {
         async fn load(&self) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail.load(Ordering::SeqCst) {
                 return Err("startup read failed".into());
             }
-            Ok(vec![session_store::LoggedSystemHistoryEntry {
-                item: startup_test_item(),
-                metadata: new_history_metadata(WorkerHistoryProvenance::JournalContext, None),
-            }])
+            Ok(vec![startup_test_input()])
         }
     }
 
@@ -17501,7 +18128,7 @@ permission = "write"
     async fn initial_system_messages_preserve_feature_metadata_without_payload_classification() {
         struct Source(Vec<session_store::LoggedSystemHistoryEntry>);
         #[async_trait]
-        impl InitialContextSource for Source {
+        impl SessionContextSource for Source {
             async fn load(&self) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
                 Ok(self.0.clone())
             }
@@ -17517,16 +18144,19 @@ permission = "write"
                 },
                 metadata: new_history_metadata(WorkerHistoryProvenance::JournalContext, None),
             },
-            session_store::LoggedSystemHistoryEntry {
-                item: startup_test_item(),
-                metadata: new_history_metadata(
+            {
+                let mut input = startup_test_input();
+                let custom = new_history_metadata(
                     WorkerHistoryProvenance::BackendInstruction {
                         operation_id: Some("feature-selected-origin".into()),
                     },
                     Some(SessionHistoryDerivation {
                         sources: vec![SessionHistoryEntryId::new()],
                     }),
-                ),
+                );
+                input.metadata.origin = custom.origin;
+                input.metadata.derivation = custom.derivation;
+                input
             },
         ];
         let mut worker = Worker::new(
@@ -17539,7 +18169,7 @@ permission = "write"
         )
         .await
         .unwrap();
-        worker.install_initial_context_source(Arc::new(Source(expected.clone())));
+        worker.install_session_context_source(Arc::new(Source(expected.clone())));
         worker.materialize_durable_session_head().await.unwrap();
         let log = store
             .read_all(worker.session_id(), worker.segment_id())
@@ -17596,7 +18226,7 @@ permission = "write"
             .await
             .unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
-            worker.install_initial_context_source(Arc::new(StartupTestSource {
+            worker.install_session_context_source(Arc::new(StartupTestSource {
                 calls: calls.clone(),
                 fail: Arc::new(AtomicBool::new(false)),
             }));
@@ -17617,7 +18247,9 @@ permission = "write"
             assert_eq!(replay[0].item.as_text(), Some("PRIOR_JOURNAL_REFERENCE"));
             assert_eq!(
                 replay[0].annotation.origin,
-                WorkerHistoryProvenance::JournalContext
+                WorkerHistoryProvenance::Provided {
+                    producer: "arbitrary-context-provider".into()
+                }
             );
             let view =
                 crate::session_capture::SessionCapture::from_history_entries("startup", replay);
@@ -17628,7 +18260,7 @@ permission = "write"
             let entries = store
                 .read_all(worker.session_id(), worker.segment_id())
                 .unwrap();
-            let journal = entries.iter().position(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if matches!(entry.item, SystemItem::JournalStartup { .. }))).unwrap();
+            let journal = entries.iter().position(|entry| matches!(entry, LogEntry::AnnotatedSystemItem { entry, .. } if input_schema(entry) == Some("journal:startup"))).unwrap();
             let user = entries
                 .iter()
                 .position(|entry| matches!(entry, LogEntry::AnnotatedUserInput { .. }))
@@ -17654,7 +18286,7 @@ permission = "write"
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let fail = Arc::new(AtomicBool::new(true));
-        worker.install_initial_context_source(Arc::new(StartupTestSource {
+        worker.install_session_context_source(Arc::new(StartupTestSource {
             calls: calls.clone(),
             fail: fail.clone(),
         }));
@@ -17668,6 +18300,110 @@ permission = "write"
         worker.materialize_durable_session_head().await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(worker.history().len(), 1);
+    }
+
+    struct PreparedPromptSource {
+        loads: Arc<AtomicUsize>,
+        completions: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl SystemPromptContributionSource for PreparedPromptSource {
+        async fn load(&self) -> SystemPromptContribution {
+            panic!("initial load must use its prepared completion")
+        }
+        async fn load_initial(
+            &self,
+        ) -> (
+            SystemPromptContribution,
+            Option<PromptContributionCompletion>,
+        ) {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            let completed = self.completions.clone();
+            (
+                SystemPromptContribution::Ready("PREPARED_RESIDENT_BODY".into()),
+                Some(Box::new(move || {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                })),
+            )
+        }
+    }
+
+    // Production initial-head preparation/create/reconciliation and real FsStore.
+    // Only returned write failures and the Feature completion counter are injected.
+    #[tokio::test]
+    async fn initial_prompt_completion_waits_for_commit_and_reconciliation_and_never_replays_to_replacement()
+     {
+        for failure in [3, 4, 0] {
+            for replace_source in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let store = FailRunTerminalStore {
+                    inner: session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+                    fail_run_terminal: Arc::new(AtomicBool::new(false)),
+                    invocation_failure: Arc::new(AtomicUsize::new(failure)),
+                };
+                let mut worker = Worker::new(
+                    minimal_manifest(),
+                    Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+                    store.clone(),
+                    WorkerWorkspaceContext::no_workspace(),
+                    WorkerFilesystemAuthority::None,
+                    Scope::empty(),
+                )
+                .await
+                .unwrap();
+                worker.set_system_prompt_template(
+                    SystemPromptTemplate::parse("default", PromptCatalogSource::builtins_only())
+                        .unwrap(),
+                );
+                let loads = Arc::new(AtomicUsize::new(0));
+                let completed = Arc::new(AtomicUsize::new(0));
+                worker.install_system_prompt_contribution(
+                    Some(Arc::new(PreparedPromptSource {
+                        loads: loads.clone(),
+                        completions: completed.clone(),
+                    })),
+                    None,
+                );
+                if failure == 0 {
+                    let fail = Arc::new(AtomicBool::new(true));
+                    worker.worker_metadata_writer = Some(Arc::new(move |_| {
+                        if fail.swap(false, Ordering::SeqCst) {
+                            Err(std::io::Error::other("initial active pointer write failed").into())
+                        } else {
+                            Ok(())
+                        }
+                    }));
+                }
+                assert!(worker.materialize_durable_session_head().await.is_err());
+                assert_eq!(completed.load(Ordering::SeqCst), 0);
+                let new_completed = Arc::new(AtomicUsize::new(0));
+                let new_loads = Arc::new(AtomicUsize::new(0));
+                if replace_source {
+                    worker.install_system_prompt_contribution(
+                        Some(Arc::new(PreparedPromptSource {
+                            loads: new_loads.clone(),
+                            completions: new_completed.clone(),
+                        })),
+                        None,
+                    );
+                }
+                worker.materialize_durable_session_head().await.unwrap();
+                worker.materialize_durable_session_head().await.unwrap();
+                assert_eq!(loads.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    completed.load(Ordering::SeqCst),
+                    usize::from(!replace_source)
+                );
+                assert_eq!(new_completed.load(Ordering::SeqCst), 0);
+                assert_eq!(new_loads.load(Ordering::SeqCst), 0);
+                let saved = store
+                    .read_all(worker.session_id(), worker.segment_id())
+                    .unwrap();
+                assert!(
+                    matches!(&saved[0], LogEntry::AnnotatedSegmentStart { system_prompt: Some(prompt), .. } if prompt.contains("PREPARED_RESIDENT_BODY"))
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -17685,7 +18421,7 @@ permission = "write"
         .await
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        worker.install_initial_context_source(Arc::new(StartupTestSource {
+        worker.install_session_context_source(Arc::new(StartupTestSource {
             calls: calls.clone(),
             fail: Arc::new(AtomicBool::new(false)),
         }));
@@ -17740,7 +18476,7 @@ permission = "write"
         .unwrap();
         worker.enable_worker_metadata_write_through().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        worker.install_initial_context_source(Arc::new(StartupTestSource {
+        worker.install_session_context_source(Arc::new(StartupTestSource {
             calls: calls.clone(),
             fail: Arc::new(AtomicBool::new(false)),
         }));
@@ -17762,7 +18498,7 @@ permission = "write"
                 &manifest.worker.name, manifest.clone(), store.clone(),
                 PromptCatalogSource::builtins_only(), WorkerWorkspaceContext::no_workspace(),
                 WorkerFilesystemAuthority::None, Some(Box::new(NoopClient))).await.unwrap();
-            restored.install_initial_context_source(Arc::new(StartupTestSource {
+            restored.install_session_context_source(Arc::new(StartupTestSource {
                 calls: calls.clone(),
                 fail: Arc::new(AtomicBool::new(true)),
             }));
@@ -17946,12 +18682,10 @@ permission = "write"
         let layout = if runtime_managed {
             crate::WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: temp.path().join("runtime/runs/1"),
-                bash_output_dir: temp.path().join("bash"),
             }
         } else {
             crate::WorkerBootstrapLayout::Direct {
                 runtime_base: temp.path().join("runtime"),
-                bash_output_dir: temp.path().join("bash"),
             }
         };
         crate::WorkerBootstrap::new(
@@ -18087,7 +18821,7 @@ permission = "write"
             .iter()
             .filter_map(|entry| match entry {
                 LogEntry::AnnotatedSystemItem { entry, .. }
-                    if matches!(entry.item, SystemItem::JournalStartup { .. }) =>
+                    if input_schema(entry) == Some("journal:startup") =>
                 {
                     Some(entry.item.clone())
                 }
@@ -18138,7 +18872,7 @@ permission = "write"
                     .iter()
                     .filter_map(|entry| match entry {
                         LogEntry::AnnotatedSystemItem { entry, .. }
-                            if matches!(entry.item, SystemItem::JournalStartup { .. }) =>
+                            if input_schema(entry) == Some("journal:startup") =>
                         {
                             Some(&entry.item)
                         }
@@ -18165,6 +18899,285 @@ permission = "write"
                     .subjektiv_session_attribution,
                 attribution
             );
+        }
+    }
+
+    #[test]
+    fn system_input_completion_observes_durable_identity_under_publication_barrier() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(temp.path()).unwrap();
+        let session_id = SessionId::now_v7();
+        let segment_id = SegmentId::now_v7();
+        let start = LogEntry::AnnotatedSegmentStart {
+            ts: 1,
+            session_id,
+            system_prompt: None,
+            config: agen::llm_client::RequestConfig::default(),
+            history: vec![],
+            forked_from: None,
+            compacted_from: None,
+        };
+        store
+            .create_segment(session_id, segment_id, std::slice::from_ref(&start))
+            .unwrap();
+        let writer = LogWriterHandle {
+            store: store.clone(),
+            state: SegmentState::new(session_id, segment_id, 1),
+            sink: SegmentLogSink::with_initial(vec![start]),
+            in_flight: None,
+        };
+        let mut receipt = None;
+        let committed = writer
+            .commit_system_item_with_extensions_then(
+                SystemItem::Notification {
+                    message: "message".into(),
+                    body: "exact committed system body".into(),
+                    prompt_provenance: None,
+                },
+                vec![],
+                None,
+                &mut |history| {
+                    assert!(writer.state.append_lock.try_lock().is_err());
+                    let durable = store.read_all(session_id, segment_id).unwrap();
+                    let Some(LogEntry::AnnotatedSystemItem { entry, .. }) = durable.last() else {
+                        panic!("completion must follow actual storage append");
+                    };
+                    assert_eq!(entry.metadata, history.annotation);
+                    assert_eq!(entry.item.to_history_item(), history.item);
+                    assert_eq!(history.item.as_text(), Some("exact committed system body"));
+                    receipt = Some(history.annotation.entry_id.clone());
+                },
+            )
+            .unwrap();
+        assert_eq!(receipt, Some(committed.annotation.entry_id));
+        assert!(writer.state.append_lock.try_lock().is_ok());
+    }
+
+    // Production bootstrap, Controller registration, and durable stores; only the
+    // Workspace transport and model are replaced. No live Server is needed.
+    #[derive(Debug, Default)]
+    struct FeatureAdmissionClient {
+        requests: Mutex<Vec<WorkspaceRequest>>,
+        response_status: Mutex<Option<u16>>,
+    }
+
+    impl WorkspaceClient for FeatureAdmissionClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("feature-restore-workspace")
+        }
+
+        fn kind(&self) -> &str {
+            "feature-admission-test"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            assert!(request.path.ends_with("/authorization/check"));
+            self.requests.lock().unwrap().push(request);
+            match *self.response_status.lock().unwrap() {
+                Some(status) => Ok(WorkspaceResponse {
+                    status,
+                    body: if status == 200 {
+                        r#"{"scope":null}"#.into()
+                    } else {
+                        r#"{"message":"current grant denied"}"#.into()
+                    },
+                }),
+                None => Err(WorkspaceClientError::Unavailable("Host not serving".into())),
+            }
+        }
+    }
+
+    fn feature_restore_bootstrap(
+        temp: &tempfile::TempDir,
+        manifest: WorkerManifest,
+        store: BodyPublicationStore,
+        client: Arc<FeatureAdmissionClient>,
+    ) -> crate::WorkerBootstrap<BodyPublicationStore> {
+        crate::WorkerBootstrap::new(
+            manifest,
+            store,
+            PromptCatalogSource::builtins_only(),
+            WorkerWorkspaceContext::with_client(
+                Some(WorkspaceId::new("feature-restore-workspace").unwrap()),
+                client,
+            ),
+            WorkerFilesystemAuthority::None,
+            crate::WorkerBootstrapLayout::RuntimeManagedRun {
+                run_dir: temp
+                    .path()
+                    .join("runtime/runs")
+                    .join(uuid::Uuid::now_v7().to_string()),
+            },
+            crate::WorkerControllerTransport::InProcess,
+        )
+        .with_model_client(NoopClient)
+    }
+
+    fn feature_restore_fixture(temp: &tempfile::TempDir) -> (WorkerManifest, BodyPublicationStore) {
+        let mut manifest = minimal_manifest();
+        manifest.worker.name = format!("feature-restore-{}", uuid::Uuid::now_v7());
+        manifest.scope.allow.clear();
+        manifest.feature.task.enabled = true;
+        manifest.feature.ticket.enabled = true;
+        manifest.profile = Some(manifest::ProfileManifestSnapshot {
+            source: manifest::ProfileSource::Registry {
+                source: manifest::ProfileRegistrySource::Builtin,
+                name: "default".into(),
+                path: None,
+                provenance: None,
+            },
+            profile: None,
+        });
+        let store = session_store::CombinedStore::new(
+            session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+            session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+        );
+        (manifest, store)
+    }
+
+    #[tokio::test]
+    async fn new_worker_rejects_denied_feature_before_persisting_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+        let (manifest, store) = feature_restore_fixture(&temp);
+        let client = Arc::new(FeatureAdmissionClient::default());
+        *client.response_status.lock().unwrap() = Some(403);
+        let result =
+            feature_restore_bootstrap(&temp, manifest.clone(), store.clone(), client.clone())
+                .prepare()
+                .await;
+        assert!(matches!(
+            result,
+            Err(crate::WorkerBootstrapError::Worker(
+                WorkerError::FeatureLifecycle(_)
+            ))
+        ));
+        assert!(store.read_by_name(&manifest.worker.name).unwrap().is_none());
+        assert!(!client.requests.lock().unwrap().is_empty());
+        assert!(!temp.path().join("runtime").exists());
+    }
+
+    #[tokio::test]
+    async fn new_worker_rechecks_feature_admission_before_controller_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+        let (manifest, store) = feature_restore_fixture(&temp);
+        let client = Arc::new(FeatureAdmissionClient::default());
+        *client.response_status.lock().unwrap() = Some(200);
+        let prepared = feature_restore_bootstrap(&temp, manifest, store, client.clone())
+            .prepare()
+            .await
+            .unwrap();
+        client.requests.lock().unwrap().clear();
+        *client.response_status.lock().unwrap() = Some(403);
+        match prepared.start().await {
+            Err(crate::WorkerBootstrapError::Controller { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(source.to_string().contains("HTTP status 403"));
+            }
+            Err(other) => panic!("unexpected rejection: {other:?}"),
+            Ok(controller) => {
+                stop_body_publication_controller(controller).await;
+                panic!("new activation must not bypass admission");
+            }
+        }
+        assert!(!client.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_preserves_saved_features_and_prompt_without_feature_readmission() {
+        for materialized in [false, true] {
+            for response_status in [Some(403), None] {
+                let temp = tempfile::tempdir().unwrap();
+                let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+                let (manifest, store) = feature_restore_fixture(&temp);
+                let client = Arc::new(FeatureAdmissionClient::default());
+                *client.response_status.lock().unwrap() = Some(200);
+                let prepared = feature_restore_bootstrap(
+                    &temp,
+                    manifest.clone(),
+                    store.clone(),
+                    client.clone(),
+                )
+                .prepare()
+                .await
+                .unwrap();
+                let session = prepared.worker().session_id();
+                let mut saved = Vec::new();
+                let mut saved_prompt = None;
+                let mut saved_segment = None;
+                if materialized {
+                    let segment = prepared.worker().segment_id();
+                    let controller = prepared.start().await.unwrap();
+                    saved = store.read_all(session, segment).unwrap();
+                    saved_prompt = session_store::collect_state(&saved).system_prompt;
+                    assert!(saved_prompt.is_some());
+                    saved_segment = Some(segment);
+                    stop_body_publication_controller(controller).await;
+                } else {
+                    drop(prepared);
+                    assert!(store.list_segments(session).unwrap().is_empty());
+                }
+                client.requests.lock().unwrap().clear();
+                *client.response_status.lock().unwrap() = response_status;
+                let mut fallback = manifest.clone();
+                fallback.feature.task.enabled = false;
+                fallback.feature.ticket.enabled = false;
+                fallback.feature.workdir_catalog.enabled = false;
+                fallback.engine.instruction = "must not replace saved instructions".into();
+                let restored =
+                    feature_restore_bootstrap(&temp, fallback, store.clone(), client.clone())
+                        .prepare_restored(&manifest.worker.name)
+                        .await
+                        .unwrap();
+                assert_eq!(restored.worker().session_id(), session);
+                assert_eq!(restored.worker().manifest().feature, manifest.feature);
+                assert_eq!(
+                    restored.worker().manifest().engine.instruction,
+                    manifest.engine.instruction
+                );
+                if let Some(prompt) = &saved_prompt {
+                    assert_eq!(
+                        restored.worker().engine().get_system_prompt(),
+                        Some(prompt.as_str())
+                    );
+                    assert_eq!(Some(restored.worker().segment_id()), saved_segment);
+                }
+                assert!(client.requests.lock().unwrap().is_empty());
+                let controller = restored.start().await.unwrap();
+                let installed: WorkerManifest =
+                    toml::from_str(&controller.handle.shared_state.manifest_toml).unwrap();
+                assert_eq!(installed.feature, manifest.feature);
+                let committed = controller.handle.committed_entries();
+                if materialized {
+                    assert_eq!(
+                        serde_json::to_value(&committed[..saved.len()]).unwrap(),
+                        serde_json::to_value(&saved).unwrap(),
+                    );
+                    assert_eq!(
+                        session_store::collect_state(&committed).system_prompt,
+                        saved_prompt
+                    );
+                } else {
+                    assert!(
+                        session_store::collect_state(&committed)
+                            .system_prompt
+                            .is_some()
+                    );
+                }
+                assert!(
+                    client.requests.lock().unwrap().is_empty(),
+                    "restore must not ask for Feature admission"
+                );
+                stop_body_publication_controller(controller).await;
+            }
         }
     }
 

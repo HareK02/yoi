@@ -63,3 +63,12 @@ export function credentialFixture(authentication = false): Credential {
       },
   } as unknown as Credential;
 }
+
+export function whoamiPayload(actor: unknown = null) {
+  return {
+    actor,
+    session: actor === null
+      ? { kind: "anonymous" }
+      : { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+  };
+}

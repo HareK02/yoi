@@ -31,11 +31,18 @@ enum WriteResponseFault {
     LostBody,
 }
 
+#[derive(Clone, Copy)]
+enum CommandResponseFault {
+    LostTerminal,
+    EmptyWaiting,
+}
+
 struct ProviderState {
     session: WorkdirSessionHandle,
     requests: Mutex<Vec<(String, String)>>,
     operations: Mutex<Vec<WorkdirSessionOperation>>,
     write_fault: Mutex<Option<WriteResponseFault>>,
+    command_fault: Mutex<Option<CommandResponseFault>>,
     observe_refusal: Mutex<bool>,
 }
 
@@ -152,6 +159,21 @@ async fn operate(
             source: Box::new(WorkdirError::OutOfScope("/private/provider/path".into())),
         });
     }
+    if let WorkdirSessionOperation::CommandOutput(output) = &request.operation {
+        if matches!(
+            *state.command_fault.lock().unwrap(),
+            Some(CommandResponseFault::EmptyWaiting)
+        ) {
+            return AxumJson(workdir::http::WorkdirSessionOperationResult::CommandOutput(
+                workdir::CommandOutput {
+                    chunks: vec![],
+                    next_cursor: output.cursor,
+                    terminal: None,
+                },
+            ))
+            .into_response();
+        }
+    }
     let result =
         dispatch_workdir_session_operation(state.session.as_ref(), request.operation).await;
     match result {
@@ -159,6 +181,15 @@ async fn operate(
         Ok(result) => {
             let fault = if is_write {
                 state.write_fault.lock().unwrap().take()
+            } else if matches!(&result, workdir::http::WorkdirSessionOperationResult::CommandOutput(output) if output.terminal.is_some())
+            {
+                let mut command_fault = state.command_fault.lock().unwrap();
+                if matches!(*command_fault, Some(CommandResponseFault::LostTerminal)) {
+                    command_fault.take();
+                    Some(WriteResponseFault::LostBody)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -237,6 +268,7 @@ impl HttpFixture {
             requests: Mutex::new(Vec::new()),
             operations: Mutex::new(Vec::new()),
             write_fault: Mutex::new(None),
+            command_fault: Mutex::new(None),
             observe_refusal: Mutex::new(false),
         });
         let app = Router::new()
@@ -358,7 +390,8 @@ async fn observe_interface(runtime: &WipRuntime, path: &str) -> wip_protocol::In
 }
 
 async fn native_call(runtime: &WipRuntime, path: &str, operation: &str, args: Json) -> Value {
-    let interface = observe_interface(runtime, path).await;
+    observe_interface(runtime, path).await;
+    let interface = super::checkout_wip_tests::contract(operation).reference();
     runtime
         .call(
             path.into(),
@@ -620,7 +653,8 @@ async fn committed_write_unknown(fault: WriteResponseFault) {
     let (runtime, router) = native_runtime(remote);
     let file = "/checkouts/main/src/deep/a.txt";
     native_call(&runtime, file, "read", json!({})).await;
-    let interface = observe_interface(&runtime, file).await;
+    observe_interface(&runtime, file).await;
+    let interface = super::checkout_wip_tests::contract("write").reference();
     *fixture.state.write_fault.lock().unwrap() = Some(fault);
     let error = runtime
         .call(
@@ -797,4 +831,176 @@ async fn remote_checkout_diagnostic_context_keeps_wip_refusal_classification_wit
         1,
         "refusal was retried"
     );
+}
+
+// Full collection/projection integration: production HTTP client, local process pipes,
+// Bash collector/store, WIP codec and common file dispatch. Only HTTP response loss is injected.
+#[tokio::test]
+async fn remote_native_bash_retains_streams_quota_and_replays_lost_terminal_through_common_files() {
+    watchdog(async {
+        let f = HttpFixture::new(WorkdirSessionCapabilities::ALL).await;
+        let remote = Arc::new(f.open(TOKEN).await.unwrap());
+        let router = Arc::new(WorkdirSessionRouter::new());
+        router.attach(WorkdirAttachmentAlias::new("main").unwrap(), remote.clone()).unwrap();
+        let mut registry = WipMountRegistry::new();
+        crate::checkout::mount_checkouts(&mut registry, router.clone(), tools::Tracker::new(), None).unwrap();
+        let view = tools::bash_output::BashOutputView::new();
+        crate::feature::builtin::bash::mount(&mut registry, router.clone(), view, None).unwrap();
+        let runtime = WipRuntime::new(WipHost::new(registry), SecurityContext::new("remote-bash"), 0).unwrap();
+        *f.state.command_fault.lock().unwrap() = Some(CommandResponseFault::LostTerminal);
+        let run = runtime.invoke("/bash-output".into(), contextual_reference("yoi.bash/command/v1", "/bash-output"), "run".into(), json!({"input":{"command":r"printf 'first\nneedle\n'; printf '%200000s' ''; printf '\377€' >&2; exit 7","cwd":"."}}), Default::default()).await.unwrap();
+        f.public_output(run.content.as_ref().unwrap());
+        let result: Json = serde_json::from_str(&run.content.unwrap()).unwrap();
+        assert_eq!(result["metadata"]["stdout_saved"], 200013);
+        assert_eq!(result["metadata"]["stderr_saved"], 4);
+        assert_eq!(result["metadata"]["terminal"]["exit_code"], 7);
+        assert_eq!(result["metadata"]["terminal"]["transport_complete"], true);
+        assert_eq!(result["metadata"]["storage_truncated"], false);
+        assert_eq!(result["preview_omitted"], true);
+        for name in ["stdout_entry", "stderr_entry", "order_entry"] {
+            runtime.inspect(result[name].as_str().unwrap().into(), false).await.unwrap();
+        }
+        let stdout = result["stdout_entry"].as_str().unwrap();
+        let search = runtime.invoke(stdout.into(), crate::file_operation::Contract::SearchText.reference(), "search".into(), json!({"pattern":"needle","limit":2}), Default::default()).await.unwrap();
+        assert!(search.content.unwrap().contains("needle"));
+        let stderr = runtime.invoke(result["stderr_entry"].as_str().unwrap().into(), crate::file_operation::Contract::ReadBytes.reference(), "read".into(), json!({"limit":4}), Default::default()).await.unwrap();
+        let stderr: Json = serde_json::from_str(&stderr.content.unwrap()).unwrap();
+        use base64::Engine as _;
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(stderr["data"].as_str().unwrap()).unwrap(), [vec![255], "€".as_bytes().to_vec()].concat());
+        let run = runtime.invoke("/bash-output".into(), contextual_reference("yoi.bash/command/v1", "/bash-output"), "run".into(), json!({"input":{"command":"printf '%4194303s' ''; printf '€'","cwd":"."}}), Default::default()).await.unwrap();
+        let result: Json = serde_json::from_str(&run.content.unwrap()).unwrap();
+        assert_eq!(result["metadata"]["stdout_saved"], 4194304);
+        assert_eq!(result["metadata"]["stdout_seen"], 4194306);
+        assert_eq!(result["metadata"]["transport_truncation"], "byte_budget");
+        assert_eq!(result["metadata"]["storage_truncated"], true);
+        let tail = runtime.invoke(result["stdout_entry"].as_str().unwrap().into(), crate::file_operation::Contract::ReadBytes.reference(), "read".into(), json!({"offset":4194303,"limit":4}), Default::default()).await.unwrap();
+        let tail: Json = serde_json::from_str(&tail.content.unwrap()).unwrap();
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(tail["data"].as_str().unwrap()).unwrap(), vec![0xe2]);
+        assert_eq!(tail["eof"], true);
+        assert_eq!(f.state.operations.lock().unwrap().iter().filter(|op| matches!(op, WorkdirSessionOperation::CommandStart(_))).count(), 2);
+        assert!(f.state.command_fault.lock().unwrap().is_none());
+        router.close_all().await.unwrap();
+        f.assert_endpoints();
+    }).await;
+}
+
+#[tokio::test]
+async fn waiting_remote_command_rejects_empty_response_without_http_busy_loop() {
+    watchdog(async {
+        let f = HttpFixture::new(WorkdirSessionCapabilities::ALL).await;
+        let remote = f.open(TOKEN).await.unwrap();
+        *f.state.command_fault.lock().unwrap() = Some(CommandResponseFault::EmptyWaiting);
+        let error = remote
+            .command_output(workdir::CommandOutputRequest {
+                handle: workdir::CommandHandle("unused".into()),
+                cursor: 0,
+                limit: 1024,
+                wait: true,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkdirError::Unavailable(_)));
+        assert_eq!(
+            f.state
+                .operations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| matches!(op, WorkdirSessionOperation::CommandOutput(_)))
+                .count(),
+            1
+        );
+        remote.close().await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn remote_checked_byte_read_uses_common_contract_and_keeps_binary_boundaries() {
+    use base64::Engine as _;
+    let fixture = HttpFixture::new(WorkdirSessionCapabilities::READ_ONLY).await;
+    let remote = Arc::new(fixture.open(TOKEN).await.unwrap());
+    let (runtime, _) = native_runtime(remote);
+    let path = "/checkouts/main/src/deep/a.txt";
+    observe_interface(&runtime, path).await;
+    let output = runtime
+        .invoke(
+            path.into(),
+            crate::file_operation::Contract::ReadBytes.reference(),
+            "read".into(),
+            json!({"offset":1,"limit":3}),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let json: Json = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    assert_eq!(json["encoding"], "base64");
+    assert_eq!(json["offset"], 1);
+    assert_eq!(json["next_offset"], 4);
+    let source = fixture
+        .state
+        .session
+        .read_bytes(workdir::ReadBytesRequest {
+            path: WorkdirPath::new("src/deep/a.txt").unwrap(),
+            offset: 1,
+            max_bytes: 3,
+            expected_hash: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(json["data"].as_str().unwrap())
+            .unwrap(),
+        source.bytes
+    );
+}
+
+#[tokio::test]
+async fn http_failed_text_read_does_not_authorize_mutations() {
+    for operation in ["write", "edit"] {
+        for oversized in ["\"".repeat(50_000), "x".repeat(65_530)] {
+            let fixture = HttpFixture::new(WorkdirSessionCapabilities::READ_WRITE).await;
+            let remote = fixture.open(TOKEN).await.unwrap();
+            checkout_wip_tests::failed_text_read_cannot_authorize_mutation(
+                Arc::new(remote),
+                &fixture.dir.path().join("text"),
+                &oversized,
+                operation,
+            )
+            .await;
+            let mutations = fixture
+                .state
+                .operations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        op,
+                        WorkdirSessionOperation::CheckoutExecute(CheckoutRequest {
+                            operation: CheckoutOperation::Write { .. }
+                                | CheckoutOperation::Edit { .. },
+                            ..
+                        })
+                    )
+                })
+                .count();
+            assert_eq!(
+                mutations, 1,
+                "only the mutation after a successful Read may reach the provider"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_long_utf8_search_refuses_incomplete_line_and_preserves_line_pagination() {
+    let fixture = HttpFixture::new(WorkdirSessionCapabilities::READ_WRITE).await;
+    let remote = fixture.open(TOKEN).await.unwrap();
+    checkout_wip_tests::assert_long_utf8_search_refuses_incomplete_line(
+        Arc::new(remote),
+        fixture.dir.path(),
+    )
+    .await;
 }

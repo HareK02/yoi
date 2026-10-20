@@ -1296,6 +1296,7 @@ mod tests {
         LoggedHistoryEntry {
             item,
             metadata: LoggedSessionHistoryMetadata {
+                input_metadata: None,
                 entry_id: LoggedSessionHistoryEntryId(id.to_owned()),
                 origin,
                 derivation: None,
@@ -1537,6 +1538,7 @@ mod tests {
                         prompt_provenance: None,
                     },
                     metadata: LoggedSessionHistoryMetadata {
+                        input_metadata: None,
                         entry_id: LoggedSessionHistoryEntryId("system-item".into()),
                         origin: LoggedSessionHistoryOrigin::BackendInstruction {
                             operation_id: None,

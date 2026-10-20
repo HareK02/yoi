@@ -238,6 +238,25 @@ pub(super) async fn root(
     let drive = drive_grants::authorized_drive(api, context, workspace, false).await?;
     blocking(false, move || drive.root()).await.map(public_node)
 }
+/// Query only the authenticated caller's current ceiling using the operation authorizer.
+/// This is admission/publication evidence, never authority retained for a later mutation.
+pub(super) async fn capabilities(
+    api: &WorkspaceApi,
+    context: &ServerRequestContext,
+    workspace: &str,
+) -> DriveResult<DriveCapabilities> {
+    let drive = drive_grants::authorized_drive(api, context, workspace, false).await?;
+    let write = blocking(false, move || match drive.check_authorized(true) {
+        Ok(()) => Ok(true),
+        Err(workspace_drive::Error::Denied) => {
+            drive.check_authorized(false)?;
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    })
+    .await?;
+    Ok(DriveCapabilities { write })
+}
 pub(super) async fn metadata(
     api: &WorkspaceApi,
     context: &ServerRequestContext,
@@ -581,6 +600,9 @@ pub(super) fn router(service: Arc<ServerApiContractService>) -> Router {
         .merge(streaming_router(service.clone()))
         .merge(server_api::server_api_axum::drive_root(service.clone()))
         .merge(server_api::server_api_axum::drive_metadata(service.clone()))
+        .merge(server_api::server_api_axum::drive_capabilities(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::drive_list(service.clone()))
         .merge(server_api::server_api_axum::drive_search(service.clone()))
         .merge(server_api::server_api_axum::drive_read_text(

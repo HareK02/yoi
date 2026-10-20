@@ -403,3 +403,71 @@ fn check_pattern(pattern: &str) -> Result<(), ToolError> {
 #[cfg(test)]
 #[path = "checkout_tests.rs"]
 mod tests;
+
+/// Read a bounded native text window through the same checked target.
+/// The returned one-shot action records prior-Read only after the caller's presentation succeeds.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_checkout_text(
+    router: Arc<WorkdirSessionRouter>,
+    tracker: Tracker,
+    alias: &str,
+    generation: u64,
+    path: WorkdirPath,
+    validator: Vec<u8>,
+    offset: usize,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<(workdir::ReadResult, Option<Vec<u8>>, impl FnOnce()), ToolError> {
+    let selected =
+        crate::routing::resolve_session(&router, Some(alias), WorkdirSessionCapability::Read)?;
+    if selected.generation != generation {
+        return Err(stale_checkout("checkout connection changed"));
+    }
+    let tracker = tracker.scoped_attachment(&selected.alias, selected.generation);
+    let target = FileTarget {
+        session: selected.session.clone(),
+        path: path.clone(),
+        validator: Some(validator),
+    };
+    let (result, validator) = target.read(offset, limit, max_bytes).await?;
+    let hash = result.content_hash.clone();
+    let total_lines = result.total_lines;
+    Ok((result, validator, move || {
+        tracker.record_workdir_observation(&path, hash, total_lines);
+    }))
+}
+
+/// Binary-safe checked byte window. This does not establish a text prior-Read observation.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_checkout_bytes(
+    router: Arc<WorkdirSessionRouter>,
+    alias: &str,
+    generation: u64,
+    path: WorkdirPath,
+    validator: Vec<u8>,
+    offset: u64,
+    max_bytes: usize,
+) -> Result<(workdir::ReadBytesResult, Vec<u8>), ToolError> {
+    let selected =
+        crate::routing::resolve_session(&router, Some(alias), WorkdirSessionCapability::Read)?;
+    if selected.generation != generation {
+        return Err(stale_checkout("checkout connection changed"));
+    }
+    let result = selected
+        .session
+        .checkout_execute(workdir::CheckoutRequest {
+            target: path.clone(),
+            validator,
+            operation: workdir::CheckoutOperation::ReadBytes { offset, max_bytes },
+        })
+        .await
+        .map_err(crate::file_target::checked_error)?;
+    match result.output {
+        workdir::CheckoutOutput::ReadBytes(read)
+            if read.path == path && read.offset == offset && read.bytes.len() <= max_bytes =>
+        {
+            Ok((read, result.observation.validator))
+        }
+        _ => Err(crate::file_target::readonly_result_error("ReadBytes")),
+    }
+}

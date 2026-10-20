@@ -187,7 +187,7 @@ async fn config_call(
     runtime
         .invoke(
             path.into(),
-            config_interface(path),
+            if matches!(operation,"edit"|"write") {wip_protocol::InterfaceReference {scope:"/".into(),name:format!("yoi.file/{operation}-text/v1")}} else {config_interface(path)},
             operation.into(),
             args,
             agen::tool::ToolExecutionContext::direct(),
@@ -859,6 +859,7 @@ async fn workspace_config_actual_remote_and_embedded_clients_use_authenticated_w
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: None,
+            execution_grant: None,
         }),
     )
     .await

@@ -23,7 +23,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process", "rt", "sync", "time"] }
 tracing = { workspace = true }
 workdir = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
 filetime = "0.2.27"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

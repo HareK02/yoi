@@ -67,7 +67,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use workdir::{
-    CommandOutput, CommandStatus, WorkdirSessionHandle, dispatch_workdir_session_operation,
+    CommandOutput, WorkdirSessionHandle, dispatch_workdir_session_operation,
     http::{
         OpenWorkdirSessionRequest, OpenWorkdirSessionResponse, WorkdirSessionId,
         WorkdirSessionOperation, WorkdirSessionOperationRequest, WorkdirSessionOperationResult,
@@ -914,13 +914,9 @@ async fn run_workdir_session_operation(
             {
                 Ok(result) => result?,
                 Err(_) => CommandOutput {
-                    exit_code: None,
-                    timed_out: false,
-                    status: CommandStatus::Running,
-                    content: String::new(),
-                    next_cursor: Some(cursor),
-                    truncated: false,
-                    output_path: None,
+                    chunks: Vec::new(),
+                    next_cursor: cursor,
+                    terminal: None,
                 },
             };
             WorkdirSessionOperationResult::CommandOutput(output)
@@ -2426,6 +2422,7 @@ pub enum RuntimeHttpServerError {
 
 #[cfg(test)]
 mod tests {
+    mod command_transport_tests;
     #[cfg(feature = "fs-store")]
     mod session_material_tests;
 

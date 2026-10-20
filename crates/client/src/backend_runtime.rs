@@ -908,6 +908,7 @@ mod tests {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: None,
+            execution_grant: None,
         };
 
         let response = create_backend_worker_with_client(&target, &create, &api)

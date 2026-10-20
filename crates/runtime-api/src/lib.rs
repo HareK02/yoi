@@ -518,9 +518,10 @@ pub struct WorkerRestorePreparation {
     pub workspace_api: Option<WorkspaceApiRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir_attachments: Option<Vec<LogicalWorkdirAttachment>>,
+    /// Retained in saved Restore intents; Restore does not apply Repository access.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repository_access: Vec<WorkingDirectoryRepositoryAccessRequest>,
-    /// Read-only references resolved by Workspace only after this operation owns admission.
+    /// Retained references from saved resource preparation, not Restore prerequisites.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repository_access_workdirs: Vec<RepositoryAccessWorkdirReference>,
 }

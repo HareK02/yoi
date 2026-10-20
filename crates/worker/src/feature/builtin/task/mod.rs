@@ -276,7 +276,9 @@ mod tests {
     use super::*;
     use crate::hook::{PreRequestInfo, SystemItemAppendHandle};
 
-    fn pre_request_context(pending: Arc<Mutex<Vec<SystemItem>>>) -> PreRequestContext {
+    fn pre_request_context(
+        pending: Arc<Mutex<Vec<session_store::LoggedSystemHistoryEntry>>>,
+    ) -> PreRequestContext {
         PreRequestContext::new(
             PreRequestInfo {
                 item_count: 1,
@@ -315,7 +317,7 @@ mod tests {
 
         let queued = pending.lock().expect("pending queue poisoned");
         assert_eq!(queued.len(), 1);
-        let SystemItem::TaskReminder { body, .. } = &queued[0] else {
+        let SystemItem::TaskReminder { body, .. } = &queued[0].item else {
             panic!("unexpected system item: {:?}", queued[0]);
         };
         assert!(body.starts_with("Current session steps are listed below."));
@@ -339,7 +341,7 @@ mod tests {
         }
 
         let queued = pending.lock().expect("pending queue poisoned");
-        let SystemItem::TaskReminder { source, body, .. } = &queued[0] else {
+        let SystemItem::TaskReminder { source, body, .. } = &queued[0].item else {
             panic!("unexpected system item: {:?}", queued[0]);
         };
         assert_eq!(*source, SystemReminderSource::TaskInactivity);
@@ -452,7 +454,7 @@ mod tests {
         }
         let queued = pending.lock().expect("pending queue poisoned");
         assert_eq!(queued.len(), 1);
-        let SystemItem::TaskReminder { body, .. } = &queued[0] else {
+        let SystemItem::TaskReminder { body, .. } = &queued[0].item else {
             panic!("unexpected system item: {:?}", queued[0]);
         };
         assert!(body.contains("taskid 1 (completed) done"));

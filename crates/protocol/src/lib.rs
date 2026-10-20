@@ -408,7 +408,7 @@ pub enum Method {
 /// Transport is fire-and-forget; receivers must tolerate out-of-order
 /// delivery (e.g. `TurnEnded` arriving after `ShutDown` for the same
 /// child Worker).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -982,6 +982,17 @@ pub enum SessionEntryProvenance {
     LegacyUnknown,
 }
 
+/// Public use decisions contain no Feature identity or private payload. Absence
+/// denotes the older projection contract, not permission to expose System input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SessionEntryUsePolicy {
+    pub observation_readable: bool,
+    pub memory_evidence: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -994,6 +1005,8 @@ pub struct SessionSnapshotEntry {
     pub provenance: SessionEntryProvenance,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derived_from: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_policy: Option<SessionEntryUsePolicy>,
     #[serde(flatten)]
     pub data: SessionSnapshotEntryData,
 }
@@ -1180,12 +1193,10 @@ pub enum Event {
     },
     /// One agent-injected system item committed to history.
     ///
-    /// Carries the JSON form of `session_store::SystemItem`. Covers
-    /// `Method::Notify` echoes, child-Worker lifecycle events from
-    /// `Method::WorkerEvent`, `@<path>` resolution payloads, and any future
-    /// Clients dispatch on the `kind` tag for typed rendering instead
-    /// of parsing free-text prefixes like `[Notification] …` or
-    /// `[File: …]`.
+    /// Carries the allowlisted JSON form of `session_store::PublicSystemItem`,
+    /// not the storage record. Its descriptive `kind` is independent from the
+    /// typed `presentation` used for notification, reminder, or context rendering.
+    /// Private Feature payloads and prompt provenance are never event data.
     ///
     /// One event per `LogEntry::AnnotatedSystemItem` commit. Disk-side and
     /// wire-side are 1:1.
@@ -2621,6 +2632,7 @@ mod tests {
             session: SessionSnapshot {
                 pending_submissions: PendingSubmissionsSnapshot::default(),
                 entries: vec![SessionSnapshotEntry {
+                    use_policy: None,
                     entry_id: "entry-1".into(),
                     timestamp: 1,
                     provenance: SessionEntryProvenance::HumanInput,
