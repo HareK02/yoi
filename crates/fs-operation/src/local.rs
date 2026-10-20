@@ -200,6 +200,7 @@ fn run_read_with_limits(
         total_lines,
         content_hash: content_hasher.finalize().into(),
         truncated: end < total_lines || byte_truncated,
+        byte_truncated,
     })
 }
 
@@ -886,6 +887,34 @@ mod bounded_read_tests {
     }
 
     #[test]
+    fn bounded_read_distinguishes_utf8_byte_cut_from_complete_line_continuation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::write(root.join("text"), "雪雪needle\nnext").unwrap();
+        for (offset, max_bytes, bytes, more, cut) in [
+            (0, 5, "雪", true, true),
+            (0, 64, "雪雪needle\n", true, false),
+            (1, 64, "next", false, false),
+        ] {
+            let result = run_read_bounded(
+                &root,
+                ReadRequest {
+                    path: FsPath::new("text").unwrap(),
+                    offset,
+                    limit: 1,
+                    max_bytes,
+                },
+                &RootAccess(root.clone()),
+                BoundedReadLimits::new(1024, 64).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(result.bytes, bytes.as_bytes());
+            assert_eq!(result.truncated, more);
+            assert_eq!(result.byte_truncated, cut);
+        }
+    }
+
+    #[test]
     fn bounded_read_caps_retained_response_independently_of_request() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -907,6 +936,7 @@ mod bounded_read_tests {
         assert_eq!(result.bytes, b"alpha");
         assert_eq!(result.total_lines, 3);
         assert!(result.truncated);
+        assert!(result.byte_truncated);
     }
 }
 

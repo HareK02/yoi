@@ -77,6 +77,7 @@ mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(index, value)| protocol::SessionSnapshotEntry {
+                        use_policy: None,
                         entry_id: format!("test-{index}"),
                         timestamp: index as u64,
                         provenance: protocol::SessionEntryProvenance::LegacyUnknown,

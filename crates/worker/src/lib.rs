@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod authorized_workdir;
 mod backend_job;
 pub use backend_job::BackendJobExecutionBinding;
 pub mod bootstrap;
@@ -15,6 +16,7 @@ pub mod hook;
 pub(crate) mod in_flight;
 pub mod ipc;
 pub mod job;
+mod metadata_lifecycle;
 pub mod model_client;
 mod paste_artifact_tool;
 pub mod prompt;
@@ -26,6 +28,7 @@ mod session_history;
 pub mod shared_state;
 mod shutdown_after_idle;
 mod subject_release;
+mod subjektiv_metadata;
 pub use subject_release::SubjectReleaseReservation;
 pub mod skill;
 pub mod spawn;
@@ -39,7 +42,7 @@ mod worker;
 
 pub use bootstrap::{
     BootstrappedWorker, PreparedWorker, WorkerBootstrap, WorkerBootstrapError,
-    WorkerBootstrapLayout, bash_output_dir_for_worker_id, start_worker_controller,
+    WorkerBootstrapLayout, start_worker_controller,
 };
 pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};
 pub use controller::{ShutdownReceiver, WorkerController, WorkerControllerTransport, WorkerHandle};

@@ -24,6 +24,7 @@ pub(crate) fn test_logged_history_entry(item: impl Into<Item>) -> LoggedHistoryE
     LoggedHistoryEntry {
         item: session_store::LoggedItem::from(item.into()),
         metadata: LoggedSessionHistoryMetadata {
+            input_metadata: None,
             entry_id: LoggedSessionHistoryEntryId::new(),
             origin: LoggedSessionHistoryOrigin::LegacyUnknown,
             derivation: None,
@@ -38,6 +39,7 @@ pub(crate) fn test_logged_system_entry(
     session_store::LoggedSystemHistoryEntry {
         item,
         metadata: LoggedSessionHistoryMetadata {
+            input_metadata: None,
             entry_id: LoggedSessionHistoryEntryId::new(),
             origin: LoggedSessionHistoryOrigin::LegacyUnknown,
             derivation: None,
@@ -58,10 +60,21 @@ pub(crate) fn metadata(
     derivation: Option<SessionHistoryDerivation>,
 ) -> SessionHistoryMetadata {
     SessionHistoryMetadata {
+        input_metadata: None,
         entry_id: SessionHistoryEntryId::new(),
         origin,
         derivation,
     }
+}
+
+pub(crate) fn compaction_use(
+    metadata: &SessionHistoryMetadata,
+) -> session_store::InputCompactionUse {
+    metadata
+        .input_metadata
+        .as_ref()
+        .map(|input| input.usage().compaction)
+        .unwrap_or(session_store::InputCompactionUse::Retain)
 }
 
 #[cfg(test)]
@@ -80,6 +93,7 @@ pub(crate) fn history_entry_with_id(
     HistoryEntry::new(
         item,
         SessionHistoryMetadata {
+            input_metadata: None,
             entry_id,
             origin,
             derivation: None,
@@ -130,22 +144,10 @@ pub(crate) fn restore_history_entries(
                 }
                 *target = from_logged(entry);
             }
-            LogEntry::AnnotatedSystemItem { entry, .. } => {
-                history.push(HistoryEntry::new(entry.item.to_history_item(), {
-                    let mut metadata = entry.metadata.clone();
-                    // Old typed startup records used generic placeholder origins.
-                    // Preserve explicitly supplied metadata on current contributions.
-                    if matches!(
-                        metadata.origin,
-                        WorkerHistoryProvenance::DerivedSummary
-                            | WorkerHistoryProvenance::LegacyUnknown
-                    ) && matches!(entry.item, session_store::SystemItem::JournalStartup { .. })
-                    {
-                        metadata.origin = WorkerHistoryProvenance::JournalContext;
-                    }
-                    metadata
-                }))
-            }
+            LogEntry::AnnotatedSystemItem { entry, .. } => history.push(HistoryEntry::new(
+                entry.item.to_history_item(),
+                entry.metadata.clone(),
+            )),
             _ => {}
         }
     }

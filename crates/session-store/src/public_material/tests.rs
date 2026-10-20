@@ -9,6 +9,7 @@ fn entry(id: &str, item: LoggedItem) -> LoggedHistoryEntry {
     LoggedHistoryEntry {
         item,
         metadata: LoggedSessionHistoryMetadata {
+            input_metadata: None,
             entry_id: LoggedSessionHistoryEntryId(id.into()),
             origin: LoggedSessionHistoryOrigin::LocalHumanInput,
             derivation: None,
@@ -23,6 +24,27 @@ fn message(id: &str, role: LoggedRole, text: &str) -> LoggedHistoryEntry {
             content: vec![LoggedContentPart::Text { text: text.into() }],
         },
     )
+}
+fn system_context(
+    id: &str,
+    text: &str,
+    compaction: crate::InputCompactionUse,
+) -> LoggedHistoryEntry {
+    let mut entry = message(id, LoggedRole::System, text);
+    entry.metadata.input_metadata = Some(
+        crate::HistoryInputMetadata::new(
+            crate::HistoryInputUsePolicy {
+                recording_material: crate::InputEvidenceUse::Exclude,
+                memory_evidence: crate::InputEvidenceUse::Exclude,
+                observation: crate::InputObservationUse::Hidden,
+                compaction,
+            },
+            None,
+            None,
+        )
+        .unwrap(),
+    );
+    entry
 }
 fn seed(session: SessionId, history: Vec<LoggedHistoryEntry>) -> LogEntry {
     LogEntry::AnnotatedSegmentStart {
@@ -347,7 +369,11 @@ fn yield_resume_cancel_keep_original_boundary_identity_across_compaction() {
         .descriptors()
         .cloned()
         .collect();
-    let mut summary = message("summary", LoggedRole::User, "must not replace originals");
+    let mut summary = system_context(
+        "summary",
+        "must not replace originals",
+        crate::InputCompactionUse::OpeningSummary,
+    );
     summary.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
     summary.metadata.derivation = Some(crate::LoggedHistoryDerivation {
         sources: vec![
@@ -543,14 +569,18 @@ fn reasoning_proves_rollback_safety_but_private_and_derived_items_are_not_materi
     let store = FsStore::new(temp.path()).unwrap();
     let session = crate::new_session_id();
     let segment = crate::new_segment_id();
-    let mut derived = message("derived", LoggedRole::User, "summary");
+    let mut derived = system_context("derived", "summary", crate::InputCompactionUse::Retain);
     derived.metadata.origin = LoggedSessionHistoryOrigin::DerivedSummary;
-    let mut journal = message("journal", LoggedRole::User, "frozen Journal reference");
+    let mut journal = system_context(
+        "journal",
+        "frozen Journal reference",
+        crate::InputCompactionUse::ReferenceInput,
+    );
     journal.metadata.origin = LoggedSessionHistoryOrigin::JournalContext;
-    let mut summary = message(
+    let mut summary = system_context(
         "compaction-summary",
-        LoggedRole::User,
         "complementary summary",
+        crate::InputCompactionUse::OpeningSummary,
     );
     summary.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
     let reasoning = entry(
@@ -579,18 +609,23 @@ fn reasoning_proves_rollback_safety_but_private_and_derived_items_are_not_materi
                 LogEntry::AnnotatedSystemItem {
                     ts: 1,
                     entry: crate::LoggedSystemHistoryEntry {
-                        item: crate::SystemItem::JournalStartup {
+                        item: crate::SystemItem::Input {
                             body: "previous Journal must not become new recording material".into(),
-                            snapshot: serde_json::json!({"journals": []}),
-                            snapshot_sha256: "retained-digest".into(),
-                            prompt_provenance: crate::PromptRenderProvenance {
-                                workspace_id: None,
-                                source_digest: "source".into(),
-                                projection_digest: "projection".into(),
-                                logical_name: "internal.subjektiv_journal_startup".into(),
-                            },
                         },
                         metadata: LoggedSessionHistoryMetadata {
+                            input_metadata: Some(
+                                crate::HistoryInputMetadata::new(
+                                    crate::HistoryInputUsePolicy {
+                                        recording_material: crate::InputEvidenceUse::Exclude,
+                                        memory_evidence: crate::InputEvidenceUse::Exclude,
+                                        observation: crate::InputObservationUse::Hidden,
+                                        compaction: crate::InputCompactionUse::ReferenceInput,
+                                    },
+                                    None,
+                                    None,
+                                )
+                                .unwrap(),
+                            ),
                             entry_id: LoggedSessionHistoryEntryId("startup-journal".into()),
                             origin: LoggedSessionHistoryOrigin::DerivedSummary,
                             derivation: None,
@@ -777,6 +812,19 @@ fn schema_v3_compaction_migrates_persistently_and_strict_reader_keeps_original_i
             panic!()
         };
         summary.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
+        summary.metadata.input_metadata = Some(
+            crate::HistoryInputMetadata::new(
+                crate::HistoryInputUsePolicy {
+                    recording_material: crate::InputEvidenceUse::Exclude,
+                    memory_evidence: crate::InputEvidenceUse::Exclude,
+                    observation: crate::InputObservationUse::Hidden,
+                    compaction: crate::InputCompactionUse::OpeningSummary,
+                },
+                None,
+                None,
+            )
+            .unwrap(),
+        );
         assert_eq!(history, &[summary]);
         // Run-transition ids synthesized from byte offsets must be frozen before
         // the changed summary record shifts every subsequent record offset.
@@ -825,8 +873,14 @@ fn midturn_compaction_uses_exact_source_ids_and_preserves_discarded_originals() 
             ],
         )
         .unwrap();
-    let mut summary = message("summary", LoggedRole::User, "never use as original");
-    summary.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
+    let mut summary = system_context(
+        "summary",
+        "never use as original",
+        crate::InputCompactionUse::OpeningSummary,
+    );
+    summary.metadata.origin = LoggedSessionHistoryOrigin::Provided {
+        producer: "renamed-summary-owner".into(),
+    };
     summary.metadata.derivation = Some(crate::LoggedHistoryDerivation {
         sources: vec![
             LoggedSessionHistoryEntryId("u".into()),
@@ -1030,7 +1084,11 @@ fn zero_turn_fork_from_seed_and_consecutive_compactions_preserve_original_identi
     for index in 0..3 {
         let compact = crate::new_segment_id();
         let summary_id = format!("summary-{index}");
-        let mut summary = message(&summary_id, LoggedRole::User, "not original");
+        let mut summary = system_context(
+            &summary_id,
+            "not original",
+            crate::InputCompactionUse::OpeningSummary,
+        );
         summary.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
         summary.metadata.derivation = Some(crate::LoggedHistoryDerivation {
             sources: source_ids
@@ -1178,7 +1236,11 @@ fn correction_preserves_original_identity_across_compaction_without_summary_fall
             ],
         )
         .unwrap();
-    let mut summary = message("summary", LoggedRole::User, "not original");
+    let mut summary = system_context(
+        "summary",
+        "not original",
+        crate::InputCompactionUse::OpeningSummary,
+    );
     summary.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
     summary.metadata.derivation = Some(crate::LoggedHistoryDerivation {
         sources: vec![LoggedSessionHistoryEntryId("result".into())],
@@ -1226,7 +1288,11 @@ fn compaction_without_exact_derivation_or_with_invalid_turn_is_rejected() {
         ),
     ] {
         let segment = crate::new_segment_id();
-        let mut summary = message("summary", LoggedRole::User, "not original");
+        let mut summary = system_context(
+            "summary",
+            "not original",
+            crate::InputCompactionUse::OpeningSummary,
+        );
         summary.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
         summary.metadata.derivation = derivation;
         let mut start = seed(session, vec![summary]);
@@ -1241,5 +1307,183 @@ fn compaction_without_exact_derivation_or_with_invalid_turn_is_rejected() {
             SessionPublicMaterialReader::open_fs(temp.path(), session, segment, Default::default()),
             Err(PublicMaterialError::Inconsistent)
         ));
+    }
+}
+
+#[test]
+fn generic_system_material_uses_explicit_evidence_purpose_not_producer_or_body() {
+    use crate::{
+        FeatureInputPayload, HistoryInputMetadata, HistoryInputUsePolicy, InputCompactionUse,
+        InputEvidenceUse, InputObservationUse, LoggedSystemHistoryEntry, SystemInputEnvelope,
+    };
+    for worker_layout in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let session = crate::new_session_id();
+        let segment = crate::new_segment_id();
+        let fork = crate::new_segment_id();
+        let make =
+            |producer: &str, recording_material, memory_evidence, body: &str, public: bool| {
+                LoggedSystemHistoryEntry::from_input(
+                    LoggedSessionHistoryOrigin::Provided {
+                        producer: producer.into(),
+                    },
+                    None,
+                    SystemInputEnvelope::new(
+                        format!("private model text: {body}"),
+                        HistoryInputMetadata::new(
+                            HistoryInputUsePolicy {
+                                recording_material,
+                                memory_evidence,
+                                observation: InputObservationUse::Hidden,
+                                compaction: InputCompactionUse::Retain,
+                            },
+                            Some(
+                                FeatureInputPayload::encode(
+                                    "unknown:future",
+                                    99,
+                                    &serde_json::json!({"private": "not-public"}),
+                                )
+                                .unwrap(),
+                            ),
+                            public.then(|| crate::PublicSystemItem {
+                                kind: "context".into(),
+                                body: body.into(),
+                                presentation: crate::PublicSystemPresentation::Context,
+                            }),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                )
+            };
+        let inputs = [
+            make(
+                "same-owner",
+                InputEvidenceUse::Include,
+                InputEvidenceUse::Exclude,
+                "do not extract this; original material",
+                true,
+            ),
+            make(
+                "same-owner",
+                InputEvidenceUse::Exclude,
+                InputEvidenceUse::Include,
+                "memory-only original",
+                true,
+            ),
+            make(
+                "renamed-owner",
+                InputEvidenceUse::Exclude,
+                InputEvidenceUse::Exclude,
+                "reference without warning text",
+                true,
+            ),
+            make(
+                "private-only",
+                InputEvidenceUse::Include,
+                InputEvidenceUse::Include,
+                "must not publish without projection",
+                false,
+            ),
+        ];
+        let root = if worker_layout {
+            temp.path().join("worker")
+        } else {
+            temp.path().join(session.to_string())
+        };
+        let store: Box<dyn Store> = if worker_layout {
+            Box::new(WorkerSessionStore::new(&root).unwrap())
+        } else {
+            Box::new(FsStore::new(temp.path()).unwrap())
+        };
+        store
+            .create_segment(session, segment, &[seed(session, vec![])])
+            .unwrap();
+        for entry in &inputs {
+            store
+                .append(
+                    session,
+                    segment,
+                    &LogEntry::AnnotatedSystemItem {
+                        ts: 2,
+                        entry: entry.clone(),
+                        extensions: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .append(
+                session,
+                segment,
+                &LogEntry::TurnEnd {
+                    ts: 3,
+                    turn_count: 1,
+                },
+            )
+            .unwrap();
+        let mut fork_seed = seed(
+            session,
+            inputs
+                .iter()
+                .map(LoggedSystemHistoryEntry::to_history_entry)
+                .collect(),
+        );
+        if let LogEntry::AnnotatedSegmentStart { forked_from, .. } = &mut fork_seed {
+            *forked_from = Some(crate::SegmentOrigin {
+                segment_id: segment,
+                at_turn_index: 1,
+            });
+        }
+        store.create_segment(session, fork, &[fork_seed]).unwrap();
+        let open = |active, purpose| {
+            if worker_layout {
+                SessionPublicMaterialReader::open_worker_for_use(
+                    &root,
+                    active,
+                    Default::default(),
+                    crate::retention::fs_retention(temp.path()),
+                    purpose,
+                )
+                .unwrap()
+            } else {
+                SessionPublicMaterialReader::open_fs_for_use(
+                    temp.path(),
+                    session,
+                    active,
+                    Default::default(),
+                    crate::retention::fs_retention(temp.path()),
+                    purpose,
+                )
+                .unwrap()
+            }
+        };
+        for (purpose, selected, expected_text) in [
+            (
+                PublicMaterialUse::Recording,
+                0,
+                "do not extract this; original material",
+            ),
+            (PublicMaterialUse::MemoryEvidence, 1, "memory-only original"),
+        ] {
+            let original = open(segment, purpose);
+            let inherited = open(fork, purpose);
+            assert_eq!(
+                ids(&original),
+                vec![format!("E{}", inputs[selected].metadata.entry_id.0)]
+            );
+            assert_eq!(ids(&inherited), ids(&original));
+            let descriptor = inherited.descriptors().next().unwrap();
+            let body = inherited
+                .read_content(descriptor, 0, 16 * 1024)
+                .unwrap()
+                .content;
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["role"], "system");
+            assert_eq!(value["content"][0]["text"], expected_text);
+            assert!(!body.contains("not-public"));
+            assert!(!body.contains("private model text"));
+            assert!(!body.contains("unknown:future"));
+        }
     }
 }

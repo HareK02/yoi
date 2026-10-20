@@ -41,13 +41,28 @@ async fn interface(r: &WipRuntime, path: &str) -> wip_protocol::InterfaceReferen
         .unwrap();
     p.interface
 }
+pub(super) fn contract(operation: &str) -> crate::file_operation::Contract {
+    use crate::file_operation::Contract as C;
+    match operation {
+        "read" => C::ReadLines,
+        "search" => C::SearchText,
+        "edit" => C::Edit,
+        "write" => C::Write,
+        "list" => C::List,
+        "glob" => C::Glob,
+        "grep" => C::Grep,
+        "create_file" => C::CreateFile,
+        _ => panic!("unknown file operation {operation}"),
+    }
+}
 async fn call(
     r: &WipRuntime,
     path: &str,
     operation: &str,
     args: Json,
 ) -> Result<ToolOutput, ToolError> {
-    let i = interface(r, path).await;
+    interface(r, path).await;
+    let i = contract(operation).reference();
     r.call(path.into(), i, operation.into(), args, Default::default())
         .await
 }
@@ -336,12 +351,26 @@ async fn checkout_wip_detach_alias_reuse_and_restore_fence_old_references() {
     let old = r.host.projection_live(path).await.unwrap().unwrap();
     router.detach(&alias).await.unwrap();
     assert!(r.host.projection_live(path).await.unwrap().is_none());
-    assert!(r.host.fetch_interface_live(&old.interface).await.is_err());
+    assert_eq!(
+        r.host
+            .fetch_interface_live(&old.interface)
+            .await
+            .unwrap()
+            .validator,
+        old.interface_validator
+    );
     router.attach(alias, session(&b, false)).unwrap();
     let new = r.host.projection_live(path).await.unwrap().unwrap();
-    assert_ne!(old.interface, new.interface);
+    assert_eq!(old.interface, new.interface);
     assert_ne!(old.object.validator, new.object.validator);
-    assert!(r.host.fetch_interface_live(&old.interface).await.is_err());
+    assert_eq!(
+        r.host
+            .fetch_interface_live(&old.interface)
+            .await
+            .unwrap()
+            .validator,
+        old.interface_validator
+    );
     assert!(
         call(
             &r,
@@ -354,14 +383,16 @@ async fn checkout_wip_detach_alias_reuse_and_restore_fence_old_references() {
     );
     let restored = runtime(router, None);
     let next = restored.host.projection_live(path).await.unwrap().unwrap();
-    assert_ne!(new.interface, next.interface);
+    assert_eq!(new.interface, next.interface);
     assert_ne!(new.object.validator, next.object.validator);
-    assert!(
+    assert_eq!(
         restored
             .host
             .fetch_interface_live(&new.interface)
             .await
-            .is_err()
+            .unwrap()
+            .validator,
+        new.interface_validator
     );
     assert_eq!(
         std::fs::read_to_string(b.path().join("file.txt")).unwrap(),
@@ -446,7 +477,11 @@ async fn checkout_wip_policy_is_not_feature_authority_and_compatibility_is_repla
     let mut registry = WipMountRegistry::new();
     crate::checkout::mount_checkouts(&mut registry, router.clone(), tools::Tracker::new(), None)
         .unwrap();
-    for def in tools::routed_builtin_tools(router, tools::Tracker::new(), dir.path().join("bash")) {
+    for def in tools::routed_builtin_tools(
+        router,
+        tools::Tracker::new(),
+        tools::bash_output::BashOutputView::new(),
+    ) {
         let (meta, tool) = def();
         let p = compatibility_projection(meta, tool, None).unwrap();
         registry.mount(p).unwrap();
@@ -497,7 +532,7 @@ async fn checkout_wip_post_operation_validators_support_cached_chains() {
         .unwrap();
     let r = runtime(router, None);
     let path = "/checkouts/main/file.txt";
-    let i = interface(&r, path).await;
+    interface(&r, path).await;
     // No rediscovery or Interface refresh between any of these operations.
     for (op, args) in [
         ("read", json!({})),
@@ -505,16 +540,23 @@ async fn checkout_wip_post_operation_validators_support_cached_chains() {
         ("write", json!({"content":"saved\n"})),
         ("read", json!({})),
     ] {
-        r.call(path.into(), i.clone(), op.into(), args, Default::default())
-            .await
-            .unwrap();
+        r.call(
+            path.into(),
+            contract(op).reference(),
+            op.into(),
+            args,
+            Default::default(),
+        )
+        .await
+        .unwrap();
     }
     assert_eq!(
         std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
         "saved\n"
     );
     let parent = "/checkouts/main";
-    let i = interface(&r, parent).await;
+    interface(&r, parent).await;
+    let i = contract("create_file").reference();
     for name in ["one.txt", "nested/two.txt"] {
         r.call(
             parent.into(),
@@ -617,11 +659,12 @@ async fn checkout_wip_scoped_child_search_and_revoke_cannot_expose_siblings() {
             .is_none()
     );
     let file = "/checkouts/child/a.txt";
-    let i = interface(&child, file).await;
+    interface(&child, file).await;
+    let i = contract("write").reference();
     child
         .call(
             file.into(),
-            i.clone(),
+            contract("read").reference(),
             "read".into(),
             json!({}),
             Default::default(),
@@ -686,7 +729,21 @@ pub(super) async fn model_invoke(
     operation: &str,
     arguments: Json,
 ) -> Result<ToolOutput, ToolError> {
-    model_operation(r, "Invoke", json!({"path":inspected["path"], "interface":inspected["interfaces"][0]["reference"], "operation":operation, "arguments":arguments})).await
+    let reference = inspected["interfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| &item["reference"])
+        .find(|r| {
+            Some(wip_protocol::InterfaceReference {
+                scope: r["scope"].as_str().unwrap().into(),
+                name: r["name"].as_str().unwrap().into(),
+            })
+            .and_then(|r| crate::file_operation::Contract::from_reference(&r))
+            .is_some_and(|c| c.operation() == operation)
+        })
+        .unwrap_or(&inspected["interfaces"][0]["reference"]);
+    model_operation(r, "Invoke", json!({"path":inspected["path"], "interface":reference, "operation":operation, "arguments":arguments})).await
 }
 
 #[tokio::test]
@@ -752,10 +809,7 @@ async fn checkout_model_list_glob_grep_entries_are_lazy_and_never_become_tree_ed
     let r = Arc::new(runtime(router, None));
     let entrance = model_inspect(r.clone(), "/checkouts/main").await;
     assert_eq!(entrance["path"], "/checkouts/main");
-    assert_eq!(
-        entrance["interfaces"][0]["reference"]["scope"],
-        "/checkouts/main"
-    );
+    assert_eq!(entrance["interfaces"][0]["reference"]["scope"], "/");
     let projection = r
         .host
         .projection_live("/checkouts/main")
@@ -829,10 +883,7 @@ async fn checkout_model_list_glob_grep_entries_are_lazy_and_never_become_tree_ed
         json!([])
     );
     let deep = model_inspect(r.clone(), "/checkouts/main/nested/deep").await;
-    assert_eq!(
-        deep["interfaces"][0]["reference"]["scope"],
-        "/checkouts/main"
-    );
+    assert_eq!(deep["interfaces"][0]["reference"]["scope"], "/");
     for (operation, args) in [
         ("list", json!({})),
         ("glob", json!({"pattern":"*.txt"})),
@@ -926,7 +977,7 @@ async fn checkout_list_permission_cannot_be_bypassed_with_glob_or_command_identi
 }
 
 #[tokio::test]
-async fn checkout_ancestor_scope_rejects_siblings_prefixes_refs_and_old_connection_before_read() {
+async fn common_scope_rejects_wrong_namespace_scope_ref_and_old_target_authority() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("a.txt"), "same\n").unwrap();
     let router = Arc::new(WorkdirSessionRouter::new());
@@ -943,8 +994,8 @@ async fn checkout_ancestor_scope_rejects_siblings_prefixes_refs_and_old_connecti
     let p = r.host.projection_live(path).await.unwrap().unwrap();
     let fetched = r.host.fetch_interface_live(&p.interface).await.unwrap();
     assert!(
-        fetched.scope_ref.is_none(),
-        "ref-less publication is legitimate"
+        fetched.scope_ref.is_some(),
+        "common namespace uses the Host root scope"
     );
     // Ordinary content changes do not terminate the entrance's Interface lifetime.
     std::fs::write(dir.path().join("new.txt"), "fixture").unwrap();
@@ -959,12 +1010,12 @@ async fn checkout_ancestor_scope_rejects_siblings_prefixes_refs_and_old_connecti
     let request = |reference, scope_ref| CallOperationRequest {
         target: wip_protocol::Target {
             path: path.into(),
-            validator: None,
+            validator: p.object.validator.clone(),
         },
         interface: wip_protocol::InterfaceTarget {
             reference,
             scope_ref,
-            validator: None,
+            validator: fetched.validator.clone(),
         },
         operation: "read".into(),
         arguments: BTreeMap::new(),
@@ -996,6 +1047,654 @@ async fn checkout_ancestor_scope_rejects_siblings_prefixes_refs_and_old_connecti
     router.attach(main, session(&dir, true)).unwrap();
     let forged = request(p.interface.clone(), None);
     assert!(
-        matches!(r.host.call(forged, WipCallContext { execution:Default::default(),security_context:"fixture".into() }).await, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::InterfaceMismatch)
+        matches!(r.host.call(forged, WipCallContext { execution:Default::default(),security_context:"fixture".into() }).await, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::ValidatorMismatch)
     );
+}
+
+fn observed_common_request(
+    path: &str,
+    validator: Option<Vec<u8>>,
+    fetched: &FetchInterfaceResponse,
+    operation: &str,
+) -> CallOperationRequest {
+    CallOperationRequest {
+        target: wip_protocol::Target {
+            path: path.into(),
+            validator,
+        },
+        interface: wip_protocol::InterfaceTarget {
+            reference: fetched.interface.clone(),
+            scope_ref: fetched.scope_ref.clone(),
+            validator: fetched.validator.clone(),
+        },
+        operation: operation.into(),
+        arguments: BTreeMap::new(),
+    }
+}
+fn file_context() -> WipCallContext {
+    WipCallContext {
+        execution: Default::default(),
+        security_context: "file-contract-test".into(),
+    }
+}
+
+#[tokio::test]
+async fn shared_contract_survives_one_attachment_update_but_old_object_authority_never_transfers() {
+    let left = TempDir::new().unwrap();
+    let right = TempDir::new().unwrap();
+    for root in [&left, &right] {
+        std::fs::write(root.path().join("a.txt"), "same\n").unwrap();
+    }
+    std::fs::write(left.path().join("b.txt"), "same\n").unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    let alias = WorkdirAttachmentAlias::new("left").unwrap();
+    router.attach(alias.clone(), session(&left, false)).unwrap();
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("right").unwrap(),
+            session(&right, true),
+        )
+        .unwrap();
+    let r = runtime(router.clone(), None);
+    let path = "/checkouts/left/a.txt";
+    let other = "/checkouts/right/a.txt";
+    let first = r.host.projection_live(path).await.unwrap().unwrap();
+    let same_bytes = r
+        .host
+        .projection_live("/checkouts/left/b.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    let independent = r.host.projection_live(other).await.unwrap().unwrap();
+    assert_eq!(first.interface, independent.interface);
+    assert_eq!(first.descriptor, independent.descriptor);
+    assert_ne!(first.object.validator, same_bytes.object.validator);
+    let definition = r.host.fetch_interface_live(&first.interface).await.unwrap();
+    let request =
+        observed_common_request(path, first.object.validator.clone(), &definition, "read");
+    assert!(r.host.call(request.clone(), file_context()).await.is_ok());
+    // Replace the same path with a different inode containing exactly the same bytes.
+    std::fs::write(left.path().join("replacement"), "same\n").unwrap();
+    std::fs::rename(left.path().join("replacement"), left.path().join("a.txt")).unwrap();
+    assert!(
+        matches!(r.host.call(request.clone(),file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::ValidatorMismatch)
+    );
+    assert_eq!(
+        r.host
+            .fetch_interface_live(&first.interface)
+            .await
+            .unwrap()
+            .validator,
+        definition.validator
+    );
+    assert!(
+        r.host
+            .call(
+                observed_common_request(
+                    other,
+                    independent.object.validator.clone(),
+                    &definition,
+                    "read"
+                ),
+                file_context()
+            )
+            .await
+            .is_ok()
+    );
+    call(&r, path, "read", json!({})).await.unwrap();
+    router.detach(&alias).await.unwrap();
+    router.attach(alias, session(&left, false)).unwrap();
+    assert!(
+        matches!(r.host.call(request,file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::ValidatorMismatch)
+    );
+    assert!(
+        r.host
+            .call(
+                observed_common_request(other, independent.object.validator, &definition, "read"),
+                file_context()
+            )
+            .await
+            .is_ok()
+    );
+    call(&r, path, "read", json!({})).await.unwrap();
+    let before_restore = r.host.projection_live(path).await.unwrap().unwrap();
+    let restored = runtime(router, None);
+    let restored_definition = restored
+        .host
+        .fetch_interface_live(&first.interface)
+        .await
+        .unwrap();
+    assert_eq!(definition.descriptor, restored_definition.descriptor);
+    assert_eq!(definition.validator, restored_definition.validator);
+    assert!(
+        matches!(restored.host.call(observed_common_request(path,before_restore.object.validator,&restored_definition,"read"),file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::ValidatorMismatch)
+    );
+    call(&restored, path, "read", json!({})).await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_readonly_contract_rejects_wrong_membership_operation_and_interface_validator() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "雪.*\r\nother\n").unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("main").unwrap(),
+            session(&dir, true),
+        )
+        .unwrap();
+    let r = Arc::new(runtime(router, None));
+    let path = "/checkouts/main/a.txt";
+    let observed = model_inspect(r.clone(), path).await;
+    let read = json_content(
+        model_invoke(r.clone(), &observed, "read", json!({"limit":1}))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        read,
+        json!({"content":"     1\t雪.*\n","next_offset":1,"truncated":true})
+    );
+    let searched = json_content(
+        model_invoke(
+            r.clone(),
+            &observed,
+            "search",
+            json!({"pattern":".*","limit":1}),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        searched,
+        json!({"matches":[{"line":1,"text":"雪.*"}],"next_offset":1,"truncated":true})
+    );
+    let p = r.host.projection_live(path).await.unwrap().unwrap();
+    let read = r
+        .host
+        .fetch_interface_live(&contract("read").reference())
+        .await
+        .unwrap();
+    let write = r
+        .host
+        .fetch_interface_live(&contract("write").reference())
+        .await
+        .unwrap();
+    assert!(
+        matches!(r.host.call(observed_common_request(path,p.object.validator.clone(),&write,"write"),file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::InterfaceMismatch)
+    );
+    assert!(
+        matches!(r.host.call(observed_common_request(path,p.object.validator.clone(),&read,"missing"),file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::OperationNotFound)
+    );
+    let mut stale = observed_common_request(path, p.object.validator.clone(), &read, "read");
+    stale.interface.validator = Some(vec![0]);
+    assert!(
+        matches!(r.host.call(stale,file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::InterfaceValidatorMismatch)
+    );
+    let mut legacy = observed_common_request(path, p.object.validator, &read, "read");
+    legacy.interface.reference = InterfaceReference {
+        scope: "/checkouts/main".into(),
+        name: "yoi.checkout/old/file/v1#target/old".into(),
+    };
+    assert!(
+        matches!(r.host.call(legacy,file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::InterfaceMismatch)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "雪.*\r\nother\n"
+    );
+}
+
+// The fixture substitutes only a binary source. Real Host/Client/model tools, fixed common
+// descriptors, membership, validators and output decoding stay on their production path.
+struct ReadonlyBytes {
+    bytes: Arc<Vec<u8>>,
+    version: Arc<std::sync::atomic::AtomicU64>,
+    captured: u64,
+}
+impl ReadonlyBytes {
+    fn projection(&self) -> WipProjection {
+        let contract = crate::file_operation::Contract::ReadBytes;
+        WipProjection {
+            route: "/virtual".into(),
+            capability: "virtual:bytes".into(),
+            kind: WipProjectionKind::Native,
+            object: Object {
+                name: "virtual".into(),
+                description: None,
+                interfaces: vec![contract.reference()],
+                r#ref: None,
+                validator: Some(self.captured.to_be_bytes().to_vec()),
+            },
+            interface: contract.reference(),
+            descriptor: contract.descriptor(),
+            interface_validator: Some(contract.validator()),
+            handler: Arc::new(Self {
+                bytes: self.bytes.clone(),
+                version: self.version.clone(),
+                captured: self.captured,
+            }),
+        }
+    }
+}
+#[async_trait]
+impl WipOperationHandler for ReadonlyBytes {
+    async fn call(
+        &self,
+        op: &str,
+        args: &BTreeMap<String, Value>,
+        _: WipCallContext,
+    ) -> Result<WipOperationOutput, WipOperationError> {
+        if op != "read_bytes" {
+            return Err(WipOperationError::Protocol(protocol_error(
+                ProtocolErrorCode::OperationNotFound,
+                "readonly bytes",
+            )));
+        }
+        if self.captured != self.version.load(Ordering::SeqCst) {
+            return Err(WipOperationError::Protocol(protocol_error(
+                ProtocolErrorCode::ValidatorMismatch,
+                "virtual source replaced",
+            )));
+        }
+        let (offset, limit) = crate::file_operation::byte_range(args)?;
+        if offset > self.bytes.len() as u64 {
+            return Err(WipOperationError::Protocol(protocol_error(
+                ProtocolErrorCode::InvalidArguments,
+                "past EOF",
+            )));
+        }
+        let end = (offset as usize + limit).min(self.bytes.len());
+        Ok(WipOperationOutput::native(
+            crate::file_operation::bytes_result(
+                args,
+                &self.bytes[offset as usize..end],
+                end == self.bytes.len(),
+            )?,
+        ))
+    }
+}
+#[async_trait]
+impl WipSubtreeProvider for ReadonlyBytes {
+    async fn publication(&self, path: &str) -> Result<Option<WipPublication>, ProtocolError> {
+        Ok((path == "/virtual").then(|| {
+            let current = Self {
+                bytes: self.bytes.clone(),
+                version: self.version.clone(),
+                captured: self.version.load(Ordering::SeqCst),
+            };
+            WipPublication {
+                projection: current.projection(),
+                scope: None,
+            }
+        }))
+    }
+    async fn children(&self, _: &str) -> Result<Vec<String>, ProtocolError> {
+        Ok(vec![])
+    }
+}
+#[tokio::test]
+async fn common_bytes_read_long_lines_invalid_utf8_arbitrary_boundaries_and_eof_without_write_authority()
+ {
+    use base64::Engine as _;
+    let mut bytes = "雪".as_bytes().to_vec();
+    bytes.extend_from_slice(&[0xff, 0, 0xc0]);
+    bytes.extend(vec![b'x'; 100_000]);
+    let bytes = Arc::new(bytes);
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("raw"), bytes.as_ref()).unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("main").unwrap(),
+            session(&dir, true),
+        )
+        .unwrap();
+    let source = Arc::new(ReadonlyBytes {
+        bytes: bytes.clone(),
+        version: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        captured: 1,
+    });
+    let mut registry = WipMountRegistry::new();
+    crate::checkout::mount_checkouts(&mut registry, router, tools::Tracker::new(), None).unwrap();
+    registry.allocate_namespace("virtual", "virtual").unwrap();
+    registry.mount(source.projection()).unwrap();
+    registry
+        .mount_subtree(WipSubtreeMount {
+            root: "/virtual".into(),
+            provider: source.clone(),
+        })
+        .unwrap();
+    let r = Arc::new(WipRuntime::from_mounts(registry, "bytes-test".into()).unwrap());
+    let virtual_inspect = model_inspect(r.clone(), "/virtual").await;
+    let reference = virtual_inspect["interfaces"][0]["reference"].clone();
+    let checkout = model_inspect(r.clone(), "/checkouts/main/raw").await;
+    assert!(
+        checkout["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["reference"] == reference)
+    );
+    for path in ["/virtual", "/checkouts/main/raw"] {
+        for offset in [0, 1, 2, 3, 5, 80_000, bytes.len()] {
+            let output=json_content(model_operation(r.clone(),"Invoke",json!({"path":path,"interface":reference,"operation":"read","arguments":{"offset":offset,"limit":17}})).await.unwrap());
+            let end = (offset + 17).min(bytes.len());
+            assert_eq!(output["encoding"], "base64");
+            assert_eq!(output["offset"], offset);
+            assert_eq!(output["next_offset"], end);
+            assert_eq!(output["eof"], end == bytes.len());
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(output["data"].as_str().unwrap())
+                    .unwrap(),
+                bytes[offset..end]
+            );
+        }
+        for arguments in [
+            json!({"limit":0}),
+            json!({"limit":32769}),
+            json!({"offset":-1}),
+            json!({"offset":9_007_199_254_740_991i64}),
+            json!({"offset":bytes.len()+1}),
+            json!({"file_path":"other"}),
+        ] {
+            assert!(model_operation(r.clone(),"Invoke",json!({"path":path,"interface":reference,"operation":"read","arguments":arguments})).await.is_err());
+        }
+        assert!(model_operation(r.clone(),"Invoke",json!({"path":path,"interface":{"scope":"/","name":"yoi.file/write-text/v1"},"operation":"write","arguments":{"content":"lost"}})).await.is_err());
+    }
+    let fetched = r
+        .host
+        .fetch_interface_live(&crate::file_operation::Contract::ReadBytes.reference())
+        .await
+        .unwrap();
+    let mut request = observed_common_request(
+        "/virtual",
+        Some(1u64.to_be_bytes().to_vec()),
+        &fetched,
+        "read",
+    );
+    source.version.store(2, Ordering::SeqCst);
+    assert!(
+        matches!(r.host.call(request.clone(),file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::ValidatorMismatch)
+    );
+    request.target.validator = Some(2u64.to_be_bytes().to_vec());
+    assert!(r.host.call(request, file_context()).await.is_ok());
+    assert_eq!(
+        std::fs::read(dir.path().join("raw")).unwrap(),
+        bytes.as_ref().clone()
+    );
+}
+
+#[tokio::test]
+async fn scope_downgrade_changes_object_membership_not_common_contract_and_read_remains_available()
+{
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a"), "same").unwrap();
+    let scope = manifest::SharedScope::new(manifest::Scope::writable(dir.path()).unwrap());
+    let session = Arc::new(LocalWorkdirSession::materialized(
+        dir.path().into(),
+        dir.path().into(),
+        scope.clone(),
+        WorkdirSessionCapabilities::READ_WRITE,
+    ));
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(WorkdirAttachmentAlias::new("main").unwrap(), session)
+        .unwrap();
+    let r = Arc::new(runtime(router, None));
+    let path = "/checkouts/main/a";
+    let old = model_inspect(r.clone(), path).await;
+    let current = r.host.projection_live(path).await.unwrap().unwrap();
+    let definition = r
+        .host
+        .fetch_interface_live(&contract("read").reference())
+        .await
+        .unwrap();
+    scope
+        .update(|_| {
+            manifest::Scope::from_config(&manifest::ScopeConfig {
+                allow: vec![manifest::ScopeRule {
+                    target: dir.path().into(),
+                    permission: manifest::Permission::Read,
+                    recursive: true,
+                    symlink_policy: manifest::SymlinkPolicy::Resolved,
+                }],
+                deny: vec![],
+            })
+        })
+        .unwrap();
+    assert!(model_operation(r.clone(),"Invoke",json!({"path":path,"interface":contract_json("write"),"operation":"write","arguments":{"content":"lost"}})).await.is_err());
+    let new = json_content(
+        model_operation(r.clone(), "Inspect", json!({"path":path,"refresh":true}))
+            .await
+            .unwrap(),
+    );
+    assert_ne!(old["object_signature"], new["object_signature"]);
+    assert!(
+        !new["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["reference"]["name"] == "yoi.file/write-text/v1")
+    );
+    assert_eq!(
+        r.host
+            .fetch_interface_live(&contract("read").reference())
+            .await
+            .unwrap()
+            .validator,
+        definition.validator
+    );
+    assert!(
+        matches!(r.host.call(observed_common_request(path,current.object.validator,&definition,"read"),file_context()).await,Err(WipOperationError::Protocol(e)) if e.code==ProtocolErrorCode::ValidatorMismatch)
+    );
+    assert_eq!(
+        json_content(
+            model_invoke(r.clone(), &new, "read", json!({}))
+                .await
+                .unwrap()
+        )["content"],
+        "     1\tsame\n"
+    );
+}
+fn contract_json(operation: &str) -> Json {
+    let r = contract(operation).reference();
+    json!({"scope":r.scope,"name":r.name})
+}
+
+#[test]
+fn common_contract_registration_rejects_descriptor_redefinition_and_domain_operation_injection() {
+    let source = ReadonlyBytes {
+        bytes: Arc::new(vec![]),
+        version: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        captured: 1,
+    };
+    let mut registry = WipMountRegistry::new();
+    registry.allocate_namespace("virtual", "virtual").unwrap();
+    let mut invalid = source.projection();
+    invalid.descriptor.operations[0]
+        .parameters
+        .push(ParameterDeclaration {
+            name: "target_override".into(),
+            required: false,
+            documentation: None,
+            r#type: TypeExpr::String,
+        });
+    assert!(matches!(
+        registry.mount(invalid),
+        Err(WipMountError::InvalidProjection { .. })
+    ));
+    let projection = source.projection();
+    registry.mount(projection.clone()).unwrap();
+    let mut extension = projection.descriptor.clone();
+    extension.operations[0].name = "erase".into();
+    assert!(matches!(
+        registry.contribute_operations(WipOperationContribution {
+            route: "/virtual".into(),
+            contributor: "other".into(),
+            interface: projection.interface,
+            descriptor: extension,
+            handler: projection.handler
+        }),
+        Err(WipMountError::InterfaceCollision { .. })
+    ));
+}
+
+pub(super) async fn failed_text_read_cannot_authorize_mutation(
+    source: WorkdirSessionHandle,
+    disk_file: &std::path::Path,
+    oversized: &str,
+    operation: &str,
+) {
+    let original = format!("{oversized}\nknown\n");
+    std::fs::write(disk_file, &original).unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(WorkdirAttachmentAlias::new("main").unwrap(), source)
+        .unwrap();
+    let r = Arc::new(runtime(router, None));
+    let inspected = model_inspect(r.clone(), "/checkouts/main/text").await;
+    let arguments = if operation == "write" {
+        json!({"content":"changed"})
+    } else {
+        json!({"old_string":"known","new_string":"changed"})
+    };
+    let failure = model_invoke(r.clone(), &inspected, "read", json!({"limit":1}))
+        .await
+        .unwrap_err();
+    assert!(
+        failure.to_string().contains("ResourceLimitExceeded"),
+        "{failure}"
+    );
+    let denied = model_invoke(r.clone(), &inspected, operation, arguments.clone()).await;
+    assert!(denied.is_err(), "failed read authorized {operation}");
+    let denied = denied.unwrap_err();
+    assert!(denied.to_string().contains("InvalidArguments"), "{denied}");
+    assert_eq!(std::fs::read_to_string(disk_file).unwrap(), original);
+    model_invoke(r.clone(), &inspected, "read", json!({"offset":1,"limit":1}))
+        .await
+        .unwrap();
+    // A failed read must neither grant new authority nor erase an earlier successful Read.
+    assert!(
+        model_invoke(r.clone(), &inspected, "read", json!({"limit":1}))
+            .await
+            .is_err()
+    );
+    model_invoke(r, &inspected, operation, arguments)
+        .await
+        .unwrap();
+    let expected = if operation == "write" {
+        "changed".to_string()
+    } else {
+        original.replace("known", "changed")
+    };
+    assert_eq!(std::fs::read_to_string(disk_file).unwrap(), expected);
+}
+
+#[tokio::test]
+async fn failed_text_read_does_not_authorize_write() {
+    for oversized in ["\"".repeat(50_000), "x".repeat(65_530)] {
+        let dir = TempDir::new().unwrap();
+        failed_text_read_cannot_authorize_mutation(
+            session(&dir, false),
+            &dir.path().join("text"),
+            &oversized,
+            "write",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn failed_text_read_does_not_authorize_edit() {
+    for oversized in ["\"".repeat(50_000), "x".repeat(65_530)] {
+        let dir = TempDir::new().unwrap();
+        failed_text_read_cannot_authorize_mutation(
+            session(&dir, false),
+            &dir.path().join("text"),
+            &oversized,
+            "edit",
+        )
+        .await;
+    }
+}
+
+pub(super) async fn assert_long_utf8_search_refuses_incomplete_line(
+    source: WorkdirSessionHandle,
+    directory: &std::path::Path,
+) {
+    let original = format!("{}needle\nnext\n", "雪".repeat(22_000));
+    std::fs::write(directory.join("text"), &original).unwrap();
+    for (name, text) in [
+        ("normal", "雪\nneedle\nnext\n"),
+        ("unterminated", "雪\nneedle\nnext"),
+    ] {
+        std::fs::write(directory.join(name), text).unwrap();
+    }
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(WorkdirAttachmentAlias::new("main").unwrap(), source)
+        .unwrap();
+    let r = Arc::new(runtime(router, None));
+    let inspected = model_inspect(r.clone(), "/checkouts/main/text").await;
+    let result = model_invoke(
+        r.clone(),
+        &inspected,
+        "search",
+        json!({"pattern":"needle","limit":1}),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "search advanced over a byte-truncated UTF-8 line: {result:?}"
+    );
+    let failure = result.unwrap_err();
+    assert!(
+        failure.to_string().contains("ResourceLimitExceeded"),
+        "{failure}"
+    );
+    let read = model_invoke(r.clone(), &inspected, "read", json!({"limit":1}))
+        .await
+        .unwrap_err();
+    assert!(read.to_string().contains("ResourceLimitExceeded"), "{read}");
+    let write = model_invoke(r.clone(), &inspected, "write", json!({"content":"lost"}))
+        .await
+        .unwrap_err();
+    assert!(write.to_string().contains("InvalidArguments"), "{write}");
+    assert_eq!(
+        std::fs::read_to_string(directory.join("text")).unwrap(),
+        original
+    );
+    for name in ["normal", "unterminated"] {
+        let inspected = model_inspect(r.clone(), &format!("/checkouts/main/{name}")).await;
+        for offset in 0..=3 {
+            let page = json_content(
+                model_invoke(
+                    r.clone(),
+                    &inspected,
+                    "search",
+                    json!({"pattern":"needle","offset":offset,"limit":1}),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(page["next_offset"], (offset + 1).min(3));
+            assert_eq!(page["truncated"], offset < 2);
+            assert_eq!(
+                page["matches"],
+                if offset == 1 {
+                    json!([{"line":2,"text":"needle"}])
+                } else {
+                    json!([])
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn long_utf8_search_refuses_incomplete_line_and_preserves_line_pagination() {
+    let dir = TempDir::new().unwrap();
+    assert_long_utf8_search_refuses_incomplete_line(session(&dir, false), dir.path()).await;
 }

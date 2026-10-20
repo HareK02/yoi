@@ -43,6 +43,80 @@ use crate::worker::{
     WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
 };
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SubjectBehaviorInput {
+    pub behavior_md: String,
+    pub prompt_provenance: Option<session_store::PromptRenderProvenance>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResidentSummaryInput {
+    prompt_provenance: Option<session_store::PromptRenderProvenance>,
+}
+
+fn resident_input(
+    body: String,
+    schema: &str,
+    payload: &impl serde::Serialize,
+    kind: &str,
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::InputMetadataError> {
+    use session_store::*;
+    let input = SystemInputEnvelope::new(
+        body.clone(),
+        HistoryInputMetadata::new(
+            HistoryInputUsePolicy {
+                recording_material: InputEvidenceUse::Exclude,
+                memory_evidence: InputEvidenceUse::Exclude,
+                observation: InputObservationUse::Hidden,
+                compaction: InputCompactionUse::Retain,
+            },
+            Some(FeatureInputPayload::encode(schema, 1, payload)?),
+            Some(PublicSystemItem {
+                kind: kind.into(),
+                body,
+                presentation: PublicSystemPresentation::Context,
+            }),
+        )?,
+    )?;
+    Ok(LoggedSystemHistoryEntry::from_input(
+        LoggedSessionHistoryOrigin::Provided {
+            producer: "subjektiv.resident-context".into(),
+        },
+        None,
+        input,
+    ))
+}
+
+pub(crate) fn subject_behavior_input(
+    body: String,
+    behavior_md: String,
+    prompt_provenance: Option<session_store::PromptRenderProvenance>,
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::InputMetadataError> {
+    resident_input(
+        body,
+        "subject:behavior",
+        &SubjectBehaviorInput {
+            behavior_md,
+            prompt_provenance,
+        },
+        "subject_behavior_refresh",
+    )
+}
+
+pub(crate) fn resident_summary_input(
+    body: String,
+    prompt_provenance: Option<session_store::PromptRenderProvenance>,
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::InputMetadataError> {
+    resident_input(
+        body,
+        "memory:resident-summary",
+        &ResidentSummaryInput { prompt_provenance },
+        "resident_summary_refresh",
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkspaceHttpMemoryBackend {
     client: Arc<dyn WorkspaceClient>,
@@ -651,7 +725,7 @@ struct SubjectBehaviorRefreshState {
 struct WorkspaceSubjektivResidentSummarySource {
     host: SubjektivHostConnection,
     prompts: Arc<ArcSwap<PromptCatalog>>,
-    behavior_state: Mutex<SubjectBehaviorRefreshState>,
+    behavior_state: Arc<Mutex<SubjectBehaviorRefreshState>>,
 }
 
 fn resident_summary_contribution(
@@ -691,6 +765,13 @@ impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
 }
 
 impl WorkspaceSubjektivResidentSummarySource {
+    fn confirm_resident_context_behavior(&self, behavior_md: &str) {
+        self.behavior_state
+            .lock()
+            .expect("subject behavior state poisoned")
+            .applied = Some(behavior_md.to_owned());
+    }
+
     async fn fetch(
         &self,
     ) -> Result<server_api::SubjektivResidentContextOutput, SubjektivHostError> {
@@ -707,7 +788,7 @@ impl WorkspaceSubjektivResidentSummarySource {
     fn render(
         &self,
         output: &server_api::SubjektivResidentContextOutput,
-    ) -> Result<String, String> {
+    ) -> Result<(String, session_store::PromptRenderProvenance), String> {
         use memory::backend::MemoryResidentSummaryAvailability as Availability;
         let availability = match output.memory_surface.availability {
             Availability::Ready => "ready",
@@ -716,53 +797,68 @@ impl WorkspaceSubjektivResidentSummarySource {
             Availability::Failed => "failed",
             Availability::Unavailable => "unavailable",
         };
-        self.prompts
-            .load()
+        let prompts = self.prompts.load_full();
+        let body = prompts
             .subjektiv_resident_context(
                 &output.behavior_md,
                 availability,
                 output.memory_surface.content.as_deref(),
             )
-            .map_err(|error| error.to_string())
-    }
-
-    fn remember_behavior(&self, output: &server_api::SubjektivResidentContextOutput) {
-        let mut state = self
-            .behavior_state
-            .lock()
-            .expect("subject behavior state poisoned");
-        state.applied = Some(output.behavior_md.clone());
+            .map_err(|error| error.to_string())?;
+        let projection = prompts.projection();
+        Ok((
+            body,
+            session_store::PromptRenderProvenance {
+                workspace_id: self.host.host.workspace_id(),
+                source_digest: projection.source_digest.clone(),
+                projection_digest: projection.catalog_digest.clone(),
+                logical_name: "internal.subjektiv_resident_context".into(),
+            },
+        ))
     }
 }
 
 /// Detect behavior changes against the state reflected in history, not the fetched state.
 ///
-/// Initial load builds a prompt contribution; change refresh does not advance applied on fetch/render alone.
-/// The interceptor confirms after durably appending a system item, allowing refetch if append fails.
-/// Invalidate applied before rewrite so even identical bodies can be presented in the new history.
+/// Fetch/render never advances applied state. Initial preparation captures a
+/// source-local completion, invoked only after its prompt and active pointer commit.
+/// Later refreshes are acknowledged by the interceptor after durable append.
+/// Invalidate applied before rewrite so identical bodies can be represented again.
 #[async_trait]
 impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource {
     async fn load(&self) -> SystemPromptContribution {
+        self.load_initial().await.0
+    }
+
+    async fn load_initial(
+        &self,
+    ) -> (
+        SystemPromptContribution,
+        Option<crate::worker::PromptContributionCompletion>,
+    ) {
         match self.fetch().await {
             Ok(output) => match self.render(&output) {
-                Ok(rendered) => {
-                    self.remember_behavior(&output);
-                    SystemPromptContribution::Ready(rendered)
+                Ok((rendered, _)) => {
+                    let state = self.behavior_state.clone();
+                    let behavior = output.behavior_md;
+                    (
+                        SystemPromptContribution::Ready(rendered),
+                        Some(Box::new(move || {
+                            state
+                                .lock()
+                                .expect("subject behavior state poisoned")
+                                .applied = Some(behavior);
+                        })),
+                    )
                 }
                 Err(error) => {
                     tracing::error!(%error, "subject resident context render failed");
-                    SystemPromptContribution::Ready(
-                        "The Host could not render the Subject resident context. Do not treat this as unset behavior or infer replacement behavior from Memory."
-                            .to_string(),
-                    )
+                    (SystemPromptContribution::Ready("The Host could not render the Subject resident context. Do not treat this as unset behavior or infer replacement behavior from Memory.".into()), None)
                 }
             },
             Err(error) => {
                 tracing::error!(%error, "subject resident context fetch failed");
-                SystemPromptContribution::Ready(
-                    "The Host could not fetch the Subject resident context. Do not treat this as unset behavior or infer replacement behavior from Memory."
-                        .to_string(),
-                )
+                (SystemPromptContribution::Ready("The Host could not fetch the Subject resident context. Do not treat this as unset behavior or infer replacement behavior from Memory.".into()), None)
             }
         }
     }
@@ -781,18 +877,31 @@ impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource 
         if !changed {
             return Ok(None);
         }
-        let rendered = self.render(&output)?;
+        let (rendered, prompt_provenance) = self.render(&output)?;
         Ok(Some(ResidentContextRefresh {
             body: rendered,
             behavior_md: output.behavior_md,
+            prompt_provenance: Some(prompt_provenance),
         }))
     }
 
-    fn confirm_resident_context_behavior(&self, behavior_md: &str) {
-        self.behavior_state
-            .lock()
-            .expect("subject behavior state poisoned")
-            .applied = Some(behavior_md.to_owned());
+    fn system_item_committed(
+        &self,
+        _item: &session_store::SystemItem,
+        metadata: &crate::session_history::SessionHistoryMetadata,
+    ) {
+        if let Some(input) = metadata
+            .input_metadata
+            .as_ref()
+            .and_then(|input| input.feature_payload())
+            .and_then(|payload| {
+                payload
+                    .decode::<SubjectBehaviorInput>("subject:behavior", 1)
+                    .ok()
+            })
+        {
+            self.confirm_resident_context_behavior(&input.behavior_md);
+        }
     }
 
     fn invalidate_resident_context_representation(&self) {
@@ -944,7 +1053,13 @@ impl Hook<PreLlmRequest> for SubjektivBehaviorRefreshHook {
                     "Subject behavior refresh requires durable session append authority",
                 )
             })?;
-            system_items.append_subject_behavior_refresh(refresh.body, refresh.behavior_md);
+            let input = subject_behavior_input(
+                refresh.body,
+                refresh.behavior_md,
+                refresh.prompt_provenance,
+            )
+            .map_err(|error| HookError::new(HookErrorCategory::Dependency, error.to_string()))?;
+            system_items.append_input(input);
         }
         Ok(HookPreRequestAction::Continue)
     }
@@ -969,16 +1084,18 @@ impl Hook<WorkerRestored> for SubjektivResidentRestoreRefreshHook {
             .resident_memory_restore_section(surface_ready, summary)
             .map_err(|error| HookError::new(HookErrorCategory::Internal, error.to_string()))?;
         let projection = prompts.projection();
-        context.system_items().append_resident_summary_refresh(
+        let input = resident_summary_input(
             body,
-            session_store::PromptRenderProvenance {
+            Some(session_store::PromptRenderProvenance {
                 workspace_id: self.workspace_id.clone(),
 
                 source_digest: projection.source_digest.clone(),
                 projection_digest: projection.catalog_digest.clone(),
                 logical_name: WorkerPrompt::ResidentMemoryRestoreSection.key().to_string(),
-            },
-        );
+            }),
+        )
+        .map_err(|error| HookError::new(HookErrorCategory::Dependency, error.to_string()))?;
+        context.system_items().append_input(input);
         Ok(())
     }
 }
@@ -1106,7 +1223,7 @@ pub(crate) fn ordinary_subjektiv_resident_summary_source(
     Ok(Some(Arc::new(WorkspaceSubjektivResidentSummarySource {
         host: host.expect("checked explicit connection"),
         prompts,
-        behavior_state: Mutex::new(SubjectBehaviorRefreshState::default()),
+        behavior_state: Arc::new(Mutex::new(SubjectBehaviorRefreshState::default())),
     })))
 }
 
@@ -1723,8 +1840,16 @@ permission = "write"
             .unwrap()
             .unwrap();
 
-        let initial = source.load().await;
+        let (initial, completion) = source.load_initial().await;
         assert!(matches!(initial, SystemPromptContribution::Ready(_)));
+        assert!(
+            source
+                .load_changed_resident_context()
+                .await
+                .unwrap()
+                .is_some()
+        );
+        completion.expect("successful initial contribution must provide completion")();
         assert!(
             source
                 .load_changed_resident_context()
@@ -1741,7 +1866,13 @@ permission = "write"
             .expect("changed behavior must produce one refresh");
         assert_eq!(refresh.behavior_md, "Ask when uncertain.");
         assert!(refresh.body.contains("Ask when uncertain."));
-        source.confirm_resident_context_behavior(&refresh.behavior_md);
+        let input = subject_behavior_input(
+            refresh.body.clone(),
+            refresh.behavior_md.clone(),
+            refresh.prompt_provenance.clone(),
+        )
+        .unwrap();
+        source.system_item_committed(&input.item, &input.metadata);
         assert!(
             source
                 .load_changed_resident_context()
@@ -1758,7 +1889,13 @@ permission = "write"
             .expect("cleared behavior must produce one refresh");
         assert_eq!(cleared.behavior_md, "");
         assert!(cleared.body.contains("No user-managed behavior is set"));
-        source.confirm_resident_context_behavior(&cleared.behavior_md);
+        let input = subject_behavior_input(
+            cleared.body.clone(),
+            cleared.behavior_md.clone(),
+            cleared.prompt_provenance.clone(),
+        )
+        .unwrap();
+        source.system_item_committed(&input.item, &input.metadata);
         assert!(
             source
                 .load_changed_resident_context()
@@ -1783,7 +1920,7 @@ permission = "write"
         // target-side bounded resident request contract.
         assert_eq!(
             client.timeouts.lock().unwrap().as_slice(),
-            &[RESIDENT_SUMMARY_REQUEST_TIMEOUT; 7]
+            &[RESIDENT_SUMMARY_REQUEST_TIMEOUT; 8]
         );
     }
 
@@ -1816,7 +1953,13 @@ permission = "write"
             .await
             .unwrap()
             .unwrap();
-        source.confirm_resident_context_behavior(&first.behavior_md);
+        let input = subject_behavior_input(
+            first.body.clone(),
+            first.behavior_md.clone(),
+            first.prompt_provenance.clone(),
+        )
+        .unwrap();
+        source.system_item_committed(&input.item, &input.metadata);
         assert_eq!(
             source
                 .load_changed_resident_context()
@@ -1825,7 +1968,13 @@ permission = "write"
                 .unwrap(),
             second
         );
-        source.confirm_resident_context_behavior(&second.behavior_md);
+        let input = subject_behavior_input(
+            second.body.clone(),
+            second.behavior_md.clone(),
+            second.prompt_provenance.clone(),
+        )
+        .unwrap();
+        source.system_item_committed(&input.item, &input.metadata);
         assert!(
             source
                 .load_changed_resident_context()

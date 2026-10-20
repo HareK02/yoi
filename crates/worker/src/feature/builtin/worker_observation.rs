@@ -813,6 +813,7 @@ mod tests {
                         _ => return None,
                     };
                     Some(protocol::SessionSnapshotEntry {
+                        use_policy: None,
                         entry_id: format!("fake-{index:08}"),
                         timestamp: index as u64,
                         provenance: protocol::SessionEntryProvenance::LegacyUnknown,

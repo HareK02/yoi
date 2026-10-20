@@ -6,6 +6,7 @@ use api_macros::api;
 pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, WebSocketOperation};
+pub mod authorization;
 mod drive;
 mod notification;
 pub use notification::*;
@@ -22,6 +23,34 @@ use webauthn_rs_proto::{
     RequestChallengeResponse,
 };
 pub use workspace_config::*;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SubjectPermissionsResponse {
+    pub permissions: Option<authorization::SubjectPermissions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SubjectPermissionsMutationResponse {
+    pub permissions: authorization::SubjectPermissions,
+    /// New operations are already fenced. These are cancellation requests and
+    /// Backend command cleanup evidence, not proof that a Runtime turn stopped.
+    pub interruptions: Vec<SubjectPermissionInterruption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SubjectPermissionInterruption {
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub cancellation_accepted: bool,
+    pub backend_command_sessions_closed: bool,
+    pub diagnostics: Vec<String>,
+}
 
 #[allow(dead_code)]
 #[derive(JsonSchema)]
@@ -168,6 +197,11 @@ macro_rules! impl_openapi_schema {
 }
 
 impl_openapi_schema!(
+    SubjectPermissionsResponse,
+    SubjectPermissionsMutationResponse,
+    SubjectPermissionInterruption,
+    authorization::SubjectPermissions,
+    authorization::SubjectPermissionsUpdate,
     AuthBootstrapUserRequest,
     AuthPublicConfig,
     HostingSettings,
@@ -1297,6 +1331,51 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: MemoryConsolidateStagingRequest,
     ) -> Result<MemoryConsolidationResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/authorization/check",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        openapi = false,
+    )]
+    async fn operation_authorize(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: authorization::OperationAuthorizationRequest,
+    ) -> Result<authorization::OperationAuthorizationResponse, RepositoryApiError>;
+
+    #[get(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/permissions",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_permissions_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+    ) -> Result<SubjectPermissionsResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/permissions",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_permissions_set(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: authorization::SubjectPermissionsUpdate,
+    ) -> Result<SubjectPermissionsMutationResponse, RepositoryApiError>;
 
     #[post(
         "/api/w/{workspace_id}/subjektiv/subjects",
@@ -2762,6 +2841,12 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
     ) -> Result<DriveEntry, DriveApiError>;
+    #[get("/api/w/{workspace_id}/drive/capabilities", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    async fn drive_capabilities(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+    ) -> Result<DriveCapabilities, DriveApiError>;
     #[get("/api/w/{workspace_id}/drive/metadata", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
     async fn drive_metadata(
         &self,
@@ -4025,6 +4110,17 @@ impl RequestActor {
 #[serde(deny_unknown_fields)]
 pub struct WhoamiResponse {
     pub actor: Option<RequestActor>,
+    pub session: BrowserSessionState,
+}
+
+/// Browser navigation evidence, not an authorization grant or a generic 401 classification.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrowserSessionState {
+    Anonymous {},
+    Authenticated { expires_at: Option<String> },
+    Expired {},
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -10428,6 +10524,10 @@ pub struct CreateWorkspaceWorkerRequest {
     /// Backend idempotency key used only for authenticated Worker-owned spawn/control.
     #[serde(default)]
     pub control_operation_id: Option<String>,
+    /// Requested least-authority child permissions. Host derives the origin; this
+    /// input cannot assert Subject identity or create a body/singleton attachment.
+    #[serde(default)]
+    pub execution_grant: Option<authorization::WorkerDelegationRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -11533,6 +11633,7 @@ pub fn auth_api_typescript() -> String {
         ActorAuthMethod::decl(&config),
         AuthenticatedUser::decl(&config),
         RequestActor::decl(&config),
+        BrowserSessionState::decl(&config),
         WhoamiResponse::decl(&config),
         AuthBootstrapUserRequest::decl(&config),
         AuthUserResponse::decl(&config),
@@ -12929,6 +13030,7 @@ mod tests {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: None,
+            execution_grant: None,
         })
         .unwrap();
         assert_eq!(
@@ -12943,6 +13045,7 @@ mod tests {
                 "workdir_attachments": [],
                 "feature_connections": {},
                 "control_operation_id": null,
+                "execution_grant": null,
             })
         );
     }
@@ -13961,7 +14064,8 @@ mod tests {
                 "handle": "hare",
                 "display_name": "Hare",
                 "auth_method": "browser_session"
-            }
+            },
+            "session": { "kind": "authenticated", "expires_at": "2026-10-20T00:00:00Z" }
         });
         let decoded = serde_json::from_value::<WhoamiResponse>(whoami.clone())
             .expect("server whoami fixture should match shared DTO");
@@ -14143,9 +14247,34 @@ mod tests {
 
         let unexpected_field = serde_json::json!({
             "actor": null,
+            "session": { "kind": "anonymous" },
             "access_token": "must-not-be-accepted"
         });
         assert!(serde_json::from_value::<WhoamiResponse>(unexpected_field).is_err());
+    }
+
+    #[test]
+    fn whoami_session_json_distinguishes_anonymous_expired_and_token_auth() {
+        for session in [
+            serde_json::json!({"kind":"anonymous"}),
+            serde_json::json!({"kind":"expired"}),
+            serde_json::json!({"kind":"authenticated", "expires_at":null}),
+        ] {
+            let value = serde_json::json!({"actor":null, "session":session});
+            let response: WhoamiResponse = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(response).unwrap(), value);
+        }
+        for session in [
+            serde_json::json!({"kind":"unknown"}),
+            serde_json::json!({"kind":"expired", "expires_at":null}),
+        ] {
+            assert!(
+                serde_json::from_value::<WhoamiResponse>(
+                    serde_json::json!({"actor":null, "session":session})
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -14532,6 +14661,7 @@ mod openapi_artifact_tests {
         // identity, or a one-use Reviewer capability. They remain generated Rust client/Axum
         // operations, but must not appear as unauthenticated operations in the public OpenAPI.
         const SIGNED_INTERNAL: &[&str] = &[
+            "operation_authorize",
             "current_worker_workspace_config_get",
             "current_worker_workspace_config_attach",
             "current_worker_workspace_config_observe",

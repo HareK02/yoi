@@ -14,7 +14,7 @@ use worker::{
 struct TicketRouterClient {
     api: WorkspaceApi,
     identity: Arc<RuntimeIdentityMaterial>,
-    source: RuntimeWorkerRef,
+    source: Mutex<RuntimeWorkerRef>,
     runtime: tokio::runtime::Handle,
     lose_next_response: AtomicBool,
     requests: Mutex<Vec<(String, u16, String)>>,
@@ -45,9 +45,10 @@ impl WorkspaceClient for TicketRouterClient {
             WorkspaceRequestMethod::Patch => "PATCH",
             WorkspaceRequestMethod::Delete => "DELETE",
         };
+        let source = self.source.lock().unwrap().clone();
         let signed = runtime_source_request(
             &self.identity,
-            Some(&self.source.worker_id),
+            Some(&source.worker_id),
             method,
             &request.path,
             request.body.unwrap_or_default().into_bytes(),
@@ -225,7 +226,7 @@ fn ticket_client(
     Arc::new(TicketRouterClient {
         api: api.clone(),
         identity: Arc::new(identity),
-        source: source.clone(),
+        source: Mutex::new(source.clone()),
         runtime: tokio::runtime::Handle::current(),
         lose_next_response: AtomicBool::new(false),
         requests: Mutex::new(Vec::new()),
@@ -307,18 +308,16 @@ async fn ticket_public_roundtrip_observed_answer_replays_without_changing_waitin
         assert!(error.to_string().contains("409"), "{error}");
         // A valid Runtime signature is not a Worker membership grant. The
         // Backend must reject this unregistered source through the same tools.
-        let denied = Arc::new(TicketRouterClient {
-            api: api.clone(),
-            identity: client.identity.clone(),
-            source: RuntimeWorkerRef::new(
-                source.runtime_id.clone(),
-                "00000000-0000-7000-8000-000000000099",
-            ),
-            runtime: tokio::runtime::Handle::current(),
-            lose_next_response: AtomicBool::new(false),
-            requests: Mutex::new(Vec::new()),
-        });
-        let denied_surface = TicketSurface::new(&dir.path().join("denied"), denied, wip).await;
+        // Activate the real Feature while the source is registered, then lose
+        // membership before dispatch. Otherwise activation itself correctly rejects
+        // the fixture before it can exercise the operation's authentication check.
+        let denied = ticket_client(&api, (*client.identity).clone(), &source);
+        let denied_surface =
+            TicketSurface::new(&dir.path().join("denied"), denied.clone(), wip).await;
+        *denied.source.lock().unwrap() = RuntimeWorkerRef::new(
+            source.runtime_id.clone(),
+            "00000000-0000-7000-8000-000000000099",
+        );
         let error = denied_surface
             .call("TicketAssignmentAnswer", input.clone(), context("denied"))
             .await

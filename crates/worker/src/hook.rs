@@ -25,7 +25,9 @@ use agen::tool::{ToolOutput, ToolResult};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use session_store::{SystemItem, SystemReminder};
+#[cfg(test)]
+use session_store::SystemItem;
+use session_store::SystemReminder;
 use thiserror::Error;
 
 use crate::SessionEntryRef;
@@ -254,7 +256,7 @@ impl From<HookTurnEndAction> for TurnEndAction {
 // Hook context handles
 // =============================================================================
 
-/// Host-created handle for appending approved durable [`SystemItem`] requests.
+/// Host-created handle for appending approved durable [`session_store::SystemItem`] requests.
 ///
 /// Hook code can use this handle only when the Worker host includes it in an
 /// event-specific context. The handle queues typed requests; the host drains the
@@ -263,11 +265,11 @@ impl From<HookTurnEndAction> for TurnEndAction {
 /// raw `agen::Item`, history writer, event sender, `Worker`, `Engine`, or
 /// notification buffer.
 pub struct SystemItemAppendHandle {
-    pending: Arc<Mutex<Vec<SystemItem>>>,
+    pending: Arc<Mutex<Vec<session_store::LoggedSystemHistoryEntry>>>,
 }
 
 impl SystemItemAppendHandle {
-    pub(crate) fn new(pending: Arc<Mutex<Vec<SystemItem>>>) -> Self {
+    pub(crate) fn new(pending: Arc<Mutex<Vec<session_store::LoggedSystemHistoryEntry>>>) -> Self {
         Self { pending }
     }
 
@@ -279,53 +281,44 @@ impl SystemItemAppendHandle {
         self.pending
             .lock()
             .expect("system-item append queue poisoned")
-            .push(item);
+            .push(session_store::LoggedSystemHistoryEntry {
+                item,
+                metadata: crate::session_history::metadata(
+                    session_store::LoggedSessionHistoryOrigin::BackendInstruction {
+                        operation_id: None,
+                    },
+                    None,
+                ),
+            });
     }
 
-    /// Queue a Subject behavior refresh with its exact represented behavior. The caller receives this
-    /// narrow operation only at a pre-request boundary, and the host commits it
-    /// before exposing it to the model.
-    pub fn append_subject_behavior_refresh(
-        &self,
-        body: impl Into<String>,
-        behavior_md: impl Into<String>,
-    ) {
+    /// Queue producer-validated System context. Metadata and body are committed together.
+    /// The Host exposes this capability only at a pre-request boundary.
+    pub fn append_input(&self, input: session_store::LoggedSystemHistoryEntry) {
         self.pending
             .lock()
             .expect("system-item append queue poisoned")
-            .push(SystemItem::SubjectBehaviorRefresh {
-                body: body.into(),
-                behavior_md: behavior_md.into(),
-                prompt_provenance: None,
-            });
+            .push(input);
     }
 }
 
 /// Host-created narrow append authority exposed only at a restore lifecycle
-/// boundary. It cannot emit arbitrary system items.
+/// boundary. No model-facing tool receives this capability.
 pub struct RestoreSystemItemAppendHandle {
-    pending: Arc<Mutex<Vec<SystemItem>>>,
+    pending: Arc<Mutex<Vec<session_store::LoggedSystemHistoryEntry>>>,
 }
 
 impl RestoreSystemItemAppendHandle {
-    pub(crate) fn new(pending: Arc<Mutex<Vec<SystemItem>>>) -> Self {
+    pub(crate) fn new(pending: Arc<Mutex<Vec<session_store::LoggedSystemHistoryEntry>>>) -> Self {
         Self { pending }
     }
 
-    /// Queue a Feature-rendered resident-summary refresh for durable append at
-    /// the restore lifecycle boundary.
-    pub fn append_resident_summary_refresh(
-        &self,
-        body: impl Into<String>,
-        prompt_provenance: session_store::PromptRenderProvenance,
-    ) {
+    /// Queue producer-validated System context at the Host restore boundary.
+    pub fn append_input(&self, input: session_store::LoggedSystemHistoryEntry) {
         self.pending
             .lock()
             .expect("restore system-item append queue poisoned")
-            .push(SystemItem::ResidentSummaryRefresh {
-                body: body.into(),
-                prompt_provenance: Some(prompt_provenance),
-            });
+            .push(input);
     }
 }
 
@@ -983,7 +976,7 @@ mod tests {
 
         let queued = pending.lock().expect("pending queue poisoned");
         assert_eq!(queued.len(), 1);
-        match &queued[0] {
+        match &queued[0].item {
             SystemItem::TaskReminder { body, .. } => {
                 assert_eq!(body, "remember tasks");
             }
@@ -992,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_append_handle_queues_only_resident_refresh_items() {
+    fn restore_append_handle_preserves_producer_metadata() {
         let pending = Arc::new(Mutex::new(Vec::new()));
         let handle = RestoreSystemItemAppendHandle::new(Arc::clone(&pending));
         let provenance = session_store::PromptRenderProvenance {
@@ -1003,15 +996,16 @@ mod tests {
             logical_name: "internal.resident_memory_restore_section".into(),
         };
 
-        handle.append_resident_summary_refresh("current surface", provenance.clone());
-
-        assert!(matches!(
-            pending.lock().unwrap().as_slice(),
-            [SystemItem::ResidentSummaryRefresh {
-                body,
-                prompt_provenance: Some(actual),
-            }] if body == "current surface" && actual == &provenance
-        ));
+        let input = crate::feature::builtin::memory::resident_summary_input(
+            "current surface".into(),
+            Some(provenance),
+        )
+        .unwrap();
+        let expected = serde_json::to_value(&input).unwrap();
+        handle.append_input(input);
+        let queued = pending.lock().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(serde_json::to_value(&queued[0]).unwrap(), expected);
     }
 
     #[test]

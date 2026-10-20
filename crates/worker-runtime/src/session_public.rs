@@ -398,6 +398,7 @@ mod tests {
                 content: vec![LoggedContentPart::Text { text: text.into() }],
             },
             metadata: LoggedSessionHistoryMetadata {
+                input_metadata: None,
                 entry_id: LoggedSessionHistoryEntryId(id.to_string()),
                 origin: LoggedSessionHistoryOrigin::HumanInput {
                     account_id: "account-1".to_string(),

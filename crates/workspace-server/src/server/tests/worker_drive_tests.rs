@@ -1,6 +1,10 @@
-//! Worker tools -> signed WorkspaceClient -> real isolated Server authority.
-//! No Git checkout, live DB, network service, or DTO-only assertions. Workdir
-//! import tests attach an explicitly read-scoped temporary source session.
+//! Tools/native WIP -> signed WorkspaceClient -> isolated Server DB and LocalFileSystem.
+//! Default fixtures have no Repository/Workdir and substitute Runtime execution.
+//! Lifetime cases use real embedded Runtime stop/removal or the shared authenticated
+//! Runtime HTTP harness for actual Git Workdir removal; controller execution remains
+//! deterministic. Import sessions have explicit read scope (and real materializer
+//! leases in the removal case). No external model, live data, or browser is used.
+//! Run with the normal Server lib target and the `worker_drive_tests` filter.
 use super::*;
 use agen::tool::{Attachment, ToolError, ToolExecutionContext, ToolOutput};
 use std::result::Result;
@@ -148,28 +152,46 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(access: [&str; 2]) -> Self {
+        Self::with_runtime(access, false).await
+    }
+    async fn with_runtime(access: [&str; 2], embedded: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let mut config = test_server_config(temp.path());
         config.repositories.clear();
         let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
-        let mut api = WorkspaceApi::new_with_execution_backend(
-            config,
-            store,
-            Arc::new(DeterministicExecutionBackend::default()),
-        )
-        .await
-        .unwrap();
+        let execution = Arc::new(DeterministicExecutionBackend {
+            materializer: worker_runtime::working_directory::RuntimeGitMaterializer::new(
+                temp.path().join("runtime-workdirs"),
+            ),
+            ..Default::default()
+        });
+        let api = WorkspaceApi::new_with_execution_backend(config, store, execution)
+            .await
+            .unwrap();
+        Self::on_api(api, temp, access, embedded).await
+    }
+    async fn on_api(
+        mut api: WorkspaceApi,
+        temp: tempfile::TempDir,
+        access: [&str; 2],
+        embedded: bool,
+    ) -> Self {
         let owner = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
-        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
-        api.runtime
-            .register_or_replace(WorkdirlessFixtureRuntime::default());
+        let runtime_id = if embedded {
+            EMBEDDED_RUNTIME_ID
+        } else {
+            register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+            api.runtime
+                .register_or_replace(WorkdirlessFixtureRuntime::default());
+            WorkdirlessFixtureRuntime::RUNTIME_ID
+        };
         let mut workers = Vec::new();
         for name in ["Drive first", "Drive second"] {
             let Json(created) = create_workspace_worker(
                 State(api.clone()),
                 HeaderMap::new(),
                 Json(CreateWorkspaceWorkerRequest {
-                    runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.into(),
+                    runtime_id: runtime_id.into(),
                     display_name: name.into(),
                     singleton_key: None,
                     profile: Some("builtin:coder".into()),
@@ -178,6 +200,7 @@ impl Fixture {
                     workdir_attachments: vec![],
                     feature_connections: Default::default(),
                     control_operation_id: None,
+                    execution_grant: None,
                 }),
             )
             .await
@@ -247,6 +270,45 @@ impl Fixture {
             .await
             .unwrap(),
         )
+    }
+    async fn upload_text(&self, name: &str, text: &str) -> Value {
+        use sha2::{Digest, Sha256};
+        let root = self.root(0).await;
+        let digest: String = Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("operation", "create")
+            .append_pair("request_id", &format!("user-upload-{name}"))
+            .append_pair("entry_workspace_id", TEST_WORKSPACE_ID)
+            .append_pair("parent_id", root["node_id"].as_str().unwrap())
+            .append_pair("name", name)
+            .append_pair("content_type", "text/markdown")
+            .append_pair("size", &text.len().to_string())
+            .append_pair("sha256", &digest)
+            .finish();
+        let response = build_router(self.api.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("{}/upload?{query}", base()))
+                    .header("authorization", format!("Bearer {}", self.owner))
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(text.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).unwrap()
     }
     fn importer(&self, worker: usize) -> DriveFeature {
         let root = self._temp.path().join("import-source");
@@ -413,6 +475,353 @@ async fn workdirless_workers_share_markdown_through_current_read_and_write_grant
         metadata, updated["entry"],
         "re-read proves durable mutation"
     );
+}
+
+#[tokio::test]
+async fn user_uploaded_markdown_roundtrips_through_workdirless_tools_and_native_wip_at_one_identity()
+ {
+    let f = Fixture::new(["read_write", "read_only"]).await;
+    let original = "# ユーザー資料\n未処理\n";
+    let updated_text = "# ユーザー資料\n処理済み ✓\n";
+    for native in [false, true] {
+        let uploaded = f
+            .upload_text(if native { "native.md" } else { "tools.md" }, original)
+            .await;
+        let id = uploaded["entry"]["entry"].clone();
+        let updated = if native {
+            let tools = native_tools(&f.features[0]);
+            // Resolve the production path projection, not an invented node path.
+            let metadata = value(
+                tool(&f.features[0], "DriveMetadata", json!({"entry":id}))
+                    .await
+                    .unwrap(),
+            );
+            let path = metadata["path"].as_str().unwrap();
+            let inspected = value(
+                native_tool(&tools, "Inspect", json!({"path":path,"refresh":true}))
+                    .await
+                    .unwrap(),
+            );
+            let reference = inspected["interfaces"][0]["reference"].clone();
+            let read = value(
+                native_tool(
+                    &tools,
+                    "Invoke",
+                    json!({"path":path,"interface":reference,"operation":"read","arguments":{}}),
+                )
+                .await
+                .unwrap(),
+            );
+            assert_eq!(read["text"], original);
+            assert_eq!(read["entry"]["metadata"]["entry"], id);
+            assert_eq!(
+                read["entry"]["metadata"]["last_mutation_id"],
+                uploaded["entry"]["last_mutation_id"]
+            );
+            value(native_tool(&tools, "Invoke", json!({"path":path,"interface":file_write_reference(&inspected),"operation":"write","arguments":{"content":updated_text}})).await.unwrap())["metadata"].clone()
+        } else {
+            let read = value(
+                tool(&f.features[0], "DriveRead", json!({"entry":id}))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(read["text"], original);
+            assert_eq!(read["entry"]["metadata"]["entry"], id);
+            assert_eq!(
+                read["entry"]["metadata"]["last_mutation_id"],
+                uploaded["entry"]["last_mutation_id"]
+            );
+            value(
+                tool(
+                    &f.features[0],
+                    "DriveWrite",
+                    json!({"entry":id,"content":updated_text}),
+                )
+                .await
+                .unwrap(),
+            )
+        };
+        assert_eq!(entry(&updated), id);
+        let mutation = &updated["entry"]["metadata"]["last_mutation_id"];
+        assert_ne!(*mutation, uploaded["entry"]["last_mutation_id"]);
+        assert_eq!(*mutation, updated["request_id"]);
+        let independent = value(
+            tool(&f.features[1], "DriveRead", json!({"entry":id}))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(independent["text"], updated_text);
+        assert_eq!(independent["entry"], updated["entry"]);
+        let metadata = owner_call(
+            &f.api,
+            &f.owner,
+            "GET",
+            &format!(
+                "{}/metadata?entry_workspace_id={TEST_WORKSPACE_ID}&id={}",
+                base(),
+                id["node_id"].as_str().unwrap()
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(metadata, updated["entry"]["metadata"]);
+        let receipt = owner_call(
+            &f.api,
+            &f.owner,
+            "GET",
+            &format!(
+                "{}/requests/{}",
+                base(),
+                updated["request_id"].as_str().unwrap()
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(receipt["state"], "committed");
+        assert_eq!(receipt["response"]["entry"], metadata);
+        let response = build_router(f.api.clone()).oneshot(Request::builder()
+            .uri(format!("{}/download?entry_workspace_id={TEST_WORKSPACE_ID}&id={}&expected_mutation_id={}", base(), id["node_id"].as_str().unwrap(), mutation.as_str().unwrap()))
+            .header("authorization", format!("Bearer {}", f.owner))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "native={native}");
+        assert_eq!(
+            to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap()
+                .as_ref(),
+            updated_text.as_bytes()
+        );
+    }
+}
+
+#[tokio::test]
+async fn source_workdir_removal_keeps_published_drive_bytes_and_receipt() {
+    let (source, binding) =
+        super::ticket_worker_launch_tests::LaunchFixture::with_source_workdir().await;
+    let workdir_id = binding.working_directory.id.clone();
+    let f = Fixture::on_api(
+        source.api.clone(),
+        tempfile::tempdir().unwrap(),
+        ["read_write", "read_only"],
+        false,
+    )
+    .await;
+    let bytes = b"clean\n";
+    let root_path = binding.root().to_owned();
+    let materialization_root = binding.working_directory_root().to_owned();
+    let scope = manifest::Scope::from_config(&manifest::ScopeConfig {
+        allow: vec![manifest::ScopeRule {
+            target: root_path.clone(),
+            permission: manifest::Permission::Read,
+            recursive: true,
+            symlink_policy: manifest::SymlinkPolicy::Resolved,
+        }],
+        deny: vec![],
+    })
+    .unwrap();
+    let sessions = Arc::new(WorkdirSessionRouter::default());
+    sessions
+        .attach(
+            workdir::WorkdirAttachmentAlias::new("source").unwrap(),
+            Arc::new(
+                workdir::LocalWorkdirSession::materialized_bound_with_environment(
+                    workdir::Workdir::new(workdir_id.clone()),
+                    root_path.clone(),
+                    root_path.clone(),
+                    manifest::SharedScope::new(scope),
+                    workdir::WorkdirSessionCapabilities::READ_ONLY,
+                    binding.command_environment(),
+                    binding.session_resources().unwrap(),
+                ),
+            ),
+        )
+        .unwrap();
+    let importer = DriveFeature::new(f.clients[0].clone(), sessions.clone());
+    let root = f.root(0).await;
+    let saved = value(tool(&importer, "DriveSaveWorkdir", json!({"target_workdir":"source","path":"README.md","parent":root,"name":"retained.md","content_type":"text/markdown"})).await.unwrap());
+    sessions.close_all().await.unwrap();
+    drop(importer);
+    drop(sessions);
+    drop(binding);
+    assert!(root_path.join("README.md").exists());
+    let api = source.api.clone();
+    let removal_id = workdir_id.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        execute_workdir_removal(
+            &api,
+            &removal_id,
+            "account:drive-test",
+            "source no longer needed",
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        removed.disposition,
+        server_api::WorkingDirectoryRemovalDisposition::Removed,
+        "{removed:?}"
+    );
+    assert!(!removed.retryable);
+    assert!(
+        !materialization_root.exists(),
+        "actual source materialization must be gone"
+    );
+    assert!(
+        f.api
+            .store
+            .get_workdir_registry(TEST_WORKSPACE_ID, &workdir_id)
+            .unwrap()
+            .is_none()
+    );
+    let fresh = DriveFeature::new(
+        f.clients[1].clone(),
+        Arc::new(WorkdirSessionRouter::default()),
+    );
+    let read = value(
+        tool(&fresh, "DriveRead", json!({"entry":entry(&saved)}))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(read["entry"], saved["entry"]);
+    assert_eq!(read["text"].as_str().unwrap().as_bytes(), bytes);
+    let receipt = value(
+        tool(
+            &fresh,
+            "DriveRequestStatus",
+            json!({"request_id":saved["request_id"]}),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(receipt["state"], "committed");
+    assert_eq!(receipt["response"]["entry"], saved["entry"]["metadata"]);
+}
+
+#[tokio::test]
+async fn worker_removal_preserves_drive_reference_for_explicitly_granted_replacement() {
+    // Real embedded Runtime lifecycle/retention; only controller execution is
+    // deterministic. No Workdir or external model is involved in this case.
+    let f = Fixture::with_runtime(["read_write", "read_only"], true).await;
+    let saved = f.create("retained.md", "# Beyond the Worker\n").await;
+    let id = entry(&saved);
+    let old = &f.clients[0].worker;
+    let worker = WorkspaceWorker::resolve_async(&f.api, &old.runtime_id, &old.worker_id)
+        .await
+        .unwrap();
+    let stopped = worker
+        .stop(
+            &WorkerOperationContext::Backend,
+            WorkerLifecycleRequest {
+                reason: Some("Drive lifetime test".into()),
+                ticket_assignment: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+    assert_eq!(f.api.runtime.worker(old).unwrap().state, "stopped");
+    seed_worker_session_for_cleanup(f._temp.path(), old);
+    let plan = build_runtime_cleanup_plan(&f.api, &old.runtime_id).unwrap();
+    let candidate = plan
+        .workers
+        .iter()
+        .find(|c| c.runtime_worker_id == old.worker_id)
+        .unwrap();
+    assert_eq!(candidate.blocking_reason, None);
+    worker
+        .delete_from_plan(&WorkerOperationContext::Backend, candidate)
+        .await
+        .unwrap();
+    assert!(f.api.runtime.worker(old).is_err());
+    let client = f.clients[0].clone();
+    let capability = tokio::task::spawn_blocking(move || {
+        client.request(
+            WorkspaceRequestMethod::Get,
+            format!("{}/capabilities", base()),
+            vec![],
+            65536,
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!(200..300).contains(&capability.status));
+    assert!(
+        f.api
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, old)
+            .unwrap()
+            .is_none()
+    );
+    denied(tool(&f.features[0], "DriveRead", json!({"entry":id})).await);
+    let Json(created) = create_workspace_worker(
+        State(f.api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: EMBEDDED_RUNTIME_ID.into(),
+            display_name: "Replacement reader".into(),
+            singleton_key: None,
+            profile: Some("builtin:coder".into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachments: vec![],
+            feature_connections: Default::default(),
+            control_operation_id: None,
+            execution_grant: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_ne!(created.worker_id, old.worker_id);
+    let client = Arc::new(RouterClient {
+        api: f.api.clone(),
+        identity: f.clients[0].identity.clone(),
+        worker: RuntimeWorkerRef::new(created.runtime_id, created.worker_id),
+        handle: tokio::runtime::Handle::current(),
+        lose_next_mutation_response: AtomicBool::new(false),
+        lose_next_upload_response: AtomicBool::new(false),
+        requests: Mutex::new(vec![]),
+    });
+    let replacement = DriveFeature::new(client.clone(), Arc::new(WorkdirSessionRouter::default()));
+    denied(tool(&replacement, "DriveRead", json!({"entry":id})).await);
+    owner_call(&f.api, &f.owner, "POST", &format!("{}/grants", base()), Some(json!({"runtime_id":client.worker.runtime_id,"worker_id":client.worker.worker_id,"access":"read_only"}))).await;
+    let read = value(
+        tool(&replacement, "DriveRead", json!({"entry":id}))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(read["entry"], saved["entry"]);
+    assert_eq!(read["text"], "# Beyond the Worker\n");
+    let receipt = owner_call(
+        &f.api,
+        &f.owner,
+        "GET",
+        &format!(
+            "{}/requests/{}",
+            base(),
+            saved["request_id"].as_str().unwrap()
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(receipt["state"], "committed");
+    assert_eq!(receipt["response"]["entry"], saved["entry"]["metadata"]);
+    // Stop remaining deterministic controllers before dropping isolated resources.
+    for target in [&f.clients[1].worker, &client.worker] {
+        let stopped = f
+            .api
+            .runtime
+            .stop_worker(
+                target,
+                WorkerLifecycleRequest {
+                    reason: None,
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+    }
 }
 
 #[tokio::test]
@@ -1177,11 +1586,30 @@ impl agen::llm_client::LlmClient for NoLlm {
         panic!("native tool fixture must not call an LLM")
     }
 }
+fn file_write_reference(observed: &Value) -> Value {
+    observed["interfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["reference"]["name"] == "yoi.file/write-text/v1")
+        .expect("write capability")["reference"]
+        .clone()
+}
 fn native_tools(
     feature: &DriveFeature,
 ) -> std::collections::BTreeMap<String, Arc<dyn agen::tool::Tool>> {
+    native_tools_with_checkouts(feature, None)
+}
+fn native_tools_with_checkouts(
+    feature: &DriveFeature,
+    router: Option<Arc<WorkdirSessionRouter>>,
+) -> std::collections::BTreeMap<String, Arc<dyn agen::tool::Tool>> {
     let mut mounts = worker::wip::WipMountRegistry::new();
     worker::feature::builtin::drive::wip::mount_drive_wip(&mut mounts, feature).unwrap();
+    if let Some(router) = router {
+        worker::checkout::mount_checkouts(&mut mounts, router, tools::Tracker::new(), None)
+            .unwrap();
+    }
     let mut engine = agen::Engine::<_, agen::state::Mutable, ()>::new_annotated(NoLlm);
     engine.register_tools(
         feature
@@ -1257,7 +1685,14 @@ async fn native_tree_does_not_index_entries_but_direct_inspect_and_invoke_use_cu
     );
     assert_eq!(read["text"], "native content");
     let denied_write = native_tool(&tools, "Invoke", json!({"path":path,"interface":reference,"operation":"write","arguments":{"content":"lost"}})).await;
-    denied(denied_write);
+    assert!(denied_write.is_err());
+    assert!(
+        !inspected["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["reference"]["name"] == "yoi.file/write-text/v1")
+    );
     f.revoke(1).await;
     assert!(
         native_tool(
@@ -1311,12 +1746,12 @@ async fn native_create_and_write_use_client_managed_committed_requests_and_rejec
             .await
             .unwrap(),
     );
-    let updated = value(native_tool(&first, "Invoke", json!({"path":path,"interface":observed_first["interfaces"][0]["reference"],"operation":"write","arguments":{"content":"committed"}})).await.unwrap());
+    let updated = value(native_tool(&first, "Invoke", json!({"path":path,"interface":file_write_reference(&observed_first),"operation":"write","arguments":{"content":"committed"}})).await.unwrap())["metadata"].clone();
     assert_ne!(
         updated["entry"]["metadata"]["last_mutation_id"],
         created["entry"]["metadata"]["last_mutation_id"]
     );
-    let error = native_tool(&second, "Invoke", json!({"path":path,"interface":observed_second["interfaces"][0]["reference"],"operation":"write","arguments":{"content":"lost"}})).await.unwrap_err();
+    let error = native_tool(&second, "Invoke", json!({"path":path,"interface":file_write_reference(&observed_second),"operation":"write","arguments":{"content":"lost"}})).await.unwrap_err();
     assert!(
         error.to_string().to_lowercase().contains("validator"),
         "stale native mutation must report validator conflict: {error:?}"
@@ -1437,5 +1872,145 @@ async fn image_attachment_retains_original_bytes_after_drive_update_and_revocati
         image.data(),
         original,
         "history attachment must not fetch latest Drive content"
+    );
+}
+
+#[tokio::test]
+async fn common_file_inspect_invoke_crosses_drive_and_checkout_without_transferring_authority() {
+    let f = Fixture::new(["read_write", "read_only"]).await;
+    let created = f.create("common.md", "first\n雪 needle\nlast\n").await;
+    let path = created["entry"]["path"].as_str().unwrap();
+    let checkout = f._temp.path().join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("file"), "first\n雪 needle\nlast\n").unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            workdir::WorkdirAttachmentAlias::new("main").unwrap(),
+            Arc::new(workdir::LocalWorkdirSession::materialized(
+                checkout.clone(),
+                checkout.clone(),
+                manifest::SharedScope::new(manifest::Scope::writable(&checkout).unwrap()),
+                workdir::WorkdirSessionCapabilities::READ_WRITE,
+            )),
+        )
+        .unwrap();
+    let tools = native_tools_with_checkouts(&f.features[0], Some(router));
+    let drive = value(
+        native_tool(&tools, "Inspect", json!({"path":path}))
+            .await
+            .unwrap(),
+    );
+    let local = value(
+        native_tool(&tools, "Inspect", json!({"path":"/checkouts/main/file"}))
+            .await
+            .unwrap(),
+    );
+    for name in [
+        "yoi.file/read-lines/v1",
+        "yoi.file/search-text/v1",
+        "yoi.file/edit-text/v1",
+        "yoi.file/write-text/v1",
+    ] {
+        let selected = drive["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["reference"]["name"] == name)
+            .unwrap();
+        let reference = &selected["reference"];
+        assert_eq!(reference["scope"], "/");
+        assert!(
+            local["interfaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["reference"] == *reference)
+        );
+        let signature = value(
+            native_tool(&tools, "Inspect", json!({"path":selected["path"]}))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            signature["interface_signature"]
+                .as_str()
+                .unwrap()
+                .contains(name)
+        );
+        let (operation, arguments) = match name {
+            "yoi.file/read-lines/v1" => ("read", json!({"offset":1,"limit":1})),
+            "yoi.file/search-text/v1" => ("search", json!({"pattern":"needle","limit":2})),
+            "yoi.file/edit-text/v1" => {
+                ("edit", json!({"old_string":"needle","new_string":"found"}))
+            }
+            _ => ("write", json!({"content":"saved\n"})),
+        };
+        let mut results = vec![];
+        for target in [path, "/checkouts/main/file"] {
+            results.push(value(native_tool(&tools,"Invoke",json!({"path":target,"interface":reference,"operation":operation,"arguments":arguments})).await.unwrap()));
+        }
+        if matches!(operation, "read" | "search") {
+            assert_eq!(results[0], results[1]);
+        } else {
+            assert!(results.iter().all(|v| v.get("metadata").is_some()));
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(checkout.join("file")).unwrap(),
+        "saved\n"
+    );
+    assert_eq!(
+        value(
+            tool(
+                &f.features[1],
+                "DriveRead",
+                json!({"entry":entry(&created)})
+            )
+            .await
+            .unwrap()
+        )["text"],
+        "saved\n"
+    );
+    // A capability query is not a grant: drop the writer to readonly after the common write was cached.
+    f.revoke(0).await;
+    owner_call(&f.api,&f.owner,"POST",&format!("{}/grants",base()),Some(json!({"runtime_id":f.clients[0].worker.runtime_id,"worker_id":f.clients[0].worker.worker_id,"access":"read_only"}))).await;
+    assert!(native_tool(&tools,"Invoke",json!({"path":path,"interface":file_write_reference(&drive),"operation":"write","arguments":{"content":"lost"}})).await.is_err());
+    let refreshed = value(
+        native_tool(&tools, "Inspect", json!({"path":path,"refresh":true}))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        !refreshed["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["reference"]["name"] == "yoi.file/write-text/v1")
+    );
+    let common_read = json!({"scope":"/","name":"yoi.file/read-lines/v1"});
+    assert_eq!(
+        value(
+            native_tool(
+                &tools,
+                "Invoke",
+                json!({"path":path,"interface":common_read,"operation":"read","arguments":{}})
+            )
+            .await
+            .unwrap()
+        )["content"],
+        "     1\tsaved\n"
+    );
+    assert_eq!(
+        value(
+            tool(
+                &f.features[1],
+                "DriveRead",
+                json!({"entry":entry(&created)})
+            )
+            .await
+            .unwrap()
+        )["text"],
+        "saved\n"
     );
 }

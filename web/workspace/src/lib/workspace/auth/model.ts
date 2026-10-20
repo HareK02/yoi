@@ -463,12 +463,40 @@ function parseActor(value: unknown, path: string): RequestActor {
 
 export function parseWhoamiResponse(value: unknown): WhoamiResponse {
   const response = asRecord(value, "whoami");
-  requireExactKeys(response, "whoami", ["actor"]);
-  return {
-    actor: response.actor === null
+  requireExactKeys(response, "whoami", ["actor", "session"]);
+  const actor = response.actor === null
+    ? null
+    : parseActor(response.actor, "whoami.actor");
+  const session = asRecord(response.session, "whoami.session");
+  if (session.kind === "authenticated") {
+    requireExactKeys(session, "whoami.session", ["kind", "expires_at"]);
+    if (actor === null) {
+      invalid("whoami", "authenticated session requires actor");
+    }
+    const expiry = session.expires_at === null
       ? null
-      : parseActor(response.actor, "whoami.actor"),
-  };
+      : boundedString(session.expires_at, "whoami.session.expires_at");
+    if (
+      (expiry !== null &&
+        (!/^\d{4}-\d\d-\d\dT/.test(expiry) ||
+          !Number.isFinite(Date.parse(expiry)))) ||
+      (actor.auth_method === "browser_session" && expiry === null)
+    ) {
+      invalid(
+        "whoami.session.expires_at",
+        "must identify the server session expiry",
+      );
+    }
+    return { actor, session: { kind: "authenticated", expires_at: expiry } };
+  }
+  requireExactKeys(session, "whoami.session", ["kind"]);
+  if (
+    actor !== null ||
+    (session.kind !== "anonymous" && session.kind !== "expired")
+  ) {
+    invalid("whoami", "inconsistent actor or session state");
+  }
+  return { actor: null, session: { kind: session.kind } };
 }
 
 export function parseAuthPublicConfig(value: unknown): AuthPublicConfig {

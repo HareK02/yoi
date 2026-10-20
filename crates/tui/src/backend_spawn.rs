@@ -162,6 +162,7 @@ fn request_from_selection(selection: Selection) -> BackendCreateWorkerRequest {
         ticket_assignment: None,
         feature_connections: Default::default(),
         control_operation_id: None,
+        execution_grant: None,
     }
 }
 

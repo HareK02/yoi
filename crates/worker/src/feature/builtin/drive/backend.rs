@@ -138,6 +138,9 @@ impl DriveBackend {
         )
         .await
     }
+    pub async fn capabilities(&self) -> Result<DriveCapabilities, DriveError> {
+        self.get("/capabilities", &serde_json::json!({})).await
+    }
     pub async fn root(&self) -> Result<DriveEntry, DriveError> {
         let entry: DriveEntry = self
             .json(

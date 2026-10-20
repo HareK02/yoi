@@ -325,6 +325,7 @@ async fn workers(api: &WorkspaceApi) -> (WorkdirlessFixtureRuntime, Vec<RuntimeW
                 workdir_attachments: vec![],
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -777,6 +778,7 @@ async fn drive_read_entrypoints_use_current_grants_and_cannot_fallback_to_browse
     configure_runtime_request_auth(&mut api, &identity, &workers[0].runtime_id);
     let routes = [
         format!("{}/root", base()),
+        format!("{}/capabilities", base()),
         format!(
             "{}/metadata?entry_workspace_id={TEST_WORKSPACE_ID}&id={id}",
             base()
@@ -1006,4 +1008,107 @@ async fn drive_download_stream_expires_instead_of_mixing_last_mutation_ids() {
         stream.next().await.unwrap().is_err(),
         "next chunk must expire, not deliver generation b"
     );
+}
+
+#[tokio::test]
+async fn drive_capabilities_expose_only_authenticated_current_caller_ceiling() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut api = test_api(temp.path()).await;
+    let owner = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let (_runtime, workers) = workers(&api).await;
+    let identity = RuntimeIdentityMaterial::generate(&workers[0].runtime_id).unwrap();
+    configure_runtime_request_auth(&mut api, &identity, &workers[0].runtime_id);
+    let path = format!("{}/capabilities", base());
+    let unsigned = build_router(api.clone())
+        .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        unsigned.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ));
+    signed(
+        &api,
+        &identity,
+        None,
+        "GET",
+        &path,
+        None,
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    let mut grants = vec![];
+    for (worker, access, write) in [
+        (&workers[0], "read_only", false),
+        (&workers[1], "read_write", true),
+    ] {
+        grants.push(user_call(&api,&owner,"POST",&format!("{}/grants",base()),Some(json!({"runtime_id":worker.runtime_id,"worker_id":worker.worker_id,"access":access})),StatusCode::OK).await);
+        assert_eq!(
+            signed(
+                &api,
+                &identity,
+                Some(&worker.worker_id),
+                "GET",
+                &path,
+                None,
+                StatusCode::OK
+            )
+            .await,
+            json!({"write":write})
+        );
+    }
+    // Altering a signed source cannot acquire the other Worker's larger ceiling.
+    let mut forged =
+        runtime_source_request(&identity, Some(&workers[0].worker_id), "GET", &path, vec![]);
+    forged
+        .headers_mut()
+        .insert("x-yoi-worker-id", workers[1].worker_id.parse().unwrap());
+    let response = build_router(api.clone()).oneshot(forged).await.unwrap();
+    assert!(matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ));
+    let foreign = path.replace(&format!("/w/{TEST_WORKSPACE_ID}/"), "/w/other-workspace/");
+    let response = build_router(api.clone())
+        .oneshot(runtime_source_request(
+            &identity,
+            Some(&workers[1].worker_id),
+            "GET",
+            &foreign,
+            vec![],
+        ))
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    signed(
+        &api,
+        &identity,
+        Some("nonexistent-worker"),
+        "GET",
+        &path,
+        None,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    for (worker, grant) in workers.iter().zip(&grants) {
+        user_call(
+            &api,
+            &owner,
+            "DELETE",
+            &format!("{}/grants/{}", base(), grant["grant_id"].as_str().unwrap()),
+            None,
+            StatusCode::OK,
+        )
+        .await;
+        signed(
+            &api,
+            &identity,
+            Some(&worker.worker_id),
+            "GET",
+            &path,
+            None,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+    }
 }

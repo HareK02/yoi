@@ -8,6 +8,50 @@ pub use server_api::{
     SkillProjectionStatus, SkillProvenance, SkillResourceRef, SkillSourceKind,
 };
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillActivationInput {
+    pub name: String,
+}
+
+pub(crate) fn activation_input(
+    activation: &SkillActivationResponse,
+) -> Result<session_store::LoggedSystemHistoryEntry, session_store::InputMetadataError> {
+    use session_store::*;
+    let body = format!(
+        "Agent Skill `{}` activated from {}.\n\n{}",
+        activation.name, activation.provenance.id, activation.body
+    );
+    let payload = FeatureInputPayload::encode(
+        "skill:activation",
+        1,
+        &SkillActivationInput {
+            name: activation.name.clone(),
+        },
+    )?;
+    let metadata = HistoryInputMetadata::new(
+        HistoryInputUsePolicy {
+            recording_material: InputEvidenceUse::Exclude,
+            memory_evidence: InputEvidenceUse::Exclude,
+            observation: InputObservationUse::Hidden,
+            compaction: InputCompactionUse::Retain,
+        },
+        Some(payload),
+        Some(PublicSystemItem {
+            kind: "skill_activation".into(),
+            body: body.clone(),
+            presentation: PublicSystemPresentation::Context,
+        }),
+    )?;
+    Ok(LoggedSystemHistoryEntry::from_input(
+        LoggedSessionHistoryOrigin::Provided {
+            producer: "skill.activation".into(),
+        },
+        None,
+        SystemInputEnvelope::new(body, metadata)?,
+    ))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SkillClientError {
     #[error("workspace client is unavailable: {0}")]

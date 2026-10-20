@@ -119,6 +119,7 @@ fn annotated(item: Item) -> session_store::LoggedHistoryEntry {
     session_store::LoggedHistoryEntry {
         item: session_store::LoggedItem::from(item),
         metadata: session_store::LoggedSessionHistoryMetadata {
+            input_metadata: None,
             entry_id: session_store::LoggedSessionHistoryEntryId::new(),
             origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
             derivation: None,
@@ -1495,11 +1496,9 @@ async fn post_compact_pause_bills_partial_without_rearming_or_consuming_correlat
     let session_id = worker.session_id();
 
     let runtime_tmp = tempfile::tempdir().unwrap();
-    let bash_output_dir = runtime_tmp.path().join("bash-output");
-    let (handle, shutdown_receiver) =
-        WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
-            .await
-            .unwrap();
+    let (handle, shutdown_receiver) = WorkerController::spawn(worker, runtime_tmp.path())
+        .await
+        .unwrap();
     let mut rx = handle.subscribe();
     handle
         .send(Method::submit_text(
@@ -1705,11 +1704,9 @@ async fn controller_does_not_repeat_a_persisted_mid_run_compaction_failure() {
     let (worker, store) = make_worker_with_manifest_and_store(MID_TURN_MANIFEST_TOML, client).await;
     let session_id = worker.session_id();
     let runtime_tmp = tempfile::tempdir().unwrap();
-    let bash_output_dir = runtime_tmp.path().join("bash-output");
-    let (handle, shutdown_receiver) =
-        WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
-            .await
-            .unwrap();
+    let (handle, shutdown_receiver) = WorkerController::spawn(worker, runtime_tmp.path())
+        .await
+        .unwrap();
     let mut rx = handle.subscribe();
 
     handle
@@ -1830,11 +1827,9 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
     let source_session = worker.session_id();
     let source_segment = worker.segment_id();
     let runtime_tmp = tempfile::tempdir().unwrap();
-    let bash_output_dir = runtime_tmp.path().join("bash-output");
-    let (handle, shutdown_receiver) =
-        WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
-            .await
-            .unwrap();
+    let (handle, shutdown_receiver) = WorkerController::spawn(worker, runtime_tmp.path())
+        .await
+        .unwrap();
     let mut rx = handle.subscribe();
 
     handle
@@ -1996,8 +1991,7 @@ async fn controller_compact_method_publishes_progress_and_clear() {
     ]);
     let worker = make_worker_with_manifest(MANUAL_ONLY_MANIFEST_TOML, client).await;
     let runtime_tmp = tempfile::tempdir().unwrap();
-    let bash_output_dir = runtime_tmp.path().join("bash-output");
-    let (handle, _shutdown) = WorkerController::spawn(worker, runtime_tmp.path(), &bash_output_dir)
+    let (handle, _shutdown) = WorkerController::spawn(worker, runtime_tmp.path())
         .await
         .unwrap();
     let mut rx = handle.subscribe();
@@ -2219,8 +2213,46 @@ fn summary_entry(
     origin: session_store::LoggedSessionHistoryOrigin,
 ) -> session_store::LoggedHistoryEntry {
     let mut entry = annotated(item);
+    entry.metadata.input_metadata = matches!(
+        &entry.item,
+        session_store::LoggedItem::Message {
+            role: session_store::LoggedRole::System,
+            ..
+        }
+    )
+    .then(|| {
+        session_store::HistoryInputMetadata::new(
+            session_store::HistoryInputUsePolicy {
+                recording_material: session_store::InputEvidenceUse::Exclude,
+                memory_evidence: session_store::InputEvidenceUse::Exclude,
+                observation: session_store::InputObservationUse::Hidden,
+                compaction: match origin {
+                    session_store::LoggedSessionHistoryOrigin::CompactionSummary => {
+                        session_store::InputCompactionUse::OpeningSummary
+                    }
+                    session_store::LoggedSessionHistoryOrigin::JournalContext => {
+                        session_store::InputCompactionUse::ReferenceInput
+                    }
+                    _ => session_store::InputCompactionUse::Retain,
+                },
+            },
+            None,
+            None,
+        )
+        .unwrap()
+    });
     entry.metadata.origin = origin;
     entry
+}
+
+fn compaction_use(
+    metadata: &session_store::LoggedSessionHistoryMetadata,
+) -> session_store::InputCompactionUse {
+    metadata
+        .input_metadata
+        .as_ref()
+        .map(|input| input.usage().compaction)
+        .unwrap_or(session_store::InputCompactionUse::Retain)
 }
 
 fn long_summary(label: &str) -> String {
@@ -2358,7 +2390,8 @@ async fn full_initial_summary_survives_small_overview_budgets_and_both_retention
             assert_eq!(
                 replacement
                     .iter()
-                    .filter(|entry| entry.metadata.origin == CompactionSummary)
+                    .filter(|entry| compaction_use(&entry.metadata)
+                        == session_store::InputCompactionUse::OpeningSummary)
                     .count(),
                 1
             );
@@ -2603,7 +2636,9 @@ async fn three_chained_compactions_transport_each_complete_predecessor_without_r
         let seed = replacement_seed(&fixture.worker);
         let inherited = seed
             .iter()
-            .filter(|entry| entry.metadata.origin == CompactionSummary)
+            .filter(|entry| {
+                compaction_use(&entry.metadata) == session_store::InputCompactionUse::OpeningSummary
+            })
             .collect::<Vec<_>>();
         assert_eq!(inherited.len(), 1);
         assert_eq!(
@@ -2891,7 +2926,7 @@ impl worker::subjektiv::SubjektivHost for CompactionJournalHost {
     }
 
     fn journal_startup_granted(&self) -> bool {
-        true
+        false
     }
 
     fn journal_startup_context(
@@ -2995,8 +3030,8 @@ fn compaction_snapshot(generation: usize) -> subjektiv::journal::startup::Journa
 fn journal_body(worker: &Worker<MockClient, TestStore>) -> String {
     let seed = replacement_seed(worker);
     assert_eq!(
-        seed[1].metadata.origin,
-        session_store::LoggedSessionHistoryOrigin::JournalContext
+        compaction_use(&seed[1].metadata),
+        session_store::InputCompactionUse::ReferenceInput
     );
     let item = Item::from(seed[1].item.clone());
     assert!(matches!(
@@ -3008,8 +3043,8 @@ fn journal_body(worker: &Worker<MockClient, TestStore>) -> String {
     ));
     assert_eq!(
         seed.iter()
-            .filter(|entry| entry.metadata.origin
-                == session_store::LoggedSessionHistoryOrigin::JournalContext)
+            .filter(|entry| compaction_use(&entry.metadata)
+                == session_store::InputCompactionUse::ReferenceInput)
             .count(),
         1
     );
@@ -3118,20 +3153,34 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
     projection.source_digest = "a".repeat(64);
     let initial_catalog = Arc::new(worker::PromptCatalog::from_projection(projection).unwrap());
     fixture.worker.prompts().store(initial_catalog.clone());
-    let legacy_startup = session_store::LoggedSystemHistoryEntry {
-        item: session_store::SystemItem::JournalStartup {
-            body: "OLD_TYPED_STARTUP_JOURNAL".into(),
-            snapshot: serde_json::json!({"journals": []}),
-            snapshot_sha256: "legacy-startup-digest".into(),
-            prompt_provenance: session_store::PromptRenderProvenance {
-                workspace_id: None,
-                source_digest: "legacy-source".into(),
-                projection_digest: "legacy-projection".into(),
-                logical_name: "internal.subjektiv_journal_startup".into(),
-            },
-        },
-        metadata: summary_entry(Item::system_message(""), DerivedSummary).metadata,
-    };
+    // Already migrated generic input with unrelated provenance/payload; Core
+    // must select it by explicit policy, not identify a Journal Feature.
+    let legacy_startup = session_store::LoggedSystemHistoryEntry::from_input(
+        DerivedSummary,
+        None,
+        session_store::SystemInputEnvelope::new(
+            "OLD_TYPED_STARTUP_JOURNAL",
+            session_store::HistoryInputMetadata::new(
+                session_store::HistoryInputUsePolicy {
+                    recording_material: session_store::InputEvidenceUse::Exclude,
+                    memory_evidence: session_store::InputEvidenceUse::Exclude,
+                    observation: session_store::InputObservationUse::Hidden,
+                    compaction: session_store::InputCompactionUse::ReferenceInput,
+                },
+                Some(
+                    session_store::FeatureInputPayload::encode(
+                        "renamed-owner:reference",
+                        8,
+                        &serde_json::json!({"private": "retained opaque context"}),
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
     let legacy_id = legacy_startup.metadata.entry_id.clone();
     fixture
         .restore_seed_with_system(
@@ -3165,7 +3214,7 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
             .unwrap()
             .annotation
             .origin,
-        JournalContext
+        DerivedSummary
     );
     let session = fixture.worker.session_id();
     let original_segment = fixture.worker.segment_id();
@@ -3190,8 +3239,8 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
                     .unwrap()
                     .annotation
                     .origin,
-                JournalContext,
-                "legacy startup classification survives a normal turn"
+                DerivedSummary,
+                "generic source provenance survives a normal turn unchanged"
             );
         }
         assert_eq!(
@@ -3242,7 +3291,7 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
         assert_eq!(host.reads.lock().unwrap().len(), index + 1);
         let history = fixture.worker.history();
         let overview = input
-            .split("## Previous Journal reference (historical, not automatically retained)")
+            .split("## Previous reference input (historical, not automatically retained)")
             .next()
             .unwrap();
         for old in &old_bodies {
@@ -3335,6 +3384,17 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
         .run_text("normal post-compaction turn")
         .await
         .unwrap();
+    let frozen_seed = replacement_seed(&fixture.worker)
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                compaction_use(&entry.metadata),
+                session_store::InputCompactionUse::ReferenceInput
+                    | session_store::InputCompactionUse::OpeningSummary
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(frozen_seed.len(), 2);
     let records = fixture
         .worker
         .store()
@@ -3374,6 +3434,20 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
         .run_text("normal turn after typed history restore")
         .await
         .unwrap();
+    for frozen in frozen_seed {
+        let replayed = fixture
+            .worker
+            .session_history()
+            .entries()
+            .iter()
+            .find(|entry| entry.annotation.entry_id == frozen.metadata.entry_id)
+            .expect("frozen entry identity survives re-restore");
+        assert_eq!(replayed.item, Item::from(frozen.item));
+        assert_eq!(
+            replayed.annotation, frozen.metadata,
+            "origin, derivation, public allowlist, policy and private payload survive atomic seed/restore"
+        );
+    }
     assert_eq!(
         host.reads.lock().unwrap().len(),
         3,
@@ -3444,27 +3518,41 @@ async fn journal_absent_disabled_unavailable_and_over_byte_budget_keep_conversat
             )
             .await;
         fixture.worker.compact(0).await.unwrap();
-        let body = journal_body(&fixture.worker);
-        let expected = match case {
-            "no-host" | "disabled" => "disabled",
-            "absent" => "absent",
-            _ => "unavailable",
-        };
-        assert!(
-            body.contains(&format!("Journal read status: {expected}.")),
-            "{case}"
-        );
         let input = first_compactor_input(&observed.requests()[1]);
-        assert_frozen_journal_transport(&input, &body);
-        assert_journal_provenance(
-            &body,
-            expected_json.as_deref(),
-            &fixture.worker.prompts().load_full(),
-            (case != "no-host").then_some(COMPACTION_HOST_WORKSPACE_ID),
-        );
+        let body = if matches!(case, "disabled" | "no-host") {
+            assert_eq!(
+                replacement_seed(&fixture.worker)
+                    .iter()
+                    .filter(|entry| compaction_use(&entry.metadata)
+                        == session_store::InputCompactionUse::ReferenceInput)
+                    .count(),
+                0
+            );
+            assert!(!input.contains("Journal reference frozen at this compaction boundary"));
+            String::new()
+        } else {
+            let body = journal_body(&fixture.worker);
+            let expected = if case == "absent" {
+                "absent"
+            } else {
+                "unavailable"
+            };
+            assert!(
+                body.contains(&format!("Journal read status: {expected}.")),
+                "{case}"
+            );
+            assert_frozen_journal_transport(&input, &body);
+            assert_journal_provenance(
+                &body,
+                expected_json.as_deref(),
+                &fixture.worker.prompts().load_full(),
+                Some(COMPACTION_HOST_WORKSPACE_ID),
+            );
+            body
+        };
         assert_full_initial_summary(&input, &inherited);
         assert!(input.contains("UNRECORDED_FALLBACK_GOAL"), "{case}");
-        assert!(input.contains("## Previous Journal reference (historical, not automatically retained)\nPREVIOUS_JOURNAL_DELEGATED_CONTEXT"));
+        assert!(input.contains("## Previous reference input (historical, not automatically retained)\nPREVIOUS_JOURNAL_DELEGATED_CONTEXT"));
         assert!(
             fixture.worker.history().iter().all(|item| !item
                 .as_text()
@@ -3566,4 +3654,133 @@ async fn journal_snapshot_counts_against_compactor_hard_input_cap_without_mutati
             before
         );
     }
+}
+#[tokio::test]
+async fn identical_reference_and_retained_inputs_preserve_distinct_metadata_after_compaction() {
+    use session_store::*;
+    let client = MockClient::new(vec![
+        single_text_events("fixture"),
+        single_text_events("fork checkpoint"),
+        write_summary_tool_use_events("review-summary", "replacement summary"),
+        single_text_events("done"),
+        single_text_events("restore checkpoint"),
+    ]);
+    let mut fixture = SummaryInputFixture::new(MANUAL_ONLY_MANIFEST_TOML, client).await;
+    let make = |producer: &str, compaction| {
+        LoggedSystemHistoryEntry::from_input(
+            LoggedSessionHistoryOrigin::Provided {
+                producer: producer.into(),
+            },
+            None,
+            SystemInputEnvelope::new(
+                "identical model context",
+                HistoryInputMetadata::new(
+                    HistoryInputUsePolicy {
+                        recording_material: InputEvidenceUse::Exclude,
+                        memory_evidence: InputEvidenceUse::Exclude,
+                        observation: InputObservationUse::Hidden,
+                        compaction,
+                    },
+                    Some(
+                        FeatureInputPayload::encode(
+                            "review:owner",
+                            1,
+                            &serde_json::json!({"producer": producer}),
+                        )
+                        .unwrap(),
+                    ),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .to_history_entry()
+    };
+    let historical = make("old-reference", InputCompactionUse::ReferenceInput);
+    let retained = make("retained-context", InputCompactionUse::Retain);
+    let repeated = make("second-retained-context", InputCompactionUse::Retain);
+    assert_ne!(historical.metadata.entry_id, retained.metadata.entry_id);
+    fixture
+        .restore_seed(
+            vec![historical.clone(), retained.clone(), repeated.clone()],
+            false,
+        )
+        .await;
+    let session = fixture.worker.session_id();
+    let original = fixture.worker.segment_id();
+    fixture
+        .worker
+        .store()
+        .append(
+            session,
+            original,
+            &LogEntry::Extension {
+                ts: 2,
+                domain: "test.fork_drift".into(),
+                payload: serde_json::json!({}),
+            },
+        )
+        .unwrap();
+    fixture.worker.run_text("fork checkpoint").await.unwrap();
+    let fork = fixture.worker.segment_id();
+    assert_ne!(fork, original);
+    let forked = replacement_seed(&fixture.worker);
+    for expected in [&historical, &retained, &repeated] {
+        assert!(forked.contains(expected));
+    }
+    fixture.worker.compact(1_000_000).await.unwrap();
+    let seed = replacement_seed(&fixture.worker);
+    let matching: Vec<_> = seed.iter().filter(|e| e.item == retained.item).collect();
+    assert_eq!(matching.len(), 2);
+    assert_eq!(
+        matching[0].metadata, retained.metadata,
+        "a retained logical entry must not inherit identity/policy/payload from an equal-body reference that was removed"
+    );
+
+    assert_eq!(matching[1].metadata, repeated.metadata);
+    let compacted = fixture.worker.segment_id();
+    let reopened = FsStore::new(fixture._store_dir.path()).unwrap();
+    let records = reopened.read_all(session, compacted).unwrap();
+    assert!(
+        matches!(&records[0], LogEntry::AnnotatedSegmentStart { compacted_from: Some(source), .. } if source.segment_id == fork)
+    );
+    fixture.worker.run_text("restore checkpoint").await.unwrap();
+    let records = fixture.worker.store().read_all(session, compacted).unwrap();
+    let snapshot = public_snapshot::project_current_session_snapshot(&records);
+    let checkpoint = snapshot
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| {
+            matches!(
+                entry.data,
+                protocol::SessionSnapshotEntryData::UserInput { .. }
+            )
+        })
+        .unwrap();
+    fixture
+        .worker
+        .rewind_to(checkpoint.entry_id.clone())
+        .await
+        .unwrap();
+    for expected in [&retained, &repeated] {
+        assert!(
+            fixture
+                .worker
+                .session_history()
+                .entries()
+                .iter()
+                .any(|entry| entry.annotation == expected.metadata
+                    && entry.item == Item::from(expected.item.clone()))
+        );
+    }
+    assert!(
+        !fixture
+            .worker
+            .session_history()
+            .entries()
+            .iter()
+            .any(|entry| entry.annotation.entry_id == historical.metadata.entry_id)
+    );
 }

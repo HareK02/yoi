@@ -26,10 +26,12 @@
 
 use subjektiv::api::*;
 mod backend_job_profile;
+mod subject_authorization;
 mod subjektiv_job;
 mod subjektiv_journal;
 mod subjektiv_journal_browser;
 mod subjektiv_memory_journal;
+mod workdir_authorization;
 mod worker_operations;
 mod worker_protocol;
 pub(crate) use worker_operations::{
@@ -475,6 +477,7 @@ struct WorkdirCommandSession {
     attachment_alias: String,
     source: WorkdirSessionHandle,
     provider_handle: CommandHandle,
+    terminal_at: Option<std::time::Instant>,
 }
 
 enum RegisteredWorkdirSession {
@@ -515,6 +518,7 @@ impl WorkdirSessionRegistry {
         source: WorkdirSessionHandle,
         provider_handle: CommandHandle,
     ) -> CommandHandle {
+        self.prune_terminal_commands(&worker);
         let external_handle = loop {
             let candidate = CommandHandle(Uuid::now_v7().to_string());
             if !self
@@ -530,6 +534,7 @@ impl WorkdirSessionRegistry {
                 attachment_alias,
                 source,
                 provider_handle,
+                terminal_at: None,
             },
         );
         external_handle
@@ -545,6 +550,45 @@ impl WorkdirSessionRegistry {
             .get(&(worker.clone(), external_handle.clone()))
             .filter(|session| session.attachment_alias == attachment_alias)
             .cloned()
+    }
+
+    fn active_command_count(&self, worker: &RuntimeWorkerRef) -> usize {
+        self.commands
+            .iter()
+            .filter(|((owner, _), command)| owner == worker && command.terminal_at.is_none())
+            .count()
+    }
+
+    fn mark_terminal(&mut self, worker: &RuntimeWorkerRef, external_handle: &CommandHandle) {
+        if let Some(command) = self
+            .commands
+            .get_mut(&(worker.clone(), external_handle.clone()))
+        {
+            command
+                .terminal_at
+                .get_or_insert_with(std::time::Instant::now);
+        }
+        self.prune_terminal_commands(worker);
+    }
+
+    fn prune_terminal_commands(&mut self, worker: &RuntimeWorkerRef) {
+        let mut terminal = self
+            .commands
+            .iter()
+            .filter_map(|((owner, handle), command)| {
+                (owner == worker)
+                    .then_some(command.terminal_at)
+                    .flatten()
+                    .map(|at| (handle.clone(), at))
+            })
+            .collect::<Vec<_>>();
+        terminal.sort_by_key(|(_, at)| *at);
+        let excess = terminal
+            .len()
+            .saturating_sub(MAX_RETAINED_TERMINAL_COMMANDS);
+        for (handle, _) in terminal.into_iter().take(excess) {
+            self.commands.remove(&(worker.clone(), handle));
+        }
     }
 
     fn take_worker_commands_for_alias(
@@ -895,7 +939,27 @@ struct ExternalProviderWorkdirSession {
     audit: Option<ExternalProviderAuditContext>,
     closed: std::sync::atomic::AtomicBool,
     close_lock: tokio::sync::Mutex<()>,
-    active_commands: tokio::sync::Mutex<HashMap<String, workdir::CommandHandle>>,
+    active_commands: tokio::sync::Mutex<HashMap<String, Arc<ExternalProviderCommandState>>>,
+}
+
+const MAX_RETAINED_TERMINAL_COMMANDS: usize = 128;
+const MAX_ACTIVE_SERVER_COMMANDS: usize = 128;
+
+struct ExternalProviderCommandState {
+    handle: workdir::CommandHandle,
+    // Serialize output ACKs, not cancellation: cancel must unblock a waiting reader.
+    cursor: tokio::sync::Mutex<u64>,
+    terminal_at: Mutex<Option<std::time::Instant>>,
+}
+
+impl ExternalProviderCommandState {
+    fn new(handle: workdir::CommandHandle) -> Self {
+        Self {
+            handle,
+            cursor: tokio::sync::Mutex::new(0),
+            terminal_at: Mutex::new(None),
+        }
+    }
 }
 
 impl std::fmt::Debug for ExternalProviderWorkdirSession {
@@ -986,17 +1050,24 @@ impl ExternalProviderWorkdirSession {
                 "External Workdir grant has expired".to_string(),
             ));
         }
-        let _admission = self
-            .connection
-            .admission
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| {
-                workdir::WorkdirError::Unavailable(
-                    "External Workdir provider admission is closed".to_string(),
-                )
-            })?;
+        // Cancellation must reach the provider even when waiting output readers
+        // occupy every data-operation slot. The socket separately bounds control requests.
+        let _admission = if matches!(&operation, WorkdirSessionOperation::CommandCancel(_)) {
+            None
+        } else {
+            Some(
+                self.connection
+                    .admission
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        workdir::WorkdirError::Unavailable(
+                            "External Workdir provider admission is closed".to_string(),
+                        )
+                    })?,
+            )
+        };
         if self
             .connection
             .expires_at
@@ -1073,10 +1144,10 @@ impl ExternalProviderWorkdirSession {
         }
     }
 
-    async fn provider_command_handle(
+    async fn provider_command(
         &self,
         external_handle: &workdir::CommandHandle,
-    ) -> std::result::Result<workdir::CommandHandle, workdir::WorkdirError> {
+    ) -> std::result::Result<Arc<ExternalProviderCommandState>, workdir::WorkdirError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(workdir::WorkdirError::SessionClosed);
         }
@@ -1088,51 +1159,111 @@ impl ExternalProviderWorkdirSession {
             .ok_or_else(|| workdir::WorkdirError::UnknownCommand(external_handle.0.clone()))
     }
 
+    async fn provider_command_handle(
+        &self,
+        external_handle: &workdir::CommandHandle,
+    ) -> std::result::Result<workdir::CommandHandle, workdir::WorkdirError> {
+        Ok(self.provider_command(external_handle).await?.handle.clone())
+    }
+
     async fn remove_active_command_if_matches(
         &self,
         external_handle: &workdir::CommandHandle,
-        provider_handle: &workdir::CommandHandle,
+        command: &Arc<ExternalProviderCommandState>,
     ) {
         let mut commands = self.active_commands.lock().await;
-        if commands.get(&external_handle.0) == Some(provider_handle) {
+        if commands
+            .get(&external_handle.0)
+            .is_some_and(|current| Arc::ptr_eq(current, command))
+        {
             commands.remove(&external_handle.0);
+        }
+    }
+
+    async fn prune_terminal_commands(&self) {
+        let mut commands = self.active_commands.lock().await;
+        let mut terminal = commands
+            .iter()
+            .filter_map(|(key, command)| {
+                command
+                    .terminal_at
+                    .lock()
+                    .unwrap()
+                    .map(|at| (key.clone(), at))
+            })
+            .collect::<Vec<_>>();
+        terminal.sort_by_key(|(_, at)| *at);
+        let excess = terminal
+            .len()
+            .saturating_sub(MAX_RETAINED_TERMINAL_COMMANDS);
+        for (key, _) in terminal.into_iter().take(excess) {
+            commands.remove(&key);
         }
     }
 
     async fn terminate_provider_command(
         &self,
-        provider_handle: workdir::CommandHandle,
+        command: Arc<ExternalProviderCommandState>,
+        reused_handle: bool,
     ) -> std::result::Result<(), workdir::WorkdirError> {
-        // Cancellation is best effort because the command may already be terminal.
-        // Terminal output is the proof that the provider reaped the process.
+        if !reused_handle && command.terminal_at.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        // Do not acquire the output lock until cancellation has unblocked any reader.
+        // The reader records its last known cursor before cleanup acknowledges bytes.
         let _ = self
             .operate(WorkdirSessionOperation::CommandCancel(
-                provider_handle.clone(),
+                command.handle.clone(),
             ))
             .await;
-        match self
-            .operate(WorkdirSessionOperation::CommandOutput(
-                workdir::CommandOutputRequest {
-                    handle: provider_handle,
-                    cursor: 0,
-                    limit: workdir::external::MAX_EXTERNAL_COMMAND_OUTPUT_BYTES,
-                    wait: true,
-                },
-            ))
-            .await?
-        {
-            WorkdirSessionOperationResult::CommandOutput(output)
-                if output.status != workdir::CommandStatus::Running =>
-            {
-                Ok(())
-            }
-            WorkdirSessionOperationResult::CommandOutput(_) => {
-                Err(workdir::WorkdirError::Unavailable(
-                    "External Workdir provider did not confirm command termination".to_string(),
-                ))
-            }
-            _ => Err(Self::mismatch("command_output")),
+        let mut cursor =
+            tokio::time::timeout(std::time::Duration::from_secs(30), command.cursor.lock())
+                .await
+                .map_err(|_| {
+                    workdir::WorkdirError::Unavailable(
+                        "External Workdir reader did not stop after cancellation".to_string(),
+                    )
+                })?;
+        if !reused_handle && command.terminal_at.lock().unwrap().is_some() {
+            return Ok(());
         }
+        let drain = async {
+            loop {
+                match self
+                    .operate(WorkdirSessionOperation::CommandOutput(
+                        workdir::CommandOutputRequest {
+                            handle: command.handle.clone(),
+                            cursor: *cursor,
+                            limit: workdir::MAX_COMMAND_READ_BYTES,
+                            wait: true,
+                        },
+                    ))
+                    .await?
+                {
+                    WorkdirSessionOperationResult::CommandOutput(output) => {
+                        *cursor = output.next_cursor;
+                        if output.terminal.is_some() {
+                            *command.terminal_at.lock().unwrap() = Some(std::time::Instant::now());
+                            return Ok(());
+                        }
+                        if output.chunks.is_empty() {
+                            return Err(workdir::WorkdirError::Unavailable(
+                                "External Workdir provider did not confirm command termination"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    _ => return Err(Self::mismatch("command_output")),
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+            .await
+            .map_err(|_| {
+                workdir::WorkdirError::Unavailable(
+                    "External Workdir command drain timed out".to_string(),
+                )
+            })?
     }
 
     fn mismatch(expected: &str) -> workdir::WorkdirError {
@@ -1410,17 +1541,27 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
     }
     async fn start_command(
         &self,
-        mut request: workdir::CommandRequest,
+        request: workdir::CommandRequest,
     ) -> std::result::Result<workdir::CommandHandle, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Command)?;
         let _close_guard = self.close_lock.lock().await;
         if self.closed.load(Ordering::Acquire) {
             return Err(workdir::WorkdirError::SessionClosed);
         }
-        // Bash supplies a Worker-host spill directory. It is neither meaningful
-        // nor safe to send to a client-hosted provider, so External commands use
-        // bounded inline output and report truncation without a provider path.
-        request.spill_dir = None;
+        self.prune_terminal_commands().await;
+        if self
+            .active_commands
+            .lock()
+            .await
+            .values()
+            .filter(|command| command.terminal_at.lock().unwrap().is_none())
+            .count()
+            >= MAX_ACTIVE_SERVER_COMMANDS
+        {
+            return Err(workdir::WorkdirError::Unavailable(
+                "External Workdir active command limit reached".to_string(),
+            ));
+        }
         match self
             .operate(WorkdirSessionOperation::CommandStart(request))
             .await?
@@ -1430,7 +1571,7 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
                     let commands = self.active_commands.lock().await;
                     commands
                         .iter()
-                        .filter(|(_, active)| *active == &provider_handle)
+                        .filter(|(_, active)| active.handle == provider_handle)
                         .map(|(external, _)| external.clone())
                         .collect::<Vec<_>>()
                 };
@@ -1439,20 +1580,29 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
                     // generation. Remove every ambiguous route before attempting
                     // cleanup so no caller can address the wrong process.
                     let mut commands = self.active_commands.lock().await;
+                    let mut quarantined = None;
                     for external_handle in duplicate_handles {
-                        commands.remove(&external_handle);
+                        if let Some(command) = commands.remove(&external_handle) {
+                            quarantined.get_or_insert(command);
+                        }
                     }
                     let quarantine_handle =
                         workdir::CommandHandle(format!("quarantined-command-{}", Uuid::now_v7()));
-                    commands.insert(quarantine_handle.0.clone(), provider_handle.clone());
+                    let command = quarantined.expect("duplicate command route disappeared");
+                    *command.terminal_at.lock().unwrap() = None;
+                    commands.insert(quarantine_handle.0.clone(), command.clone());
                     drop(commands);
                     if self
-                        .terminate_provider_command(provider_handle.clone())
+                        .terminate_provider_command(command.clone(), true)
                         .await
                         .is_ok()
                     {
-                        self.remove_active_command_if_matches(&quarantine_handle, &provider_handle)
+                        self.remove_active_command_if_matches(&quarantine_handle, &command)
                             .await;
+                    } else {
+                        // An earlier read of the reused handle cannot establish that
+                        // the newly started, ambiguous process has been cleaned up.
+                        *command.terminal_at.lock().unwrap() = None;
                     }
                     return Err(workdir::WorkdirError::Unavailable(
                         "External Workdir provider reused an active command handle".to_string(),
@@ -1460,10 +1610,10 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
                 }
                 let external_handle =
                     workdir::CommandHandle(format!("external-command-{}", Uuid::now_v7()));
-                self.active_commands
-                    .lock()
-                    .await
-                    .insert(external_handle.0.clone(), provider_handle);
+                self.active_commands.lock().await.insert(
+                    external_handle.0.clone(),
+                    Arc::new(ExternalProviderCommandState::new(provider_handle)),
+                );
                 Ok(external_handle)
             }
             _ => Err(Self::mismatch("command_start")),
@@ -1489,21 +1639,29 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
     ) -> std::result::Result<workdir::CommandOutput, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Command)?;
         let external_handle = request.handle.clone();
-        let provider_handle = self.provider_command_handle(&external_handle).await?;
-        request.handle = provider_handle.clone();
+        let command = self.provider_command(&external_handle).await?;
+        let mut cursor = command.cursor.lock().await;
+        request.handle = command.handle.clone();
+        // If the response is lost, this request cursor still replays the provider page.
         match self
             .operate(WorkdirSessionOperation::CommandOutput(request))
-            .await?
+            .await
         {
-            WorkdirSessionOperationResult::CommandOutput(output) => {
-                if output.status != workdir::CommandStatus::Running && output.next_cursor.is_none()
-                {
-                    self.remove_active_command_if_matches(&external_handle, &provider_handle)
-                        .await;
+            Ok(WorkdirSessionOperationResult::CommandOutput(output)) => {
+                *cursor = output.next_cursor;
+                if output.terminal.is_some() {
+                    command
+                        .terminal_at
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(std::time::Instant::now);
                 }
+                drop(cursor);
+                self.prune_terminal_commands().await;
                 Ok(output)
             }
-            _ => Err(Self::mismatch("command_output")),
+            Ok(_) => Err(Self::mismatch("command_output")),
+            Err(error) => Err(error),
         }
     }
     async fn cancel_command(
@@ -1540,21 +1698,25 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
             })
             .collect::<Vec<_>>();
         let mut cleanup_errors = Vec::new();
-        for (external_handle, provider_handle) in commands {
+        for (external_handle, command) in commands {
             // Detach/session replacement is terminal authority for commands
             // started through this exact provider generation. Do not report a
             // successful close until the provider confirms terminal output.
             match self
-                .terminate_provider_command(provider_handle.clone())
+                .terminate_provider_command(command.clone(), false)
                 .await
             {
                 Ok(()) => {
-                    self.remove_active_command_if_matches(&external_handle, &provider_handle)
+                    self.remove_active_command_if_matches(&external_handle, &command)
                         .await;
                 }
                 Err(error) => {
-                    let still_active = self.active_commands.lock().await.get(&external_handle.0)
-                        == Some(&provider_handle);
+                    let still_active = self
+                        .active_commands
+                        .lock()
+                        .await
+                        .get(&external_handle.0)
+                        .is_some_and(|current| Arc::ptr_eq(current, &command));
                     if still_active {
                         cleanup_errors.push(error.to_string());
                     }
@@ -4378,6 +4540,7 @@ impl WorkspaceApi {
                 // main-Subject/Memory attachment or its resident/extraction policy.
                 resolved_subjektiv_attached: request.grants.subjektiv_consolidation.is_some(),
                 resolved_control_operation: Some(control_operation),
+                resolved_execution_grant: None,
             },
         ) {
             Ok(spawned) => spawned,
@@ -5428,6 +5591,21 @@ impl WorkspaceApi {
             crate::store::validate_worker_singleton_key(singleton_key)?;
         }
         self.validate_worker_spawn_repository_scope(runtime_id, &mut request)?;
+        if let Some(grant) = request.resolved_execution_grant.as_ref() {
+            for claim in &mut request.resolved_workdir_attachments {
+                claim.capabilities = workdir_authorization::intersect_capabilities(
+                    &grant.permissions,
+                    &claim.working_directory_id,
+                    claim.capabilities,
+                );
+                if claim.capabilities == workdir::WorkdirSessionCapabilities::EMPTY {
+                    return Err(Error::WorkspacePermissionDenied(
+                        "attachment has no operation within the delegated execution grant".into(),
+                    )
+                    .into());
+                }
+            }
+        }
         let workspace_api = self.workspace_api_ref(runtime_id);
         request.resolved_workspace_api = Some(workspace_api.clone());
         for access in take_new_workdir_repository_access(&mut request)? {
@@ -5527,6 +5705,41 @@ impl WorkspaceApi {
         };
         drop(subject_guard);
         let worker_id = reservation.worker_id;
+        if let Some(grant) = request.resolved_execution_grant.as_ref() {
+            subject_authorization::bind_reserved_grant(self, grant, &worker_id.to_string())?;
+        }
+        // A completed exact-source allocation is historical acceptance, not a new
+        // launch. Source/grant authorization and the full fingerprint were checked
+        // above. Do not reserve its already-linked attachments again, redispatch
+        // initial input, or compensate an existing Worker on a replay failure.
+        let reserved_worker = RuntimeWorkerRef::new(runtime_id, worker_id.to_string());
+        if request.resolved_control_operation.is_some()
+            && !self
+                .store
+                .has_active_worker_create_reservation(&self.config.workspace_id, &reserved_worker)?
+        {
+            let record = self
+                .store
+                .get_worker_registry(&self.config.workspace_id, &reserved_worker)?
+                .ok_or_else(|| {
+                    Error::Store("completed Worker allocation has no registry evidence".into())
+                })?;
+            let summary = self
+                .runtime
+                .worker(&reserved_worker)
+                .unwrap_or_else(|_| worker_summary_from_registry(&record));
+            return Ok(WorkerSpawnResult {
+                state: InternalWorkerOperationState::Accepted,
+                worker: Some(summary),
+                acceptance_evidence: vec![crate::hosts::WorkerSpawnAcceptanceEvidence {
+                    kind: "saved_creation".into(),
+                    detail:
+                        "Exact allocation was previously accepted; no new execution was requested"
+                            .into(),
+                }],
+                diagnostics: Vec::new(),
+            });
+        }
         if let Some(assignment) = request.ticket_assignment.as_ref() {
             self.store.bind_ticket_assignment_operation_worker(
                 &self.config.workspace_id,
@@ -6856,6 +7069,7 @@ async fn attach_server_request_context(
 }
 
 fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
+    let auth = auth_public_config(&service.auth_api().config);
     let service = Arc::new(service);
     let origin_context = Router::new()
         .merge(server_api::server_api_axum::auth_activation_options(
@@ -6887,7 +7101,6 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
         .merge(server_api::server_api_axum::auth_device_login_approve(
             service.clone(),
         ))
-        .merge(server_api::server_api_axum::auth_whoami(service.clone()))
         .layer(middleware::from_fn_with_state(
             service.as_ref().clone(),
             attach_server_request_context,
@@ -6908,12 +7121,20 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
             service.clone(),
         ))
         .merge(server_api::server_api_axum::auth_logout(service.clone()))
+        .merge(
+            server_api::server_api_axum::auth_whoami(service.clone())
+                .layer(middleware::from_fn(attach_server_origin_context)),
+        )
         .merge(server_api::server_api_axum::auth_device_login_start(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::auth_device_login_poll(service))
         .merge(origin_context)
         .merge(actor_context)
+        .layer(middleware::from_fn_with_state(
+            auth,
+            append_session_marker_cookie,
+        ))
         .layer(middleware::map_response(
             |mut response: Response| async move {
                 // Current role/policy and authentication responses must not be cached
@@ -6924,6 +7145,62 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
                 response
             },
         ))
+}
+
+// The typed auth operations expose one Set-Cookie. At the HTTP boundary, pair only a real
+// session Set-Cookie with a non-authenticating expiry marker, including login and logout.
+// Mirroring its attributes keeps Secure/Path/Domain/SameSite aligned without a second policy.
+async fn append_session_marker_cookie(
+    State(auth): State<AuthPublicConfig>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let marker = response
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .find_map(|value| {
+            let value = value.to_str().ok()?;
+            let (pair, attributes) = value.split_once(';')?;
+            let (name, token) = pair.split_once('=')?;
+            if name != auth.cookie_name {
+                return None;
+            }
+            let max_age = attributes
+                .split(';')
+                .find_map(|attr| attr.trim().strip_prefix("Max-Age=")?.parse::<i64>().ok())?;
+            let (hash, marker_age) = if max_age <= 0 {
+                (String::new(), 0)
+            } else {
+                (
+                    token_hash(token),
+                    max_age + crate::auth::SESSION_EXPIRY_GRACE_SECONDS,
+                )
+            };
+            let attributes = attributes
+                .split(';')
+                .map(|attr| {
+                    if attr.trim().starts_with("Max-Age=") {
+                        format!(" Max-Age={marker_age}")
+                    } else {
+                        attr.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            HeaderValue::from_str(&format!(
+                "{}={hash};{attributes}",
+                crate::auth::session_marker_cookie_name(name)
+            ))
+            .ok()
+        });
+    if let Some(marker) = marker {
+        response
+            .headers_mut()
+            .append(axum::http::header::SET_COOKIE, marker);
+    }
+    response
 }
 
 fn generated_workspace_catalog_contract_router(service: ServerApiContractService) -> Router {
@@ -7034,6 +7311,11 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::memory_consolidation(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::operation_authorize(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_subject_permissions_get(service.clone()))
+        .merge(server_api::server_api_axum::subjektiv_subject_permissions_set(service.clone()))
         .merge(server_api::server_api_axum::subjektiv_subject_create(
             service.clone(),
         ))
@@ -7616,6 +7898,7 @@ fn worker_spawn_request_from_api(
         resolved_worker_observation_enabled: false,
         resolved_worker_observation_grants: Vec::new(),
         resolved_control_operation: None,
+        resolved_execution_grant: None,
     })
 }
 
@@ -8151,9 +8434,15 @@ impl server_api::ServerApi for ServerApiContractService {
         &self,
         context: server_api::ServerRequestContext,
     ) -> std::result::Result<WhoamiResponse, server_api::RepositoryApiError> {
-        Ok(WhoamiResponse {
-            actor: context.actor,
-        })
+        let headers = contract_request_headers(&context)?;
+        let api = self.auth_api();
+        crate::auth::resolve_whoami(
+            api.store.clone(),
+            &headers,
+            &auth_public_config(&api.config).cookie_name,
+        )
+        .await
+        .map_err(|error| ApiError::from(error).into_repository_api_error())
     }
 
     async fn auth_logout(
@@ -8983,6 +9272,114 @@ impl server_api::ServerApi for ServerApiContractService {
             total_bytes: response.total_bytes,
         })
         .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn operation_authorize(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::authorization::OperationAuthorizationRequest,
+    ) -> std::result::Result<
+        server_api::authorization::OperationAuthorizationResponse,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?.clone();
+        // Runtime startup/restore can hold Host while asking this callback. The
+        // authority query uses only current stores, never Runtime or Host reentry.
+        api.store
+            .db_executor()
+            .run(move || {
+                validate_workspace_scope(&api, &workspace_id)?;
+                let worker = subject_authorization::source_from_context(&context)?;
+                let scope = subject_authorization::authorize_scope(&api, &worker, &request)?;
+                Ok(server_api::authorization::OperationAuthorizationResponse { scope })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_subject_permissions_get(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        subject_id: String,
+    ) -> std::result::Result<server_api::SubjectPermissionsResponse, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?.clone();
+        let actor = subject_authorization::administration_actor(&context)
+            .map_err(ApiError::into_repository_api_error)?;
+        require_workspace_owner(
+            &api,
+            &workspace_id,
+            actor,
+            "Subject permission administration",
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        api.store
+            .db_executor()
+            .run(move || -> ApiResult<_> {
+                Ok(open_subjektiv_store(&api)?
+                    .subject_permissions(&subject_id)
+                    .map(|permissions| server_api::SubjectPermissionsResponse { permissions })
+                    .map_err(subjektiv_store_error)?)
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_subject_permissions_set(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        subject_id: String,
+        request: server_api::authorization::SubjectPermissionsUpdate,
+    ) -> std::result::Result<
+        server_api::SubjectPermissionsMutationResponse,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?.clone();
+        let actor = subject_authorization::administration_actor(&context)
+            .map_err(ApiError::into_repository_api_error)?;
+        require_workspace_owner(
+            &api,
+            &workspace_id,
+            actor,
+            "Subject permission administration",
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        let mutation_api = api.clone();
+        let mutation_subject = subject_id.clone();
+        let (permissions, changed) = api
+            .store
+            .db_executor()
+            .run(move || -> ApiResult<_> {
+                let store = open_subjektiv_store(&mutation_api)?;
+                let before = store
+                    .subject_permissions(&mutation_subject)
+                    .map_err(subjektiv_store_error)?;
+                let was_current = before.as_ref().map(|policy| &policy.change_id)
+                    == request.expected_change_id.as_ref();
+                let permissions = store
+                    .set_subject_permissions(&mutation_subject, &request)
+                    .map_err(subjektiv_store_error)?;
+                let changed = was_current
+                    && before.as_ref().map(|source| &source.change_id)
+                        != Some(&permissions.change_id);
+                Ok((permissions, changed))
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)?;
+        let interruptions = if changed {
+            subject_authorization::interrupt_subject_workers(&api, &subject_id).await
+        } else {
+            Vec::new()
+        };
+        Ok(server_api::SubjectPermissionsMutationResponse {
+            permissions,
+            interruptions,
+        })
     }
 
     async fn subjektiv_subject_create(
@@ -12533,6 +12930,14 @@ impl server_api::ServerApi for ServerApiContractService {
     ) -> std::result::Result<server_api::DriveEntry, server_api::DriveApiError> {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
         drive::root(api, &context, &workspace_id).await
+    }
+    async fn drive_capabilities(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+    ) -> std::result::Result<server_api::DriveCapabilities, server_api::DriveApiError> {
+        let api = self.workspace_api().map_err(|_| drive::failure(404))?;
+        drive::capabilities(api, &context, &workspace_id).await
     }
     async fn drive_metadata(
         &self,
@@ -16813,6 +17218,18 @@ fn execute_ticket_rest_operation_on_host(
 
     let (result, created_ticket) = match operation {
         TicketBackendOperation::Create { input } => {
+            if let Some(source) = source.as_ref() {
+                subject_authorization::authorize(
+                    api,
+                    &RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id),
+                    &server_api::authorization::OperationAuthorizationRequest {
+                        operation: "ticket.create".into(),
+                        resource: server_api::authorization::PermissionResource::Workspace {
+                            workspace_id: workspace_id.into(),
+                        },
+                    },
+                )?;
+            }
             let (reference, ticket) = backend.create_with_snapshot(input).map_err(Error::from)?;
             (
                 TicketBackendOperationResult::TicketRef(reference),
@@ -20802,6 +21219,11 @@ async fn scoped_execute_current_worker_workdir_operation(
     context.runtime_id_hash = Some(crate::worker_source::diagnostic_id_hash(&worker.runtime_id));
     context.worker_id_hash = Some(crate::worker_source::diagnostic_id_hash(&worker.worker_id));
     let target_workdir = request.target_workdir;
+    context.stage = "attachment_validation";
+    let permission_link = validated_current_worker_attachment_async(&api, &worker, &target_workdir, None).await?;
+    context.workdir_id_hash = Some(crate::worker_source::diagnostic_id_hash(&permission_link.workdir_id));
+    context.stage = "operation_authorization";
+    workdir_authorization::authorize(&api, &worker, &permission_link, &request.operation)?;
     let result = match request.operation {
         WorkdirSessionOperation::CommandStart(command) => {
             let session_lock = current_worker_session_lock(&api, &worker);
@@ -20811,6 +21233,9 @@ async fn scoped_execute_current_worker_workdir_operation(
                 &api, &worker, &target_workdir, Some(&_session_guard),
             ).await?;
             context.workdir_id_hash = Some(crate::worker_source::diagnostic_id_hash(&link.workdir_id));
+            if api.workdir_sessions.lock().unwrap().active_command_count(&worker) >= MAX_ACTIVE_SERVER_COMMANDS {
+                return Err(InternalWorkdirOperationError::Provider(workdir_operation_transport_error(workdir::WorkdirError::Unavailable("Worker active command limit reached".to_string()))));
+            }
             context.stage = "session_open";
             let source = open_current_worker_workdir_session_locked(&api, &worker, &link, &_session_guard).await?;
             context.stage = "provider_dispatch";
@@ -20852,14 +21277,16 @@ async fn scoped_execute_current_worker_workdir_operation(
                 .map_err(workdir_operation_transport_error)?
         }
         WorkdirSessionOperation::CommandOutput(mut output) => {
+            let external_handle = output.handle.clone();
             let (session, provider_handle) =
-                current_worker_command_session(&api, &worker, &target_workdir, &output.handle, &mut context).await?;
+                current_worker_command_session(&api, &worker, &target_workdir, &external_handle, &mut context).await?;
             output.handle = provider_handle;
-            session
-                .command_output(output)
-                .await
-                .map(WorkdirSessionOperationResult::CommandOutput)
-                .map_err(workdir_operation_transport_error)?
+            let page = session.command_output(output).await.map_err(workdir_operation_transport_error)?;
+            if page.terminal.is_some() {
+                // Retain the binding for a retry after an unknown HTTP outcome.
+                api.workdir_sessions.lock().unwrap().mark_terminal(&worker, &external_handle);
+            }
+            WorkdirSessionOperationResult::CommandOutput(page)
         }
         WorkdirSessionOperation::CommandCancel(external_handle) => {
             let (session, provider_handle) =
@@ -20893,6 +21320,7 @@ async fn scoped_execute_current_worker_workdir_operation(
             context.stage = "session_open";
             let source = open_current_worker_workdir_session_locked(&api, &worker, &link, &_session_guard).await?;
             context.stage = "provider_dispatch";
+            let source = worker::authorized_workdir::authorized_workdir_session(source, subject_authorization::bind_operation_client(&api, &worker), link.workdir_id.clone());
             execute_workdir_session_operation(&source, operation)
                 .await
                 .map_err(workdir_operation_transport_error)?
@@ -23879,6 +24307,14 @@ async fn scoped_subjektiv_memory_backend(
 
 fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
     match error {
+        crate::subjektiv::SubjektivError::AuthorizationDenied(_) => {
+            Error::WorkspacePermissionDenied(error.to_string())
+        }
+        crate::subjektiv::SubjektivError::SubjectPermissionsConflict(_)
+        | crate::subjektiv::SubjektivError::PermissionOperationConflict(_)
+        | crate::subjektiv::SubjektivError::WorkerExecutionGrantConflict(_) => {
+            Error::RepositoryConflict(error.to_string())
+        }
         crate::subjektiv::SubjektivError::SubjectScopeMismatch { .. } => {
             Error::WorkspacePermissionDenied(format!("subject_scope_mismatch: {error}"))
         }
@@ -24131,6 +24567,7 @@ fn start_memory_staging_consolidation(
             resolved_memory_settings: None,
             resolved_subjektiv_attached: false,
             resolved_control_operation: None,
+            resolved_execution_grant: None,
         },
     )?;
     if result.state != InternalWorkerOperationState::Accepted {
@@ -25504,6 +25941,38 @@ fn authorize_known_worker_permission(
     subject: &RuntimeWorkerRef,
     permission: &str,
 ) -> Result<WorkerControlGrantRecord> {
+    // Child result return is deliberately narrower than control or public chat
+    // posting. The execution grant names only this origin Worker and only notify.
+    if permission == "notify" {
+        if let Some(permissions) = subject_authorization::worker_permissions(api, controller)
+            .map_err(|error| error.error)?
+        {
+            let requested = server_api::authorization::ScopedPermission {
+                operation: "worker.result".into(),
+                resource: server_api::authorization::PermissionResource::Worker {
+                    runtime_id: subject.runtime_id.clone(),
+                    worker_id: subject.worker_id.clone(),
+                },
+            };
+            if permissions.iter().any(|granted| granted.covers(&requested)) {
+                return Ok(WorkerControlGrantRecord {
+                    workspace_id: workspace_id.into(),
+                    grant_id: format!(
+                        "execution-result:{}/{}",
+                        controller.runtime_id, controller.worker_id
+                    ),
+                    controller: controller.clone(),
+                    subject: subject.clone(),
+                    relation: "result_return".into(),
+                    origin: "execution_grant".into(),
+                    permissions: vec!["notify".into()],
+                    operation_id: "execution-result".into(),
+                    created_at: String::new(),
+                    revoked_at: None,
+                });
+            }
+        }
+    }
     let grant = api
         .store
         .get_active_worker_control_grant(workspace_id, controller, subject)?
@@ -25891,6 +26360,7 @@ async fn scoped_start_workspace_orchestrator(
             resolved_memory_settings: None,
             resolved_subjektiv_attached: false,
             resolved_control_operation: None,
+            resolved_execution_grant: None,
         },
     )?;
     if result.state != InternalWorkerOperationState::Accepted || result.worker.is_none() {
@@ -26838,7 +27308,12 @@ async fn serve_external_workdir_provider(
                         }));
                         continue;
                     }
-                    if pending.len() >= 16 {
+                    let pending_limit = if matches!(&operation, WorkdirSessionOperation::CommandCancel(_)) {
+                        16 + MAX_ACTIVE_SERVER_COMMANDS
+                    } else {
+                        16
+                    };
+                    if pending.len() >= pending_limit {
                         let _ = response.send(Err(WorkdirTransportError {
                             denial_reason: None,
                             code: workdir::http::WorkdirTransportErrorCode::Unavailable,
@@ -30307,14 +30782,14 @@ fn issue_browser_session(
         token_hash: token_hash(&session_token),
         user_id: user.user_id.clone(),
         created_at: crate::auth::now_rfc3339(),
-        expires_at: rfc3339_after(Duration::days(14)),
+        expires_at: rfc3339_after(Duration::seconds(crate::auth::BROWSER_SESSION_SECONDS)),
         revoked_at: None,
     })?;
     let auth = auth_public_config(&api.config);
     let cookie = session_set_cookie(
         session_cookie_policy(&auth),
         &session_token,
-        14 * 24 * 60 * 60,
+        crate::auth::BROWSER_SESSION_SECONDS,
     );
     Ok((
         AuthUserResponse {
@@ -30509,6 +30984,16 @@ fn logout_browser_session(
         let _ = api
             .store
             .revoke_browser_session(&token_hash(&session_token), &crate::auth::now_rfc3339())?;
+    }
+    // A missing auth cookie after Max-Age must not prevent explicit logout from revoking
+    // the recovery reference. This hash is never accepted as an authentication credential.
+    if let Some(hash) = parse_cookie(
+        &headers,
+        &crate::auth::session_marker_cookie_name(&auth.cookie_name),
+    ) {
+        let _ = api
+            .store
+            .revoke_browser_session(&hash, &crate::auth::now_rfc3339())?;
     }
     Ok((
         LogoutResponse {
@@ -31761,6 +32246,7 @@ async fn create_workspace_worker_authenticated_on_host(
         initial_submit,
         workdir_attachments,
         feature_connections,
+        execution_grant,
         control_operation_id: _,
     } = request;
     let delegation = ticket_assignment
@@ -31820,6 +32306,47 @@ async fn create_workspace_worker_authenticated_on_host(
             &profile,
             prompt_catalog.as_ref(),
         )?;
+    let resolved_execution_grant = if let Some(source) = source.as_ref() {
+        let resolved = resolved_config_bundle
+            .as_ref()
+            .ok_or_else(|| Error::Config("resolved Worker Profile bundle is missing".into()))?;
+        let profile_digest = format!(
+            "sha256:{}",
+            Sha256::digest(
+                serde_json::to_vec(resolved).map_err(|error| Error::Config(error.to_string()))?
+            )
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+        );
+        subject_authorization::prepare_delegation(
+            &api,
+            &RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id),
+            execution_grant.as_ref(),
+            &runtime_id,
+            &profile,
+            &profile_digest,
+            singleton_key.as_deref(),
+            feature_connections.subjektiv.is_some(),
+        )?
+    } else {
+        if execution_grant.is_some() {
+            return Err(Error::WorkspacePermissionDenied(
+                "execution grants require an authenticated delegation origin".into(),
+            )
+            .into());
+        }
+        None
+    };
+    // Generic creation has no authenticated-origin operation reservation or
+    // control-grant recovery. A supplied ID alone must not make that path a
+    // delegation API; require the normal worker-control lifecycle instead.
+    if resolved_execution_grant.is_some() && resolved_control_operation.is_none() {
+        return Err(Error::WorkspacePermissionDenied(
+            "Subject delegation requires worker-control creation with control_operation_id; generic Worker creation is not supported".into(),
+        )
+        .into());
+    }
     let resolved_subjektiv_attached = match feature_connections.subjektiv {
         None => {
             validate_caller_worker_singleton_key(singleton_key.as_deref())?;
@@ -31899,6 +32426,7 @@ async fn create_workspace_worker_authenticated_on_host(
         resolved_worker_observation_enabled: false,
         resolved_worker_observation_grants: Vec::new(),
         resolved_control_operation,
+        resolved_execution_grant,
         resolved_workspace_api: None,
         resolved_memory_settings: None,
         resolved_subjektiv_attached,
@@ -37009,6 +37537,7 @@ mod tests {
 
     mod api_logging_tests;
     mod auth_logging_tests;
+    mod command_transport_tests;
     mod drive_api_tests;
     mod drive_tests;
     mod drive_web_roundtrip_tests;
@@ -37016,6 +37545,7 @@ mod tests {
     mod external_checkout_tests;
     mod protocol_backpressure_tests;
     mod restored_parent_control_tests;
+    mod subject_authorization_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod subjektiv_journal_tests;
@@ -37358,9 +37888,8 @@ mod tests {
             .start_command(workdir::CommandRequest {
                 command: "touch forbidden".to_string(),
                 timeout_secs: 1,
-                output_limit: 1024,
+                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
                 cwd: workdir::WorkdirPath::root(),
-                spill_dir: None,
                 tool_call_id: None,
             })
             .await;
@@ -37509,9 +38038,8 @@ mod tests {
             .start_command(workdir::CommandRequest {
                 command: "printf forbidden".to_string(),
                 timeout_secs: 30,
-                output_limit: 1024,
+                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
                 cwd: workdir::WorkdirPath::root(),
-                spill_dir: None,
                 tool_call_id: None,
             })
             .await;
@@ -37563,9 +38091,8 @@ mod tests {
                     .start_command(workdir::CommandRequest {
                         command: "printf routed".to_string(),
                         timeout_secs: 30,
-                        output_limit: 1024,
+                        transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
                         cwd: workdir::WorkdirPath::root(),
-                        spill_dir: Some("/worker/private/spill".into()),
                         tool_call_id: Some("call-1".to_string()),
                     })
                     .await
@@ -37581,10 +38108,7 @@ mod tests {
         };
         assert!(matches!(
             operation,
-            WorkdirSessionOperation::CommandStart(workdir::CommandRequest {
-                spill_dir: None,
-                ..
-            })
+            WorkdirSessionOperation::CommandStart(workdir::CommandRequest { .. })
         ));
         let provider_handle = workdir::CommandHandle("command-1".to_string());
         response
@@ -37637,13 +38161,9 @@ mod tests {
         response
             .send(Ok(WorkdirSessionOperationResult::CommandOutput(
                 workdir::CommandOutput {
-                    status: workdir::CommandStatus::Running,
-                    exit_code: None,
-                    timed_out: false,
-                    content: String::new(),
-                    next_cursor: None,
-                    truncated: false,
-                    output_path: None,
+                    chunks: Vec::new(),
+                    next_cursor: 0,
+                    terminal: None,
                 },
             )))
             .unwrap();
@@ -37716,13 +38236,22 @@ mod tests {
         response
             .send(Ok(WorkdirSessionOperationResult::CommandOutput(
                 workdir::CommandOutput {
-                    status: workdir::CommandStatus::Cancelled,
-                    exit_code: None,
-                    timed_out: false,
-                    content: String::new(),
-                    next_cursor: None,
-                    truncated: false,
-                    output_path: None,
+                    chunks: Vec::new(),
+                    next_cursor: 0,
+                    terminal: Some(workdir::CommandTerminal {
+                        status: workdir::CommandStatus::Cancelled,
+                        exit_code: None,
+
+                        stdout_bytes: 0,
+
+                        stderr_bytes: 0,
+
+                        stdout_delivered_bytes: 0,
+
+                        stderr_delivered_bytes: 0,
+
+                        truncation_reason: None,
+                    }),
                 },
             )))
             .unwrap();
@@ -37751,9 +38280,8 @@ mod tests {
         let request = || workdir::CommandRequest {
             command: "sleep 30".to_string(),
             timeout_secs: 30,
-            output_limit: 1024,
+            transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
             cwd: workdir::WorkdirPath::root(),
-            spill_dir: None,
             tool_call_id: None,
         };
         let provider_handle = workdir::CommandHandle("command-reused".to_string());
@@ -37810,13 +38338,22 @@ mod tests {
         response
             .send(Ok(WorkdirSessionOperationResult::CommandOutput(
                 workdir::CommandOutput {
-                    status: workdir::CommandStatus::Cancelled,
-                    exit_code: None,
-                    timed_out: false,
-                    content: String::new(),
-                    next_cursor: None,
-                    truncated: false,
-                    output_path: None,
+                    chunks: Vec::new(),
+                    next_cursor: 0,
+                    terminal: Some(workdir::CommandTerminal {
+                        status: workdir::CommandStatus::Cancelled,
+                        exit_code: None,
+
+                        stdout_bytes: 0,
+
+                        stderr_bytes: 0,
+
+                        stdout_delivered_bytes: 0,
+
+                        stderr_delivered_bytes: 0,
+
+                        truncation_reason: None,
+                    }),
                 },
             )))
             .unwrap();
@@ -37867,9 +38404,8 @@ mod tests {
         let request = || workdir::CommandRequest {
             command: "sleep 30".to_string(),
             timeout_secs: 30,
-            output_limit: 1024,
+            transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
             cwd: workdir::WorkdirPath::root(),
-            spill_dir: None,
             tool_call_id: None,
         };
         let provider_handle = workdir::CommandHandle("command-1".to_string());
@@ -38103,6 +38639,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -38691,6 +39228,7 @@ mod tests {
                 ],
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -38766,9 +39304,8 @@ mod tests {
                     .start_command(workdir::CommandRequest {
                         command: "printf forbidden".to_string(),
                         timeout_secs: 30,
-                        output_limit: 1024,
+                        transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
                         cwd: workdir::WorkdirPath::root(),
-                        spill_dir: None,
                         tool_call_id: None,
                     })
                     .await;
@@ -38789,9 +39326,8 @@ mod tests {
                         .start_command(workdir::CommandRequest {
                             command: "printf attached".to_string(),
                             timeout_secs: 30,
-                            output_limit: 1024,
+                            transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
                             cwd: workdir::WorkdirPath::root(),
-                            spill_dir: None,
                             tool_call_id: None,
                         })
                         .await
@@ -38894,13 +39430,22 @@ mod tests {
             response
                 .send(Ok(WorkdirSessionOperationResult::CommandOutput(
                     workdir::CommandOutput {
-                        status: workdir::CommandStatus::Cancelled,
-                        exit_code: None,
-                        timed_out: false,
-                        content: String::new(),
-                        next_cursor: None,
-                        truncated: false,
-                        output_path: None,
+                        chunks: Vec::new(),
+                        next_cursor: 0,
+                        terminal: Some(workdir::CommandTerminal {
+                            status: workdir::CommandStatus::Cancelled,
+                            exit_code: None,
+
+                            stdout_bytes: 0,
+
+                            stderr_bytes: 0,
+
+                            stdout_delivered_bytes: 0,
+
+                            stderr_delivered_bytes: 0,
+
+                            truncation_reason: None,
+                        }),
                     },
                 )))
                 .unwrap();
@@ -38930,6 +39475,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -38985,11 +39531,9 @@ mod tests {
         };
 
         let (mut old_provider, _) = connect_async(&url).await.unwrap();
-        let old_registration = serde_json::to_string(&register(1)).unwrap().replacen(
-            r#""version":2"#,
-            r#""version":1"#,
-            1,
-        );
+        let mut old_registration = serde_json::to_value(register(1)).unwrap();
+        old_registration["version"] = serde_json::json!(1);
+        let old_registration = serde_json::to_string(&old_registration).unwrap();
         old_provider
             .send(Message::Text(old_registration.into()))
             .await
@@ -39003,7 +39547,10 @@ mod tests {
                 .reason
                 .contains("unsupported External Workdir protocol version 1")
         );
-        assert!(frame.reason.contains("requires 2"));
+        assert!(frame.reason.contains(&format!(
+            "requires {}",
+            workdir::external::EXTERNAL_WORKDIR_PROVIDER_PROTOCOL_VERSION
+        )));
 
         let (mut smaller_provider, _) = connect_async(&url).await.unwrap();
         let mut smaller_registration = serde_json::to_value(register(1)).unwrap();
@@ -39244,37 +39791,106 @@ mod tests {
             fs::read_to_string(provider_root.path().join("created.txt")).unwrap(),
             "created"
         );
+        let binary_handle = broker_session
+            .start_command(workdir::CommandRequest {
+                command: "head -c 196609 /dev/zero".to_string(),
+                timeout_secs: 30,
+                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
+                cwd: workdir::WorkdirPath::root(),
+                tool_call_id: None,
+            })
+            .await
+            .unwrap();
+        let (terminal_request, terminal_page) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut cursor = 0;
+                let mut bytes = Vec::new();
+                loop {
+                    let request = workdir::CommandOutputRequest {
+                        handle: binary_handle.clone(),
+                        cursor,
+                        limit: workdir::MAX_COMMAND_READ_BYTES,
+                        wait: true,
+                    };
+                    let page = broker_session
+                        .command_output(request.clone())
+                        .await
+                        .unwrap();
+                    for chunk in &page.chunks {
+                        assert_eq!(chunk.stream, workdir::CommandStream::Stdout);
+                        assert_eq!(chunk.sequence, bytes.len() as u64);
+                        assert_eq!(chunk.offset, bytes.len() as u64);
+                        bytes.extend_from_slice(&chunk.bytes);
+                    }
+                    assert!(
+                        page.chunks
+                            .iter()
+                            .map(|chunk| chunk.bytes.len())
+                            .sum::<usize>()
+                            <= workdir::MAX_COMMAND_READ_BYTES
+                    );
+                    cursor = page.next_cursor;
+                    if let Some(terminal) = &page.terminal {
+                        assert_eq!(terminal.status, workdir::CommandStatus::Completed);
+                        assert_eq!(terminal.exit_code, Some(0));
+                        assert_eq!(bytes, vec![0; 196609]);
+                        break (request, page);
+                    }
+                }
+            })
+            .await
+            .expect("incremental provider output did not terminate");
+        assert_eq!(
+            broker_session
+                .command_output(terminal_request.clone())
+                .await
+                .unwrap(),
+            terminal_page
+        );
+        for cursor in [0, terminal_page.next_cursor + 1] {
+            assert!(
+                broker_session
+                    .command_output(workdir::CommandOutputRequest {
+                        cursor,
+                        ..terminal_request.clone()
+                    })
+                    .await
+                    .is_err()
+            );
+        }
+
         let command_handle = broker_session
             .start_command(workdir::CommandRequest {
-                command: "sleep 30 & child=$!; echo $child > child.pid; wait $child".to_string(),
+                command: "sleep 30 & child=$!; echo $child > child.pid; printf ready; wait $child"
+                    .to_string(),
                 timeout_secs: 30,
-                output_limit: 1024,
+                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
                 cwd: workdir::WorkdirPath::root(),
-                spill_dir: Some("/worker/private/spill".into()),
                 tool_call_id: Some("call-e2e".to_string()),
             })
             .await
             .unwrap();
-
-        for _ in 0..100 {
-            if provider_root.path().join("child.pid").is_file() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(provider_root.path().join("child.pid").is_file());
 
         let command_output = broker_session
             .command_output(workdir::CommandOutputRequest {
                 handle: command_handle,
                 cursor: 0,
                 limit: 1024,
-                wait: false,
+                wait: true,
             })
             .await
             .unwrap();
-        assert_eq!(command_output.status, workdir::CommandStatus::Running);
-        assert_eq!(command_output.output_path, None);
+        assert!(command_output.terminal.is_none());
+
+        assert_eq!(
+            command_output
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.bytes.clone())
+                .collect::<Vec<_>>(),
+            b"ready"
+        );
+        assert!(provider_root.path().join("child.pid").is_file());
 
         let Json(revoked) = scoped_revoke_external_workdir_grant(
             State(api.clone()),
@@ -40477,9 +41093,8 @@ mod tests {
             .start_command(workdir::CommandRequest {
                 command: "printf ready; sleep 30".to_string(),
                 timeout_secs: 60,
-                output_limit: 4096,
+                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
                 cwd: workdir::WorkdirPath::root(),
-                spill_dir: None,
                 tool_call_id: Some("tool-call-command-session".to_string()),
             })
             .await
@@ -40526,7 +41141,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(output.status, workdir::CommandStatus::Running));
+        assert!(output.terminal.is_none());
         assert!(matches!(
             command
                 .source
@@ -40538,14 +41153,21 @@ mod tests {
         let waiting_source = command.source.clone();
         let waiting_handle = command.provider_handle.clone();
         let waiting = tokio::spawn(async move {
-            waiting_source
-                .command_output(workdir::CommandOutputRequest {
-                    handle: waiting_handle,
-                    cursor: output.next_cursor.unwrap_or(0),
-                    limit: 4096,
-                    wait: true,
-                })
-                .await
+            let mut cursor = output.next_cursor;
+            loop {
+                let page = waiting_source
+                    .command_output(workdir::CommandOutputRequest {
+                        handle: waiting_handle.clone(),
+                        cursor,
+                        limit: 4096,
+                        wait: true,
+                    })
+                    .await?;
+                cursor = page.next_cursor;
+                if page.terminal.is_some() {
+                    return Ok::<_, workdir::WorkdirError>(page);
+                }
+            }
         });
         tokio::task::yield_now().await;
         command
@@ -40558,7 +41180,7 @@ mod tests {
             .expect("cancel should unblock a waiting output read")
             .unwrap()
             .unwrap();
-        assert!(!matches!(terminal.status, workdir::CommandStatus::Running));
+        assert!(terminal.terminal.is_some());
 
         let registered = registry.take_worker(&worker);
         assert_eq!(registered.len(), 1);
@@ -40591,9 +41213,8 @@ mod tests {
         let request = || workdir::CommandRequest {
             command: "sleep 30".to_string(),
             timeout_secs: 60,
-            output_limit: 4096,
+            transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
             cwd: workdir::WorkdirPath::root(),
-            spill_dir: None,
             tool_call_id: None,
         };
         let left_provider = left.start_command(request()).await.unwrap();
@@ -42187,6 +42808,7 @@ mod tests {
             resolved_memory_settings: None,
             resolved_subjektiv_attached: false,
             resolved_control_operation: None,
+            resolved_execution_grant: None,
         };
         assert!(
             api.validate_worker_spawn_repository_scope("runtime-1", &mut workdir_flow_launch)
@@ -42446,6 +43068,7 @@ mod tests {
             resolved_memory_settings: None,
             resolved_subjektiv_attached: false,
             resolved_control_operation: None,
+            resolved_execution_grant: None,
         };
 
         assert!(
@@ -42540,6 +43163,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await;
@@ -42575,6 +43199,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -42611,6 +43236,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -42702,6 +43328,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -42768,7 +43395,9 @@ mod tests {
     async fn production_profile_backend_restores_zero_input_orchestrator() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
-        let config = test_server_config(workspace.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_server_config(workspace.path());
+        config.backend_base_url = Some(format!("http://{}", listener.local_addr().unwrap()));
         let store =
             Arc::new(SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap());
         seed_test_registered_workspace(store.as_ref(), &config)
@@ -42776,6 +43405,8 @@ mod tests {
             .unwrap();
         let api = WorkspaceApi::new_for_test(config, store).await.unwrap();
         let workspace_id = api.config.workspace_id.clone();
+        let _callback_server =
+            AuthorizationCallbackServer::start(listener, build_router(api.clone()));
 
         let result = scoped_start_workspace_orchestrator(
             State(api.clone()),
@@ -42962,6 +43593,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -43457,6 +44089,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -43758,6 +44391,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -43791,6 +44425,7 @@ mod tests {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: Some("control-spawn-retry".to_string()),
+            execution_grant: None,
         };
 
         let Json(first) = spawn_known_worker(
@@ -43867,6 +44502,7 @@ mod tests {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: None,
+            execution_grant: None,
         };
 
         let Json(created) =
@@ -44031,6 +44667,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -44108,6 +44745,7 @@ mod tests {
                     content: vec![LoggedContentPart::Text { text: text.into() }],
                 },
                 metadata: LoggedSessionHistoryMetadata {
+                    input_metadata: None,
                     entry_id: LoggedSessionHistoryEntryId(id.to_string()),
                     origin: LoggedSessionHistoryOrigin::HumanInput {
                         account_id: "account-1".to_string(),
@@ -44130,6 +44768,7 @@ mod tests {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: None,
+            execution_grant: None,
         };
         let Json(controller) = create_workspace_worker(
             State(api.clone()),
@@ -44297,6 +44936,7 @@ mod tests {
                     content: vec![LoggedContentPart::Text { text: text.into() }],
                 },
                 metadata: LoggedSessionHistoryMetadata {
+                    input_metadata: None,
                     entry_id: LoggedSessionHistoryEntryId(id.to_string()),
                     origin: LoggedSessionHistoryOrigin::HumanInput {
                         account_id: "account-1".to_string(),
@@ -44344,6 +44984,7 @@ mod tests {
                     resolved_memory_settings: None,
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .unwrap();
@@ -45366,6 +46007,7 @@ mod tests {
                     }),
                 },
                 control_operation_id: None,
+                execution_grant: None,
             }
         };
 
@@ -45498,6 +46140,7 @@ mod tests {
                 }),
             },
             control_operation_id: None,
+            execution_grant: None,
         };
         let Json(created) = scoped_create_workspace_worker(
             State(api.clone()),
@@ -46685,6 +47328,7 @@ mod tests {
             resolved_workspace_api: None,
             resolved_memory_settings: None,
             resolved_subjektiv_attached: false,
+            resolved_execution_grant: None,
             resolved_control_operation: Some(WorkerControlOperation {
                 operation_id: operation_id.to_string(),
                 input_fingerprint: format!("sha256:{operation_id}"),
@@ -46928,6 +47572,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -46948,6 +47593,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -46990,6 +47636,7 @@ mod tests {
                     resolved_memory_settings: None,
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .unwrap()
@@ -47033,6 +47680,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -48518,6 +49166,22 @@ mod tests {
         );
     }
 
+    struct AuthorizationCallbackServer(tokio::task::JoinHandle<()>);
+
+    impl AuthorizationCallbackServer {
+        fn start(listener: tokio::net::TcpListener, router: Router) -> Self {
+            Self(tokio::spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            }))
+        }
+    }
+
+    impl Drop for AuthorizationCallbackServer {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     fn test_server_config(workspace_root: impl Into<PathBuf>) -> ServerConfig {
         let workspace_root = workspace_root.into();
         let store_root = workspace_root.join(".test-embedded-runtime-store");
@@ -48548,21 +49212,25 @@ mod tests {
         let worker_root = root
             .join(".test-embedded-runtime-store/workers")
             .join(&worker.worker_id);
-        fs::create_dir_all(worker_root.join("session/segments")).unwrap();
-        fs::write(
-            worker_root.join("session/session.json"),
-            serde_json::to_vec_pretty(&json!({
-                "schema_version": 1,
-                "session_id": session_store::new_session_id()
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            worker_root.join("session/segments/segment-a.jsonl"),
-            b"backend job retained session evidence\n",
-        )
-        .unwrap();
+        use session_store::Store;
+        let store = session_store::WorkerSessionStore::new(worker_root.join("session")).unwrap();
+        let session = session_store::new_session_id();
+        let segment = session_store::new_segment_id();
+        store
+            .create_segment(
+                session,
+                segment,
+                &[session_store::LogEntry::AnnotatedSegmentStart {
+                    ts: 1,
+                    session_id: session,
+                    system_prompt: Some("backend job retained session evidence".into()),
+                    config: Default::default(),
+                    history: vec![],
+                    forked_from: None,
+                    compacted_from: None,
+                }],
+            )
+            .unwrap();
     }
 
     fn job_notification_evidence(
@@ -48597,6 +49265,7 @@ mod tests {
                 resolved_memory_settings: None,
                 resolved_subjektiv_attached: false,
                 resolved_control_operation: None,
+                resolved_execution_grant: None,
             },
         )
         .unwrap()
@@ -50014,6 +50683,7 @@ mod tests {
                     resolved_memory_settings: None,
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .unwrap()
@@ -50697,13 +51367,16 @@ mod tests {
     #[tokio::test]
     async fn repository_free_workspace_can_be_created_selected_and_used_then_register_repository() {
         let temp = tempfile::tempdir().unwrap();
-        let config = test_server_config(temp.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_server_config(temp.path());
+        config.backend_base_url = Some(format!("http://{}", listener.local_addr().unwrap()));
         let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
         let owner = seed_test_api_token(store.as_ref(), "empty-owner");
         let foreign = seed_test_api_token(store.as_ref(), "empty-foreign");
         let app = build_workspace_server_router(config.clone(), store.clone())
             .await
             .unwrap();
+        let _callback_server = AuthorizationCallbackServer::start(listener, app.clone());
         let wire =
             json!({"operation_key": "create-empty-workspace", "display_name": "Empty Workspace"});
         request_json(
@@ -53509,6 +54182,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(registration_response.status(), StatusCode::OK);
+        assert_auth_response_has_expiry_marker(registration_response.headers(), &cookie_name);
         let registration_cookie = registration_response
             .headers()
             .get(axum::http::header::SET_COOKIE)
@@ -53546,6 +54220,12 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        assert_eq!(registered_whoami["session"]["kind"], "authenticated");
+        assert!(
+            registered_whoami["session"]["expires_at"]
+                .as_str()
+                .is_some()
+        );
         assert_eq!(
             registered_whoami["actor"]["handle"],
             "generated-passkey-user"
@@ -53600,6 +54280,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(login_response.status(), StatusCode::OK);
+        assert_auth_response_has_expiry_marker(login_response.headers(), &cookie_name);
         let login_cookie = login_response
             .headers()
             .get(axum::http::header::SET_COOKIE)
@@ -53682,6 +54363,169 @@ mod tests {
         )
         .unwrap();
         assert!(logged_out_whoami["actor"].is_null());
+    }
+
+    // Real generated auth routes, DB executor and SQLite; no auth resolution is mocked.
+    #[tokio::test]
+    async fn whoami_expiry_marker_survives_auth_cookie_loss_but_logout_revokes_it() {
+        let workspace = tempfile::tempdir().unwrap();
+        let api = test_api(workspace.path()).await;
+        seed_test_api_token(api.store.as_ref(), "expiry-router");
+        let user = api.store.get_user("user-expiry-router").unwrap().unwrap();
+        let auth = auth_public_config(&api.config);
+        let cookie_name = auth.cookie_name;
+        let hash = token_hash("expired-router-secret");
+        api.store
+            .create_browser_session(&BrowserSessionRecord {
+                session_id: "expired-router-session".into(),
+                token_hash: hash.clone(),
+                user_id: user.user_id,
+                created_at: crate::auth::now_rfc3339(),
+                expires_at: rfc3339_after(Duration::minutes(-1)),
+                revoked_at: None,
+            })
+            .unwrap();
+        let marker = format!(
+            "{}={hash}",
+            crate::auth::session_marker_cookie_name(&cookie_name)
+        );
+        let app = generated_auth_contract_router(ServerApiContractService::Workspace(api.clone()));
+        for (cookie, kind) in [
+            (String::new(), "anonymous"),
+            (format!("{cookie_name}=expired-router-secret"), "expired"),
+            (marker.clone(), "expired"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/auth/whoami")
+                        .header(axum::http::header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(axum::http::header::SET_COOKIE)
+            );
+            let value: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(value["actor"], Value::Null);
+            assert_eq!(value["session"]["kind"], kind);
+        }
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/passkeys/addition/options")
+                    .header(axum::http::header::COOKIE, &marker)
+                    .header(ORIGIN, &auth.origin)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Preserve the operation's existing auth_required/403 contract; no HTML redirect.
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(!denied.headers().contains_key(axum::http::header::LOCATION));
+        let logout = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/auth/logout")
+                    .header(axum::http::header::COOKIE, &marker)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::OK);
+        let cleared: Vec<_> = logout
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cleared.len(), 2);
+        assert!(
+            cleared
+                .iter()
+                .all(|value| value.contains("Max-Age=0") && value.contains("HttpOnly"))
+        );
+        assert!(cleared.iter().any(|value| value.starts_with(&format!(
+            "{}=;",
+            crate::auth::session_marker_cookie_name(&cookie_name)
+        ))));
+        assert!(api.store.resolve_browser_session(&hash).unwrap().is_none());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/whoami")
+                    .header(axum::http::header::COOKIE, marker)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let value: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(value["session"]["kind"], "anonymous");
+    }
+
+    fn assert_auth_response_has_expiry_marker(headers: &HeaderMap, cookie_name: &str) {
+        let cookies: Vec<_> = headers
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        let auth = cookies
+            .iter()
+            .find(|value| value.starts_with(&format!("{cookie_name}=")))
+            .unwrap();
+        let (_, token) = auth.split(';').next().unwrap().split_once('=').unwrap();
+        let marker = cookies
+            .iter()
+            .find(|value| {
+                value.starts_with(&format!(
+                    "{}=",
+                    crate::auth::session_marker_cookie_name(cookie_name)
+                ))
+            })
+            .unwrap();
+        let expected = token_hash(token);
+        assert_eq!(
+            parse_cookie(
+                &{
+                    let mut headers = HeaderMap::new();
+                    headers.insert(axum::http::header::COOKIE, marker.parse().unwrap());
+                    headers
+                },
+                &crate::auth::session_marker_cookie_name(cookie_name)
+            ),
+            Some(expected)
+        );
+        assert!(auth.contains(&format!("Max-Age={}", crate::auth::BROWSER_SESSION_SECONDS)));
+        assert!(marker.contains(&format!(
+            "Max-Age={}",
+            crate::auth::BROWSER_SESSION_SECONDS + crate::auth::SESSION_EXPIRY_GRACE_SECONDS
+        )));
+        for attribute in ["Path=/", "HttpOnly", "SameSite=Lax", "Secure"] {
+            assert_eq!(
+                auth.contains(attribute),
+                marker.contains(attribute),
+                "{attribute}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -54053,6 +54897,7 @@ mod tests {
                     resolved_memory_settings: Some(test_worker_memory_settings()),
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .unwrap();
@@ -54449,6 +55294,7 @@ mod tests {
                     resolved_memory_settings: Some(test_worker_memory_settings()),
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .unwrap()
@@ -54666,6 +55512,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -55128,6 +55975,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             }),
         )
         .await
@@ -55820,6 +56668,7 @@ mod tests {
                     resolved_memory_settings: Some(test_worker_memory_settings()),
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .unwrap()
@@ -55923,6 +56772,7 @@ mod tests {
             resolved_memory_settings: Some(test_worker_memory_settings()),
             resolved_subjektiv_attached: false,
             resolved_control_operation: None,
+            resolved_execution_grant: None,
         };
         let source_worker = api
             .runtime
@@ -56478,6 +57328,7 @@ mod tests {
                     resolved_memory_settings: Some(test_worker_memory_settings()),
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .unwrap()
@@ -56546,6 +57397,7 @@ mod tests {
                     resolved_memory_settings: Some(test_worker_memory_settings()),
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .unwrap()
@@ -58278,6 +59130,7 @@ mod tests {
                     resolved_memory_settings: None,
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .unwrap();
@@ -58359,6 +59212,7 @@ mod tests {
                     resolved_memory_settings: None,
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .unwrap();
@@ -58499,6 +59353,7 @@ mod tests {
                     resolved_memory_settings: None,
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .unwrap();
@@ -60061,9 +60916,8 @@ mod tests {
             .start_command(workdir::CommandRequest {
                 command: "sleep 30".to_string(),
                 timeout_secs: 60,
-                output_limit: 4096,
+                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
                 cwd: workdir::WorkdirPath::root(),
-                spill_dir: None,
                 tool_call_id: None,
             })
             .await
@@ -61693,6 +62547,7 @@ mod tests {
                     resolved_memory_settings: None,
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .unwrap();
@@ -64368,6 +65223,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: None,
+                execution_grant: None,
             },
             None,
         )
@@ -65153,6 +66009,7 @@ mod tests {
                     resolved_memory_settings: Some(test_worker_memory_settings()),
                     resolved_subjektiv_attached: false,
                     resolved_control_operation: None,
+                    resolved_execution_grant: None,
                 },
             )
             .expect("spawn worker");
@@ -66604,6 +67461,7 @@ mod tests {
             resolved_memory_settings: None,
             resolved_subjektiv_attached: false,
             resolved_control_operation: None,
+            resolved_execution_grant: None,
         };
         let spawned = api
             .spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn_request)
@@ -67471,6 +68329,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             resolved_memory_settings: None,
             resolved_subjektiv_attached: false,
             resolved_control_operation: None,
+            resolved_execution_grant: None,
         };
 
         let dedicated_key = "subjektiv-consolidation:dedicated-subject";

@@ -88,7 +88,7 @@ impl InternalSpawnedWorkerRecord {
     pub(crate) fn new(
         worker_name: String,
         scope_delegated: Vec<ScopeRule>,
-        workdir_tool_scope: WorkdirScopeLeaseSet,
+        workdir_tool_scope: Arc<WorkdirScopeLeaseSet>,
         #[cfg(test)] installed_tools: Vec<String>,
         session: InternalWorkerSessionHandle,
         child_registry: Arc<SpawnedWorkerRegistry>,
@@ -97,7 +97,7 @@ impl InternalSpawnedWorkerRecord {
         Self {
             worker_name: worker_name.clone(),
             scope_delegated,
-            workdir_tool_scope: Arc::new(workdir_tool_scope),
+            workdir_tool_scope,
             #[cfg(test)]
             installed_tools: installed_tools.into(),
             published: Arc::new(super::published::PublishedProtocol::new(
@@ -329,6 +329,7 @@ pub struct SpawnedWorkerRegistry {
     pending_internal_notify: Notify,
     internal_spawn_cleanup_failed: AtomicBool,
     parent_scope: Option<SharedScope>,
+    bash_output: Mutex<tools::bash_output::BashOutputView>,
     parent_protocol: Mutex<Option<(broadcast::Sender<Event>, String)>>,
     protocol_publish_lock: Arc<Mutex<()>>,
 }
@@ -340,6 +341,14 @@ pub struct SpawnedWorkerRegistryLoad {
 }
 
 impl SpawnedWorkerRegistry {
+    pub(crate) fn bash_output(&self) -> tools::bash_output::BashOutputView {
+        self.bash_output.lock().unwrap().clone()
+    }
+
+    pub(crate) fn inherit_bash_output(&self, view: tools::bash_output::BashOutputView) {
+        *self.bash_output.lock().unwrap() = view;
+    }
+
     pub(crate) fn new_for_internal_services() -> Arc<Self> {
         Arc::new(Self {
             internal_records: std::sync::Mutex::new(Vec::new()),
@@ -352,6 +361,7 @@ impl SpawnedWorkerRegistry {
             pending_internal_notify: Notify::new(),
             internal_spawn_cleanup_failed: AtomicBool::new(false),
             parent_scope: None,
+            bash_output: Mutex::new(tools::bash_output::BashOutputView::new()),
             parent_protocol: Mutex::new(None),
             protocol_publish_lock: Arc::new(Mutex::new(())),
         })
@@ -370,6 +380,7 @@ impl SpawnedWorkerRegistry {
             pending_internal_notify: Notify::new(),
             internal_spawn_cleanup_failed: AtomicBool::new(false),
             parent_scope: None,
+            bash_output: Mutex::new(tools::bash_output::BashOutputView::new()),
             parent_protocol: Mutex::new(None),
             protocol_publish_lock: Arc::new(Mutex::new(())),
         })
@@ -387,6 +398,7 @@ impl SpawnedWorkerRegistry {
             pending_internal_notify: Notify::new(),
             internal_spawn_cleanup_failed: AtomicBool::new(false),
             parent_scope: Some(parent_scope),
+            bash_output: Mutex::new(tools::bash_output::BashOutputView::new()),
             parent_protocol: Mutex::new(None),
             protocol_publish_lock: Arc::new(Mutex::new(())),
         })
@@ -473,6 +485,7 @@ impl SpawnedWorkerRegistry {
                 pending_internal_notify: Notify::new(),
                 internal_spawn_cleanup_failed: AtomicBool::new(false),
                 parent_scope,
+                bash_output: Mutex::new(tools::bash_output::BashOutputView::new()),
                 parent_protocol: Mutex::new(None),
                 protocol_publish_lock: Arc::new(Mutex::new(())),
             }),
@@ -966,6 +979,10 @@ impl SpawnedWorkerRegistry {
                 "an in-flight Internal SubWorker failed cleanup during shutdown",
             ));
         }
+        let output = self.bash_output();
+        if !output.is_root() {
+            output.revoke();
+        }
         first_error.map_or(Ok(()), Err)
     }
 
@@ -1111,6 +1128,7 @@ fn internal_worker_live_snapshot(snapshot: InternalWorkerSnapshot) -> Option<Eve
 
 impl Drop for SpawnedWorkerRegistry {
     fn drop(&mut self) {
+        self.bash_output.get_mut().unwrap().revoke();
         let Some(parent_scope) = &self.parent_scope else {
             return;
         };
@@ -1297,11 +1315,13 @@ mod tests {
             InternalSpawnedWorkerRecord::new(
                 name.into(),
                 Vec::new(),
-                workdir::WorkdirScopeLeaseSet::from_single(
-                    workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
-                    delegation,
-                )
-                .unwrap(),
+                Arc::new(
+                    workdir::WorkdirScopeLeaseSet::from_single(
+                        workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
+                        delegation,
+                    )
+                    .unwrap(),
+                ),
                 Vec::new(),
                 session,
                 registry(),
@@ -1338,6 +1358,7 @@ mod tests {
                         is_error: false,
                     },
                     metadata: session_store::LoggedSessionHistoryMetadata {
+                        input_metadata: None,
                         entry_id: session_store::LoggedSessionHistoryEntryId(entry_id.into()),
                         origin: session_store::LoggedSessionHistoryOrigin::LegacyUnknown,
                         derivation: None,

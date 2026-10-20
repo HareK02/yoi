@@ -47,6 +47,12 @@ use crate::wip::{
 pub(super) struct ConfigProvider {
     pub feature: WorkspaceConfigFeature,
     pub backend: Arc<WorkspaceConfigBackend>,
+    // A fresh mount after restore invalidates observations from its predecessor.
+    pub observation_nonce: Arc<str>,
+}
+
+fn object_validator(nonce: &str, connection: &str, validator: &str) -> Vec<u8> {
+    Sha256::digest(format!("{nonce}:{connection}:{validator}")).to_vec()
 }
 
 /// Backend tree root is empty; source names are canonical relative config paths.
@@ -240,7 +246,7 @@ impl ConfigProvider {
         let descriptor = descriptor(&operations);
         let interface = contextual_reference("yoi.workspace-config/node/v1", path);
         let interface_validator = Some(Sha256::digest(format!("{descriptor:?}")).to_vec());
-        Ok(Some(WipProjection {
+        let mut projection = WipProjection {
             route: path.into(),
             capability: "workspace-config:content".into(),
             kind: WipProjectionKind::Native,
@@ -252,7 +258,11 @@ impl ConfigProvider {
                 )),
                 interfaces: vec![interface.clone()],
                 r#ref: None,
-                validator: Some(node.validator.as_bytes().to_vec()),
+                validator: Some(object_validator(
+                    &self.observation_nonce,
+                    &attachment.connection_id,
+                    &node.validator,
+                )),
             },
             interface,
             descriptor,
@@ -263,9 +273,12 @@ impl ConfigProvider {
                 attachment,
                 snapshot,
                 node,
-                operations,
+                operations: operations.clone(),
+                observation_nonce: self.observation_nonce.clone(),
             }),
-        }))
+        };
+        crate::file_operation::expose(&mut projection, common_contracts(&operations));
+        Ok(Some(projection))
     }
 }
 
@@ -335,10 +348,26 @@ fn operations(
             names.push(name.into());
         }
     }
+    if names.iter().any(|name| name == "read") {
+        names.extend(["read_lines".into(), "search_text".into()]);
+    }
     if root {
         names.push("attach".into());
     }
     names
+}
+
+fn common_contracts(names: &[String]) -> Vec<crate::file_operation::Contract> {
+    use crate::file_operation::Contract;
+    [
+        ("read_lines", Contract::ReadLines),
+        ("search_text", Contract::SearchText),
+        ("edit", Contract::Edit),
+        ("write", Contract::Write),
+    ]
+    .into_iter()
+    .filter_map(|(name, contract)| names.iter().any(|n| n == name).then_some(contract))
+    .collect()
 }
 
 fn parameter(name: &str, required: bool, r#type: TypeExpr) -> ParameterDeclaration {
@@ -356,11 +385,11 @@ fn descriptor(names: &[String]) -> InterfaceDescriptor {
             summary: "Logical Workspace configuration file operations".into(),
             details: Some("Backend grants, semantic validation, atomic whole-tree CAS and activation apply. Validators and change digests are managed automatically. apply_changes atomically accepts create/update/delete/rename changes without validators or expected_digest fields. Saving updates configuration for future operation boundaries, not already-running Worker manifests. No OS or command access.".into()),
         }),
-        operations: names.iter().map(|name| OperationDeclaration {
+        operations: names.iter().filter(|name| !matches!(name.as_str(), "read_lines" | "search_text" | "edit" | "write")).map(|name| OperationDeclaration {
             name: name.clone(), documentation: None,
             parameters: match name.as_str() {
                 "attach" => vec![parameter("access", false, TypeExpr::String)],
-                "read" | "write" | "edit" => crate::file_operation::parameters(name, false).unwrap(),
+                "read" => crate::file_operation::parameters(name, false).unwrap(),
                 "delete" => vec![],
                 "create" => vec![parameter("path", false, TypeExpr::String), parameter("content", true, TypeExpr::String), parameter("content_type", false, TypeExpr::String)],
                 "apply_changes" => vec![parameter("changes", true, TypeExpr::Json)],
@@ -378,6 +407,7 @@ struct ConfigHandler {
     snapshot: WorkspaceConfigObserveResponse,
     node: WorkspaceConfigNode,
     operations: Vec<String>,
+    observation_nonce: Arc<str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -476,11 +506,16 @@ impl ConfigHandler {
             || response.validator != self.node.validator
             || Some(&response.digest) != self.node.digest.as_ref()
             || Some(&response.content_type) != self.node.content_type.as_ref()
-            || response.content.len() > MAX_TEXT_BYTES
         {
             return Err(failure(
                 ProtocolErrorCode::Internal,
                 "Invalid Workspace config read response",
+            ));
+        }
+        if response.content.len() > MAX_TEXT_BYTES {
+            return Err(failure(
+                ProtocolErrorCode::ResourceLimitExceeded,
+                "Workspace config source exceeds text limit",
             ));
         }
         let mut response = response;
@@ -628,11 +663,33 @@ impl ConfigHandler {
             ));
         }
         // Direct handler calls also enforce parameter shape; no model validators accepted.
-        let declaration = descriptor(&self.operations)
-            .operations
-            .into_iter()
-            .find(|op| op.name == operation)
-            .ok_or_else(invalid)?;
+        let declaration = match operation {
+            "read_lines" => crate::file_operation::Contract::ReadLines
+                .descriptor()
+                .operations
+                .into_iter()
+                .next(),
+            "search_text" => crate::file_operation::Contract::SearchText
+                .descriptor()
+                .operations
+                .into_iter()
+                .next(),
+            "edit" => crate::file_operation::Contract::Edit
+                .descriptor()
+                .operations
+                .into_iter()
+                .next(),
+            "write" => crate::file_operation::Contract::Write
+                .descriptor()
+                .operations
+                .into_iter()
+                .next(),
+            _ => descriptor(&self.operations)
+                .operations
+                .into_iter()
+                .find(|op| op.name == operation),
+        }
+        .ok_or_else(invalid)?;
         if arguments
             .keys()
             .any(|name| !declaration.parameters.iter().any(|p| p.name == *name))
@@ -646,6 +703,19 @@ impl ConfigHandler {
                 .call(operation, arguments, context)
                 .await;
         }
+        if matches!(operation, "read_lines" | "search_text") {
+            crate::file_operation::text_result(operation, arguments, "")?;
+            let result = self.read().await?;
+            let value = crate::file_operation::text_result(operation, arguments, &result.content)?;
+            return Ok(WipOperationOutput::native_with_validator(
+                value,
+                object_validator(
+                    &self.observation_nonce,
+                    &self.attachment.connection_id,
+                    &result.validator,
+                ),
+            ));
+        }
         if operation == "read" {
             let _: fs_operation::text::ReadArgs = decode_text(arguments)?;
             let result = self.read().await?;
@@ -657,7 +727,11 @@ impl ConfigHandler {
             .map_err(|_| invalid())?;
             return Ok(WipOperationOutput::native_with_validator(
                 value,
-                self.node.validator.as_bytes().to_vec(),
+                object_validator(
+                    &self.observation_nonce,
+                    &self.attachment.connection_id,
+                    &self.node.validator,
+                ),
             ));
         }
         if self.attachment.access != WorkspaceConfigAccess::ReadWrite {
@@ -762,7 +836,11 @@ impl ConfigHandler {
             "activation": "Saved to canonical Workspace configuration; existing Worker manifests are not rewritten"})).map_err(|_| unknown())?;
         Ok(WipOperationOutput::native_with_validator(
             value,
-            node.validator.as_bytes().to_vec(),
+            object_validator(
+                &self.observation_nonce,
+                &self.attachment.connection_id,
+                &node.validator,
+            ),
         ))
     }
 }

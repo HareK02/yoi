@@ -17,12 +17,12 @@ use crate::{
     PasteArtifactRef, PendingSubmissionSummary, PendingSubmissionsSnapshot, Permission,
     ReasoningConfig, RewindSummary, RunFailureKind, RunResult, RunResumeSource, RunYieldReason,
     ScopeRule, Segment, SessionContentPart, SessionConversationTurn, SessionEntryProvenance,
-    SessionHistoryLineageBoundary, SessionHistoryPage, SessionMessageRole, SessionSnapshot,
-    SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment, SubmissionDisposition,
-    SymlinkPolicy, ToolResultDisposition, TurnResult, UploadedFileAvailability, UploadedFileRef,
-    WorkerBusyState, WorkerCommandAcknowledgement, WorkerCommandDisposition, WorkerCommandEnvelope,
-    WorkerCommandKind, WorkerEvent, WorkerMaintenanceState, WorkerRunState, WorkerState,
-    WorkerStateSnapshot, WorkerStatus,
+    SessionEntryUsePolicy, SessionHistoryLineageBoundary, SessionHistoryPage, SessionMessageRole,
+    SessionSnapshot, SessionSnapshotEntry, SessionSnapshotEntryData, SessionToolAttachment,
+    SubmissionDisposition, SymlinkPolicy, ToolResultDisposition, TurnResult,
+    UploadedFileAvailability, UploadedFileRef, WorkerBusyState, WorkerCommandAcknowledgement,
+    WorkerCommandDisposition, WorkerCommandEnvelope, WorkerCommandKind, WorkerEvent,
+    WorkerMaintenanceState, WorkerRunState, WorkerState, WorkerStateSnapshot, WorkerStatus,
     subscription::{
         EventSubscriptionSelector, MAX_CORRELATION_ID_BYTES, MAX_REJECTION_MESSAGE_BYTES,
         MAX_RESOURCE_ID_BYTES, MAX_SUBSCRIPTION_COLLECTION_ITEMS,
@@ -117,6 +117,7 @@ pub fn generated_protocol_types() -> String {
     push_decl::<InFlightCompaction>(&cfg, &mut output);
     push_decl::<InFlightSnapshot>(&cfg, &mut output);
     push_decl::<SessionEntryProvenance>(&cfg, &mut output);
+    push_decl::<SessionEntryUsePolicy>(&cfg, &mut output);
     push_decl::<SessionMessageRole>(&cfg, &mut output);
     push_decl::<SessionContentPart>(&cfg, &mut output);
     push_decl::<SessionToolAttachment>(&cfg, &mut output);

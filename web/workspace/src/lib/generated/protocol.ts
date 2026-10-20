@@ -178,6 +178,8 @@ compaction?: InFlightCompaction | null, };
 
 export type SessionEntryProvenance = "human_input" | "worker_input" | "flow_instruction" | "backend_instruction" | "model_output" | "tool_output" | "derived_summary" | "legacy_unknown";
 
+export type SessionEntryUsePolicy = { observation_readable: boolean, memory_evidence: boolean, };
+
 export type SessionMessageRole = "user" | "assistant";
 
 export type SessionContentPart = { "kind": "text", text: string, } | { "kind": "refusal", refusal: string, };
@@ -206,7 +208,7 @@ entry_id: string,
 /**
  * Timestamp copied from the durable log record that commits this entry.
  */
-timestamp: number, provenance: SessionEntryProvenance, derived_from?: Array<string>, } & ({ "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_yielded", reason: RunYieldReason, active_run_turn_count: number, } | { "kind": "run_resumed", source: RunResumeSource, active_run_turn_count: number, } | { "kind": "invoke", trigger: InvokeKind, } | { "kind": "usage", input_tokens: number, cache_read_input_tokens: number, output_tokens: number, } | { "kind": "run_stats", elapsed_ms: number, requests: number, upload_tokens: number, output_tokens: number, } | { "kind": "run_cancelled" } | { "kind": "run_error", message: string, failure?: RunFailureKind | null, });
+timestamp: number, provenance: SessionEntryProvenance, derived_from?: Array<string>, use_policy?: SessionEntryUsePolicy | null, } & ({ "kind": "user_input", segments: Array<Segment>, } | { "kind": "message", role: SessionMessageRole, content: Array<SessionContentPart>, } | { "kind": "tool_call", call_id: string, name: string, arguments: string, } | { "kind": "tool_result", call_id: string, summary: string, content?: string | null, is_error: boolean, attachments?: Array<SessionToolAttachment>, } | { "kind": "system_item", item_kind: string, content: string, data?: unknown, } | { "kind": "run_yielded", reason: RunYieldReason, active_run_turn_count: number, } | { "kind": "run_resumed", source: RunResumeSource, active_run_turn_count: number, } | { "kind": "invoke", trigger: InvokeKind, } | { "kind": "usage", input_tokens: number, cache_read_input_tokens: number, output_tokens: number, } | { "kind": "run_stats", elapsed_ms: number, requests: number, upload_tokens: number, output_tokens: number, } | { "kind": "run_cancelled" } | { "kind": "run_error", message: string, failure?: RunFailureKind | null, });
 
 export type SessionConversationTurn = { turn_id: string, entries: Array<SessionSnapshotEntry>, };
 

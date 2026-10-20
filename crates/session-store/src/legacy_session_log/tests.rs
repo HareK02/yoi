@@ -1,5 +1,7 @@
 use super::*;
 
+mod v5;
+
 fn seed(
     origin: LoggedSessionHistoryOrigin,
     compacted: bool,
@@ -22,6 +24,7 @@ fn seed(
                 content: vec![crate::LoggedContentPart::Text { text: text.into() }],
             },
             metadata: LoggedSessionHistoryMetadata {
+                input_metadata: None,
                 entry_id: LoggedSessionHistoryEntryId("summary".into()),
                 origin,
                 derivation: Some(crate::LoggedHistoryDerivation {

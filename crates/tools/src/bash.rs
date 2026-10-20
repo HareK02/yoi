@@ -1,19 +1,19 @@
 //! Bash Tool using WorkdirSession command capability.
 //!
-//! The selected session owns cwd, process launch, bounded output, timeout, and cancellation.
+//! Workdir owns launch and byte transport; Bash owns bounded preview and retained evidence.
 //! Bash is not a sandbox; the Runtime process and OS user define the execution boundary.
 //! Per-execution handles and nonces prevent cancellation of another command. Dropping a future
-//! does not confirm termination; active registrations remain until cleanup requests cancellation
-//! and observes terminal output.
+//! does not confirm termination. Registrations remain during bounded cancellation/drain cleanup;
+//! an unconfirmed provider outcome leaves partial evidence, never a fabricated terminal fence.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::bash_output::{BashOutputMetadata, BashOutputView, BashOutputWriter};
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use workdir::{
     CommandHandle, CommandOutputRequest, CommandRequest, WorkdirPath, WorkdirSessionHandle,
     WorkdirSessionRouter,
@@ -35,9 +35,9 @@ struct BashParams {
     timeout: Option<u64>,
 }
 
-pub(crate) struct BashTool {
+pub struct BashTool {
     router: Arc<WorkdirSessionRouter>,
-    output_dir: PathBuf,
+    output: BashOutputView,
     state: Arc<Mutex<BashExecutionState>>,
 }
 
@@ -63,6 +63,8 @@ struct CommandGuard {
     execution_id: String,
     execution_nonce: u64,
     handle: Option<CommandHandle>,
+    cursor: u64,
+    retained: Option<BashOutputWriter>,
 }
 
 impl Drop for CommandGuard {
@@ -74,20 +76,66 @@ impl Drop for CommandGuard {
         let state = Arc::clone(&self.state);
         let execution_id = self.execution_id.clone();
         let execution_nonce = self.execution_nonce;
+        let mut retained = self.retained.take();
+        let cursor = self.cursor;
         // A dropped provider future is not terminal confirmation. Keep the live
         // execution registered until cleanup has both requested cancellation and
         // observed terminal command output, so cancellation/session teardown
         // cannot race with an apparently empty registry.
         tokio::spawn(async move {
-            let _ = workdir.cancel_command(handle.clone()).await;
-            let _ = workdir
-                .command_output(CommandOutputRequest {
-                    handle,
-                    cursor: 0,
-                    limit: INLINE_BYTE_BUDGET,
-                    wait: true,
-                })
-                .await;
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let _ = workdir.cancel_command(handle.clone()).await;
+                let mut cursor = cursor;
+                loop {
+                    let page = command_page(
+                        &workdir,
+                        CommandOutputRequest {
+                            handle: handle.clone(),
+                            cursor,
+                            limit: workdir::MAX_COMMAND_READ_BYTES,
+                            wait: true,
+                        },
+                    )
+                    .await?;
+                    if let Some(writer) = &mut retained {
+                        let mut next = cursor;
+                        for chunk in &page.chunks {
+                            if chunk.sequence != next {
+                                return Err(workdir::WorkdirError::Unavailable(
+                                    "command cleanup sequence gap".into(),
+                                ));
+                            }
+                            writer
+                                .append_chunk(chunk)
+                                .map_err(workdir::WorkdirError::Unavailable)?;
+                            next = next.checked_add(chunk.bytes.len() as u64).ok_or_else(|| {
+                                workdir::WorkdirError::Unavailable(
+                                    "command cleanup cursor overflow".into(),
+                                )
+                            })?;
+                        }
+                        if page.next_cursor != next {
+                            return Err(workdir::WorkdirError::Unavailable(
+                                "command cleanup cursor gap".into(),
+                            ));
+                        }
+                    }
+                    cursor = page.next_cursor;
+                    if let Some(terminal) = page.terminal {
+                        if let Some(writer) = &mut retained {
+                            writer
+                                .finish_transport(&terminal)
+                                .map_err(workdir::WorkdirError::Unavailable)?;
+                        }
+                        return Ok::<(), workdir::WorkdirError>(());
+                    }
+                }
+            })
+            .await;
+            // Bounded cleanup can end with an unknown provider outcome. The writer then
+            // terminalizes partial evidence on drop; retaining a dead collector in `active`
+            // would leak registrations and falsely suggest it could still collect output.
+            let _ = result;
             let mut state = state.lock().unwrap();
             if state
                 .active
@@ -101,15 +149,49 @@ impl Drop for CommandGuard {
     }
 }
 
-#[async_trait]
-impl Tool for BashTool {
-    async fn execute(
+// Output pages are replayable only with the exact same command/cursor/limit.
+// Retry read transport failures, never command start, and cap both attempts and
+// backoff. The caller's deadline bounds a disconnected or unresponsive provider.
+async fn command_page(
+    session: &workdir::WorkdirSessionHandle,
+    request: CommandOutputRequest,
+) -> Result<workdir::CommandOutput, workdir::WorkdirError> {
+    for attempt in 0..3 {
+        match session.command_output(request.clone()).await {
+            Err(
+                workdir::WorkdirError::Transport(_)
+                | workdir::WorkdirError::Unavailable(_)
+                | workdir::WorkdirError::OutcomeUnknown(_),
+            ) if attempt < 2 => {
+                tokio::time::sleep(std::time::Duration::from_millis(100 << attempt)).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded retry loop returns its last result")
+}
+
+impl BashTool {
+    pub fn input_schema() -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(BashParams)).expect("Bash schema serialization")
+    }
+
+    pub fn new(router: Arc<WorkdirSessionRouter>, output: BashOutputView) -> Self {
+        Self {
+            router,
+            output,
+            state: Arc::new(Mutex::new(BashExecutionState::default())),
+        }
+    }
+
+    pub async fn execute_result(
         &self,
         input_json: &str,
         ctx: agen::tool::ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<BashResult, ToolError> {
         let params: BashParams = serde_json::from_str(input_json)
             .map_err(|error| ToolError::InvalidArgument(format!("invalid Bash input: {error}")))?;
+        let retained = self.output.begin().map_err(ToolError::ExecutionFailed)?;
         let selected = crate::routing::resolve_session(
             &self.router,
             params.target_workdir.as_deref(),
@@ -134,14 +216,15 @@ impl Tool for BashTool {
             execution_id: execution_id.clone(),
             execution_nonce,
             handle: None,
+            cursor: 0,
+            retained: Some(retained),
         };
         let handle = session
             .start_command(CommandRequest {
                 command: params.command,
                 timeout_secs,
-                output_limit: INLINE_BYTE_BUDGET,
+                transport_byte_budget: self.output.byte_budget(),
                 cwd: params.cwd,
-                spill_dir: Some(self.output_dir.clone()),
                 tool_call_id: Some(call_id.clone()),
             })
             .await
@@ -167,15 +250,101 @@ impl Tool for BashTool {
                 .await
                 .map_err(crate::ToolsError::from)?;
         }
-        let output = session
-            .command_output(CommandOutputRequest {
-                handle,
-                cursor: 0,
-                limit: INLINE_BYTE_BUDGET,
-                wait: true,
-            })
+        let mut cursor = 0;
+        let mut stdout_preview = Vec::new();
+        let mut stderr_preview = Vec::new();
+        let mut seen = [0_u64; 2];
+        let mut empty_polls = 0;
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs + 30);
+        let terminal = loop {
+            let page = tokio::time::timeout_at(
+                deadline,
+                command_page(
+                    &session,
+                    CommandOutputRequest {
+                        handle: handle.clone(),
+                        cursor,
+                        limit: workdir::MAX_COMMAND_READ_BYTES,
+                        wait: true,
+                    },
+                ),
+            )
             .await
+            .map_err(|_| {
+                ToolError::ExecutionFailed(
+                    "command byte transport deadline exceeded; terminal outcome unknown".into(),
+                )
+            })?
             .map_err(crate::ToolsError::from)?;
+            let mut next = cursor;
+            for chunk in &page.chunks {
+                if chunk.sequence != next || chunk.bytes.is_empty() {
+                    return Err(ToolError::ExecutionFailed(
+                        "command byte transport sequence gap".into(),
+                    ));
+                }
+                next = next
+                    .checked_add(chunk.bytes.len() as u64)
+                    .filter(|n| *n <= self.output.byte_budget())
+                    .ok_or_else(|| {
+                        ToolError::ExecutionFailed(
+                            "command byte transport exceeds delivery budget".into(),
+                        )
+                    })?;
+                let index = if chunk.stream == workdir::CommandStream::Stdout {
+                    0
+                } else {
+                    1
+                };
+                if chunk.offset != seen[index] {
+                    return Err(ToolError::ExecutionFailed(
+                        "command byte transport offset gap".into(),
+                    ));
+                }
+                seen[index] += chunk.bytes.len() as u64;
+                guard
+                    .retained
+                    .as_mut()
+                    .unwrap()
+                    .append_chunk(chunk)
+                    .map_err(ToolError::ExecutionFailed)?;
+                let available =
+                    INLINE_BYTE_BUDGET.saturating_sub(stdout_preview.len() + stderr_preview.len());
+                let preview = if index == 0 {
+                    &mut stdout_preview
+                } else {
+                    &mut stderr_preview
+                };
+                preview.extend_from_slice(&chunk.bytes[..available.min(chunk.bytes.len())]);
+            }
+            if page.next_cursor != next {
+                return Err(ToolError::ExecutionFailed(
+                    "command byte transport cursor does not fence the page".into(),
+                ));
+            }
+            if page.chunks.is_empty() && page.terminal.is_none() {
+                empty_polls += 1;
+                if empty_polls > 32 {
+                    return Err(ToolError::ExecutionFailed(
+                        "command byte transport made no progress after bounded polls".into(),
+                    ));
+                }
+            } else {
+                empty_polls = 0;
+            }
+            cursor = page.next_cursor;
+            guard.cursor = cursor;
+            if let Some(terminal) = page.terminal {
+                break terminal;
+            }
+        };
+        let metadata = guard
+            .retained
+            .as_mut()
+            .unwrap()
+            .finish_transport(&terminal)
+            .map_err(ToolError::ExecutionFailed)?;
         let cancellation_requested = {
             let mut state = self.state.lock().unwrap();
             let owns_registration = state
@@ -193,41 +362,78 @@ impl Tool for BashTool {
         };
         guard.handle = None;
 
-        let timed_out = output.timed_out;
-        let summary = if cancellation_requested {
-            format!("$ {cmd_summary} (cancelled)")
-        } else if output.timed_out {
-            format!("$ {cmd_summary} (timed out after {timeout_secs}s)")
-        } else {
-            match output.exit_code {
-                Some(0) => format!("$ {cmd_summary}"),
-                Some(code) => format!("$ {cmd_summary} (exit {code})"),
-                None => format!("$ {cmd_summary} (terminated)"),
-            }
-        };
-        let content = if output.content.is_empty() {
-            None
-        } else if output.truncated {
-            let notice = match output.output_path {
-                Some(path) => format!(
-                    "[showing bounded WorkdirSession command output; full output saved to {}]",
-                    path.display()
-                ),
-                None => "[showing bounded WorkdirSession command output; additional output was truncated]"
-                    .to_owned(),
+        let timed_out = terminal.status == workdir::CommandStatus::TimedOut;
+        let summary =
+            if cancellation_requested || terminal.status == workdir::CommandStatus::Cancelled {
+                format!("$ {cmd_summary} (cancelled)")
+            } else if timed_out {
+                format!("$ {cmd_summary} (timed out after {timeout_secs}s)")
+            } else {
+                match terminal.exit_code {
+                    Some(0) => format!("$ {cmd_summary}"),
+                    Some(code) => format!("$ {cmd_summary} (exit {code})"),
+                    None => format!("$ {cmd_summary} (terminated)"),
+                }
             };
-            Some(format!("{notice}\n{}", output.content))
-        } else {
-            Some(output.content)
-        };
-        let output = ToolOutput {
+        Ok(BashResult {
             summary,
-            content,
-            attachments: Vec::new(),
-        };
-        if cancellation_requested {
+            stdout_preview: String::from_utf8_lossy(&stdout_preview).into_owned(),
+            stderr_preview: String::from_utf8_lossy(&stderr_preview).into_owned(),
+            preview_omitted: terminal.stdout_bytes.saturating_add(terminal.stderr_bytes)
+                > (stdout_preview.len() + stderr_preview.len()) as u64,
+            metadata,
+            cancelled: cancellation_requested
+                || terminal.status == workdir::CommandStatus::Cancelled,
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct BashResult {
+    pub summary: String,
+    pub stdout_preview: String,
+    pub stderr_preview: String,
+    pub preview_omitted: bool,
+    pub metadata: BashOutputMetadata,
+    pub cancelled: bool,
+}
+
+impl BashResult {
+    pub fn stdout_entry(&self) -> String {
+        format!("/bash-output/{}/stdout", self.metadata.id)
+    }
+    pub fn stderr_entry(&self) -> String {
+        format!("/bash-output/{}/stderr", self.metadata.id)
+    }
+    pub fn order_entry(&self) -> String {
+        format!("/bash-output/{}/order", self.metadata.id)
+    }
+    pub fn tool_output(&self) -> ToolOutput {
+        let content = serde_json::json!({
+            "stdout_preview": self.stdout_preview, "stderr_preview": self.stderr_preview,
+            "preview_omitted": self.preview_omitted, "output": self.metadata,
+            "stdout_entry": self.stdout_entry(), "stderr_entry": self.stderr_entry(), "order_entry": self.order_entry(),
+        });
+        ToolOutput {
+            summary: self.summary.clone(),
+            content: Some(content.to_string()),
+            attachments: vec![],
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for BashTool {
+    async fn execute(
+        &self,
+        input: &str,
+        ctx: agen::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let result = self.execute_result(input, ctx).await?;
+        let output = result.tool_output();
+        if result.cancelled {
             Err(ToolError::Cancelled(output))
-        } else if timed_out {
+        } else if result.metadata.terminal.status == Some(workdir::CommandStatus::TimedOut) {
             Err(ToolError::Interrupted(output))
         } else {
             Ok(output)
@@ -288,164 +494,19 @@ fn truncate_for_summary(command: &str) -> String {
     summary
 }
 
-pub fn bash_tool(session: WorkdirSessionHandle, output_dir: PathBuf) -> ToolDefinition {
-    routed_bash_tool(crate::routing::singleton_router(session), output_dir)
+pub fn bash_tool(session: WorkdirSessionHandle, output: BashOutputView) -> ToolDefinition {
+    routed_bash_tool(crate::routing::singleton_router(session), output)
 }
 
 pub(crate) fn routed_bash_tool(
     router: Arc<WorkdirSessionRouter>,
-    output_dir: PathBuf,
+    output: BashOutputView,
 ) -> ToolDefinition {
     Arc::new(move || {
-        let schema = schemars::schema_for!(BashParams);
         let meta = ToolMeta::new("Bash")
-            .description("Execute a shell command in one selected Workdir. Process start, bounded inline output, full-output spill, timeout and cancellation are owned by that WorkdirSession provider. This is not a sandbox.")
-            .input_schema(serde_json::to_value(schema).expect("Bash schema serialization"));
-        let tool: Arc<dyn Tool> = Arc::new(BashTool {
-            router: router.clone(),
-            output_dir: output_dir.clone(),
-            state: Arc::new(Mutex::new(BashExecutionState::default())),
-        });
+            .description("Execute a shell command in one selected Workdir. Workdir owns launch, lossless bounded byte transport, timeout and cancel; Bash owns preview, quota-limited ephemeral output and read-only virtual references. This is not a sandbox.")
+            .input_schema(BashTool::input_schema());
+        let tool: Arc<dyn Tool> = Arc::new(BashTool::new(router.clone(), output.clone()));
         (meta, tool)
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
-    use tempfile::TempDir;
-    use workdir::{LocalWorkdirSession, WorkdirSessionHandle};
-
-    use super::bash_tool;
-    use crate::{grep::grep_tool, read::read_tool, tracker::Tracker};
-
-    fn session_with_output_scope(root: &TempDir, output: &TempDir) -> WorkdirSessionHandle {
-        let scope = Scope::from_config(&ScopeConfig {
-            allow: vec![
-                ScopeRule {
-                    target: root.path().to_path_buf(),
-                    permission: Permission::Write,
-                    recursive: true,
-                    symlink_policy: Default::default(),
-                },
-                ScopeRule {
-                    target: output.path().to_path_buf(),
-                    permission: Permission::Read,
-                    recursive: true,
-                    symlink_policy: Default::default(),
-                },
-            ],
-            deny: Vec::new(),
-        })
-        .unwrap();
-        Arc::new(LocalWorkdirSession::new(scope, root.path().to_path_buf()))
-    }
-
-    #[tokio::test]
-    async fn long_output_is_spilled_and_available_to_read_and_grep() {
-        let root = TempDir::new().unwrap();
-        let output = TempDir::new().unwrap();
-        let session = session_with_output_scope(&root, &output);
-        let (_, bash) = bash_tool(session.clone(), output.path().to_path_buf())();
-        let command = "i=0; while [ $i -lt 2000 ]; do printf 'line-%04d\\n' \"$i\"; i=$((i+1)); done; printf 'FINAL-NEEDLE\\n'";
-        let result = bash
-            .execute(
-                &serde_json::json!({ "command": command, "cwd": "." }).to_string(),
-                Default::default(),
-            )
-            .await
-            .unwrap();
-        let rendered = result.content.expect("bounded Bash output");
-        let artifact = std::fs::read_dir(output.path())
-            .unwrap()
-            .next()
-            .expect("artifact entry")
-            .unwrap()
-            .path();
-
-        assert!(rendered.contains("full output saved to"));
-        assert!(rendered.contains(&artifact.display().to_string()));
-        let retained = std::fs::read_to_string(&artifact).unwrap();
-        assert!(retained.starts_with("line-0000\n"));
-        assert!(retained.ends_with("FINAL-NEEDLE\n"));
-        assert_eq!(retained.lines().count(), 2001);
-
-        let (_, read) = read_tool(session.clone(), Tracker::new())();
-        let read_result = read
-            .execute(
-                &serde_json::json!({
-                    "file_path": artifact,
-                    "offset": 2000,
-                    "limit": 1,
-                })
-                .to_string(),
-                Default::default(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            read_result
-                .content
-                .expect("Read content")
-                .contains("FINAL-NEEDLE")
-        );
-
-        let (_, grep) = grep_tool(session)();
-        let grep_result = grep
-            .execute(
-                &serde_json::json!({
-                    "pattern": "FINAL-NEEDLE",
-                    "path": artifact,
-                    "output_mode": "content",
-                })
-                .to_string(),
-                Default::default(),
-            )
-            .await
-            .unwrap();
-        let grep_content = grep_result.content.expect("Grep content");
-        assert!(
-            grep_content.contains("FINAL-NEEDLE"),
-            "unexpected Grep content: {grep_content:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_cwd_is_rejected_before_command_start() {
-        let root = TempDir::new().unwrap();
-        let output = TempDir::new().unwrap();
-        let session = session_with_output_scope(&root, &output);
-        let (_, bash) = bash_tool(session, output.path().to_path_buf())();
-
-        let error = bash
-            .execute(
-                &serde_json::json!({ "command": "printf hidden" }).to_string(),
-                Default::default(),
-            )
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("missing field `cwd`"));
-    }
-
-    #[tokio::test]
-    async fn short_output_does_not_leave_a_spill_artifact() {
-        let root = TempDir::new().unwrap();
-        let output = TempDir::new().unwrap();
-        let session = session_with_output_scope(&root, &output);
-        let (_, bash) = bash_tool(session, output.path().to_path_buf())();
-
-        let result = bash
-            .execute(
-                &serde_json::json!({ "command": "printf short", "cwd": "." }).to_string(),
-                Default::default(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(result.content.as_deref(), Some("short"));
-        assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
-    }
 }

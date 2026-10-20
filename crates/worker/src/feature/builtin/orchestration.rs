@@ -164,6 +164,7 @@ impl Tool for SpawnTicketWorkerTool {
                 operation_id: Some(format!("spawn-ticket-worker:{}:{call_id}", ticket.id)),
                 display_name: format!("Worker · {}", ticket.resource_key),
                 initial_submit,
+                execution_grant: None,
             })
             .await
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;

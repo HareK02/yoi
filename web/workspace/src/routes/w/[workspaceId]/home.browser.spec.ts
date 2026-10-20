@@ -79,6 +79,7 @@ test("loader only uses bounded read-only supported endpoints and advertises expl
   const depends = vi.fn();
   const result = await load(
     {
+      parent: async () => ({}),
       fetch,
       params: { workspaceId: "home-owner" },
       depends,

@@ -341,7 +341,9 @@ impl WorkdirSession for RoutedWorkdirSession {
         let _active = self.state.enter()?;
         let handle = request.handle.clone();
         let output = self.state.session.command_output(request).await?;
-        self.state.mark_terminal(&handle, output.status);
+        if let Some(terminal) = &output.terminal {
+            self.state.mark_terminal(&handle, terminal.status);
+        }
         Ok(output)
     }
 
@@ -789,11 +791,12 @@ mod tests {
             .unwrap();
         let handle = routed
             .start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "printf done".to_string(),
                 timeout_secs: 5,
-                output_limit: 1024,
+
                 cwd: crate::WorkdirPath::root(),
-                spill_dir: None,
+
                 tool_call_id: None,
             })
             .await
@@ -823,11 +826,12 @@ mod tests {
         let routed = router.attach(alias, Arc::clone(&underlying)).unwrap();
         let handle = routed
             .start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "sleep 30".to_string(),
                 timeout_secs: 60,
-                output_limit: 1024,
+
                 cwd: crate::WorkdirPath::root(),
-                spill_dir: None,
+
                 tool_call_id: None,
             })
             .await
@@ -850,11 +854,12 @@ mod tests {
         let routed = router.attach(alias.clone(), session("wd", &dir)).unwrap();
         let handle = routed
             .start_command(CommandRequest {
+                transport_byte_budget: crate::MAX_COMMAND_TRANSPORT_BYTES,
                 command: "sleep 30".to_string(),
                 timeout_secs: 60,
-                output_limit: 1024,
+
                 cwd: crate::WorkdirPath::root(),
-                spill_dir: None,
+
                 tool_call_id: None,
             })
             .await

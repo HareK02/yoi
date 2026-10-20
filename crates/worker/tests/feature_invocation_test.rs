@@ -14,7 +14,7 @@ use protocol::{
     InvocationArgumentDescriptor, InvocationArgumentType, InvocationArgumentValue,
     InvocationCompletion, InvocationValue, Segment,
 };
-use session_store::{CombinedStore, FsStore, FsWorkerStore, LogEntry, SystemItem};
+use session_store::{CombinedStore, FsStore, FsWorkerStore, LogEntry};
 use worker::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureInvocationContext,
     FeatureInvocationHandler, FeatureInvocationHandlerError, FeatureModule, FeatureRegistryBuilder,
@@ -224,10 +224,20 @@ fn results(worker: &Worker<Trace, TestStore>) -> Vec<FeatureInvocationResult> {
         .0
         .into_iter()
         .filter_map(|entry| match entry {
-            LogEntry::AnnotatedSystemItem { entry, .. } => match entry.item {
-                SystemItem::FeatureInvocationResult { result, .. } => Some(result),
-                _ => None,
-            },
+            LogEntry::AnnotatedSystemItem { entry, .. } => {
+                #[derive(serde::Deserialize)]
+                struct SavedResult {
+                    result: FeatureInvocationResult,
+                }
+                entry
+                    .metadata
+                    .input_metadata
+                    .as_ref()?
+                    .feature_payload()?
+                    .decode::<SavedResult>("feature:invocation-result", 1)
+                    .ok()
+                    .map(|input| input.result)
+            }
             _ => None,
         })
         .collect()

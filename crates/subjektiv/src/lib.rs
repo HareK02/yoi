@@ -4,6 +4,7 @@ pub mod api;
 pub mod job;
 pub mod journal;
 mod legacy_migrations;
+pub mod permissions;
 mod schema;
 use legacy_migrations::{
     add_candidate_decision_receipts, add_subject_behavior, add_subject_session_attribution,
@@ -82,6 +83,16 @@ pub enum SubjektivError {
     },
     #[error("subject `{subject_id}` behavior content changed")]
     SubjectBehaviorConflict { subject_id: String },
+    #[error("subject `{0}` permission source changed")]
+    SubjectPermissionsConflict(String),
+    #[error("permission operation `{0}` was reused with different input")]
+    PermissionOperationConflict(String),
+    #[error("authorization denied: {0}")]
+    AuthorizationDenied(String),
+    #[error("Worker execution grant binding conflicts for `{0}`")]
+    WorkerExecutionGrantConflict(String),
+    #[error("Subject `{subject_id}` has more than {limit} retained Worker execution grants")]
+    WorkerExecutionGrantListOverflow { subject_id: String, limit: usize },
     #[error("surface generation conflict: {0}")]
     SurfaceGenerationConflict(String),
     #[error("memory `{memory_id}` cannot transition from {from:?} to {to:?}")]
@@ -622,6 +633,11 @@ static MIGRATIONS: &[FeatureMigration] = &[
         11,
         "add immutable candidate Journal context links",
         journal::memory_links::migrate,
+    ),
+    FeatureMigration::new(
+        12,
+        "add explicit Subject permission sources and immutable child execution grants",
+        permissions::migrate,
     ),
 ];
 

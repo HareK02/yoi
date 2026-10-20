@@ -53,6 +53,7 @@ async fn start_source(api: &mut WorkspaceApi, runtime: &WorkdirlessFixtureRuntim
             resolved_memory_settings: None,
             resolved_subjektiv_attached: false,
             resolved_control_operation: None,
+            resolved_execution_grant: None,
         },
     );
     summary.tags = vec!["orchestrator".into(), "singleton".into()];

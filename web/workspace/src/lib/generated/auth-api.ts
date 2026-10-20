@@ -19,7 +19,9 @@ export type AuthenticatedUser = { user_id: string, account_id: string, handle: s
 
 export type RequestActor = { user_id: string, account_id: string, handle: string, display_name: string, auth_method: ActorAuthMethod, };
 
-export type WhoamiResponse = { actor: RequestActor | null, };
+export type BrowserSessionState = { "kind": "anonymous", } | { "kind": "authenticated", expires_at: string | null, } | { "kind": "expired", };
+
+export type WhoamiResponse = { actor: RequestActor | null, session: BrowserSessionState, };
 
 export type AuthBootstrapUserRequest = { handle: string, display_name?: string | null, };
 

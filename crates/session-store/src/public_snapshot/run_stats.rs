@@ -103,6 +103,7 @@ fn finish(
     stats.insert(
         anchor.clone(),
         SessionSnapshotEntry {
+            use_policy: None,
             entry_id: format!("run-stats:{anchor}"),
             timestamp: ended_at,
             provenance: SessionEntryProvenance::LegacyUnknown,
