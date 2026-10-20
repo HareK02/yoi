@@ -39,6 +39,8 @@ fn page(cursor: u64, bytes: &[u8], terminal: bool) -> workdir::CommandOutput {
         },
         next_cursor: cursor + bytes.len() as u64,
         terminal: terminal.then_some(workdir::CommandTerminal {
+            process_failure: None,
+            output_collection: workdir::CommandOutputCollection::Complete,
             status: workdir::CommandStatus::Cancelled,
             exit_code: None,
             stdout_bytes: cursor + bytes.len() as u64,

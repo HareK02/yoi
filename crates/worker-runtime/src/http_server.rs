@@ -2146,6 +2146,7 @@ impl RuntimeHttpWorkdirError {
         Self {
             status,
             payload: WorkdirTransportError {
+                failure_reason: None,
                 denial_reason: None,
                 code,
                 message: message.into(),
@@ -2214,6 +2215,16 @@ impl From<workdir::WorkdirError> for RuntimeHttpWorkdirError {
 
 impl IntoResponse for RuntimeHttpWorkdirError {
     fn into_response(self) -> Response {
+        if let Some(reason) = self.payload.failure_reason {
+            tracing::warn!(
+                target: "worker_runtime::workdir",
+                event = "workdir_provider_failure",
+                status = self.status.as_u16(),
+                code = self.payload.code.as_str(),
+                failure_reason = reason.as_str(),
+                "Workdir provider operation failed"
+            );
+        }
         (self.status, Json(self.payload)).into_response()
     }
 }
@@ -3195,9 +3206,13 @@ mod tests {
             .await
             .expect_err("close must be terminal");
         assert!(matches!(
-            closed_error,
+            closed_error.classification_source(),
             workdir::WorkdirError::Unavailable(_)
         ));
+        assert_eq!(
+            closed_error.failure_reason(),
+            Some(workdir::WorkdirFailureReason::SessionClosed)
+        );
         assert!(
             state
                 .workdir_sessions

@@ -158,11 +158,15 @@ async fn command_page(
 ) -> Result<workdir::CommandOutput, workdir::WorkdirError> {
     for attempt in 0..3 {
         match session.command_output(request.clone()).await {
-            Err(
-                workdir::WorkdirError::Transport(_)
-                | workdir::WorkdirError::Unavailable(_)
-                | workdir::WorkdirError::OutcomeUnknown(_),
-            ) if attempt < 2 => {
+            Err(error)
+                if attempt < 2
+                    && matches!(
+                        error.classification_source(),
+                        workdir::WorkdirError::Transport(_)
+                            | workdir::WorkdirError::Unavailable(_)
+                            | workdir::WorkdirError::OutcomeUnknown(_)
+                    ) =>
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(100 << attempt)).await;
             }
             result => return result,
@@ -363,7 +367,7 @@ impl BashTool {
         guard.handle = None;
 
         let timed_out = terminal.status == workdir::CommandStatus::TimedOut;
-        let summary =
+        let mut summary =
             if cancellation_requested || terminal.status == workdir::CommandStatus::Cancelled {
                 format!("$ {cmd_summary} (cancelled)")
             } else if timed_out {
@@ -375,6 +379,12 @@ impl BashTool {
                     None => format!("$ {cmd_summary} (terminated)"),
                 }
             };
+        if matches!(
+            terminal.output_collection,
+            workdir::CommandOutputCollection::Incomplete { .. }
+        ) {
+            summary.push_str(" (output incomplete)");
+        }
         Ok(BashResult {
             summary,
             stdout_preview: String::from_utf8_lossy(&stdout_preview).into_owned(),

@@ -3,6 +3,7 @@
 //! pre-seeded session is a fixture; no Runtime Worker/materializer is claimed here.
 
 use super::*;
+use std::collections::BTreeMap;
 use std::time::Duration;
 use workdir::http::{
     RemoteWorkdirSession, WorkdirHttpAuthorization, WorkdirHttpAuthorizationFuture,
@@ -70,14 +71,23 @@ impl Harness {
     }
 
     async fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
-        let session: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::materialized_bound(
-            Workdir::new("wd-transport"),
-            root.path().to_path_buf(),
-            root.path().to_path_buf(),
-            SharedScope::new(Scope::writable(root.path()).unwrap()),
-            WorkdirSessionCapabilities::ALL,
-        ));
+        Self::with_environment(tempfile::tempdir().unwrap(), BTreeMap::new()).await
+    }
+
+    async fn with_environment(
+        root: tempfile::TempDir,
+        command_environment: BTreeMap<String, String>,
+    ) -> Self {
+        let session: WorkdirSessionHandle =
+            Arc::new(LocalWorkdirSession::materialized_bound_with_environment(
+                Workdir::new("wd-transport"),
+                root.path().to_path_buf(),
+                root.path().to_path_buf(),
+                SharedScope::new(Scope::writable(root.path()).unwrap()),
+                WorkdirSessionCapabilities::ALL,
+                command_environment,
+                Vec::new(),
+            ));
         let identity = RuntimeIdentityMaterial::generate("transport-key").unwrap();
         let trust = workspace_trust(&identity);
         let state = RuntimeHttpState {
@@ -157,6 +167,336 @@ impl Harness {
 }
 
 #[tokio::test]
+async fn real_http_waiting_command_survives_long_poll_expiry() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let harness = Harness::new().await;
+        let handle = harness
+            .remote
+            .start_command(CommandRequest {
+                transport_byte_budget: 1024,
+                command: "printf ready; while [ ! -e release ]; do sleep 0.05; done; printf after; printf err >&2; exit 7".into(),
+                timeout_secs: 40,
+                cwd: WorkdirPath::root(),
+                tool_call_id: None,
+            })
+            .await
+            .unwrap();
+        let mut request = CommandOutputRequest {
+            handle,
+            cursor: 0,
+            limit: 1024,
+            wait: true,
+        };
+        let ready = harness.remote.command_output(request.clone()).await.unwrap();
+        assert_eq!(ready.chunks.iter().flat_map(|c| c.bytes.iter().copied()).collect::<Vec<_>>(), b"ready");
+        assert!(ready.terminal.is_none());
+        request.cursor = ready.next_cursor;
+
+        // Keep the command silent until the production HTTP handler has expired
+        // its 20-second long poll. The client must keep waiting, not fail or
+        // expose an empty page as completed output.
+        let waiting = harness.remote.command_output(request.clone());
+        tokio::pin!(waiting);
+        tokio::select! {
+            result = &mut waiting => panic!("waiting read ended before release: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_secs(21)) => {}
+        }
+        std::fs::write(harness._root.path().join("release"), b"").unwrap();
+        let mut page = waiting.await.unwrap();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let terminal = loop {
+            // The retry cursor still replays the exact nonempty/terminal page.
+            assert_eq!(harness.remote.command_output(request.clone()).await.unwrap(), page);
+            for chunk in &page.chunks {
+                assert_eq!(chunk.sequence, request.cursor);
+                request.cursor += chunk.bytes.len() as u64;
+                match chunk.stream {
+                    CommandStream::Stdout => stdout.extend_from_slice(&chunk.bytes),
+                    CommandStream::Stderr => stderr.extend_from_slice(&chunk.bytes),
+                }
+            }
+            assert_eq!(page.next_cursor, request.cursor);
+            if let Some(terminal) = page.terminal {
+                break terminal;
+            }
+            page = harness.remote.command_output(request.clone()).await.unwrap();
+        };
+        assert_eq!(stdout, b"after");
+        assert_eq!(stderr, b"err");
+        assert_eq!(terminal.status, workdir::CommandStatus::Failed);
+        assert_eq!(terminal.exit_code, Some(7));
+        harness.remote.close().await.unwrap();
+    })
+    .await
+    .expect("bounded long-poll continuation over HTTP");
+}
+
+#[tokio::test]
+async fn real_http_spawn_failure_preserves_safe_cause_counts_and_terminal_replay() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let root = tempfile::tempdir().unwrap();
+        let missing_path = root.path().join("private-spawn-path-must-not-exist");
+        assert!(!missing_path.exists());
+        let private_path = missing_path.to_str().unwrap().to_owned();
+        let environment_secret = "spawn-environment-secret-must-not-leak";
+        let command_secret = "spawn-command-secret-must-not-leak";
+        let tool_call_secret = "spawn-tool-call-secret-must-not-leak";
+        // This is an OS spawn failure in the production local provider, not a
+        // fabricated terminal: PATH contains no bash. The test process environment
+        // is untouched, so parallel command tests retain their normal PATH.
+        let harness = Harness::with_environment(
+            root,
+            BTreeMap::from([
+                ("PATH".into(), private_path.clone()),
+                ("PRIVATE_AUTH_TOKEN".into(), environment_secret.into()),
+            ]),
+        )
+        .await;
+        let command = format!("printf '{command_secret}'; printf ran > must-not-run");
+        let handle = harness
+            .remote
+            .start_command(CommandRequest {
+                transport_byte_budget: 1024,
+                command: command.clone(),
+                timeout_secs: 5,
+                cwd: WorkdirPath::root(),
+                tool_call_id: Some(tool_call_secret.into()),
+            })
+            .await
+            .unwrap();
+        let request = CommandOutputRequest {
+            handle,
+            cursor: 0,
+            limit: 16,
+            wait: true,
+        };
+        let page = harness.remote.command_output(request.clone()).await.unwrap();
+        assert!(page.chunks.is_empty());
+        assert_eq!(page.next_cursor, 0);
+        let terminal = page.terminal.as_ref().expect("spawn failure is terminal");
+        assert_eq!(terminal.status, workdir::CommandStatus::Failed);
+        assert_eq!(terminal.exit_code, None);
+        assert_eq!(
+            terminal.process_failure,
+            Some(workdir::CommandFailure {
+                stage: workdir::CommandFailureStage::Spawn,
+                reason: workdir::CommandIoErrorKind::NotFound,
+                os_code: Some(libc::ENOENT),
+            })
+        );
+        assert_eq!(
+            terminal.output_collection,
+            workdir::CommandOutputCollection::NotStarted
+        );
+        assert_eq!(terminal.stdout_bytes, 0);
+        assert_eq!(terminal.stderr_bytes, 0);
+        assert_eq!(terminal.stdout_delivered_bytes, 0);
+        assert_eq!(terminal.stderr_delivered_bytes, 0);
+        assert_eq!(terminal.truncation_reason, None);
+
+        // A zero-byte terminal page remains replayable at its unchanged cursor;
+        // neither a retry nor a smaller nonwaiting read changes its accounting.
+        assert_eq!(
+            harness.remote.command_output(request.clone()).await.unwrap(),
+            page
+        );
+        let replay_request = CommandOutputRequest {
+            wait: false,
+            limit: 1,
+            ..request
+        };
+        assert_eq!(
+            harness
+                .remote
+                .command_output(replay_request.clone())
+                .await
+                .unwrap(),
+            page
+        );
+        let response = harness
+            .raw_operation(
+                serde_json::to_value(WorkdirSessionOperation::CommandOutput(
+                    replay_request.clone(),
+                ))
+                .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.text().await.unwrap();
+        for secret in [
+            private_path.as_str(),
+            harness._root.path().to_str().unwrap(),
+            "private-spawn-path-must-not-exist",
+            "PRIVATE_AUTH_TOKEN",
+            environment_secret,
+            command_secret,
+            command.as_str(),
+            tool_call_secret,
+        ] {
+            assert!(
+                !body.contains(secret),
+                "private input leaked into HTTP terminal"
+            );
+        }
+        let wire: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "operation": "command_output",
+                "result": {
+                    "chunks": [],
+                    "next_cursor": 0,
+                    "terminal": {
+                        "status": "failed",
+                        "exit_code": null,
+                        "process_failure": {"stage": "spawn", "reason": "not_found", "os_code": libc::ENOENT},
+                        "output_collection": {"state": "not_started"},
+                        "stdout_bytes": 0,
+                        "stderr_bytes": 0,
+                        "stdout_delivered_bytes": 0,
+                        "stderr_delivered_bytes": 0,
+                        "truncation_reason": null
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            harness.remote.command_output(replay_request).await.unwrap(),
+            page
+        );
+        // Exercise the same real spawn failure through Bash, not a terminal
+        // fixture. Opening another remote client reuses the pre-seeded provider
+        // session and still passes through the signed HTTP middleware.
+        let bash_remote: WorkdirSessionHandle = Arc::new(
+            RemoteWorkdirSession::open_with_authorization(
+                harness.client.clone(),
+                harness.operation_url.join("/").unwrap(),
+                harness.authorization.clone(),
+                Workdir::new("wd-transport").id().clone(),
+                OpenWorkdirSessionRequest::default(),
+            )
+            .await
+            .unwrap(),
+        );
+        let view = tools::bash_output::BashOutputView::new();
+        let (_, bash) = tools::bash_tool(bash_remote, view.clone())();
+        let input = serde_json::json!({
+            "command": command,
+            "cwd": ".",
+            "timeout": 5
+        })
+        .to_string();
+        let output = bash
+            .execute(
+                &input,
+                agen::tool::ToolExecutionContext::new(tool_call_secret, "http-spawn-attempt", 0),
+            )
+            .await
+            .expect("Bash returns a structured failed-command result");
+        let content = output.content.as_deref().expect("Bash ToolOutput body");
+        let tool_body: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_eq!(tool_body["stdout_preview"], "");
+        assert_eq!(tool_body["stderr_preview"], "");
+        assert_eq!(tool_body["preview_omitted"], false);
+        assert_eq!(
+            tool_body["output"]["terminal"],
+            serde_json::json!({
+                "status": "failed",
+                "exit_code": null,
+                "process_failure": {"stage": "spawn", "reason": "not_found", "os_code": libc::ENOENT},
+                "output_collection": {"state": "not_started"},
+                "transport_complete": false
+            })
+        );
+        let output_id = tool_body["output"]["id"].as_str().unwrap();
+        let retained = view.metadata(output_id).expect("retained spawn failure");
+        assert_eq!(retained.terminal.status, Some(workdir::CommandStatus::Failed));
+        assert_eq!(retained.terminal.exit_code, None);
+        assert_eq!(retained.terminal.process_failure, terminal.process_failure);
+        assert_eq!(
+            retained.terminal.output_collection,
+            Some(workdir::CommandOutputCollection::NotStarted)
+        );
+        assert!(!retained.terminal.transport_complete);
+        assert_eq!(retained.stdout_saved, 0);
+        assert_eq!(retained.stderr_saved, 0);
+        assert_eq!(retained.stdout_seen, 0);
+        assert_eq!(retained.stderr_seen, 0);
+        assert_eq!(retained.stdout_delivered, 0);
+        assert_eq!(retained.stderr_delivered, 0);
+        assert!(!retained.storage_truncated);
+        assert!(retained.retention_limit.is_none());
+        assert_eq!(retained.transport_truncation, None);
+        let retained_wire = serde_json::to_value(&retained).unwrap();
+        assert_eq!(retained_wire, tool_body["output"]);
+        for stream in [CommandStream::Stdout, CommandStream::Stderr] {
+            assert_eq!(view.read(output_id, stream, 0, 1), Some(Vec::new()));
+        }
+        for secret in [
+            private_path.as_str(),
+            harness._root.path().to_str().unwrap(),
+            "private-spawn-path-must-not-exist",
+            "PRIVATE_AUTH_TOKEN",
+            environment_secret,
+            command_secret,
+            command.as_str(),
+            tool_call_secret,
+        ] {
+            assert!(
+                !content.contains(secret),
+                "private input leaked into Bash ToolOutput body"
+            );
+        }
+        assert!(!harness._root.path().join("must-not-run").exists());
+        harness.remote.close().await.unwrap();
+        assert!(harness.session.command_snapshot().is_empty());
+        assert_eq!(
+            serde_json::to_value(view.metadata(output_id).unwrap()).unwrap(),
+            retained_wire
+        );
+    })
+    .await
+    .expect("bounded real spawn failure over signed HTTP");
+}
+
+#[tokio::test]
+async fn real_http_closed_session_retains_failure_reason() {
+    let harness = Harness::new().await;
+    let handle = harness
+        .remote
+        .start_command(CommandRequest {
+            transport_byte_budget: 1024,
+            command: "printf done".into(),
+            timeout_secs: 5,
+            cwd: WorkdirPath::root(),
+            tool_call_id: None,
+        })
+        .await
+        .unwrap();
+    // Keep the HTTP session identity registered, but close the underlying provider.
+    harness.session.close().await.unwrap();
+    let error = harness
+        .remote
+        .command_output(CommandOutputRequest {
+            handle,
+            cursor: 0,
+            limit: 16,
+            wait: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.failure_reason(),
+        Some(workdir::WorkdirFailureReason::SessionClosed)
+    );
+    assert!(matches!(
+        error.classification_source(),
+        workdir::WorkdirError::Unavailable(_)
+    ));
+}
+
+#[tokio::test]
 async fn real_http_command_pages_preserve_binary_streams_replay_and_nonzero_exit() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let harness = Harness::new().await;
@@ -189,6 +529,11 @@ async fn real_http_command_pages_preserve_binary_streams_replay_and_nonzero_exit
         assert_eq!(stderr, b"stderr\xe6\x97\xa5");
         assert_eq!(terminal.status, workdir::CommandStatus::Failed);
         assert_eq!(terminal.exit_code, Some(9));
+        assert_eq!(terminal.process_failure, None);
+        assert_eq!(
+            terminal.output_collection,
+            workdir::CommandOutputCollection::Complete
+        );
         assert!(harness.remote.command_output(CommandOutputRequest { handle, cursor: 0, limit: 1, wait: false }).await.is_err());
         harness.remote.close().await.unwrap();
         assert!(harness.session.command_snapshot().is_empty());
@@ -333,6 +678,11 @@ async fn real_http_command_budget_bounds_unique_payload_and_reports_larger_seen_
             );
             assert_eq!(terminal.status, workdir::CommandStatus::Failed);
             assert_eq!(terminal.exit_code, Some(9));
+            assert_eq!(terminal.process_failure, None);
+            assert_eq!(
+                terminal.output_collection,
+                workdir::CommandOutputCollection::Complete
+            );
             assert!(
                 harness
                     .remote

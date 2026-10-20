@@ -401,8 +401,44 @@ impl From<&str> for WorkdirDenial {
     }
 }
 
+/// Bounded operational diagnostics, never provider text, paths or credentials.
+/// Reasons describe an observation, not retry permission or proof of no effects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkdirFailureReason {
+    SessionClosed,
+    ProviderUnavailable,
+    CommandTerminalMissing,
+    HttpTimeout,
+    HttpConnect,
+    HttpTransfer,
+    HttpResponseInvalid,
+    HttpResponseTooLarge,
+}
+
+impl WorkdirFailureReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionClosed => "session_closed",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::CommandTerminalMissing => "command_terminal_missing",
+            Self::HttpTimeout => "http_timeout",
+            Self::HttpConnect => "http_connect",
+            Self::HttpTransfer => "http_transfer",
+            Self::HttpResponseInvalid => "http_response_invalid",
+            Self::HttpResponseTooLarge => "http_response_too_large",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkdirError {
+    #[error("{source}")]
+    FailureContext {
+        reason: WorkdirFailureReason,
+        #[source]
+        source: Box<WorkdirError>,
+    },
     #[error("Workdir operation denied: {0}")]
     Denied(WorkdirDenial),
 
@@ -521,10 +557,27 @@ impl WorkdirError {
     /// and `denial_reason`: enrichment must not alter behavior or retry policy.
     pub fn classification_source(&self) -> &Self {
         let mut error = self;
-        while let Self::DenialContext { source, .. } = error {
+        while let Self::DenialContext { source, .. } | Self::FailureContext { source, .. } = error {
             error = source;
         }
         error
+    }
+
+    pub fn with_failure_reason(self, reason: WorkdirFailureReason) -> Self {
+        Self::FailureContext {
+            reason,
+            source: Box::new(self),
+        }
+    }
+
+    pub fn failure_reason(&self) -> Option<WorkdirFailureReason> {
+        match self {
+            Self::FailureContext { reason, .. } => Some(*reason),
+            Self::DenialContext { source, .. } => source.failure_reason(),
+            Self::SessionClosed => Some(WorkdirFailureReason::SessionClosed),
+            Self::Unavailable(_) => Some(WorkdirFailureReason::ProviderUnavailable),
+            _ => None,
+        }
     }
 
     pub fn denied(reason: WorkdirDenialReason, message: impl Into<String>) -> Self {
@@ -540,6 +593,7 @@ impl WorkdirError {
         match self {
             Self::Denied(denial) => denial.reason,
             Self::DenialContext { reason, .. } => Some(*reason),
+            Self::FailureContext { source, .. } => source.denial_reason(),
             Self::OutOfScope(_) => Some(Reason::PathOutOfScope),
             Self::SymlinkOutOfScope { .. } => Some(Reason::SymlinkTargetOutOfScope),
             Self::ReadOnly(_) => Some(Reason::PathReadOnly),

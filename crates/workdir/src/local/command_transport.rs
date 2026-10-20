@@ -3,6 +3,7 @@
 //! A replay page survives a lost HTTP response until its next cursor is sent.
 
 use super::*;
+use crate::{CommandFailure, CommandFailureStage, CommandIoErrorKind, CommandOutputCollection};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
 
@@ -113,6 +114,7 @@ impl Transport {
                         WorkdirError::Unavailable(
                             "command transport ended before terminal fence".into(),
                         )
+                        .with_failure_reason(crate::WorkdirFailureReason::CommandTerminalMissing)
                     })?;
                     self.terminal = Some(terminal.clone());
                     page.terminal = Some(terminal);
@@ -146,6 +148,33 @@ pub(super) fn start(
     environment: BTreeMap<String, String>,
     resources: Vec<Arc<dyn WorkdirSessionResource>>,
 ) -> LocalCommand {
+    let execution_id = command_id.clone();
+    let execution_telemetry = telemetry.clone();
+    start_with(
+        command_id,
+        telemetry,
+        resources,
+        move |cancel, sender| async move {
+            execute(
+                cwd,
+                request,
+                &execution_id,
+                &execution_telemetry,
+                environment,
+                cancel,
+                &sender,
+            )
+            .await
+        },
+    )
+}
+
+fn start_with<F: std::future::Future<Output = crate::CommandTerminal> + Send + 'static>(
+    command_id: String,
+    telemetry: CommandTelemetry,
+    resources: Vec<Arc<dyn WorkdirSessionResource>>,
+    execution: impl FnOnce(watch::Receiver<bool>, mpsc::Sender<Message>) -> F + Send + 'static,
+) -> LocalCommand {
     let (sender, receiver) = mpsc::channel(QUEUE_CHUNKS);
     let (cancel, cancel_rx) = watch::channel(false);
     let (status_tx, status) = watch::channel(None);
@@ -159,16 +188,7 @@ pub(super) fn start(
     }));
     let task = tokio::spawn(async move {
         let _resources = resources;
-        let terminal = execute(
-            cwd,
-            request,
-            &command_id,
-            &telemetry,
-            environment,
-            cancel_rx,
-            &sender,
-        )
-        .await;
+        let terminal = execution(cancel_rx, sender.clone()).await;
         telemetry.terminal(&command_id, terminal.status, terminal.exit_code);
         // Closing the byte queue fences this already-published terminal, without
         // requiring spare queue capacity or a receiver to release task resources.
@@ -191,10 +211,18 @@ struct ByteAccounting {
 }
 
 impl ByteAccounting {
-    fn terminal(&self, status: CommandStatus, exit_code: Option<i32>) -> crate::CommandTerminal {
+    fn terminal(
+        &self,
+        status: CommandStatus,
+        exit_code: Option<i32>,
+        process_failure: Option<CommandFailure>,
+        output_collection: CommandOutputCollection,
+    ) -> crate::CommandTerminal {
         crate::CommandTerminal {
             status,
             exit_code,
+            process_failure,
+            output_collection,
             stdout_bytes: self.stdout,
             stderr_bytes: self.stderr,
             stdout_delivered_bytes: self.stdout_delivered,
@@ -214,7 +242,7 @@ async fn pump<R: AsyncRead + Unpin>(
     command_id: &str,
     mut remaining: u64,
     accounting: &mut ByteAccounting,
-) -> std::io::Result<()> {
+) -> Result<(), CommandFailure> {
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut stdout_decoder = CommandOutputDecoder::default();
@@ -227,7 +255,11 @@ async fn pump<R: AsyncRead + Unpin>(
         // Before quota, reserve first to retain bounded pipe backpressure.
         let permit = if remaining > 0 {
             let Ok(permit) = sender.reserve().await else {
-                return Ok(());
+                return Err(CommandFailure {
+                    stage: CommandFailureStage::OutputDelivery,
+                    reason: CommandIoErrorKind::Unknown,
+                    os_code: None,
+                });
             };
             Some(permit)
         } else {
@@ -241,7 +273,15 @@ async fn pump<R: AsyncRead + Unpin>(
             CommandStream::Stdout => &stdout_buffer,
             CommandStream::Stderr => &stderr_buffer,
         };
-        let count = result?;
+        let count = result.map_err(|error| {
+            CommandFailure::io(
+                match stream {
+                    CommandStream::Stdout => CommandFailureStage::StdoutRead,
+                    CommandStream::Stderr => CommandFailureStage::StderrRead,
+                },
+                &error,
+            )
+        })?;
         let decoder = match stream {
             CommandStream::Stdout => &mut stdout_decoder,
             CommandStream::Stderr => &mut stderr_decoder,
@@ -287,7 +327,7 @@ async fn execute(
     command_id: &str,
     telemetry: &CommandTelemetry,
     environment: BTreeMap<String, String>,
-    mut cancel: watch::Receiver<bool>,
+    cancel: watch::Receiver<bool>,
     sender: &mpsc::Sender<Message>,
 ) -> crate::CommandTerminal {
     telemetry.started(command_id, request.tool_call_id);
@@ -303,74 +343,159 @@ async fn execute(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.as_std_mut().process_group(0);
-    let mut accounting = ByteAccounting::default();
-    let Ok(mut child) = command.spawn() else {
-        return accounting.terminal(CommandStatus::Failed, None);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return ByteAccounting::default().terminal(
+                CommandStatus::Failed,
+                None,
+                Some(CommandFailure::io(CommandFailureStage::Spawn, &error)),
+                CommandOutputCollection::NotStarted,
+            );
+        }
     };
-    let mut process_group = CommandProcessGroupGuard::new(child.id());
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let (status, exit_code) = {
+    supervise(
+        child,
+        stdout,
+        stderr,
+        request.timeout_secs,
+        request.transport_byte_budget,
+        command_id,
+        telemetry,
+        cancel,
+        sender,
+    )
+    .await
+}
+
+// Substitute only syscalls and readers: injected faults run the production supervisor.
+trait CommandProcess: Send {
+    fn id(&self) -> Option<u32>;
+    fn start_kill(&mut self);
+    fn wait(
+        &mut self,
+    ) -> impl std::future::Future<Output = std::io::Result<std::process::ExitStatus>> + Send;
+}
+
+impl CommandProcess for tokio::process::Child {
+    fn id(&self) -> Option<u32> {
+        self.id()
+    }
+    fn start_kill(&mut self) {
+        let _ = self.start_kill();
+    }
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.wait().await
+    }
+}
+
+fn process_result(
+    result: std::io::Result<std::process::ExitStatus>,
+) -> (CommandStatus, Option<i32>, Option<CommandFailure>) {
+    match result {
+        Ok(exit) => (
+            if exit.success() {
+                CommandStatus::Completed
+            } else {
+                CommandStatus::Failed
+            },
+            exit.code(),
+            None,
+        ),
+        Err(error) => (
+            CommandStatus::Failed,
+            None,
+            Some(CommandFailure::io(CommandFailureStage::Wait, &error)),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise(
+    mut child: impl CommandProcess,
+    stdout: impl AsyncRead + Unpin,
+    stderr: impl AsyncRead + Unpin,
+    timeout_secs: u64,
+    byte_budget: u64,
+    command_id: &str,
+    telemetry: &CommandTelemetry,
+    mut cancel: watch::Receiver<bool>,
+    sender: &mpsc::Sender<Message>,
+) -> crate::CommandTerminal {
+    let mut process_group = CommandProcessGroupGuard::new(child.id());
+    let mut accounting = ByteAccounting::default();
+    let (status, exit_code, process_failure, output_collection) = {
         let output = pump(
             stdout,
             stderr,
             sender,
             telemetry,
             command_id,
-            request.transport_byte_budget,
+            byte_budget,
             &mut accounting,
         );
         tokio::pin!(output);
-        let mut drained = false;
-        let timeout = tokio::time::sleep(Duration::from_secs(request.timeout_secs.max(1)));
+        let mut collected = None;
+        let timeout = tokio::time::sleep(Duration::from_secs(timeout_secs.max(1)));
         tokio::pin!(timeout);
         let terminal = loop {
             tokio::select! {
-                result = &mut output, if !drained => {
-                    drained = true;
-                    if result.is_err() || sender.is_closed() {
+                result = &mut output, if collected.is_none() => {
+                    let failed = result.is_err();
+                    collected = Some(result);
+                    if failed {
                         process_group.terminate();
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        break (CommandStatus::Failed, None);
+                        child.start_kill();
+                        break process_result(child.wait().await);
                     }
                 }
                 exit = child.wait() => {
                     process_group.terminate();
-                    break match exit {
-                        Ok(exit) => (if exit.success() { CommandStatus::Completed } else { CommandStatus::Failed }, exit.code()),
-                        Err(_) => (CommandStatus::Failed, None),
-                    };
+                    break process_result(exit);
                 }
                 _ = &mut timeout => {
                     process_group.terminate();
-                    let _ = child.start_kill();
-                    let code = child.wait().await.ok().and_then(|exit| exit.code());
-                    break (CommandStatus::TimedOut, code);
+                    child.start_kill();
+                    let (_, code, failure) = process_result(child.wait().await);
+                    break (CommandStatus::TimedOut, code, failure);
                 }
                 _ = sender.closed() => {
                     process_group.terminate();
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    break (CommandStatus::Cancelled, None);
+                    child.start_kill();
+                    let (_, code, failure) = process_result(child.wait().await);
+                    break (CommandStatus::Cancelled, code, failure);
                 }
                 changed = cancel.changed() => {
                     if changed.is_err() || *cancel.borrow() {
                         process_group.terminate();
-                        let _ = child.start_kill();
-                        let code = child.wait().await.ok().and_then(|exit| exit.code());
-                        break (CommandStatus::Cancelled, code);
+                        child.start_kill();
+                        let (_, code, failure) = process_result(child.wait().await);
+                        break (CommandStatus::Cancelled, code, failure);
                     }
                 }
             }
         };
-        // Even after kill, preserve the bounded pipe tail before publishing terminal.
-        if !drained {
-            let _ = output.await;
-        }
-        terminal
+        // Exit is not pipe EOF. Retain read failures first observed during drain.
+        let result = match collected {
+            Some(result) => result,
+            None => output.await.map_err(|mut failure| {
+                failure.stage = match failure.stage {
+                    CommandFailureStage::StdoutRead => CommandFailureStage::StdoutDrain,
+                    CommandFailureStage::StderrRead => CommandFailureStage::StderrDrain,
+                    stage => stage,
+                };
+                failure
+            }),
+        };
+        let collection = match result {
+            Ok(()) => CommandOutputCollection::Complete,
+            Err(failure) => CommandOutputCollection::Incomplete { failure },
+        };
+        (terminal.0, terminal.1, terminal.2, collection)
     };
-    accounting.terminal(status, exit_code)
+    accounting.terminal(status, exit_code, process_failure, output_collection)
 }
 
 #[cfg(test)]

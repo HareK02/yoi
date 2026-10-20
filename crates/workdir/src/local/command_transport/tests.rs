@@ -4,6 +4,38 @@
 use super::*;
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn missing_terminal_is_diagnosed_without_changing_error_classification() {
+    let (sender, receiver) = mpsc::channel(1);
+    let (_status, terminal_status) = watch::channel(None);
+    drop(sender);
+    let mut transport = Transport {
+        receiver,
+        pending: None,
+        cursor: 0,
+        replay: None,
+        terminal: None,
+        terminal_status,
+    };
+    let error = transport
+        .read(&CommandOutputRequest {
+            handle: CommandHandle("diagnostic-test".into()),
+            cursor: 0,
+            limit: 16,
+            wait: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.failure_reason(),
+        Some(crate::WorkdirFailureReason::CommandTerminalMissing)
+    );
+    assert!(matches!(
+        error.classification_source(),
+        WorkdirError::Unavailable(_)
+    ));
+}
+
 struct Harness {
     session: LocalWorkdirSession,
     _root: TempDir,
@@ -486,5 +518,351 @@ async fn slow_receiver_backpressures_before_quota_but_full_queue_does_not_block_
             queued_bytes += chunk.bytes.len();
         }
         assert_eq!(queued_bytes, QUEUE_CHUNKS * COMMAND_EVENT_CHUNK_BYTES);
+    }
+}
+
+#[derive(Clone, Default)]
+struct Gate(Arc<std::sync::Mutex<(bool, Option<std::task::Waker>)>>);
+
+impl Gate {
+    fn open(&self) {
+        let mut state = self.0.lock().unwrap();
+        state.0 = true;
+        if let Some(waker) = state.1.take() {
+            waker.wake();
+        }
+    }
+
+    fn poll(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let mut state = self.0.lock().unwrap();
+        if state.0 {
+            std::task::Poll::Ready(())
+        } else {
+            state.1 = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+}
+
+struct FaultProcess {
+    ready: Gate,
+    exited: Gate,
+    wait_error: Option<std::io::ErrorKind>,
+}
+
+impl CommandProcess for FaultProcess {
+    fn id(&self) -> Option<u32> {
+        None
+    }
+    fn start_kill(&mut self) {
+        self.ready.open();
+    }
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        std::future::poll_fn(|cx| self.ready.poll(cx)).await;
+        self.exited.open();
+        match self.wait_error {
+            Some(kind) => Err(std::io::Error::new(
+                kind,
+                "/private/path TOKEN=secret command-body",
+            )),
+            None => Ok(std::process::ExitStatus::default()),
+        }
+    }
+}
+
+struct FaultReader {
+    prefix: &'static [u8],
+    prefix_read: Gate,
+    fail_ready: Gate,
+}
+
+impl AsyncRead for FaultReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.prefix.is_empty() {
+            let count = self.prefix.len().min(buffer.remaining());
+            buffer.put_slice(&self.prefix[..count]);
+            self.prefix = &self.prefix[count..];
+            self.prefix_read.open();
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::task::ready!(self.fail_ready.poll(cx));
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "/private/path TOKEN=secret command-body",
+        )))
+    }
+}
+
+// Faults replace only OS wait/read boundaries, not collection or finalization.
+#[tokio::test]
+async fn read_and_post_exit_drain_faults_keep_prefix_exit_and_safe_original_reason() {
+    for stream in [CommandStream::Stdout, CommandStream::Stderr] {
+        for after_exit in [false, true] {
+            let ready = Gate::default();
+            let exited = Gate::default();
+            let fail_ready = if after_exit {
+                exited.clone()
+            } else {
+                let gate = Gate::default();
+                gate.open();
+                gate
+            };
+            let reader = FaultReader {
+                prefix: b"partial",
+                prefix_read: if after_exit {
+                    ready.clone()
+                } else {
+                    Gate::default()
+                },
+                fail_ready,
+            };
+            let process = FaultProcess {
+                ready,
+                exited,
+                wait_error: None,
+            };
+            let (sender, mut receiver) = mpsc::channel(QUEUE_CHUNKS);
+            let (_cancel, cancel_rx) = watch::channel(false);
+            let telemetry = CommandTelemetry::new();
+            let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+                match stream {
+                    CommandStream::Stdout => {
+                        supervise(
+                            process,
+                            reader,
+                            &b""[..],
+                            10,
+                            100,
+                            "fault",
+                            &telemetry,
+                            cancel_rx,
+                            &sender,
+                        )
+                        .await
+                    }
+                    CommandStream::Stderr => {
+                        supervise(
+                            process,
+                            &b""[..],
+                            reader,
+                            10,
+                            100,
+                            "fault",
+                            &telemetry,
+                            cancel_rx,
+                            &sender,
+                        )
+                        .await
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let Message::Bytes(chunk) = receiver.recv().await.unwrap();
+            assert_eq!(chunk.bytes, b"partial");
+            assert_eq!(chunk.stream, stream);
+            assert_eq!(chunk.sequence, 0);
+            assert_eq!(chunk.offset, 0);
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(terminal.status, CommandStatus::Completed);
+            assert_eq!(terminal.exit_code, Some(0));
+            assert_eq!(terminal.process_failure, None);
+            assert_eq!(terminal.stdout_bytes + terminal.stderr_bytes, 7);
+            assert_eq!(
+                terminal.stdout_delivered_bytes + terminal.stderr_delivered_bytes,
+                7
+            );
+            assert_eq!(terminal.truncation_reason, None);
+            assert_eq!(
+                terminal.output_collection,
+                CommandOutputCollection::Incomplete {
+                    failure: CommandFailure {
+                        stage: match (stream, after_exit) {
+                            (CommandStream::Stdout, false) => CommandFailureStage::StdoutRead,
+                            (CommandStream::Stdout, true) => CommandFailureStage::StdoutDrain,
+                            (CommandStream::Stderr, false) => CommandFailureStage::StderrRead,
+                            (CommandStream::Stderr, true) => CommandFailureStage::StderrDrain,
+                        },
+                        reason: CommandIoErrorKind::PermissionDenied,
+                        os_code: None
+                    },
+                }
+            );
+            let wire = serde_json::to_string(&terminal).unwrap();
+            for secret in ["/private", "TOKEN", "secret", "command-body"] {
+                assert!(!wire.contains(secret));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn wait_fault_keeps_collected_bytes_and_does_not_invent_exit_information() {
+    let ready = Gate::default();
+    ready.open();
+    let process = FaultProcess {
+        ready,
+        exited: Gate::default(),
+        wait_error: Some(std::io::ErrorKind::InvalidData),
+    };
+    let (sender, mut receiver) = mpsc::channel(QUEUE_CHUNKS);
+    let (_cancel, cancel_rx) = watch::channel(false);
+    let terminal = supervise(
+        process,
+        &b"out"[..],
+        &b"err"[..],
+        10,
+        100,
+        "wait-fault",
+        &CommandTelemetry::new(),
+        cancel_rx,
+        &sender,
+    )
+    .await;
+    assert_eq!(terminal.status, CommandStatus::Failed);
+    assert_eq!(terminal.exit_code, None);
+    assert_eq!(
+        terminal.process_failure,
+        Some(CommandFailure {
+            stage: CommandFailureStage::Wait,
+            reason: CommandIoErrorKind::InvalidData,
+            os_code: None
+        })
+    );
+    assert_eq!(
+        terminal.output_collection,
+        CommandOutputCollection::Complete
+    );
+    assert_eq!(terminal.stdout_bytes, 3);
+    assert_eq!(terminal.stderr_bytes, 3);
+    let mut chunks = Vec::new();
+    while let Ok(Message::Bytes(chunk)) = receiver.try_recv() {
+        chunks.push(chunk);
+    }
+    assert_eq!(stream_bytes(&chunks, CommandStream::Stdout), b"out");
+    assert_eq!(stream_bytes(&chunks, CommandStream::Stderr), b"err");
+    assert!(!serde_json::to_string(&terminal).unwrap().contains("secret"));
+}
+
+#[tokio::test]
+async fn spawn_fault_retains_safe_reason_without_claiming_output_collection() {
+    let root = TempDir::new().unwrap();
+    let (sender, _receiver) = mpsc::channel(QUEUE_CHUNKS);
+    let (_cancel, cancel_rx) = watch::channel(false);
+    let terminal = execute(
+        root.path().join("missing-secret-path"),
+        Harness::request("secret-command", 10, 100),
+        "spawn-fault",
+        &CommandTelemetry::new(),
+        BTreeMap::new(),
+        cancel_rx,
+        &sender,
+    )
+    .await;
+    assert_eq!(
+        terminal.process_failure,
+        Some(CommandFailure {
+            stage: CommandFailureStage::Spawn,
+            reason: CommandIoErrorKind::NotFound,
+            os_code: Some(libc::ENOENT)
+        })
+    );
+    assert_eq!(
+        terminal.output_collection,
+        CommandOutputCollection::NotStarted
+    );
+    assert_eq!(terminal.exit_code, None);
+    assert_eq!(terminal.status, CommandStatus::Failed);
+    assert_eq!(terminal.stdout_bytes + terminal.stderr_bytes, 0);
+    assert!(!serde_json::to_string(&terminal).unwrap().contains("secret"));
+}
+
+#[cfg(feature = "http-client")]
+mod http;
+
+#[tokio::test]
+async fn drain_failure_and_byte_budget_keep_independent_loss_diagnostics() {
+    for stream in [CommandStream::Stdout, CommandStream::Stderr] {
+        let ready = Gate::default();
+        let exited = Gate::default();
+        let process = FaultProcess {
+            ready: ready.clone(),
+            exited: exited.clone(),
+            wait_error: None,
+        };
+        let reader = FaultReader {
+            prefix: b"partial",
+            prefix_read: ready,
+            fail_ready: exited,
+        };
+        let (sender, mut receiver) = mpsc::channel(QUEUE_CHUNKS);
+        let (_cancel, cancel_rx) = watch::channel(false);
+        let telemetry = CommandTelemetry::new();
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            match stream {
+                CommandStream::Stdout => {
+                    supervise(
+                        process,
+                        reader,
+                        &b""[..],
+                        10,
+                        3,
+                        "quota-fault",
+                        &telemetry,
+                        cancel_rx,
+                        &sender,
+                    )
+                    .await
+                }
+                CommandStream::Stderr => {
+                    supervise(
+                        process,
+                        &b""[..],
+                        reader,
+                        10,
+                        3,
+                        "quota-fault",
+                        &telemetry,
+                        cancel_rx,
+                        &sender,
+                    )
+                    .await
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let Message::Bytes(chunk) = receiver.recv().await.unwrap();
+        assert_eq!(chunk.stream, stream);
+        assert_eq!(chunk.bytes, b"par");
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(terminal.exit_code, Some(0));
+        assert_eq!(terminal.stdout_bytes + terminal.stderr_bytes, 7);
+        assert_eq!(
+            terminal.stdout_delivered_bytes + terminal.stderr_delivered_bytes,
+            3
+        );
+        assert_eq!(
+            terminal.truncation_reason,
+            Some(crate::CommandOutputTruncation::ByteBudget)
+        );
+        assert_eq!(
+            terminal.output_collection,
+            CommandOutputCollection::Incomplete {
+                failure: CommandFailure {
+                    stage: match stream {
+                        CommandStream::Stdout => CommandFailureStage::StdoutDrain,
+                        CommandStream::Stderr => CommandFailureStage::StderrDrain,
+                    },
+                    reason: CommandIoErrorKind::PermissionDenied,
+                    os_code: None,
+                },
+            }
+        );
+        assert!(terminal.metadata_valid());
     }
 }
