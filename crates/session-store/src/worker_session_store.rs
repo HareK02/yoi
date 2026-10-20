@@ -259,6 +259,33 @@ impl WorkerSessionStore {
         })
     }
 
+    /// Validate an existing Session's conversion without publishing any bytes.
+    /// Hosts can isolate unreadable archives before admitting a staged migration;
+    /// the versioned decoder and conversion checks remain owned by this store.
+    pub fn validate_migration(root: &Path) -> Result<(), StoreError> {
+        let manifest: SessionManifest =
+            serde_json::from_slice(&fs::read(root.join(SESSION_FILE))?)?;
+        match manifest.schema_version {
+            SESSION_SCHEMA_VERSION => validate_canonical_segment_logs(root),
+            LEGACY_SESSION_SCHEMA_VERSION
+            | PREVIOUS_SESSION_SCHEMA_VERSION
+            | ANNOTATED_SESSION_SCHEMA_VERSION
+            | COMPACTION_SESSION_SCHEMA_VERSION
+            | SYSTEM_INPUT_SESSION_SCHEMA_VERSION => migrate_segment_logs_to_current(
+                segment_log_paths(root)?,
+                manifest.session_id,
+                manifest.schema_version,
+                |_, _| Ok(()),
+            ),
+            version => Err(StoreError::Corrupt {
+                line: 0,
+                message: format!(
+                    "unsupported Worker Session schema version {version}, expected {SESSION_SCHEMA_VERSION}"
+                ),
+            }),
+        }
+    }
+
     /// Open an already-retained Session without creating directories or migrating
     /// persisted data. Observation paths must never mutate retained state.
     pub fn open_read_only(root: impl Into<PathBuf>) -> Result<Self, StoreError> {

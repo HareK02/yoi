@@ -58628,6 +58628,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_preload_keeps_workspace_available_with_unreadable_embedded_archive() {
+        // Exercise catalog preload through the production embedded Runtime/store;
+        // only the database and filesystem roots are isolated fixtures.
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_server_config(temp.path());
+        let store =
+            Arc::new(SqliteWorkspaceStore::open_api_fixture(&config.database_path).unwrap());
+        seed_test_registered_workspace(store.as_ref(), &config)
+            .await
+            .unwrap();
+        let workspace = store
+            .get_workspace(TEST_WORKSPACE_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let scoped = config
+            .for_catalog_workspace(&workspace, Vec::new())
+            .unwrap();
+        drop(
+            worker_runtime::Runtime::with_fs_store(
+                worker_runtime::fs_store::FsRuntimeStoreOptions::new(
+                    &scoped.embedded_runtime_store_root,
+                )
+                .with_runtime_id(EMBEDDED_WORKER_RUNTIME_ID),
+            )
+            .unwrap(),
+        );
+        let archive = scoped
+            .embedded_runtime_store_root
+            .join("archives/workers/unreadable-archive");
+        fs::create_dir_all(archive.join("session")).unwrap();
+        let marker = archive.join("session/session.json");
+        fs::write(&marker, b"{broken archive identity\n").unwrap();
+        let server = WorkspaceServerApi::new_for_test(config, store);
+        server.preload().await.unwrap();
+        let api = server
+            .api_for_workspace(TEST_WORKSPACE_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            api.runtime
+                .list_runtimes(100)
+                .items
+                .iter()
+                .any(|runtime| { runtime.runtime_id == EMBEDDED_WORKER_RUNTIME_ID })
+        );
+        assert_eq!(fs::read(marker).unwrap(), b"{broken archive identity\n");
+        server.shutdown_feature_storage().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn api_startup_revalidates_workspace_schema_after_store_was_opened() {
         let temp = tempfile::tempdir().unwrap();
         let config = test_server_config(temp.path());

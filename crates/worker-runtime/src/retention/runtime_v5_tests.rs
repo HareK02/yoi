@@ -359,7 +359,7 @@ fn runtime_v11_and_current_route_v4_stopped_orphan_archive_through_staging() {
 }
 
 #[test]
-fn runtime_v5_archive_failure_discards_staging_without_losing_originals_and_retry_converges() {
+fn corrupt_archive_does_not_block_startup_or_healthy_session_migration_and_repair_converges() {
     for runtime_schema in [11, 12] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime");
@@ -373,18 +373,48 @@ fn runtime_v5_archive_failure_discards_staging_without_losing_originals_and_retr
             .join(format!("{archived_segment}.jsonl"));
         let original = fs::read(&path).unwrap();
         fs::write(&path, b"corrupt archive\n").unwrap();
-        let before = tree_bytes(&root);
+        let (healthy_worker, healthy_session, healthy_segment) =
+            stopped_worker(&root, runtime_schema);
+        let mut healthy_request =
+            super::tests::request(healthy_worker, SessionDisposition::Archive);
+        healthy_request.operation_id = "healthy-operation".into();
+        healthy_request.archive_id = Some("healthy-archive".into());
+        let healthy_manifest = commit_session_archive(
+            &provider,
+            &healthy_request,
+            &provider.worker_dir(healthy_worker),
+        )
+        .unwrap();
+        fs::remove_dir_all(provider.worker_dir(healthy_worker)).unwrap();
+        let before = tree_bytes(&archive);
         let options = FsRuntimeStoreOptions::new(&root).with_runtime_id("runtime-a");
         assert!(
             FsRuntimeStore::migration_plan(&options)
                 .unwrap()
                 .migration_required
         );
-        // workers are visited before archives: earlier successful staged
-        // conversion must not leak into the original tree on this later error.
-        assert!(FsRuntimeStore::open_or_create(root.clone(), "runtime-a").is_err());
-        assert_eq!(tree_bytes(&root), before);
+        drop(FsRuntimeStore::open_or_create(root.clone(), "runtime-a").unwrap());
+        assert_eq!(tree_bytes(&archive), before);
+        assert!(provider.session_archive("archive-a").is_err());
+        let (manifest, healthy_root) = provider.session_archive("healthy-archive").unwrap();
+        assert_eq!(manifest, healthy_manifest);
+        assert_generic(&healthy_root, healthy_session, healthy_segment);
         assert!(!archive.join(ARCHIVE_STORAGE_FILE).exists());
+        assert_generic(
+            &root
+                .join("workers")
+                .join(worker.to_string())
+                .join("session"),
+            session,
+            segment,
+        );
+        assert!(
+            !FsRuntimeStore::migration_plan(&options)
+                .unwrap()
+                .migration_required
+        );
+        drop(FsRuntimeStore::open_or_create(root.clone(), "runtime-a").unwrap());
+        assert_eq!(tree_bytes(&archive), before);
         fs::write(&path, original).unwrap();
         FsRuntimeStore::migrate(&options).unwrap();
         assert_generic(
@@ -401,50 +431,160 @@ fn runtime_v5_archive_failure_discards_staging_without_losing_originals_and_retr
 }
 
 #[test]
-fn runtime_v5_typed_legacy_payload_failure_keeps_valid_archive_evidence_on_retries() {
-    for (from, to) in [
-        (
-            "\"snapshot_sha256\":\"snapshot-digest\"",
-            "\"snapshot_sha256\":42",
-        ),
-        ("\"behavior_md\":\"exact behavior\"", "\"behavior_md\":[]"),
+fn unmigratable_archive_preserves_evidence_across_startup_and_reopen() {
+    for (field, value) in [
+        ("snapshot_sha256", json!(42)),
+        ("behavior_md", json!([])),
+        ("snapshot", json!({"large": "x".repeat(128 * 1024 + 1)})),
+        ("body", json!("x".repeat(256 * 1024 + 1))),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime");
-        runtime_fixture(&root, 12);
+        let (live_worker, live_session, live_segment) = runtime_fixture(&root, 12);
         let (worker, _, segment) = stopped_worker(&root, 12);
         let provider = FsWorkerRetentionProvider::new(&root);
         let path = provider
             .worker_dir(worker)
             .join("session/segments")
             .join(format!("{segment}.jsonl"));
-        let original = fs::read_to_string(&path).unwrap();
-        assert!(original.contains(from));
-        fs::write(&path, original.replace(from, to)).unwrap();
+        let source = fs::read_to_string(&path).unwrap();
+        let mut replaced = false;
+        let mut altered = String::new();
+        for line in source.lines() {
+            let mut entry: Value = serde_json::from_str(line).unwrap();
+            if let Some(item) = entry.pointer_mut("/entry/item")
+                && item.get(field).is_some()
+            {
+                item[field] = value.clone();
+                replaced = true;
+            }
+            altered.push_str(&serde_json::to_string(&entry).unwrap());
+            altered.push('\n');
+        }
+        assert!(replaced);
+        fs::write(&path, altered).unwrap();
         let request = request(worker, SessionDisposition::Archive);
         let manifest =
             commit_session_archive(&provider, &request, &provider.worker_dir(worker)).unwrap();
         fs::remove_dir_all(provider.worker_dir(worker)).unwrap();
         let archive = provider.archive_dir("archive-a").unwrap();
-        // This archive checksum is valid; failure must come from the legacy
-        // typed decoder, not from deliberately broken ingestion evidence.
         validate_existing_archive(&archive, &manifest, false).unwrap();
-        let before = tree_bytes(&root);
+        let before = tree_bytes(&archive);
         let options = FsRuntimeStoreOptions::new(&root).with_runtime_id("runtime-a");
         for _ in 0..2 {
-            let error = FsRuntimeStore::migrate(&options).unwrap_err();
-            let RuntimeError::StoreCorrupt {
-                operation, path, ..
-            } = error
-            else {
-                panic!("unexpected failure: {error}");
+            let runtime = crate::Runtime::with_fs_store(options.clone()).unwrap();
+            assert_eq!(runtime.summary().unwrap().worker_count, 1);
+            runtime.bind_runtime_identity("runtime-a").unwrap();
+            let search = runtime_api::SessionPublicSearchRequest {
+                workspace_id: "workspace-a".into(),
+                source: runtime_api::SessionPublicSource::Archived {
+                    archive_id: "archive-a".into(),
+                },
+                expected_session_id: manifest.source_session_id.clone(),
+                expected_generation: None,
+                query: None,
+                kind: None,
+                tool_name: None,
+                tool_part: runtime_api::SessionPublicToolPart::Both,
+                scan_cursor: None,
+                limit: 10,
+                max_scan_bytes: 1024 * 1024,
+                max_segments: 10,
+                max_entries: 100,
             };
-            assert_eq!(operation, "migrate Session schema");
-            assert!(path.starts_with(temp.path().join(".runtime.schema-v12-staging")));
-            assert_eq!(tree_bytes(&root), before);
+            let availability = runtime
+                .session_public_search_scoped(
+                    &crate::runtime::RuntimeWorkspaceScope::new("workspace-a", "owner-a"),
+                    &search,
+                )
+                .unwrap();
+            assert!(matches!(
+                availability,
+                runtime_api::SessionPublicSearchAvailability::Unavailable {
+                    reason: runtime_api::SessionPublicUnavailableReason::ArchiveIncomplete,
+                    ..
+                }
+            ));
+            drop(runtime);
+            assert_eq!(tree_bytes(&archive), before);
             validate_existing_archive(&archive, &manifest, false).unwrap();
+            assert!(matches!(
+                provider.session_archive("archive-a"),
+                Err(RuntimeError::StoreCorrupt { .. })
+            ));
+            assert!(
+                !FsRuntimeStore::migration_plan(&options)
+                    .unwrap()
+                    .migration_required
+            );
+            assert_generic(
+                &provider.worker_dir(live_worker).join("session"),
+                live_session,
+                live_segment,
+            );
         }
     }
+}
+
+#[test]
+fn unreadable_archive_metadata_does_not_block_archive_only_runtime_startup() {
+    for (path, field, value) in [
+        ("session/session.json", None, Value::Null),
+        ("manifest.json", None, Value::Null),
+        (ARCHIVE_STORAGE_FILE, None, Value::Null),
+        ("session/session.json", Some("schema_version"), json!(999)),
+        ("manifest.json", Some("schema_version"), json!(999)),
+        (
+            "manifest.json",
+            Some("archive_id"),
+            json!("another-archive"),
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("runtime");
+        let (worker, _, _) = runtime_fixture(&root, 12);
+        completed_v4_archive(&root, 12);
+        let provider = FsWorkerRetentionProvider::new(&root);
+        fs::remove_dir_all(provider.worker_dir(worker)).unwrap();
+        let archive = provider.archive_dir("archive-a").unwrap();
+        if let Some(field) = field {
+            let mut record: Value = read_json(&archive.join(path), "test").unwrap();
+            record[field] = value;
+            write_json(&archive.join(path), &record);
+        } else {
+            fs::write(archive.join(path), b"{broken\n").unwrap();
+        }
+        let before = tree_bytes(&archive);
+        let options = FsRuntimeStoreOptions::new(&root).with_runtime_id("runtime-a");
+        for _ in 0..2 {
+            assert!(
+                !FsRuntimeStore::migration_plan(&options)
+                    .unwrap()
+                    .migration_required
+            );
+            let runtime = crate::Runtime::with_fs_store(options.clone()).unwrap();
+            assert_eq!(runtime.summary().unwrap().worker_count, 0);
+            drop(runtime);
+            assert!(provider.session_archive("archive-a").is_err());
+            assert_eq!(tree_bytes(&archive), before);
+        }
+    }
+}
+
+#[test]
+fn archive_isolation_does_not_bypass_corrupt_erasure_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("runtime");
+    runtime_fixture(&root, 12);
+    let (session, _, _, _) = completed_v4_archive(&root, 12);
+    let ledger = root.join("retention/session-sources");
+    fs::create_dir_all(&ledger).unwrap();
+    fs::write(ledger.join(format!("{session}.json")), b"{broken\n").unwrap();
+    let before = tree_bytes(&root);
+    let options = FsRuntimeStoreOptions::new(&root).with_runtime_id("runtime-a");
+    assert!(FsRuntimeStore::migration_plan(&options).is_err());
+    assert!(crate::Runtime::with_fs_store(options).is_err());
+    assert_eq!(tree_bytes(&root), before);
 }
 
 #[test]

@@ -641,6 +641,13 @@ impl FsWorkerRetentionProvider {
         let (manifest, session_root) = self.session_archive_identity(archive_id)?;
         let archive_dir = self.archive_dir(archive_id)?;
         let manifest = validate_existing_archive(&archive_dir, &manifest, false)?;
+        session_store::WorkerSessionStore::open_read_only(&session_root).map_err(|_| {
+            RuntimeError::StoreCorrupt {
+                operation: "read Worker Session archive",
+                path: session_root.clone(),
+                message: "archive Session is unavailable in the current schema".into(),
+            }
+        })?;
         Ok((manifest, session_root))
     }
 
@@ -653,13 +660,7 @@ impl FsWorkerRetentionProvider {
             &archive_dir.join("manifest.json"),
             "read Worker Session archive",
         )?;
-        if manifest.schema_version != ARCHIVE_SCHEMA_VERSION || manifest.archive_id != archive_id {
-            return Err(RuntimeError::StoreCorrupt {
-                operation: "read Worker Session archive",
-                path: archive_dir.join("manifest.json"),
-                message: "archive manifest identity mismatch".to_string(),
-            });
-        }
+        validate_archive_identity(&archive_dir, &manifest)?;
         Ok((manifest, archive_dir.join("session")))
     }
 
@@ -1204,9 +1205,10 @@ fn archive_storage(
     }
 }
 
-// Share discovery and erasure fencing between the read-only Runtime preflight
-// and its private staging pass. Session Store remains the authority for schema
-// admission and conversion; Runtime must not duplicate its version table.
+// Share discovery and erasure fencing between Runtime preflight and staging.
+// Unreadable archives are retained but excluded before any conversion writes;
+// one historical archive must not block the live Runtime's startup. Session
+// Store owns conversion admission, including the current resource limits.
 fn for_each_live_session(
     root: &Path,
     mut visit: impl FnMut(&Path, bool) -> Result<(), RuntimeError>,
@@ -1232,39 +1234,80 @@ fn for_each_live_session(
             })?;
             let aggregate = entry.path();
             let session = aggregate.join("session");
-            if !session
-                .join("session.json")
-                .try_exists()
-                .map_err(|source| RuntimeError::StoreIo {
-                    operation: "inspect Session migration",
-                    path: session.clone(),
-                    source,
-                })?
-            {
-                continue;
-            }
-            let identity: CanonicalSessionManifest = read_json(
-                &session.join("session.json"),
-                "read Session migration identity",
-            )?;
-            let session_id = identity.session_id.parse().map_err(|_| {
-                RuntimeError::InvalidRequest("Session migration identity is invalid".into())
-            })?;
+            let is_archive = directory == root.join("archives/workers");
+            let identity = (|| {
+                if !session
+                    .join("session.json")
+                    .try_exists()
+                    .map_err(|source| RuntimeError::StoreIo {
+                        operation: "inspect Session migration",
+                        path: session.clone(),
+                        source,
+                    })?
+                {
+                    return Ok(None);
+                }
+                let identity: CanonicalSessionManifest = read_json(
+                    &session.join("session.json"),
+                    "read Session migration identity",
+                )?;
+                identity.session_id.parse().map(Some).map_err(|_| {
+                    RuntimeError::InvalidRequest("Session migration identity is invalid".into())
+                })
+            })();
+            let session_id = match identity {
+                Ok(Some(session_id)) => session_id,
+                Ok(None) => continue,
+                Err(_) if is_archive => {
+                    warn_unavailable_archive(&aggregate);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             match runtime_session_retention(root).ensure_live(session_id) {
                 Ok(()) => {}
-                // Erasure fences remain authoritative even if physical removal
-                // was interrupted. Do not inspect or migrate fenced originals.
+                // Retention-ledger failures are not archive-local. Never bypass
+                // erasure authority while isolating an unreadable archive.
                 Err(session_store::StoreError::SessionErased(_)) => continue,
                 Err(error) => return Err(retention_error(error)),
             }
-            visit(&aggregate, directory == root.join("archives/workers"))?;
+            if is_archive && validate_archive_migration(&aggregate).is_err() {
+                warn_unavailable_archive(&aggregate);
+                continue;
+            }
+            // Publication failures still abort the outer staging transaction.
+            visit(&aggregate, is_archive)?;
         }
     }
     Ok(())
 }
 
-/// Read-only admission probe: a rejected Session needs the existing staged
-/// migration attempt (which will also reject corrupt/unsupported inputs).
+fn validate_archive_migration(aggregate: &Path) -> Result<(), RuntimeError> {
+    let session = aggregate.join("session");
+    // Current archives need no conversion. Their payload integrity is checked
+    // on access, not by scanning every retained byte during Runtime startup.
+    if session_store::WorkerSessionStore::open_read_only(&session).is_ok() {
+        return Ok(());
+    }
+    let manifest: WorkerSessionArchiveManifest = read_json(
+        &aggregate.join("manifest.json"),
+        "read archive before Session migration",
+    )?;
+    validate_existing_archive(aggregate, &manifest, false)?;
+    session_store::WorkerSessionStore::validate_migration(&session).map_err(retention_error)
+}
+
+fn warn_unavailable_archive(aggregate: &Path) {
+    let archive_id = aggregate.file_name().unwrap_or_default().to_string_lossy();
+    tracing::warn!(
+        archive_id = %bounded_diagnostic_id(&archive_id),
+        code = "session_archive_unavailable",
+        "Retained Session archive could not be admitted for migration; original bytes retained"
+    );
+}
+
+/// Read-only admission probe. Only convertible archives request a staged pass;
+/// unreadable originals remain available for archive-local diagnostics/recovery.
 /// Never create a writable Session store or rewrite archive attestations here.
 pub(crate) fn sessions_require_migration(root: &Path) -> Result<bool, RuntimeError> {
     let mut required = false;
@@ -1281,6 +1324,11 @@ pub(crate) fn sessions_require_migration(root: &Path) -> Result<bool, RuntimeErr
 pub(crate) fn migrate_staged_sessions(root: &Path) -> Result<(), RuntimeError> {
     for_each_live_session(root, |aggregate, is_archive| {
         let session = aggregate.join("session");
+        // Current Sessions need no writable admission, and their storage
+        // attestations must remain byte-for-byte unchanged.
+        if session_store::WorkerSessionStore::open_read_only(&session).is_ok() {
+            return Ok(());
+        }
         let archive = if is_archive {
             let manifest: WorkerSessionArchiveManifest = read_json(
                 &aggregate.join("manifest.json"),
@@ -1290,11 +1338,6 @@ pub(crate) fn migrate_staged_sessions(root: &Path) -> Result<(), RuntimeError> {
         } else {
             None
         };
-        // Current Sessions need no writable admission, and their storage
-        // attestations must remain byte-for-byte unchanged.
-        if session_store::WorkerSessionStore::open_read_only(&session).is_ok() {
-            return Ok(());
-        }
         session_store::WorkerSessionStore::new(&session).map_err(|error| {
             RuntimeError::StoreCorrupt {
                 operation: "migrate Session schema",
@@ -1323,6 +1366,22 @@ pub(crate) fn migrate_staged_sessions(root: &Path) -> Result<(), RuntimeError> {
     })
 }
 
+fn validate_archive_identity(
+    archive_dir: &Path,
+    manifest: &WorkerSessionArchiveManifest,
+) -> Result<(), RuntimeError> {
+    if manifest.schema_version != ARCHIVE_SCHEMA_VERSION
+        || archive_dir.file_name().and_then(|name| name.to_str()) != Some(&manifest.archive_id)
+    {
+        return Err(RuntimeError::StoreCorrupt {
+            operation: "read Worker Session archive",
+            path: archive_dir.join("manifest.json"),
+            message: "archive manifest identity mismatch".into(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_existing_archive(
     archive_dir: &Path,
     expected: &WorkerSessionArchiveManifest,
@@ -1332,6 +1391,7 @@ fn validate_existing_archive(
         &archive_dir.join("manifest.json"),
         "verify Worker Session archive",
     )?;
+    validate_archive_identity(archive_dir, &existing)?;
     let storage = archive_storage(archive_dir, &existing)?;
     let mut comparable_expected = expected.clone();
     comparable_expected.archived_at_unix_seconds = existing.archived_at_unix_seconds;
@@ -2040,7 +2100,7 @@ mod tests {
     }
 
     #[test]
-    fn session_migration_rejects_corrupt_archive_before_replacing_its_bytes() {
+    fn session_migration_preserves_corrupt_archive_without_blocking_other_sessions() {
         let temp = tempfile::tempdir().unwrap();
         let worker = WorkerId::now_v7();
         let compact = old_compacted_source(temp.path(), worker);
@@ -2052,7 +2112,7 @@ mod tests {
             .join("session/segments")
             .join(format!("{compact}.jsonl"));
         fs::write(&path, b"corrupt\n").unwrap();
-        assert!(migrate_staged_sessions(temp.path()).is_err());
+        migrate_staged_sessions(temp.path()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"corrupt\n");
         assert!(!archive.join(ARCHIVE_STORAGE_FILE).exists());
     }

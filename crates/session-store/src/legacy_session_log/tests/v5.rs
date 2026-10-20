@@ -211,7 +211,7 @@ fn v1_through_v4_worker_migration_reopen_and_mixed_file_retry() {
         migrate(&mut converted);
         let mut mixed = encode(&converted[..1]);
         mixed.extend_from_slice(source.split_once('\n').unwrap().1.as_bytes());
-        fs::write(&path, mixed).unwrap();
+        fs::write(&path, &mixed).unwrap();
         let new_path = root
             .path()
             .join("segments")
@@ -224,6 +224,11 @@ fn v1_through_v4_worker_migration_reopen_and_mixed_file_retry() {
             .join(format!("{}.jsonl", SegmentId::from_u128(3)));
         fs::write(&old_path, source).unwrap();
 
+        let marker = fs::read(root.path().join("session.json")).unwrap();
+        WorkerSessionStore::validate_migration(root.path()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), mixed);
+        assert_eq!(fs::read(&old_path).unwrap(), source.as_bytes());
+        assert_eq!(fs::read(root.path().join("session.json")).unwrap(), marker);
         let store = WorkerSessionStore::new(root.path()).unwrap();
         assert_marker(root.path(), 6);
         let restored = store.read_all(session, segment).unwrap();
@@ -286,6 +291,7 @@ fn all_segments_preflight_keeps_old_bytes_on_decode_or_conversion_failure() {
             .join(format!("{}.jsonl", SegmentId::from_u128(2)));
         fs::write(&later, &bad).unwrap();
         let marker = fs::read(root.path().join("session.json")).unwrap();
+        assert!(WorkerSessionStore::validate_migration(root.path()).is_err());
         assert!(WorkerSessionStore::new(root.path()).is_err());
         assert_eq!(fs::read(&first).unwrap(), V4.as_bytes());
         assert_eq!(fs::read(&later).unwrap(), bad.as_bytes());
