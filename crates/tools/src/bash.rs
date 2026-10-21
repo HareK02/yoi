@@ -19,6 +19,8 @@ use workdir::{
     WorkdirSessionRouter,
 };
 
+mod cleanup;
+
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
 const INLINE_BYTE_BUDGET: usize = 12 * 1024;
@@ -72,80 +74,19 @@ impl Drop for CommandGuard {
         let Some(handle) = self.handle.take() else {
             return;
         };
-        let workdir = self.session.clone();
-        let state = Arc::clone(&self.state);
-        let execution_id = self.execution_id.clone();
-        let execution_nonce = self.execution_nonce;
-        let mut retained = self.retained.take();
-        let cursor = self.cursor;
-        // A dropped provider future is not terminal confirmation. Keep the live
-        // execution registered until cleanup has both requested cancellation and
-        // observed terminal command output, so cancellation/session teardown
-        // cannot race with an apparently empty registry.
-        tokio::spawn(async move {
-            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                let _ = workdir.cancel_command(handle.clone()).await;
-                let mut cursor = cursor;
-                loop {
-                    let page = command_page(
-                        &workdir,
-                        CommandOutputRequest {
-                            handle: handle.clone(),
-                            cursor,
-                            limit: workdir::MAX_COMMAND_READ_BYTES,
-                            wait: true,
-                        },
-                    )
-                    .await?;
-                    if let Some(writer) = &mut retained {
-                        let mut next = cursor;
-                        for chunk in &page.chunks {
-                            if chunk.sequence != next {
-                                return Err(workdir::WorkdirError::Unavailable(
-                                    "command cleanup sequence gap".into(),
-                                ));
-                            }
-                            writer
-                                .append_chunk(chunk)
-                                .map_err(workdir::WorkdirError::Unavailable)?;
-                            next = next.checked_add(chunk.bytes.len() as u64).ok_or_else(|| {
-                                workdir::WorkdirError::Unavailable(
-                                    "command cleanup cursor overflow".into(),
-                                )
-                            })?;
-                        }
-                        if page.next_cursor != next {
-                            return Err(workdir::WorkdirError::Unavailable(
-                                "command cleanup cursor gap".into(),
-                            ));
-                        }
-                    }
-                    cursor = page.next_cursor;
-                    if let Some(terminal) = page.terminal {
-                        if let Some(writer) = &mut retained {
-                            writer
-                                .finish_transport(&terminal)
-                                .map_err(workdir::WorkdirError::Unavailable)?;
-                        }
-                        return Ok::<(), workdir::WorkdirError>(());
-                    }
-                }
-            })
-            .await;
-            // Bounded cleanup can end with an unknown provider outcome. The writer then
-            // terminalizes partial evidence on drop; retaining a dead collector in `active`
-            // would leak registrations and falsely suggest it could still collect output.
-            let _ = result;
-            let mut state = state.lock().unwrap();
-            if state
-                .active
-                .get(&execution_id)
-                .is_some_and(|active| active.execution_nonce == execution_nonce)
-            {
-                state.active.remove(&execution_id);
-                state.cancellation_requested.remove(&execution_id);
-            }
-        });
+        let cleanup = cleanup::Cleanup {
+            session: self.session.clone(),
+            state: Arc::clone(&self.state),
+            execution_id: self.execution_id.clone(),
+            execution_nonce: self.execution_nonce,
+            handle,
+            cursor: self.cursor,
+            retained: self
+                .retained
+                .take()
+                .expect("started command owns output writer"),
+        };
+        tokio::spawn(cleanup.run());
     }
 }
 

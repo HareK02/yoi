@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use workdir::{CommandStatus, CommandStream};
 
-const COMMAND_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const COMMAND_BYTES: usize = 4 * 1024 * 1024;
 const STORE_BYTES: usize = 32 * 1024 * 1024;
 const STORE_COUNT: usize = 64;
 const ORDER_COUNT: usize = 4096;
@@ -55,6 +55,7 @@ struct Record {
     transport_counts: Option<(u64, u64)>,
     transport_truncation: Option<workdir::CommandOutputTruncation>,
     terminal: Option<OutputTerminal>,
+    cleanup: Option<CleanupDiagnostics>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -95,8 +96,70 @@ pub struct BashOutputMetadata {
     pub transport_truncation: Option<workdir::CommandOutputTruncation>,
     pub storage_truncated: bool,
     pub terminal: OutputTerminal,
+    pub cleanup: Option<CleanupDiagnostics>,
     pub text_encoding: &'static str,
     pub ordering: &'static str,
+}
+
+/// Drop cleanup observations, not assertions that cancellation stopped a process.
+/// Correlate with the enclosing output UUID and this host-assigned execution generation;
+/// caller identifiers, provider handles, commands and error text are deliberately excluded.
+#[derive(Clone, Debug, Serialize)]
+pub struct CleanupDiagnostics {
+    pub execution_nonce: u64,
+    pub cancel: CleanupCancel,
+    pub drain: CleanupDrain,
+    pub deadline_expired: bool,
+    pub registration: CleanupRegistration,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum CleanupCancel {
+    Acknowledged,
+    Failed { reason: CleanupProviderFailure },
+    DeadlineExceeded,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum CleanupDrain {
+    TerminalConfirmed,
+    Failed { reason: CleanupFailure },
+    DeadlineExceeded,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CleanupFailure {
+    Provider { reason: CleanupProviderFailure },
+    SequenceGap,
+    CursorGap,
+    DeliveryBudgetExceeded,
+    RetainedChunkInvalid,
+    TerminalMetadataInvalid,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CleanupProviderFailure {
+    pub failure_reason: Option<workdir::WorkdirFailureReason>,
+    pub denial_reason: Option<workdir::WorkdirDenialReason>,
+}
+
+impl From<&workdir::WorkdirError> for CleanupProviderFailure {
+    fn from(error: &workdir::WorkdirError) -> Self {
+        Self {
+            failure_reason: error.failure_reason(),
+            denial_reason: error.denial_reason(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupRegistration {
+    Released,
+    Superseded,
 }
 
 /// A bounded reservation acquired before command start. Drop terminalizes partial evidence.
@@ -214,6 +277,7 @@ impl BashOutputView {
             transport_counts: None,
             transport_truncation: None,
             terminal: None,
+            cleanup: None,
         }));
         store.records.push_back(record.clone());
         store.reserved += COMMAND_BYTES;
@@ -313,6 +377,7 @@ impl Record {
             transport_truncation: self.transport_truncation.clone(),
             storage_truncated: self.truncated || self.transport_truncation.is_some(),
             terminal: self.terminal.clone().expect("finalized record"),
+            cleanup: self.cleanup.clone(),
             text_encoding: "utf8_lossy",
             ordering: "provider_read_observation",
         }
@@ -342,6 +407,14 @@ async fn reap(weak: Weak<Mutex<Store>>, mut shutdown: tokio::sync::watch::Receiv
 }
 
 impl BashOutputWriter {
+    pub(crate) fn id(&self) -> String {
+        self.record.lock().unwrap().id.clone()
+    }
+
+    pub(crate) fn finish_cleanup(&mut self, diagnostics: CleanupDiagnostics) {
+        self.record.lock().unwrap().cleanup = Some(diagnostics);
+    }
+
     pub fn append_chunk(&mut self, chunk: &workdir::CommandByteChunk) -> Result<(), String> {
         let expected = {
             let r = self.record.lock().unwrap();
