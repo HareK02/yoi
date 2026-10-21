@@ -315,3 +315,71 @@ async fn capability_claims_must_match_current_workspace_identity_before_signing(
         .unwrap();
     verify(&fixture.verifier(), &token).unwrap();
 }
+
+#[tokio::test]
+async fn remote_workdir_authorization_failures_keep_safe_reason_without_dispatch_or_fallback() {
+    use workdir::WorkdirFailureReason as Reason;
+    use workdir::http::{OpenWorkdirSessionRequest, RemoteWorkdirSession, WorkdirTransportError};
+    for case in ["stale", "missing_material", "missing_authorization"] {
+        let fixture = Fixture::new().await;
+        if case == "stale" {
+            fixture
+                .store
+                .revoke_workspace_runtime_binding(WORKSPACE, RUNTIME, "revoked")
+                .unwrap();
+        } else if case == "missing_material" {
+            fixture
+                .materials
+                .delete(&fixture.identity.private_material_ref)
+                .unwrap();
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let authorization = RemoteWorkdirAuthorization {
+            workspace_authorization: (case != "missing_authorization")
+                .then(|| fixture.authorizer.clone()),
+            fallback_bearer_token: (case != "missing_authorization")
+                .then(|| "bearer-secret".into()),
+        };
+        let error = RemoteWorkdirSession::open_with_authorization(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{}", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+            Arc::new(authorization),
+            workdir::Workdir::new("workdir-secret").id().clone(),
+            OpenWorkdirSessionRequest::default(),
+        )
+        .await
+        .unwrap_err();
+        let reason = match case {
+            "stale" => Reason::AuthorizationStale,
+            "missing_material" => Reason::AuthorizationUnavailable,
+            _ => Reason::AuthorizationMissing,
+        };
+        assert_eq!(error.failure_reason(), Some(reason));
+        assert_eq!(reason.stage().as_str(), "authorization_preparation");
+        let transport = WorkdirTransportError::from_workdir_error(&error);
+        assert_eq!(transport.code.http_status(), 503);
+        assert_eq!(transport.message, "Workdir session is unavailable");
+        assert!(
+            !serde_json::to_string(&transport)
+                .unwrap()
+                .contains("secret")
+        );
+        let debug = format!("{error:?}");
+        for secret in [
+            "secret",
+            "workspace-signing/",
+            "private material",
+            "Authorization:",
+            "Bearer ",
+        ] {
+            assert!(!debug.contains(secret), "{case}: {debug}");
+        }
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "authorization failure sent HTTP or fell back"
+        );
+    }
+}

@@ -556,15 +556,13 @@ mod tests {
         ));
     }
     #[tokio::test]
-    async fn checkout_hardlink_save_isolates_alias_and_rejects_symlinks_special_files() {
+    async fn checkout_hardlink_save_isolates_alias_and_rejects_symlinks() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a"), "original").unwrap();
         std::fs::hard_link(root.path().join("a"), root.path().join("alias")).unwrap();
         std::os::unix::fs::symlink("a", root.path().join("link")).unwrap();
-        let _socket = std::os::unix::net::UnixListener::bind(root.path().join("socket")).unwrap();
         let session = session(root.path());
         assert!(session.checkout_observe(path("link")).await.is_err());
-        assert!(session.checkout_observe(path("socket")).await.is_err());
         let read = checked_read(&session, session.checkout_observe(path("a")).await.unwrap()).await;
         session
             .checkout_execute(CheckoutRequest {

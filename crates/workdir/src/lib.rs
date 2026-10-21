@@ -408,12 +408,36 @@ impl From<&str> for WorkdirDenial {
 pub enum WorkdirFailureReason {
     SessionClosed,
     ProviderUnavailable,
+    ProviderGrantExpired,
+    ProviderAdmissionClosed,
+    ProviderDispatchRejected,
+    ProviderResponseLost,
+    ProviderOperationTimeout,
     CommandTerminalMissing,
+    AuditStoreUnavailable,
     HttpTimeout,
     HttpConnect,
     HttpTransfer,
     HttpResponseInvalid,
     HttpResponseTooLarge,
+    OperationResultMismatch,
+    SessionIdentityMismatch,
+    SessionOpenTaskFailed,
+    SessionOpenFailed,
+    AuthorizationMissing,
+    AuthorizationStale,
+    AuthorizationUnavailable,
+    SigningIdentityUnavailable,
+    AuthorizationSignFailed,
+    RuntimeStopped,
+    RuntimeStateUnavailable,
+    RuntimeBackendUnavailable,
+    RuntimeOwnerMismatch,
+    RuntimeInvalidRequest,
+    WorkingDirectoryNotFound,
+    WorkingDirectoryNotActive,
+    WorkingDirectoryRecordInvalid,
+    WorkingDirectoryAccessUnavailable,
 }
 
 impl WorkdirFailureReason {
@@ -421,12 +445,107 @@ impl WorkdirFailureReason {
         match self {
             Self::SessionClosed => "session_closed",
             Self::ProviderUnavailable => "provider_unavailable",
+            Self::ProviderGrantExpired => "provider_grant_expired",
+            Self::ProviderAdmissionClosed => "provider_admission_closed",
+            Self::ProviderDispatchRejected => "provider_dispatch_rejected",
+            Self::ProviderResponseLost => "provider_response_lost",
+            Self::ProviderOperationTimeout => "provider_operation_timeout",
             Self::CommandTerminalMissing => "command_terminal_missing",
+            Self::AuditStoreUnavailable => "audit_store_unavailable",
             Self::HttpTimeout => "http_timeout",
             Self::HttpConnect => "http_connect",
             Self::HttpTransfer => "http_transfer",
             Self::HttpResponseInvalid => "http_response_invalid",
             Self::HttpResponseTooLarge => "http_response_too_large",
+            Self::OperationResultMismatch => "operation_result_mismatch",
+            Self::SessionIdentityMismatch => "session_identity_mismatch",
+            Self::SessionOpenTaskFailed => "session_open_task_failed",
+            Self::SessionOpenFailed => "session_open_failed",
+            Self::AuthorizationMissing => "authorization_missing",
+            Self::AuthorizationStale => "authorization_stale",
+            Self::AuthorizationUnavailable => "authorization_unavailable",
+            Self::SigningIdentityUnavailable => "signing_identity_unavailable",
+            Self::AuthorizationSignFailed => "authorization_sign_failed",
+            Self::RuntimeStopped => "runtime_stopped",
+            Self::RuntimeStateUnavailable => "runtime_state_unavailable",
+            Self::RuntimeBackendUnavailable => "runtime_backend_unavailable",
+            Self::RuntimeOwnerMismatch => "runtime_owner_mismatch",
+            Self::RuntimeInvalidRequest => "runtime_invalid_request",
+            Self::WorkingDirectoryNotFound => "working_directory_not_found",
+            Self::WorkingDirectoryNotActive => "working_directory_not_active",
+            Self::WorkingDirectoryRecordInvalid => "working_directory_record_invalid",
+            Self::WorkingDirectoryAccessUnavailable => "working_directory_access_unavailable",
+        }
+    }
+
+    /// The observed failing boundary, not a dispatch or effects assertion.
+    pub const fn stage(self) -> WorkdirFailureStage {
+        use WorkdirFailureStage as Stage;
+        match self {
+            Self::SessionClosed => Stage::Session,
+            Self::ProviderUnavailable => Stage::Provider,
+            Self::ProviderGrantExpired | Self::ProviderAdmissionClosed => Stage::ProviderAdmission,
+            Self::ProviderDispatchRejected => Stage::ProviderDispatch,
+            Self::ProviderResponseLost | Self::ProviderOperationTimeout => Stage::ProviderResponse,
+            Self::AuditStoreUnavailable => Stage::Audit,
+            Self::CommandTerminalMissing => Stage::Command,
+            Self::HttpTimeout | Self::HttpConnect | Self::HttpTransfer => Stage::Http,
+            Self::HttpResponseInvalid
+            | Self::HttpResponseTooLarge
+            | Self::OperationResultMismatch => Stage::ResponseValidation,
+            Self::SessionIdentityMismatch
+            | Self::SessionOpenTaskFailed
+            | Self::SessionOpenFailed
+            | Self::WorkingDirectoryNotFound
+            | Self::WorkingDirectoryNotActive
+            | Self::WorkingDirectoryRecordInvalid
+            | Self::WorkingDirectoryAccessUnavailable => Stage::SessionOpen,
+            Self::AuthorizationMissing
+            | Self::AuthorizationStale
+            | Self::AuthorizationUnavailable
+            | Self::SigningIdentityUnavailable
+            | Self::AuthorizationSignFailed => Stage::AuthorizationPreparation,
+            Self::RuntimeStopped
+            | Self::RuntimeStateUnavailable
+            | Self::RuntimeBackendUnavailable
+            | Self::RuntimeOwnerMismatch
+            | Self::RuntimeInvalidRequest => Stage::Runtime,
+        }
+    }
+}
+
+/// Internal operational boundary derived only from a bounded reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkdirFailureStage {
+    Session,
+    Provider,
+    ProviderAdmission,
+    ProviderDispatch,
+    ProviderResponse,
+    Audit,
+    Command,
+    Http,
+    ResponseValidation,
+    SessionOpen,
+    AuthorizationPreparation,
+    Runtime,
+}
+
+impl WorkdirFailureStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Provider => "provider",
+            Self::ProviderAdmission => "provider_admission",
+            Self::ProviderDispatch => "provider_dispatch",
+            Self::ProviderResponse => "provider_response",
+            Self::Audit => "audit",
+            Self::Command => "command",
+            Self::Http => "http",
+            Self::ResponseValidation => "response_validation",
+            Self::SessionOpen => "session_open",
+            Self::AuthorizationPreparation => "authorization_preparation",
+            Self::Runtime => "runtime",
         }
     }
 }
@@ -465,6 +584,10 @@ pub enum WorkdirError {
 
     #[error("Workdir session is unavailable: {0}")]
     Unavailable(String),
+
+    /// The broker has proof that this operation never reached the provider.
+    #[error("Workdir operation was not dispatched")]
+    NotDispatched,
 
     #[error("Workdir operation failed")]
     OperationFailed,
