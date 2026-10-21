@@ -46,7 +46,10 @@ struct ProviderProbe {
 }
 
 impl ProviderProbe {
-    async fn receive_write(&mut self, pending: &mut PendingHttpWrite) -> (String, ProviderReply) {
+    async fn receive_operation(
+        &mut self,
+        pending: &mut PendingHttpWrite,
+    ) -> (String, WorkdirSessionOperation, ProviderReply) {
         let command = tokio::time::timeout(BOUND, async {
             tokio::select! {
                 command = self.receiver.recv() => command.expect("provider channel closed"),
@@ -66,6 +69,11 @@ impl ProviderProbe {
             panic!("expected write dispatch, received cancellation")
         };
         self.dispatches += 1;
+        (operation_id.as_str().to_owned(), operation, response)
+    }
+
+    async fn receive_write(&mut self, pending: &mut PendingHttpWrite) -> (String, ProviderReply) {
+        let (operation_id, operation, response) = self.receive_operation(pending).await;
         let WorkdirSessionOperation::Write(request) = operation else {
             panic!("expected mutation, got {operation:?}")
         };
@@ -75,7 +83,7 @@ impl ProviderProbe {
         );
         assert_eq!(request.content, WRITE_SECRET);
         assert_eq!(request.expected_hash, None);
-        (operation_id.as_str().to_owned(), response)
+        (operation_id, response)
     }
 
     fn assert_dispatches(&mut self, expected: usize) {
@@ -200,14 +208,18 @@ impl AuditHttpFixture {
     }
 
     fn start_write(&self) -> PendingHttpWrite {
+        self.start_operation(WorkdirSessionOperation::Write(workdir::WriteRequest {
+            path: workdir::WorkdirPath::new(PATH_SECRET).unwrap(),
+            content: WRITE_SECRET.to_vec(),
+            expected_hash: None,
+        }))
+    }
+
+    fn start_operation(&self, operation: WorkdirSessionOperation) -> PendingHttpWrite {
         let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
         let body = serde_json::to_vec(&WorkspaceWorkdirSessionOperationRequest {
             target_workdir: "attachment".into(),
-            operation: WorkdirSessionOperation::Write(workdir::WriteRequest {
-                path: workdir::WorkdirPath::new(PATH_SECRET).unwrap(),
-                content: WRITE_SECRET.to_vec(),
-                expected_hash: None,
-            }),
+            operation,
         })
         .unwrap();
         let request = self.fixture.request(
@@ -259,6 +271,7 @@ impl AuditHttpFixture {
                 encoded_content.as_str(),
                 PATH_SECRET,
                 PROVIDER_SECRET,
+                PROVIDER_SECRET.trim_start_matches('/'),
                 pending.proof.as_str(),
                 worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
                 self.fixture.identity.private_key.as_str(),
@@ -276,6 +289,10 @@ impl AuditHttpFixture {
     }
 
     fn assert_audits(&self, expected: &[(&str, &str)]) {
+        self.assert_operation_audits(expected, "write");
+    }
+
+    fn assert_operation_audits(&self, expected: &[(&str, &str)], operation: &str) {
         let connection =
             rusqlite::Connection::open(&self.fixture.api.config.database_path).unwrap();
         let mut statement = connection
@@ -298,7 +315,10 @@ impl AuditHttpFixture {
             .collect();
         assert_eq!(actual, expected, "persisted audits: {rows:?}");
         for (_, _, summary) in rows {
-            assert!(summary.contains("operation_kind=write"), "{summary}");
+            assert!(
+                summary.contains(&format!("operation_kind={operation}")),
+                "{summary}"
+            );
             for secret in [
                 AUDIT_SECRET,
                 PATH_SECRET,
@@ -696,4 +716,170 @@ async fn provider_reported_unknown_preserves_received_response_and_unknown_effec
     assert_eq!(receipt_id, dispatched_id);
     provider.assert_dispatches(1);
     h.assert_audits(&[(&dispatched_id, "requested")]);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CheckoutReplyFault {
+    WrongOperation,
+    WrongPath,
+    EmptyValidator,
+    WrongOutput,
+    ProviderUnavailable,
+    ProviderTransport,
+}
+
+async fn assert_checkout_unknown_audit(fault: CheckoutReplyFault, fail_completion: bool) {
+    let (h, mut provider) = AuditHttpFixture::new().await;
+    if fail_completion {
+        h.fail_audit(false);
+    }
+    let target = workdir::WorkdirPath::new(PATH_SECRET).unwrap();
+    let mut pending = h.start_operation(WorkdirSessionOperation::CheckoutExecute(
+        workdir::CheckoutRequest {
+            target: target.clone(),
+            validator: vec![1],
+            operation: workdir::CheckoutOperation::Write {
+                content: WRITE_SECRET.to_vec(),
+                expected_hash: [0; 32],
+            },
+        },
+    ));
+    let (operation_id, operation, reply) = provider.receive_operation(&mut pending).await;
+    let WorkdirSessionOperation::CheckoutExecute(request) = operation else {
+        panic!("expected checkout mutation, got {operation:?}");
+    };
+    assert_eq!(request.target, target);
+    assert_eq!(request.validator, vec![1]);
+    assert!(
+        matches!(request.operation, workdir::CheckoutOperation::Write { ref content, .. } if content == WRITE_SECRET)
+    );
+    h.apply_provider_write();
+    let result = match fault {
+        CheckoutReplyFault::WrongOperation => Ok(write_result()),
+        CheckoutReplyFault::ProviderUnavailable => Err(WorkdirTransportError::from_workdir_error(
+            &workdir::WorkdirError::Unavailable(PROVIDER_SECRET.into()),
+        )),
+        CheckoutReplyFault::ProviderTransport => Err(WorkdirTransportError::from_workdir_error(
+            &workdir::WorkdirError::Transport(PROVIDER_SECRET.into()),
+        )),
+        _ => {
+            let mut result = workdir::CheckoutResult {
+                observation: workdir::CheckoutObservation {
+                    path: target,
+                    validator: vec![2],
+                    kind: workdir::EntryKind::File,
+                    size: WRITE_SECRET.len() as u64,
+                    capabilities: workdir::WorkdirSessionCapabilities::READ_WRITE,
+                },
+                output: workdir::CheckoutOutput::Write(workdir::WriteResult {
+                    bytes_written: WRITE_SECRET.len(),
+                    created: false,
+                }),
+            };
+            match fault {
+                CheckoutReplyFault::WrongPath => {
+                    result.observation.path =
+                        workdir::WorkdirPath::new(PROVIDER_SECRET.trim_start_matches('/')).unwrap()
+                }
+                CheckoutReplyFault::EmptyValidator => result.observation.validator.clear(),
+                CheckoutReplyFault::WrongOutput => {
+                    result.output = workdir::CheckoutOutput::Edit(workdir::EditResult {
+                        replacements: 1,
+                        content_hash: [0; 32],
+                        bytes_written: 1,
+                    })
+                }
+                _ => unreachable!(),
+            }
+            Ok(WorkdirSessionOperationResult::CheckoutExecute(result))
+        }
+    };
+    reply.send(result).unwrap();
+    let (body, events) = h.finish(pending, StatusCode::INTERNAL_SERVER_ERROR).await;
+    assert_eq!(body["code"], "outcome_unknown", "{fault:?}: {body}");
+    assert_eq!(
+        body["message"],
+        "Workdir operation may have effects; inspect before retrying"
+    );
+    if !matches!(
+        fault,
+        CheckoutReplyFault::ProviderUnavailable | CheckoutReplyFault::ProviderTransport
+    ) {
+        assert_failure_reason(&events, "operation_result_mismatch", "response_validation");
+    }
+    if fail_completion {
+        assert_eq!(
+            body["audit_failures"],
+            json!([{
+                "operation_id": operation_id,
+                "stage": "response_received",
+                "reason": "audit_store_unavailable",
+                "operation_outcome": {"kind":"unknown"},
+            }]),
+            "{fault:?}: {body}"
+        );
+        let audit_logs: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "external_workdir_audit_failed")
+            .collect();
+        assert_eq!(audit_logs.len(), 1, "{events:?}");
+        let event = audit_logs[0];
+        assert_eq!(event["operation_id"], operation_id);
+        assert_eq!(event["operation"], "checkout_execute");
+        assert_eq!(event["audit_stage"], "ResponseReceived");
+        assert_eq!(event["operation_outcome"], "Unknown");
+        h.assert_operation_audits(&[(&operation_id, "requested")], "checkout_execute");
+    } else {
+        assert!(body.get("audit_failures").is_none(), "{body}");
+        assert!(
+            events
+                .iter()
+                .all(|e| e["event"] != "external_workdir_audit_failed")
+        );
+        h.assert_operation_audits(
+            &[
+                (&operation_id, "requested"),
+                (&operation_id, "outcome_unknown"),
+            ],
+            "checkout_execute",
+        );
+    }
+    assert_eq!(std::fs::read(h.effect_path()).unwrap(), WRITE_SECRET);
+    provider.assert_dispatches(1);
+}
+
+#[tokio::test]
+async fn checkout_invalid_reply_records_unknown_in_healthy_completion_audit() {
+    for fault in [
+        CheckoutReplyFault::WrongOperation,
+        CheckoutReplyFault::WrongPath,
+        CheckoutReplyFault::EmptyValidator,
+        CheckoutReplyFault::WrongOutput,
+    ] {
+        assert_checkout_unknown_audit(fault, false).await;
+    }
+}
+
+#[tokio::test]
+async fn checkout_invalid_reply_records_unknown_in_failed_completion_receipt_and_log() {
+    for fault in [
+        CheckoutReplyFault::WrongOperation,
+        CheckoutReplyFault::WrongPath,
+        CheckoutReplyFault::EmptyValidator,
+        CheckoutReplyFault::WrongOutput,
+    ] {
+        assert_checkout_unknown_audit(fault, true).await;
+    }
+}
+
+#[tokio::test]
+async fn checkout_uncertain_reply_normalization_matches_audit_outcome() {
+    for fault in [
+        CheckoutReplyFault::ProviderUnavailable,
+        CheckoutReplyFault::ProviderTransport,
+    ] {
+        for fail_completion in [false, true] {
+            assert_checkout_unknown_audit(fault, fail_completion).await;
+        }
+    }
 }
