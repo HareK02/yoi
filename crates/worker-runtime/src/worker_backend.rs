@@ -9889,12 +9889,25 @@ mod tests {
                         })
                         .await;
                     session.close().await.unwrap();
-                    Ok(result.unwrap_err().to_string())
+                    Ok(result.unwrap_err())
                 })
                 .unwrap();
+            // The String-returning opener cannot safely classify its raw cause. The
+            // deferred boundary must preserve its typed stage without exposing that text.
+            assert_eq!(
+                error.failure_reason(),
+                Some(workdir::WorkdirFailureReason::SessionOpenFailed),
+                "{damage}: {error:?}"
+            );
             assert!(
-                error.contains("working_directory_cleanup_"),
-                "{damage}: {error}"
+                matches!(error.classification_source(), workdir::WorkdirError::Unavailable(message)
+                    if message == "Workdir session could not be opened"),
+                "{damage}: {error:?}"
+            );
+            assert_eq!(
+                error.denial_reason(),
+                None,
+                "{damage}: no guessed denial cause"
             );
             assert_eq!(
                 observed.lock().unwrap().len(),
@@ -9907,6 +9920,13 @@ mod tests {
                 "damaged checkout must be retained"
             );
             assert!(backend.stop_worker(&request.worker_ref).is_accepted());
+            println!(
+                "damage={damage}; reason={:?}; classification={:?}; cwd_bind_count={}; retained_files={}; retained_data_unchanged=true; stopped=true",
+                error.failure_reason(),
+                error.classification_source(),
+                observed.lock().unwrap().len(),
+                before.len(),
+            );
         }
     }
 

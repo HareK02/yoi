@@ -3677,7 +3677,11 @@ mod tests {
     #[test]
     fn bound_ssh_workdir_uses_attachment_scoped_agent_and_cleans_it_up() {
         let repo = create_clean_repo();
-        let runtime_root = tempfile::tempdir().unwrap();
+        // ssh-agent and the broker receive relative socket paths in this owned
+        // fixture tree, so the test does not depend on checkout/TMPDIR length.
+        // Neither this process nor its peers change cwd.
+        let runtime_root = tempfile::tempdir_in(".").unwrap();
+        let runtime_path = Path::new(runtime_root.path().file_name().unwrap());
         let key_root = tempfile::tempdir().unwrap();
         let key_path = key_root.path().join("id_ed25519");
         let fallback_key_path = key_root.path().join("id_ed25519_fallback");
@@ -3689,7 +3693,7 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
-        let materializer = RuntimeGitMaterializer::new(runtime_root.path());
+        let materializer = RuntimeGitMaterializer::new(runtime_path);
         let mut request = request(repo.path());
         request.materialization = Some(crate::catalog::RepositoryMaterializationContext {
             workspace_id: "workspace-1".to_string(),
@@ -3731,7 +3735,7 @@ mod tests {
             kind: server_api::RepositorySourceKind::Ssh,
             uri: "ssh://git@example.test/repo.git".to_string(),
         };
-        let command_access = RepositoryCommandAccess::prepare(runtime_root.path(), &ssh_operation)
+        let command_access = RepositoryCommandAccess::prepare(runtime_path, &ssh_operation)
             .unwrap()
             .unwrap();
         assert!(!command_access.root.join("identity").exists());
@@ -3873,18 +3877,17 @@ mod tests {
             .unwrap();
         // Restore preflight must validate without consuming this one-shot SSH
         // delivery or creating agent/session resources needed by actual bind.
-        let record_before =
-            fs::read(runtime_root.path().join(&id).join(MATERIALIZATION_RECORD)).unwrap();
+        let record_before = fs::read(runtime_path.join(&id).join(MATERIALIZATION_RECORD)).unwrap();
         materializer
             .preflight_bind_working_directory(&id, None)
             .unwrap();
         assert_eq!(
-            fs::read(runtime_root.path().join(&id).join(MATERIALIZATION_RECORD)).unwrap(),
+            fs::read(runtime_path.join(&id).join(MATERIALIZATION_RECORD)).unwrap(),
             record_before
         );
         assert_eq!(materializer.list_working_directories().unwrap().len(), 1);
         assert_eq!(
-            fs::read_dir(runtime_root.path().join(".repository-agents"))
+            fs::read_dir(runtime_path.join(".repository-agents"))
                 .map(|entries| entries.count())
                 .unwrap_or_default(),
             0
@@ -3898,7 +3901,7 @@ mod tests {
         assert!(ssh_policy.contains("__repository-ssh"));
         assert!(!ssh_policy.contains("SSH_AUTH_SOCK"));
         assert_eq!(
-            fs::read_dir(runtime_root.path().join(".repository-agents"))
+            fs::read_dir(runtime_path.join(".repository-agents"))
                 .map(|entries| entries.count())
                 .unwrap_or_default(),
             1
@@ -3916,7 +3919,7 @@ mod tests {
             "consumed delivery expiry must not revoke a live Workdir session"
         );
         assert_eq!(
-            fs::read_dir(runtime_root.path().join(".repository-agents"))
+            fs::read_dir(runtime_path.join(".repository-agents"))
                 .map(|entries| entries.count())
                 .unwrap_or_default(),
             1,
@@ -3925,7 +3928,7 @@ mod tests {
         drop(binding);
         assert!(!ssh_command.exists());
         assert_eq!(
-            fs::read_dir(runtime_root.path().join(".repository-agents"))
+            fs::read_dir(runtime_path.join(".repository-agents"))
                 .map(|entries| entries.count())
                 .unwrap_or_default(),
             0
@@ -3971,7 +3974,7 @@ mod tests {
             ],
             &read_only_command_policy,
         ));
-        let broker_socket = fs::read_dir(runtime_root.path().join(REPOSITORY_ACCESS_DIR))
+        let broker_socket = fs::read_dir(runtime_path.join(REPOSITORY_ACCESS_DIR))
             .unwrap()
             .filter_map(Result::ok)
             .map(|entry| entry.path().join("b.sock"))
@@ -4104,7 +4107,7 @@ mod tests {
                 .code,
             "working_directory_repository_access_expired"
         );
-        let restored = RuntimeGitMaterializer::new(runtime_root.path());
+        let restored = RuntimeGitMaterializer::new(runtime_path);
         assert_eq!(
             restored.bind_working_directory(&id, None).unwrap_err().code,
             "working_directory_remote_repository_access_required"
