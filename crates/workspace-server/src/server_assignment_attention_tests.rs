@@ -467,7 +467,6 @@ impl AttentionWorkerFactory {
             worker::WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: root.join(uuid::Uuid::now_v7().to_string()),
             },
-            worker::WorkerControllerTransport::InProcess,
         )
         .start()
         .await

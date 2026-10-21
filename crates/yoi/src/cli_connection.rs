@@ -25,7 +25,7 @@ pub(crate) enum CliCommand {
     Panel,
     Keys,
     SetupModel,
-    WorkerRuntime,
+    Serve,
     WorkerCleanup,
     Ticket,
     Objective,
@@ -45,7 +45,7 @@ impl CliCommand {
             CliCommand::Panel => "yoi panel",
             CliCommand::Keys => "yoi keys",
             CliCommand::SetupModel => "yoi setup-model",
-            CliCommand::WorkerRuntime => "yoi worker",
+            CliCommand::Serve => "yoi --local serve",
             CliCommand::WorkerCleanup => "yoi worker management",
             CliCommand::Ticket => "yoi ticket",
             CliCommand::Objective => "yoi objective",
@@ -68,7 +68,7 @@ impl CliCommand {
             CliCommand::Login => CliConnectionRequirement::BackendOnly,
             CliCommand::Keys
             | CliCommand::SetupModel
-            | CliCommand::WorkerRuntime
+            | CliCommand::Serve
             | CliCommand::WorkerCleanup
             | CliCommand::Plugin
             | CliCommand::Mcp
@@ -325,7 +325,7 @@ mod tests {
         for command in [
             CliCommand::Keys,
             CliCommand::SetupModel,
-            CliCommand::WorkerRuntime,
+            CliCommand::Serve,
             CliCommand::WorkerCleanup,
             CliCommand::Plugin,
             CliCommand::Mcp,

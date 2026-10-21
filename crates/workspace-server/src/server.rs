@@ -4169,7 +4169,6 @@ impl WorkspaceApi {
                     .with_runtime_request_source(&embedded_identity, embedded_request_audience),
                 )
                 .with_runtime_store_dir(config.embedded_runtime_store_root.clone())
-                .with_controller_transport(worker::WorkerControllerTransport::InProcess)
                 .with_resource_client(Arc::new(resource_broker.clone())),
         )
         .map_err(|err| {

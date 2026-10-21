@@ -23,7 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 session-store.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "io-util", "io-std", "signal"] }
 uuid = { workspace = true, features = ["v7"] }
 worker.workspace = true
 

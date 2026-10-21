@@ -531,7 +531,6 @@ use crate::prompt::agents_md::read_agents_md;
 use crate::prompt::catalog::{CatalogError, PromptCatalog, WorkspacePromptProjection};
 use crate::prompt::source::PromptCatalogSource;
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
-use crate::runtime::dir;
 use crate::runtime::worker_allocation::{
     self, ScopeAllocationGuard, ScopeLockError, SegmentActivationGuard,
 };
@@ -3456,18 +3455,13 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// authority before the outer allocation guard reacquires the same lock.
     failed_activation_authority: Mutex<Option<SegmentActivationGuard>>,
     /// Scope allocation in the machine-wide lock file. `Some` for
-    /// Workers built via `from_manifest` / `from_manifest_spawned` /
+    /// Workers built via `from_manifest` /
     /// `restore_from_manifest` (production paths); `None` for the
     /// low-level `Worker::new` constructor used in tests, which bypasses
     /// the registry. Kept purely for its `Drop` impl, which releases
     /// the allocation when the Worker is dropped.
     #[allow(dead_code)]
     scope_allocation: Option<ScopeAllocationGuard>,
-    /// Socket path of the spawning Worker. `Some` only for Workers built via
-    /// `from_manifest_spawned`. Consumed by the controller to fire
-    /// `Method::WorkerEvent` reports upward (turn end, error, shutdown,
-    /// scope sub-delegation).
-    callback_socket: Option<PathBuf>,
     /// Transient launch role for Ticket role sessions. This is process-local
     /// runtime identity used by controller policy; it is not model-visible and
     /// is not persisted into Ticket claim/session records.
@@ -3751,7 +3745,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             failed_activation_authority: Mutex::new(None),
             scope_allocation: None,
-            callback_socket: None,
             runtime_ticket_role: None,
             prompts,
             inject_resident_summary: true,
@@ -3916,8 +3909,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.runtime_ticket_role.as_deref()
     }
 
-    /// Set the process-local Ticket role marker. Intended for entrypoint
-    /// launch metadata, not for model-visible prompts or durable claims.
+    /// Set the process-local Ticket role marker supplied by the Host at launch,
+    /// not by model-visible prompts or durable claims.
     pub fn set_runtime_ticket_role(&mut self, role: Option<String>) {
         self.runtime_ticket_role = role;
     }
@@ -4786,15 +4779,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.pending_notifies
             .bind_mutation_authority(self.segment_state.mutation_authority.clone());
         self.pending_notifies.clone()
-    }
-
-    /// Parent callback socket set by `from_manifest_spawned`.
-    ///
-    /// Consumed by the Controller to fire `Method::WorkerEvent` upward on
-    /// lifecycle transitions. `None` for top-level Workers, in which case
-    /// the Controller silently skips the send.
-    pub fn callback_socket(&self) -> Option<&PathBuf> {
-        self.callback_socket.as_ref()
     }
 
     pub(crate) fn install_compaction_budget(
@@ -8304,14 +8288,10 @@ where
         // Register this Worker in the machine-wide worker-allocation
         // before building anything else, so a spawn that conflicts on
         // scope fails fast.
-        let socket_path = dir::default_base()
-            .map_err(ScopeLockError::from)?
-            .join(&manifest.worker.name)
-            .join("sock");
         let scope_allocation = worker_allocation::install_top_level(
             manifest.worker.name.clone(),
             std::process::id(),
-            socket_path,
+            PathBuf::new(), // Reserved legacy allocation field; no Worker endpoint exists.
             common.scope.allow_rules(),
             segment_id,
         )?;
@@ -8372,7 +8352,6 @@ where
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             failed_activation_authority: Mutex::new(None),
             scope_allocation: Some(scope_allocation),
-            callback_socket: None,
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
@@ -8773,7 +8752,6 @@ where
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             failed_activation_authority: Mutex::new(None),
             scope_allocation: None,
-            callback_socket: None,
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
@@ -8793,141 +8771,6 @@ where
         };
         worker.apply_permissions_from_manifest();
         worker.apply_prune_from_manifest();
-        Ok(worker)
-    }
-
-    /// Build a Worker spawned by another Worker (sibling process).
-    ///
-    /// Behaves like [`Worker::from_manifest`] but claims the scope
-    /// allocation that the spawner pre-registered via
-    /// [`worker_allocation::delegate_scope`], rather than installing a new
-    /// top-level entry. `callback_socket` carries the spawner's
-    /// Unix-socket path so the spawned Worker can send `Method::Notify`
-    /// back to the spawner.
-    pub async fn from_manifest_spawned(
-        manifest: WorkerManifest,
-        store: St,
-        loader: PromptCatalogSource,
-        callback_socket: PathBuf,
-    ) -> Result<Self, WorkerError> {
-        let cwd = current_cwd()?;
-        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
-        let workspace_context = WorkerWorkspaceContext::local_filesystem(None);
-        Self::from_manifest_spawned_with_context(
-            manifest,
-            store,
-            loader,
-            callback_socket,
-            workspace_context,
-            authority,
-        )
-        .await
-    }
-
-    pub async fn from_manifest_spawned_with_context(
-        manifest: WorkerManifest,
-        store: St,
-        loader: PromptCatalogSource,
-        callback_socket: PathBuf,
-        workspace_context: WorkerWorkspaceContext,
-        filesystem_authority: WorkerFilesystemAuthority,
-    ) -> Result<Self, WorkerError> {
-        let common = prepare_worker_common_with_context(
-            &manifest,
-            &loader,
-            /* parse_template */ true,
-            workspace_context,
-            filesystem_authority,
-            manifest.scope.clone(),
-        )?;
-
-        // A spawned child starts its own conversation, so it mints a
-        // fresh Session rather than joining the spawner's.
-        let session_id = session_store::new_session_id();
-        let segment_id = session_store::new_segment_id();
-        let scope_allocation = worker_allocation::adopt_allocation(
-            manifest.worker.name.clone(),
-            std::process::id(),
-            segment_id,
-        )?;
-
-        let mut worker =
-            Engine::<Box<dyn LlmClient>, Mutable, SessionHistoryMetadata>::new_annotated(
-                common.client,
-            );
-        apply_worker_manifest(&mut worker, &manifest.engine);
-        worker.set_cache_key(Some(segment_id.to_string()));
-        let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
-        let worker_metadata_segment_cas = Some(worker_metadata_segment_cas_for_store(&store));
-        let scope = SharedScope::new(common.scope);
-        let workdir_sessions =
-            workdir_sessions_from_authority(&common.filesystem_authority, &scope);
-
-        let mut worker = Self {
-            backend_job: std::sync::OnceLock::new(),
-            manifest,
-            engine: Some(worker),
-            session: WorkerSession::new(session_id, Vec::new()),
-            last_run_interrupted: false,
-            store,
-            worker_metadata_writer,
-            worker_metadata_segment_cas,
-            segment_state: SegmentState::new(session_id, segment_id, 0),
-            filesystem_authority: common.filesystem_authority,
-            workdir_sessions,
-            workspace_context: common.workspace_context,
-            flow_runtime_state: Arc::new(Mutex::new(None)),
-            flow_feature_enabled: false,
-            scope,
-            hook_builder: HookRegistryBuilder::new(),
-            hook_registry: None,
-            feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
-            feature_invocations: FeatureInvocationRegistry::default(),
-            manifest_lifecycle_features_enabled: true,
-            interceptor_installed: false,
-            compaction_service_budget: None,
-            compact_state: None,
-            usage_tracker: Arc::new(UsageTracker::new()),
-            metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
-            usage_history: Arc::new(Mutex::new(Vec::new())),
-            tracker: None,
-            task_feature: TaskFeature::new(),
-            worker_observation_provider: None,
-            system_prompt_template: common.system_prompt_template,
-            feature_instructions: common.feature_instructions,
-            alerter: None,
-            working_event_tx: None,
-            internal_worker_registry: None,
-            pending_compaction_cleanup: Mutex::new(None),
-            in_flight: None,
-            ai_activity_counter: Arc::new(AtomicUsize::new(0)),
-            pending_notifies: NotifyBuffer::new(),
-            notification_coalesce_delay: DEFAULT_NOTIFICATION_COALESCE_DELAY,
-            pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
-            pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-            failed_activation_authority: Mutex::new(None),
-            scope_allocation: Some(scope_allocation),
-            callback_socket: Some(callback_socket),
-            runtime_ticket_role: None,
-            prompts: common.prompts,
-            inject_resident_summary: true,
-            feature_resident_summary_source: None,
-            session_context_source: None,
-            prepared_initial_seed: None,
-            prepared_initial_prompt_completion: None,
-            subjektiv_host: None,
-            feature_installation: crate::feature::FeatureInstallation::Activate,
-            restore_feature_lifecycle_pending: false,
-            feature_system_prompt_override: None,
-            user_segments: Vec::new(),
-            sink: SegmentLogSink::new(),
-            history_persistence_wired: false,
-            log_writer: None,
-            notification_committer: None,
-        };
-        worker.apply_permissions_from_manifest();
-        worker.apply_prune_from_manifest();
-        worker.write_worker_metadata_pending()?;
         Ok(worker)
     }
 
@@ -9215,14 +9058,10 @@ where
         // the lookup + install inside a single `LockFileGuard` is what
         // makes "no two live Workers write to the same session log"
         // actually structural rather than a hopeful pre-check.
-        let socket_path = dir::default_base()
-            .map_err(ScopeLockError::from)?
-            .join(&manifest.worker.name)
-            .join("sock");
         let scope_allocation = worker_allocation::install_top_level_with_deny(
             manifest.worker.name.clone(),
             std::process::id(),
-            socket_path,
+            PathBuf::new(), // Reserved legacy allocation field; no Worker endpoint exists.
             common.scope.allow_rules(),
             common.scope.deny_rules(),
             segment_id,
@@ -9320,7 +9159,6 @@ where
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             failed_activation_authority: Mutex::new(None),
             scope_allocation: Some(scope_allocation),
-            callback_socket: None,
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
@@ -10416,6 +10254,8 @@ struct WorkerCommon {
     feature_instructions: Vec<FeatureInstructionDeclaration>,
 }
 
+/// Migration-only safety probe for retained process-child metadata.
+/// New Internal SubWorkers never publish socket metadata or use this path.
 async fn restored_child_reachable(child: &WorkerSpawnedChild) -> bool {
     tokio::time::timeout(
         RESTORE_RECONCILIATION_REACHABILITY_TIMEOUT,
@@ -17962,7 +17802,6 @@ permission = "write"
             WorkerWorkspaceContext::no_workspace(),
             WorkerFilesystemAuthority::None,
             layout,
-            crate::WorkerControllerTransport::InProcess,
         )
         .with_model_client(NoopClient)
         .with_subjektiv_host(host)
@@ -18282,7 +18121,6 @@ permission = "write"
                     .join("runtime/runs")
                     .join(uuid::Uuid::now_v7().to_string()),
             },
-            crate::WorkerControllerTransport::InProcess,
         )
         .with_model_client(NoopClient)
     }

@@ -146,9 +146,9 @@ use worker::feature::builtin::{
 use worker::ipc::protocol_session::{WorkerProtocolSessionStreams, live_log_entry_event};
 use worker::{
     PreparedWorker, PromptCatalogSource, SegmentLogSink, SubjektivSessionAttributionLifecycle,
-    Worker, WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout,
-    WorkerControllerTransport, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
-    WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
+    Worker, WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout, WorkerError,
+    WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState, WorkerWorkspaceContext,
+    WorkspaceClient, WorkspaceId,
 };
 
 #[cfg(feature = "ws-server")]
@@ -508,7 +508,6 @@ pub struct ProfileRuntimeWorkerFactory {
     worker_mutation_identity: Option<RuntimeIdentityMaterial>,
     workspace_request_clients: Arc<HashMap<String, RuntimeWorkspaceRequestClient>>,
     embedded_worker_mutation_dispatcher: Option<Arc<dyn EmbeddedWorkerMutationDispatcher>>,
-    controller_transport: WorkerControllerTransport,
     failed_restore_sessions: Arc<
         Mutex<
             HashMap<
@@ -536,7 +535,6 @@ impl ProfileRuntimeWorkerFactory {
             worker_mutation_identity: None,
             workspace_request_clients: Arc::new(HashMap::new()),
             embedded_worker_mutation_dispatcher: None,
-            controller_transport: WorkerControllerTransport::InProcess,
             failed_restore_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -582,14 +580,6 @@ impl ProfileRuntimeWorkerFactory {
         self.runtime_id = Some(runtime_id.into());
         self.worker_mutation_identity = None;
         self.embedded_worker_mutation_dispatcher = Some(dispatcher);
-        self
-    }
-
-    pub fn with_controller_transport(
-        mut self,
-        controller_transport: WorkerControllerTransport,
-    ) -> Self {
-        self.controller_transport = controller_transport;
         self
     }
 
@@ -1598,13 +1588,13 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 .resolve_profile(selector, &worker_root, &worker_name)
                 .map_err(|err| format!("failed to resolve profile source archive: {err}"))?;
             if has_local_filesystem {
-                worker::entrypoint::resolve_runtime_profile_manifest_from_manifest(
+                worker::profile_manifest::resolve_runtime_profile_manifest_from_manifest(
                     manifest,
                     &worker_root,
                     &worker_name,
                 )?
             } else {
-                worker::entrypoint::resolve_runtime_profile_manifest_from_manifest_without_filesystem(
+                worker::profile_manifest::resolve_runtime_profile_manifest_from_manifest_without_filesystem(
                     manifest,
                     &worker_root,
                     &worker_name,
@@ -1651,7 +1641,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: run_dir.clone(),
             },
-            self.controller_transport,
         );
         let bootstrap = match &self.spawn_model_client_factory {
             Some(factory) => bootstrap.with_model_client(factory()),
@@ -2004,7 +1993,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: run_dir.clone(),
             },
-            self.controller_transport,
         )
         .start()
         .await
@@ -6515,8 +6503,7 @@ mod tests {
         let backend = WorkerRuntimeExecutionBackend::new(
             ProfileRuntimeWorkerFactory::new(root.path().join("missing-profiles"))
                 .with_runtime_store_dir(&store)
-                .with_runtime_id("runtime-subjektiv-test")
-                .with_controller_transport(WorkerControllerTransport::InProcess),
+                .with_runtime_id("runtime-subjektiv-test"),
         )
         .unwrap();
         backend.preflight_restore(&request).unwrap();
@@ -9132,17 +9119,6 @@ mod tests {
         assert!(error.contains("replacement Worker is required"), "{error}");
     }
 
-    #[test]
-    fn profile_runtime_factory_defaults_to_in_process_controller_transport() {
-        let root = tempfile::tempdir().unwrap();
-        let factory = ProfileRuntimeWorkerFactory::new(root.path());
-
-        assert!(matches!(
-            factory.controller_transport,
-            WorkerControllerTransport::InProcess
-        ));
-    }
-
     #[tokio::test]
     #[serial_test::serial(worker_allocation)]
     async fn in_process_restore_does_not_bind_unix_socket_under_overlong_store_path() {
@@ -9205,7 +9181,6 @@ mod tests {
 
         let controller = ProfileRuntimeWorkerFactory::new(root.path())
             .with_runtime_store_dir(&runtime_store_dir)
-            .with_controller_transport(WorkerControllerTransport::InProcess)
             .restore_controller(WorkerExecutionRestoreRequest {
                 operation_id: crate::execution::WorkerLifecycleOperationId::new(),
                 worker_ref: worker_ref.clone(),

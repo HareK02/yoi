@@ -6,9 +6,7 @@ use thiserror::Error;
 use workdir::WorkdirSessionHandle;
 
 use crate::PromptCatalogSource;
-use crate::controller::{
-    ShutdownReceiver, WorkerController, WorkerControllerTransport, WorkerHandle,
-};
+use crate::controller::{ShutdownReceiver, WorkerController, WorkerHandle};
 use crate::worker::{Worker, WorkerError, WorkerFilesystemAuthority, WorkerWorkspaceContext};
 use manifest::WorkerManifest;
 
@@ -30,7 +28,6 @@ pub struct WorkerBootstrap<St> {
     workspace_context: WorkerWorkspaceContext,
     filesystem_authority: WorkerFilesystemAuthority,
     layout: WorkerBootstrapLayout,
-    transport: WorkerControllerTransport,
     model_client: Option<Box<dyn LlmClient>>,
     workdir_session: Option<WorkdirSessionHandle>,
     subjektiv_host: Option<std::sync::Arc<dyn crate::subjektiv::SubjektivHost>>,
@@ -41,7 +38,6 @@ pub struct WorkerBootstrap<St> {
 pub struct PreparedWorker<C: LlmClient, St: Store> {
     worker: Worker<C, St>,
     layout: WorkerBootstrapLayout,
-    transport: WorkerControllerTransport,
 }
 
 /// Live controller returned only after Worker construction and feature
@@ -68,7 +64,6 @@ impl<St> WorkerBootstrap<St>
 where
     St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
 {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         manifest: WorkerManifest,
         store: St,
@@ -76,7 +71,6 @@ where
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
         layout: WorkerBootstrapLayout,
-        transport: WorkerControllerTransport,
     ) -> Self {
         Self {
             manifest,
@@ -85,7 +79,6 @@ where
             workspace_context,
             filesystem_authority,
             layout,
-            transport,
             model_client: None,
             workdir_session: None,
             subjektiv_host: None,
@@ -165,7 +158,7 @@ where
                 )
                 .map_err(WorkerBootstrapError::Worker)?;
         }
-        Ok(PreparedWorker::new(worker, self.layout, self.transport))
+        Ok(PreparedWorker::new(worker, self.layout))
     }
 
     pub async fn prepare_restored(
@@ -206,7 +199,7 @@ where
                 )
                 .map_err(WorkerBootstrapError::Worker)?;
         }
-        Ok(PreparedWorker::new(worker, self.layout, self.transport))
+        Ok(PreparedWorker::new(worker, self.layout))
     }
 
     pub async fn start(self) -> Result<BootstrappedWorker, WorkerBootstrapError> {
@@ -221,16 +214,8 @@ where
 {
     /// Wrap a restored Worker in the same pre-exposure lifecycle used by fresh
     /// bootstraps.
-    pub fn new(
-        worker: Worker<C, St>,
-        layout: WorkerBootstrapLayout,
-        transport: WorkerControllerTransport,
-    ) -> Self {
-        Self {
-            worker,
-            layout,
-            transport,
-        }
+    pub fn new(worker: Worker<C, St>, layout: WorkerBootstrapLayout) -> Self {
+        Self { worker, layout }
     }
 
     pub fn worker(&self) -> &Worker<C, St> {
@@ -242,7 +227,7 @@ where
     }
 
     pub async fn start(self) -> Result<BootstrappedWorker, WorkerBootstrapError> {
-        start_worker_controller(self.worker, self.layout, self.transport).await
+        start_worker_controller(self.worker, self.layout).await
     }
 }
 
@@ -252,7 +237,6 @@ where
 pub async fn start_worker_controller<C, St>(
     worker: Worker<C, St>,
     layout: WorkerBootstrapLayout,
-    transport: WorkerControllerTransport,
 ) -> Result<BootstrappedWorker, WorkerBootstrapError>
 where
     C: LlmClient + Clone + 'static,
@@ -261,13 +245,10 @@ where
     let cleanup_sessions = worker.workdir_sessions();
     let controller = match layout {
         WorkerBootstrapLayout::Direct { runtime_base } => {
-            WorkerController::spawn_with_transport_owned(worker, &runtime_base, transport).await
+            WorkerController::spawn_owned(worker, &runtime_base).await
         }
         WorkerBootstrapLayout::RuntimeManagedRun { run_dir } => {
-            WorkerController::spawn_runtime_managed_run_with_transport_owned(
-                worker, &run_dir, transport,
-            )
-            .await
+            WorkerController::spawn_runtime_managed_run_owned(worker, &run_dir).await
         }
     };
 

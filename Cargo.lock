@@ -6521,7 +6521,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "clap",
  "client",
  "config-source",
  "dotenv",
@@ -6687,6 +6686,7 @@ dependencies = [
  "futures",
  "manifest",
  "project-record",
+ "protocol",
  "reqwest",
  "serde",
  "serde_json",
@@ -6702,7 +6702,6 @@ dependencies = [
  "tui",
  "uuid",
  "workdir",
- "worker",
 ]
 
 [[package]]

@@ -4,6 +4,7 @@
 //! execution in lower-level crates.
 
 mod cli_connection;
+mod local_cli;
 mod mcp_cli;
 mod objective_cli;
 mod plugin_cli;
@@ -66,7 +67,12 @@ enum Mode {
     WorkspaceCreate(WorkspaceCreateOptions),
     WorkdirHelp,
     WorkdirShare(workdir_share::WorkdirShareOptions),
-    WorkerRuntime(Vec<String>),
+    LocalHelp(&'static str),
+    LocalServe {
+        options: local_cli::ServeOptions,
+        state_dir: PathBuf,
+    },
+    LocalAttach(PathBuf),
     Keys,
     SetupModel,
     Tui {
@@ -260,7 +266,26 @@ async fn run(mode: Mode) -> ExitCode {
                 }
             }
         }
-        Mode::WorkerRuntime(args) => worker::entrypoint::run_cli_from("yoi worker", args).await,
+        Mode::LocalHelp(help) => {
+            print!("{help}");
+            ExitCode::SUCCESS
+        }
+        Mode::LocalServe { options, state_dir } => {
+            match local_cli::run_serve(options, state_dir).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("yoi --local serve: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Mode::LocalAttach(endpoint) => match standalone::run_unix_client(endpoint).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("yoi --local attach: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Mode::Keys => tui::keys::launch().await,
         Mode::SetupModel => tui::setup_model::launch().await,
         Mode::Tui {
@@ -467,6 +492,33 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
         "workdir" => {
             return parse_workdir_args(&args[1..], &target_selection);
         }
+        "serve" | "attach" => {
+            if target_selection.backend_url.is_some() || target_selection.workspace_id.is_some() {
+                return Err(ParseError(format!(
+                    "yoi {} is local-only and does not accept Backend selectors",
+                    args[0]
+                )));
+            }
+            if !target_selection.explicit_local {
+                return Err(ParseError(format!(
+                    "yoi {} requires explicit --local selection",
+                    args[0]
+                )));
+            }
+            return match local_cli::parse(&args[0], &args[1..])? {
+                local_cli::LocalCli::Help(help) => Ok(Mode::LocalHelp(help)),
+                local_cli::LocalCli::Attach(endpoint) => Ok(Mode::LocalAttach(endpoint)),
+                local_cli::LocalCli::Serve(options) => {
+                    let target =
+                        resolve_local_cli_connection(connection_resolver, CliCommand::Serve)?;
+                    let state_dir = target
+                        .spawn_worker()
+                        .map_err(|error| ParseError(error.to_string()))?
+                        .state_dir;
+                    Ok(Mode::LocalServe { options, state_dir })
+                }
+            };
+        }
         "worker" => {
             if let Some(cli) = worker_cleanup_cli::parse_worker_management_args(&args[1..])
                 .map_err(|e| ParseError(e.to_string()))?
@@ -475,9 +527,9 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
                     resolve_local_cli_connection(connection_resolver, CliCommand::WorkerCleanup)?;
                 return Ok(Mode::WorkerCleanup(cli));
             }
-            let _target =
-                resolve_local_cli_connection(connection_resolver, CliCommand::WorkerRuntime)?;
-            return Ok(Mode::WorkerRuntime(args[1..].to_vec()));
+            return Err(ParseError(
+                "direct Worker execution was removed; use `yoi --local serve --socket <PATH>` (legacy metadata cleanup: `yoi worker --help`)".to_owned(),
+            ));
         }
         "objective" => {
             let cli = objective_cli::parse_objective_args(&args[1..])
@@ -973,10 +1025,8 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
 ) -> Result<Mode, ParseError> {
     let mut workspace_root = current_dir()?;
     let mut worker_name = None;
-    let mut session = None;
     let mut profile = None;
     let mut subject_id = None;
-    let mut socket_override = None;
     let mut runtime_id = None;
     let mut worker_id = None;
     let mut i = 0;
@@ -1001,26 +1051,6 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
                     return Err(ParseError("--workspace requires a path".to_string()));
                 }
                 workspace_root = PathBuf::from(value);
-                i += 2;
-            }
-            "--session" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| ParseError("--session requires a path".to_string()))?;
-                if value.starts_with('-') || value.is_empty() {
-                    return Err(ParseError("--session requires a path".to_string()));
-                }
-                session = Some(PathBuf::from(value));
-                i += 2;
-            }
-            "--socket" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| ParseError("--socket requires a path".to_string()))?;
-                if value.starts_with('-') || value.is_empty() {
-                    return Err(ParseError("--socket requires a path".to_string()));
-                }
-                socket_override = Some(PathBuf::from(value));
                 i += 2;
             }
             "--subject" => {
@@ -1078,22 +1108,6 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
                 workspace_root = PathBuf::from(value);
                 i += 1;
             }
-            arg if arg.starts_with("--session=") => {
-                let value = arg.trim_start_matches("--session=");
-                if value.is_empty() {
-                    return Err(ParseError("--session requires a path".to_string()));
-                }
-                session = Some(PathBuf::from(value));
-                i += 1;
-            }
-            arg if arg.starts_with("--socket=") => {
-                let value = arg.trim_start_matches("--socket=");
-                if value.is_empty() {
-                    return Err(ParseError("--socket requires a path".to_string()));
-                }
-                socket_override = Some(PathBuf::from(value));
-                i += 1;
-            }
             arg if arg.starts_with("--profile=") => {
                 let value = arg.trim_start_matches("--profile=");
                 if value.is_empty() {
@@ -1138,11 +1152,7 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
     }
 
     if subject_id.is_some() {
-        if session.is_some()
-            || socket_override.is_some()
-            || runtime_id.is_some()
-            || worker_id.is_some()
-        {
+        if runtime_id.is_some() || worker_id.is_some() {
             return Err(ParseError(
                 "--subject can only be used for fresh local spawn, not attach or restore"
                     .to_owned(),
@@ -1160,28 +1170,11 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
             "--worker-id requires --runtime-id for Runtime API attach".to_string(),
         ));
     }
-    if (runtime_id.is_some() || worker_id.is_some())
-        && (session.is_some()
-            || worker_name.is_some()
-            || socket_override.is_some()
-            || profile.is_some())
+    if (runtime_id.is_some() || worker_id.is_some()) && (worker_name.is_some() || profile.is_some())
     {
         return Err(ParseError(
-            "Runtime API target cannot be combined with --worker, --socket, --session, or --profile".to_string(),
+            "Runtime API target cannot be combined with --worker or --profile".to_string(),
         ));
-    }
-    if profile.is_some() && (session.is_some() || socket_override.is_some()) {
-        return Err(ParseError(
-            "--profile can only be used for fresh spawn".to_string(),
-        ));
-    }
-    if session.is_some() && socket_override.is_some() {
-        return Err(ParseError(
-            "--session cannot be combined with --socket".to_string(),
-        ));
-    }
-    if socket_override.is_some() && worker_name.is_none() {
-        return Err(ParseError("--socket requires --worker".to_string()));
     }
 
     let target = if subject_id.is_some() {
@@ -1215,18 +1208,6 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
                     .to_string(),
             ));
         }
-        if session.is_some() {
-            return Err(ParseError(
-                "--local does not accept legacy --session; use `yoi --local resume` for Standalone Worker restore"
-                    .to_string(),
-            ));
-        }
-        if socket_override.is_some() {
-            return Err(ParseError(
-                "--local uses an in-process Standalone connection and does not accept --socket"
-                    .to_string(),
-            ));
-        }
     }
 
     if let (Some(runtime_id), Some(worker_id)) = (runtime_id.clone(), worker_id) {
@@ -1253,13 +1234,6 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
         });
     }
 
-    if target.kind() == TargetKind::Standalone && (session.is_some() || socket_override.is_some()) {
-        return Err(ParseError(
-            "Standalone does not accept legacy Worker session or socket selectors; use `yoi --local resume` for the standalone Worker store"
-                .to_string(),
-        ));
-    }
-
     let mode = if target.kind() == TargetKind::Standalone {
         LaunchMode::Spawn {
             worker_name,
@@ -1267,14 +1241,9 @@ fn parse_console_options<R: CliConnectionResolver + ?Sized>(
             subject_id,
         }
     } else {
-        if worker_name.is_some()
-            || profile.is_some()
-            || session.is_some()
-            || socket_override.is_some()
-        {
+        if worker_name.is_some() || profile.is_some() {
             return Err(ParseError(
-                "Backend target does not accept host-local Worker, profile, session, or socket selectors"
-                    .to_string(),
+                "Backend target does not accept host-local Worker or profile selectors".to_string(),
             ));
         }
         LaunchMode::BackendSpawn
@@ -2109,7 +2078,9 @@ Host commands:
   yoi workdir share           Interactively share a client-hosted External Workdir.
   keys                         Manage local model/API keys
   setup-model                  Configure a local model provider
-  worker [WORKER_OPTIONS]      Run the direct Worker process entrypoint
+  --local serve --socket <PATH>  Run a headless Standalone Host (serve --help for restore)
+  --local attach --socket <PATH> Connect a JSONL protocol client; EOF leaves Host running
+  worker delete/prune          Safely clean up legacy Worker metadata only
   ticket <COMMAND>             Manage Tickets through a Backend target
   objective <COMMAND>          Manage Objectives through a Backend target
   plugin <COMMAND>             Author/check/pack explicit Plugin packages
@@ -2939,39 +2910,23 @@ backend = "shared"
     }
 
     #[test]
-    fn parser_standalone_rejects_legacy_session_and_socket_inputs() {
-        let resolver = DefaultBackendCliConnectionResolver {
-            backend_url: "http://default-backend.example",
-        };
-        let session_args = ["--local", "--session", "session-1"]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>();
-        let err = parse_args_slice_with_connection_resolver(&session_args, &resolver).unwrap_err();
-        assert_eq!(
-            err.0,
-            "--local does not accept legacy --session; use `yoi --local resume` for Standalone Worker restore"
-        );
-
-        let socket_args = [
-            "--local",
-            "--worker",
-            "worker-a",
-            "--socket",
-            "/tmp/worker.sock",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect::<Vec<_>>();
-        let err = parse_args_slice_with_connection_resolver(&socket_args, &resolver).unwrap_err();
-        assert_eq!(
-            err.0,
-            "--local uses an in-process Standalone connection and does not accept --socket"
-        );
+    fn console_rejects_removed_session_and_socket_options() {
+        for prefix in [vec!["--local"], vec!["--backend", "http://backend.example"]] {
+            for option in [
+                "--session",
+                "--session=log",
+                "--socket",
+                "--socket=endpoint",
+            ] {
+                let args = [prefix.clone(), vec![option]].concat();
+                let error = parse_args_from(args).unwrap_err();
+                assert_eq!(error.to_string(), format!("unknown argument: {option}"));
+            }
+        }
     }
 
     #[test]
-    fn parse_backend_runtime_target_rejects_legacy_socket_mix() {
+    fn backend_runtime_target_rejects_local_launch_options() {
         let err = parse_args_from([
             "--backend",
             "http://127.0.0.1:8787",
@@ -2985,7 +2940,7 @@ backend = "shared"
         .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "Runtime API target cannot be combined with --worker, --socket, --session, or --profile"
+            "Runtime API target cannot be combined with --worker or --profile"
         );
     }
 
@@ -3124,13 +3079,119 @@ backend = "shared"
     }
 
     #[test]
-    fn parse_worker_subcommand_uses_runtime_mode() {
-        match parse_args_from(["worker", "--worker", "agent", "--profile", "default"]).unwrap() {
-            Mode::WorkerRuntime(args) => {
-                assert_eq!(args, ["--worker", "agent", "--profile", "default"])
-            }
-            _ => panic!("expected WorkerRuntime mode"),
+    fn direct_worker_execution_is_rejected_without_compatibility_fallback() {
+        for args in [
+            vec!["worker"],
+            vec!["worker", "--worker", "agent", "--profile", "default"],
+        ] {
+            let error = parse_args_from(args).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("direct Worker execution was removed")
+            );
+            assert!(error.to_string().contains("yoi --local serve --socket"));
         }
+    }
+
+    #[test]
+    fn socket_commands_require_explicit_local_and_reject_backend_selection() {
+        let resolver = DefaultBackendCliConnectionResolver {
+            backend_url: "http://backend.example",
+        };
+        for command in ["serve", "attach"] {
+            for args in [
+                vec![command, "--socket", "/tmp/host.sock"],
+                vec![
+                    "--backend=http://backend.example",
+                    command,
+                    "--socket=/tmp/host.sock",
+                ],
+                vec![
+                    "--local",
+                    "--workspace-id=workspace",
+                    command,
+                    "--socket=/tmp/host.sock",
+                ],
+            ] {
+                let input = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+                assert!(
+                    parse_args_slice_with_connection_resolver(&input, &resolver).is_err(),
+                    "{input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn socket_commands_dispatch_without_backend_default_or_workspace_discovery() {
+        let resolver = DefaultBackendCliConnectionResolver {
+            backend_url: "http://backend.example",
+        };
+        let args = [
+            "--local",
+            "serve",
+            "--socket=/tmp/host.sock",
+            "--profile=builtin:standalone",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+        let Mode::LocalServe { options, state_dir } =
+            parse_args_slice_with_connection_resolver(&args, &resolver).unwrap()
+        else {
+            panic!("expected headless serve")
+        };
+        assert_eq!(options.profile.as_deref(), Some("builtin:standalone"));
+        assert!(state_dir.is_absolute());
+
+        let args = ["--local", "attach", "--socket=/tmp/host.sock"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let Mode::LocalAttach(endpoint) =
+            parse_args_slice_with_connection_resolver(&args, &resolver).unwrap()
+        else {
+            panic!("expected attach")
+        };
+        assert_eq!(endpoint, PathBuf::from("/tmp/host.sock"));
+    }
+
+    #[test]
+    fn socket_attach_and_help_do_not_require_worker_state_resolution() {
+        struct UnavailableWorkerState;
+        impl CliConnectionResolver for UnavailableWorkerState {
+            fn resolve_connection(
+                &self,
+                _command: CliCommand,
+                _input: CliConnectionInput<'_>,
+            ) -> Result<Box<dyn Target>, ParseError> {
+                Err(ParseError(
+                    "Standalone state directory is unavailable".to_owned(),
+                ))
+            }
+        }
+        let resolver = UnavailableWorkerState;
+        for command in ["serve", "attach"] {
+            let args = ["--local", command, "--help"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                parse_args_slice_with_connection_resolver(&args, &resolver).unwrap(),
+                Mode::LocalHelp(_)
+            ));
+        }
+        let args = ["--local", "attach", "--socket=/tmp/host.sock"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            parse_args_slice_with_connection_resolver(&args, &resolver).unwrap(),
+            Mode::LocalAttach(_)
+        ));
+        assert!(TOP_LEVEL_HELP.contains("--local serve --socket <PATH>"));
+        assert!(TOP_LEVEL_HELP.contains("--local attach --socket <PATH>"));
     }
 
     #[test]
@@ -3877,36 +3938,6 @@ backend = "shared"
                 assert_eq!(workspace_root, PathBuf::from("/tmp/other-workspace"));
             }
             _ => panic!("expected Spawn mode"),
-        }
-    }
-
-    #[test]
-    fn parse_profile_rejects_resume_attach_modes() {
-        let segment_id = session_store::new_segment_id().to_string();
-        let cases = [
-            (
-                vec![
-                    "--profile".to_string(),
-                    "p.toml".to_string(),
-                    "--session".to_string(),
-                    segment_id,
-                ],
-                "--profile can only be used for fresh spawn",
-            ),
-            (
-                vec![
-                    "--profile".to_string(),
-                    "p.toml".to_string(),
-                    "--socket".to_string(),
-                    "/tmp/yoi/sock".to_string(),
-                ],
-                "--profile can only be used for fresh spawn",
-            ),
-        ];
-
-        for (args, message) in cases {
-            let err = parse_args_from(args).unwrap_err();
-            assert_eq!(err.to_string(), message);
         }
     }
 

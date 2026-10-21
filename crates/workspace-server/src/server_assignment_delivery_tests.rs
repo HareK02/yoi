@@ -800,7 +800,6 @@ impl DeliveryWorkerFactory {
             worker::WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: root.join(uuid::Uuid::now_v7().to_string()),
             },
-            worker::WorkerControllerTransport::InProcess,
         )
         .with_model_client(self.client.clone());
         let prepared = if restore {

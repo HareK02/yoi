@@ -7,8 +7,6 @@ pub mod bootstrap;
 pub mod checkout;
 pub mod compact;
 pub mod controller;
-pub mod discovery;
-pub mod entrypoint;
 pub mod feature;
 mod file_operation;
 pub mod fs_view;
@@ -19,9 +17,9 @@ pub mod job;
 mod metadata_lifecycle;
 pub mod model_client;
 mod paste_artifact_tool;
+pub mod profile_manifest;
 pub mod prompt;
 pub mod runtime;
-pub mod runtime_command;
 pub mod segment_log_sink;
 mod session_capture;
 mod session_history;
@@ -37,6 +35,7 @@ pub mod wip;
 
 mod internal_worker;
 mod interrupt_prep;
+mod peer;
 mod permission;
 mod worker;
 
@@ -45,10 +44,9 @@ pub use bootstrap::{
     WorkerBootstrapLayout, start_worker_controller,
 };
 pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};
-pub use controller::{ShutdownReceiver, WorkerController, WorkerControllerTransport, WorkerHandle};
+pub use controller::{ShutdownReceiver, WorkerController, WorkerHandle};
 pub use hook::{Hook, HookEventKind, HookRegistryBuilder};
 pub use ipc::alerter::Alerter;
-pub use ipc::server::SocketServer;
 pub use manifest::{
     AuthRef, ModelManifest, SchemeKind, Scope, WorkerManifest, WorkerManifestConfig,
     WorkerMetaConfig,

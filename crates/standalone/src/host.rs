@@ -24,7 +24,6 @@ use session_store::{
 };
 use thiserror::Error;
 use worker::bootstrap::{WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout};
-use worker::controller::WorkerControllerTransport;
 use worker::ipc::protocol_session::{
     WorkerProtocolSessionStreams, dispatch_worker_protocol_method, live_log_entry_event,
     subscribe_worker_protocol_session,
@@ -222,7 +221,6 @@ impl StandaloneHost {
             workspace_context,
             filesystem_authority,
             WorkerBootstrapLayout::Direct { runtime_base },
-            WorkerControllerTransport::InProcess,
         );
         if let Some(subject) = &subject {
             bootstrap = bootstrap.with_subjektiv_host(subject.host.clone());
@@ -430,7 +428,6 @@ impl StandaloneHost {
             workspace_context,
             filesystem_authority,
             WorkerBootstrapLayout::Direct { runtime_base },
-            WorkerControllerTransport::InProcess,
         );
         if let Some(subject) = &subject {
             bootstrap = bootstrap.with_subjektiv_host(subject.host.clone());
@@ -520,10 +517,7 @@ impl StandaloneHost {
     /// Working events, committed session entries, alert snapshots, and the
     /// initial history snapshot are merged behind the client boundary.
     pub fn connect(&self) -> Client<InProcessSocket> {
-        let streams = subscribe_worker_protocol_session(&self.handle);
-        let (socket, peer) = InProcessSocket::pair();
-        tokio::spawn(run_protocol_session(self.handle.clone(), streams, peer));
-        Client::new(socket)
+        Client::new(connect_protocol(self.handle.clone()))
     }
 
     /// Logical Subject disconnection, not Worker shutdown or completion of its represented work.
@@ -563,6 +557,35 @@ impl StandaloneHost {
                 Err(StandaloneSubjectDisconnectError::Incomplete(error))
             }
         }
+    }
+
+    /// Run without a TUI until an admitted protocol Shutdown, controller exit, or process signal.
+    /// Client EOF only disconnects that client. All exits confirm the same production shutdown
+    /// and lease release as the in-process UI; an unconfirmed shutdown retains the lease.
+    pub async fn serve_unix(
+        self,
+        endpoint: crate::unix::UnixEndpoint,
+    ) -> Result<(), crate::HeadlessError> {
+        let mut adapter = crate::unix::UnixAdapter::start(endpoint, self.handle.clone());
+        let signal = async {
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => result,
+                _ = terminate.recv() => Ok(()),
+            }
+        };
+        let result = tokio::select! {
+            _ = self.handle.protocol_closed() => Ok(()),
+            result = signal => result,
+            result = adapter.ended() => result,
+        };
+        // Reclaim the public entry and every connection before releasing execution ownership.
+        let transport = adapter.shutdown().await;
+        self.shutdown().await?;
+        result?;
+        transport?;
+        Ok(())
     }
 
     pub fn with_shutdown_timeout(mut self, shutdown_timeout: Duration) -> Self {
@@ -647,9 +670,8 @@ impl Drop for StandaloneHost {
     }
 }
 
-// The in-process channel is owned by the local operator's Host, not an
-// arbitrary socket or Backend account. decode_method discards wire provenance;
-// only this boundary can stamp accepted local human input.
+// Both in-process views and credential-checked Unix clients are admitted by this operator's
+// Host. decode_method discards wire provenance; only this boundary stamps local human input.
 fn authorize_local_input(method: protocol::Method) -> protocol::Method {
     use protocol::{AuthenticatedInputSource, Method};
     match method {
@@ -690,6 +712,13 @@ fn authorize_local_input(method: protocol::Method) -> protocol::Method {
         },
         method => method,
     }
+}
+
+pub(crate) fn connect_protocol(handle: worker::WorkerHandle) -> InProcessSocket {
+    let streams = subscribe_worker_protocol_session(&handle);
+    let (socket, peer) = InProcessSocket::pair();
+    tokio::spawn(run_protocol_session(handle, streams, peer));
+    socket
 }
 
 async fn run_protocol_session(

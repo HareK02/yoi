@@ -127,7 +127,6 @@ async fn local_host_compaction_freezes_pending_journal_through_request_and_durab
             worker::WorkerWorkspaceContext::no_workspace(),
             worker::WorkerFilesystemAuthority::None,
             worker::WorkerBootstrapLayout::Direct { runtime_base: fixture._temp.path().join("runtime") },
-            worker::WorkerControllerTransport::InProcess,
         ).with_model_client(model.clone()).with_subjektiv_host(fixture.host().clone()).prepare_restored("journal-test").await.unwrap();
         assert_eq!(prepared.worker().session_id().to_string(), fixture.context.session_id);
         let source_segment = prepared.worker().segment_id();
