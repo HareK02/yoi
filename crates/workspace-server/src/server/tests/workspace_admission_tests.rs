@@ -1,3 +1,5 @@
+mod audit_tests;
+
 use super::*;
 use sha2::Digest;
 use std::sync::atomic::AtomicI64;
@@ -459,7 +461,7 @@ async fn provider_error_and_disconnect_release_dispatch_admission() {
         assert_json(
             result,
             if disconnect {
-                StatusCode::SERVICE_UNAVAILABLE
+                StatusCode::INTERNAL_SERVER_ERROR
             } else {
                 StatusCode::FORBIDDEN
             },
@@ -575,8 +577,8 @@ async fn provider_timeout_releases_admission_without_wall_clock_wait() {
     let (long, _reply) = f.start_read("1", &mut a).await;
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(31)).await;
-    let body = assert_json(long.await.unwrap(), StatusCode::SERVICE_UNAVAILABLE).await;
-    assert_eq!(body["code"], "unavailable");
+    let body = assert_json(long.await.unwrap(), StatusCode::INTERNAL_SERVER_ERROR).await;
+    assert_eq!(body["code"], "outcome_unknown");
     tokio::time::resume();
     let gate = f.server.admission_for_workspace(TEST_WORKSPACE_ID).await;
     drop(

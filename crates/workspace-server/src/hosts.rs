@@ -3995,12 +3995,27 @@ impl WorkdirHttpAuthorization for RemoteWorkdirAuthorization {
                 return authorizer
                     .issue_async(method, path_and_query, operation, None, body)
                     .await
-                    .map_err(|error| WorkdirError::Unavailable(error.message));
+                    .map_err(|error| {
+                        use workdir::WorkdirFailureReason as Reason;
+                        let reason = match error.code.as_str() {
+                            "workspace_runtime_authorization_stale" => Reason::AuthorizationStale,
+                            "workspace_signing_identity_unavailable" => {
+                                Reason::SigningIdentityUnavailable
+                            }
+                            "workspace_runtime_authorization_sign_failed" => {
+                                Reason::AuthorizationSignFailed
+                            }
+                            _ => Reason::AuthorizationUnavailable,
+                        };
+                        WorkdirError::Unavailable("Workdir authorization is unavailable".into())
+                            .with_failure_reason(reason)
+                    });
             }
             authorization.fallback_bearer_token.ok_or_else(|| {
                 WorkdirError::Unavailable(
                     "remote Runtime does not have bearer authorization configured".to_string(),
                 )
+                .with_failure_reason(workdir::WorkdirFailureReason::AuthorizationMissing)
             })
         })
     }
@@ -6839,9 +6854,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(
-            error,
-            WorkdirError::Unavailable(message) if message == Error::DbCapacityExceeded.to_string()
+            error.classification_source(),
+            WorkdirError::Unavailable(_)
         ));
+        assert_eq!(
+            error.failure_reason(),
+            Some(workdir::WorkdirFailureReason::AuthorizationUnavailable)
+        );
+        let transport = workdir::http::WorkdirTransportError::from_workdir_error(&error);
+        assert_eq!(transport.message, "Workdir session is unavailable");
+        assert!(!format!("{error:?}").contains(&Error::DbCapacityExceeded.to_string()));
         drop(release);
         executor.drain().await.unwrap();
     }
@@ -8866,7 +8888,14 @@ mod tests {
             })
             .await
             .expect_err("closed session must reject local operation without another request");
-        assert!(matches!(error, WorkdirError::Unavailable(_)));
+        assert!(matches!(
+            error.classification_source(),
+            WorkdirError::Unavailable(_)
+        ));
+        assert_eq!(
+            error.failure_reason(),
+            Some(workdir::WorkdirFailureReason::SessionClosed)
+        );
         server.join().expect("mock remote server finished");
     }
 

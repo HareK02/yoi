@@ -167,6 +167,7 @@ pub(crate) fn checked_error(error: workdir::WorkdirError) -> ToolError {
         | WorkdirError::IsDirectory { .. }
         | WorkdirError::InvalidGlob { .. }
         | WorkdirError::InvalidRegex { .. } => "checkout_invalid",
+        WorkdirError::NotDispatched => "checkout_not_dispatched",
         WorkdirError::Unavailable { .. } | WorkdirError::SessionClosed => "checkout_unavailable",
         // IO/transport failures may arrive after effects have begun. Do not infer
         // no-effects from their text or strip explicit OutcomeUnknown evidence.

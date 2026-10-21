@@ -26,6 +26,7 @@
 
 use subjektiv::api::*;
 mod backend_job_profile;
+mod external_operation_audit;
 mod subject_authorization;
 mod subjektiv_job;
 mod subjektiv_journal;
@@ -933,6 +934,10 @@ struct ExternalProviderAuditContext {
 /// output confirmation from the old connection; unconfirmed cleanup is not reported as success.
 /// Only confirmed provider shutdown can replace per-command confirmation. Reconnection does
 /// not prove that missing commands have stopped.
+///
+/// Required request auditing fails closed before dispatch. Completion audit failure cannot
+/// undo a provider result: it is emitted independently and retained in the current API
+/// response, including successful command handles. Audit loss never triggers a resend.
 struct ExternalProviderWorkdirSession {
     workdir: workdir::Workdir,
     connection: Arc<ExternalProviderConnection>,
@@ -991,18 +996,22 @@ impl ExternalProviderWorkdirSession {
     async fn audit_operation(
         &self,
         operation_id: &ExternalWorkdirOperationId,
-        operation_kind: &str,
+        operation_kind: &'static str,
         outcome: &str,
-    ) -> std::result::Result<(), workdir::WorkdirError> {
+        stage: workdir::http::WorkdirAuditStage,
+        operation_outcome: workdir::http::WorkdirAuditOperationOutcome,
+    ) -> std::result::Result<(), workdir::http::WorkdirAuditFailure> {
         let Some(audit) = &self.audit else {
             return Ok(());
         };
         let audit = audit.clone();
+        let operation_id_for_notification = operation_id.as_str().to_owned();
+        let operation_kind_for_notification = operation_kind;
         let operation_id = operation_id.clone();
         let operation_kind = operation_kind.to_owned();
         let outcome = outcome.to_owned();
         let connection = self.connection.clone();
-        audit
+        let result = audit
             .store
             .db_executor()
             .run(move || {
@@ -1024,18 +1033,30 @@ impl ExternalProviderWorkdirSession {
                     &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
                 )
             })
-            .await
-            .map_err(|error| {
-                workdir::WorkdirError::Unavailable(format!(
-                    "External Workdir operation audit failed: {error}"
-                ))
-            })
+            .await;
+        result.map_err(|_| {
+            let failure = workdir::http::WorkdirAuditFailure {
+                operation_id: operation_id_for_notification,
+                stage,
+                operation_outcome,
+                reason: workdir::http::WorkdirAuditFailureReason::AuditStoreUnavailable,
+            };
+            external_operation_audit::notify(failure.clone(), operation_kind_for_notification);
+            failure
+        })
     }
 
-    async fn operate(
+    async fn operate<T, F, Fut>(
         &self,
         operation: WorkdirSessionOperation,
-    ) -> std::result::Result<WorkdirSessionOperationResult, workdir::WorkdirError> {
+        validate: F,
+    ) -> std::result::Result<T, workdir::WorkdirError>
+    where
+        T: Send,
+        F: FnOnce(std::result::Result<WorkdirSessionOperationResult, workdir::WorkdirError>) -> Fut
+            + Send,
+        Fut: std::future::Future<Output = std::result::Result<T, workdir::WorkdirError>> + Send,
+    {
         let operation_kind = external_workdir_operation_kind(&operation);
         let operation_timeout = external_workdir_operation_timeout(&operation);
         if self.closed.load(Ordering::Acquire) {
@@ -1048,7 +1069,8 @@ impl ExternalProviderWorkdirSession {
         {
             return Err(workdir::WorkdirError::Unavailable(
                 "External Workdir grant has expired".to_string(),
-            ));
+            )
+            .with_failure_reason(workdir::WorkdirFailureReason::ProviderGrantExpired));
         }
         // Cancellation must reach the provider even when waiting output readers
         // occupy every data-operation slot. The socket separately bounds control requests.
@@ -1065,6 +1087,7 @@ impl ExternalProviderWorkdirSession {
                         workdir::WorkdirError::Unavailable(
                             "External Workdir provider admission is closed".to_string(),
                         )
+                        .with_failure_reason(workdir::WorkdirFailureReason::ProviderAdmissionClosed)
                     })?,
             )
         };
@@ -1075,12 +1098,24 @@ impl ExternalProviderWorkdirSession {
         {
             return Err(workdir::WorkdirError::Unavailable(
                 "External Workdir grant has expired".to_string(),
-            ));
+            )
+            .with_failure_reason(workdir::WorkdirFailureReason::ProviderGrantExpired));
         }
         let operation_id = ExternalWorkdirOperationId::new(format!("op-{}", Uuid::now_v7()))
             .map_err(workdir::WorkdirError::InvalidArgument)?;
-        self.audit_operation(&operation_id, operation_kind, "requested")
-            .await?;
+        use workdir::http::{WorkdirAuditOperationOutcome as Outcome, WorkdirAuditStage as Stage};
+        self.audit_operation(
+            &operation_id,
+            operation_kind,
+            "requested",
+            Stage::BeforeDispatch,
+            Outcome::NotDispatched,
+        )
+        .await
+        .map_err(|_| {
+            workdir::WorkdirError::NotDispatched
+                .with_failure_reason(workdir::WorkdirFailureReason::AuditStoreUnavailable)
+        })?;
         let (response, receive) = tokio::sync::oneshot::channel();
         let mut cancel_guard = ExternalOperationCancelGuard {
             sender: self.connection.sender.clone(),
@@ -1097,39 +1132,80 @@ impl ExternalProviderWorkdirSession {
             .await
             .is_err()
         {
-            self.audit_operation(&operation_id, operation_kind, "provider_unavailable")
-                .await?;
-            return Err(workdir::WorkdirError::Unavailable(
-                "External Workdir provider disconnected".to_string(),
-            ));
+            cancel_guard.disarm();
+            // A rejected channel send proves there was no provider dispatch.
+            let _audit_result = self
+                .audit_operation(
+                    &operation_id,
+                    operation_kind,
+                    "not_dispatched",
+                    Stage::DispatchRejected,
+                    Outcome::NotDispatched,
+                )
+                .await;
+            return Err(workdir::WorkdirError::NotDispatched
+                .with_failure_reason(workdir::WorkdirFailureReason::ProviderDispatchRejected));
         }
-        let result = match tokio::time::timeout(operation_timeout, receive).await {
+        let (result, stage) = match tokio::time::timeout(operation_timeout, receive).await {
             Ok(result) => {
                 cancel_guard.disarm();
                 match result {
-                    Ok(result) => result.map_err(WorkdirTransportError::into_workdir_error),
-                    Err(_) => Err(workdir::WorkdirError::Unavailable(
-                        "External Workdir provider disconnected".to_string(),
-                    )),
+                    Ok(result) => (
+                        result.map_err(WorkdirTransportError::into_workdir_error),
+                        Stage::ResponseReceived,
+                    ),
+                    Err(_) => (
+                        Err(workdir::WorkdirError::OutcomeUnknown(
+                            "External Workdir provider response lost; inspect before retrying"
+                                .to_string(),
+                        )
+                        .with_failure_reason(workdir::WorkdirFailureReason::ProviderResponseLost)),
+                        Stage::ResponseUnknown,
+                    ),
                 }
             }
             Err(_) => {
                 cancel_guard.cancel();
-                Err(workdir::WorkdirError::Unavailable(
-                    "External Workdir provider operation timed out".to_string(),
-                ))
+                (
+                    Err(workdir::WorkdirError::OutcomeUnknown(
+                        "External Workdir provider response timed out; inspect before retrying"
+                            .to_string(),
+                    )
+                    .with_failure_reason(workdir::WorkdirFailureReason::ProviderOperationTimeout)),
+                    Stage::ResponseUnknown,
+                )
             }
         };
-        self.audit_operation(
-            &operation_id,
-            operation_kind,
-            if result.is_ok() {
-                "completed"
-            } else {
-                "failed"
+        // Provider dispatch is finished; validation may issue bounded command cleanup
+        // and must not retain a data-operation slot while awaiting another operation.
+        drop(_admission);
+        // A received response is not evidence of operation success until its requested
+        // type and semantics (including mutation uncertainty) have been checked.
+        let result = validate(result).await;
+        let outcome = match &result {
+            Ok(_) => Outcome::Succeeded,
+            Err(error)
+                if matches!(
+                    error.classification_source(),
+                    workdir::WorkdirError::OutcomeUnknown(_)
+                ) =>
+            {
+                Outcome::Unknown
+            }
+            Err(error) => Outcome::Failed {
+                code: WorkdirTransportError::from_workdir_error(error).code,
             },
-        )
-        .await?;
+        };
+        let audit_outcome = match outcome {
+            Outcome::Succeeded => "completed",
+            Outcome::Failed { .. } => "failed",
+            Outcome::Unknown => "outcome_unknown",
+            Outcome::NotDispatched => unreachable!("provider result follows dispatch"),
+        };
+        // Failure is notified independently, never substituted for the provider result.
+        let _audit_result = self
+            .audit_operation(&operation_id, operation_kind, audit_outcome, stage, outcome)
+            .await;
         result
     }
 
@@ -1212,9 +1288,15 @@ impl ExternalProviderWorkdirSession {
         // Do not acquire the output lock until cancellation has unblocked any reader.
         // The reader records its last known cursor before cleanup acknowledges bytes.
         let _ = self
-            .operate(WorkdirSessionOperation::CommandCancel(
-                command.handle.clone(),
-            ))
+            .operate(
+                WorkdirSessionOperation::CommandCancel(command.handle.clone()),
+                |result| async move {
+                    match result? {
+                        WorkdirSessionOperationResult::CommandCancel => Ok(()),
+                        _ => Err(Self::mismatch("command_cancel")),
+                    }
+                },
+            )
             .await;
         let mut cursor =
             tokio::time::timeout(std::time::Duration::from_secs(30), command.cursor.lock())
@@ -1229,31 +1311,31 @@ impl ExternalProviderWorkdirSession {
         }
         let drain = async {
             loop {
-                match self
-                    .operate(WorkdirSessionOperation::CommandOutput(
-                        workdir::CommandOutputRequest {
+                let output = self
+                    .operate(
+                        WorkdirSessionOperation::CommandOutput(workdir::CommandOutputRequest {
                             handle: command.handle.clone(),
                             cursor: *cursor,
                             limit: workdir::MAX_COMMAND_READ_BYTES,
                             wait: true,
+                        }),
+                        |result| async move {
+                            match result? {
+                                WorkdirSessionOperationResult::CommandOutput(output) => Ok(output),
+                                _ => Err(Self::mismatch("command_output")),
+                            }
                         },
-                    ))
-                    .await?
-                {
-                    WorkdirSessionOperationResult::CommandOutput(output) => {
-                        *cursor = output.next_cursor;
-                        if output.terminal.is_some() {
-                            *command.terminal_at.lock().unwrap() = Some(std::time::Instant::now());
-                            return Ok(());
-                        }
-                        if output.chunks.is_empty() {
-                            return Err(workdir::WorkdirError::Unavailable(
-                                "External Workdir provider did not confirm command termination"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                    _ => return Err(Self::mismatch("command_output")),
+                    )
+                    .await?;
+                *cursor = output.next_cursor;
+                if output.terminal.is_some() {
+                    *command.terminal_at.lock().unwrap() = Some(std::time::Instant::now());
+                    return Ok(());
+                }
+                if output.chunks.is_empty() {
+                    return Err(workdir::WorkdirError::Unavailable(
+                        "External Workdir provider did not confirm command termination".to_string(),
+                    ));
                 }
             }
         };
@@ -1270,6 +1352,7 @@ impl ExternalProviderWorkdirSession {
         workdir::WorkdirError::Unavailable(format!(
             "External Workdir provider returned a mismatched result; expected {expected}"
         ))
+        .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch)
     }
 }
 
@@ -1320,46 +1403,55 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         request: workdir::WorkdirScopeAuthorizationRequest,
     ) -> std::result::Result<(), workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
-        match self
-            .operate(WorkdirSessionOperation::AuthorizeScope(request))
-            .await?
-        {
-            WorkdirSessionOperationResult::AuthorizeScope => Ok(()),
-            _ => Err(Self::mismatch("authorize_scope")),
-        }
+        self.operate(
+            WorkdirSessionOperation::AuthorizeScope(request),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::AuthorizeScope => Ok(()),
+                    _ => Err(Self::mismatch("authorize_scope")),
+                }
+            },
+        )
+        .await
     }
     async fn scope_rules_overlap(
         &self,
         request: workdir::WorkdirScopeOverlapRequest,
     ) -> std::result::Result<bool, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
-        match self
-            .operate(WorkdirSessionOperation::ScopeRulesOverlap(request))
-            .await?
-        {
-            WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps } => Ok(overlaps),
-            _ => Err(Self::mismatch("scope_rules_overlap")),
-        }
+        self.operate(
+            WorkdirSessionOperation::ScopeRulesOverlap(request),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::ScopeRulesOverlap { overlaps } => Ok(overlaps),
+                    _ => Err(Self::mismatch("scope_rules_overlap")),
+                }
+            },
+        )
+        .await
     }
     async fn checkout_observe(
         &self,
         path: workdir::WorkdirPath,
     ) -> std::result::Result<workdir::CheckoutObservation, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
-        match self
-            .operate(WorkdirSessionOperation::CheckoutObserve(path.clone()))
-            .await?
-        {
-            WorkdirSessionOperationResult::CheckoutObserve(mut value)
-                if value.path == path
-                    && !value.validator.is_empty()
-                    && value.validator.len() <= 256 =>
-            {
-                value.capabilities = value.capabilities.intersection(self.capabilities());
-                Ok(value)
-            }
-            _ => Err(Self::mismatch("checkout_observe")),
-        }
+        self.operate(
+            WorkdirSessionOperation::CheckoutObserve(path.clone()),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::CheckoutObserve(mut value)
+                        if value.path == path
+                            && !value.validator.is_empty()
+                            && value.validator.len() <= 256 =>
+                    {
+                        value.capabilities = value.capabilities.intersection(self.capabilities());
+                        Ok(value)
+                    }
+                    _ => Err(Self::mismatch("checkout_observe")),
+                }
+            },
+        )
+        .await
     }
     async fn checkout_execute(
         &self,
@@ -1369,62 +1461,67 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         self.ensure_capability(cap)?;
         let target = request.target.clone();
         let mutation = cap != workdir::WorkdirSessionCapability::Read;
-        match self
-            .operate(WorkdirSessionOperation::CheckoutExecute(request))
-            .await
-        {
-            Ok(WorkdirSessionOperationResult::CheckoutExecute(mut value))
-                if value.observation.path == target
-                    && !value.observation.validator.is_empty()
-                    && value.observation.validator.len() <= 256
-                    && matches!(
-                        (&value.output, cap),
-                        (
-                            workdir::CheckoutOutput::Read(_),
-                            workdir::WorkdirSessionCapability::Read
-                        ) | (
-                            workdir::CheckoutOutput::Write(_),
-                            workdir::WorkdirSessionCapability::Write
-                        ) | (
-                            workdir::CheckoutOutput::Edit(_),
-                            workdir::WorkdirSessionCapability::Edit
-                        )
-                    ) =>
-            {
-                value.observation.capabilities = value
-                    .observation
-                    .capabilities
-                    .intersection(self.capabilities());
-                Ok(value)
-            }
-            Ok(_) if mutation => Err(workdir::WorkdirError::OutcomeUnknown(
-                "mismatched checkout mutation response".into(),
-            )),
-            Ok(_) => Err(Self::mismatch("checkout_execute")),
-            Err(error)
-                if mutation
-                    && matches!(
-                        error.classification_source(),
-                        workdir::WorkdirError::Unavailable(_) | workdir::WorkdirError::Transport(_)
-                    ) =>
-            {
-                let outcome = workdir::WorkdirError::OutcomeUnknown(
-                    "checkout provider response lost; inspect effects before retry".into(),
-                );
-                let outcome = match error.failure_reason() {
-                    Some(reason) => outcome.with_failure_reason(reason),
-                    None => outcome,
-                };
-                Err(match error.denial_reason() {
-                    Some(reason) => workdir::WorkdirError::DenialContext {
-                        reason,
-                        source: Box::new(outcome),
-                    },
-                    None => outcome,
-                })
-            }
-            Err(error) => Err(error),
-        }
+        self.operate(
+            WorkdirSessionOperation::CheckoutExecute(request),
+            |result| async move {
+                match result {
+                    Ok(WorkdirSessionOperationResult::CheckoutExecute(mut value))
+                        if value.observation.path == target
+                            && !value.observation.validator.is_empty()
+                            && value.observation.validator.len() <= 256
+                            && matches!(
+                                (&value.output, cap),
+                                (
+                                    workdir::CheckoutOutput::Read(_),
+                                    workdir::WorkdirSessionCapability::Read
+                                ) | (
+                                    workdir::CheckoutOutput::Write(_),
+                                    workdir::WorkdirSessionCapability::Write
+                                ) | (
+                                    workdir::CheckoutOutput::Edit(_),
+                                    workdir::WorkdirSessionCapability::Edit
+                                )
+                            ) =>
+                    {
+                        value.observation.capabilities = value
+                            .observation
+                            .capabilities
+                            .intersection(self.capabilities());
+                        Ok(value)
+                    }
+                    Ok(_) if mutation => Err(workdir::WorkdirError::OutcomeUnknown(
+                        "mismatched checkout mutation response".into(),
+                    )
+                    .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch)),
+                    Ok(_) => Err(Self::mismatch("checkout_execute")),
+                    Err(error)
+                        if mutation
+                            && matches!(
+                                error.classification_source(),
+                                workdir::WorkdirError::Unavailable(_)
+                                    | workdir::WorkdirError::Transport(_)
+                            ) =>
+                    {
+                        let outcome = workdir::WorkdirError::OutcomeUnknown(
+                            "checkout provider response lost; inspect effects before retry".into(),
+                        );
+                        let outcome = match error.failure_reason() {
+                            Some(reason) => outcome.with_failure_reason(reason),
+                            None => outcome,
+                        };
+                        Err(match error.denial_reason() {
+                            Some(reason) => workdir::WorkdirError::DenialContext {
+                                reason,
+                                source: Box::new(outcome),
+                            },
+                            None => outcome,
+                        })
+                    }
+                    Err(error) => Err(error),
+                }
+            },
+        )
+        .await
     }
     async fn checkout_search(
         &self,
@@ -1440,108 +1537,153 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
             Op::Grep(_) => Cap::Grep,
         };
         self.ensure_capability(cap)?;
-        match self
-            .operate(WorkdirSessionOperation::CheckoutSearch(request))
-            .await?
-        {
-            WorkdirSessionOperationResult::CheckoutSearch(value)
-                if matches!(
-                    (&value, cap),
-                    (Result::List(_), Cap::Read)
-                        | (Result::Glob(_), Cap::Glob)
-                        | (Result::Grep(_), Cap::Grep)
-                ) =>
-            {
-                Ok(value)
-            }
-            _ => Err(Self::mismatch("checkout_search")),
-        }
+        self.operate(
+            WorkdirSessionOperation::CheckoutSearch(request),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::CheckoutSearch(value)
+                        if matches!(
+                            (&value, cap),
+                            (Result::List(_), Cap::Read)
+                                | (Result::Glob(_), Cap::Glob)
+                                | (Result::Grep(_), Cap::Grep)
+                        ) =>
+                    {
+                        Ok(value)
+                    }
+                    _ => Err(Self::mismatch("checkout_search")),
+                }
+            },
+        )
+        .await
     }
     async fn stat(
         &self,
         request: workdir::StatRequest,
     ) -> std::result::Result<workdir::StatResult, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
-        match self.operate(WorkdirSessionOperation::Stat(request)).await? {
-            WorkdirSessionOperationResult::Stat(value) => Ok(value),
-            _ => Err(Self::mismatch("stat")),
-        }
+        self.operate(
+            WorkdirSessionOperation::Stat(request),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::Stat(value) => Ok(value),
+                    _ => Err(Self::mismatch("stat")),
+                }
+            },
+        )
+        .await
     }
     async fn read(
         &self,
         request: workdir::ReadRequest,
     ) -> std::result::Result<workdir::ReadResult, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
-        match self.operate(WorkdirSessionOperation::Read(request)).await? {
-            WorkdirSessionOperationResult::Read(value) => Ok(value),
-            _ => Err(Self::mismatch("read")),
-        }
+        self.operate(
+            WorkdirSessionOperation::Read(request),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::Read(value) => Ok(value),
+                    _ => Err(Self::mismatch("read")),
+                }
+            },
+        )
+        .await
     }
     async fn read_bytes(
         &self,
         request: workdir::ReadBytesRequest,
     ) -> std::result::Result<workdir::ReadBytesResult, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
-        match self
-            .operate(WorkdirSessionOperation::ReadBytes(request))
-            .await?
-        {
-            WorkdirSessionOperationResult::ReadBytes(value) => Ok(value),
-            _ => Err(Self::mismatch("read_bytes")),
-        }
+        self.operate(
+            WorkdirSessionOperation::ReadBytes(request),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::ReadBytes(value) => Ok(value),
+                    _ => Err(Self::mismatch("read_bytes")),
+                }
+            },
+        )
+        .await
     }
     async fn write(
         &self,
         request: workdir::WriteRequest,
     ) -> std::result::Result<workdir::WriteResult, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Write)?;
-        match self
-            .operate(WorkdirSessionOperation::Write(request))
-            .await?
-        {
-            WorkdirSessionOperationResult::Write(value) => Ok(value),
-            _ => Err(Self::mismatch("write")),
-        }
+        self.operate(
+            WorkdirSessionOperation::Write(request),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::Write(value) => Ok(value),
+                    _ => Err(Self::mismatch("write")),
+                }
+            },
+        )
+        .await
     }
     async fn edit(
         &self,
         request: workdir::EditRequest,
     ) -> std::result::Result<workdir::EditResult, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Edit)?;
-        match self.operate(WorkdirSessionOperation::Edit(request)).await? {
-            WorkdirSessionOperationResult::Edit(value) => Ok(value),
-            _ => Err(Self::mismatch("edit")),
-        }
+        self.operate(
+            WorkdirSessionOperation::Edit(request),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::Edit(value) => Ok(value),
+                    _ => Err(Self::mismatch("edit")),
+                }
+            },
+        )
+        .await
     }
     async fn list(
         &self,
         request: workdir::ListRequest,
     ) -> std::result::Result<workdir::ListResult, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Read)?;
-        match self.operate(WorkdirSessionOperation::List(request)).await? {
-            WorkdirSessionOperationResult::List(value) => Ok(value),
-            _ => Err(Self::mismatch("list")),
-        }
+        self.operate(
+            WorkdirSessionOperation::List(request),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::List(value) => Ok(value),
+                    _ => Err(Self::mismatch("list")),
+                }
+            },
+        )
+        .await
     }
     async fn glob(
         &self,
         request: workdir::GlobRequest,
     ) -> std::result::Result<workdir::GlobResult, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Glob)?;
-        match self.operate(WorkdirSessionOperation::Glob(request)).await? {
-            WorkdirSessionOperationResult::Glob(value) => Ok(value),
-            _ => Err(Self::mismatch("glob")),
-        }
+        self.operate(
+            WorkdirSessionOperation::Glob(request),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::Glob(value) => Ok(value),
+                    _ => Err(Self::mismatch("glob")),
+                }
+            },
+        )
+        .await
     }
     async fn grep(
         &self,
         request: workdir::GrepRequest,
     ) -> std::result::Result<workdir::GrepResult, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Grep)?;
-        match self.operate(WorkdirSessionOperation::Grep(request)).await? {
-            WorkdirSessionOperationResult::Grep(value) => Ok(value),
-            _ => Err(Self::mismatch("grep")),
-        }
+        self.operate(
+            WorkdirSessionOperation::Grep(request),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::Grep(value) => Ok(value),
+                    _ => Err(Self::mismatch("grep")),
+                }
+            },
+        )
+        .await
     }
     async fn start_command(
         &self,
@@ -1566,62 +1708,68 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
                 "External Workdir active command limit reached".to_string(),
             ));
         }
-        match self
-            .operate(WorkdirSessionOperation::CommandStart(request))
-            .await?
-        {
-            WorkdirSessionOperationResult::CommandStart(provider_handle) => {
-                let duplicate_handles = {
-                    let commands = self.active_commands.lock().await;
-                    commands
-                        .iter()
-                        .filter(|(_, active)| active.handle == provider_handle)
-                        .map(|(external, _)| external.clone())
-                        .collect::<Vec<_>>()
-                };
-                if !duplicate_handles.is_empty() {
-                    // A provider handle must identify exactly one command in one
-                    // generation. Remove every ambiguous route before attempting
-                    // cleanup so no caller can address the wrong process.
-                    let mut commands = self.active_commands.lock().await;
-                    let mut quarantined = None;
-                    for external_handle in duplicate_handles {
-                        if let Some(command) = commands.remove(&external_handle) {
-                            quarantined.get_or_insert(command);
+        self.operate(
+            WorkdirSessionOperation::CommandStart(request),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::CommandStart(provider_handle) => {
+                        let duplicate_handles = {
+                            let commands = self.active_commands.lock().await;
+                            commands
+                                .iter()
+                                .filter(|(_, active)| active.handle == provider_handle)
+                                .map(|(external, _)| external.clone())
+                                .collect::<Vec<_>>()
+                        };
+                        if !duplicate_handles.is_empty() {
+                            // A provider handle must identify exactly one command in one
+                            // generation. Remove every ambiguous route before attempting
+                            // cleanup so no caller can address the wrong process.
+                            let mut commands = self.active_commands.lock().await;
+                            let mut quarantined = None;
+                            for external_handle in duplicate_handles {
+                                if let Some(command) = commands.remove(&external_handle) {
+                                    quarantined.get_or_insert(command);
+                                }
+                            }
+                            let quarantine_handle = workdir::CommandHandle(format!(
+                                "quarantined-command-{}",
+                                Uuid::now_v7()
+                            ));
+                            let command = quarantined.expect("duplicate command route disappeared");
+                            *command.terminal_at.lock().unwrap() = None;
+                            commands.insert(quarantine_handle.0.clone(), command.clone());
+                            drop(commands);
+                            if self
+                                .terminate_provider_command(command.clone(), true)
+                                .await
+                                .is_ok()
+                            {
+                                self.remove_active_command_if_matches(&quarantine_handle, &command)
+                                    .await;
+                            } else {
+                                // An earlier read of the reused handle cannot establish that
+                                // the newly started, ambiguous process has been cleaned up.
+                                *command.terminal_at.lock().unwrap() = None;
+                            }
+                            return Err(workdir::WorkdirError::Unavailable(
+                                "External Workdir provider reused an active command handle"
+                                    .to_string(),
+                            ));
                         }
+                        let external_handle =
+                            workdir::CommandHandle(format!("external-command-{}", Uuid::now_v7()));
+                        self.active_commands.lock().await.insert(
+                            external_handle.0.clone(),
+                            Arc::new(ExternalProviderCommandState::new(provider_handle)),
+                        );
+                        Ok(external_handle)
                     }
-                    let quarantine_handle =
-                        workdir::CommandHandle(format!("quarantined-command-{}", Uuid::now_v7()));
-                    let command = quarantined.expect("duplicate command route disappeared");
-                    *command.terminal_at.lock().unwrap() = None;
-                    commands.insert(quarantine_handle.0.clone(), command.clone());
-                    drop(commands);
-                    if self
-                        .terminate_provider_command(command.clone(), true)
-                        .await
-                        .is_ok()
-                    {
-                        self.remove_active_command_if_matches(&quarantine_handle, &command)
-                            .await;
-                    } else {
-                        // An earlier read of the reused handle cannot establish that
-                        // the newly started, ambiguous process has been cleaned up.
-                        *command.terminal_at.lock().unwrap() = None;
-                    }
-                    return Err(workdir::WorkdirError::Unavailable(
-                        "External Workdir provider reused an active command handle".to_string(),
-                    ));
+                    _ => Err(Self::mismatch("command_start")),
                 }
-                let external_handle =
-                    workdir::CommandHandle(format!("external-command-{}", Uuid::now_v7()));
-                self.active_commands.lock().await.insert(
-                    external_handle.0.clone(),
-                    Arc::new(ExternalProviderCommandState::new(provider_handle)),
-                );
-                Ok(external_handle)
-            }
-            _ => Err(Self::mismatch("command_start")),
-        }
+            },
+        )
+        .await
     }
     async fn command_status(
         &self,
@@ -1629,13 +1777,16 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
     ) -> std::result::Result<workdir::CommandStatus, workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Command)?;
         let provider_handle = self.provider_command_handle(&external_handle).await?;
-        match self
-            .operate(WorkdirSessionOperation::CommandStatus(provider_handle))
-            .await?
-        {
-            WorkdirSessionOperationResult::CommandStatus(status) => Ok(status),
-            _ => Err(Self::mismatch("command_status")),
-        }
+        self.operate(
+            WorkdirSessionOperation::CommandStatus(provider_handle),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::CommandStatus(status) => Ok(status),
+                    _ => Err(Self::mismatch("command_status")),
+                }
+            },
+        )
+        .await
     }
     async fn command_output(
         &self,
@@ -1644,29 +1795,33 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
         self.ensure_capability(workdir::WorkdirSessionCapability::Command)?;
         let external_handle = request.handle.clone();
         let command = self.provider_command(&external_handle).await?;
+        let command = &command;
         let mut cursor = command.cursor.lock().await;
         request.handle = command.handle.clone();
         // If the response is lost, this request cursor still replays the provider page.
-        match self
-            .operate(WorkdirSessionOperation::CommandOutput(request))
-            .await
-        {
-            Ok(WorkdirSessionOperationResult::CommandOutput(output)) => {
-                *cursor = output.next_cursor;
-                if output.terminal.is_some() {
-                    command
-                        .terminal_at
-                        .lock()
-                        .unwrap()
-                        .get_or_insert_with(std::time::Instant::now);
+        self.operate(
+            WorkdirSessionOperation::CommandOutput(request),
+            |result| async move {
+                match result {
+                    Ok(WorkdirSessionOperationResult::CommandOutput(output)) => {
+                        *cursor = output.next_cursor;
+                        if output.terminal.is_some() {
+                            command
+                                .terminal_at
+                                .lock()
+                                .unwrap()
+                                .get_or_insert_with(std::time::Instant::now);
+                        }
+                        drop(cursor);
+                        self.prune_terminal_commands().await;
+                        Ok(output)
+                    }
+                    Ok(_) => Err(Self::mismatch("command_output")),
+                    Err(error) => Err(error),
                 }
-                drop(cursor);
-                self.prune_terminal_commands().await;
-                Ok(output)
-            }
-            Ok(_) => Err(Self::mismatch("command_output")),
-            Err(error) => Err(error),
-        }
+            },
+        )
+        .await
     }
     async fn cancel_command(
         &self,
@@ -1674,13 +1829,16 @@ impl workdir::WorkdirSession for ExternalProviderWorkdirSession {
     ) -> std::result::Result<(), workdir::WorkdirError> {
         self.ensure_capability(workdir::WorkdirSessionCapability::Command)?;
         let provider_handle = self.provider_command_handle(&external_handle).await?;
-        match self
-            .operate(WorkdirSessionOperation::CommandCancel(provider_handle))
-            .await?
-        {
-            WorkdirSessionOperationResult::CommandCancel => Ok(()),
-            _ => Err(Self::mismatch("command_cancel")),
-        }
+        self.operate(
+            WorkdirSessionOperation::CommandCancel(provider_handle),
+            |result| async move {
+                match result? {
+                    WorkdirSessionOperationResult::CommandCancel => Ok(()),
+                    _ => Err(Self::mismatch("command_cancel")),
+                }
+            },
+        )
+        .await
     }
     async fn close(&self) -> std::result::Result<(), workdir::WorkdirError> {
         let _close_guard = self.close_lock.lock().await;
@@ -13169,26 +13327,38 @@ impl server_api::ServerApi for ServerApiContractService {
             ),
             ..Default::default()
         };
-        let Json(response) = scoped_execute_current_worker_workdir_operation(
-            State(
-                self.workspace_api()
-                    .map_err(server_api::WorkdirOperationApiError::api)?
-                    .clone(),
-            ),
-            AxumPath(ScopedWorkspacePath { workspace_id }),
-            current_worker_contract_headers(&context).map_err(|error| {
-                let mut error = server_api::WorkdirOperationApiError::api(error);
-                error.workdir_log = Some(fallback_log);
-                error
-            })?,
-            Json(WorkspaceWorkdirSessionOperationRequest {
-                target_workdir: request.target_workdir,
-                operation: request.operation,
-            }),
-        )
-        .await
-        .map_err(InternalWorkdirOperationError::into_contract_error)?;
-        Ok(server_api::CurrentWorkerWorkdirOperationResponse(response))
+        let (result, audit_failures) =
+            external_operation_audit::capture(scoped_execute_current_worker_workdir_operation(
+                State(
+                    self.workspace_api()
+                        .map_err(server_api::WorkdirOperationApiError::api)?
+                        .clone(),
+                ),
+                AxumPath(ScopedWorkspacePath { workspace_id }),
+                current_worker_contract_headers(&context).map_err(|error| {
+                    let mut error = server_api::WorkdirOperationApiError::api(error);
+                    error.workdir_log = Some(fallback_log);
+                    error
+                })?,
+                Json(WorkspaceWorkdirSessionOperationRequest {
+                    target_workdir: request.target_workdir,
+                    operation: request.operation,
+                }),
+            ))
+            .await;
+        match result {
+            Ok(Json(result)) => Ok(server_api::CurrentWorkerWorkdirOperationResponse(
+                workdir::http::WorkdirSessionOperationResponse {
+                    result,
+                    audit_failures,
+                },
+            )),
+            Err(error) => {
+                let mut error = error.into_contract_error();
+                error.audit_failures = audit_failures;
+                Err(error)
+            }
+        }
     }
 
     async fn external_workdir_grant_create(
@@ -13506,6 +13676,7 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
             request_token_id_hash = context.and(request_token_id_hash.as_deref()),
             denial_reason = error.and_then(|error| error.denial_reason).map(|reason| reason.as_str()),
             failure_reason = error.and_then(|error| error.failure_reason).map(|reason| reason.as_str()),
+            failure_stage = error.and_then(|error| error.failure_reason).map(|reason| reason.stage().as_str()),
             status = event.status,
             kind = event.kind.unwrap_or("unknown"),
             message = event.message.unwrap_or(""),
@@ -36942,8 +37113,9 @@ impl ApiErrorLog {
         log.denial_reason = error.denial_reason;
         log.failure_reason = error.failure_reason;
         if log.workdir_log.is_some() {
-            // Existing public API details are unchanged; do not copy request-derived
-            // alias/handle text or session-open errors into operational diagnostics.
+            // Public classification and arbitrary diagnostic text are not safe
+            // operational causes. Keep only the separately typed reason/stage;
+            // never infer a reason by parsing request- or provider-authored text.
             log.kind = format!("workdir_session_operation_api_{}", status.as_u16());
             // This can also fail after a command was dispatched. Do not claim
             // a pre-dispatch refusal or absence of effects in the safe message.
@@ -37791,10 +37963,19 @@ mod tests {
                     )))
                     .unwrap();
             }
+            let error = write.await.unwrap().unwrap_err();
             assert!(matches!(
-                write.await.unwrap(),
-                Err(workdir::WorkdirError::OutcomeUnknown(_))
+                error.classification_source(),
+                workdir::WorkdirError::OutcomeUnknown(_)
             ));
+            assert_eq!(
+                error.failure_reason(),
+                Some(if lose_response {
+                    workdir::WorkdirFailureReason::ProviderResponseLost
+                } else {
+                    workdir::WorkdirFailureReason::OperationResultMismatch
+                })
+            );
         }
     }
 
