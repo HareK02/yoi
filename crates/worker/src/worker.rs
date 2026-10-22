@@ -7338,6 +7338,20 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .cloned()
             .collect::<Vec<_>>();
         project_compactor_capture_attachments(&mut entries_to_summarise);
+        // Project before Host selection so omitted summary/reference inputs never
+        // rebase the original source positions of the retained prefix entries.
+        let mut exploration_entries = history_entries[..retain_from].to_vec();
+        project_compactor_capture_attachments(&mut exploration_entries);
+        let summarised_ids = entries_to_summarise
+            .iter()
+            .map(|entry| entry.annotation.entry_id.0.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let exploration_view = crate::session_capture::SessionCapture::from_complete_history(
+            self.session_id().to_string(),
+            self.segment_id().to_string(),
+            exploration_entries,
+        )
+        .retain_entries(|entry| summarised_ids.contains(entry.entry_id.as_str()));
         let items_to_summarise = entries_to_summarise
             .iter()
             .map(|entry| entry.item.clone())
@@ -7500,11 +7514,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .with_module(
                 crate::feature::builtin::session_explore::SessionExploreFeature::new(
                     crate::feature::builtin::session_explore::SessionExploreState::new(
-                        crate::session_capture::SessionCapture::from_history_entries(
-                            self.session_id().to_string(),
-                            self.segment_id().to_string(),
-                            entries_to_summarise.clone(),
-                        ),
+                        exploration_view,
                     ),
                 ),
             )
@@ -17375,7 +17385,7 @@ permission = "write"
                     producer: "arbitrary-context-provider".into()
                 }
             );
-            let view = crate::session_capture::SessionCapture::from_history_entries(
+            let view = crate::session_capture::SessionCapture::from_complete_history(
                 "session", "startup", replay,
             );
             let extract =

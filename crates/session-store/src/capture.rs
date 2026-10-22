@@ -237,6 +237,7 @@ pub struct SessionEntryEvidence {
     pub segment_id: String,
     pub entry_ref: SessionEntryRef,
     pub origin: SessionEntryProvenance,
+    /// Inclusive original-source positions in `segment_id`, not view/UI order.
     pub entry_range: [u64; 2],
     pub kind: ReferenceKind,
     pub tool_part: Option<ToolPart>,
@@ -259,6 +260,7 @@ pub struct SessionCapture {
     session_id: String,
     segment_id: String,
     capture_id: String,
+    view_entry_count: u64,
     entries: Arc<Vec<CapturedHistoryEntry>>,
     overview: Vec<OverviewItem>,
     index: Vec<ReferenceEntry>,
@@ -271,6 +273,7 @@ impl SessionCapture {
         snapshot: SessionSnapshot,
     ) -> Self {
         let segment_id = segment_id.into();
+        let view_entry_count = snapshot.entries.len() as u64;
         let entries = snapshot
             .entries
             .into_iter()
@@ -341,7 +344,7 @@ impl SessionCapture {
                 })
             })
             .collect();
-        Self::from_projected(session_id.into(), segment_id, entries)
+        Self::from_projected(session_id.into(), segment_id, view_entry_count, entries)
     }
 
     pub fn new(
@@ -350,6 +353,7 @@ impl SessionCapture {
         items: Vec<Item>,
     ) -> Self {
         let segment_id = segment_id.into();
+        let view_entry_count = items.len() as u64;
         let entries = items
             .into_iter()
             .enumerate()
@@ -371,15 +375,19 @@ impl SessionCapture {
                 })
             })
             .collect();
-        Self::from_projected(session_id.into(), segment_id, entries)
+        Self::from_projected(session_id.into(), segment_id, view_entry_count, entries)
     }
 
-    pub fn from_history_entries(
+    /// Project a complete Host-fixed history whose source positions start at zero.
+    /// Select a suffix with `select_order_range` on the resulting value instead
+    /// of passing a rebased history vector: annotations do not carry source positions.
+    pub fn from_complete_history(
         session_id: impl Into<String>,
         segment_id: impl Into<String>,
         entries: Vec<HistoryEntry<SessionHistoryMetadata>>,
     ) -> Self {
         let segment_id = segment_id.into();
+        let view_entry_count = entries.len() as u64;
         let entries = entries
             .into_iter()
             .enumerate()
@@ -432,14 +440,20 @@ impl SessionCapture {
                 })
             })
             .collect();
-        Self::from_projected(session_id.into(), segment_id, entries)
+        Self::from_projected(session_id.into(), segment_id, view_entry_count, entries)
     }
 
-    fn from_projected(session_id: String, segment_id: String, dtos: Vec<CaptureEntryDto>) -> Self {
+    fn from_projected(
+        session_id: String,
+        segment_id: String,
+        view_entry_count: u64,
+        dtos: Vec<CaptureEntryDto>,
+    ) -> Self {
         let dto = CaptureDto {
             version: CAPTURE_VERSION,
             session_id: session_id.clone(),
             segment_id: segment_id.clone(),
+            view_entry_count,
             entries: dtos,
         };
         let capture_id = dto.fingerprint();
@@ -589,6 +603,7 @@ impl SessionCapture {
             session_id,
             segment_id,
             capture_id,
+            view_entry_count,
             entries: Arc::new(entries),
             overview,
             index,
@@ -604,7 +619,8 @@ impl SessionCapture {
         &self.overview
     }
 
-    pub fn source_index_for_ref(&self, reference: &SessionEntryRef) -> Option<u64> {
+    /// Capture-local UI position, not the original source position used by evidence.
+    pub fn view_order_for_ref(&self, reference: &SessionEntryRef) -> Option<u64> {
         self.index
             .iter()
             .find(|entry| entry.id == *reference)
@@ -624,12 +640,12 @@ impl SessionCapture {
         let min_entry_index = options
             .from
             .as_ref()
-            .and_then(|reference| self.source_index_for_ref(reference))
+            .and_then(|reference| self.view_order_for_ref(reference))
             .unwrap_or_else(|| options.min_entry_index.unwrap_or(0));
         let max_entry_index = options
             .through
             .as_ref()
-            .and_then(|reference| self.source_index_for_ref(reference))
+            .and_then(|reference| self.view_order_for_ref(reference))
             .unwrap_or(u64::MAX);
         let mut skipped = 0usize;
         let mut hits = Vec::new();
@@ -787,24 +803,16 @@ impl SessionCapture {
         if entry.use_policy.is_some_and(|p| !p.memory_evidence) {
             return None;
         }
-        let item = &self
+        let captured = self
             .entries
             .iter()
-            .find(|captured| captured.dto.order == entry.entry_range[0])?
-            .item;
-        let excerpt = render_item(item, entry, ReadDetail::Compact, 2 * 1024);
+            .find(|captured| captured.dto.order == entry.entry_range[0])?;
+        let excerpt = render_item(&captured.item, entry, ReadDetail::Compact, 2 * 1024);
         Some(SessionEntryEvidence {
-            segment_id: self
-                .entries
-                .iter()
-                .find(|captured| captured.dto.order == entry.entry_range[0])?
-                .dto
-                .source
-                .segment_id
-                .clone(),
+            segment_id: captured.dto.source.segment_id.clone(),
             entry_ref: entry.id.clone(),
             origin: entry.origin.clone(),
-            entry_range: entry.entry_range,
+            entry_range: [captured.dto.source.entry_index; 2],
             kind: entry.kind,
             tool_part: entry.tool_part,
             label: entry.label.clone(),

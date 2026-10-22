@@ -307,6 +307,8 @@ pub struct CaptureDto {
     pub version: u32,
     pub session_id: String,
     pub segment_id: String,
+    /// Extent of view order, including positions omitted by public projection.
+    pub view_entry_count: u64,
     pub entries: Vec<CaptureEntryDto>,
 }
 
@@ -408,6 +410,9 @@ impl CaptureDto {
                 || !ids.insert(&entry.entry_id)
             {
                 return Err(CaptureError::Invalid("entry identity"));
+            }
+            if entry.order >= self.view_entry_count {
+                return Err(CaptureError::Invalid("entry outside view extent"));
             }
             if previous.is_some_and(|order| order >= entry.order) {
                 return Err(CaptureError::Invalid("entry order"));
@@ -598,6 +603,7 @@ impl SessionCapture {
             version: CAPTURE_VERSION,
             session_id: self.session_id.clone(),
             segment_id: self.segment_id.clone(),
+            view_entry_count: self.view_entry_count,
             entries: self.entries.iter().map(|e| e.dto.clone()).collect(),
         }
     }
@@ -607,6 +613,7 @@ impl SessionCapture {
         Ok(Self::from_projected(
             dto.session_id,
             dto.segment_id,
+            dto.view_entry_count,
             dto.entries,
         ))
     }
@@ -618,11 +625,48 @@ impl SessionCapture {
         Self::try_from_dto(CaptureDto::decode(bytes, limits)?, limits)
     }
 
+    /// Select fixed view positions. UI order is rebased, while every original
+    /// source identity/position, body, provenance and policy stays unchanged.
+    pub fn select_order_range(&self, range: std::ops::Range<u64>) -> Result<Self, CaptureError> {
+        if range.start > range.end || range.end > self.view_entry_count {
+            return Err(CaptureError::InvalidRange);
+        }
+        let entries = self
+            .entries()
+            .filter(|entry| range.contains(&entry.order))
+            .map(|entry| {
+                let mut entry = entry.clone();
+                entry.order -= range.start;
+                entry
+            })
+            .collect();
+        Ok(Self::from_projected(
+            self.session_id.clone(),
+            self.segment_id.clone(),
+            range.end - range.start,
+            entries,
+        ))
+    }
+
+    /// Host-owned target selection may exclude entries without renumbering either
+    /// the fixed view or its original sources. No source I/O or business policy is applied.
+    pub fn retain_entries(&self, mut include: impl FnMut(&CaptureEntryDto) -> bool) -> Self {
+        Self::from_projected(
+            self.session_id.clone(),
+            self.segment_id.clone(),
+            self.view_entry_count,
+            self.entries()
+                .filter(|entry| include(entry))
+                .cloned()
+                .collect(),
+        )
+    }
+
     pub fn scoped_ref(
         &self,
         reference: &SessionEntryRef,
     ) -> Result<ScopedSessionEntryRef, CaptureError> {
-        if self.source_index_for_ref(reference).is_none() {
+        if self.view_order_for_ref(reference).is_none() {
             return Err(CaptureError::UnknownReference);
         }
         Ok(ScopedSessionEntryRef {
@@ -679,7 +723,7 @@ impl SessionCapture {
             .from
             .as_ref()
             .map(|r| {
-                self.source_index_for_ref(r)
+                self.view_order_for_ref(r)
                     .ok_or(CaptureError::UnknownReference)
             })
             .transpose()?;
@@ -687,7 +731,7 @@ impl SessionCapture {
             .through
             .as_ref()
             .map(|r| {
-                self.source_index_for_ref(r)
+                self.view_order_for_ref(r)
                     .ok_or(CaptureError::UnknownReference)
             })
             .transpose()?;
@@ -710,7 +754,7 @@ impl SessionCapture {
         match selector {
             ReadSelector::Id(id) => {
                 let reference = SessionEntryRef::parse(id).ok_or(CaptureError::UnknownReference)?;
-                self.source_index_for_ref(&reference)
+                self.view_order_for_ref(&reference)
                     .ok_or(CaptureError::UnknownReference)?;
             }
             ReadSelector::EntryRange([start, end]) => {

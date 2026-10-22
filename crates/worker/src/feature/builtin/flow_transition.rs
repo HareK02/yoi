@@ -474,7 +474,7 @@ where
             self.segment_id,
             &entries,
         )?;
-        Ok(SessionCapture::from_history_entries(
+        Ok(SessionCapture::from_complete_history(
             self.session_id.to_string(),
             self.segment_id.to_string(),
             history,

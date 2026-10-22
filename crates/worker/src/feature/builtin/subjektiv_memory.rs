@@ -571,7 +571,7 @@ impl SubjektivMemoryState {
                 .capture()
                 .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
             let session_id = capture.session_id.clone();
-            let view = SessionCapture::from_history_entries(
+            let view = SessionCapture::from_complete_history(
                 capture.session_id.clone(),
                 capture.segment_id,
                 capture.history,
@@ -680,7 +680,7 @@ fn replay_pending_committed_memory_with_policy(
         .capture
         .capture()
         .map_err(|error| HookError::new(HookErrorCategory::Dependency, error.to_string()))?;
-    let view = SessionCapture::from_history_entries(
+    let view = SessionCapture::from_complete_history(
         capture.session_id.clone(),
         capture.segment_id.clone(),
         capture.history.clone(),
@@ -815,7 +815,7 @@ fn resolve_entry_refs(
     capture: &crate::feature::session::CommittedSessionCapture,
     entry_refs: &[String],
 ) -> Result<Vec<SessionEntryEvidence>, ToolError> {
-    let view = SessionCapture::from_history_entries(
+    let view = SessionCapture::from_complete_history(
         capture.session_id.clone(),
         capture.segment_id.clone(),
         capture.history.clone(),

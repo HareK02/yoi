@@ -456,11 +456,13 @@ impl MemoryLifecycleTask {
                 .await;
             return Ok(());
         }
-        let view = SessionCapture::from_history_entries(
+        let view = SessionCapture::from_complete_history(
             capture.session_id.clone(),
             capture.segment_id.clone(),
-            capture.history[history_start..history_end].to_vec(),
-        );
+            capture.history.clone(),
+        )
+        .select_order_range(history_start as u64..history_end as u64)
+        .map_err(hook_internal)?;
         let start_entry = pointer
             .as_ref()
             .map(|pointer| pointer.processed_through_entry + 1)
@@ -1557,7 +1559,7 @@ permission = "write"
     #[tokio::test]
     async fn run_committed_background_task_stages_non_empty_extraction_and_commits_pointer() {
         let source = capture(2, 250);
-        let entry_ref = SessionCapture::from_history_entries(
+        let entry_ref = SessionCapture::from_complete_history(
             source.session_id.clone(),
             source.segment_id.clone(),
             source.history.clone(),
@@ -1610,10 +1612,95 @@ permission = "write"
         );
     }
 
+    // Real background extraction -> common fixed selection -> StageMemoryCandidate
+    // -> typed backend operation and pointer write. Only model/backend transport
+    // are replaced; the second extraction uses the first run's saved pointer.
+    #[tokio::test]
+    async fn second_extraction_preserves_original_evidence_positions_after_nonzero_pointer() {
+        let first = capture(2, 250);
+        let mut second = capture(4, 750);
+        second.history[..2].clone_from_slice(&first.history);
+        second
+            .usage_history
+            .insert(0, first.usage_history[0].clone());
+        let selected_ref =
+            crate::SessionEntryRef::from_history_entry_id(&second.history[2].annotation.entry_id)
+                .to_string();
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let (event_tx, _) = broadcast::channel(64);
+        run_background_task(test_task(
+            first,
+            Box::new(ScriptClient::new(vec![
+                finish_empty_events("first-empty"),
+                completed_events(),
+            ])),
+            extension_writes.clone(),
+            event_tx.clone(),
+            workspace_client.clone(),
+        ))
+        .await;
+        {
+            let writes = extension_writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            let pointer: memory::ExtractPointerPayload =
+                serde_json::from_value(writes[0].2.clone()).unwrap();
+            assert_eq!(pointer.processed_through_history_len, 2);
+            second
+                .extensions
+                .push((writes[0].1.clone(), writes[0].2.clone()));
+        }
+        run_background_task(test_task(
+            second,
+            Box::new(ScriptClient::new(vec![
+                stage_candidate_events("second-stage", &selected_ref),
+                finish_events("second-finish", 1),
+                completed_events(),
+            ])),
+            extension_writes.clone(),
+            event_tx,
+            workspace_client.clone(),
+        ))
+        .await;
+        let operations = workspace_client
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| {
+                request.body.as_deref().and_then(|body| {
+                    serde_json::from_str::<memory::backend::MemoryBackendOperation>(body).ok()
+                })
+            })
+            .filter_map(|operation| match operation {
+                memory::backend::MemoryBackendOperation::StageCandidate(operation) => {
+                    Some(operation)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(operations.len(), 1);
+        let operation = &operations[0];
+        assert_eq!(operation.source.range, [2, 3]);
+        assert_eq!(operation.evidence[0].id, selected_ref);
+        assert_eq!(operation.evidence[0].entry_range, Some([2, 2]));
+        assert_eq!(
+            operation.source_refs[0].segment_id.as_deref(),
+            Some("segment-1")
+        );
+        assert_eq!(operation.source_refs[0].entry_range, Some([2, 2]));
+        let writes = extension_writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        let pointer: memory::ExtractPointerPayload =
+            serde_json::from_value(writes[1].2.clone()).unwrap();
+        assert_eq!(pointer.processed_through_history_len, 4);
+        assert_eq!(pointer.processed_through_entry, 3);
+    }
+
     #[tokio::test]
     async fn subjektiv_extraction_stages_once_and_commits_its_independent_pointer() {
         let source = capture(2, 250);
-        let entry_ref = SessionCapture::from_history_entries(
+        let entry_ref = SessionCapture::from_complete_history(
             source.session_id.clone(),
             source.segment_id.clone(),
             source.history.clone(),
@@ -1722,7 +1809,7 @@ permission = "write"
     #[tokio::test]
     async fn subjektiv_candidate_remains_staged_when_later_extraction_fails_without_pointer() {
         let source = capture(2, 250);
-        let entry_ref = SessionCapture::from_history_entries(
+        let entry_ref = SessionCapture::from_complete_history(
             source.session_id.clone(),
             source.segment_id.clone(),
             source.history.clone(),

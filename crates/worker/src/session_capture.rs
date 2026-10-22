@@ -30,7 +30,7 @@ mod tests {
                 },
             ),
         ];
-        let capture = SessionCapture::from_history_entries("session", "segment", entries);
+        let capture = SessionCapture::from_complete_history("session", "segment", entries);
         let overview = capture.overview();
         assert_eq!(overview.len(), 1);
         assert!(matches!(
@@ -54,8 +54,9 @@ mod tests {
             },
         );
         let expected_ref = SessionEntryRef::from_history_entry_id(&retained.annotation.entry_id);
-        let before = SessionCapture::from_history_entries("session", "old", vec![retained.clone()]);
-        let after = SessionCapture::from_history_entries("session", "new", vec![retained]);
+        let before =
+            SessionCapture::from_complete_history("session", "old", vec![retained.clone()]);
+        let after = SessionCapture::from_complete_history("session", "new", vec![retained]);
         assert_eq!(before.overview()[0].id, expected_ref);
         assert_eq!(after.overview()[0].id, expected_ref);
         assert_eq!(
@@ -96,7 +97,7 @@ mod tests {
             .iter()
             .map(|entry| SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id))
             .collect::<Vec<_>>();
-        let capture = SessionCapture::from_history_entries("session", "segment", entries);
+        let capture = SessionCapture::from_complete_history("session", "segment", entries);
         assert!(capture.overview().is_empty());
         assert!(
             capture
@@ -235,7 +236,7 @@ mod tests {
         let snapshot: SessionSnapshot =
             serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap();
         for capture in [
-            SessionCapture::from_history_entries(
+            SessionCapture::from_complete_history(
                 session.to_string(),
                 segment.to_string(),
                 restored,
@@ -369,7 +370,7 @@ mod tests {
                         assert_eq!(entry.item, items[index]);
                         assert_eq!(entry.annotation, history[index].metadata);
                     }
-                    let capture = SessionCapture::from_history_entries(
+                    let capture = SessionCapture::from_complete_history(
                         session.to_string(),
                         fork.to_string(),
                         restored,
@@ -757,7 +758,7 @@ mod tests {
         let restored =
             crate::session_history::restore_history_entries(session, first, &log).unwrap();
         let fixed =
-            SessionCapture::from_history_entries(session.to_string(), first.to_string(), restored);
+            SessionCapture::from_complete_history(session.to_string(), first.to_string(), restored);
         let overview = fixed.overview()[0].clone();
         let evidence = fixed.evidence_for(overview.id.as_str()).unwrap();
         let extract = render_extract_input(&fixed);

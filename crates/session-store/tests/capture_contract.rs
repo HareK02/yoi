@@ -77,7 +77,7 @@ fn public_consumer_roundtrip_retains_body_original_source_order_origin_and_indep
             Some(HistoryInputMetadata::new(usage(false, false, true), None, None).unwrap()),
         ),
     ];
-    let capture = SessionCapture::from_history_entries("synthetic-session", "selected", entries);
+    let capture = SessionCapture::from_complete_history("synthetic-session", "selected", entries);
     let mut dto = capture.to_dto();
     // The checked boundary also accepts entries retained from different original segments.
     dto.entries[0].source.segment_id = "original-a".into();
@@ -115,6 +115,7 @@ fn public_consumer_roundtrip_retains_body_original_source_order_origin_and_indep
     assert!(restored.evidence_for("Erecording").is_none());
     let evidence = restored.evidence_for("Ememory").unwrap();
     assert_eq!(evidence.segment_id, "original-b");
+    assert_eq!(evidence.entry_range, [3, 3]);
     assert!(evidence.excerpt.contains("memory-only"));
     let recorded = restored
         .slice(CapturePurpose::Recording, None, 10, 16_000)
@@ -159,7 +160,7 @@ fn common_data_drops_reasoning_raw_system_and_private_payload_even_when_unindexe
         HistoryInputMetadata::new(usage(true, true, true), Some(payload.clone()), Some(public))
             .unwrap();
     let private = HistoryInputMetadata::new(usage(true, true, true), Some(payload), None).unwrap();
-    let capture = SessionCapture::from_history_entries(
+    let capture = SessionCapture::from_complete_history(
         "s",
         "segment",
         vec![
@@ -195,7 +196,7 @@ fn common_data_drops_reasoning_raw_system_and_private_payload_even_when_unindexe
     // Filtered entries do not renumber the public source positions.
     assert_eq!(capture.to_dto().entries[0].order, 3);
     assert_eq!(
-        capture.source_index_for_ref(&SessionEntryRef::parse("Eordinary").unwrap()),
+        capture.view_order_for_ref(&SessionEntryRef::parse("Eordinary").unwrap()),
         Some(4)
     );
 }
@@ -318,6 +319,7 @@ fn malformed_dtos_and_oversized_representations_are_rejected() {
             .is_err()
     );
     let mut reversed = capture.to_dto();
+    reversed.view_entry_count = 2;
     let mut second = reversed.entries[0].clone();
     second.entry_id = "second".into();
     second.source.entry_index = 4;
@@ -325,6 +327,16 @@ fn malformed_dtos_and_oversized_representations_are_rejected() {
     reversed.entries[0].order = 1;
     reversed.entries.push(second);
     assert!(SessionCapture::try_from_dto(reversed, CaptureLimits::default()).is_err());
+    let mut duplicate_source = capture.to_dto();
+    duplicate_source.view_entry_count = 2;
+    let mut second = duplicate_source.entries[0].clone();
+    second.entry_id = "distinct-id".into();
+    second.order = 1;
+    duplicate_source.entries.push(second);
+    assert!(matches!(
+        SessionCapture::try_from_dto(duplicate_source, CaptureLimits::default()),
+        Err(CaptureError::Invalid("duplicate source position"))
+    ));
 }
 
 #[test]
@@ -503,7 +515,7 @@ fn snapshot_immutability_and_scoped_operations_reject_foreign_or_unknown_refs_an
         2
     );
     let unknown = SessionEntryRef::parse("E99999999").unwrap();
-    assert_eq!(capture.source_index_for_ref(&unknown), None);
+    assert_eq!(capture.view_order_for_ref(&unknown), None);
     assert!(matches!(
         capture.scoped_ref(&unknown),
         Err(CaptureError::UnknownReference)
@@ -591,4 +603,109 @@ fn slices_preserve_empty_and_long_result_fields_under_item_and_metadata_budgets(
         metadata_heavy.slice(CapturePurpose::Recording, None, 1, 700),
         Err(CaptureError::BudgetTooSmall)
     ));
+}
+
+#[test]
+fn evidence_uses_original_segment_positions_after_roundtrip_and_view_selection() {
+    let full = SessionCapture::new(
+        "s",
+        "selected",
+        vec![
+            Item::user_message("first"),
+            Item::assistant_message("second"),
+        ],
+    );
+    let mut dto = full.to_dto();
+    dto.entries[0].source.segment_id = "original-a".into();
+    dto.entries[0].source.entry_index = 80;
+    dto.entries[1].source.segment_id = "original-b".into();
+    dto.entries[1].source.entry_index = 3;
+    let encoded = dto.encode(CaptureLimits::default()).unwrap();
+    let restored = SessionCapture::decode(&encoded, CaptureLimits::default()).unwrap();
+    for (id, segment, index, order) in [
+        ("E00000000", "original-a", 80, 0),
+        ("E00000001", "original-b", 3, 1),
+    ] {
+        let evidence = restored.evidence_for(id).unwrap();
+        assert_eq!(evidence.segment_id, segment);
+        assert_eq!(evidence.entry_range, [index; 2]);
+        let read = restored.read(ReadSelector::Id(id), ReadOptions::default());
+        assert_eq!(read.entries[0].entry_range, [order; 2]);
+    }
+    let selected = restored.select_order_range(1..2).unwrap();
+    assert_eq!(selected.overview()[0].entry_range, [0, 0]);
+    let evidence = selected.evidence_for("E00000001").unwrap();
+    assert_eq!(evidence.segment_id, "original-b");
+    assert_eq!(evidence.entry_range, [3, 3]);
+    let roundtrip = SessionCapture::decode(
+        &selected.encode(CaptureLimits::default()).unwrap(),
+        CaptureLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(roundtrip.to_dto(), selected.to_dto());
+    assert_eq!(
+        roundtrip.evidence_for("E00000001").unwrap().entry_range,
+        [3, 3]
+    );
+}
+
+#[test]
+fn fixed_history_selection_preserves_original_coordinates_and_checks_private_position_bounds() {
+    let history = vec![
+        history("old", Item::user_message("old"), None),
+        history("hidden", Item::reasoning("PRIVATE"), None),
+        history("selected", Item::user_message("selected"), None),
+        history("private-tail", Item::system_message("PRIVATE"), None),
+    ];
+    let full = SessionCapture::from_complete_history("s", "seg", history);
+    let suffix = full.select_order_range(1..4).unwrap();
+    let original = full
+        .entries()
+        .find(|entry| entry.entry_id == "selected")
+        .unwrap();
+    let selected = suffix.entries().next().unwrap();
+    assert_eq!(selected.entry_id, original.entry_id);
+    assert_eq!(selected.source, original.source);
+    assert_eq!(selected.body, original.body);
+    assert_eq!(selected.policy, original.policy);
+    assert!(suffix.evidence_for("Eold").is_none());
+    assert_eq!(suffix.search(&SearchOptions::default()).len(), 1);
+    assert_eq!(
+        suffix.view_order_for_ref(&SessionEntryRef::parse("Eselected").unwrap()),
+        Some(1)
+    );
+    assert_eq!(selected.source.entry_index, 2);
+    assert_eq!(selected.order, 1);
+    assert_eq!(suffix.to_dto().view_entry_count, 3);
+    assert_eq!(
+        suffix.evidence_for("Eselected").unwrap().entry_range,
+        [2, 2]
+    );
+    let nested = suffix.select_order_range(1..2).unwrap();
+    assert_eq!(nested.entries().next().unwrap().order, 0);
+    assert_eq!(nested.entries().next().unwrap().source, original.source);
+    let restored = SessionCapture::decode(
+        &suffix.encode(CaptureLimits::default()).unwrap(),
+        CaptureLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(restored.to_dto(), suffix.to_dto());
+    assert!(full.select_order_range(4..5).is_err());
+    let reversed = std::ops::Range { start: 3, end: 2 };
+    assert!(full.select_order_range(reversed).is_err());
+    let hidden_only = full.select_order_range(3..4).unwrap();
+    assert_eq!(hidden_only.entries().len(), 0);
+    assert_eq!(hidden_only.to_dto().view_entry_count, 1);
+    let mut invalid = full.to_dto();
+    invalid.view_entry_count = 2; // the selected entry's view order is outside this extent
+    assert!(SessionCapture::try_from_dto(invalid, CaptureLimits::default()).is_err());
+    assert_eq!(
+        full.retain_entries(|entry| entry.entry_id == "selected")
+            .entries()
+            .next()
+            .unwrap()
+            .source,
+        original.source
+    );
+    assert_eq!(full.to_dto().view_entry_count, 4);
 }
