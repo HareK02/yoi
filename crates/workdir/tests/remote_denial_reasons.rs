@@ -14,6 +14,18 @@ use workdir::{
     },
 };
 
+fn opened(workdir_id: &str) -> String {
+    serde_json::to_string(&workdir::http::OpenWorkdirSessionResponse {
+        session_id: workdir::http::WorkdirSessionId::new("s").unwrap(),
+        workdir_id: Workdir::new(workdir_id).id().clone(),
+        capabilities: workdir::WorkdirSessionCapabilities::ALL,
+        environment: workdir::WorkdirSessionEnvironment::root(
+            workdir::WorkdirSessionCapabilities::ALL,
+        ),
+    })
+    .unwrap()
+}
+
 fn reply(listener: &TcpListener, status: &str, body: &str) {
     listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -73,11 +85,7 @@ async fn remote_http_denials_forward_only_typed_reasons_and_old_missing_reason()
             error["denial_reason"] = serde_json::to_value(reason).unwrap();
         }
         let server = thread::spawn(move || {
-            reply(
-                &listener,
-                "200 OK",
-                r#"{"session_id":"s","workdir_id":"w","capabilities":{"bits":63}}"#,
-            );
+            reply(&listener, "200 OK", &opened("w"));
             reply(&listener, "403 Forbidden", &error.to_string());
         });
         let remote = RemoteWorkdirSession::open(
@@ -163,11 +171,7 @@ async fn remote_checkout_diagnostics_preserve_mutation_outcome_and_read_failures
                 let address = listener.local_addr().unwrap();
                 let error = serde_json::json!({"code":code, "message":"/secret/host provider-secret", "denial_reason":reason});
                 let server = thread::spawn(move || {
-                    reply(
-                        &listener,
-                        "200 OK",
-                        r#"{"session_id":"s","workdir_id":"w","capabilities":{"bits":63}}"#,
-                    );
+                    reply(&listener, "200 OK", &opened("w"));
                     reply(
                         &listener,
                         &format!("{} Fixture failure", code.http_status()),
@@ -230,11 +234,11 @@ async fn mismatched_http_results_keep_cause_and_mutation_uncertainty() {
             reply(
                 &listener,
                 "200 OK",
-                if case == "identity" {
-                    r#"{"session_id":"s","workdir_id":"wrong-secret","capabilities":{"bits":63}}"#
+                &opened(if case == "identity" {
+                    "wrong-secret"
                 } else {
-                    r#"{"session_id":"s","workdir_id":"w","capabilities":{"bits":63}}"#
-                },
+                    "w"
+                }),
             );
             if case != "identity" {
                 let result = if case == "bytes" {

@@ -27,7 +27,7 @@ pub(crate) struct GrepParams {
     #[serde(default)]
     target_workdir: Option<String>,
     pattern: String,
-    /// Workdir-relative path, or an absolute path covered by readable scope. Defaults to the Workdir root.
+    /// File or directory to search. Defaults to `.`.
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
@@ -160,7 +160,7 @@ pub(crate) fn routed_grep_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefinit
     Arc::new(move || {
         let schema = schemars::schema_for!(GrepParams);
         let meta = ToolMeta::new("Grep")
-            .description("Search a file or directory in the selected Workdir with a regex. Content results group lines by file; `>` marks matching lines and unmarked lines are context. Directory traversal executes inside the WorkdirSession provider. Results are bounded and Workdir-relative.")
+            .description("Search a file or directory in the selected Workdir with a regex. Content results group lines by file; `>` marks matching lines and unmarked lines are context. Directory traversal executes inside the WorkdirSession provider. Results are bounded.")
             .input_schema(serde_json::to_value(schema).expect("Grep schema serialization"));
         let tool: Arc<dyn Tool> = Arc::new(GrepTool {
             router: router.clone(),

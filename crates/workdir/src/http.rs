@@ -54,6 +54,7 @@ pub struct OpenWorkdirSessionResponse {
     pub session_id: WorkdirSessionId,
     pub workdir_id: WorkdirId,
     pub capabilities: WorkdirSessionCapabilities,
+    pub environment: crate::WorkdirSessionEnvironment,
 }
 
 /// One provider-side Workdir operation.
@@ -553,6 +554,7 @@ mod client {
         workdir: Workdir,
         session_id: WorkdirSessionId,
         capabilities: WorkdirSessionCapabilities,
+        environment: crate::WorkdirSessionEnvironment,
         closed: AtomicBool,
     }
 
@@ -612,6 +614,7 @@ mod client {
                 workdir: Workdir::new(opened.workdir_id.as_str()),
                 session_id: opened.session_id,
                 capabilities: opened.capabilities,
+                environment: opened.environment,
                 closed: AtomicBool::new(false),
             })
         }
@@ -674,6 +677,12 @@ mod client {
 
         fn capabilities(&self) -> WorkdirSessionCapabilities {
             self.capabilities
+        }
+
+        fn environment(&self) -> crate::WorkdirSessionEnvironment {
+            let mut environment = self.environment.clone();
+            environment.capabilities = self.capabilities();
+            environment
         }
 
         async fn authorize_scope_path(
@@ -1209,6 +1218,9 @@ mod client {
                 workdir,
                 session_id: WorkdirSessionId::new("s").unwrap(),
                 capabilities: WorkdirSessionCapabilities::EMPTY,
+                environment: crate::WorkdirSessionEnvironment::root(
+                    WorkdirSessionCapabilities::EMPTY,
+                ),
                 closed: AtomicBool::new(false),
             };
             let stat = StatRequest {

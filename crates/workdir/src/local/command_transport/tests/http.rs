@@ -134,6 +134,9 @@ async fn pipe_and_wait_faults_cross_real_http_with_prefix_and_terminal_replay() 
                             session_id: WorkdirSessionId::new("fault-session").unwrap(),
                             workdir_id: crate::Workdir::new("fault-workdir").id().clone(),
                             capabilities: crate::WorkdirSessionCapabilities::ALL,
+                            environment: crate::WorkdirSessionEnvironment::root(
+                                crate::WorkdirSessionCapabilities::ALL,
+                            ),
                         })
                     }),
                 )

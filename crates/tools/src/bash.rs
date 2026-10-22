@@ -30,7 +30,9 @@ struct BashParams {
     /// Worker-local alias of the Workdir attachment to use.
     #[serde(default)]
     target_workdir: Option<String>,
-    /// Workdir-relative directory in which to execute the command.
+    /// Directory in which to execute the command.
+    // Keep provider path-coordinate documentation out of the model-facing schema.
+    #[schemars(with = "String")]
     cwd: WorkdirPath,
     command: String,
     #[serde(default)]

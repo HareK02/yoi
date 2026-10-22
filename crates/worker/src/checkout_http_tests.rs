@@ -121,6 +121,7 @@ async fn open_session(
         session_id: WorkdirSessionId::new(SESSION).unwrap(),
         workdir_id: state.session.workdir().id().clone(),
         capabilities: state.session.capabilities(),
+        environment: state.session.environment(),
     })
     .into_response()
 }
@@ -251,6 +252,10 @@ impl Drop for HttpFixture {
 
 impl HttpFixture {
     async fn new(capabilities: WorkdirSessionCapabilities) -> Self {
+        Self::at_cwd(capabilities, "").await
+    }
+
+    async fn at_cwd(capabilities: WorkdirSessionCapabilities, cwd: &str) -> Self {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("src/deep")).unwrap();
         std::fs::write(
@@ -264,6 +269,13 @@ impl HttpFixture {
             manifest::SharedScope::new(manifest::Scope::writable(dir.path()).unwrap()),
             capabilities,
         ));
+        let session: WorkdirSessionHandle = if cwd.is_empty() {
+            session
+        } else {
+            workdir::WorkdirToolBroker::at_cwd(session, WorkdirPath::new(cwd).unwrap())
+                .unwrap()
+                .tool_session()
+        };
         let state = Arc::new(ProviderState {
             session,
             requests: Mutex::new(Vec::new()),
@@ -347,6 +359,31 @@ impl HttpFixture {
             && (path == &open || path == &operations))
             || (method == "DELETE" && path == &close)));
     }
+}
+
+#[tokio::test]
+async fn remote_open_keeps_provider_environment_and_nonroot_operation_coordinates() {
+    let fixture = HttpFixture::at_cwd(WorkdirSessionCapabilities::READ_ONLY, "src/deep").await;
+    let remote = fixture.open(TOKEN).await.unwrap();
+    assert_eq!(remote.environment(), fixture.state.session.environment());
+    assert_eq!(remote.environment().cwd.as_str(), "src/deep");
+    assert_eq!(
+        remote.environment().capabilities,
+        WorkdirSessionCapabilities::READ_ONLY
+    );
+    let result = remote
+        .read(workdir::ReadRequest {
+            path: WorkdirPath::new("a.txt").unwrap(),
+            offset: 0,
+            limit: 10,
+            max_bytes: 4096,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.bytes, b"first\nneedle needle\nlast\n");
+    fixture.public_output(&serde_json::to_string(&remote.environment()).unwrap());
+    remote.close().await.unwrap();
+    fixture.assert_endpoints();
 }
 
 fn native_runtime(remote: Arc<RemoteWorkdirSession>) -> (WipRuntime, Arc<WorkdirSessionRouter>) {

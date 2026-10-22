@@ -5,6 +5,8 @@ pub use checkout::{
     CheckoutObservation, CheckoutOperation, CheckoutOutput, CheckoutRequest, CheckoutResult,
     CheckoutSearchOperation, CheckoutSearchRequest, CheckoutSearchResult,
 };
+mod environment;
+pub use environment::WorkdirSessionEnvironment;
 pub mod external;
 pub mod http;
 mod local;
@@ -15,6 +17,8 @@ pub mod workspace;
 
 #[cfg(test)]
 mod checkout_search_tests;
+#[cfg(test)]
+mod environment_tests;
 #[cfg(test)]
 mod external_local_tests;
 
@@ -185,6 +189,9 @@ pub type WriteOutcome = WriteResult;
 /// Worker-bound operation session for a persistent [`Workdir`].
 ///
 /// Filesystem search and commands run on the host owning materialization.
+/// Relative operation paths and reusable search results use the session's cwd;
+/// root-coordinate providers are adapted once at attachment, not by each Tool.
+/// Scope declarations retain their own root-coordinate authority contract.
 /// Session closure is terminal but does not delete the Workdir or files.
 /// Unsupported checkout/search implementations explicitly reject requests, with no ambient
 /// filesystem fallback. Providers own identity validators; callers own read hash history
@@ -193,6 +200,13 @@ pub type WriteOutcome = WriteResult;
 pub trait WorkdirSession: std::fmt::Debug + Send + Sync {
     fn workdir(&self) -> &Workdir;
     fn capabilities(&self) -> WorkdirSessionCapabilities;
+
+    /// Describe the coordinates used by this session, not a caller's Profile
+    /// or filesystem authority. Root-coordinate providers use the default;
+    /// coordinate and authority wrappers must project their effective view.
+    fn environment(&self) -> WorkdirSessionEnvironment {
+        WorkdirSessionEnvironment::root(self.capabilities())
+    }
 
     /// Validate an attenuated filesystem rule at the provider boundary without
     /// exposing the resolved host path. Providers that cannot resolve symbolic

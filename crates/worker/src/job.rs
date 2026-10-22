@@ -13,7 +13,6 @@
 mod result;
 pub use result::{JobResultFeature, JobResultFinalizer, JobResultSink, SUBMIT_JOB_RESULT_TOOL};
 
-use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -154,7 +153,7 @@ fn prepare_job_from_registry_with_grant(
     )?;
     let mut system_prompt = template.render(&SystemPromptContext {
         now: chrono::Utc::now(),
-        cwd: Cow::Borrowed("(no filesystem)"),
+        workdir_sessions: &workdir::WorkdirSessionRouter::new(),
         language: &manifest.engine.language,
         scope: &scope,
         tool_names,

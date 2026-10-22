@@ -17,7 +17,7 @@ pub(crate) struct GlobParams {
     pub target_workdir: Option<String>,
     /// Glob pattern, for example `**/*.rs` or `src/**/test_*.py`.
     pub pattern: String,
-    /// Logical Workdir-relative directory. Defaults to the Workdir root.
+    /// Directory to search. Defaults to `.`.
     #[serde(default)]
     pub path: Option<String>,
 }
@@ -106,7 +106,7 @@ pub(crate) fn routed_glob_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefinit
     Arc::new(move || {
         let schema = schemars::schema_for!(GlobParams);
         let meta = ToolMeta::new("Glob")
-            .description("Find files matching a glob pattern inside the selected Workdir. Results are sorted and capped at 1000 entries. Paths are Workdir-relative.")
+            .description("Find files matching a glob pattern inside the selected Workdir. Results are sorted and capped at 1000 entries.")
             .input_schema(serde_json::to_value(schema).expect("Glob schema serialization"));
         let tool: Arc<dyn Tool> = Arc::new(GlobTool {
             router: router.clone(),

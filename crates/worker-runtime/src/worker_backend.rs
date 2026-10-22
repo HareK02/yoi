@@ -1127,8 +1127,17 @@ fn runtime_local_workdir_router(
             ),
             None => source,
         };
+        let cwd = binding
+            .cwd()
+            .strip_prefix(binding.root())
+            .map_err(|_| format!("Workdir attachment `{alias}` cwd is outside its logical root"))?;
+        let cwd = workdir::WorkdirPath::new(
+            cwd.to_str()
+                .ok_or_else(|| format!("Workdir attachment `{alias}` cwd is not UTF-8"))?,
+        )
+        .map_err(|error| error.to_string())?;
         router
-            .attach(alias.clone(), source)
+            .attach_at_cwd(alias.clone(), source, cwd)
             .map_err(|error| format!("bind Workdir attachment `{alias}`: {error}"))?;
     }
     Ok(router)
@@ -10548,6 +10557,60 @@ mod tests {
         // Closed handles, router and passive bindings can remain alive.
         materializer.cleanup_working_directory(id).unwrap();
         assert!(!binding.working_directory_root().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_attachment_router_keeps_each_binding_cwd_and_capability_ceiling() {
+        let runtime_base = tempfile::tempdir().unwrap();
+        let repo = create_clean_repo();
+        let materializer = RuntimeGitMaterializer::new(runtime_base.path());
+        let root_binding = materializer
+            .create(&working_directory_request(repo.path()))
+            .unwrap();
+        std::fs::create_dir(root_binding.root().join("nested")).unwrap();
+        std::fs::write(root_binding.root().join("marker"), "root").unwrap();
+        std::fs::write(root_binding.root().join("nested/marker"), "nested").unwrap();
+        let mut nested_binding = root_binding.clone();
+        nested_binding.cwd = root_binding.root().join("nested");
+        let root_alias = WorkdirAttachmentAlias::new("root").unwrap();
+        let nested_alias = WorkdirAttachmentAlias::new("nested").unwrap();
+        let attachments = BTreeMap::from([
+            (root_alias.clone(), root_binding),
+            (nested_alias.clone(), nested_binding),
+        ]);
+        let ceilings = BTreeMap::from([
+            (root_alias, WorkdirSessionCapabilities::ALL),
+            (nested_alias, WorkdirSessionCapabilities::READ_ONLY),
+        ]);
+        let router = runtime_local_workdir_router(&attachments, &ceilings, None).unwrap();
+        assert!(router.resolve(None).is_err());
+        for (alias, cwd, content, command) in [
+            ("root", "", "root", true),
+            ("nested", "nested", "nested", false),
+        ] {
+            let selected = router.resolve(Some(alias)).unwrap().session;
+            let environment = selected.environment();
+            assert_eq!(environment.cwd.as_str(), cwd);
+            assert_eq!(
+                environment
+                    .capabilities
+                    .supports(workdir::WorkdirSessionCapability::Command),
+                command
+            );
+            let read = selected
+                .read(workdir::ReadRequest {
+                    path: workdir::WorkdirPath::new("marker").unwrap(),
+                    offset: 0,
+                    limit: 10,
+                    max_bytes: 100,
+                })
+                .await
+                .unwrap();
+            assert_eq!(read.bytes, content.as_bytes());
+            assert_eq!(read.path.as_str(), "marker");
+        }
+        router.close_all().await.unwrap();
     }
 
     #[test]

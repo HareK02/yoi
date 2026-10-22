@@ -3700,7 +3700,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let prompts = Arc::new(ArcSwap::from(PromptCatalog::builtins_only()?));
         DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
         let scope = SharedScope::new(scope);
-        let workdir_sessions = workdir_sessions_from_authority(&filesystem_authority, &scope);
+        let workdir_sessions = workdir_sessions_from_authority(&filesystem_authority, &scope)?;
         let mut worker = Self {
             backend_job: std::sync::OnceLock::new(),
             manifest,
@@ -4980,11 +4980,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         let Some(template) = self.system_prompt_template.as_ref() else {
             return Ok(());
         };
-        if let Some(rendered) = self.feature_system_prompt_override.as_ref() {
+        if let Some(body) = self.feature_system_prompt_override.as_ref() {
+            let environment =
+                crate::prompt::system::workdir_environment_section(&self.workdir_sessions)
+                    .map_err(|source| WorkerError::SystemPromptRender { source })?;
             self.engine
                 .as_mut()
                 .expect("worker present")
-                .set_system_prompt(rendered.clone());
+                .set_system_prompt(format!("{body}\n\n{environment}"));
             return Ok(());
         }
         let alerter = self.alerter.clone();
@@ -5029,14 +5032,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         };
         let worker_language = worker_language(&self.manifest.engine);
         let scope_snapshot = self.scope.snapshot();
-        let cwd_for_prompt = self
-            .local_working_directory()
-            .map(|local| local.cwd.display().to_string())
-            .unwrap_or_else(|| "no local working directory".to_string());
         let prompt_catalog = self.prompts.load_full();
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
-            cwd: cwd_for_prompt.into(),
+            workdir_sessions: &self.workdir_sessions,
             language: worker_language,
             scope: &scope_snapshot,
             tool_names,
@@ -8306,7 +8305,7 @@ where
         let worker_metadata_segment_cas = Some(worker_metadata_segment_cas_for_store(&store));
         let scope = SharedScope::new(common.scope);
         let workdir_sessions =
-            workdir_sessions_from_authority(&common.filesystem_authority, &scope);
+            workdir_sessions_from_authority(&common.filesystem_authority, &scope)?;
 
         let mut worker = Self {
             backend_job: std::sync::OnceLock::new(),
@@ -8707,7 +8706,7 @@ where
         engine.set_cache_key(Some(segment_id.to_string()));
         let scope = SharedScope::new(common.scope);
         let workdir_sessions =
-            workdir_sessions_from_authority(&common.filesystem_authority, &scope);
+            workdir_sessions_from_authority(&common.filesystem_authority, &scope)?;
         let mut worker = Self {
             backend_job: std::sync::OnceLock::new(),
             manifest,
@@ -9109,7 +9108,7 @@ where
         let worker_metadata_segment_cas = Some(worker_metadata_segment_cas_for_store(&store));
         let scope = SharedScope::new(common.scope);
         let workdir_sessions =
-            workdir_sessions_from_authority(&common.filesystem_authority, &scope);
+            workdir_sessions_from_authority(&common.filesystem_authority, &scope)?;
 
         let mut worker = Self {
             backend_job: std::sync::OnceLock::new(),
@@ -10220,9 +10219,25 @@ pub enum WorkerError {
 fn workdir_sessions_from_authority(
     authority: &WorkerFilesystemAuthority,
     scope: &SharedScope,
-) -> Arc<WorkdirSessionRouter> {
+) -> Result<Arc<WorkdirSessionRouter>, WorkerError> {
     let router = Arc::new(WorkdirSessionRouter::new());
     if let Some(local) = authority.as_local() {
+        let invalid_cwd = |error: String| WorkerError::InvalidCwd {
+            cwd: local.cwd.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, error),
+        };
+        let relative_cwd = local.cwd.strip_prefix(&local.root).map_err(|error| {
+            invalid_cwd(format!(
+                "session cwd must be within its Workdir root: {error}"
+            ))
+        })?;
+        let relative_cwd = relative_cwd
+            .to_str()
+            .ok_or_else(|| invalid_cwd("session cwd must be UTF-8".into()))?;
+        let relative_cwd = workdir::WorkdirPath::new(relative_cwd)
+            .map_err(|error| invalid_cwd(error.to_string()))?;
+        // The provider keeps root-coordinate operations. Only the routed tool
+        // view uses cwd; delegation reuses the same root-coordinate broker.
         let session = Arc::new(LocalWorkdirSession::materialized(
             local.root.clone(),
             local.cwd.clone(),
@@ -10230,13 +10245,14 @@ fn workdir_sessions_from_authority(
             WorkdirSessionCapabilities::ALL,
         )) as WorkdirSessionHandle;
         router
-            .attach(
+            .attach_at_cwd(
                 WorkdirAttachmentAlias::new("workdir").expect("static alias is valid"),
                 session,
+                relative_cwd,
             )
-            .expect("fresh Workdir router accepts its only attachment");
+            .map_err(|error| invalid_cwd(error.to_string()))?;
     }
-    router
+    Ok(router)
 }
 
 /// Bundle of resources that every high-level Worker constructor needs:

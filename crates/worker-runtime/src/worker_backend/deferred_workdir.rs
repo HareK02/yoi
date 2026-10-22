@@ -124,6 +124,18 @@ macro_rules! impl_deferred_session {
                 self.capabilities
             }
 
+            fn environment(&self) -> WorkdirSessionEnvironment {
+                let mut environment = self.state.try_lock().ok().and_then(|state| {
+                    state.session.as_ref().map(|session| session.environment())
+                }).unwrap_or_else(|| {
+                    let mut environment = WorkdirSessionEnvironment::root(self.capabilities);
+                    environment.restrictions.push("Deferred provider: scope is checked on connection and every operation".into());
+                    environment
+                });
+                environment.capabilities = self.capabilities;
+                environment
+            }
+
             $(
                 async fn $method(&self, $request: $request_type) -> Result<$result, WorkdirError> {
                     self.session().await?.$method($request).await

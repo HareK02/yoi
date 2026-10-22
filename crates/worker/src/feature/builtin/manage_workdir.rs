@@ -226,6 +226,7 @@ pub struct WorkspaceAttachedWorkdirSession {
     target_workdir: String,
     workdir: Workdir,
     capabilities: WorkdirSessionCapabilities,
+    environment: workdir::WorkdirSessionEnvironment,
 }
 
 impl WorkspaceAttachedWorkdirSession {
@@ -249,17 +250,38 @@ impl WorkspaceAttachedWorkdirSession {
         )
     }
 
+    /// Bind a known root-coordinate attachment. Opened provider sessions must
+    /// instead pass their metadata to [`Self::handle_for_workdir_with_environment`].
     pub fn handle_for_workdir_with_capabilities(
         client: Arc<dyn WorkspaceClient>,
         target_workdir: impl Into<String>,
         workdir_id: impl Into<String>,
         capabilities: WorkdirSessionCapabilities,
     ) -> WorkdirSessionHandle {
+        Self::handle_for_workdir_with_environment(
+            client,
+            target_workdir,
+            workdir_id,
+            capabilities,
+            workdir::WorkdirSessionEnvironment::root(capabilities),
+        )
+    }
+
+    /// Bind provider-authored coordinates without allowing metadata to expand
+    /// the Backend attachment capability ceiling.
+    pub fn handle_for_workdir_with_environment(
+        client: Arc<dyn WorkspaceClient>,
+        target_workdir: impl Into<String>,
+        workdir_id: impl Into<String>,
+        capabilities: WorkdirSessionCapabilities,
+        environment: workdir::WorkdirSessionEnvironment,
+    ) -> WorkdirSessionHandle {
         Arc::new(Self {
             client,
             target_workdir: target_workdir.into(),
             workdir: Workdir::new(workdir_id),
-            capabilities,
+            capabilities: capabilities.intersection(environment.capabilities),
+            environment,
         })
     }
 
@@ -360,6 +382,12 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
 
     fn capabilities(&self) -> WorkdirSessionCapabilities {
         self.capabilities
+    }
+
+    fn environment(&self) -> workdir::WorkdirSessionEnvironment {
+        let mut environment = self.environment.clone();
+        environment.capabilities = environment.capabilities.intersection(self.capabilities());
+        environment
     }
 
     async fn authorize_scope_path(
@@ -684,11 +712,12 @@ impl WorkspaceHttpWorkdirBackend {
         let response = self.attach_response(alias, working_directory_id)?;
         if let Err(error) = self.session_router.attach(
             alias_key.clone(),
-            WorkspaceAttachedWorkdirSession::handle_for_workdir_with_capabilities(
+            WorkspaceAttachedWorkdirSession::handle_for_workdir_with_environment(
                 self.client.clone(),
                 alias,
                 working_directory_id,
-                response.capabilities,
+                response.attachment.capabilities,
+                response.environment.clone(),
             ),
         ) {
             let _ = self.detach(alias);
@@ -706,9 +735,9 @@ impl WorkspaceHttpWorkdirBackend {
         &self,
         alias: &str,
         working_directory_id: &str,
-    ) -> Result<WorkdirAttachmentResponse, ToolError> {
+    ) -> Result<WorkdirSessionAttachmentResponse, ToolError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
-        self.execute_json::<WorkdirAttachmentResponse>(WorkspaceRequest::json(
+        self.execute_json::<WorkdirSessionAttachmentResponse>(WorkspaceRequest::json(
             WorkspaceRequestMethod::Post,
             format!("/api/w/{workspace_id}/workers/self/workdir-attachments"),
             serde_json::to_string(&WorkdirAttachRequest {
@@ -1192,6 +1221,13 @@ struct WorkdirAttachmentResponse {
     attached: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkdirSessionAttachmentResponse {
+    #[serde(flatten)]
+    attachment: WorkdirAttachmentResponse,
+    environment: workdir::WorkdirSessionEnvironment,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkdirDeleteInput {
@@ -1502,6 +1538,7 @@ mod tests {
                 "alias": "checkout",
                 "working_directory_id": "wd-created",
                 "capabilities": {"bits": 63},
+                "environment": workdir::WorkdirSessionEnvironment::root(WorkdirSessionCapabilities::ALL),
                 "attached": true
             })),
             response(json!({
@@ -2004,6 +2041,7 @@ mod tests {
                 "alias": "checkout",
                 "working_directory_id": "wd-attached",
                 "capabilities": {"bits": 63},
+                "environment": workdir::WorkdirSessionEnvironment::root(WorkdirSessionCapabilities::ALL),
                 "attached": true
             })),
             response(json!({
@@ -2063,16 +2101,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn attach_propagates_provider_read_only_capabilities_to_the_alias_session() {
+    #[tokio::test]
+    async fn attach_projects_provider_environment_without_expanding_capability_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let provider = Arc::new(workdir::LocalWorkdirSession::materialized(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            manifest::SharedScope::new(manifest::Scope::writable(dir.path()).unwrap()),
+            WorkdirSessionCapabilities::ALL,
+        ));
+        let broker =
+            workdir::WorkdirToolBroker::at_cwd(provider, workdir::WorkdirPath::new("src").unwrap())
+                .unwrap();
+        let mut environment = broker.tool_session().environment();
         let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
             "workspace_id": "workspace/test",
             "alias": "external",
             "working_directory_id": "external-workdir",
             "capabilities": {"bits": 25},
+            "environment": environment,
             "attached": true
         }))]));
-        let backend = WorkspaceHttpWorkdirBackend::new(client);
+        let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
         backend
             .attach(WorkdirAttachInput {
                 alias: "external".to_string(),
@@ -2084,10 +2135,33 @@ mod tests {
             .session_router
             .session(&workdir::WorkdirAttachmentAlias::new("external").unwrap())
             .unwrap();
+        environment.capabilities = WorkdirSessionCapabilities::READ_ONLY;
+        assert_eq!(session.environment(), environment);
         assert_eq!(
             session.capabilities(),
             WorkdirSessionCapabilities::READ_ONLY
         );
+        assert!(matches!(
+            session
+                .checkout_execute(workdir::CheckoutRequest {
+                    target: workdir::WorkdirPath::root(),
+                    validator: vec![1],
+                    operation: workdir::CheckoutOperation::Create {
+                        path: workdir::WorkdirPath::new("new.txt").unwrap(),
+                        content: b"denied".to_vec(),
+                    },
+                })
+                .await,
+            Err(WorkdirError::Unsupported(
+                workdir::WorkdirSessionCapability::Write
+            ))
+        ));
+        assert_eq!(
+            client.requests().len(),
+            1,
+            "denied mutation must not reach the Backend"
+        );
+        broker.tool_session().close().await.unwrap();
     }
 
     #[tokio::test]
@@ -2097,6 +2171,7 @@ mod tests {
             "alias": "checkout",
             "working_directory_id": "wd-attached",
             "capabilities": {"bits": 63},
+            "environment": workdir::WorkdirSessionEnvironment::root(WorkdirSessionCapabilities::ALL),
             "attached": true
         }))]));
         let reopen_calls = Arc::new(AtomicUsize::new(0));

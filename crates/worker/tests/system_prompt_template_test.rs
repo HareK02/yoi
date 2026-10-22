@@ -187,7 +187,8 @@ async fn materialise_on_first_turn_populates_worker() {
         .expect("system prompt materialised")
         .to_string();
     assert!(rendered.contains("date="));
-    assert!(rendered.contains(&pwd.display().to_string()));
+    assert!(rendered.contains("## Workdir execution environment"));
+    assert!(!rendered.contains(&pwd.display().to_string()));
     assert!(rendered.starts_with("date="));
 }
 
@@ -206,7 +207,8 @@ async fn session_start_state_captures_rendered_prompt() {
         LogEntry::AnnotatedSegmentStart { system_prompt, .. } => {
             let sp = system_prompt.as_deref().expect("system prompt set");
             assert!(sp.starts_with("hello"));
-            assert!(sp.contains(&pwd.display().to_string()));
+            assert!(sp.contains("## Workdir execution environment"));
+            assert!(!sp.contains(&pwd.display().to_string()));
         }
         other => panic!("expected AnnotatedSegmentStart as first entry, got {other:?}"),
     }

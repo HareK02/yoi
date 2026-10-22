@@ -8827,6 +8827,9 @@ mod tests {
             session_id: workdir::http::WorkdirSessionId::new("session-1").unwrap(),
             workdir_id: Workdir::new("wd-1").id().clone(),
             capabilities: workdir::WorkdirSessionCapabilities::ALL,
+            environment: workdir::WorkdirSessionEnvironment::root(
+                workdir::WorkdirSessionCapabilities::ALL,
+            ),
         };
         let stat = workdir::http::WorkdirSessionOperationResult::Stat(StatResult {
             path: WorkdirPath::new("hello.txt").unwrap(),

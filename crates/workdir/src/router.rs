@@ -225,16 +225,27 @@ impl Drop for ActiveOperation<'_> {
 #[derive(Debug, Clone)]
 pub struct RoutedWorkdirSession {
     state: Arc<RoutedSessionState>,
+    view: Option<WorkdirSessionHandle>,
+}
+
+impl RoutedWorkdirSession {
+    fn inner(&self) -> &WorkdirSessionHandle {
+        self.view.as_ref().unwrap_or(&self.state.session)
+    }
 }
 
 #[async_trait]
 impl WorkdirSession for RoutedWorkdirSession {
     fn workdir(&self) -> &Workdir {
-        self.state.session.workdir()
+        self.inner().workdir()
     }
 
     fn capabilities(&self) -> WorkdirSessionCapabilities {
-        self.state.session.capabilities()
+        self.inner().capabilities()
+    }
+
+    fn environment(&self) -> crate::WorkdirSessionEnvironment {
+        self.inner().environment()
     }
 
     async fn authorize_scope_path(
@@ -242,7 +253,7 @@ impl WorkdirSession for RoutedWorkdirSession {
         request: WorkdirScopeAuthorizationRequest,
     ) -> Result<(), WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.authorize_scope_path(request).await
+        self.inner().authorize_scope_path(request).await
     }
 
     async fn scope_rules_overlap(
@@ -250,7 +261,7 @@ impl WorkdirSession for RoutedWorkdirSession {
         request: WorkdirScopeOverlapRequest,
     ) -> Result<bool, WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.scope_rules_overlap(request).await
+        self.inner().scope_rules_overlap(request).await
     }
 
     async fn checkout_search(
@@ -258,7 +269,7 @@ impl WorkdirSession for RoutedWorkdirSession {
         request: crate::CheckoutSearchRequest,
     ) -> Result<crate::CheckoutSearchResult, WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.checkout_search(request).await
+        self.inner().checkout_search(request).await
     }
 
     async fn checkout_observe(
@@ -266,59 +277,59 @@ impl WorkdirSession for RoutedWorkdirSession {
         path: crate::WorkdirPath,
     ) -> Result<crate::CheckoutObservation, WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.checkout_observe(path).await
+        self.inner().checkout_observe(path).await
     }
     async fn checkout_execute(
         &self,
         request: crate::CheckoutRequest,
     ) -> Result<crate::CheckoutResult, WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.checkout_execute(request).await
+        self.inner().checkout_execute(request).await
     }
 
     async fn stat(&self, request: StatRequest) -> Result<StatResult, WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.stat(request).await
+        self.inner().stat(request).await
     }
 
     async fn read(&self, request: ReadRequest) -> Result<ReadResult, WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.read(request).await
+        self.inner().read(request).await
     }
 
     async fn read_bytes(&self, request: ReadBytesRequest) -> Result<ReadBytesResult, WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.read_bytes(request).await
+        self.inner().read_bytes(request).await
     }
 
     async fn write(&self, request: WriteRequest) -> Result<WriteResult, WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.write(request).await
+        self.inner().write(request).await
     }
 
     async fn edit(&self, request: EditRequest) -> Result<EditResult, WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.edit(request).await
+        self.inner().edit(request).await
     }
 
     async fn list(&self, request: ListRequest) -> Result<ListResult, WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.list(request).await
+        self.inner().list(request).await
     }
 
     async fn glob(&self, request: GlobRequest) -> Result<GlobResult, WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.glob(request).await
+        self.inner().glob(request).await
     }
 
     async fn grep(&self, request: GrepRequest) -> Result<GrepResult, WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.grep(request).await
+        self.inner().grep(request).await
     }
 
     async fn start_command(&self, request: CommandRequest) -> Result<CommandHandle, WorkdirError> {
         let _active = self.state.enter()?;
-        let handle = self.state.session.start_command(request).await?;
+        let handle = self.inner().start_command(request).await?;
         self.state
             .active_commands
             .lock()
@@ -329,7 +340,7 @@ impl WorkdirSession for RoutedWorkdirSession {
 
     async fn command_status(&self, handle: CommandHandle) -> Result<CommandStatus, WorkdirError> {
         let _active = self.state.enter()?;
-        let status = self.state.session.command_status(handle.clone()).await?;
+        let status = self.inner().command_status(handle.clone()).await?;
         self.state.mark_terminal(&handle, status);
         Ok(status)
     }
@@ -340,7 +351,7 @@ impl WorkdirSession for RoutedWorkdirSession {
     ) -> Result<CommandOutput, WorkdirError> {
         let _active = self.state.enter()?;
         let handle = request.handle.clone();
-        let output = self.state.session.command_output(request).await?;
+        let output = self.inner().command_output(request).await?;
         if let Some(terminal) = &output.terminal {
             self.state.mark_terminal(&handle, terminal.status);
         }
@@ -349,7 +360,7 @@ impl WorkdirSession for RoutedWorkdirSession {
 
     async fn cancel_command(&self, handle: CommandHandle) -> Result<(), WorkdirError> {
         let _active = self.state.enter()?;
-        self.state.session.cancel_command(handle.clone()).await?;
+        self.inner().cancel_command(handle.clone()).await?;
         self.state
             .active_commands
             .lock()
@@ -359,11 +370,11 @@ impl WorkdirSession for RoutedWorkdirSession {
     }
 
     fn subscribe_command_events(&self) -> Option<broadcast::Receiver<CommandEvent>> {
-        self.state.session.subscribe_command_events()
+        self.inner().subscribe_command_events()
     }
 
     fn command_snapshot(&self) -> Vec<CommandSnapshot> {
-        let snapshots = self.state.session.command_snapshot();
+        let snapshots = self.inner().command_snapshot();
         self.state.reconcile_terminal_commands(&snapshots);
         snapshots
     }
@@ -374,7 +385,7 @@ impl WorkdirSession for RoutedWorkdirSession {
                 "Workdir attachment has active operations or commands".to_string(),
             ));
         }
-        self.state.session.close().await
+        self.inner().close().await
     }
 }
 
@@ -387,6 +398,7 @@ impl WorkdirSession for RoutedWorkdirSession {
 pub struct WorkdirSessionRouter {
     sessions: RwLock<BTreeMap<WorkdirAttachmentAlias, Arc<RoutedSessionState>>>,
     next_generation: AtomicU64,
+    coordinate_brokers: RwLock<BTreeMap<WorkdirAttachmentAlias, (u64, crate::WorkdirToolBroker)>>,
 }
 
 impl WorkdirSessionRouter {
@@ -473,9 +485,9 @@ impl WorkdirSessionRouter {
             }
         };
         Ok(ResolvedWorkdirSession {
+            session: self.routed(&selected.0, selected.1.clone()),
             alias: selected.0,
             generation: selected.1.generation,
-            session: Arc::new(RoutedWorkdirSession { state: selected.1 }),
         })
     }
 
@@ -484,12 +496,21 @@ impl WorkdirSessionRouter {
         alias: WorkdirAttachmentAlias,
         session: WorkdirSessionHandle,
     ) -> Result<WorkdirSessionHandle, WorkdirError> {
+        self.attach_with_cwd(alias, session, None)
+    }
+
+    fn attach_with_cwd(
+        &self,
+        alias: WorkdirAttachmentAlias,
+        session: WorkdirSessionHandle,
+        cwd: Option<crate::WorkdirPath>,
+    ) -> Result<WorkdirSessionHandle, WorkdirError> {
         let mut sessions = self.sessions.write().map_err(|_| {
-            WorkdirError::Unavailable("Workdir attachment router is poisoned".to_string())
+            WorkdirError::Unavailable("Workdir attachment router is poisoned".into())
         })?;
         if sessions.contains_key(&alias) {
             return Err(WorkdirError::Conflict(format!(
-                "Workdir attachment alias `{alias}` already exists"
+                "Workdir attachment alias \u{0060}{alias}\u{0060} already exists"
             )));
         }
         let state = Arc::new(RoutedSessionState {
@@ -499,8 +520,61 @@ impl WorkdirSessionRouter {
             active_operations: AtomicUsize::new(0),
             active_commands: Mutex::new(HashSet::new()),
         });
+        let view = if let Some(cwd) = cwd {
+            let source = Arc::new(RoutedWorkdirSession {
+                state: state.clone(),
+                view: None,
+            });
+            let broker = crate::WorkdirToolBroker::at_cwd(source, cwd)?;
+            let view = broker.tool_session();
+            self.coordinate_brokers
+                .write()
+                .map_err(|_| {
+                    WorkdirError::Unavailable("Workdir coordinate broker map is poisoned".into())
+                })?
+                .insert(alias.clone(), (state.generation, broker));
+            Some(view)
+        } else {
+            None
+        };
         sessions.insert(alias, state.clone());
-        Ok(Arc::new(RoutedWorkdirSession { state }))
+        Ok(Arc::new(RoutedWorkdirSession { state, view }))
+    }
+
+    fn routed(
+        &self,
+        alias: &WorkdirAttachmentAlias,
+        state: Arc<RoutedSessionState>,
+    ) -> Arc<RoutedWorkdirSession> {
+        let view = self
+            .coordinate_broker(alias, state.generation)
+            .map(|broker| broker.tool_session());
+        Arc::new(RoutedWorkdirSession { state, view })
+    }
+
+    pub(crate) fn coordinate_broker(
+        &self,
+        alias: &WorkdirAttachmentAlias,
+        generation: u64,
+    ) -> Option<crate::WorkdirToolBroker> {
+        self.coordinate_brokers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(alias)
+            .filter(|(current, _)| *current == generation)
+            .map(|(_, broker)| broker.clone())
+    }
+
+    /// Bind tool coordinates once while retaining root-coordinate delegation
+    /// and provider authorization. Both views share the route's detach fence.
+    pub fn attach_at_cwd(
+        &self,
+        alias: WorkdirAttachmentAlias,
+        source: WorkdirSessionHandle,
+        cwd: crate::WorkdirPath,
+    ) -> Result<WorkdirSessionHandle, WorkdirError> {
+        let cwd = crate::WorkdirPath::new(cwd.as_str())?;
+        self.attach_with_cwd(alias, source, Some(cwd))
     }
 
     pub fn session(&self, alias: &WorkdirAttachmentAlias) -> Option<WorkdirSessionHandle> {
@@ -509,7 +583,7 @@ impl WorkdirSessionRouter {
             .ok()?
             .get(alias)
             .cloned()
-            .map(|state| Arc::new(RoutedWorkdirSession { state }) as WorkdirSessionHandle)
+            .map(|state| self.routed(alias, state) as WorkdirSessionHandle)
     }
 
     /// Compatibility projection used only while filesystem tool schemas have no
@@ -521,10 +595,8 @@ impl WorkdirSessionRouter {
             return None;
         }
         sessions
-            .values()
-            .next()
-            .cloned()
-            .map(|state| Arc::new(RoutedWorkdirSession { state }) as WorkdirSessionHandle)
+            .first_key_value()
+            .map(|(alias, state)| self.routed(alias, state.clone()) as WorkdirSessionHandle)
     }
 
     pub fn can_detach(&self, alias: &WorkdirAttachmentAlias) -> Result<(), WorkdirError> {
@@ -620,6 +692,10 @@ impl WorkdirSessionRouter {
             .is_some_and(|current| Arc::ptr_eq(current, &state))
         {
             sessions.remove(alias);
+            self.coordinate_brokers
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(alias);
         }
         Ok(state.session.clone())
     }
@@ -661,6 +737,10 @@ impl WorkdirSessionRouter {
                 .is_some_and(|current| Arc::ptr_eq(current, &state))
             {
                 sessions.remove(&alias);
+                self.coordinate_brokers
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&alias);
             }
         }
         Ok(())
@@ -682,6 +762,131 @@ mod tests {
             manifest::SharedScope::new(Scope::writable(dir.path()).unwrap()),
             WorkdirSessionCapabilities::ALL,
         ))
+    }
+
+    #[tokio::test]
+    async fn cwd_views_share_root_delegation_leases_and_attachment_fences() {
+        use crate::{
+            WorkdirPath as P, WorkdirToolBrokerRouter, WorkdirToolScope,
+            WorkdirToolScopePermission as Permission, WorkdirToolScopeRule,
+        };
+        let root = TempDir::new().unwrap();
+        for directory in ["work", "other", "other/inside"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            std::fs::write(root.path().join(directory).join("marker"), directory).unwrap();
+        }
+        let router = Arc::new(WorkdirSessionRouter::new());
+        let alias = WorkdirAttachmentAlias::new("source").unwrap();
+        let parent = router
+            .attach_at_cwd(alias.clone(), session("wd", &root), P::new("work").unwrap())
+            .unwrap();
+        assert_eq!(parent.environment().cwd, P::new("work").unwrap());
+        let request = |cwd: &str| WorkdirToolScope {
+            rules: vec![WorkdirToolScopeRule {
+                target: P::new(cwd).unwrap(),
+                permission: Permission::Write,
+                recursive: true,
+                symlink_policy: Default::default(),
+            }],
+            cwd: P::new(cwd).unwrap(),
+            command: false,
+        };
+        let brokers = WorkdirToolBrokerRouter::new(router.clone());
+        // Declarations stay root-relative, not work/other.
+        let child = brokers
+            .scope(vec![(alias.clone(), request("other"))])
+            .await
+            .unwrap();
+        let grandchild = child
+            .broker_router()
+            .scope(vec![(alias.clone(), request("other/inside"))])
+            .await
+            .unwrap();
+        for (session, cwd) in [
+            (parent.clone(), "work"),
+            (
+                child.session_router().resolve(None).unwrap().session,
+                "other",
+            ),
+            (
+                grandchild.session_router().resolve(None).unwrap().session,
+                "other/inside",
+            ),
+        ] {
+            assert_eq!(session.environment().cwd, P::new(cwd).unwrap());
+            let result = session
+                .read(ReadRequest {
+                    path: P::new("marker").unwrap(),
+                    offset: 0,
+                    limit: 10,
+                    max_bytes: 100,
+                })
+                .await
+                .unwrap();
+            assert_eq!(result.bytes, cwd.as_bytes());
+            assert_eq!(result.path, P::new("marker").unwrap());
+            assert_eq!(
+                session
+                    .stat(StatRequest {
+                        path: P::new("marker").unwrap()
+                    })
+                    .await
+                    .unwrap()
+                    .path,
+                P::new("marker").unwrap()
+            );
+        }
+        // The model's tool view and delegation view share write-lease exclusion.
+        let absolute = P::new_scoped(root.path().join("other/marker").to_str().unwrap()).unwrap();
+        let denied = parent
+            .write(WriteRequest {
+                path: absolute,
+                content: b"forbidden".to_vec(),
+                expected_hash: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied.denial_reason(),
+            Some(crate::WorkdirDenialReason::ChildWriteLeaseConflict)
+        );
+        let old_child = child.session_router().resolve(None).unwrap().session;
+        router.begin_detach(&alias).await.unwrap();
+        assert!(
+            old_child
+                .read(ReadRequest {
+                    path: P::new("marker").unwrap(),
+                    offset: 0,
+                    limit: 10,
+                    max_bytes: 100
+                })
+                .await
+                .is_err()
+        );
+        router.cancel_detach(&alias);
+        grandchild.close().await.unwrap();
+        child.close().await.unwrap();
+        router.detach(&alias).await.unwrap();
+        router
+            .attach_at_cwd(
+                alias,
+                session("replacement", &root),
+                P::new("other").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            router.resolve(None).unwrap().session.environment().cwd,
+            P::new("other").unwrap()
+        );
+        assert!(
+            old_child
+                .stat(StatRequest {
+                    path: P::new("marker").unwrap()
+                })
+                .await
+                .is_err()
+        );
+        router.close_all().await.unwrap();
     }
 
     #[tokio::test]

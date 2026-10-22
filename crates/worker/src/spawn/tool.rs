@@ -1107,6 +1107,8 @@ fn sub_worker_spawn_tool_impl(
 
 #[cfg(test)]
 mod tests {
+    mod environment;
+
     use super::*;
     use manifest::{DelegationScope, Permission, Scope, SharedScope};
     use std::pin::Pin;

@@ -13,7 +13,7 @@ use workdir::{WorkdirPath, WorkdirSessionHandle, WorkdirSessionRouter};
 const DESCRIPTION: &str = "Read a text file from a Workdir attachment selected by its Worker-local alias. \
 Supports offset/limit for large files. Returns line-numbered output (1-based). \
 Directories cannot be read. The file must be read before Write or Edit can \
-modify it. Paths are Workdir-relative unless an absolute path is explicitly readable. \
+modify it. \
 When exactly one Workdir is attached, target_workdir may be omitted.";
 
 const DEFAULT_LIMIT: usize = 2000;
@@ -24,7 +24,7 @@ pub(crate) struct ReadParams {
     /// Worker-local alias of the Workdir attachment to use.
     #[serde(default)]
     pub target_workdir: Option<String>,
-    /// Workdir-relative path, or an absolute path covered by readable scope.
+    /// Text file to read; directories are not supported.
     pub file_path: String,
     #[serde(flatten)]
     pub read: fs_operation::text::LineReadArgs,

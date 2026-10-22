@@ -7,13 +7,12 @@
 //! eagerly syntax-checks it at Worker construction. The final system
 //! prompt is materialised exactly once just before the first LLM turn:
 //! the rendered body is appended with a fixed trailing section carrying
-//! the Worker's `Scope` summary, (if present) the project's `AGENTS.md`
-//! contents, resident memory sections, and conditional Worker-orchestration
-//! guidance, then the whole string is handed to the Engine via
-//! `set_system_prompt`. Subsequent turns and compactions reuse that
+//! the Worker's `Scope` summary, actual Workdir session environments, (if
+//! present) the project's `AGENTS.md` contents, resident memory sections, and
+//! conditional Worker-orchestration guidance, then the whole string is handed
+//! to the Engine via `set_system_prompt`. Subsequent turns and compactions reuse that
 //! materialised string verbatim.
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -105,7 +104,8 @@ impl std::fmt::Debug for SystemPromptTemplate {
 /// templates cannot drop them on the floor.
 pub struct SystemPromptContext<'a> {
     pub now: DateTime<Utc>,
-    pub cwd: Cow<'a, str>,
+    /// The same session router used by the Worker's filesystem tools.
+    pub workdir_sessions: &'a workdir::WorkdirSessionRouter,
     /// Language policy exposed to instruction templates as `{{ language }}`.
     pub language: &'a str,
     pub scope: &'a Scope,
@@ -140,7 +140,14 @@ impl<'a> SystemPromptContext<'a> {
             "datetime".into(),
             Value::from(self.now.to_rfc3339_opts(SecondsFormat::Secs, true)),
         );
-        root.insert("cwd".into(), Value::from(self.cwd.as_ref()));
+        // A singular template cwd is meaningful only with one attachment. Never
+        // substitute the local Profile/Memory discovery directory for a session cwd.
+        let cwd = self
+            .workdir_sessions
+            .only_session()
+            .map(|session| display_workdir_path(&session.environment().cwd).to_owned())
+            .unwrap_or_else(|| "no single Workdir session cwd; see execution environment".into());
+        root.insert("cwd".into(), Value::from(cwd));
         root.insert("language".into(), Value::from(self.language));
         root.insert(
             "tools".into(),
@@ -255,6 +262,70 @@ fn exact_prompt_name(reference: &str) -> Option<String> {
     }
 }
 
+fn display_workdir_path(path: &workdir::WorkdirPath) -> &str {
+    if path.as_str().is_empty() {
+        "."
+    } else {
+        path.as_str()
+    }
+}
+
+/// Project provider-owned session metadata, rather than reconstructing authority
+/// from a manifest Scope or the directory used to discover Profiles and Memory.
+pub(crate) fn workdir_environment_section(
+    router: &workdir::WorkdirSessionRouter,
+) -> Result<String, SystemPromptError> {
+    use workdir::WorkdirSessionCapability::{Command, Edit, Glob, Grep, Read, Write};
+
+    let mut environments = Vec::new();
+    for alias in router.aliases() {
+        let resolved = router
+            .resolve(Some(alias.as_str()))
+            .map_err(|error| SystemPromptError::Render(error.to_string()))?;
+        let environment = resolved.session.environment();
+        let capabilities: Vec<_> = [
+            (Read, "read"),
+            (Write, "write"),
+            (Edit, "edit"),
+            (Glob, "glob"),
+            (Grep, "grep"),
+            (Command, "command"),
+        ]
+        .into_iter()
+        .filter_map(|(capability, name)| {
+            environment
+                .capabilities
+                .supports(capability)
+                .then_some(name)
+        })
+        .collect();
+        environments.push(serde_json::json!({
+            "alias": alias.as_str(),
+            "cwd": display_workdir_path(&environment.cwd),
+            "scope": environment.scope,
+            "restrictions": environment.restrictions,
+            "capabilities": capabilities,
+            "command": environment.capabilities.supports(Command),
+        }));
+    }
+    let json = serde_json::to_string_pretty(&environments)
+        .map_err(|error| SystemPromptError::Render(error.to_string()))?;
+    Ok(format!(
+        "## Workdir execution environment\n\n\
+         Select a Workdir by its alias (`target_workdir`); omission is allowed only with one attachment. \
+         Relative filesystem operation paths are resolved from that selected session's cwd, not its Workdir root. \
+         Paths returned by Glob/Grep use the same cwd-relative coordinates and can be passed unchanged to other filesystem tools. \
+         Bash starts at the session cwd; an explicit relative cwd is resolved from it, and shell cd does not change the session cwd.\n\n\
+         In the metadata below, cwd and relative scope targets are Workdir-root-relative (`.` or an empty path denotes the root); explicit absolute provider scope targets stay absolute. \
+         A null scope means the provider's full available scope, not unrestricted host access; an empty scope grants no paths. \
+         Restrictions retain additional provider or ancestor ceilings, including deny rules. \
+         Capabilities and command availability are session ceilings, not new grants. \
+         Resolved targets remain subject to scope, symlink and command authorization. \
+         SubWorker scope declarations remain Workdir-root-relative; other Scope declarations and Profile/Memory roots retain their own meaning and are not rebased by session cwd.\n\n\
+         ```json\n{json}\n```"
+    ))
+}
+
 /// Build the final system prompt by appending the fixed trailing
 /// section to `body`. The Rust side owns the layout (blank-line
 /// separators, trailing-whitespace trim); each section's header + body
@@ -276,8 +347,12 @@ fn append_trailing_section(
     }
     out.push('\n');
 
-    let boundaries = prompts.working_boundaries_section(&scope.summary())?;
-    out.push_str(boundaries.trim_end_matches(&['\n', ' '][..]));
+    if ctx.workdir_sessions.is_empty() {
+        let boundaries = prompts.working_boundaries_section(&scope.summary())?;
+        out.push_str(boundaries.trim_end_matches(&['\n', ' '][..]));
+        out.push('\n');
+    }
+    out.push_str(&workdir_environment_section(ctx.workdir_sessions)?);
     out.push('\n');
     if let Some(agents) = agents_md {
         out.push('\n');
@@ -392,7 +467,7 @@ mod tests {
                 now: DateTime::parse_from_rfc3339("2026-10-08T00:00:00Z")
                     .unwrap()
                     .with_timezone(&Utc),
-                cwd: Cow::Borrowed("."),
+                workdir_sessions: &workdir::WorkdirSessionRouter::new(),
                 language: "en",
                 scope: &scope,
                 tool_names: metas.iter().map(|meta| meta.name.clone()).collect(),

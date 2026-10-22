@@ -111,6 +111,9 @@ impl Harness {
                         session_id: WorkdirSessionId::new("session-transport").unwrap(),
                         workdir_id: Workdir::new("wd-transport").id().clone(),
                         capabilities: WorkdirSessionCapabilities::ALL,
+                        environment: workdir::WorkdirSessionEnvironment::root(
+                            WorkdirSessionCapabilities::ALL,
+                        ),
                     })
                 }),
             )

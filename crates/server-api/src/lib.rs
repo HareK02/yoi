@@ -7514,6 +7514,9 @@ pub struct CurrentWorkerWorkdirAttachmentResponse {
     pub alias: String,
     pub working_directory_id: String,
     pub capabilities: workdir::WorkdirSessionCapabilities,
+    /// Present for attachment responses, absent after detach.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<workdir::WorkdirSessionEnvironment>,
     pub attached: bool,
 }
 
@@ -13286,6 +13289,7 @@ mod tests {
             alias: "checkout".to_string(),
             working_directory_id: "workdir".to_string(),
             capabilities: workdir::WorkdirSessionCapabilities::EMPTY,
+            environment: None,
             attached: false,
         };
         let value = serde_json::to_value(&response).unwrap();

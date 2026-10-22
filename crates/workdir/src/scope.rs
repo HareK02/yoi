@@ -108,17 +108,34 @@ impl WorkdirToolBroker {
         Self::with_capabilities(source, capabilities)
     }
 
+    /// Set the tool coordinate base without changing provider authority.
+    /// The input is relative to the source session's coordinates; delegation
+    /// declarations retain their existing coordinate contract.
+    pub fn at_cwd(source: WorkdirSessionHandle, cwd: FsPath) -> Result<Self, WorkdirError> {
+        let cwd = FsPath::new(cwd.as_str())?;
+        let capabilities = source.capabilities();
+        Ok(Self::with_capabilities_and_cwd(source, capabilities, cwd))
+    }
+
     /// Own a session behind an additional Backend-authored capability ceiling.
     /// The ceiling can only attenuate provider capabilities; it can never add one.
     pub fn with_capabilities(
         source: WorkdirSessionHandle,
         capabilities: WorkdirSessionCapabilities,
     ) -> Self {
+        Self::with_capabilities_and_cwd(source, capabilities, FsPath::root())
+    }
+
+    fn with_capabilities_and_cwd(
+        source: WorkdirSessionHandle,
+        capabilities: WorkdirSessionCapabilities,
+        cwd: FsPath,
+    ) -> Self {
         let capabilities = source.capabilities().intersection(capabilities);
         let (command_events, _) = broadcast::channel(64);
         let authority = Arc::new(ScopedWorkdirSession {
             source,
-            cwd: FsPath::new("").expect("empty Workdir path is valid"),
+            cwd,
             scope: None,
             capabilities,
             validity: SessionValidity::root(),
@@ -416,6 +433,9 @@ impl WorkdirToolBrokerRouter {
             .sessions
             .resolve(Some(alias.as_str()))
             .map_err(|error| WorkdirError::InvalidArgument(error.to_string()))?;
+        if let Some(broker) = self.sessions.coordinate_broker(alias, selected.generation) {
+            return Ok(broker);
+        }
         let mut brokers = self.brokers.lock().map_err(|_| {
             WorkdirError::Unavailable("Workdir tool broker router is poisoned".to_string())
         })?;
@@ -684,7 +704,7 @@ impl ScopedWorkdirSession {
     }
 
     fn resolve_path(&self, path: &FsPath) -> Result<FsPath, WorkdirError> {
-        if self.cwd.as_str().is_empty() {
+        if self.cwd.as_str().is_empty() || Path::new(path.as_str()).is_absolute() {
             return Ok(path.clone());
         }
         let joined = Path::new(self.cwd.as_str()).join(path.as_str());
@@ -1085,6 +1105,43 @@ impl WorkdirSession for ScopedWorkdirSession {
         self.capabilities
     }
 
+    fn environment(&self) -> crate::WorkdirSessionEnvironment {
+        let mut environment = self.source.environment();
+        let source_cwd = environment.cwd.clone();
+        environment.cwd = FsPath::new(
+            Path::new(source_cwd.as_str())
+                .join(self.cwd.as_str())
+                .to_str()
+                .expect("validated UTF-8 paths"),
+        )
+        .expect("validated session cwd");
+        if let Some(scope) = &self.scope {
+            if let Some(inherited) = environment.scope.take() {
+                environment
+                    .restrictions
+                    .push(format!("Provider allow ceiling: {inherited:?}"));
+            }
+            environment.scope = Some(
+                scope
+                    .iter()
+                    .cloned()
+                    .map(|mut rule| {
+                        rule.target = FsPath::new(
+                            Path::new(source_cwd.as_str())
+                                .join(rule.target.as_str())
+                                .to_str()
+                                .expect("validated UTF-8 paths"),
+                        )
+                        .expect("validated scope target");
+                        rule
+                    })
+                    .collect(),
+            );
+        }
+        environment.capabilities = self.capabilities();
+        environment
+    }
+
     async fn authorize_scope_path(
         &self,
         mut request: WorkdirScopeAuthorizationRequest,
@@ -1273,8 +1330,11 @@ impl WorkdirSession for ScopedWorkdirSession {
             .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
             .await?;
         self.ensure_read(&path, WorkdirSessionCapability::Read)?;
+        let caller_path = request.path.clone();
         request.path = path;
-        self.source.stat(request).await
+        let mut result = self.source.stat(request).await?;
+        result.path = caller_path;
+        Ok(result)
     }
 
     async fn read(&self, mut request: ReadRequest) -> Result<ReadResult, WorkdirError> {
@@ -1282,8 +1342,11 @@ impl WorkdirSession for ScopedWorkdirSession {
             .resolve_operation_path(&request.path, WorkdirToolScopePermission::Read)
             .await?;
         self.ensure_read(&path, WorkdirSessionCapability::Read)?;
+        let caller_path = request.path.clone();
         request.path = path;
-        self.source.read(request).await
+        let mut result = self.source.read(request).await?;
+        result.path = caller_path;
+        Ok(result)
     }
 
     async fn read_bytes(
@@ -1422,9 +1485,10 @@ impl WorkdirSession for ScopedWorkdirSession {
             )));
         }
         let tool_call_id = request.tool_call_id.clone();
-        if self.scope.is_some() {
-            request.cwd = self.resolve_path(&request.cwd)?;
-        }
+        request.cwd = self
+            .resolve_operation_path(&request.cwd, WorkdirToolScopePermission::Read)
+            .await?;
+        self.ensure_path(&request.cwd, WorkdirToolScopePermission::Read)?;
         if let Some(tool_call_id) = &tool_call_id {
             self.starting_tool_calls
                 .lock()
@@ -1601,7 +1665,20 @@ impl WorkdirSession for ReadOnlyWorkdirSession {
     }
 
     fn capabilities(&self) -> WorkdirSessionCapabilities {
-        WorkdirSessionCapabilities::READ_ONLY
+        self.inner
+            .capabilities()
+            .intersection(WorkdirSessionCapabilities::READ_ONLY)
+    }
+
+    fn environment(&self) -> crate::WorkdirSessionEnvironment {
+        let mut environment = self.inner.environment();
+        environment.capabilities = self.capabilities();
+        if let Some(scope) = &mut environment.scope {
+            for rule in scope {
+                rule.permission = WorkdirToolScopePermission::Read;
+            }
+        }
+        environment
     }
 
     async fn authorize_scope_path(

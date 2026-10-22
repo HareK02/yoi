@@ -20,7 +20,7 @@ pub(crate) struct WriteParams {
     /// Worker-local alias of the Workdir attachment to use.
     #[serde(default)]
     pub target_workdir: Option<String>,
-    /// Logical path relative to the bound Workdir root.
+    /// File to create or overwrite.
     pub file_path: String,
     #[serde(flatten)]
     pub write: fs_operation::text::WriteArgs,

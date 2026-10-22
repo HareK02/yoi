@@ -6,7 +6,7 @@
 //! hashes alone do not accept same-content inode replacements. Callers own Read line numbering
 //! and per-attachment read history.
 //!
-//! Create paths are checkout-root-relative and must be strict descendants of the observed target
+//! Create paths use the target's session coordinates and must be strict descendants of the observed target
 //! directory. Existing destinations are never overwritten; results return the updated observation
 //! of the retained target directory, not the created file. Read results also return the validator
 //! of the state actually read, never a replacement from a later independent stat.
@@ -18,7 +18,8 @@
 //!
 //! Search delegates to shared List/Glob/Grep engines. Scope rules form unions within layers and
 //! intersections across layers, provider authority, and output roots. Wrappers transform coordinates
-//! once; returned paths and Grep content are relative to the final session's logical root.
+//! once; returned paths and Grep content are relative to the composed output root (the caller's
+//! cwd by default).
 //! Paths are not reverse-parsed from rendered filenames; non-UTF-8 names are not lossily aliased.
 //! Unsupported providers reject search rather than fall back to broader trait searches. Search is
 //! live traversal, not an atomic snapshot of all descendants or exclusion of external editors.

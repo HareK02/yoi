@@ -20656,6 +20656,55 @@ async fn import_current_worker_workdir_observation(
     Ok(())
 }
 
+// The Backend proxy has root-coordinate operations even before its provider is
+// opened. Multiple attachments must remain attachable without opening every
+// provider: a pending/offline provider is checked when an operation selects it.
+async fn current_worker_attachment_environment_locked(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    link: &WorkerWorkdirLinkRecord,
+    capabilities: workdir::WorkdirSessionCapabilities,
+    open_if_single: bool,
+    session_guard: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+) -> Result<workdir::WorkdirSessionEnvironment> {
+    if open_if_single {
+        let stage_api = api.clone();
+        let stage_worker = worker.clone();
+        let count = api
+            .store
+            .db_executor()
+            .run(move || {
+                active_filesystem_workdir_links(&stage_api, &stage_worker).map(|links| links.len())
+            })
+            .await?;
+        if count == 1 {
+            return Ok(open_current_worker_workdir_session_locked(
+                api,
+                worker,
+                link,
+                session_guard,
+            )
+            .await?
+            .environment());
+        }
+    }
+    if let Some(mut environment) = api
+        .workdir_sessions
+        .lock()
+        .expect("Workdir session registry lock poisoned")
+        .attachments
+        .get(worker)
+        .filter(|source| source.workdir().id().as_str() == link.workdir_id)
+        .map(|source| source.environment())
+    {
+        environment.capabilities = environment.capabilities.intersection(capabilities);
+        return Ok(environment);
+    }
+    let mut environment = workdir::WorkdirSessionEnvironment::root(capabilities);
+    environment.restrictions.push("Backend proxy: provider scope and availability are checked when each operation selects this attachment".into());
+    Ok(environment)
+}
+
 async fn scoped_attach_current_worker_workdir(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -20782,17 +20831,17 @@ async fn scoped_attach_current_worker_workdir(
                 }
                 let effective_capabilities = existing.capabilities.intersection(capabilities);
                 if effective_capabilities != existing.capabilities {
-                    let mut attenuated = existing;
+                    let mut attenuated = existing.clone();
                     attenuated.capabilities = effective_capabilities;
                     api.store.attach_worker_workdir(&attenuated)?;
                 }
-                Ok(Some(effective_capabilities))
+                Ok(Some((existing, effective_capabilities)))
             } else {
                 Ok(None)
             }
         })
         .await?;
-    if let Some(effective_capabilities) = existing {
+    if let Some((link, effective_capabilities)) = existing {
         sync_runtime_worker_workdir_attachments_locked(&api, &worker, &_session_guard).await?;
         api.worker_projection
             .refresh_async(&worker)
@@ -20803,6 +20852,17 @@ async fn scoped_attach_current_worker_workdir(
             alias: alias.to_string(),
             working_directory_id: workdir_id.to_string(),
             capabilities: effective_capabilities,
+            environment: Some(
+                current_worker_attachment_environment_locked(
+                    &api,
+                    &worker,
+                    &link,
+                    effective_capabilities,
+                    false,
+                    &_session_guard,
+                )
+                .await?,
+            ),
             attached: true,
         }));
     }
@@ -20828,25 +20888,25 @@ async fn scoped_attach_current_worker_workdir(
             detach_worker_workdir_stage_locked(&api, &worker, workdir_id, &_session_guard).await;
         return Err(error);
     }
-    let stage_api = api.clone();
-    let stage_worker = worker.clone();
-    let active_count = api
-        .store
-        .db_executor()
-        .run(move || {
-            active_filesystem_workdir_links(&stage_api, &stage_worker).map(|links| links.len())
-        })
-        .await?;
-    if active_count == 1
-        && let Err(error) =
-            open_current_worker_workdir_session_locked(&api, &worker, &link, &_session_guard).await
+    let environment = match current_worker_attachment_environment_locked(
+        &api,
+        &worker,
+        &link,
+        capabilities,
+        true,
+        &_session_guard,
+    )
+    .await
     {
-        let _ =
-            detach_worker_workdir_stage_locked(&api, &worker, workdir_id, &_session_guard).await;
-        let _ =
-            sync_runtime_worker_workdir_attachments_locked(&api, &worker, &_session_guard).await;
-        return Err(error.into());
-    }
+        Ok(environment) => environment,
+        Err(error) => {
+            let _ = detach_worker_workdir_stage_locked(&api, &worker, workdir_id, &_session_guard)
+                .await;
+            let _ = sync_runtime_worker_workdir_attachments_locked(&api, &worker, &_session_guard)
+                .await;
+            return Err(error.into());
+        }
+    };
     if let Err(error) = api
         .worker_projection
         .refresh_async(&worker)
@@ -20863,6 +20923,7 @@ async fn scoped_attach_current_worker_workdir(
         alias: alias.to_string(),
         working_directory_id: workdir_id.to_string(),
         capabilities,
+        environment: Some(environment),
         attached: true,
     }))
 }
@@ -21105,6 +21166,7 @@ async fn detach_current_worker_workdir(
         alias: alias.to_string(),
         working_directory_id: link.workdir_id,
         capabilities: workdir::WorkdirSessionCapabilities::EMPTY,
+        environment: None,
         attached: false,
     })
 }
@@ -60835,6 +60897,12 @@ mod tests {
             serde_json::from_slice(&attached_body).unwrap();
         assert!(attached.attached);
         assert_eq!(attached.working_directory_id, fixture.docs_workdir_id);
+        let environment = attached
+            .environment
+            .expect("attached proxy has an execution environment");
+        assert!(environment.cwd.is_root());
+        assert_eq!(environment.capabilities, attached.capabilities);
+        assert!(!environment.restrictions.is_empty());
         assert_eq!(
             api.store
                 .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)

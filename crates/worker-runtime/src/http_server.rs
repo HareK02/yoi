@@ -869,6 +869,7 @@ async fn open_workdir_session(
         session_id: session_id.clone(),
         workdir_id: session.workdir().id().clone(),
         capabilities: session.capabilities(),
+        environment: session.environment(),
     };
     state
         .workdir_sessions
