@@ -1332,15 +1332,28 @@ impl WorkspaceClient for ReviewerChildWorkspaceClient {
         mut request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let workspace_id = self.workspace_id().unwrap_or_default();
-        let ticket_id = &self.context.ticket_id;
         let ticket_query_path = format!("/api/w/{workspace_id}/tickets/query");
-        let ticket_show_path = format!("/api/w/{workspace_id}/tickets/{ticket_id}/show");
+        let ticket_show_prefix = format!("/api/w/{workspace_id}/tickets/");
+        // ShowTicket uses POST for bounded read parameters. Like Ticket query
+        // and GET reads, it must allow related Tickets through the bound Host's
+        // read authority. Only review submission is restricted to the attested MR.
+        // Match one literal reference segment, not arbitrary POST routes.
+        let is_ticket_show = request
+            .path
+            .strip_prefix(&ticket_show_prefix)
+            .and_then(|path| path.strip_suffix("/show"))
+            .is_some_and(|reference| {
+                !reference.is_empty()
+                    && reference
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            });
         let merge_request_id = &self.context.merge_request_id;
         let review_path =
             format!("/api/w/{workspace_id}/merge-requests/{merge_request_id}/reviews");
         let read_allowed = request.method == WorkspaceRequestMethod::Get
             || (request.method == WorkspaceRequestMethod::Post
-                && (request.path == ticket_query_path || request.path == ticket_show_path));
+                && (request.path == ticket_query_path || is_ticket_show));
         if request.method == WorkspaceRequestMethod::Post && request.path == review_path {
             let body = request.body.take().ok_or_else(|| {
                 WorkspaceClientError::Request("review submission requires a JSON body".to_string())
@@ -1868,16 +1881,11 @@ mod reviewer_client_tests {
     }
 
     #[test]
-    fn reviewer_child_client_rejects_other_ticket_and_mutation_posts() {
+    fn reviewer_child_client_rejects_mutation_posts() {
         let inner: Arc<dyn WorkspaceClient> = Arc::new(RecordingWorkspaceClient::default());
         let client = reviewer_client(inner);
 
         for request in [
-            WorkspaceRequest::json(
-                WorkspaceRequestMethod::Post,
-                "/api/w/ws/tickets/T2/show",
-                "{}".to_string(),
-            ),
             WorkspaceRequest::json(
                 WorkspaceRequestMethod::Post,
                 "/api/w/ws/tickets/T1/comments",
@@ -1892,6 +1900,54 @@ mod reviewer_client_tests {
             let error = client.execute(request).unwrap_err();
             assert!(error.to_string().contains("read-only"));
         }
+    }
+
+    #[test]
+    fn reviewer_ticket_reads_reject_route_injection_and_mutations_without_transport() {
+        let inner = Arc::new(RecordingWorkspaceClient::default());
+        let client = reviewer_client(inner.clone());
+        for path in [
+            "/api/w/other/tickets/T-1/show",
+            "/api/w/ws/tickets//show",
+            "/api/w/ws/tickets/T-1/comments",
+            "/api/w/ws/tickets/T-1/posts",
+            "/api/w/ws/tickets/T-1/show/",
+            "/api/w/ws/tickets/T-1/show?query=1",
+            "/api/w/ws/tickets/T-1?query=1/show",
+            "/api/w/ws/tickets/T-1#fragment/show",
+            "/api/w/ws/tickets/../show",
+            "/api/w/ws/tickets/T-1/../T-2/show",
+            "/api/w/ws/tickets/T%2D1/show",
+            "/api/w/ws/tickets/T-1%2fcomments/show",
+            "/api/w/ws/merge-requests/MR2/reviews",
+        ] {
+            assert!(
+                client
+                    .execute(WorkspaceRequest::json(
+                        WorkspaceRequestMethod::Post,
+                        path,
+                        "{}",
+                    ))
+                    .is_err(),
+                "{path}"
+            );
+        }
+        for method in [
+            WorkspaceRequestMethod::Put,
+            WorkspaceRequestMethod::Patch,
+            WorkspaceRequestMethod::Delete,
+        ] {
+            assert!(
+                client
+                    .execute(WorkspaceRequest::json(
+                        method,
+                        "/api/w/ws/tickets/T-1/show",
+                        "{}"
+                    ))
+                    .is_err()
+            );
+        }
+        assert!(inner.requests.lock().unwrap().is_empty());
     }
 
     #[test]

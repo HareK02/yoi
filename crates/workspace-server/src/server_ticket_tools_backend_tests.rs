@@ -120,6 +120,14 @@ struct TicketSurface {
 }
 impl TicketSurface {
     async fn new(root: &Path, client: Arc<TicketRouterClient>, wip: bool) -> Self {
+        Self::with_access(root, client, wip, TicketFeatureAccess::workflow()).await
+    }
+    async fn with_access(
+        root: &Path,
+        client: Arc<dyn WorkspaceClient>,
+        wip: bool,
+        access: TicketFeatureAccess,
+    ) -> Self {
         let manifest = worker::WorkerManifest::from_toml("[worker]\nname=\"ticket-tools\"\n[model]\nscheme=\"anthropic\"\nmodel_id=\"unused\"\n[engine]\n[scope]\nallow=[]\n").unwrap();
         let engine =
             agen::Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
@@ -138,22 +146,18 @@ impl TicketSurface {
         )
         .await
         .unwrap();
-        let report =
-            host.install_features(worker::feature::FeatureRegistryBuilder::new().with_module(
-                TicketFeature::new(client.clone(), TicketFeatureAccess::workflow()),
-            ));
+        let report = host.install_features(
+            worker::feature::FeatureRegistryBuilder::new()
+                .with_module(TicketFeature::new(client.clone(), access)),
+        );
         assert!(!report.has_errors());
         let handle = host.engine().tool_server_handle();
         handle.flush_pending();
-        let tools = [
-            "TicketAssignmentTrackingQuery",
-            "TicketAssignmentAnswer",
-            "TicketImplementationResult",
-            "TicketImplementationResultQuery",
-        ]
-        .into_iter()
-        .map(|name| (name.into(), handle.get_tool(name).unwrap().1))
-        .collect();
+        let tools = access
+            .tool_names()
+            .into_iter()
+            .map(|name| (name.into(), handle.get_tool(name).unwrap().1))
+            .collect();
         if !wip {
             return Self { tools, wip };
         }
@@ -162,7 +166,7 @@ impl TicketSurface {
         worker::feature::builtin::ticket::mount_workspace_http_ticket_wip(
             &mut mounts,
             client,
-            TicketFeatureAccess::workflow(),
+            access,
             None,
             &route,
         )
@@ -189,8 +193,9 @@ impl TicketSurface {
         if !self.wip {
             return execute_tool(self.tools[name].clone(), input, context).await;
         }
-        let path = format!("/tickets/{}", input["ticket"].as_str().unwrap());
-        input.as_object_mut().unwrap().remove("ticket");
+        let reference_field = if name == "ShowTicket" { "id" } else { "ticket" };
+        let path = format!("/tickets/{}", input[reference_field].as_str().unwrap());
+        input.as_object_mut().unwrap().remove(reference_field);
         // Observe the real item representation before invoking a mutation. Tracking
         // reads alone do not establish the Ticket WIP object validator. Explicit
         // refresh also reconciles stale observations after an unknown result;
@@ -201,6 +206,9 @@ impl TicketSurface {
             ToolExecutionContext::direct(),
         )
         .await?;
+        if name == "ShowTicket" {
+            return execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":"read","arguments":input}), context).await;
+        }
         execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":"read","arguments":{}}), ToolExecutionContext::direct()).await?;
         let inspected = execute_tool(
             self.tools["Inspect"].clone(),
@@ -361,6 +369,210 @@ async fn ticket_public_roundtrip_observed_answer_replays_without_changing_waitin
                 .unwrap(),
             observed
         );
+    }
+}
+
+// Reviewer policy, tool projection, reference resolution, authentication and
+// persistence remain production code. Only the synchronous HTTP transport is
+// replaced by signed in-process router dispatch. Child spawning and MR attestation
+// have their own suites; this fixture does not claim to exercise those boundaries.
+fn reviewer_client(inner: Arc<TicketRouterClient>, bound_ticket: &str) -> Arc<dyn WorkspaceClient> {
+    Arc::new(worker::ReviewerChildWorkspaceClient::new(
+        inner,
+        worker::ReviewerContext {
+            ticket_id: bound_ticket.into(),
+            merge_request_id: "unsubmitted-review-candidate".into(),
+        },
+        "unused-review-capability".into(),
+    ))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reviewer_reads_saved_related_tickets_by_key_and_id_and_pages_their_threads() {
+    for wip in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _runtime, identity, source, bound_id) = tracking_fixture(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let mut related = ticket::NewTicket::new("Related requirements");
+        related.body = ticket::MarkdownText::new("Requirements from a different Ticket");
+        let related = backend.create(related).unwrap();
+        backend
+            .add_ticket_relation(
+                bound_id.clone().into(),
+                ticket::NewTicketRelation {
+                    kind: ticket::TicketRelationKind::DependsOn,
+                    target: related.id.clone(),
+                    note: None,
+                    author: None,
+                },
+            )
+            .unwrap();
+        for body in ["Earlier decision", "Latest decision"] {
+            backend
+                .add_event(
+                    related.id.clone().into(),
+                    ticket::NewTicketEvent::new(ticket::TicketEventKind::Comment, body),
+                )
+                .unwrap();
+        }
+        let bound = backend.show(bound_id.clone().into()).unwrap();
+        let related_before = backend.show(related.id.clone().into()).unwrap();
+        let bound_key = bound.meta.resource_key.as_deref().unwrap();
+        let related_key = related.resource_key.as_deref().unwrap();
+        let transport = ticket_client(&api, identity, &source);
+        // One client must retain its review binding while following related Tickets.
+        let client = reviewer_client(transport.clone(), &bound_id);
+        let surface =
+            TicketSurface::with_access(dir.path(), client, wip, TicketFeatureAccess::review())
+                .await;
+        for (reference, expected_key, expected_title, expected_body) in [
+            (
+                bound_key,
+                bound_key,
+                "Tracking authority",
+                bound.document.body.as_str(),
+            ),
+            (
+                related_key,
+                related_key,
+                "Related requirements",
+                related_before.document.body.as_str(),
+            ),
+            (
+                related.id.as_str(),
+                related_key,
+                "Related requirements",
+                related_before.document.body.as_str(),
+            ),
+            (
+                bound_id.as_str(),
+                bound_key,
+                "Tracking authority",
+                bound.document.body.as_str(),
+            ),
+        ] {
+            let shown = surface
+                .call(
+                    "ShowTicket",
+                    serde_json::json!({"id":reference}),
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(shown["ticket"], expected_key);
+            assert_eq!(shown["title"], expected_title);
+            assert_eq!(shown["body"], expected_body);
+            if expected_key == bound_key {
+                assert!(
+                    shown["relations"]["outgoing"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|relation| relation["ticket"] == related_key
+                            && relation["kind"] == "depends_on")
+                );
+            }
+        }
+        let first = surface
+            .call(
+                "ShowTicket",
+                serde_json::json!({"id":related_key,"event_limit":1}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first["thread"].as_array().unwrap().len(), 1);
+        assert_eq!(first["thread"][0]["body"], "Latest decision");
+        assert_eq!(first["event_page"]["has_more"], true);
+        let second = surface.call("ShowTicket", serde_json::json!({"id":related_key,"event_limit":1,"event_cursor":first["event_page"]["next_cursor"]}), ToolExecutionContext::direct()).await.unwrap();
+        assert_eq!(second["thread"].as_array().unwrap().len(), 1);
+        assert_eq!(second["thread"][0]["body"], "Earlier decision");
+        assert_eq!(backend.show(bound_id.into()).unwrap(), bound);
+        assert_eq!(backend.show(related.id.into()).unwrap(), related_before);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reviewer_read_uses_live_backend_membership_and_cannot_mutate_saved_ticket() {
+    for wip in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, _runtime, identity, source, ticket) = tracking_fixture(dir.path()).await;
+        let backend = browser_ticket_backend(&api).unwrap();
+        let before = backend.show(ticket.clone().into()).unwrap();
+        let transport = ticket_client(&api, identity, &source);
+        let client = reviewer_client(transport.clone(), &ticket);
+        let surface = TicketSurface::with_access(
+            dir.path(),
+            client.clone(),
+            wip,
+            TicketFeatureAccess::review(),
+        )
+        .await;
+        surface
+            .call(
+                "ShowTicket",
+                serde_json::json!({"id":ticket}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        let request_count = transport.requests.lock().unwrap().len();
+        for (method, path, body) in [
+            (
+                WorkspaceRequestMethod::Post,
+                format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/comments"),
+                serde_json::json!({"body":"unauthorized comment"}),
+            ),
+            (
+                WorkspaceRequestMethod::Patch,
+                format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}"),
+                serde_json::json!({"title":"unauthorized title"}),
+            ),
+            (
+                WorkspaceRequestMethod::Post,
+                format!("/api/w/another-workspace/tickets/{ticket}/show"),
+                serde_json::json!({}),
+            ),
+            (
+                WorkspaceRequestMethod::Post,
+                format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/other-candidate/reviews"),
+                serde_json::json!({"verdict":"approved"}),
+            ),
+        ] {
+            let client = client.clone();
+            let error = tokio::task::spawn_blocking(move || {
+                client.execute(WorkspaceRequest::json(method, path, body.to_string()))
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(error.to_string().contains("read-only"), "{error}");
+        }
+        assert_eq!(transport.requests.lock().unwrap().len(), request_count);
+        assert_eq!(backend.show(ticket.clone().into()).unwrap(), before);
+        // Keep a valid Runtime signature but select an unregistered Worker.
+        // This must fail at the real Backend, not the Reviewer route filter.
+        *transport.source.lock().unwrap() =
+            RuntimeWorkerRef::new(source.runtime_id, uuid::Uuid::now_v7().to_string());
+        let error = surface
+            .call(
+                "ShowTicket",
+                serde_json::json!({"id":ticket}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("401"), "{error}");
+        assert!(
+            transport
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .skip(request_count)
+                .any(|(_, status, _)| *status == 401)
+        );
+        assert_eq!(backend.show(ticket.into()).unwrap(), before);
     }
 }
 
