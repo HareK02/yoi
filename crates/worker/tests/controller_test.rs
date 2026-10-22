@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -150,6 +151,19 @@ impl LlmClient for MockClient {
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[path = "../../../tests/support/restore_environment.rs"]
+mod restore_test_environment;
+use restore_test_environment::require_restore_test_environment;
+
+fn owned_relative_runtime_base() -> (tempfile::TempDir, PathBuf) {
+    require_restore_test_environment();
+    let temp = tempfile::tempdir_in(".").unwrap();
+    // The relative reference and the TempDir name the same owned tree, without
+    // putting the checkout prefix into sockaddr_un or changing process cwd.
+    let runtime_base = Path::new(temp.path().file_name().unwrap()).join("runtime");
+    (temp, runtime_base)
+}
+
 fn simple_text_events() -> Vec<LlmEvent> {
     vec![
         LlmEvent::text_block_start(0),
@@ -295,6 +309,7 @@ async fn make_worker_with_manifest_and_workspace_context(
     manifest: WorkerManifest,
     workspace_context: WorkerWorkspaceContext,
 ) -> (Worker<MockClient, TestStore>, std::path::PathBuf) {
+    require_restore_test_environment();
     let store_tmp = tempfile::tempdir().unwrap();
     let store = CombinedStore::new(
         FsStore::new(store_tmp.path()).unwrap(),
@@ -320,18 +335,21 @@ async fn make_worker_with_manifest_and_workspace_context(
 }
 
 async fn spawn_controller(worker: Worker<MockClient, TestStore>) -> WorkerHandle {
-    let tmp = tempfile::tempdir().unwrap();
-    let runtime_base = tmp.path().to_owned();
-    std::mem::forget(tmp);
-    let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
+    let (tmp, runtime_base) = owned_relative_runtime_base();
+    let (handle, shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
         .await
         .unwrap();
+    // Retain ownership until controller shutdown (or test-runtime teardown).
+    tokio::spawn(async move {
+        let _ = shutdown_rx.await;
+        drop(tmp);
+    });
     handle
 }
 
 #[tokio::test]
 async fn canonical_worker_handle_uploads_and_submits_attachment() {
-    let root = tempfile::tempdir().unwrap();
+    let (root, runtime_base) = owned_relative_runtime_base();
     let manifest = WorkerManifest::from_toml(MANIFEST_TOML).unwrap();
     let session = session_store::WorkerSessionStore::new(root.path().join("session")).unwrap();
     let store = CombinedStore::new(
@@ -353,7 +371,7 @@ async fn canonical_worker_handle_uploads_and_submits_attachment() {
     )
     .await
     .unwrap();
-    let (handle, shutdown_rx) = WorkerController::spawn(worker, &root.path().join("runtime"))
+    let (handle, shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
         .await
         .unwrap();
     let mut rx = handle.subscribe();
@@ -1761,11 +1779,12 @@ permission = "write"
 "#;
     let client = MockClient::new(simple_text_events());
     let worker = make_worker_with_pwd_and_manifest(client, manifest).await.0;
-    let tmp = tempfile::tempdir().unwrap();
-    let result = WorkerController::spawn(worker, tmp.path()).await;
+    let (_tmp, runtime_base) = owned_relative_runtime_base();
+    let result = WorkerController::spawn(worker, &runtime_base).await;
     assert!(
         result.is_ok(),
-        "feature exposure must not imply delegation authority"
+        "feature exposure must not imply delegation authority: {:?}",
+        result.as_ref().err()
     );
 }
 

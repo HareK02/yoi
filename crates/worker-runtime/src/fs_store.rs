@@ -2301,9 +2301,28 @@ impl WorkerAggregateRecord {
                     });
                 }
                 if let Some(request) = request {
+                    let mut validation_request = request.clone();
+                    // Pending admission may supply a missing Workspace connection
+                    // without applying it to the saved execution. Validate that
+                    // exact owner's intent against identity; do not widen the
+                    // Available-record rule or mutate the canonical request.
+                    if validation_request.workspace_api.is_none()
+                        && let PersistedWorkerLifecycleOperation::Restore(restore) = &operation
+                        && let Some(api) = restore_guard
+                            .pending_preparation(restore.operation_id)
+                            .and_then(|preparation| preparation.workspace_api.as_ref())
+                    {
+                        validation_request.workspace_api =
+                            Some(
+                                serde_json::from_value(serde_json::to_value(api).map_err(
+                                    |error| runtime_store_corrupt(path, error.to_string()),
+                                )?)
+                                .map_err(|error| runtime_store_corrupt(path, error.to_string()))?,
+                            );
+                    }
                     WorkerExecutionRecord {
                         schema_version: SCHEMA_VERSION,
-                        request: request.clone(),
+                        request: validation_request,
                         binding: binding.clone(),
                         restore_intent,
                     }

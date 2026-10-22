@@ -9,6 +9,7 @@ use crate::PromptCatalogSource;
 use crate::controller::{
     ShutdownReceiver, WorkerController, WorkerControllerTransport, WorkerHandle,
 };
+pub use crate::worker::{PreparedRestoredWorker, RestoreCandidateWorkdirCleanup};
 use crate::worker::{Worker, WorkerError, WorkerFilesystemAuthority, WorkerWorkspaceContext};
 use manifest::WorkerManifest;
 
@@ -166,6 +167,38 @@ where
                 .map_err(WorkerBootstrapError::Worker)?;
         }
         Ok(PreparedWorker::new(worker, self.layout, self.transport))
+    }
+
+    /// Reconstruct a saved materialized Worker without allocation, attribution
+    /// repair, Feature installation, or controller exposure. The caller owns the
+    /// later controller layout/transport and must activate before starting it.
+    pub async fn prepare_restored_candidate(
+        self,
+        worker_name: &str,
+    ) -> Result<PreparedRestoredWorker<St>, WorkerBootstrapError> {
+        let mut candidate =
+            Worker::prepare_restored_from_worker_metadata_with_context_and_model_client(
+                worker_name,
+                self.manifest,
+                self.store,
+                self.prompt_catalog,
+                self.workspace_context,
+                self.filesystem_authority,
+                self.model_client,
+            )
+            .await
+            .map_err(WorkerBootstrapError::Worker)?;
+        if let Some(workdir_session) = self.workdir_session {
+            candidate
+                .worker_mut()
+                .map_err(WorkerBootstrapError::Worker)?
+                .bind_single_workdir_session(Some(workdir_session));
+        }
+        candidate
+            .worker_mut()
+            .map_err(WorkerBootstrapError::Worker)?
+            .bind_subjektiv_host(self.subjektiv_host);
+        Ok(candidate)
     }
 
     pub async fn prepare_restored(

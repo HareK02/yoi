@@ -682,8 +682,10 @@ fn runtime_v5_rejects_broken_or_future_source_without_rewriting_evidence() {
 #[cfg(unix)]
 #[test]
 fn current_runtime_session_migration_still_rejects_live_worker_sockets() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("runtime");
+    // The same TempDir owns the relative bind/connect reference. No cwd change
+    // or alias is needed, and the real live-socket migration refusal stays tested.
+    let temp = tempfile::tempdir_in(".").unwrap();
+    let root = Path::new(temp.path().file_name().unwrap()).join("runtime");
     let (worker, _, _) = runtime_fixture(&root, 12);
     let before = tree_bytes(&root);
     let runs = root.join("workers").join(worker.to_string()).join("runs");

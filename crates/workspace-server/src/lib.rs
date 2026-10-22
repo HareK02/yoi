@@ -19,6 +19,9 @@ pub mod repositories;
 pub mod repository_access;
 pub mod repository_source;
 pub mod resource_broker;
+#[cfg(test)]
+#[path = "../../../tests/support/restore_environment.rs"]
+mod restore_test_environment;
 pub mod retention;
 pub mod runtime_settings;
 pub mod runtime_subscription;

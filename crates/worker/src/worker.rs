@@ -3386,6 +3386,208 @@ impl WorkerStartupFeatureCleanup {
     }
 }
 
+/// A close-only candidate resource owner, not filesystem execution authority.
+#[derive(Clone)]
+pub struct RestoreCandidateWorkdirCleanup {
+    sessions: Arc<WorkdirSessionRouter>,
+}
+
+impl RestoreCandidateWorkdirCleanup {
+    pub async fn close(&self) -> Result<(), WorkerError> {
+        self.sessions
+            .close_all()
+            .await
+            .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))
+    }
+}
+
+/// An unpublished, read-only reconstruction of an existing materialized Worker.
+///
+/// The host must hold its per-Worker operation lock through activation. Snapshot
+/// checks reject drift; they do not replace that lock or current host authorization.
+/// No controller, allocation, Feature installation, or repair runs during prepare.
+/// The public candidate exposes no Worker execution or mutation handles. Binding
+/// inside this crate is limited to the open candidate; once discard begins, only
+/// cleanup retry remains valid, even if its previous attempt failed or was cancelled.
+/// Use `discard` for confirmed cleanup; Drop only schedules best-effort cleanup on
+/// the current Tokio runtime and cannot attest that asynchronous cleanup completed.
+pub struct PreparedRestoredWorker<St: Store> {
+    worker: Option<Worker<Box<dyn LlmClient>, St>>,
+    closing: bool,
+    metadata: Option<WorkerMetadata>,
+    entries: serde_json::Value,
+    manifest: serde_json::Value,
+}
+
+impl<St> PreparedRestoredWorker<St>
+where
+    St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+{
+    pub fn manifest(&self) -> &WorkerManifest {
+        &self.worker().manifest
+    }
+
+    /// Retain the same Workdir resource owner for explicit cleanup, including
+    /// after discard fails. This does not grant Worker input or execution access.
+    pub fn workdir_cleanup(&self) -> RestoreCandidateWorkdirCleanup {
+        RestoreCandidateWorkdirCleanup {
+            sessions: self.worker().workdir_sessions.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn workdir_sessions(&self) -> Arc<WorkdirSessionRouter> {
+        self.worker().workdir_sessions.clone()
+    }
+
+    fn worker(&self) -> &Worker<Box<dyn LlmClient>, St> {
+        self.worker
+            .as_ref()
+            .expect("restore candidate already discarded")
+    }
+
+    /// Bootstrap may bind host services before returning an open candidate.
+    /// Never reopen a candidate whose cleanup has begun.
+    pub(crate) fn worker_mut(
+        &mut self,
+    ) -> Result<&mut Worker<Box<dyn LlmClient>, St>, WorkerError> {
+        if self.closing {
+            return Err(WorkerError::RestoreCandidateClosing);
+        }
+        self.worker
+            .as_mut()
+            .ok_or(WorkerError::RestoreCandidateClosing)
+    }
+
+    fn revalidate(&self, worker: &Worker<Box<dyn LlmClient>, St>) -> Result<(), WorkerError> {
+        let changed = |component| WorkerError::RestoreCandidateChanged {
+            worker_name: worker.manifest.worker.name.clone(),
+            component,
+        };
+        if worker.store.read_by_name(&worker.manifest.worker.name)? != self.metadata {
+            return Err(changed("metadata"));
+        }
+        if restore_snapshot_value(&worker.manifest)? != self.manifest {
+            return Err(changed("manifest"));
+        }
+        let entries = worker
+            .store
+            .read_all(worker.session_id(), worker.segment_id())?;
+        if restore_snapshot_value(&entries)? != self.entries {
+            return Err(changed("segment"));
+        }
+        Ok(())
+    }
+
+    /// Acquire writer allocation only after exact source validation, validate
+    /// again under that allocation, then apply the existing restore mutations.
+    /// An error may retain partial durable effects; ConstructionCleanup carries
+    /// resource ownership and is not evidence of rollback.
+    pub async fn activate(self) -> Result<Worker<Box<dyn LlmClient>, St>, WorkerError> {
+        self.activate_with_allocation(|worker| {
+            let socket_path = dir::default_base()
+                .map_err(ScopeLockError::from)?
+                .join(&worker.manifest.worker.name)
+                .join("sock");
+            Ok(worker_allocation::install_top_level_with_deny(
+                worker.manifest.worker.name.clone(),
+                std::process::id(),
+                socket_path,
+                worker.scope.snapshot().allow_rules(),
+                worker.scope.snapshot().deny_rules(),
+                worker.segment_id(),
+            )?)
+        })
+        .await
+    }
+
+    async fn activate_with_allocation(
+        mut self,
+        allocate: impl FnOnce(
+            &Worker<Box<dyn LlmClient>, St>,
+        ) -> Result<ScopeAllocationGuard, WorkerError>,
+    ) -> Result<Worker<Box<dyn LlmClient>, St>, WorkerError> {
+        let mut worker = self
+            .worker
+            .take()
+            .ok_or(WorkerError::RestoreCandidateClosing)?;
+        if self.closing {
+            // Preserve the same cleanup owner without validating or acquiring
+            // allocation for a partially closed candidate.
+            return Err(worker.construction_failure(WorkerError::RestoreCandidateClosing));
+        }
+        self.revalidate(&worker)
+            .map_err(|error| worker.construction_failure(error))?;
+        worker.scope_allocation =
+            Some(allocate(&worker).map_err(|error| worker.construction_failure(error))?);
+        self.revalidate(&worker)
+            .map_err(|error| worker.construction_failure(error))?;
+        worker
+            .finish_restored_construction()
+            .await
+            .map_err(|source| WorkerError::RestoreActivationEffects {
+                source: Box::new(source),
+            })
+    }
+
+    /// Directly settle candidate resources, without Controller Shutdown. Failed
+    /// cleanup retains the candidate so the same owner can retry it.
+    pub async fn discard(&mut self) -> Result<(), WorkerError> {
+        self.closing = true;
+        if let Some(worker) = self.worker.as_mut() {
+            worker
+                .retain_startup_feature_cleanup()
+                .shutdown()
+                .await
+                .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?;
+            worker
+                .workdir_sessions
+                .close_all()
+                .await
+                .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?;
+            // An unpublished candidate has no allocation guard. Activation moves
+            // the Worker out and uses ConstructionCleanup on failure; never try
+            // releasing a cleanup handle while its guard is still attached.
+            debug_assert!(worker.scope_allocation.is_none());
+        }
+        self.worker = None;
+        Ok(())
+    }
+}
+
+impl<St: Store> Drop for PreparedRestoredWorker<St> {
+    fn drop(&mut self) {
+        let Some(worker) = self.worker.as_mut() else {
+            return;
+        };
+        let sessions = worker.workdir_sessions.clone();
+        let features = worker.retain_startup_feature_cleanup();
+        // Candidates do not acquire allocation until consuming activation.
+        debug_assert!(worker.scope_allocation.is_none());
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = features.shutdown().await {
+                        tracing::warn!(%error, "restore candidate Feature cleanup unconfirmed");
+                        return;
+                    }
+                    if let Err(error) = sessions.close_all().await {
+                        tracing::warn!(%error, "restore candidate Workdir cleanup unconfirmed");
+                    }
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "restore candidate dropped without async cleanup runtime")
+            }
+        }
+    }
+}
+
+fn restore_snapshot_value(value: &impl serde::Serialize) -> Result<serde_json::Value, WorkerError> {
+    serde_json::to_value(value)
+        .map_err(|error| WorkerError::InvalidState(format!("encode restore snapshot: {error}")))
+}
+
 /// An independent agent execution unit.
 ///
 /// Holds a [`Engine`] directly and persists session state via
@@ -3405,6 +3607,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// constructors install this from the same FsStore that owns the session
     /// logs; low-level `Worker::new` tests leave it absent.
     worker_metadata_writer: Option<WorkerMetadataWriter>,
+    persist_restored_manifest: bool,
     worker_metadata_segment_cas: Option<WorkerMetadataSegmentCas>,
     /// Shared session pointer. Source of truth for the Worker's current
     /// `segment_id` and append tally. `self.segment_id()` is a thin
@@ -3820,6 +4023,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             last_run_interrupted: false,
             store,
             worker_metadata_writer: None,
+            persist_restored_manifest: false,
             worker_metadata_segment_cas: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority,
@@ -4534,14 +4738,21 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 
     fn worker_metadata(&self, active: Option<WorkerActiveSegmentRef>) -> WorkerMetadata {
-        worker_metadata_for_manifest(
+        let mut metadata = worker_metadata_for_manifest(
             &self.manifest,
             self.workspace_id(),
             self.filesystem_authority
                 .as_local()
                 .map(|local| local.root.as_path()),
             active,
-        )
+        );
+        // A repaired/restored Session must not lose the saved execution policy
+        // merely because its current composition also permits legacy local use.
+        if self.persist_restored_manifest {
+            metadata.resolved_manifest_snapshot =
+                manifest::write_persisted_worker_manifest_snapshot(&self.manifest).ok();
+        }
+        metadata
     }
 
     fn write_worker_metadata_pending(&self) -> Result<(), WorkerError> {
@@ -8445,6 +8656,7 @@ where
             last_run_interrupted: false,
             store,
             worker_metadata_writer,
+            persist_restored_manifest: existing_session_id.is_some(),
             worker_metadata_segment_cas,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority: common.filesystem_authority,
@@ -8852,6 +9064,7 @@ where
             last_run_interrupted: false,
             store,
             worker_metadata_writer: None,
+            persist_restored_manifest: false,
             worker_metadata_segment_cas: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority: common.filesystem_authority,
@@ -8987,6 +9200,7 @@ where
             last_run_interrupted: false,
             store,
             worker_metadata_writer,
+            persist_restored_manifest: true,
             worker_metadata_segment_cas,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority: common.filesystem_authority,
@@ -9080,6 +9294,33 @@ where
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
+        Self::prepare_restored_from_worker_metadata_with_context_and_model_client(
+            worker_name,
+            manifest,
+            store,
+            loader,
+            workspace_context,
+            filesystem_authority,
+            None,
+        )
+        .await?
+        .activate()
+        .await
+    }
+
+    /// Prepare only a materialized saved Worker. Pending Session creation and
+    /// Subject attribution repair must be performed explicitly by the host
+    /// before entering this read-only path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_restored_from_worker_metadata_with_context_and_model_client(
+        worker_name: &str,
+        fallback: WorkerManifest,
+        store: St,
+        loader: PromptCatalogSource,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
+        model_client: Option<Box<dyn LlmClient>>,
+    ) -> Result<PreparedRestoredWorker<St>, WorkerError> {
         let metadata =
             store
                 .read_by_name(worker_name)?
@@ -9093,11 +9334,13 @@ where
                 worker_name: worker_name.to_string(),
             });
         }
-        let active = metadata
-            .active
-            .ok_or_else(|| WorkerError::WorkerMetadataInactive {
-                worker_name: worker_name.to_string(),
-            })?;
+        let active =
+            metadata
+                .active
+                .as_ref()
+                .ok_or_else(|| WorkerError::WorkerMetadataInactive {
+                    worker_name: worker_name.to_string(),
+                })?;
         let segment_id = active
             .segment_id
             .ok_or_else(|| WorkerError::WorkerMetadataPending {
@@ -9106,10 +9349,15 @@ where
             })?;
         let manifest = restore_manifest_from_worker_metadata_snapshot(
             worker_name,
-            metadata.resolved_manifest_snapshot,
-            manifest,
+            metadata.resolved_manifest_snapshot.clone(),
+            fallback,
         )?;
-        Self::restore_from_manifest_with_context(
+        if manifest.worker.name != worker_name {
+            return Err(WorkerError::InvalidState(
+                "restore manifest Worker name mismatch".into(),
+            ));
+        }
+        Self::prepare_restored_from_manifest_snapshot(
             active.session_id,
             segment_id,
             manifest,
@@ -9117,6 +9365,8 @@ where
             loader,
             workspace_context,
             filesystem_authority,
+            model_client,
+            Some(metadata),
         )
         .await
     }
@@ -9303,10 +9553,41 @@ where
         filesystem_authority: WorkerFilesystemAuthority,
         model_client: Option<Box<dyn LlmClient>>,
     ) -> Result<Self, WorkerError> {
+        let metadata = store.read_by_name(&manifest.worker.name)?;
+        Self::prepare_restored_from_manifest_snapshot(
+            session_id,
+            segment_id,
+            manifest,
+            store,
+            loader,
+            workspace_context,
+            filesystem_authority,
+            model_client,
+            metadata,
+        )
+        .await?
+        .activate()
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_restored_from_manifest_snapshot(
+        session_id: SessionId,
+        segment_id: SegmentId,
+        manifest: WorkerManifest,
+        store: St,
+        loader: PromptCatalogSource,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
+        model_client: Option<Box<dyn LlmClient>>,
+        metadata: Option<WorkerMetadata>,
+    ) -> Result<PreparedRestoredWorker<St>, WorkerError> {
         // Read raw entries once so we can both reconstruct state and
         // seed the broadcast sink's mirror with the same prefix that
         // sits on disk.
         let raw_entries = store.read_all(session_id, segment_id)?;
+        let entries_snapshot = restore_snapshot_value(&raw_entries)?;
+        let manifest_snapshot = restore_snapshot_value(&manifest)?;
         let state = session_store::collect_state(&raw_entries);
         if state.entries_count == 0 {
             return Err(WorkerError::SegmentEmpty { segment_id });
@@ -9330,24 +9611,6 @@ where
             filesystem_authority,
             scope_config,
             model_client,
-        )?;
-
-        // Atomic: register_worker inside install_top_level rejects when
-        // another live allocation already holds `segment_id`. Wrapping
-        // the lookup + install inside a single `LockFileGuard` is what
-        // makes "no two live Workers write to the same session log"
-        // actually structural rather than a hopeful pre-check.
-        let socket_path = dir::default_base()
-            .map_err(ScopeLockError::from)?
-            .join(&manifest.worker.name)
-            .join("sock");
-        let scope_allocation = worker_allocation::install_top_level_with_deny(
-            manifest.worker.name.clone(),
-            std::process::id(),
-            socket_path,
-            common.scope.allow_rules(),
-            common.scope.deny_rules(),
-            segment_id,
         )?;
 
         // Build the worker and apply the manifest defaults first, then
@@ -9398,6 +9661,7 @@ where
             last_run_interrupted: state.last_run_interrupted,
             store,
             worker_metadata_writer,
+            persist_restored_manifest: true,
             worker_metadata_segment_cas,
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
             filesystem_authority: common.filesystem_authority,
@@ -9436,7 +9700,7 @@ where
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             failed_activation_authority: Mutex::new(None),
-            scope_allocation: Some(scope_allocation),
+            scope_allocation: None,
             callback_socket: None,
             runtime_ticket_role: None,
             prompts: common.prompts,
@@ -9461,7 +9725,20 @@ where
         worker
             .session
             .restore_pending_activations(&state.extensions);
-        worker.finish_restored_construction().await
+        worker.apply_permissions_from_manifest();
+        worker.apply_prune_from_manifest();
+        let mut candidate = PreparedRestoredWorker {
+            worker: Some(worker),
+            closing: false,
+            metadata,
+            entries: entries_snapshot,
+            manifest: manifest_snapshot,
+        };
+        if let Err(error) = candidate.revalidate(candidate.worker()) {
+            let worker = candidate.worker.take().expect("candidate just constructed");
+            return Err(worker.construction_failure(error));
+        }
+        Ok(candidate)
     }
 
     async fn finish_restored_construction(mut self) -> Result<Self, WorkerError> {
@@ -10327,6 +10604,23 @@ pub enum WorkerError {
         source: Box<WorkerError>,
         allocation: Option<ScopeAllocationCleanup>,
         sessions: Arc<WorkdirSessionRouter>,
+    },
+
+    /// Activation entered canonical pin/metadata/delegation updates. Cleanup
+    /// ownership in the source does not establish rollback of those effects.
+    #[error("{source}")]
+    RestoreActivationEffects {
+        #[source]
+        source: Box<WorkerError>,
+    },
+
+    #[error("restore candidate is closing; only cleanup retry is allowed")]
+    RestoreCandidateClosing,
+
+    #[error("restore candidate source changed for Worker {worker_name}: {component}")]
+    RestoreCandidateChanged {
+        worker_name: String,
+        component: &'static str,
     },
 
     #[error("invalid durable Worker state: {0}")]
@@ -12996,6 +13290,686 @@ mod build_summary_prompt_tests {
         cleanup.release().unwrap();
         let table = worker_allocation::LockFileGuard::open(&lock_path).unwrap();
         assert!(table.data().find("test-worker").is_none());
+    }
+
+    // Real Session/metadata stores, allocation and Workdir providers; only the
+    // model transport is substituted. Profile/Runtime publication belongs to the
+    // factory integration suite, not this reconstruction component suite.
+    mod restored_candidate_tests {
+        use super::*;
+
+        type CandidateStore =
+            session_store::CombinedStore<session_store::FsStore, session_store::FsWorkerStore>;
+
+        #[derive(Clone)]
+        struct CountedClient(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl LlmClient for CountedClient {
+            async fn stream(
+                &self,
+                request: agen::llm_client::Request,
+            ) -> Result<
+                std::pin::Pin<
+                    Box<
+                        dyn futures::Stream<
+                                Item = Result<
+                                    agen::llm_client::event::Event,
+                                    agen::llm_client::ClientError,
+                                >,
+                            > + Send,
+                    >,
+                >,
+                agen::llm_client::ClientError,
+            > {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                NoopClient.stream(request).await
+            }
+
+            fn clone_boxed(&self) -> Box<dyn LlmClient> {
+                Box::new(self.clone())
+            }
+        }
+
+        #[derive(Debug)]
+        struct FailCloseOnce {
+            inner: workdir::WorkdirSessionHandle,
+            attempts: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl workdir::WorkdirSession for FailCloseOnce {
+            fn workdir(&self) -> &workdir::Workdir {
+                self.inner.workdir()
+            }
+            fn capabilities(&self) -> workdir::WorkdirSessionCapabilities {
+                self.inner.capabilities()
+            }
+            async fn stat(
+                &self,
+                request: workdir::StatRequest,
+            ) -> Result<workdir::StatResult, workdir::WorkdirError> {
+                self.inner.stat(request).await
+            }
+            async fn read(
+                &self,
+                request: workdir::ReadRequest,
+            ) -> Result<workdir::ReadResult, workdir::WorkdirError> {
+                self.inner.read(request).await
+            }
+            async fn write(
+                &self,
+                request: workdir::WriteRequest,
+            ) -> Result<workdir::WriteResult, workdir::WorkdirError> {
+                self.inner.write(request).await
+            }
+            async fn edit(
+                &self,
+                request: workdir::EditRequest,
+            ) -> Result<workdir::EditResult, workdir::WorkdirError> {
+                self.inner.edit(request).await
+            }
+            async fn list(
+                &self,
+                request: workdir::ListRequest,
+            ) -> Result<workdir::ListResult, workdir::WorkdirError> {
+                self.inner.list(request).await
+            }
+            async fn glob(
+                &self,
+                request: workdir::GlobRequest,
+            ) -> Result<workdir::GlobResult, workdir::WorkdirError> {
+                self.inner.glob(request).await
+            }
+            async fn grep(
+                &self,
+                request: workdir::GrepRequest,
+            ) -> Result<workdir::GrepResult, workdir::WorkdirError> {
+                self.inner.grep(request).await
+            }
+            async fn start_command(
+                &self,
+                request: workdir::CommandRequest,
+            ) -> Result<workdir::CommandHandle, workdir::WorkdirError> {
+                self.inner.start_command(request).await
+            }
+            async fn command_status(
+                &self,
+                handle: workdir::CommandHandle,
+            ) -> Result<workdir::CommandStatus, workdir::WorkdirError> {
+                self.inner.command_status(handle).await
+            }
+            async fn command_output(
+                &self,
+                request: workdir::CommandOutputRequest,
+            ) -> Result<workdir::CommandOutput, workdir::WorkdirError> {
+                self.inner.command_output(request).await
+            }
+            async fn cancel_command(
+                &self,
+                handle: workdir::CommandHandle,
+            ) -> Result<(), workdir::WorkdirError> {
+                self.inner.cancel_command(handle).await
+            }
+            async fn close(&self) -> Result<(), workdir::WorkdirError> {
+                self.inner.close().await?;
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // The real provider has closed, but its first response is
+                    // uncertain: the candidate must not become activatable again.
+                    Err(workdir::WorkdirError::Unavailable(
+                        "close response lost".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        struct Fixture {
+            temp: tempfile::TempDir,
+            store: CandidateStore,
+            manifest: WorkerManifest,
+            session_id: SessionId,
+            segment_id: SegmentId,
+            orphan: protocol::UploadedFileRef,
+            model_calls: Arc<AtomicUsize>,
+        }
+
+        impl Fixture {
+            async fn new() -> Self {
+                let temp = tempfile::tempdir().unwrap();
+                let store = session_store::CombinedStore::new(
+                    session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+                    session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+                );
+                let mut manifest = minimal_manifest();
+                manifest.scope = ScopeConfig {
+                    allow: vec![ScopeRule {
+                        target: temp.path().canonicalize().unwrap(),
+                        permission: Permission::Write,
+                        recursive: true,
+                        symlink_policy: Default::default(),
+                    }],
+                    deny: Vec::new(),
+                };
+                let model_calls = Arc::new(AtomicUsize::new(0));
+                let mut worker = Worker::new(
+                    manifest.clone(),
+                    Engine::<Box<dyn LlmClient>, Mutable, SessionHistoryMetadata>::new_annotated(
+                        Box::new(CountedClient(model_calls.clone())),
+                    ),
+                    store.clone(),
+                    WorkerWorkspaceContext::no_workspace(),
+                    WorkerFilesystemAuthority::None,
+                    Scope::empty(),
+                )
+                .await
+                .unwrap();
+                worker
+                    .engine_mut()
+                    .set_system_prompt("saved candidate prompt");
+                worker.ensure_segment_head().await.unwrap();
+                let session_id = worker.session_id();
+                let segment_id = worker.segment_id();
+                let queue = worker.pending_submission_handle();
+                queue
+                    .accept(
+                        "saved-submit".into(),
+                        vec![Segment::Text {
+                            content: "saved input".into(),
+                        }],
+                        false,
+                    )
+                    .unwrap();
+                queue
+                    .accept_notification("saved-notification".into(), "saved notice".into())
+                    .unwrap();
+                let orphan = store
+                    .write_uploaded_file(
+                        session_id,
+                        "orphan.txt",
+                        "text/plain",
+                        b"orphan",
+                        session_store::UploadedFileLimits::default(),
+                    )
+                    .unwrap();
+                store
+                    .pin_uploaded_file(session_id, &orphan, "acceptance-without-checkpoint")
+                    .unwrap();
+                let mut metadata = WorkerMetadata::new(
+                    &manifest.worker.name,
+                    Some(WorkerActiveSegmentRef {
+                        session_id,
+                        segment_id: Some(segment_id),
+                    }),
+                );
+                // Activation replaces this stale derived path; preparation must not.
+                metadata.workspace_root = Some(temp.path().join("old-root"));
+                metadata.spawned_children.push(WorkerSpawnedChild {
+                    worker_name: "missing-child".into(),
+                    socket_path: temp.path().join("missing-child.sock"),
+                    scope_delegated: Vec::new(),
+                    callback_address: temp.path().join("unused-parent.sock"),
+                });
+                metadata.resolved_manifest_snapshot =
+                    Some(manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap());
+                store.write(&metadata).unwrap();
+                drop(worker);
+                Self {
+                    temp,
+                    store,
+                    manifest,
+                    session_id,
+                    segment_id,
+                    orphan,
+                    model_calls,
+                }
+            }
+
+            async fn prepare(&self) -> PreparedRestoredWorker<CandidateStore> {
+                Worker::prepare_restored_from_worker_metadata_with_context_and_model_client(
+                    &self.manifest.worker.name,
+                    self.manifest.clone(),
+                    self.store.clone(),
+                    PromptCatalogSource::builtins_only(),
+                    WorkerWorkspaceContext::no_workspace(),
+                    WorkerFilesystemAuthority::local(
+                        self.temp.path().to_path_buf(),
+                        self.temp.path().to_path_buf(),
+                    ),
+                    Some(Box::new(CountedClient(self.model_calls.clone()))),
+                )
+                .await
+                .unwrap()
+            }
+
+            fn allocate(
+                &self,
+                worker: &Worker<Box<dyn LlmClient>, CandidateStore>,
+            ) -> Result<ScopeAllocationGuard, WorkerError> {
+                Ok(worker_allocation::install_top_level_at_for_test(
+                    self.temp.path().join("allocation.json"),
+                    worker.manifest.worker.name.clone(),
+                    std::process::id(),
+                    self.temp.path().join("worker.sock"),
+                    worker.scope.snapshot().allow_rules(),
+                    worker.segment_id(),
+                )?)
+            }
+
+            fn snapshot(&self) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+                fn visit(
+                    root: &Path,
+                    path: &Path,
+                    files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+                ) {
+                    for entry in std::fs::read_dir(path).unwrap() {
+                        let path = entry.unwrap().path();
+                        if path.is_dir() {
+                            visit(root, &path, files);
+                        } else {
+                            files.insert(
+                                path.strip_prefix(root).unwrap().to_path_buf(),
+                                std::fs::read(path).unwrap(),
+                            );
+                        }
+                    }
+                }
+                let mut files = std::collections::BTreeMap::new();
+                for name in ["sessions", "workers"] {
+                    visit(self.temp.path(), &self.temp.path().join(name), &mut files);
+                }
+                files
+            }
+        }
+
+        #[tokio::test]
+        async fn prepare_and_discard_preserve_session_queue_pins_and_metadata() {
+            let fixture = Fixture::new().await;
+            let before = fixture.snapshot();
+            let mut candidate = fixture.prepare().await;
+            assert!(
+                candidate
+                    .worker()
+                    .restore_allocation_cleanup_handle()
+                    .is_none()
+            );
+            assert!(!fixture.temp.path().join("worker.sock").exists());
+            assert_eq!(
+                candidate.worker().pending_submissions().submissions.len(),
+                1
+            );
+            assert_eq!(
+                candidate
+                    .worker()
+                    .session
+                    .pending_activations
+                    .lock()
+                    .unwrap()
+                    .pending_notifications
+                    .len(),
+                1
+            );
+            assert_eq!(fixture.snapshot(), before);
+            assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 0);
+            let session = candidate
+                .worker()
+                .workdir_sessions()
+                .resolve(None)
+                .unwrap()
+                .session;
+            assert!(
+                session
+                    .stat(workdir::StatRequest {
+                        path: workdir::WorkdirPath::root()
+                    })
+                    .await
+                    .is_ok()
+            );
+            candidate.discard().await.unwrap();
+            candidate.discard().await.unwrap();
+            assert!(
+                session
+                    .stat(workdir::StatRequest {
+                        path: workdir::WorkdirPath::root()
+                    })
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fixture.snapshot(), before);
+        }
+
+        #[tokio::test]
+        async fn failed_discard_allows_only_cleanup_retry_not_binding_or_activation() {
+            for retry_discard in [true, false] {
+                let fixture = Fixture::new().await;
+                let before = fixture.snapshot();
+                let mut candidate = fixture.prepare().await;
+                let provider = Arc::new(FailCloseOnce {
+                    inner: candidate.workdir_sessions().resolve(None).unwrap().session,
+                    attempts: AtomicUsize::new(0),
+                });
+                candidate
+                    .worker_mut()
+                    .unwrap()
+                    .bind_single_workdir_session(Some(provider.clone()));
+                let cleanup = candidate.workdir_sessions();
+                assert!(matches!(
+                    candidate.discard().await,
+                    Err(WorkerError::FeatureLifecycle(_))
+                ));
+                assert_eq!(provider.attempts.load(Ordering::SeqCst), 1);
+                assert!(!cleanup.is_empty());
+                assert_eq!(fixture.snapshot(), before);
+                assert!(matches!(
+                    candidate.worker_mut(),
+                    Err(WorkerError::RestoreCandidateClosing)
+                ));
+                assert_eq!(
+                    candidate.manifest().worker.name,
+                    fixture.manifest.worker.name
+                );
+                assert!(Arc::ptr_eq(&candidate.workdir_sessions(), &cleanup));
+                if retry_discard {
+                    candidate.discard().await.unwrap();
+                    assert!(cleanup.is_empty());
+                    assert_eq!(provider.attempts.load(Ordering::SeqCst), 2);
+                    assert!(matches!(
+                        candidate.worker_mut(),
+                        Err(WorkerError::RestoreCandidateClosing)
+                    ));
+                    candidate.discard().await.unwrap();
+                } else {
+                    let allocations = AtomicUsize::new(0);
+                    let error = match candidate
+                        .activate_with_allocation(|worker| {
+                            allocations.fetch_add(1, Ordering::SeqCst);
+                            fixture.allocate(worker)
+                        })
+                        .await
+                    {
+                        Err(error) => error,
+                        Ok(_) => panic!("partially closed candidate was activated"),
+                    };
+                    let WorkerError::ConstructionCleanup {
+                        source,
+                        allocation,
+                        sessions,
+                    } = error
+                    else {
+                        panic!("cleanup ownership lost");
+                    };
+                    assert!(matches!(*source, WorkerError::RestoreCandidateClosing));
+                    assert!(allocation.is_none());
+                    assert_eq!(allocations.load(Ordering::SeqCst), 0);
+                    assert_eq!(provider.attempts.load(Ordering::SeqCst), 1);
+                    assert!(Arc::ptr_eq(&sessions, &cleanup));
+                    sessions.close_all().await.unwrap();
+                    assert!(cleanup.is_empty());
+                    assert_eq!(provider.attempts.load(Ordering::SeqCst), 2);
+                }
+                assert_eq!(fixture.snapshot(), before);
+                assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn dropping_candidate_closes_workdir_without_consuming_saved_inputs() {
+            let fixture = Fixture::new().await;
+            let before = fixture.snapshot();
+            let candidate = fixture.prepare().await;
+            let sessions = candidate.worker().workdir_sessions();
+            let session = sessions.resolve(None).unwrap().session;
+            drop(candidate);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !sessions.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("candidate Drop must finish direct close");
+            assert!(
+                session
+                    .stat(workdir::StatRequest {
+                        path: workdir::WorkdirPath::root()
+                    })
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fixture.snapshot(), before);
+            assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn activation_alone_reconciles_orphan_pins_and_updates_active_metadata() {
+            let fixture = Fixture::new().await;
+            let before_metadata = fixture
+                .store
+                .read_by_name(&fixture.manifest.worker.name)
+                .unwrap()
+                .unwrap();
+            let before_entries = restore_snapshot_value(
+                &fixture
+                    .store
+                    .read_all(fixture.session_id, fixture.segment_id)
+                    .unwrap(),
+            )
+            .unwrap();
+            let candidate = fixture.prepare().await;
+            assert!(matches!(
+                fixture
+                    .store
+                    .delete_uploaded_file(fixture.session_id, &fixture.orphan.artifact_id),
+                Err(StoreError::ArtifactAlreadyCommitted)
+            ));
+            let worker = candidate
+                .activate_with_allocation(|worker| fixture.allocate(worker))
+                .await
+                .unwrap();
+            assert!(worker.restore_allocation_cleanup_handle().is_some());
+            let metadata = fixture
+                .store
+                .read_by_name(&fixture.manifest.worker.name)
+                .unwrap()
+                .unwrap();
+            assert_ne!(metadata.workspace_root, before_metadata.workspace_root);
+            assert_eq!(metadata.active, before_metadata.active);
+            assert_eq!(before_metadata.spawned_children.len(), 1);
+            assert!(metadata.spawned_children.is_empty());
+            assert_eq!(metadata.reclaimed_children.len(), 1);
+            assert!(
+                fixture
+                    .store
+                    .delete_uploaded_file(fixture.session_id, &fixture.orphan.artifact_id)
+                    .unwrap()
+            );
+            assert_eq!(worker.pending_submissions().submissions.len(), 1);
+            assert_eq!(
+                worker
+                    .session
+                    .pending_activations
+                    .lock()
+                    .unwrap()
+                    .pending_notifications
+                    .len(),
+                1
+            );
+            assert_eq!(
+                restore_snapshot_value(
+                    &fixture
+                        .store
+                        .read_all(fixture.session_id, fixture.segment_id)
+                        .unwrap()
+                )
+                .unwrap(),
+                before_entries
+            );
+            assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 0);
+            worker.workdir_sessions().close_all().await.unwrap();
+            let allocation = worker.restore_allocation_cleanup_handle().unwrap();
+            assert!(matches!(
+                allocation.release(),
+                Err(ScopeLockError::AllocationGuardAttached { .. })
+            ));
+            drop(worker);
+            allocation.release().unwrap();
+        }
+
+        #[tokio::test]
+        async fn metadata_or_same_entry_count_history_drift_rejects_before_allocation() {
+            for component in ["metadata", "segment", "manifest"] {
+                let fixture = Fixture::new().await;
+                let mut candidate = fixture.prepare().await;
+                match component {
+                    "metadata" => {
+                        fixture
+                            .store
+                            .update_by_name(&fixture.manifest.worker.name, |metadata| {
+                                metadata.workspace_id = Some("changed-workspace".into());
+                            })
+                            .unwrap();
+                    }
+                    "segment" => {
+                        let mut entries = fixture
+                            .store
+                            .read_all(fixture.session_id, fixture.segment_id)
+                            .unwrap();
+                        let LogEntry::AnnotatedSegmentStart { system_prompt, .. } = &mut entries[0]
+                        else {
+                            panic!("fixture seed");
+                        };
+                        *system_prompt = Some("different same-length history".into());
+                        fixture
+                            .store
+                            .create_segment(fixture.session_id, fixture.segment_id, &entries)
+                            .unwrap();
+                    }
+                    "manifest" => {
+                        candidate.worker_mut().unwrap().manifest.model.model_id =
+                            Some("changed-model".into());
+                    }
+                    _ => unreachable!(),
+                }
+                let before = fixture.snapshot();
+                let allocations = AtomicUsize::new(0);
+                let error = match candidate
+                    .activate_with_allocation(|worker| {
+                        allocations.fetch_add(1, Ordering::SeqCst);
+                        fixture.allocate(worker)
+                    })
+                    .await
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("stale candidate accepted"),
+                };
+                let WorkerError::ConstructionCleanup {
+                    source,
+                    allocation,
+                    sessions,
+                } = error
+                else {
+                    panic!("cleanup ownership lost");
+                };
+                assert!(
+                    matches!(*source, WorkerError::RestoreCandidateChanged { component: changed, .. } if changed == component)
+                );
+                assert!(allocation.is_none());
+                assert_eq!(allocations.load(Ordering::SeqCst), 0);
+                sessions.close_all().await.unwrap();
+                assert_eq!(fixture.snapshot(), before);
+                assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn post_allocation_metadata_drift_retains_cleanup_without_mutating_pins() {
+            let fixture = Fixture::new().await;
+            let candidate = fixture.prepare().await;
+            let error = match candidate
+                .activate_with_allocation(|worker| {
+                    let guard = fixture.allocate(worker)?;
+                    fixture
+                        .store
+                        .update_by_name(&fixture.manifest.worker.name, |metadata| {
+                            metadata.workspace_id = Some("changed-under-allocation".into());
+                        })?;
+                    Ok(guard)
+                })
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("stale candidate accepted"),
+            };
+            let before = fixture.snapshot();
+            let WorkerError::ConstructionCleanup {
+                source,
+                allocation,
+                sessions,
+            } = error
+            else {
+                panic!("cleanup ownership lost");
+            };
+            assert!(matches!(
+                *source,
+                WorkerError::RestoreCandidateChanged {
+                    component: "metadata",
+                    ..
+                }
+            ));
+            let allocation =
+                allocation.expect("allocation retained after second validation failure");
+            assert!(
+                worker_allocation::LockFileGuard::open(
+                    &fixture.temp.path().join("allocation.json")
+                )
+                .unwrap()
+                .data()
+                .find(&fixture.manifest.worker.name)
+                .is_some()
+            );
+            assert!(matches!(
+                fixture
+                    .store
+                    .delete_uploaded_file(fixture.session_id, &fixture.orphan.artifact_id),
+                Err(StoreError::ArtifactAlreadyCommitted)
+            ));
+            sessions.close_all().await.unwrap();
+            worker_allocation::fail_next_save_for_test(
+                &fixture.temp.path().join("allocation.json"),
+            );
+            assert!(allocation.release().is_err());
+            allocation.release().unwrap();
+            assert_eq!(fixture.snapshot(), before);
+        }
+
+        #[tokio::test]
+        async fn pending_session_is_rejected_without_repair_or_session_creation() {
+            let fixture = Fixture::new().await;
+            fixture
+                .store
+                .update_by_name(&fixture.manifest.worker.name, |metadata| {
+                    metadata.active.as_mut().unwrap().segment_id = None;
+                })
+                .unwrap();
+            let before = fixture.snapshot();
+            let result =
+                Worker::prepare_restored_from_worker_metadata_with_context_and_model_client(
+                    &fixture.manifest.worker.name,
+                    fixture.manifest.clone(),
+                    fixture.store.clone(),
+                    PromptCatalogSource::builtins_only(),
+                    WorkerWorkspaceContext::no_workspace(),
+                    WorkerFilesystemAuthority::None,
+                    Some(Box::new(CountedClient(fixture.model_calls.clone()))),
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(WorkerError::WorkerMetadataPending { .. })
+            ));
+            assert_eq!(fixture.snapshot(), before);
+            assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     // Constructor finalization uses real Worker, allocation, Workdir, and storage

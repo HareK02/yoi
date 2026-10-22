@@ -1,8 +1,11 @@
 // Integration coverage through EmbeddedRuntime -> real Profile factory -> real
-// Worker/bootstrap, local Git Workdir provider, and allocation table. Model I/O
-// is not invoked; this is a deterministic ordinary suite, not product E2E.
+// Worker/bootstrap, local Git Workdir provider, and allocation table. External
+// model I/O is replaced for saved-input coverage; this is not product E2E.
+
+use crate::restore_test_environment::require_restore_test_environment;
 
 fn restore_failure_tempdir() -> tempfile::TempDir {
+    require_restore_test_environment();
     // Explicitly stay inside this checkout, even when TMPDIR points elsewhere.
     // Keep fixture components short; no symlink/alias to evade socket limits.
     let target = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -102,11 +105,16 @@ struct ProfileFailureFixture {
     backend: Arc<WorkerRuntimeExecutionBackend>,
     worker: crate::catalog::WorkerDetail,
     provider_opens: Arc<AtomicUsize>,
+    seed_handle: Option<WorkerHandle>,
     root: tempfile::TempDir,
 }
 
 impl ProfileFailureFixture {
     fn new(timeout: Duration) -> Self {
+        Self::with_saved_inputs(timeout, None)
+    }
+
+    fn with_saved_inputs(timeout: Duration, model: Option<MockClient>) -> Self {
         let root = restore_failure_tempdir();
         let repo = root.path().join("g");
         fs::create_dir(&repo).unwrap();
@@ -118,16 +126,20 @@ impl ProfileFailureFixture {
         git(&repo, &["commit", "-m", "init"]);
         let store = root.path().join("s");
         let provider_opens = Arc::new(AtomicUsize::new(0));
+        let mut factory =
+            ProfileRuntimeWorkerFactory::new(root.path()).with_runtime_store_dir(&store);
+        let queue_inputs = model.is_some();
+        if let Some(model) = model {
+            factory = factory.with_spawn_model_client_factory(move || Box::new(model.clone()));
+        }
         let backend = Arc::new(
-            WorkerRuntimeExecutionBackend::new(
-                ProfileRuntimeWorkerFactory::new(root.path()).with_runtime_store_dir(&store),
-            )
-            .unwrap()
-            .with_spawn_restore_timeout(timeout)
-            .with_working_directory_materializer(RestoreOpenCountingMaterializer {
-                inner: RuntimeGitMaterializer::new(root.path().join("w")),
-                opens: provider_opens.clone(),
-            }),
+            WorkerRuntimeExecutionBackend::new(factory)
+                .unwrap()
+                .with_spawn_restore_timeout(timeout)
+                .with_working_directory_materializer(RestoreOpenCountingMaterializer {
+                    inner: RuntimeGitMaterializer::new(root.path().join("w")),
+                    opens: provider_opens.clone(),
+                }),
         );
         let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
@@ -146,12 +158,41 @@ impl ProfileFailureFixture {
             working_directory: working_directory_request(&repo),
         }];
         let worker = runtime.create_worker(request).unwrap();
+        let seed_handle = queue_inputs.then(|| {
+            backend.workers.lock().unwrap()[&worker.worker_ref]
+                .handle
+                .clone()
+        });
+        if let Some(handle) = seed_handle.clone() {
+            backend.run_on_adapter_runtime(async move {
+                async fn event(events: &mut tokio::sync::broadcast::Receiver<Event>, predicate: impl Fn(&Event) -> bool) {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let next = events.recv().await.unwrap();
+                            assert!(!matches!(next, Event::Error { .. } | Event::SubmissionRejected { .. } | Event::NotificationRejected { .. }), "{next:?}");
+                            if predicate(&next) { break; }
+                        }
+                    }).await.expect("saved-input fixture acknowledgement");
+                }
+                let mut events = handle.subscribe();
+                handle.send(Method::submit_text("revocation-seed", "hold for saved input setup")).await.unwrap();
+                event(&mut events, |next| matches!(next, Event::TextDelta { .. })).await;
+                handle.send(Method::Pause { command: protocol::WorkerCommandEnvelope::new(handle.shared_state.snapshot().last_command_id + 1) }).await.unwrap();
+                event(&mut events, |next| matches!(next, Event::WorkerState { snapshot } if snapshot.catalog_status() == protocol::WorkerStatus::Paused)).await;
+                handle.send(Method::submit_text("revocation-saved-submit", "must stay queued")).await.unwrap();
+                event(&mut events, |next| matches!(next, Event::SubmissionAccepted { submission_request_id, disposition: protocol::SubmissionDisposition::Queued, .. } if submission_request_id == "revocation-saved-submit")).await;
+                handle.send(Method::Notify { notification_request_id: "revocation-saved-notice".into(), message: "must also stay queued".into() }).await.unwrap();
+                event(&mut events, |next| matches!(next, Event::NotificationAccepted { notification_request_id } if notification_request_id == "revocation-saved-notice")).await;
+                Ok(())
+            }).unwrap();
+        }
         runtime.stop_worker(&worker.worker_ref, None).unwrap();
         // Count restore provider access, not the initial create/stop setup.
         provider_opens.store(0, Ordering::SeqCst);
         Self {
             root,
             provider_opens,
+            seed_handle,
             runtime,
             backend,
             worker,
@@ -241,6 +282,68 @@ impl ProfileFailureFixture {
         assert_eq!(self.provider_opens.load(Ordering::SeqCst), 0);
     }
 
+    fn resume_same_operation(
+        &self,
+        request: runtime_api::WorkerRestoreRequest,
+        operation_id: crate::execution::WorkerLifecycleOperationId,
+    ) {
+        let result = self
+            .runtime
+            .restore_worker_operation(&self.worker.worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(
+            result.state,
+            server_api::WorkerRestoreState::Accepted,
+            "{result:?}"
+        );
+        assert_eq!(
+            self.backend.workers.lock().unwrap()[&self.worker.worker_ref].restore_operation_id,
+            Some(operation_id)
+        );
+        let calls = self
+            .backend
+            .factory
+            .restore_faults
+            .executions
+            .load(Ordering::SeqCst);
+        let replay = self
+            .runtime
+            .restore_worker_operation(&self.worker.worker_ref, request)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(replay).unwrap(),
+            serde_json::to_value(result).unwrap()
+        );
+        assert_eq!(
+            self.backend
+                .factory
+                .restore_faults
+                .executions
+                .load(Ordering::SeqCst),
+            calls
+        );
+        self.runtime
+            .stop_worker(&self.worker.worker_ref, None)
+            .unwrap();
+        assert!(
+            self.backend
+                .factory
+                .observation_hub
+                .get(&self.worker.worker_ref)
+                .is_none()
+        );
+        assert!(self.backend.pending_restores.lock().unwrap().is_empty());
+        assert!(self.backend.workers.lock().unwrap().is_empty());
+        assert!(
+            self.backend
+                .factory
+                .failed_restore_resources
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     fn fresh_restore_and_old_replay(
         &self,
         request: runtime_api::WorkerRestoreRequest,
@@ -321,14 +424,177 @@ impl ProfileFailureFixture {
 
 #[test]
 #[serial_test::serial(worker_allocation)]
+fn profile_restore_timeout_attachment_revocation_cannot_reactivate_old_candidate() {
+    let model = MockClient::sequential(vec![MockResponse::Hang(
+        simple_text_events().into_iter().take(2).collect(),
+    )]);
+    let fixture =
+        ProfileFailureFixture::with_saved_inputs(Duration::from_secs(2), Some(model.clone()));
+    let body_calls = model.call_count.load(Ordering::SeqCst);
+    assert_eq!(body_calls, 1);
+    let aggregate = fixture
+        .backend
+        .factory
+        .worker_aggregate_dir(&fixture.worker.worker_ref)
+        .unwrap();
+    let session_before = persisted_files(&aggregate.join("session"));
+    let metadata = WorkerAggregateStore::open_read_only(
+        &aggregate,
+        ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&fixture.worker.worker_ref),
+    )
+    .unwrap();
+    let saved = metadata
+        .read_by_name(&ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(
+            &fixture.worker.worker_ref,
+        ))
+        .unwrap()
+        .unwrap();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (entered_tx, entered) = mpsc::channel();
+    *fixture
+        .backend
+        .factory
+        .restore_faults
+        .factory_gate
+        .lock()
+        .unwrap() = Some(release.clone());
+    *fixture
+        .backend
+        .factory
+        .restore_faults
+        .factory_entered
+        .lock()
+        .unwrap() = Some(entered_tx);
+    let request = fixture
+        .runtime
+        .test_restore_request(&fixture.worker.worker_ref);
+    let first = fixture
+        .runtime
+        .restore_worker_operation(&fixture.worker.worker_ref, request.clone())
+        .unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        first.state,
+        server_api::WorkerRestoreState::ReconciliationRequired
+    );
+    let pending = fixture
+        .backend
+        .pending_restore(&fixture.worker.worker_ref)
+        .unwrap()
+        .unwrap();
+    assert!(!pending.request.logical_workdir_attachments.is_empty());
+    let updated = fixture
+        .runtime
+        .replace_worker_workdir_attachments(&fixture.worker.worker_ref, Vec::new())
+        .unwrap();
+    assert!(updated.workdir_attachments.is_empty());
+    let authority = || -> serde_json::Value {
+        serde_json::from_slice(
+            &fs::read(
+                fixture
+                    .root
+                    .path()
+                    .join("s/workers")
+                    .join(fixture.worker.worker_ref.worker_id.to_string())
+                    .join("worker.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    assert!(authority().get("logical_workdir_attachments").is_none());
+    release.notify_one();
+    let replay = fixture
+        .runtime
+        .restore_worker_operation(&fixture.worker.worker_ref, request.clone())
+        .unwrap();
+    assert_eq!(
+        replay.state,
+        server_api::WorkerRestoreState::ReconciliationRequired,
+        "current attachment revocation must fence the old candidate: {replay:?}"
+    );
+    assert!(
+        replay
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("current Worker authority differs"),
+        "{replay:?}"
+    );
+    let record = authority();
+    let owner = &record["restore_guard"]["owners"][&request.request_id];
+    assert_eq!(
+        owner["operation_id"],
+        serde_json::to_value(pending.request.operation_id).unwrap()
+    );
+    assert!(owner["receipt"].is_null());
+    assert!(fixture.backend.workers.lock().unwrap().is_empty());
+    assert!(Arc::ptr_eq(
+        &pending,
+        &fixture
+            .backend
+            .pending_restore(&fixture.worker.worker_ref)
+            .unwrap()
+            .unwrap()
+    ));
+    assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 0);
+    assert!(!pending.activation_started.load(Ordering::SeqCst));
+    assert_eq!(model.call_count.load(Ordering::SeqCst), body_calls);
+    assert_eq!(persisted_files(&aggregate.join("session")), session_before);
+    assert_eq!(
+        metadata.read_by_name(&saved.worker_name).unwrap().unwrap(),
+        saved
+    );
+    let old = fixture.seed_handle.clone().unwrap();
+    fixture
+        .backend
+        .run_on_adapter_runtime(async move {
+            assert!(old.protocol_is_closed());
+            let old_command = Method::Resume {
+                command: protocol::WorkerCommandEnvelope::new(
+                    old.shared_state.snapshot().last_command_id + 1,
+                ),
+            };
+            assert!(
+                old.send(old_command).await.is_err(),
+                "old execution command must not enter the restore candidate"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(authority().get("logical_workdir_attachments").is_none());
+    let input = fixture.runtime.send_input(
+        &fixture.worker.worker_ref,
+        WorkerInput::user("must-not-enter-revoked-candidate"),
+    );
+    assert!(
+        input.is_err(),
+        "pending candidate must not admit fresh input: {input:?}"
+    );
+    // Stop owns cleanup of the original operation, never a newly rebound alias.
+    fixture
+        .runtime
+        .stop_worker(&fixture.worker.worker_ref, None)
+        .unwrap();
+    fixture.assert_closed_deferred_sessions(&pending);
+    assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 0);
+    assert!(fixture.backend.pending_restores.lock().unwrap().is_empty());
+    let old = fixture
+        .runtime
+        .restore_worker_operation(&fixture.worker.worker_ref, request)
+        .unwrap();
+    assert_ne!(old.state, server_api::WorkerRestoreState::Accepted);
+    assert!(fixture.backend.workers.lock().unwrap().is_empty());
+}
+
+#[test]
+#[serial_test::serial(worker_allocation)]
 fn profile_restore_multistage_failure_cleans_then_fresh_restore_without_stop() {
     // Binding means runtime Worker/attachment-router binding, not eager provider
     // materialization. Provider access stays deferred through every boundary.
     for stage in [
         RuntimeRestoreStage::Reconstruction,
         RuntimeRestoreStage::Binding,
-        RuntimeRestoreStage::Feature,
-        RuntimeRestoreStage::Controller,
     ] {
         let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
         fixture.fail(stage);
@@ -474,7 +740,7 @@ fn profile_restore_cleanup_failure_retains_owner_and_cause_without_opening_defer
         .unwrap();
     assert_eq!(
         result.state,
-        server_api::WorkerRestoreState::RolledBack,
+        server_api::WorkerRestoreState::ReconciliationRequired,
         "{result:?}"
     );
     assert!(
@@ -488,12 +754,11 @@ fn profile_restore_cleanup_failure_retains_owner_and_cause_without_opening_defer
             .iter()
             .all(|sessions| sessions.aliases().is_empty())
     );
-    fixture.assert_released();
     fixture.assert_closed_deferred_sessions(&pending);
     eprintln!(
-        "restore-fault cleanup=Workdir owner-retained=true retry=same-operation outcome=RolledBack"
+        "restore-fault cleanup=Workdir owner-retained=true retry=same-operation outcome=ReconciliationRequired"
     );
-    fixture.fresh_restore_and_old_replay(request, result);
+    fixture.resume_same_operation(request, pending.request.operation_id);
 }
 
 #[test]
@@ -585,6 +850,7 @@ async fn failed_restore_raw_cleanup_is_operation_bound_and_does_not_follow_reuse
         FailedRestoreResources {
             operation_id: current.operation_id,
             sessions: Vec::new(),
+            candidate_workdir_cleanup: None,
             allocation: None,
             feature_tasks: None,
         },
@@ -715,14 +981,14 @@ fn profile_restore_cleanup_timeout_keeps_running_join_and_late_failure_reconcile
         .unwrap();
     assert_eq!(
         result.state,
-        server_api::WorkerRestoreState::RolledBack,
+        server_api::WorkerRestoreState::Accepted,
         "{result:?}"
     );
-    fixture.assert_released();
+    assert_eq!(fixture.backend.workers.lock().unwrap().len(), 1);
     eprintln!(
         "restore-fault cleanup=timeout retained-task=true late-completion=joined executions=1"
     );
-    fixture.fresh_restore_and_old_replay(request, result);
+    fixture.resume_same_operation(request, pending.request.operation_id);
 }
 
 #[cfg(unix)]
@@ -745,7 +1011,7 @@ fn profile_restore_real_socket_start_failure_removes_partial_run_and_allocation(
         .unwrap();
     assert_eq!(
         result.state,
-        server_api::WorkerRestoreState::RolledBack,
+        server_api::WorkerRestoreState::ReconciliationRequired,
         "{result:?}"
     );
     let diagnostic = serde_json::to_string(&result).unwrap();
@@ -757,8 +1023,12 @@ fn profile_restore_real_socket_start_failure_removes_partial_run_and_allocation(
     // This case deliberately exercises the real Unix socket path-limit error;
     // positive restore cases retain the factory's normal InProcess transport.
     // Short fixture roots must not accidentally turn it into a successful bind.
-    let operation_id =
-        fixture.backend.completed_restore_failures.lock().unwrap()[&fixture.worker.worker_ref].0;
+    let pending = fixture
+        .backend
+        .pending_restore(&fixture.worker.worker_ref)
+        .unwrap()
+        .unwrap();
+    let operation_id = pending.request.operation_id;
     let socket = fixture
         .backend
         .factory
@@ -767,7 +1037,25 @@ fn profile_restore_real_socket_start_failure_removes_partial_run_and_allocation(
         .join("worker.sock");
     assert!(socket.as_os_str().as_encoded_bytes().len() >= 108);
     assert!(!diagnostic.contains(&fixture.root.path().to_string_lossy().to_string()));
-    fixture.assert_released();
+    assert!(!socket.exists());
+    assert!(fixture.backend.workers.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .backend
+            .factory
+            .failed_restore_resources
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .backend
+            .completed_restore_failures
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
     fixture
         .backend
         .factory
@@ -777,7 +1065,7 @@ fn profile_restore_real_socket_start_failure_removes_partial_run_and_allocation(
     eprintln!(
         "restore-fault stage=socket-start real-bootstrap=true partial-run=removed allocation=released"
     );
-    fixture.fresh_restore_and_old_replay(request, result);
+    fixture.resume_same_operation(request, operation_id);
 }
 
 #[test]
@@ -1178,6 +1466,8 @@ fn profile_restore_missing_committed_system_prompt_rolls_back_and_replays_classi
         "#,
     )
     .unwrap();
+    let mut manifest = manifest;
+    manifest.worker.name = worker_name.clone();
     metadata.resolved_manifest_snapshot =
         Some(manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap());
     metadata_store.write(&metadata).unwrap();

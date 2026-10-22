@@ -1066,7 +1066,8 @@ mod tests {
     use tokio::net::UnixListener;
 
     use crate::runtime::dir::RuntimeDir;
-    use crate::runtime::worker_allocation::test_util::RuntimeDirSandbox;
+
+    use crate::restore_test_environment::require_restore_test_environment;
 
     #[derive(Clone)]
     struct FailTargetPeerStore {
@@ -1110,11 +1111,13 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn state_backed_visibility_and_restore_planning() {
-        let root = TempDir::new().unwrap();
+        require_restore_test_environment();
+        let root = tempfile::tempdir_in(".").unwrap();
         let store_dir = root.path().join("store");
-        let runtime_base = root.path().join("runtime");
+        // Bind, durable child metadata, and discovery probes all use this same
+        // short reference into the tree still owned by root. No cwd mutation.
+        let runtime_base = Path::new(root.path().file_name().unwrap()).join("runtime");
         std::fs::create_dir_all(&runtime_base).unwrap();
-        let _runtime_sandbox = RuntimeDirSandbox::new(&runtime_base);
 
         let store = FsWorkerStore::new(&store_dir).unwrap();
         let session_id = new_session_id();

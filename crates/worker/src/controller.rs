@@ -689,6 +689,35 @@ pub enum WorkerControllerTransport {
 pub struct WorkerController;
 
 impl WorkerController {
+    /// Explicit recovery of an unmaterialized Session head. This installs the
+    /// saved Feature composition needed to produce the seed, but creates no
+    /// Controller, input channel, socket, observer, or queue consumer. The caller
+    /// owns the same operation's Feature/session/allocation cleanup on every exit.
+    pub async fn recover_pending_head<C, St>(
+        worker: &mut Worker<C, St>,
+        runtime_base: &Path,
+    ) -> std::io::Result<()>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        if worker.needs_initial_session_head_materialization() {
+            worker
+                .validate_subjektiv_body_publication()
+                .map_err(std::io::Error::other)?;
+            let registry = SpawnedWorkerRegistry::new_internal(
+                worker.manifest().worker.name.clone(),
+                worker.scope().clone(),
+            );
+            register_worker_tools(worker, runtime_base.to_path_buf(), registry, None, None).await?;
+            worker
+                .materialize_durable_session_head()
+                .await
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+
     pub async fn spawn<C, St>(
         worker: Worker<C, St>,
         runtime_base: &Path,
