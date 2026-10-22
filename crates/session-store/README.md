@@ -11,5 +11,7 @@ checks or Runtime catalog lifecycle management.
 - [`worker_session_store`]: storage boundary for a Session bound to a Worker
 - [`worker_metadata`]: current Worker state and active Segment switching
 - [`system_item`]: records of system input presented to the model
+- [`capture`]: Worker-independent immutable public values and bounded body transport;
+  authorization, source I/O, and delivery lifecycle stay with the Host
 - [`public_snapshot`] / [`public_index`]: public projections of stored history
 - [`event_trace`]: diagnostic records independent of history replay

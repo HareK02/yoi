@@ -510,7 +510,11 @@ mod tests {
 
     fn state() -> MemoryStagingOutputState {
         MemoryStagingOutputState::new(
-            SessionCapture::new("segment-1", vec![Item::user_message("durable decision")]),
+            SessionCapture::new(
+                "session",
+                "segment-1",
+                vec![Item::user_message("durable decision")],
+            ),
             crate::worker::marker_workspace_client(None, "test-backend"),
             SourceRef {
                 segment_id: "segment-1".to_string(),
@@ -537,6 +541,7 @@ mod tests {
     #[test]
     fn render_input_uses_session_entry_refs_and_new_tool_names() {
         let view = SessionCapture::new(
+            "session",
             "segment-1",
             vec![
                 Item::user_message("preference"),
@@ -586,7 +591,11 @@ mod tests {
     async fn subjektiv_destination_sends_committed_session_without_subject_scope() {
         let client = Arc::new(RecordingSubjektivClient::default());
         let state = MemoryStagingOutputState::new_subjektiv(
-            SessionCapture::new("segment-1", vec![Item::user_message("durable decision")]),
+            SessionCapture::new(
+                "session",
+                "segment-1",
+                vec![Item::user_message("durable decision")],
+            ),
             {
                 let mut host = crate::subjektiv::test_connection(client.clone());
                 host.context.session_id = "session-committed".into();

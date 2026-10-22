@@ -570,15 +570,8 @@ impl Tool for SearchSessionEntriesTool {
         let view = latest_view(&*self.provider, &params.subject).await?;
         let from = params.from.as_deref().map(parse_entry_ref).transpose()?;
         let through = params.through.as_deref().map(parse_entry_ref).transpose()?;
-        if let (Some(from), Some(through)) = (&from, &through) {
-            if view.source_index_for_ref(from) > view.source_index_for_ref(through) {
-                return Err(ToolError::InvalidArgument(
-                    "SearchSessionEntries from must not be after through".to_string(),
-                ));
-            }
-        }
         let entries = view
-            .search(&SearchOptions {
+            .search_checked(&SearchOptions {
                 query: params.query,
                 kind: params.kind.as_deref().map(parse_kind).transpose()?,
                 tool_part: params
@@ -593,6 +586,7 @@ impl Tool for SearchSessionEntriesTool {
                 through,
                 offset: params.offset,
             })
+            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?
             .into_iter()
             .map(|entry| {
                 serde_json::json!({
@@ -604,6 +598,7 @@ impl Tool for SearchSessionEntriesTool {
                     "tool_name": entry.tool_name,
                     "label": entry.label,
                     "text": entry.summary,
+                    "text_kind": "preview",
                 })
             })
             .collect::<Vec<_>>();
@@ -687,7 +682,10 @@ async fn latest_view(
         .capture_worker_session(subject)
         .await
         .map_err(tool_error)?;
+    // Observation providers expose a stable subject scope rather than a raw
+    // Session handle. This scope is never used to select recording material.
     Ok(SessionCapture::from_session_snapshot(
+        format!("observation:{}", capture.segment_id),
         capture.segment_id,
         capture.session,
     ))

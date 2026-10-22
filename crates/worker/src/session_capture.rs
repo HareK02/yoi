@@ -1,881 +1,14 @@
-//! Exploration domain for immutable Session captures, with no Workspace/Memory mutation capability.
-//!
-//! A capture is an ordered projection of committed entries; exploration excludes reasoning and
-//! system prompts, including Host compaction summaries and other derived context. Full inherited
-//! summary input belongs to compaction, not public observation or Memory evidence. Overview,
-//! search, bounded reads, and evidence conversion share `SessionEntryRef`.
-//! References identify entries in the selected Session and cannot be reused for another subject.
-//! Appends preserve existing entry identities. Sparse real user/assistant anchors and intervening
-//! entry counts index long histories. Search with an empty filter also provides bounded range lists.
-//!
-//! Host-fixed snapshot exploration, Memory candidate evidence validation, and current Worker
-//! observation share only this domain; they do not enable or modify each other's Features.
-//! The provider owns authorization to recapture a current Worker. A capture itself proves neither
-//! completion nor approval and grants no business-mutation authority.
+//! Host consumers share the pure immutable Session capture implementation.
+//! Live authorization, append fences, and recapture remain with the calling Host.
 
-use std::collections::HashSet;
-use std::sync::Arc;
-
-use crate::session_history::{SessionHistoryMetadata, WorkerHistoryProvenance};
-use agen::{HistoryEntry, Item, Role};
-use protocol::{
-    SessionContentPart, SessionEntryProvenance, SessionMessageRole, SessionSnapshot,
-    SessionSnapshotEntryData,
-};
-use serde::{Deserialize, Serialize};
-
-const DEFAULT_SEARCH_LIMIT: usize = 20;
-const MAX_SEARCH_LIMIT: usize = 50;
-const DEFAULT_READ_MAX_ITEMS: usize = 40;
-const MAX_READ_MAX_ITEMS: usize = 80;
-const DEFAULT_READ_MAX_BYTES: usize = 32 * 1024;
-const OVERVIEW_ANCHOR_STRIDE: usize = 8;
-
-/// Append-stable exploration reference derived from an entry identity in the selected Session.
-/// Shared by overview, search, read, and evidence conversion; it does not identify other Sessions' entries.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SessionEntryRef(String);
-
-impl SessionEntryRef {
-    pub fn from_history_entry_id(entry_id: &crate::SessionHistoryEntryId) -> Self {
-        Self(format!("E{}", entry_id.0))
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        let suffix = value.strip_prefix('E')?;
-        if suffix.is_empty()
-            || suffix.len() > 64
-            || !suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        {
-            return None;
-        }
-        Some(Self(value.to_string()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub(crate) fn source_index(&self) -> Option<u64> {
-        self.0.strip_prefix('E')?.parse().ok()
-    }
-}
-
-impl std::fmt::Display for SessionEntryRef {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReferenceKind {
-    User,
-    Assistant,
-    System,
-    Tool,
-}
-
-impl ReferenceKind {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::System => "system",
-            Self::Tool => "tool",
-        }
-    }
-
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value {
-            "user" => Some(Self::User),
-            "assistant" | "agent" => Some(Self::Assistant),
-            "system" => Some(Self::System),
-            "tool" => Some(Self::Tool),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolPart {
-    Input,
-    Output,
-    Both,
-}
-
-impl ToolPart {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value {
-            "input" => Some(Self::Input),
-            "output" => Some(Self::Output),
-            "both" => Some(Self::Both),
-            _ => None,
-        }
-    }
-
-    fn matches(self, actual: ToolPart) -> bool {
-        matches!(self, ToolPart::Both) || self == actual
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct OverviewItem {
-    pub id: SessionEntryRef,
-    pub origin: SessionEntryProvenance,
-    pub entry_range: [u64; 2],
-    pub kind: ReferenceKind,
-    pub label: String,
-    pub text: String,
-    pub intervening_entries: usize,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ReferenceEntry {
-    use_policy: Option<protocol::SessionEntryUsePolicy>,
-    pub id: SessionEntryRef,
-    pub origin: SessionEntryProvenance,
-    pub entry_range: [u64; 2],
-    pub kind: ReferenceKind,
-    pub tool_part: Option<ToolPart>,
-    pub tool_name: Option<String>,
-    pub label: String,
-    pub summary: String,
-    search_text: String,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SearchOptions {
-    pub query: String,
-    pub kind: Option<ReferenceKind>,
-    pub tool_part: Option<ToolPart>,
-    pub tool_name: Option<String>,
-    pub limit: Option<usize>,
-    pub min_entry_index: Option<u64>,
-    pub from: Option<SessionEntryRef>,
-    pub through: Option<SessionEntryRef>,
-    pub offset: usize,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SearchHit {
-    pub id: SessionEntryRef,
-    pub origin: SessionEntryProvenance,
-    pub kind: ReferenceKind,
-    pub tool_part: Option<ToolPart>,
-    pub tool_name: Option<String>,
-    pub entry_range: [u64; 2],
-    pub label: String,
-    pub summary: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ReadSelector<'a> {
-    Id(&'a str),
-    #[cfg(test)]
-    EntryRange([u64; 2]),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadDetail {
-    Compact,
-    Full,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ReadOptions {
-    pub include_tools: bool,
-    pub tool_part: ToolPart,
-    pub detail: ReadDetail,
-    pub max_items: usize,
-    pub max_bytes: usize,
-}
-
-impl Default for ReadOptions {
-    fn default() -> Self {
-        Self {
-            include_tools: true,
-            tool_part: ToolPart::Both,
-            detail: ReadDetail::Compact,
-            max_items: DEFAULT_READ_MAX_ITEMS,
-            max_bytes: DEFAULT_READ_MAX_BYTES,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ReadEntry {
-    pub id: SessionEntryRef,
-    pub origin: SessionEntryProvenance,
-    pub kind: ReferenceKind,
-    pub tool_part: Option<ToolPart>,
-    pub tool_name: Option<String>,
-    pub entry_range: [u64; 2],
-    pub label: String,
-    pub text: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ReadResult {
-    pub entries: Vec<ReadEntry>,
-    pub truncated: bool,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct CommittedToolCall {
-    pub call_id: String,
-    pub name: String,
-    pub arguments: String,
-    pub evidence: SessionEntryEvidence,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SessionEntryEvidence {
-    pub segment_id: String,
-    pub entry_ref: SessionEntryRef,
-    pub origin: SessionEntryProvenance,
-    pub entry_range: [u64; 2],
-    pub kind: ReferenceKind,
-    pub tool_part: Option<ToolPart>,
-    pub label: String,
-    pub summary: String,
-    pub excerpt: String,
-}
-
-#[derive(Debug, Clone)]
-struct CapturedHistoryEntry {
-    use_policy: Option<protocol::SessionEntryUsePolicy>,
-    item: Item,
-    entry_id: session_store::LoggedSessionHistoryEntryId,
-    origin: SessionEntryProvenance,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SessionCapture {
-    segment_id: String,
-    entries: Arc<Vec<CapturedHistoryEntry>>,
-    overview: Vec<OverviewItem>,
-    index: Vec<ReferenceEntry>,
-}
-
-impl SessionCapture {
-    pub(crate) fn from_session_snapshot(
-        segment_id: impl Into<String>,
-        snapshot: SessionSnapshot,
-    ) -> Self {
-        let entries = snapshot
-            .entries
-            .into_iter()
-            .filter_map(|entry| {
-                let item = match entry.data {
-                    SessionSnapshotEntryData::UserInput { segments } => {
-                        Item::user_message(protocol::Segment::flatten_to_text(&segments))
-                    }
-                    SessionSnapshotEntryData::Message { role, content } => {
-                        let role = match role {
-                            SessionMessageRole::User => Role::User,
-                            SessionMessageRole::Assistant => Role::Assistant,
-                        };
-                        Item::Message {
-                            id: None,
-                            role,
-                            content: content
-                                .into_iter()
-                                .map(|part| match part {
-                                    SessionContentPart::Text { text } => {
-                                        agen::ContentPart::Text { text }
-                                    }
-                                    SessionContentPart::Refusal { refusal } => {
-                                        agen::ContentPart::Refusal { refusal }
-                                    }
-                                })
-                                .collect(),
-                            status: None,
-                        }
-                    }
-                    SessionSnapshotEntryData::ToolCall {
-                        call_id,
-                        name,
-                        arguments,
-                    } => Item::tool_call(call_id, name, arguments),
-                    SessionSnapshotEntryData::ToolResult {
-                        call_id,
-                        summary,
-                        content,
-                        is_error,
-                        attachments: _,
-                    } => Item::tool_result_item(call_id, summary, content, is_error),
-                    SessionSnapshotEntryData::SystemItem { content, .. } => {
-                        entry.use_policy?;
-                        Item::system_message(content)
-                    }
-                    // Controller errors are not model-visible evidence.
-                    SessionSnapshotEntryData::Invoke { .. }
-                    | SessionSnapshotEntryData::Usage { .. }
-                    | SessionSnapshotEntryData::RunStats { .. }
-                    | SessionSnapshotEntryData::RunYielded { .. }
-                    | SessionSnapshotEntryData::RunResumed { .. }
-                    | SessionSnapshotEntryData::RunCancelled
-                    | SessionSnapshotEntryData::RunError { .. } => return None,
-                };
-                Some(CapturedHistoryEntry {
-                    use_policy: entry.use_policy,
-                    item,
-                    entry_id: session_store::LoggedSessionHistoryEntryId(entry.entry_id),
-                    origin: entry.provenance,
-                })
-            })
-            .collect();
-        Self::from_captured_entries(segment_id, entries)
-    }
-
-    pub(crate) fn new(segment_id: impl Into<String>, items: Vec<Item>) -> Self {
-        let entries = items
-            .into_iter()
-            .enumerate()
-            .map(|(index, item)| CapturedHistoryEntry {
-                use_policy: None,
-                item,
-                entry_id: session_store::LoggedSessionHistoryEntryId(format!("{index:08}")),
-                origin: SessionEntryProvenance::LegacyUnknown,
-            })
-            .collect();
-        Self::from_captured_entries(segment_id, entries)
-    }
-
-    pub(crate) fn from_history_entries(
-        segment_id: impl Into<String>,
-        entries: Vec<HistoryEntry<SessionHistoryMetadata>>,
-    ) -> Self {
-        let entries = entries
-            .into_iter()
-            .map(|entry| {
-                let (item, use_policy) = if let Some(input) = &entry.annotation.input_metadata {
-                    let is_system = matches!(
-                        entry.item,
-                        Item::Message {
-                            role: Role::System,
-                            ..
-                        }
-                    );
-                    if is_system {
-                        (
-                            Item::system_message(input.public_projection().body),
-                            Some(input.public_system_use_policy()),
-                        )
-                    } else {
-                        (entry.item, Some(input.public_use_policy()))
-                    }
-                } else {
-                    (entry.item, None)
-                };
-                CapturedHistoryEntry {
-                    item,
-                    use_policy,
-                    entry_id: entry.annotation.entry_id,
-                    origin: public_provenance(&entry.annotation.origin),
-                }
-            })
-            .collect();
-        Self::from_captured_entries(segment_id, entries)
-    }
-
-    fn from_captured_entries(
-        segment_id: impl Into<String>,
-        entries: Vec<CapturedHistoryEntry>,
-    ) -> Self {
-        let segment_id = segment_id.into();
-        let mut overview = Vec::new();
-        let mut index = Vec::new();
-
-        for (idx, entry) in entries.iter().enumerate() {
-            let item = &entry.item;
-            let entry_range = [idx as u64, idx as u64];
-            match item {
-                Item::Message { role, content, .. } => {
-                    let Some(kind) = message_reference_kind(&entry.origin, role, entry.use_policy)
-                    else {
-                        continue;
-                    };
-                    let text = content
-                        .iter()
-                        .map(|p| p.as_text())
-                        .collect::<Vec<_>>()
-                        .join("");
-                    let label = format!("{} message", kind.as_str());
-                    let summary = truncate_chars(&text, 240);
-                    let id = SessionEntryRef::from_history_entry_id(&entry.entry_id);
-                    index.push(ReferenceEntry {
-                        use_policy: entry.use_policy,
-                        id: id.clone(),
-                        origin: entry.origin.clone(),
-                        entry_range,
-                        kind,
-                        tool_part: None,
-                        tool_name: None,
-                        label: label.clone(),
-                        summary: summary.clone(),
-                        search_text: text.clone(),
-                    });
-                    if entry.use_policy.is_none_or(|p| p.observation_readable)
-                        && matches!(kind, ReferenceKind::User | ReferenceKind::Assistant)
-                    {
-                        overview.push(OverviewItem {
-                            id: id.clone(),
-                            origin: entry.origin.clone(),
-                            entry_range,
-                            kind,
-                            label,
-                            text,
-                            intervening_entries: 0,
-                        });
-                    }
-                }
-                Item::ToolCall {
-                    name, arguments, ..
-                } => {
-                    let text = format!("{name}\n{arguments}");
-                    index.push(ReferenceEntry {
-                        use_policy: entry.use_policy,
-                        id: SessionEntryRef::from_history_entry_id(&entry.entry_id),
-                        origin: entry.origin.clone(),
-                        entry_range,
-                        kind: ReferenceKind::Tool,
-                        tool_part: Some(ToolPart::Input),
-                        tool_name: Some(name.clone()),
-                        label: format!("tool input: {name}"),
-                        summary: format!("Tool call {name}"),
-                        search_text: text,
-                    });
-                }
-                Item::ToolResult {
-                    summary,
-                    content,
-                    attachments,
-                    ..
-                } => {
-                    let attachment_marker = if attachments.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n[{} image attachment(s)]", attachments.len())
-                    };
-                    let text = format!(
-                        "{summary}\n{}{attachment_marker}",
-                        content.as_deref().unwrap_or_default(),
-                    );
-                    index.push(ReferenceEntry {
-                        use_policy: entry.use_policy,
-                        id: SessionEntryRef::from_history_entry_id(&entry.entry_id),
-                        origin: entry.origin.clone(),
-                        entry_range,
-                        kind: ReferenceKind::Tool,
-                        tool_part: Some(ToolPart::Output),
-                        tool_name: None,
-                        label: "tool output".to_string(),
-                        summary: truncate_chars(summary, 240),
-                        search_text: text,
-                    });
-                }
-                Item::AssistantResponseBoundary { .. } | Item::Reasoning { .. } => {}
-            }
-        }
-
-        if overview.len() > 2 {
-            let last = overview.len() - 1;
-            overview = overview
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, entry)| {
-                    (index == 0 || index == last || index % OVERVIEW_ANCHOR_STRIDE == 0)
-                        .then_some(entry)
-                })
-                .collect();
-        }
-
-        for overview_index in 0..overview.len().saturating_sub(1) {
-            let current_entry = overview[overview_index].entry_range[0];
-            let next_entry = overview[overview_index + 1].entry_range[0];
-            overview[overview_index].intervening_entries = index
-                .iter()
-                .filter(|entry| {
-                    let entry_index = entry.entry_range[0];
-                    entry_index > current_entry && entry_index < next_entry
-                })
-                .count();
-        }
-
-        Self {
-            segment_id,
-            entries: Arc::new(entries),
-            overview,
-            index,
-        }
-    }
-
-    pub(crate) fn overview(&self) -> &[OverviewItem] {
-        &self.overview
-    }
-
-    pub(crate) fn source_index_for_ref(&self, reference: &SessionEntryRef) -> Option<u64> {
-        self.index
-            .iter()
-            .find(|entry| entry.id == *reference)
-            .map(|entry| entry.entry_range[0])
-            .or_else(|| reference.source_index())
-    }
-
-    pub(crate) fn search(&self, options: &SearchOptions) -> Vec<SearchHit> {
-        let query = options.query.trim().to_lowercase();
-        let limit = options
-            .limit
-            .unwrap_or(DEFAULT_SEARCH_LIMIT)
-            .clamp(1, MAX_SEARCH_LIMIT);
-        let tool_name = options.tool_name.as_deref();
-        let min_entry_index = options
-            .from
-            .as_ref()
-            .and_then(|reference| self.source_index_for_ref(reference))
-            .unwrap_or_else(|| options.min_entry_index.unwrap_or(0));
-        let max_entry_index = options
-            .through
-            .as_ref()
-            .and_then(|reference| self.source_index_for_ref(reference))
-            .unwrap_or(u64::MAX);
-        let mut skipped = 0usize;
-        let mut hits = Vec::new();
-
-        for entry in &self.index {
-            if entry.use_policy.is_some_and(|p| !p.observation_readable) {
-                continue;
-            }
-            if entry.entry_range[0] < min_entry_index || entry.entry_range[0] > max_entry_index {
-                continue;
-            }
-            if let Some(kind) = options.kind {
-                if entry.kind != kind {
-                    continue;
-                }
-            }
-            if let Some(part) = options.tool_part {
-                if entry.kind != ReferenceKind::Tool {
-                    continue;
-                }
-                let Some(actual) = entry.tool_part else {
-                    continue;
-                };
-                if !part.matches(actual) {
-                    continue;
-                }
-            }
-            if let Some(name) = tool_name {
-                if entry.tool_name.as_deref() != Some(name) {
-                    continue;
-                }
-            }
-            if !query.is_empty() && !entry.search_text.to_lowercase().contains(&query) {
-                continue;
-            }
-            if skipped < options.offset {
-                skipped += 1;
-                continue;
-            }
-            hits.push(SearchHit {
-                id: entry.id.clone(),
-                origin: entry.origin.clone(),
-                kind: entry.kind,
-                tool_part: entry.tool_part,
-                tool_name: entry.tool_name.clone(),
-                entry_range: entry.entry_range,
-                label: entry.label.clone(),
-                summary: entry.summary.clone(),
-            });
-            if hits.len() >= limit {
-                break;
-            }
-        }
-
-        hits
-    }
-
-    pub(crate) fn read(&self, selector: ReadSelector<'_>, options: ReadOptions) -> ReadResult {
-        let max_items = options.max_items.clamp(1, MAX_READ_MAX_ITEMS);
-        let max_bytes = options.max_bytes.max(1);
-        let mut entries = Vec::new();
-        let mut bytes = 0usize;
-        let mut truncated = false;
-
-        let selected: Vec<&ReferenceEntry> = match selector {
-            ReadSelector::Id(id) => self
-                .index
-                .iter()
-                .filter(|entry| entry.id.as_str() == id)
-                .collect(),
-            #[cfg(test)]
-            ReadSelector::EntryRange([start, end]) => self
-                .index
-                .iter()
-                .filter(|entry| entry.entry_range[0] >= start && entry.entry_range[0] <= end)
-                .collect(),
-        };
-
-        for entry in selected {
-            if entry.use_policy.is_some_and(|p| !p.observation_readable) {
-                continue;
-            }
-            if entries.len() >= max_items {
-                truncated = true;
-                break;
-            }
-            if entry.kind == ReferenceKind::Tool {
-                if !options.include_tools {
-                    continue;
-                }
-                if let Some(actual) = entry.tool_part {
-                    if !options.tool_part.matches(actual) {
-                        continue;
-                    }
-                }
-            }
-            let Some(item) = self
-                .entries
-                .get(entry.entry_range[0] as usize)
-                .map(|entry| &entry.item)
-            else {
-                continue;
-            };
-            let text = render_item(item, entry, options.detail, max_bytes.saturating_sub(bytes));
-            bytes = bytes.saturating_add(text.len());
-            entries.push(ReadEntry {
-                id: entry.id.clone(),
-                origin: entry.origin.clone(),
-                kind: entry.kind,
-                tool_part: entry.tool_part,
-                tool_name: entry.tool_name.clone(),
-                entry_range: entry.entry_range,
-                label: entry.label.clone(),
-                text,
-            });
-            if bytes >= max_bytes {
-                truncated = true;
-                break;
-            }
-        }
-
-        ReadResult { entries, truncated }
-    }
-
-    /// Resolves the committed tool-call input for a provider call id. This is
-    /// used by explicit-memory receipts only after the containing run is durable,
-    /// so a model-authored claim can cite its own committed tool invocation
-    /// without inventing a SessionEntryRef.
-    pub(crate) fn evidence_for_tool_call(&self, call_id: &str) -> Option<SessionEntryEvidence> {
-        let entry_index = self.entries.iter().position(|entry| {
-            matches!(
-                &entry.item,
-                Item::ToolCall {
-                    call_id: stored_call_id,
-                    ..
-                } if stored_call_id == call_id
-            )
-        })?;
-        let reference = self.index.iter().find(|entry| {
-            entry.entry_range[0] == entry_index as u64
-                && entry.kind == ReferenceKind::Tool
-                && entry.tool_part == Some(ToolPart::Input)
-        })?;
-        self.evidence_for(reference.id.as_str())
-    }
-
-    pub(crate) fn committed_pending_tool_calls(&self, names: &[&str]) -> Vec<CommittedToolCall> {
-        let pending_call_ids = self
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                let Item::ToolResult {
-                    call_id,
-                    content: Some(content),
-                    is_error: false,
-                    ..
-                } = &entry.item
-                else {
-                    return None;
-                };
-                (serde_json::from_str::<serde_json::Value>(content)
-                    .ok()
-                    .and_then(|value| value.get("status").cloned())
-                    .as_ref()
-                    .and_then(serde_json::Value::as_str)
-                    == Some("pending_commit"))
-                .then_some(call_id.as_str())
-            })
-            .collect::<HashSet<_>>();
-        self.entries
-            .iter()
-            .filter_map(|entry| {
-                let Item::ToolCall {
-                    call_id,
-                    name,
-                    arguments,
-                    ..
-                } = &entry.item
-                else {
-                    return None;
-                };
-                if !names.contains(&name.as_str()) || !pending_call_ids.contains(call_id.as_str()) {
-                    return None;
-                }
-                Some(CommittedToolCall {
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                    evidence: self.evidence_for_tool_call(call_id)?,
-                })
-            })
-            .collect()
-    }
-
-    pub(crate) fn evidence_for(&self, id: &str) -> Option<SessionEntryEvidence> {
-        let entry = self.index.iter().find(|entry| entry.id.as_str() == id)?;
-        if entry.use_policy.is_some_and(|p| !p.memory_evidence) {
-            return None;
-        }
-        let item = &self.entries.get(entry.entry_range[0] as usize)?.item;
-        let excerpt = render_item(item, entry, ReadDetail::Compact, 2 * 1024);
-        Some(SessionEntryEvidence {
-            segment_id: self.segment_id.clone(),
-            entry_ref: entry.id.clone(),
-            origin: entry.origin.clone(),
-            entry_range: entry.entry_range,
-            kind: entry.kind,
-            tool_part: entry.tool_part,
-            label: entry.label.clone(),
-            summary: entry.summary.clone(),
-            excerpt,
-        })
-    }
-}
-
-fn public_provenance(origin: &WorkerHistoryProvenance) -> SessionEntryProvenance {
-    match origin {
-        WorkerHistoryProvenance::HumanInput { .. } | WorkerHistoryProvenance::LocalHumanInput => {
-            SessionEntryProvenance::HumanInput
-        }
-        WorkerHistoryProvenance::WorkerInput { .. } => SessionEntryProvenance::WorkerInput,
-        WorkerHistoryProvenance::FlowInstruction { .. } => SessionEntryProvenance::FlowInstruction,
-        WorkerHistoryProvenance::BackendInstruction { .. }
-        | WorkerHistoryProvenance::Provided { .. } => SessionEntryProvenance::BackendInstruction,
-        WorkerHistoryProvenance::ModelOutput { .. } => SessionEntryProvenance::ModelOutput,
-        WorkerHistoryProvenance::ToolOutput { .. } => SessionEntryProvenance::ToolOutput,
-        WorkerHistoryProvenance::CompactionSummary
-        | WorkerHistoryProvenance::DerivedSummary
-        | WorkerHistoryProvenance::JournalContext => SessionEntryProvenance::DerivedSummary,
-        WorkerHistoryProvenance::LegacyUnknown => SessionEntryProvenance::LegacyUnknown,
-    }
-}
-
-fn message_reference_kind(
-    origin: &SessionEntryProvenance,
-    provider_role: &Role,
-    use_policy: Option<protocol::SessionEntryUsePolicy>,
-) -> Option<ReferenceKind> {
-    if use_policy.is_some() {
-        return match provider_role {
-            Role::System => Some(ReferenceKind::System),
-            Role::User => Some(ReferenceKind::User),
-            Role::Assistant => Some(ReferenceKind::Assistant),
-        };
-    }
-    match origin {
-        SessionEntryProvenance::HumanInput | SessionEntryProvenance::WorkerInput => {
-            Some(ReferenceKind::User)
-        }
-        SessionEntryProvenance::ModelOutput => Some(ReferenceKind::Assistant),
-        SessionEntryProvenance::ToolOutput => Some(ReferenceKind::Tool),
-        SessionEntryProvenance::LegacyUnknown => match provider_role {
-            Role::User => Some(ReferenceKind::User),
-            Role::Assistant => Some(ReferenceKind::Assistant),
-            Role::System => None,
-        },
-        // Flow/backend/system content remains out of the observation surface
-        // even when represented with a provider user/system role.
-        SessionEntryProvenance::FlowInstruction
-        | SessionEntryProvenance::BackendInstruction
-        | SessionEntryProvenance::DerivedSummary => None,
-    }
-}
-
-fn render_item(
-    item: &Item,
-    entry: &ReferenceEntry,
-    detail: ReadDetail,
-    max_bytes: usize,
-) -> String {
-    let text = match item {
-        Item::Message { role, content, .. } => {
-            let text = content
-                .iter()
-                .map(|p| p.as_text())
-                .collect::<Vec<_>>()
-                .join("");
-            format!("[{} {:?}] {text}", entry.id, role)
-        }
-        Item::ToolCall {
-            name, arguments, ..
-        } => match detail {
-            ReadDetail::Compact => format!("[{} ToolInput {name}] (arguments omitted)", entry.id),
-            ReadDetail::Full => format!("[{} ToolInput {name}]\narguments: {arguments}", entry.id),
-        },
-        Item::ToolResult {
-            summary,
-            content,
-            attachments,
-            is_error,
-            ..
-        } => {
-            let attachment_line = if attachments.is_empty() {
-                String::new()
-            } else {
-                format!("\nattachments: {} image(s)", attachments.len())
-            };
-            match detail {
-                ReadDetail::Compact => format!(
-                    "[{} ToolOutput{}]\nsummary: {summary}\ncontent: (omitted){attachment_line}",
-                    entry.id,
-                    if *is_error { " error" } else { "" },
-                ),
-                ReadDetail::Full => format!(
-                    "[{} ToolOutput{}]\nsummary: {summary}\ncontent: {}{attachment_line}",
-                    entry.id,
-                    if *is_error { " error" } else { "" },
-                    content.as_deref().unwrap_or_default(),
-                ),
-            }
-        }
-        Item::AssistantResponseBoundary { .. } => {
-            format!("[{} Assistant response boundary omitted]", entry.id)
-        }
-        Item::Reasoning { .. } => format!("[{} Reasoning omitted]", entry.id),
-    };
-    truncate_chars(&text, max_bytes)
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return "… [truncated]".to_string();
-    }
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out = text.chars().take(max_chars).collect::<String>();
-    out.push_str("… [truncated]");
-    out
-}
+pub use session_store::capture::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_history::WorkerHistoryProvenance;
+    use agen::Item;
+    use protocol::{SessionEntryProvenance, SessionSnapshot};
 
     #[test]
     fn flow_user_role_is_excluded_while_explicit_human_origin_remains_evidence() {
@@ -897,7 +30,7 @@ mod tests {
                 },
             ),
         ];
-        let capture = SessionCapture::from_history_entries("segment", entries);
+        let capture = SessionCapture::from_history_entries("session", "segment", entries);
         let overview = capture.overview();
         assert_eq!(overview.len(), 1);
         assert!(matches!(
@@ -921,8 +54,8 @@ mod tests {
             },
         );
         let expected_ref = SessionEntryRef::from_history_entry_id(&retained.annotation.entry_id);
-        let before = SessionCapture::from_history_entries("old", vec![retained.clone()]);
-        let after = SessionCapture::from_history_entries("new", vec![retained]);
+        let before = SessionCapture::from_history_entries("session", "old", vec![retained.clone()]);
+        let after = SessionCapture::from_history_entries("session", "new", vec![retained]);
         assert_eq!(before.overview()[0].id, expected_ref);
         assert_eq!(after.overview()[0].id, expected_ref);
         assert_eq!(
@@ -963,7 +96,7 @@ mod tests {
             .iter()
             .map(|entry| SessionEntryRef::from_history_entry_id(&entry.annotation.entry_id))
             .collect::<Vec<_>>();
-        let capture = SessionCapture::from_history_entries("segment", entries);
+        let capture = SessionCapture::from_history_entries("session", "segment", entries);
         assert!(capture.overview().is_empty());
         assert!(
             capture
@@ -1102,8 +235,16 @@ mod tests {
         let snapshot: SessionSnapshot =
             serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap();
         for capture in [
-            SessionCapture::from_history_entries(segment.to_string(), restored),
-            SessionCapture::from_session_snapshot(segment.to_string(), snapshot),
+            SessionCapture::from_history_entries(
+                session.to_string(),
+                segment.to_string(),
+                restored,
+            ),
+            SessionCapture::from_session_snapshot(
+                session.to_string(),
+                segment.to_string(),
+                snapshot,
+            ),
         ] {
             let hits = capture.search(&SearchOptions {
                 kind: Some(ReferenceKind::System),
@@ -1228,13 +369,15 @@ mod tests {
                         assert_eq!(entry.item, items[index]);
                         assert_eq!(entry.annotation, history[index].metadata);
                     }
-                    let capture = SessionCapture::from_history_entries(fork.to_string(), restored);
-                    assert!(
-                        matches!(&capture.entries[2].item, Item::ToolCall { call_id, .. } if call_id == "derived")
+                    let capture = SessionCapture::from_history_entries(
+                        session.to_string(),
+                        fork.to_string(),
+                        restored,
                     );
-                    assert!(
-                        matches!(&capture.entries[3].item, Item::ToolResult { call_id, .. } if call_id == "derived")
-                    );
+                    // Private derived content must be absent even from the saved
+                    // body representation, not merely hidden by the UI index.
+                    let encoded = serde_json::to_string(&capture.to_dto()).unwrap();
+                    assert!(!encoded.contains("PRIVATE_SYNTHETIC"));
                     let snapshot = public_snapshot::project_session_snapshot(session, &saved);
                     assert!(
                         !serde_json::to_string(&snapshot)
@@ -1243,7 +386,11 @@ mod tests {
                     );
                     for capture in [
                         capture,
-                        SessionCapture::from_session_snapshot(fork.to_string(), snapshot),
+                        SessionCapture::from_session_snapshot(
+                            session.to_string(),
+                            fork.to_string(),
+                            snapshot,
+                        ),
                     ] {
                         assert_eq!(
                             capture
@@ -1315,6 +462,7 @@ mod tests {
     #[test]
     fn overview_contains_user_and_assistant_only() {
         let view = SessionCapture::new(
+            "session",
             "segment-1",
             vec![
                 Item::system_message("sys"),
@@ -1335,6 +483,7 @@ mod tests {
     #[test]
     fn search_filters_tool_input_and_output() {
         let view = SessionCapture::new(
+            "session",
             "segment-1",
             vec![
                 Item::tool_call("c1", "Read", "{\"file\":\"Cargo.toml\"}"),
@@ -1374,6 +523,7 @@ mod tests {
     #[test]
     fn read_by_entry_range_is_bounded_and_can_skip_tools() {
         let view = SessionCapture::new(
+            "session",
             "segment-1",
             vec![
                 Item::user_message("one"),
@@ -1406,6 +556,7 @@ mod tests {
     #[test]
     fn tool_image_projection_exposes_only_bounded_metadata() {
         let view = SessionCapture::new(
+            "session",
             "segment-1",
             vec![Item::tool_result_item_with_attachments(
                 "c1",
@@ -1435,6 +586,7 @@ mod tests {
     #[test]
     fn system_prompt_and_reasoning_are_excluded_from_every_projection() {
         let view = SessionCapture::new(
+            "session",
             "segment-1",
             vec![
                 Item::system_message("raw secret system prompt"),
@@ -1472,7 +624,7 @@ mod tests {
         let items = (0..20)
             .map(|index| Item::user_message(format!("message-{index}")))
             .collect::<Vec<_>>();
-        let view = SessionCapture::new("segment-1", items);
+        let view = SessionCapture::new("session", "segment-1", items);
         let refs = view
             .overview()
             .iter()
@@ -1490,6 +642,7 @@ mod tests {
     #[test]
     fn append_preserves_existing_session_entry_refs() {
         let first = SessionCapture::new(
+            "session",
             "segment-1",
             vec![
                 Item::user_message("first"),
@@ -1497,6 +650,7 @@ mod tests {
             ],
         );
         let appended = SessionCapture::new(
+            "session",
             "segment-1",
             vec![
                 Item::user_message("first"),
@@ -1540,7 +694,7 @@ mod tests {
 
     #[test]
     fn evidence_projection_uses_entry_range_and_session_entry_ref() {
-        let view = SessionCapture::new("segment-1", vec![Item::user_message("hello")]);
+        let view = SessionCapture::new("session", "segment-1", vec![Item::user_message("hello")]);
         let source = view.evidence_for("E00000000").unwrap();
         assert_eq!(source.segment_id, "segment-1");
         assert_eq!(source.entry_range, [0, 0]);
@@ -1550,6 +704,7 @@ mod tests {
     #[test]
     fn committed_tool_call_can_be_resolved_by_provider_call_id() {
         let view = SessionCapture::new(
+            "session",
             "segment-1",
             vec![Item::tool_call(
                 "call-remember",
@@ -1561,5 +716,112 @@ mod tests {
         assert_eq!(evidence.entry_ref.as_str(), "E00000000");
         assert_eq!(evidence.tool_part, Some(ToolPart::Input));
         assert!(view.evidence_for_tool_call("missing").is_none());
+    }
+    // Real Store append and Segment replacement -> Worker replay -> the common
+    // fixed value used by Memory and compaction exploration. No live I/O remains
+    // available after the owned temporary source is removed.
+    #[test]
+    fn frozen_memory_and_exploration_survive_append_compaction_and_source_removal() {
+        use crate::feature::builtin::memory_staging_output::render_extract_input;
+        use crate::feature::builtin::session_explore::SessionExploreState;
+        use session_store::{FsStore, LogEntry, SegmentOrigin, Store};
+        let root = tempfile::tempdir().unwrap();
+        let store = FsStore::new(root.path()).unwrap();
+        let session = session_store::new_session_id();
+        let first = session_store::new_segment_id();
+        let next = session_store::new_segment_id();
+        let original = crate::session_history::history_entry(
+            Item::user_message("fixed 日本語 intent"),
+            WorkerHistoryProvenance::LocalHumanInput,
+        );
+        let seed = |history, compacted_from| LogEntry::AnnotatedSegmentStart {
+            ts: 1,
+            session_id: session,
+            system_prompt: Some("PRIVATE_SYSTEM".into()),
+            config: Default::default(),
+            history,
+            forked_from: None,
+            compacted_from,
+        };
+        store
+            .create_segment(
+                session,
+                first,
+                &[seed(
+                    vec![crate::session_history::to_logged_history_entry(&original)],
+                    None,
+                )],
+            )
+            .unwrap();
+        let log = store.read_all(session, first).unwrap();
+        let restored =
+            crate::session_history::restore_history_entries(session, first, &log).unwrap();
+        let fixed =
+            SessionCapture::from_history_entries(session.to_string(), first.to_string(), restored);
+        let overview = fixed.overview()[0].clone();
+        let evidence = fixed.evidence_for(overview.id.as_str()).unwrap();
+        let extract = render_extract_input(&fixed);
+        let encoded = fixed.encode(CaptureLimits::default()).unwrap();
+        let state = SessionExploreState::new(fixed.clone());
+        store
+            .append(
+                session,
+                first,
+                &LogEntry::AnnotatedAssistantItem {
+                    ts: 2,
+                    entry: crate::session_history::to_logged_history_entry(
+                        &crate::session_history::history_entry(
+                            Item::assistant_message("later append"),
+                            WorkerHistoryProvenance::LegacyUnknown,
+                        ),
+                    ),
+                },
+            )
+            .unwrap();
+        let summary = crate::session_history::history_entry(
+            Item::system_message("PRIVATE_COMPACTED_SUMMARY"),
+            WorkerHistoryProvenance::DerivedSummary,
+        );
+        store
+            .create_segment(
+                session,
+                next,
+                &[seed(
+                    vec![crate::session_history::to_logged_history_entry(&summary)],
+                    Some(SegmentOrigin {
+                        segment_id: first,
+                        at_turn_index: 0,
+                    }),
+                )],
+            )
+            .unwrap();
+        drop(store);
+        drop(root);
+        assert_eq!(fixed.encode(CaptureLimits::default()).unwrap(), encoded);
+        assert_eq!(render_extract_input(state.view()), extract);
+        assert_eq!(state.view().overview()[0].id, overview.id);
+        assert_eq!(state.view().overview()[0].text, overview.text);
+        let retained = state.view().evidence_for(overview.id.as_str()).unwrap();
+        assert_eq!(retained.entry_range, evidence.entry_range);
+        assert_eq!(retained.excerpt, evidence.excerpt);
+        assert!(
+            state
+                .view()
+                .search(&SearchOptions {
+                    query: "later".into(),
+                    ..Default::default()
+                })
+                .is_empty()
+        );
+        let restored = SessionCapture::decode(&encoded, CaptureLimits::default()).unwrap();
+        let scoped = fixed.scoped_ref(&overview.id).unwrap();
+        assert_eq!(
+            restored
+                .resolve_ref(&scoped, CapturePurpose::MemoryEvidence)
+                .unwrap()
+                .entry_id,
+            original.annotation.entry_id.0
+        );
+        assert!(!String::from_utf8(encoded).unwrap().contains("PRIVATE_"));
     }
 }

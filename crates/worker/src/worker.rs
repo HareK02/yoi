@@ -7501,6 +7501,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 crate::feature::builtin::session_explore::SessionExploreFeature::new(
                     crate::feature::builtin::session_explore::SessionExploreState::new(
                         crate::session_capture::SessionCapture::from_history_entries(
+                            self.session_id().to_string(),
                             self.segment_id().to_string(),
                             entries_to_summarise.clone(),
                         ),
@@ -17374,8 +17375,9 @@ permission = "write"
                     producer: "arbitrary-context-provider".into()
                 }
             );
-            let view =
-                crate::session_capture::SessionCapture::from_history_entries("startup", replay);
+            let view = crate::session_capture::SessionCapture::from_history_entries(
+                "session", "startup", replay,
+            );
             let extract =
                 crate::feature::builtin::memory_staging_output::render_extract_input(&view);
             assert!(!extract.contains("PRIOR_JOURNAL_REFERENCE"));

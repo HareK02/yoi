@@ -17,14 +17,14 @@ use crate::feature::{
     ToolDeclaration,
 };
 use crate::session_capture::{
-    ReadDetail, ReadOptions, ReadSelector, ReferenceKind, SearchOptions, SessionCapture,
-    SessionEntryRef, ToolPart,
+    CapturePurpose, RawField, ReadDetail, ReadOptions, ReadSelector, ReferenceKind, SearchOptions,
+    SessionCapture, SessionEntryRef, ToolPart,
 };
 
 const SHOW_OVERVIEW_DESCRIPTION: &str =
     "Show a sparse, bounded index of real user and assistant session entries.";
 const SEARCH_ENTRIES_DESCRIPTION: &str = "Search or compactly list a bounded range of committed session entries. Reasoning entries are never exposed.";
-const READ_ENTRY_DESCRIPTION: &str = "Read one committed session entry by stable SessionEntryRef. Compact mode is the default; full mode includes bounded tool input or output.";
+const READ_ENTRY_DESCRIPTION: &str = "Read one committed session entry by stable SessionEntryRef. Compact mode is the default; full mode is a bounded rendering, not raw source. Raw mode requires raw_field and supports UTF-8 byte_offset/next_offset without omission; use capture_id to bind continuation to this exact capture.";
 const DEFAULT_PAGE_LIMIT: usize = 20;
 const MAX_PAGE_LIMIT: usize = 100;
 const DEFAULT_READ_ITEMS: usize = 10;
@@ -173,6 +173,38 @@ struct ReadEntryParams {
     mode: String,
     #[serde(default)]
     max_items: Option<usize>,
+    #[serde(default)]
+    raw_field: Option<RawEntryField>,
+    #[serde(default)]
+    part_index: Option<usize>,
+    #[serde(default)]
+    byte_offset: Option<usize>,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+    #[serde(default)]
+    capture_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum RawEntryField {
+    MessagePart,
+    PublicSystem,
+    ToolArguments,
+    ToolSummary,
+    ToolContent,
+}
+
+impl RawEntryField {
+    fn into_common(self, part_index: usize) -> RawField {
+        match self {
+            Self::MessagePart => RawField::MessagePart(part_index),
+            Self::PublicSystem => RawField::PublicSystem,
+            Self::ToolArguments => RawField::ToolArguments,
+            Self::ToolSummary => RawField::ToolSummary,
+            Self::ToolContent => RawField::ToolContent,
+        }
+    }
 }
 
 fn default_read_mode() -> String {
@@ -243,25 +275,20 @@ impl Tool for SearchEntriesTool {
         let from = params.from.as_deref().map(parse_entry_ref).transpose()?;
         let through = params.through.as_deref().map(parse_entry_ref).transpose()?;
         let view = self.state.view();
-        if let (Some(from), Some(through)) = (&from, &through) {
-            if view.source_index_for_ref(from) > view.source_index_for_ref(through) {
-                return Err(ToolError::InvalidArgument(
-                    "SearchEntries from must not be after through".to_string(),
-                ));
-            }
-        }
         let limit = bounded_limit(params.limit, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT);
-        let hits = view.search(&SearchOptions {
-            query: params.query,
-            kind,
-            tool_part,
-            tool_name: params.tool_name,
-            limit: Some(limit),
-            min_entry_index: None,
-            from,
-            through,
-            offset: params.offset,
-        });
+        let hits = view
+            .search_checked(&SearchOptions {
+                query: params.query,
+                kind,
+                tool_part,
+                tool_name: params.tool_name,
+                limit: Some(limit),
+                min_entry_index: None,
+                from,
+                through,
+                offset: params.offset,
+            })
+            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
         let entries = hits
             .iter()
             .map(|hit| {
@@ -272,6 +299,7 @@ impl Tool for SearchEntriesTool {
                     "tool_name": hit.tool_name,
                     "label": hit.label,
                     "text": hit.summary,
+                    "text_kind": "preview",
                 })
             })
             .collect::<Vec<_>>();
@@ -299,12 +327,62 @@ impl Tool for ReadEntryTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: ReadEntryParams = parse_input("ReadEntry", input_json)?;
         let entry_ref = parse_entry_ref(&params.entry_ref)?;
+        let view = self.state.view();
+        if params
+            .capture_id
+            .as_deref()
+            .is_some_and(|id| id != view.capture_id())
+        {
+            return Err(ToolError::InvalidArgument(
+                "capture identity does not match".into(),
+            ));
+        }
+        if params.mode == "raw" {
+            let field = params
+                .raw_field
+                .ok_or_else(|| ToolError::InvalidArgument("raw mode requires raw_field".into()))?;
+            if params.part_index.is_some() && !matches!(field, RawEntryField::MessagePart) {
+                return Err(ToolError::InvalidArgument(
+                    "part_index is only valid for message_part".into(),
+                ));
+            }
+            let reference = view
+                .scoped_ref(&entry_ref)
+                .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+            let raw = view
+                .read_raw(
+                    &reference,
+                    CapturePurpose::Observation,
+                    field.into_common(params.part_index.unwrap_or(0)),
+                    params.byte_offset.unwrap_or(0),
+                    params
+                        .max_bytes
+                        .unwrap_or(MAX_READ_BYTES)
+                        .clamp(1, MAX_READ_BYTES),
+                )
+                .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+            return json_output(
+                "Read raw session source bytes.".into(),
+                serde_json::json!({
+                    "text_kind": "raw", "raw": raw,
+                }),
+            );
+        }
+        if params.raw_field.is_some()
+            || params.part_index.is_some()
+            || params.byte_offset.is_some()
+            || params.max_bytes.is_some()
+        {
+            return Err(ToolError::InvalidArgument(
+                "raw fields require raw mode".into(),
+            ));
+        }
         let detail = match params.mode.as_str() {
             "compact" => ReadDetail::Compact,
             "full" => ReadDetail::Full,
             other => {
                 return Err(ToolError::InvalidArgument(format!(
-                    "invalid ReadEntry mode {other:?}; expected compact or full"
+                    "invalid ReadEntry mode {other:?}; expected compact, full, or raw"
                 )));
             }
         };
@@ -347,6 +425,7 @@ impl Tool for ReadEntryTool {
             serde_json::json!({
                 "entries": entries,
                 "truncated": read.truncated,
+                "text_kind": "rendered",
             }),
         )
     }
@@ -408,6 +487,7 @@ mod tests {
 
     fn state() -> SessionExploreState {
         SessionExploreState::new(SessionCapture::new(
+            "session",
             "segment-1",
             vec![
                 Item::user_message("first"),
@@ -478,5 +558,65 @@ mod tests {
             .await
             .unwrap();
         assert!(output.content.unwrap().contains("second"));
+    }
+    #[tokio::test]
+    async fn search_rejects_unknown_or_reversed_capture_endpoints() {
+        let search = search_entries_definition(state())().1;
+        for input in [
+            r#"{"from":"E99999999"}"#,
+            r#"{"through":"E99999999"}"#,
+            r#"{"from":"E00000003","through":"E00000000"}"#,
+        ] {
+            assert!(
+                search
+                    .execute(input, agen::tool::ToolExecutionContext::direct())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_tool_arguments_reassemble_without_preview_or_utf8_loss() {
+        let arguments = "日本語\n\"\\".repeat(100);
+        let state = SessionExploreState::new(SessionCapture::new(
+            "session",
+            "segment",
+            vec![Item::tool_call("call", "Read", arguments.clone())],
+        ));
+        let capture_id = state.view().capture_id().to_owned();
+        let tool = read_entry_definition(state)().1;
+        let mut offset = 0;
+        let mut assembled = String::new();
+        loop {
+            let input = serde_json::json!({
+                "entry_ref": "E00000000", "mode": "raw", "raw_field": "tool_arguments",
+                "byte_offset": offset, "max_bytes": 17, "capture_id": capture_id,
+            });
+            let output = tool
+                .execute(
+                    &input.to_string(),
+                    agen::tool::ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&output.content.unwrap()).unwrap();
+            assert_eq!(value["text_kind"], "raw");
+            let raw = &value["raw"];
+            assert_eq!(raw["offset"], offset);
+            let text = raw["text"].as_str().unwrap();
+            assert!(text.len() <= 17);
+            assembled.push_str(text);
+            match raw["next_offset"].as_u64() {
+                Some(next) => {
+                    assert!(next > offset as u64);
+                    offset = next as usize;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(assembled, arguments);
+        assert!(tool.execute(r#"{"entry_ref":"E00000000","mode":"raw","raw_field":"tool_arguments","capture_id":"other"}"#,
+            agen::tool::ToolExecutionContext::direct()).await.is_err());
     }
 }

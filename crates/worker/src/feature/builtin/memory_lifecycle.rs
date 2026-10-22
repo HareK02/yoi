@@ -457,6 +457,7 @@ impl MemoryLifecycleTask {
             return Ok(());
         }
         let view = SessionCapture::from_history_entries(
+            capture.session_id.clone(),
             capture.segment_id.clone(),
             capture.history[history_start..history_end].to_vec(),
         );
@@ -1556,11 +1557,14 @@ permission = "write"
     #[tokio::test]
     async fn run_committed_background_task_stages_non_empty_extraction_and_commits_pointer() {
         let source = capture(2, 250);
-        let entry_ref =
-            SessionCapture::from_history_entries(source.segment_id.clone(), source.history.clone())
-                .overview()[0]
-                .id
-                .to_string();
+        let entry_ref = SessionCapture::from_history_entries(
+            source.session_id.clone(),
+            source.segment_id.clone(),
+            source.history.clone(),
+        )
+        .overview()[0]
+            .id
+            .to_string();
         let client = ScriptClient::new(vec![
             stage_candidate_events("stage-1", &entry_ref),
             finish_events("finish-1", 1),
@@ -1609,11 +1613,14 @@ permission = "write"
     #[tokio::test]
     async fn subjektiv_extraction_stages_once_and_commits_its_independent_pointer() {
         let source = capture(2, 250);
-        let entry_ref =
-            SessionCapture::from_history_entries(source.segment_id.clone(), source.history.clone())
-                .overview()[0]
-                .id
-                .to_string();
+        let entry_ref = SessionCapture::from_history_entries(
+            source.session_id.clone(),
+            source.segment_id.clone(),
+            source.history.clone(),
+        )
+        .overview()[0]
+            .id
+            .to_string();
         let client = ScriptClient::new(vec![
             stage_candidate_events("stage-1", &entry_ref),
             finish_events("finish-1", 1),
@@ -1715,11 +1722,14 @@ permission = "write"
     #[tokio::test]
     async fn subjektiv_candidate_remains_staged_when_later_extraction_fails_without_pointer() {
         let source = capture(2, 250);
-        let entry_ref =
-            SessionCapture::from_history_entries(source.segment_id.clone(), source.history.clone())
-                .overview()[0]
-                .id
-                .to_string();
+        let entry_ref = SessionCapture::from_history_entries(
+            source.session_id.clone(),
+            source.segment_id.clone(),
+            source.history.clone(),
+        )
+        .overview()[0]
+            .id
+            .to_string();
         let client = ScriptClient::new(vec![stage_candidate_events("stage-1", &entry_ref)]);
         let extension_writes = Arc::new(Mutex::new(Vec::new()));
         let (event_tx, _) = broadcast::channel(32);
