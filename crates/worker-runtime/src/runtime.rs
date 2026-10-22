@@ -2150,6 +2150,16 @@ impl Runtime {
                 {
                     return Err(conflict());
                 }
+                if let Err(error) = owner.validate_workdir_preparation_authority(&candidate) {
+                    return Ok((
+                        Some(RuntimeWorkerRestoreResult::failed(
+                            WorkerRestoreState::ReconciliationRequired,
+                            "worker_restore_authority_changed",
+                            sanitize_worker_create_failure_message(&error.to_string()),
+                        )),
+                        None,
+                    ));
+                }
             } else {
                 // Startup/older persisted pending operations have a lifecycle
                 // owner but no public request receipt. Bind recovery to that
@@ -2215,12 +2225,18 @@ impl Runtime {
                 candidate.pending_restore = Some(pending);
                 candidate.restore_guard.rotate();
                 candidate.restore_guard.active_request_id = Some(request.request_id.clone());
+                let workdir_attachment_preparation_base = request
+                    .preparation
+                    .as_ref()
+                    .and_then(|preparation| preparation.workdir_attachments.as_ref())
+                    .map(|_| candidate.logical_workdir_attachments.clone());
                 candidate.restore_guard.owners.insert(
                     request.request_id.clone(),
                     RestoreRequestOwner {
                         fingerprint,
                         operation_id,
                         request,
+                        workdir_attachment_preparation_base,
                         preparation_applied: recovering_pending,
                         execution_started: recovering_pending,
                         receipt: None,
@@ -2433,14 +2449,15 @@ impl Runtime {
             {
                 return Ok(RuntimeWorkerRestoreResult::accepted(worker.detail()));
             }
-            let preparation = worker
+            let owner = worker
                 .restore_guard
                 .active_request_id
                 .as_ref()
-                .and_then(|id| worker.restore_guard.owners.get(id))
-                .filter(|owner| !owner.preparation_applied)
-                .and_then(|owner| owner.request.preparation.as_ref());
-            let prepared_worker = match worker.prepared_restore_record(preparation) {
+                .and_then(|id| worker.restore_guard.owners.get(id));
+            let prepared_worker = match owner.map_or_else(
+                || Ok(worker.clone()),
+                |owner| owner.prepared_worker_record(worker),
+            ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     return Ok(RuntimeWorkerRestoreResult::failed(
@@ -4398,8 +4415,7 @@ impl Runtime {
                     worker_id: worker_ref.worker_id,
                 });
             }
-            let mut candidate =
-                previous.prepared_restore_record(owner.request.preparation.as_ref())?;
+            let mut candidate = owner.prepared_worker_record(previous)?;
             candidate
                 .restore_guard
                 .owners
@@ -6277,10 +6293,46 @@ pub(crate) struct RestoreRequestOwner {
     fingerprint: String,
     operation_id: WorkerLifecycleOperationId,
     request: runtime_api::WorkerRestoreRequest,
+    // This is the admission comparison input, not a second attachment authority.
+    // Without it an old preparation could hide a later canonical revocation.
+    // Older owners lacking this fact cannot safely reapply attachment overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workdir_attachment_preparation_base: Option<Vec<LogicalWorkdirAttachment>>,
     preparation_applied: bool,
     #[serde(default)]
     execution_started: bool,
     receipt: Option<RuntimeWorkerRestoreResult>,
+}
+
+impl RestoreRequestOwner {
+    fn validate_workdir_preparation_authority(
+        &self,
+        worker: &WorkerRecord,
+    ) -> Result<(), RuntimeError> {
+        if !self.preparation_applied
+            && self
+                .request
+                .preparation
+                .as_ref()
+                .is_some_and(|preparation| preparation.workdir_attachments.is_some())
+            && self.workdir_attachment_preparation_base.as_ref()
+                != Some(&worker.logical_workdir_attachments)
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "current Worker authority differs from admitted Restore attachment preparation"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepared_worker_record(&self, worker: &WorkerRecord) -> Result<WorkerRecord, RuntimeError> {
+        if self.preparation_applied {
+            return Ok(worker.clone());
+        }
+        self.validate_workdir_preparation_authority(worker)?;
+        worker.prepared_restore_record(self.request.preparation.as_ref())
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -11995,7 +12047,7 @@ mod tests {
         let mut request = runtime.test_restore_request(&worker.worker_ref);
         request.preparation = Some(serde_json::from_value(serde_json::json!({
             "workspace_api": { "workspace_id": "workspace-a", "base_url": "https://prepared.example" },
-            "workdir_attachments": [], "repository_access": []
+            "workdir_attachments": [{ "alias": "checkout", "working_directory_id": "prepared-logical-workdir" }], "repository_access": []
         })).unwrap());
         let gate = Arc::new(RestoreGate::default());
         *backend.restore_gate.lock().unwrap() = Some(gate.clone());
@@ -12014,6 +12066,26 @@ mod tests {
             let state = runtime.lock().unwrap();
             let record = state.worker(&worker.worker_ref).unwrap();
             assert!(record.request.as_ref().unwrap().workspace_api.is_none());
+            assert!(record.logical_workdir_attachments.is_empty());
+            let owner = record.restore_guard.owners.values().next().unwrap();
+            let mut saved_owner = serde_json::to_value(owner).unwrap();
+            let decoded: RestoreRequestOwner = serde_json::from_value(saved_owner.clone()).unwrap();
+            assert!(
+                decoded
+                    .validate_workdir_preparation_authority(record)
+                    .is_ok()
+            );
+            saved_owner
+                .as_object_mut()
+                .unwrap()
+                .remove("workdir_attachment_preparation_base");
+            let legacy: RestoreRequestOwner = serde_json::from_value(saved_owner).unwrap();
+            assert!(
+                legacy
+                    .validate_workdir_preparation_authority(record)
+                    .is_err(),
+                "a missing historical comparison input must not be invented from current authority"
+            );
             assert!(
                 !record
                     .restore_guard
@@ -12032,6 +12104,11 @@ mod tests {
                 .unwrap()
                 .base_url,
             "https://prepared.example"
+        );
+        assert_eq!(
+            backend.restore_requests.lock().unwrap()[0].logical_workdir_attachments[0]
+                .working_directory_id,
+            "prepared-logical-workdir"
         );
         assert!(backend.activation_operation_ids.lock().unwrap().is_empty());
         gate.release();
@@ -12052,6 +12129,25 @@ mod tests {
                 .unwrap()
                 .base_url,
             "https://prepared.example"
+        );
+        let record = state.worker(&worker.worker_ref).unwrap();
+        assert_eq!(
+            record.logical_workdir_attachments[0].working_directory_id,
+            "prepared-logical-workdir"
+        );
+        let owner = record.restore_guard.owners.values().next().unwrap();
+        assert!(owner.preparation_applied);
+        let mut revoked = record.clone();
+        revoked
+            .apply_logical_workdir_attachments(Vec::new())
+            .unwrap();
+        assert!(
+            owner
+                .prepared_worker_record(&revoked)
+                .unwrap()
+                .logical_workdir_attachments
+                .is_empty(),
+            "a committed preparation is not a perpetual grant"
         );
     }
 

@@ -360,20 +360,21 @@ async fn prepare_restore_operation<F: RuntimeWorkerFactory + ?Sized>(
             failure
         })?;
     if repaired {
-        Ok(Box::new(RepairedRestoreCandidate { candidate }))
+        Ok(Box::new(EffectRetainingRestoreCandidate { candidate }))
     } else {
         Ok(candidate)
     }
 }
 
-// A completed repair is a canonical effect even when later activation fails
-// before its own mutation boundary. Carry that evidence with the resource owner.
-struct RepairedRestoreCandidate {
+// Completed repair or an earlier activation may have changed canonical state.
+// Keep that operation-owned evidence through reconstruction and even an
+// activation failure before the replacement candidate's own mutation boundary.
+struct EffectRetainingRestoreCandidate {
     candidate: Box<dyn RuntimeRestoreCandidate>,
 }
 
 #[async_trait]
-impl RuntimeRestoreCandidate for RepairedRestoreCandidate {
+impl RuntimeRestoreCandidate for EffectRetainingRestoreCandidate {
     fn initial_state(&self) -> protocol::WorkerStateSnapshot {
         self.candidate.initial_state()
     }
@@ -2953,6 +2954,9 @@ struct PendingRuntimeRestore {
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     result: Mutex<Option<Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure>>>,
     activated: Mutex<Option<Result<RuntimeWorkerController, RuntimeRestoreFailure>>>,
+    // Monotonic for this operation, not a claim that its current candidate has
+    // started. A reconstructed candidate has a new result and no completion in
+    // `activated`; prior activation/effect evidence must survive that handoff.
     activation_started: AtomicBool,
     discard_started: AtomicBool,
     discard_result: Mutex<Option<Result<(), RuntimeRestoreCleanupFailure>>>,
@@ -2960,6 +2964,16 @@ struct PendingRuntimeRestore {
 }
 
 impl PendingRuntimeRestore {
+    fn owns_prepared_candidate(&self) -> bool {
+        matches!(
+            self.result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref(),
+            Some(Ok(_))
+        )
+    }
+
     async fn wait(&self, timeout: Duration) -> Result<(), String> {
         let mut task = self.task.lock().await;
         if let Some(message) = self
@@ -3279,23 +3293,40 @@ where
                     && (failure.durable_effects_possible
                         || owner.activation_started.load(Ordering::Acquire))
                 {
+                    let prior_effects = failure.durable_effects_possible
+                        || owner.activation_started.load(Ordering::Acquire);
                     let result =
                         match prepare_restore_operation(factory.as_ref(), owner.request.clone())
                             .await
                         {
-                            Ok(candidate) => Ok(candidate),
-                            Err(failure) => Err(finish_restore_failure(
-                                factory.as_ref(),
-                                &owner.request,
-                                failure,
-                            )
-                            .await),
+                            Ok(candidate) => {
+                                Ok(Box::new(EffectRetainingRestoreCandidate { candidate })
+                                    as Box<dyn RuntimeRestoreCandidate>)
+                            }
+                            Err(mut failure) => {
+                                failure.durable_effects_possible |= prior_effects;
+                                Err(finish_restore_failure(
+                                    factory.as_ref(),
+                                    &owner.request,
+                                    failure,
+                                )
+                                .await)
+                            }
                         };
-                    owner.activation_started.store(false, Ordering::Release);
+                    // A completed reprepare replaces attempt resources, never
+                    // the operation's effect history. Only a ready candidate
+                    // may clear the old activation completion for a new attempt.
+                    let activated = match &result {
+                        Ok(_) => None,
+                        Err(failure) if owner.activation_started.load(Ordering::Acquire) => {
+                            Some(Err(failure.clone()))
+                        }
+                        Err(_) => None,
+                    };
                     *owner
                         .activated
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = activated;
                     *owner
                         .result
                         .lock()
@@ -4019,7 +4050,9 @@ where
                     failure.to_string(),
                 );
             }
-            if pending.activation_started.load(Ordering::Acquire) {
+            if pending.activation_started.load(Ordering::Acquire)
+                && !pending.owns_prepared_candidate()
+            {
                 let mut activated = match pending.activated.lock() {
                     Ok(result) => result,
                     Err(_) => {
@@ -5205,7 +5238,8 @@ where
                 };
             }
         }
-        if pending.activation_started.load(Ordering::Acquire) {
+        if pending.activation_started.load(Ordering::Acquire) && !pending.owns_prepared_candidate()
+        {
             let activated = pending
                 .activated
                 .lock()
@@ -5330,7 +5364,8 @@ where
                 return Err("restored Worker operation identity does not match".into());
             }
             self.wait_pending_restore(&pending, self.spawn_restore_timeout)?;
-            if !pending.activation_started.swap(true, Ordering::AcqRel) {
+            if pending.owns_prepared_candidate() {
+                pending.activation_started.store(true, Ordering::Release);
                 let owner = pending.clone();
                 let factory = self.factory.clone();
                 let task = self.spawn_on_adapter_runtime(async move {

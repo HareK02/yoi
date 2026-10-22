@@ -100,6 +100,148 @@ impl WorkingDirectoryMaterializer for RestoreOpenCountingMaterializer {
     }
 }
 
+// Substitute only initial creation: a new aggregate/Session is left pending
+// before its first head, without ever materializing or rewinding a saved head.
+// All Restore preflight, repair, retry, activation and Stop use the real backend.
+struct PendingProfileSeedBackend {
+    inner: Arc<WorkerRuntimeExecutionBackend>,
+}
+
+impl WorkerExecutionBackend for PendingProfileSeedBackend {
+    fn backend_id(&self) -> &str {
+        self.inner.backend_id()
+    }
+
+    fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+        let aggregate = self
+            .inner
+            .factory
+            .worker_aggregate_dir(&request.worker_ref)
+            .unwrap();
+        let name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&request.worker_ref);
+        self.inner
+            .run_on_adapter_runtime(async move {
+                assert!(
+                    !aggregate.join("session").exists(),
+                    "pending fixture requires a new Session aggregate"
+                );
+                let manifest = manifest::WorkerManifest::from_toml(&format!(
+                    r#"
+[worker]
+name = "{name}"
+pwd = "./"
+[scope]
+allow = []
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+auth = {{ kind = "none" }}
+[engine]
+max_tokens = 100
+"#
+                ))
+                .unwrap();
+                let sessions = WorkerSessionStore::new(aggregate.join("session")).unwrap();
+                let metadata = WorkerAggregateStore::new(&aggregate, &name).unwrap();
+                assert!(metadata.read_by_name(&name).unwrap().is_none());
+                let engine =
+                    Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
+                        MockClient::new(Vec::new()),
+                    );
+                let mut head = Worker::new(
+                    manifest.clone(),
+                    engine,
+                    CombinedStore::new(sessions.clone(), metadata.clone()),
+                    WorkerWorkspaceContext::unavailable(
+                        None,
+                        "initial creation interrupted before first head",
+                    ),
+                    WorkerFilesystemAuthority::None,
+                    Scope::empty(),
+                )
+                .await
+                .unwrap();
+                head.enable_worker_metadata_write_through().unwrap();
+                let mut saved = metadata.read_by_name(&name).unwrap().unwrap();
+                let active = saved.active.as_ref().unwrap();
+                assert!(active.segment_id.is_none());
+                assert!(sessions.list_segments(active.session_id).unwrap().is_empty());
+                saved.resolved_manifest_snapshot =
+                    Some(manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap());
+                metadata.write(&saved).unwrap();
+                drop(head);
+                Ok(())
+            })
+            .unwrap();
+        WorkerExecutionSpawnResult::Connected {
+            worker_state: protocol::WorkerStateSnapshot::initial(),
+            workdir_attachments: Vec::new(),
+        }
+    }
+
+    fn fetch_workspace_config(
+        &self,
+        request: WorkspaceConfigFetchRequest,
+    ) -> Result<WorkspaceConfigFetchResult, String> {
+        self.inner.fetch_workspace_config(request)
+    }
+
+    fn observe_workspace_prompt_projection(
+        &self,
+        projection: worker::WorkspacePromptProjection,
+    ) -> Result<(), String> {
+        self.inner.observe_workspace_prompt_projection(projection)
+    }
+
+    fn preflight_restore(
+        &self,
+        request: &WorkerExecutionRestoreRequest,
+    ) -> Result<(), WorkerExecutionResult> {
+        self.inner.preflight_restore(request)
+    }
+
+    fn completed_restore_failure(
+        &self,
+        operation_id: crate::execution::WorkerLifecycleOperationId,
+        worker_ref: &WorkerRef,
+    ) -> Option<WorkerExecutionSpawnResult> {
+        self.inner
+            .completed_restore_failure(operation_id, worker_ref)
+    }
+
+    fn restore_worker(&self, request: WorkerExecutionRestoreRequest) -> WorkerExecutionSpawnResult {
+        self.inner.restore_worker(request)
+    }
+
+    fn reconcile_restore(
+        &self,
+        request: WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        self.inner.reconcile_restore(request)
+    }
+
+    fn activate_restored_worker(
+        &self,
+        operation_id: crate::execution::WorkerLifecycleOperationId,
+        worker_ref: &WorkerRef,
+    ) -> Result<(), String> {
+        self.inner
+            .activate_restored_worker(operation_id, worker_ref)
+    }
+
+    fn dispatch_input(&self, worker_ref: &WorkerRef, input: WorkerInput) -> WorkerExecutionResult {
+        self.inner.dispatch_input(worker_ref, input)
+    }
+
+    fn dispatch_method(&self, worker_ref: &WorkerRef, method: Method) -> WorkerExecutionResult {
+        self.inner.dispatch_method(worker_ref, method)
+    }
+
+    fn stop_worker_operation(&self, request: WorkerExecutionStopRequest) -> WorkerExecutionResult {
+        self.inner.stop_worker_operation(request)
+    }
+}
+
 struct ProfileFailureFixture {
     runtime: EmbeddedRuntime,
     backend: Arc<WorkerRuntimeExecutionBackend>,
@@ -115,6 +257,14 @@ impl ProfileFailureFixture {
     }
 
     fn with_saved_inputs(timeout: Duration, model: Option<MockClient>) -> Self {
+        Self::with_seed(timeout, model, false)
+    }
+
+    fn with_pending_head(timeout: Duration) -> Self {
+        Self::with_seed(timeout, None, true)
+    }
+
+    fn with_seed(timeout: Duration, model: Option<MockClient>, pending_head: bool) -> Self {
         let root = restore_failure_tempdir();
         let repo = root.path().join("g");
         fs::create_dir(&repo).unwrap();
@@ -141,22 +291,31 @@ impl ProfileFailureFixture {
                     opens: provider_opens.clone(),
                 }),
         );
+        let execution: Arc<dyn WorkerExecutionBackend> = if pending_head {
+            Arc::new(PendingProfileSeedBackend {
+                inner: backend.clone(),
+            })
+        } else {
+            backend.clone()
+        };
         let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: store,
                 runtime_id: "r".into(),
                 display_name: None,
             },
-            backend.clone(),
+            execution,
         )
         .unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
         let mut request = create_request("restore failure recovery");
         request.profile = ProfileSelector::Builtin("default".into());
-        request.workdir_attachment_requests = vec![WorkingDirectoryAttachmentRequest {
-            alias: WorkdirAttachmentAlias::new("checkout").unwrap(),
-            working_directory: working_directory_request(&repo),
-        }];
+        if !pending_head {
+            request.workdir_attachment_requests = vec![WorkingDirectoryAttachmentRequest {
+                alias: WorkdirAttachmentAlias::new("checkout").unwrap(),
+                working_directory: working_directory_request(&repo),
+            }];
+        }
         let worker = runtime.create_worker(request).unwrap();
         let seed_handle = queue_inputs.then(|| {
             backend.workers.lock().unwrap()[&worker.worker_ref]
@@ -201,6 +360,127 @@ impl ProfileFailureFixture {
 
     fn fail(&self, stage: RuntimeRestoreStage) {
         *self.backend.factory.restore_faults.fail_at.lock().unwrap() = Some(stage);
+    }
+
+    fn pin_unclaimed_restore_upload(&self) -> (PathBuf, BTreeMap<PathBuf, Vec<u8>>) {
+        let aggregate = self
+            .backend
+            .factory
+            .worker_aggregate_dir(&self.worker.worker_ref)
+            .unwrap();
+        let name =
+            ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&self.worker.worker_ref);
+        let metadata = WorkerAggregateStore::open_read_only(&aggregate, name.clone()).unwrap();
+        let session_id = metadata
+            .read_by_name(&name)
+            .unwrap()
+            .unwrap()
+            .active
+            .unwrap()
+            .session_id;
+        let session = WorkerSessionStore::new(aggregate.join("session")).unwrap();
+        let orphan = session
+            .write_uploaded_file(
+                session_id,
+                "orphan.txt",
+                "text/plain",
+                b"restore effect evidence",
+                session_store::UploadedFileLimits::default(),
+            )
+            .unwrap();
+        session
+            .pin_uploaded_file(session_id, &orphan, "uncommitted-restore-input")
+            .unwrap();
+        let artifacts = aggregate.join("session/artifacts/paste");
+        let pinned = persisted_files(&artifacts);
+        assert!(!pinned.is_empty());
+        (artifacts, pinned)
+    }
+
+    fn assert_retained_restore_effects(
+        &self,
+        request: &runtime_api::WorkerRestoreRequest,
+        pending: &Arc<PendingRuntimeRestore>,
+        stage: RuntimeRestoreStage,
+    ) {
+        let retained = self
+            .backend
+            .pending_restore(&self.worker.worker_ref)
+            .unwrap()
+            .expect("resource cleanup must not remove the operation's effect owner");
+        assert!(Arc::ptr_eq(pending, &retained));
+        {
+            let result = retained.result.lock().unwrap();
+            let failure = result.as_ref().unwrap().as_ref().err().unwrap();
+            assert_eq!(failure.stage, stage);
+            assert_eq!(failure.cleanup, RuntimeRestoreCleanup::Confirmed);
+            assert!(
+                failure.durable_effects_possible,
+                "resource cleanup cannot erase prior canonical effects: {failure:?}"
+            );
+        }
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                self.root
+                    .path()
+                    .join("s/workers")
+                    .join(self.worker.worker_ref.worker_id.to_string())
+                    .join("worker.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            record["restore_guard"]["active_request_id"],
+            request.request_id
+        );
+        let operation = serde_json::to_value(pending.request.operation_id).unwrap();
+        let owner = &record["restore_guard"]["owners"][&request.request_id];
+        assert_eq!(owner["operation_id"], operation);
+        assert!(
+            owner["receipt"].is_null(),
+            "false terminal receipt: {owner:?}"
+        );
+        assert_eq!(
+            record["execution_state"]["state"],
+            "reconciliation_required"
+        );
+        assert_eq!(
+            record["execution_state"]["execution"]["operation"],
+            "restore"
+        );
+        assert_eq!(
+            record["execution_state"]["execution"]["intent"]["operation_id"],
+            operation
+        );
+        assert!(
+            self.backend
+                .completed_restore_failures
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(self.backend.workers.lock().unwrap().is_empty());
+        assert!(
+            self.backend
+                .factory
+                .failed_restore_resources
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "cleanup confirmed resources, not rollback of canonical effects"
+        );
+        assert!(
+            self.backend
+                .factory
+                .observation_hub
+                .get(&self.worker.worker_ref)
+                .is_none()
+        );
+        if !pending.request.deferred_workdir_sessions.is_empty() {
+            self.assert_closed_deferred_sessions(pending);
+        }
+        assert_eq!(self.provider_opens.load(Ordering::SeqCst), 0);
     }
 
     fn assert_released(&self) {
@@ -420,6 +700,311 @@ impl ProfileFailureFixture {
             .unwrap();
         assert_eq!(self.provider_opens.load(Ordering::SeqCst), 0);
     }
+}
+
+#[test]
+#[serial_test::serial(worker_allocation)]
+fn profile_restore_prior_effects_survive_read_only_reprepare_failure() {
+    for (activation_stage, read_stage) in [
+        (RuntimeRestoreStage::Feature, RuntimeRestoreStage::Metadata),
+        (
+            RuntimeRestoreStage::Controller,
+            RuntimeRestoreStage::Reconstruction,
+        ),
+    ] {
+        let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
+        let (artifacts, pinned) = fixture.pin_unclaimed_restore_upload();
+        fixture.fail(activation_stage);
+        let request = fixture
+            .runtime
+            .test_restore_request(&fixture.worker.worker_ref);
+        let first = fixture
+            .runtime
+            .restore_worker_operation(&fixture.worker.worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(
+            first.state,
+            server_api::WorkerRestoreState::ReconciliationRequired,
+            "{activation_stage:?}: {first:?}"
+        );
+        let pending = fixture
+            .backend
+            .pending_restore(&fixture.worker.worker_ref)
+            .unwrap()
+            .unwrap();
+        assert!(pending.activation_started.load(Ordering::SeqCst));
+        fixture.assert_retained_restore_effects(&request, &pending, activation_stage);
+        let effected = persisted_files(&artifacts);
+        assert_ne!(
+            effected, pinned,
+            "activation must actually reconcile the orphan pin"
+        );
+
+        // The next attempt needs no repair, and fails before any new mutation.
+        // Resource cleanup is confirmed, but the first attempt's pin change
+        // was not rolled back. Repeated sends must retain the same owner.
+        for _ in 0..2 {
+            fixture.fail(read_stage);
+            let replay = fixture
+                .runtime
+                .restore_worker_operation(&fixture.worker.worker_ref, request.clone())
+                .unwrap();
+            assert_eq!(
+                replay.state,
+                server_api::WorkerRestoreState::ReconciliationRequired,
+                "{activation_stage:?} then {read_stage:?}: {replay:?}"
+            );
+            fixture.assert_retained_restore_effects(&request, &pending, read_stage);
+            assert!(pending.activation_started.load(Ordering::SeqCst));
+            assert_eq!(persisted_files(&artifacts), effected);
+        }
+        fixture.resume_same_operation(request, pending.request.operation_id);
+    }
+}
+
+#[test]
+#[serial_test::serial(worker_allocation)]
+fn profile_restore_prior_effects_from_pending_head_repair_survive_read_only_reprepare_failure() {
+    let fixture = ProfileFailureFixture::with_pending_head(Duration::from_secs(5));
+    let aggregate = fixture
+        .backend
+        .factory
+        .worker_aggregate_dir(&fixture.worker.worker_ref)
+        .unwrap();
+    let name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&fixture.worker.worker_ref);
+    let metadata = WorkerAggregateStore::new(&aggregate, &name).unwrap();
+    let initial = metadata.read_by_name(&name).unwrap().unwrap();
+    let pending_session = initial.active.as_ref().unwrap().session_id;
+    assert!(initial.active.as_ref().unwrap().segment_id.is_none());
+    {
+        let before = WorkerSessionStore::new(aggregate.join("session")).unwrap();
+        assert!(before.list_sessions().unwrap().is_empty());
+        assert!(before.list_segments(pending_session).unwrap().is_empty());
+    }
+    // The independent new Worker has never published a head. Its first segment
+    // and active pointer must be created by production repair, not fixture
+    // rewinding/deletion of a materialized Session.
+    fixture.fail(RuntimeRestoreStage::Metadata);
+    let request = fixture
+        .runtime
+        .test_restore_request(&fixture.worker.worker_ref);
+    let first = fixture
+        .runtime
+        .restore_worker_operation(&fixture.worker.worker_ref, request.clone())
+        .unwrap();
+    assert_eq!(
+        first.state,
+        server_api::WorkerRestoreState::ReconciliationRequired,
+        "{first:?}"
+    );
+    let pending = fixture
+        .backend
+        .pending_restore(&fixture.worker.worker_ref)
+        .unwrap()
+        .unwrap();
+    assert!(!pending.activation_started.load(Ordering::SeqCst));
+    assert!(pending.request.deferred_workdir_sessions.is_empty());
+    fixture.assert_retained_restore_effects(&request, &pending, RuntimeRestoreStage::Metadata);
+    let failure = pending
+        .result
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .err()
+        .unwrap()
+        .clone();
+    let repaired = WorkerAggregateStore::open_read_only(&aggregate, &name)
+        .unwrap()
+        .read_by_name(&name)
+        .unwrap()
+        .unwrap();
+    eprintln!(
+        "pending-head repair first={first:?} failure={failure:?} active={:?}",
+        repaired.active
+    );
+    let active = repaired
+        .active
+        .as_ref()
+        .expect("real repair must retain the pending Session's active pointer");
+    assert_eq!(active.session_id, pending_session);
+    // Store handles opened before the first Manifest retain session_id=None;
+    // they cannot observe that another owner has since published this Session.
+    // Reopen read-only to require the canonical Manifest as well as its logs.
+    let session = WorkerSessionStore::open_read_only(aggregate.join("session"))
+        .unwrap_or_else(|error| {
+            panic!(
+                "repair Manifest reread failed: {error}; first={first:?}; failure={failure:?}; active={active:?}"
+            )
+        });
+    assert_eq!(session.list_sessions().unwrap(), vec![pending_session]);
+    let segments = session.list_segments(pending_session).unwrap();
+    assert_eq!(
+        segments.len(),
+        1,
+        "real repair must commit exactly one seed; failure={failure:?}; active={active:?}"
+    );
+    assert_eq!(active.segment_id, Some(segments[0]));
+    let entries = session
+        .read_all_read_only(pending_session, segments[0])
+        .unwrap();
+    assert!(matches!(
+        entries.first(),
+        Some(LogEntry::AnnotatedSegmentStart { .. })
+    ));
+    assert!(
+        session_store::collect_state(&entries)
+            .system_prompt
+            .is_some()
+    );
+    assert_ne!(
+        repaired, initial,
+        "repair must publish the first active head"
+    );
+    let repaired_session = persisted_files(&aggregate.join("session"));
+
+    for _ in 0..2 {
+        fixture.fail(RuntimeRestoreStage::Reconstruction);
+        let replay = fixture
+            .runtime
+            .restore_worker_operation(&fixture.worker.worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(
+            replay.state,
+            server_api::WorkerRestoreState::ReconciliationRequired,
+            "repair effect cannot become a rollback on the next read failure: {replay:?}"
+        );
+        fixture.assert_retained_restore_effects(
+            &request,
+            &pending,
+            RuntimeRestoreStage::Reconstruction,
+        );
+        let current_metadata = WorkerAggregateStore::open_read_only(&aggregate, &name).unwrap();
+        assert_eq!(
+            current_metadata.read_by_name(&name).unwrap().unwrap(),
+            repaired
+        );
+        let current_session =
+            WorkerSessionStore::open_read_only(aggregate.join("session")).unwrap();
+        assert_eq!(
+            current_session.list_sessions().unwrap(),
+            vec![pending_session]
+        );
+        assert_eq!(
+            current_session.list_segments(pending_session).unwrap(),
+            segments
+        );
+        assert_eq!(
+            persisted_files(&aggregate.join("session")),
+            repaired_session
+        );
+    }
+    fixture.resume_same_operation(request, pending.request.operation_id);
+}
+
+#[test]
+#[serial_test::serial(worker_allocation)]
+fn profile_restore_prior_effects_survive_rebuilt_candidate_pre_effect_activation_failure() {
+    let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
+    let (artifacts, pinned) = fixture.pin_unclaimed_restore_upload();
+    fixture.fail(RuntimeRestoreStage::Feature);
+    let request = fixture
+        .runtime
+        .test_restore_request(&fixture.worker.worker_ref);
+    let first = fixture
+        .runtime
+        .restore_worker_operation(&fixture.worker.worker_ref, request.clone())
+        .unwrap();
+    assert_eq!(
+        first.state,
+        server_api::WorkerRestoreState::ReconciliationRequired,
+        "{first:?}"
+    );
+    let pending = fixture
+        .backend
+        .pending_restore(&fixture.worker.worker_ref)
+        .unwrap()
+        .unwrap();
+    fixture.assert_retained_restore_effects(&request, &pending, RuntimeRestoreStage::Feature);
+    let effected = persisted_files(&artifacts);
+    assert_ne!(effected, pinned);
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (entered_tx, entered) = mpsc::channel();
+    *fixture
+        .backend
+        .factory
+        .restore_faults
+        .factory_gate
+        .lock()
+        .unwrap() = Some(release.clone());
+    *fixture
+        .backend
+        .factory
+        .restore_faults
+        .factory_entered
+        .lock()
+        .unwrap() = Some(entered_tx);
+    let runtime = fixture.runtime.clone();
+    let worker_ref = fixture.worker.worker_ref.clone();
+    let resend = request.clone();
+    let retry = std::thread::spawn(move || runtime.restore_worker_operation(&worker_ref, resend));
+    let reached = entered.recv_timeout(Duration::from_secs(5));
+    // This gate is after real read-only reconstruction. Change only saved
+    // metadata, so the rebuilt candidate's first activation revalidation fails
+    // before allocation/pin/metadata/delegation mutation. No factory or repair
+    // implementation is replaced by a fake.
+    let aggregate = fixture
+        .backend
+        .factory
+        .worker_aggregate_dir(&fixture.worker.worker_ref)
+        .unwrap();
+    let name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&fixture.worker.worker_ref);
+    let metadata = WorkerAggregateStore::new(&aggregate, &name).unwrap();
+    let mut changed = metadata.read_by_name(&name).unwrap().unwrap();
+    changed.workspace_root = Some(fixture.root.path().join("changed-after-reconstruction"));
+    metadata.write(&changed).unwrap();
+    release.notify_one();
+    let rebuilt = retry.join().unwrap().unwrap();
+    reached.expect("same-operation retry must reach the real reconstructed candidate");
+    assert_eq!(
+        rebuilt.state,
+        server_api::WorkerRestoreState::ReconciliationRequired,
+        "{rebuilt:?}"
+    );
+    assert_eq!(
+        fixture
+            .backend
+            .factory
+            .restore_faults
+            .executions
+            .load(Ordering::SeqCst),
+        2
+    );
+    assert!(pending.activation_started.load(Ordering::SeqCst));
+    fixture.assert_retained_restore_effects(
+        &request,
+        &pending,
+        RuntimeRestoreStage::Reconstruction,
+    );
+    assert_eq!(metadata.read_by_name(&name).unwrap().unwrap(), changed);
+    assert_eq!(persisted_files(&artifacts), effected);
+
+    fixture.fail(RuntimeRestoreStage::Metadata);
+    let replay = fixture
+        .runtime
+        .restore_worker_operation(&fixture.worker.worker_ref, request.clone())
+        .unwrap();
+    assert_eq!(
+        replay.state,
+        server_api::WorkerRestoreState::ReconciliationRequired,
+        "successful reconstruction must not erase the older effect: {replay:?}"
+    );
+    fixture.assert_retained_restore_effects(&request, &pending, RuntimeRestoreStage::Metadata);
+    assert_eq!(metadata.read_by_name(&name).unwrap().unwrap(), changed);
+    assert_eq!(persisted_files(&artifacts), effected);
+    fixture.resume_same_operation(request, pending.request.operation_id);
 }
 
 #[test]

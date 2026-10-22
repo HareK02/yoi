@@ -895,4 +895,210 @@ mod restore_candidate {
             assert_eq!(model.call_count.load(Ordering::SeqCst), 0);
         }
     }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn attachment_preparation_replay_cannot_hide_logical_authority_revocation() {
+        use crate::fs_store::{
+            FsRuntimeStoreOptions, PersistedWorkerExecution, PersistedWorkerExecutionState,
+            PersistedWorkerRecord,
+        };
+        let mut fixture = Fixture::new();
+        Arc::get_mut(&mut fixture.backend)
+            .unwrap()
+            .spawn_restore_timeout = Duration::from_secs(2);
+        let worker_ref = fixture.request.worker_ref.clone();
+        let scope = fixture.request.workspace_scope.clone().unwrap();
+        let options = FsRuntimeStoreOptions {
+            root: fixture._root.path().join("catalog"),
+            runtime_id: "candidate-runtime".into(),
+            display_name: None,
+        };
+        let attachment = crate::catalog::LogicalWorkdirAttachment {
+            alias: WorkdirAttachmentAlias::new("checkout").unwrap(),
+            working_directory_id: "workspace-only-workdir".into(),
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+        };
+        // Only the initial Runtime catalog is seeded. The saved Profile, queue,
+        // restore admission, revocation, replay and Stop use their real owners.
+        let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+            options.clone(),
+            fixture.backend.clone(),
+        )
+        .unwrap();
+        let create = fixture.request.request.clone();
+        runtime
+            .test_runtime_store()
+            .write_worker_record(&PersistedWorkerRecord {
+                restore_guard: crate::runtime::RestoreGuard::default(),
+                worker_ref: worker_ref.clone(),
+                worker_id: worker_ref.worker_id,
+                profile: create.profile.clone(),
+                display_name: None,
+                profile_source: create.profile_source.reference(),
+                config_bundle: create.config_bundle.clone(),
+                created_at_ms: None,
+                status: crate::catalog::WorkerStatus::Stopped,
+                last_finished_submission_request_id: None,
+                execution_state: PersistedWorkerExecutionState::Available(
+                    PersistedWorkerExecution {
+                        request: create,
+                        binding: None,
+                        restore_intent: crate::catalog::WorkerRestoreIntent::Explicit,
+                    },
+                ),
+                workspace_id: Some(scope.workspace_id.clone()),
+                workdir_attachments: Vec::new(),
+                logical_workdir_attachments: vec![attachment.clone()],
+            })
+            .unwrap();
+        drop(runtime);
+        let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+            options.clone(),
+            fixture.backend.clone(),
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .worker_detail(&worker_ref)
+                .unwrap()
+                .workdir_attachments
+                .is_empty()
+        );
+        let before = fixture.canonical_files();
+        let authority = || -> serde_json::Value {
+            serde_json::from_slice(
+                &fs::read(
+                    options
+                        .root
+                        .join("workers")
+                        .join(worker_ref.worker_id.to_string())
+                        .join("worker.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (entered_tx, entered) = mpsc::channel();
+        *fixture
+            .backend
+            .factory
+            .restore_faults
+            .factory_gate
+            .lock()
+            .unwrap() = Some(release.clone());
+        *fixture
+            .backend
+            .factory
+            .restore_faults
+            .factory_entered
+            .lock()
+            .unwrap() = Some(entered_tx);
+        let mut request = runtime.test_restore_request(&worker_ref);
+        request.preparation.as_mut().unwrap().workdir_attachments =
+            Some(serde_json::from_value(serde_json::to_value(vec![attachment]).unwrap()).unwrap());
+        let first = runtime
+            .restore_worker_operation_scoped(&scope, &worker_ref, request.clone())
+            .unwrap();
+        entered.recv_timeout(WAIT).unwrap();
+        assert_eq!(
+            first.state,
+            server_api::WorkerRestoreState::ReconciliationRequired,
+            "{first:?}"
+        );
+        let pending = fixture
+            .backend
+            .pending_restore(&worker_ref)
+            .unwrap()
+            .unwrap();
+        assert!(!pending.request.logical_workdir_attachments.is_empty());
+        assert!(pending.request.previous_workdir_attachments.is_empty());
+        assert!(pending.request.deferred_workdir_sessions.is_empty());
+        runtime
+            .replace_worker_workdir_attachments_scoped(&scope, &worker_ref, Vec::new())
+            .unwrap();
+        assert!(authority().get("logical_workdir_attachments").is_none());
+        release.notify_one();
+        let replay = runtime
+            .restore_worker_operation_scoped(&scope, &worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(
+            replay.state,
+            server_api::WorkerRestoreState::ReconciliationRequired,
+            "revocation hidden by saved preparation: {replay:?}"
+        );
+        assert!(
+            replay
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("current Worker authority differs"),
+            "{replay:?}"
+        );
+        let record = authority();
+        assert!(record.get("logical_workdir_attachments").is_none());
+        let owner = &record["restore_guard"]["owners"][&request.request_id];
+        assert_eq!(
+            owner["operation_id"],
+            serde_json::to_value(pending.request.operation_id).unwrap()
+        );
+        assert!(owner["receipt"].is_null());
+        assert_eq!(
+            owner["workdir_attachment_preparation_base"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let loaded = runtime.test_runtime_store().load_runtime_state().unwrap();
+        let durable_guard =
+            serde_json::to_value(&loaded.workers[&worker_ref.worker_id].restore_guard).unwrap();
+        assert_eq!(durable_guard["owners"][&request.request_id], *owner);
+        let (coordinated, preparation) = runtime
+            .coordinate_worker_restore_operation(
+                &worker_ref,
+                runtime_api::WorkerRestoreCoordinationRequest {
+                    expected_observation_token: request.expected_observation_token.clone(),
+                    request_id: request.request_id.clone(),
+                    preparation: None,
+                },
+                Some(&scope),
+            )
+            .unwrap();
+        assert_eq!(
+            coordinated.unwrap().state,
+            server_api::WorkerRestoreState::ReconciliationRequired
+        );
+        assert!(
+            preparation.is_none(),
+            "coordinator must not export the revoked preparation again"
+        );
+        assert!(fixture.backend.workers.lock().unwrap().is_empty());
+        assert!(Arc::ptr_eq(
+            &pending,
+            &fixture
+                .backend
+                .pending_restore(&worker_ref)
+                .unwrap()
+                .unwrap()
+        ));
+        assert!(!pending.activation_started.load(Ordering::SeqCst));
+        fixture.assert_quiet();
+        assert_eq!(fixture.canonical_files(), before);
+        runtime
+            .stop_worker_scoped(&scope, &worker_ref, None)
+            .unwrap();
+        fixture.assert_released();
+        fixture.assert_quiet();
+        assert_eq!(fixture.canonical_files(), before);
+        assert!(authority().get("logical_workdir_attachments").is_none());
+        assert_ne!(
+            runtime
+                .restore_worker_operation_scoped(&scope, &worker_ref, request)
+                .unwrap()
+                .state,
+            server_api::WorkerRestoreState::Accepted
+        );
+    }
 }
