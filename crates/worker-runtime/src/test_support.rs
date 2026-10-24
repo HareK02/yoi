@@ -492,6 +492,7 @@ impl StoppedWorkerTemplate {
             .filter(|line| !line.is_empty())
         {
             let _: PortableJson = decode(line)?;
+            validate_preserved_record(line)?;
         }
         Ok(())
     }
@@ -505,6 +506,18 @@ impl StoppedWorkerTemplate {
             || !ids.insert(entry.metadata.entry_id.0.clone())
         {
             return Err(reject("duplicate or invalid entry identity"));
+        }
+        if entry
+            .metadata
+            .input_metadata
+            .as_ref()
+            .is_some_and(|metadata| {
+                metadata.feature_payload().is_some() || metadata.public_item().is_some()
+            })
+        {
+            // These are opaque owner-specific payloads, not part of the narrow
+            // artificial conversation contract. Never preserve unchecked JSON.
+            return Err(reject("Feature history payloads are unsupported"));
         }
         if !matches!(
             entry.item,
@@ -557,10 +570,12 @@ impl StoppedWorkerTemplate {
             .map_err(|_| reject("invalid canonical Session records"))?
             .0;
         if !matches!(logs.first(), Some(session_store::LogEntry::AnnotatedSegmentStart {
-            session_id, forked_from: None, compacted_from: None, ..
+            session_id, system_prompt: Some(_), forked_from: None, compacted_from: None, ..
         }) if *session_id == self.session_id)
         {
-            return Err(reject("invalid Segment seed or unsupported lineage"));
+            return Err(reject(
+                "missing system prompt, invalid Segment seed, or unsupported lineage",
+            ));
         }
         let mut ids = std::collections::BTreeSet::new();
         for (index, log) in logs.iter().enumerate() {
@@ -614,6 +629,71 @@ impl StoppedWorkerTemplate {
     }
 }
 
+// Compare *fields*, not re-encoded bytes or scalar values (e.g. f32 JSON
+// normalization). Serde's permissive/untagged/flattened compatibility readers
+// can drop unknown data without surfacing it to an ignored-field callback. A
+// retained field must survive the owner's typed projection at every depth.
+// This intentionally accepts only canonical writer shapes: even an explicit
+// empty optional field omitted by that writer is rejected, not repaired.
+// The projection is validation-only; installation always writes original bytes.
+fn validate_preserved_record(bytes: &[u8]) -> Result<(), RuntimeError> {
+    let original: serde_json::Value = decode(bytes)?;
+    let record: session_store::LogEntry = decode(bytes)?;
+    let projection =
+        serde_json::to_value(&record).map_err(|_| reject("invalid typed Session record"))?;
+    require_preserved_fields(&original, &projection)
+}
+
+fn require_preserved_fields(
+    original: &serde_json::Value,
+    projection: &serde_json::Value,
+) -> Result<(), RuntimeError> {
+    use serde_json::Value;
+    match (original, projection) {
+        (Value::Object(original), Value::Object(projection)) => {
+            for (key, value) in original {
+                let projected = projection
+                    .get(key)
+                    .ok_or_else(|| reject("unknown or noncanonical Session field"))?;
+                require_preserved_fields(value, projected)?;
+            }
+        }
+        (Value::Array(original), Value::Array(projection))
+            if original.len() == projection.len() =>
+        {
+            for (value, projected) in original.iter().zip(projection) {
+                require_preserved_fields(value, projected)?;
+            }
+        }
+        (Value::Null, Value::Null)
+        | (Value::Bool(_), Value::Bool(_))
+        | (Value::Number(_), Value::Number(_))
+        | (Value::String(_), Value::String(_)) => {}
+        _ => return Err(reject("noncanonical Session field shape")),
+    }
+    Ok(())
+}
+
+// Exact receipt wire fields owned by worker::PendingActivationState. Keep these
+// fixture-only mirrors strict; do not change the production compatibility reader.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmissionReceipt {
+    submission_request_id: String,
+    source_namespace: String,
+    submission_id: String,
+    payload_digest: String,
+    disposition: protocol::SubmissionDisposition,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotificationReceipt {
+    notification_request_id: String,
+    source_namespace: String,
+    payload_digest: String,
+}
+
 // The approved conversation has committed submission checkpoints in its original
 // Session records. Keep their receipt bytes, but reject any resumable queue or
 // Feature invocation history. This projection confers no execution authority.
@@ -630,9 +710,9 @@ fn validate_settled_activation(
         pending: Vec<serde::de::IgnoredAny>,
         pending_notifications: Vec<serde::de::IgnoredAny>,
         #[serde(rename = "receipts")]
-        _receipts: Vec<serde::de::IgnoredAny>,
+        _receipts: Vec<SubmissionReceipt>,
         #[serde(rename = "notification_receipts")]
-        _notification_receipts: Vec<serde::de::IgnoredAny>,
+        _notification_receipts: Vec<NotificationReceipt>,
         invocation_receipts: Vec<serde::de::IgnoredAny>,
         invocation_recovery_blocked: bool,
     }
@@ -761,7 +841,16 @@ impl<'de> Deserialize<'de> for PortableJson {
                 self,
                 mut map: A,
             ) -> Result<PortableJson, A::Error> {
-                while map.next_entry::<PortableJson, PortableJson>()?.is_some() {}
+                let mut keys = std::collections::BTreeSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    // A duplicate key can hide discarded data even inside an
+                    // otherwise opaque extension payload. Never retain it.
+                    if !keys.insert(key.clone()) {
+                        return Err(serde::de::Error::custom("duplicate fixture JSON field"));
+                    }
+                    serde::de::Visitor::visit_str::<A::Error>(Visitor, &key)?;
+                    map.next_value::<PortableJson>()?;
+                }
                 Ok(PortableJson)
             }
         }

@@ -9,6 +9,52 @@ const RUNTIME: &str = "fixture-runtime";
 const WORKSPACE: &str = "fixture-workspace";
 const NEW_URL: &str = "http://127.0.0.1:34567";
 
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ReceiptFixture<T> {
+    Valid(T),
+    Malformed(u8),
+}
+
+#[derive(Default, Serialize)]
+struct CheckpointFixture {
+    next_activation_sequence: u64,
+    activating: Option<u8>,
+    activating_notification: Vec<u8>,
+    pending: Vec<u8>,
+    pending_notifications: Vec<u8>,
+    receipts: Vec<ReceiptFixture<SubmissionReceipt>>,
+    notification_receipts: Vec<ReceiptFixture<NotificationReceipt>>,
+    invocation_receipts: Vec<u8>,
+    invocation_recovery_blocked: bool,
+}
+
+fn settled_checkpoint() -> CheckpointFixture {
+    CheckpointFixture {
+        next_activation_sequence: 2,
+        receipts: vec![ReceiptFixture::Valid(SubmissionReceipt {
+            submission_request_id: "completed-submission-request".into(),
+            source_namespace: "fixture-source".into(),
+            submission_id: "completed-submission".into(),
+            payload_digest: "fixture-payload-digest".into(),
+            disposition: protocol::SubmissionDisposition::Started,
+        })],
+        notification_receipts: vec![ReceiptFixture::Valid(NotificationReceipt {
+            notification_request_id: "completed-notification-request".into(),
+            source_namespace: "fixture-source".into(),
+            payload_digest: "fixture-notification-digest".into(),
+        })],
+        ..Default::default()
+    }
+}
+
+fn checkpoint_extension(checkpoint: &CheckpointFixture) -> session_store::SessionExtension {
+    session_store::SessionExtension::new(
+        "worker.pending_activations.v1",
+        serde_json::to_value(checkpoint).unwrap(),
+    )
+}
+
 fn worker_id() -> WorkerId {
     "01a1657d-b762-7791-87ae-a49f28cadbce".parse().unwrap()
 }
@@ -185,15 +231,65 @@ fn source() -> (tempfile::TempDir, PathBuf, StoppedWorkerTemplate) {
                 LogEntry::AnnotatedSegmentStart {
                     ts: 123,
                     session_id,
-                    system_prompt: None,
+                    system_prompt: Some("Harmless artificial fixture instructions.".into()),
                     config: Default::default(),
                     history: vec![],
                     forked_from: None,
                     compacted_from: None,
                 },
-                LogEntry::AnnotatedAssistantItem {
+                LogEntry::Invoke {
                     ts: 124,
+                    trigger: protocol::InvokeKind::UserSend,
+                },
+                LogEntry::AnnotatedUserInput {
+                    ts: 124,
+                    segments: vec![protocol::Segment::text(
+                        "Harmless artificial fixture input.",
+                    )],
+                    extensions: vec![checkpoint_extension(&settled_checkpoint())],
+                    history: vec![session_store::LoggedHistoryEntry {
+                        item: session_store::LoggedItem::Message {
+                            role: session_store::LoggedRole::User,
+                            content: vec![session_store::LoggedContentPart::Text {
+                                text: "Harmless artificial fixture input.".into(),
+                            }],
+                        },
+                        metadata: session_store::LoggedSessionHistoryMetadata {
+                            entry_id: session_store::LoggedSessionHistoryEntryId(
+                                "fixed-user-id".into(),
+                            ),
+                            origin: session_store::LoggedSessionHistoryOrigin::BackendInstruction {
+                                operation_id: None,
+                            },
+                            derivation: None,
+                            input_metadata: None,
+                        },
+                    }],
+                },
+                LogEntry::AnnotatedAssistantItem {
+                    ts: 125,
                     entry: history,
+                },
+                LogEntry::LlmUsage {
+                    ts: 125,
+                    history_len: 2,
+                    input_total_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    output_tokens: 1,
+                },
+                LogEntry::TurnEnd {
+                    ts: 126,
+                    turn_count: 1,
+                },
+                LogEntry::RunCompleted {
+                    entry_id: Some(session_store::LoggedSessionHistoryEntryId(
+                        "fixed-terminal-id".into(),
+                    )),
+                    ts: 126,
+                    interrupted: false,
+                    result: agen::EngineResult::Finished,
+                    active_run_turn_count: None,
                 },
             ],
         )
@@ -554,40 +650,193 @@ fn fresh_manifest_and_memory_settings_are_required() {
 
 #[test]
 fn settled_checkpoints_preserve_receipts_but_refuse_pending_work() {
-    #[derive(Default, Serialize)]
-    struct Checkpoint {
-        next_activation_sequence: u64,
-        activating: Option<u8>,
-        activating_notification: Vec<u8>,
-        pending: Vec<u8>,
-        pending_notifications: Vec<u8>,
-        receipts: Vec<u8>,
-        notification_receipts: Vec<u8>,
-        invocation_receipts: Vec<u8>,
-        invocation_recovery_blocked: bool,
-    }
-    let extension = |checkpoint: &Checkpoint| {
-        session_store::SessionExtension::new(
-            "worker.pending_activations.v1",
-            serde_json::to_value(checkpoint).unwrap(),
-        )
-    };
-    let mut checkpoint = Checkpoint {
-        receipts: vec![1, 2],
-        ..Default::default()
-    };
-    assert!(validate_settled_activation(&extension(&checkpoint)).is_ok());
+    let mut checkpoint = settled_checkpoint();
+    assert!(validate_settled_activation(&checkpoint_extension(&checkpoint)).is_ok());
     checkpoint.pending.push(1);
-    assert!(validate_settled_activation(&extension(&checkpoint)).is_err());
+    assert!(validate_settled_activation(&checkpoint_extension(&checkpoint)).is_err());
     checkpoint.pending.clear();
     checkpoint.activating = Some(1);
-    assert!(validate_settled_activation(&extension(&checkpoint)).is_err());
+    assert!(validate_settled_activation(&checkpoint_extension(&checkpoint)).is_err());
     checkpoint.activating = None;
     checkpoint.invocation_receipts.push(1);
-    assert!(validate_settled_activation(&extension(&checkpoint)).is_err());
+    assert!(validate_settled_activation(&checkpoint_extension(&checkpoint)).is_err());
     checkpoint.invocation_receipts.clear();
     checkpoint.invocation_recovery_blocked = true;
-    assert!(validate_settled_activation(&extension(&checkpoint)).is_err());
+    assert!(validate_settled_activation(&checkpoint_extension(&checkpoint)).is_err());
+}
+
+// Deliberately corrupt only test-owned synthetic source files, never the lab.
+fn assert_rejected_session_bytes(worker: &Path, template: &StoppedWorkerTemplate, bytes: Vec<u8>) {
+    let path = worker.join(format!("session/segments/{}.jsonl", template.segment_id()));
+    fs::write(path, &bytes).unwrap();
+    let extraction_error = StoppedWorkerTemplate::extract(worker)
+        .err()
+        .expect("invalid source accepted");
+    assert!(
+        !extraction_error
+            .to_string()
+            .contains("synthetic-discarded-material")
+    );
+    let (_target, options) = destination(template);
+    let mut invalid = template.clone();
+    invalid.segment_jsonl = bytes;
+    let installation_error = invalid
+        .install(&options, request(), &resolved())
+        .unwrap_err();
+    assert!(
+        !installation_error
+            .to_string()
+            .contains("synthetic-discarded-material")
+    );
+    assert_fresh(&options);
+}
+
+fn synthetic_logs(template: &StoppedWorkerTemplate) -> Vec<LogEntry> {
+    template
+        .segment_jsonl
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect()
+}
+
+fn encode_synthetic_logs(logs: &[LogEntry]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for log in logs {
+        serde_json::to_writer(&mut bytes, log).unwrap();
+        bytes.push(b'\n');
+    }
+    bytes
+}
+
+#[tokio::test]
+async fn missing_system_prompt_matches_worker_restore_rejection() {
+    let (_source, worker_dir, template) = source();
+    let mut logs = synthetic_logs(&template);
+    assert!(session_store::collect_state(&logs).system_prompt.is_some());
+    let LogEntry::AnnotatedSegmentStart { system_prompt, .. } = &mut logs[0] else {
+        panic!("missing seed")
+    };
+    *system_prompt = None;
+    assert_rejected_session_bytes(&worker_dir, &template, encode_synthetic_logs(&logs));
+    // The owning Worker constructor rejects this before model-client creation,
+    // allocation, or execution. Do not start a controller or submit any input.
+    let store = session_store::CombinedStore::new(
+        WorkerSessionStore::open_read_only(worker_dir.join("session")).unwrap(),
+        session_store::WorkerAggregateStore::open_read_only(&worker_dir, template.worker_name())
+            .unwrap(),
+    );
+    let restored = worker::Worker::restore_from_manifest(
+        template.session_id(),
+        template.segment_id(),
+        resolved(),
+        store,
+        worker::PromptCatalogSource::builtins_only(),
+    )
+    .await;
+    assert!(matches!(
+        restored,
+        Err(worker::WorkerError::SegmentSystemPromptMissing { .. })
+    ));
+}
+
+#[test]
+fn malformed_submission_and_notification_receipts_fail_extraction_and_install() {
+    let (_source, worker, template) = source();
+    for notification in [false, true] {
+        let mut checkpoint = settled_checkpoint();
+        if notification {
+            checkpoint.notification_receipts =
+                vec![ReceiptFixture::Malformed(1), ReceiptFixture::Malformed(2)];
+        } else {
+            checkpoint.receipts = vec![ReceiptFixture::Malformed(1), ReceiptFixture::Malformed(2)];
+        }
+        let mut logs = synthetic_logs(&template);
+        for log in &mut logs {
+            if let LogEntry::AnnotatedUserInput { extensions, .. } = log {
+                *extensions = vec![checkpoint_extension(&checkpoint)];
+            }
+        }
+        assert_rejected_session_bytes(&worker, &template, encode_synthetic_logs(&logs));
+    }
+}
+
+#[test]
+fn unknown_fields_at_every_retained_record_depth_are_rejected_without_secret_diagnostics() {
+    let (_source, worker, template) = source();
+    let original = String::from_utf8(template.segment_jsonl.clone()).unwrap();
+    // These values are harmless synthetic markers, not lab/private material.
+    // The compatibility decoder normally discards many of these fields.
+    let locations = [
+        r#""kind":"annotated_segment_start""#,
+        r#""kind":"invoke""#,
+        r#""kind":"annotated_user_input""#,
+        r#""kind":"annotated_assistant_item""#,
+        r#""kind":"llm_usage""#,
+        r#""kind":"turn_end""#,
+        r#""kind":"run_completed""#,
+        r#""max_tokens":null"#,
+        r#""kind":"message","role":"assistant""#,
+        r#""kind":"text","text":"artificial fixture reply""#,
+        r#""kind":"text","content":"Harmless artificial fixture input.""#,
+        r#""entry_id":"fixed-entry-id""#,
+        r#""kind":"model_output""#,
+        r#""worker_id":"01a1657d-b762-7791-87ae-a49f28cadbce""#,
+        r#""domain":"worker.pending_activations.v1""#,
+        r#""next_activation_sequence":2"#,
+        r#""submission_request_id":"completed-submission-request""#,
+        r#""notification_request_id":"completed-notification-request""#,
+    ];
+    for location in locations {
+        assert!(original.contains(location));
+        for extra in [
+            r#", "reasoning":{"text":"synthetic-discarded-material"}"#,
+            r#", "encrypted_content":"synthetic-discarded-material""#,
+        ] {
+            let altered = original.replacen(location, &format!("{location}{extra}"), 1);
+            assert_rejected_session_bytes(&worker, &template, altered.into_bytes());
+        }
+    }
+    let duplicate = original.replacen(
+        r#""role":"assistant""#,
+        r#""role":"assistant","role":"assistant""#,
+        1,
+    );
+    assert_rejected_session_bytes(&worker, &template, duplicate.into_bytes());
+}
+
+#[test]
+fn opaque_feature_payloads_cannot_bypass_strict_session_validation() {
+    let (_source, worker, template) = source();
+    let mut logs = synthetic_logs(&template);
+    for log in &mut logs {
+        if let LogEntry::AnnotatedUserInput { history, .. } = log {
+            if let session_store::LoggedItem::Message { role, .. } = &mut history[0].item {
+                *role = session_store::LoggedRole::System;
+            }
+            history[0].metadata.input_metadata = Some(
+                session_store::HistoryInputMetadata::new(
+                    session_store::HistoryInputUsePolicy {
+                        recording_material: session_store::InputEvidenceUse::Exclude,
+                        memory_evidence: session_store::InputEvidenceUse::Exclude,
+                        observation: session_store::InputObservationUse::Hidden,
+                        compaction: session_store::InputCompactionUse::Retain,
+                    },
+                    Some(
+                        session_store::FeatureInputPayload::encode(
+                            "fixture.test",
+                            1,
+                            &BTreeMap::from([("reasoning", "harmless synthetic payload")]),
+                        )
+                        .unwrap(),
+                    ),
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+    }
+    assert_rejected_session_bytes(&worker, &template, encode_synthetic_logs(&logs));
 }
 
 #[cfg(unix)]

@@ -31,7 +31,11 @@ It does not add a product endpoint or change create/restore authorization.
 
 The template preserves the original Session manifest/JSONL bytes, including stable
 entry IDs, timestamps, and settled submission receipts. It rejects resumable queues
-and Feature invocation history. Portability/secret-marker checks do not replace
+and Feature invocation history. A saved system prompt is required for restore;
+checkpoint receipts must match the Worker's typed receipt schema. Preserved records
+must use canonical writer field shapes: unknown/duplicate fields (including nested
+fields), discarded optional fields, and opaque Feature history payloads are rejected,
+not stripped or rewritten. Portability/secret-marker checks do not replace
 review of the supplied artificial conversation or its independently verified hashes.
 The installer refuses any destination content other than initialized `auth.toml`;
 interrupted publication is fail-closed, not an overwrite/recovery facility.
