@@ -10,6 +10,10 @@ autobins = false
 name = "yoi-server"
 path = "src/main.rs"
 
+[features]
+# Offline fixture preparation only; build product binaries without this feature.
+test-support = []
+
 [dependencies]
 api-macros = { workspace = true, features = ["axum"] }
 async-trait.workspace = true
