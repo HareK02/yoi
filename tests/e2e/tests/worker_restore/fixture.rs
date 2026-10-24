@@ -73,6 +73,18 @@ impl Fixture {
         // never skips, and no test generates or repairs a fixture.
         let root = std::env::var_os("YOI_E2E_RESTORE_FIXTURE")
             .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .join(path)
+                }
+            })
             .unwrap_or_else(|| {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/worker-codex-v1")
             });

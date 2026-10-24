@@ -21,7 +21,7 @@ fn supplied_stopped_worker_restores_exact_live_session_and_cleans_up() -> Result
     let result = (|| {
         let installed = seed::start(&fixture)?;
         let subscription = restore(&installed, &fixture, "fixed-fixture-restore-single")?;
-        stop_and_cleanup(installed, subscription, &fixture)
+        stop_and_cleanup(installed, vec![subscription], &fixture)
     })();
     fixture.source.assert_unchanged()?;
     result
@@ -112,7 +112,7 @@ fn concurrent_fixed_id_restores_keep_sessions_storage_and_cleanup_isolated() -> 
         let second_session = FixtureSource::capture(&second_session_root)?;
         let first_root = first.environment.root.clone();
         let first_artifacts = first.environment.artifacts_dir.clone();
-        stop_and_cleanup(first, first_subscription, &fixture)?;
+        stop_and_cleanup(first, vec![first_subscription], &fixture)?;
         assert!(!first_root.exists());
         assert!(first_artifacts.join("cleanup.json").is_file());
         assert!(second.environment.root.is_dir());
@@ -136,8 +136,7 @@ fn concurrent_fixed_id_restores_keep_sessions_storage_and_cleanup_isolated() -> 
         )?;
         reconnected.assert_alive()?;
         second_session.assert_unchanged()?;
-        stop_and_cleanup(second, second_subscription, &fixture)?;
-        reconnected.expect_stopped()?;
+        stop_and_cleanup(second, vec![second_subscription, reconnected], &fixture)?;
         Ok(())
     })();
     fixture.source.assert_unchanged()?;
@@ -236,7 +235,7 @@ fn assert_single_state(
 
 fn stop_and_cleanup(
     installed: Installed,
-    subscription: WorkerSessionSubscription,
+    subscriptions: Vec<WorkerSessionSubscription>,
     fixture: &Fixture,
 ) -> Result<()> {
     phase(&installed.environment, "stop")?;
@@ -248,7 +247,12 @@ fn stop_and_cleanup(
     if result.state != WorkerOperationState::Accepted {
         return Err(failure("Worker stop was not accepted"));
     }
-    subscription.expect_stopped()?;
+    installed.environment.assert_connected()?;
+    for subscription in subscriptions {
+        subscription.expect_stopped()?;
+        // A transport close caused by Server/Runtime shutdown is not stop evidence.
+        installed.environment.assert_connected()?;
+    }
     assert_single_state(&installed.environment, fixture, "stopped")?;
     phase(&installed.environment, "shutdown-cleanup")?;
     let report = installed.environment.cleanup()?;

@@ -129,6 +129,14 @@ fn error(message: &str) -> HarnessError {
 
 pub fn validate_full_snapshot(raw: &serde_json::Value, expected: &SessionSnapshot) -> Result<()> {
     let event: Event = serde_json::from_value(raw.clone())?;
+    // Product DTOs intentionally tolerate unknown fields for compatibility. This
+    // fixture boundary does not: anything discarded by typed decoding must never
+    // be persisted to an artifact, including fields outside the Session payload.
+    if serde_json::to_value(&event)? != *raw {
+        return Err(error(
+            "noncanonical or unknown fields in full protocol Snapshot envelope",
+        ));
+    }
     let Event::Snapshot {
         session,
         state,
@@ -233,6 +241,36 @@ mod tests {
             .unwrap()
             .push(entry);
         assert!(validate_full_snapshot(&extra, &expected).is_err());
+    }
+
+    #[test]
+    fn full_snapshot_rejects_unknown_fields_outside_session_before_artifact_write() {
+        let (raw, expected) = sample();
+        for pointer in [
+            "",
+            "/data",
+            "/data/greeting",
+            "/data/state",
+            "/data/state/state",
+        ] {
+            let mut changed = raw.clone();
+            changed
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(
+                    "hidden_reasoning".into(),
+                    serde_json::json!("must not reach artifact"),
+                );
+            assert!(
+                validate_full_snapshot(&changed, &expected).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut changed = raw;
+        changed["data"]["greeting"]["private_key"] = serde_json::json!("must not reach artifact");
+        assert!(validate_full_snapshot(&changed, &expected).is_err());
     }
 
     #[test]

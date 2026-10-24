@@ -1247,7 +1247,7 @@ impl ManagedProcess {
     fn shutdown(&mut self, timeout: Duration) -> Result<ExitStatus> {
         if let Some(status) = self.child.try_wait()? {
             self.join_readers();
-            return Ok(status);
+            return self.require_successful_exit(status);
         }
         let signal_result = unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
         if signal_result != 0 {
@@ -1257,13 +1257,7 @@ impl ManagedProcess {
         loop {
             if let Some(status) = self.child.try_wait()? {
                 self.join_readers();
-                if status.success() {
-                    return Ok(status);
-                }
-                return Err(HarnessError::Protocol(format!(
-                    "{} did not complete graceful shutdown: {status}",
-                    self.name
-                )));
+                return self.require_successful_exit(status);
             }
             if start.elapsed() >= timeout {
                 let _ = self.child.kill();
@@ -1275,6 +1269,17 @@ impl ManagedProcess {
                 )));
             }
             thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn require_successful_exit(&self, status: ExitStatus) -> Result<ExitStatus> {
+        if status.success() {
+            Ok(status)
+        } else {
+            Err(HarnessError::Protocol(format!(
+                "{} did not complete graceful shutdown: {status}",
+                self.name
+            )))
         }
     }
 
@@ -1397,6 +1402,34 @@ fn io_error(operation: &str, error: std::io::Error) -> HarnessError {
 #[cfg(test)]
 mod startup_address_tests {
     use super::parse_address_after;
+
+    #[test]
+    fn shutdown_rejects_nonzero_exit_even_when_process_already_exited() -> super::Result<()> {
+        let root = tempfile::tempdir()?;
+        for code in [0, 7] {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .env_clear()
+                .current_dir(root.path())
+                .args(["-c", &format!("exit {code}")]);
+            let mut process = super::ManagedProcess::spawn(
+                "already-exited",
+                command,
+                &root.path().join(format!("{code}.stdout")),
+                &root.path().join(format!("{code}.stderr")),
+            )?;
+            // Reap first to deterministically exercise the initial try_wait branch.
+            assert_eq!(process.child.wait()?.code(), Some(code));
+            let result = process.shutdown(std::time::Duration::from_secs(1));
+            if code == 0 {
+                assert!(result?.success());
+            } else {
+                assert!(matches!(result, Err(super::HarnessError::Protocol(message))
+                    if message.contains("did not complete graceful shutdown")));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn startup_address_waits_for_complete_valid_socket_record() {

@@ -73,6 +73,9 @@ pub fn start(fixture: &Fixture) -> Result<Installed> {
         &format!("http://{}", reserved_endpoint.local_addr()?),
         &template.worker_name(),
     )?;
+    // Close the placeholder before Backend probes it: an accepting TCP listener
+    // with no HTTP service would stall discovery until its transport timeout.
+    drop(reserved_endpoint);
     super::phase(&environment, "start-seeded-backend")?;
     environment.start_seeded_backend(
         fixture.manifest.workspace_id.clone(),
@@ -122,10 +125,9 @@ pub fn start(fixture: &Fixture) -> Result<Installed> {
         ))?;
         let projected = session_store::project_session_snapshot(template.session_id(), &logs);
         fixture.verify_conversation(&projected)?;
-        snapshot = Some(projected);
+        snapshot = Some(full_restored_snapshot(&sessions, &logs));
         Ok(())
     })?;
-    drop(reserved_endpoint);
     fixture.source.assert_unchanged()?;
     Ok(Installed {
         environment,
@@ -133,6 +135,120 @@ pub fn start(fixture: &Fixture) -> Result<Installed> {
         runtime_public_key,
         workspace_public_key: bootstrap.workspace_public_key,
     })
+}
+
+fn full_restored_snapshot(
+    store: &dyn session_store::Store,
+    logs: &[session_store::LogEntry],
+) -> SessionSnapshot {
+    session_store::public_snapshot::project_current_session_snapshot_with_accounting(store, logs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{
+        Event, Greeting, InFlightSnapshot, InvokeKind, SessionSnapshotEntryData,
+        WorkerStateSnapshot, WorkerStatus,
+    };
+    use session_store::{
+        LogEntry, LoggedContentPart, LoggedHistoryEntry, LoggedItem, LoggedRole,
+        LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin,
+    };
+
+    #[test]
+    fn completed_run_full_snapshot_retains_invoke_and_usage_accounting() -> Result<()> {
+        // Projection regression only: no saved Worker or substitute E2E fixture.
+        let temp = tempfile::tempdir()?;
+        let store = support(session_store::WorkerSessionStore::new(temp.path()))?;
+        let session_id = session_store::new_session_id();
+        let logs = vec![
+            LogEntry::AnnotatedSegmentStart {
+                ts: 1,
+                session_id,
+                system_prompt: None,
+                config: Default::default(),
+                history: vec![],
+                forked_from: None,
+                compacted_from: None,
+            },
+            LogEntry::Invoke {
+                ts: 10,
+                trigger: InvokeKind::UserSend,
+            },
+            LogEntry::AnnotatedAssistantItem {
+                ts: 20,
+                entry: LoggedHistoryEntry {
+                    item: LoggedItem::Message {
+                        role: LoggedRole::Assistant,
+                        content: vec![LoggedContentPart::Text {
+                            text: "unit response".into(),
+                        }],
+                    },
+                    metadata: LoggedSessionHistoryMetadata {
+                        entry_id: LoggedSessionHistoryEntryId("unit-response".into()),
+                        origin: LoggedSessionHistoryOrigin::LegacyUnknown,
+                        derivation: None,
+                        input_metadata: None,
+                    },
+                },
+            },
+            LogEntry::LlmUsage {
+                ts: 30,
+                history_len: 1,
+                input_total_tokens: 100,
+                cache_read_tokens: 20,
+                cache_write_tokens: 0,
+                output_tokens: 5,
+            },
+            serde_json::from_value(serde_json::json!({"kind":"run_completed", "ts":40,
+                "interrupted":false,"result":"finished"}))?,
+        ];
+        let conversation = session_store::project_session_snapshot(session_id, &logs);
+        let expected = full_restored_snapshot(&store, &logs);
+        assert_eq!(expected.entries.len(), conversation.entries.len() + 2);
+        assert!(matches!(
+            expected.entries[expected.entries.len() - 2].data,
+            SessionSnapshotEntryData::Invoke {
+                trigger: InvokeKind::UserSend
+            }
+        ));
+        assert_eq!(expected.entries[expected.entries.len() - 2].timestamp, 10);
+        assert!(matches!(
+            expected.entries.last().unwrap().data,
+            SessionSnapshotEntryData::Usage {
+                input_tokens: 100,
+                cache_read_input_tokens: 20,
+                output_tokens: 5
+            }
+        ));
+        assert_eq!(expected.entries.last().unwrap().timestamp, 30);
+        let live = session_store::public_snapshot::project_current_session_snapshot_with_accounting(
+            &store, &logs,
+        );
+        let event = Event::Snapshot {
+            session: live,
+            state: WorkerStateSnapshot::from(WorkerStatus::Idle),
+            in_flight: InFlightSnapshot::default(),
+            internal_workers: vec![],
+            greeting: Greeting {
+                worker_name: "unit".into(),
+                cwd: ".".into(),
+                provider: "unit".into(),
+                model: "unit".into(),
+                reasoning: None,
+                scope_summary: "none".into(),
+                tools: vec![],
+                context_window: 0,
+                context_tokens: 0,
+                context_usage: None,
+            },
+        };
+        let raw = serde_json::to_value(event)?;
+        yoi_e2e::validate_full_snapshot(&raw, &expected)?;
+        assert!(yoi_e2e::validate_full_snapshot(&raw, &conversation).is_err());
+        Ok(())
+    }
 }
 
 struct Bootstrap {
