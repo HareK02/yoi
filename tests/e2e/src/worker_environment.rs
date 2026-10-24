@@ -13,8 +13,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    FixtureAllocation, HarnessError, Result, allocate_fixture, command_display,
-    current_target_profile_dir, now_ms, test_profile, workspace_root, yoi_binary_info,
+    FixtureAllocation, HarnessError, Result, allocate_fixture, command_display, now_ms,
+    product_target_dir, test_profile, workspace_root,
 };
 
 const STARTUP_WAIT: Duration = Duration::from_secs(15);
@@ -61,21 +61,19 @@ pub fn worker_binary_provider_info() -> Result<WorkerBinaryProviderInfo> {
 fn resolve_worker_binaries() -> Result<WorkerBinaryProviderInfo> {
     let workspace_root = workspace_root()?;
     let profile = test_profile();
-    let yoi = yoi_binary_info()?;
-    let mut records = vec![binary_record(
-        "yoi",
-        yoi.binary,
-        yoi.provider,
-        yoi.build_command,
-    )?];
-
+    let mut records = Vec::new();
+    let yoi_override = resolve_override("YOI_E2E_BIN", &workspace_root)?;
     let server_override = resolve_override("YOI_E2E_SERVER_BIN", &workspace_root)?;
     let runtime_override = resolve_override("YOI_E2E_RUNTIME_BIN", &workspace_root)?;
     let mut build_command = None;
-    if server_override.is_none() || runtime_override.is_none() {
+    if yoi_override.is_none() || server_override.is_none() || runtime_override.is_none() {
         let cargo = PathBuf::from(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
         let mut args = vec![
             "build".to_string(),
+            "-p".to_string(),
+            "yoi".to_string(),
+            "--bin".to_string(),
+            "yoi".to_string(),
             "-p".to_string(),
             "yoi-workspace-server".to_string(),
             "--bin".to_string(),
@@ -84,6 +82,8 @@ fn resolve_worker_binaries() -> Result<WorkerBinaryProviderInfo> {
             "worker-runtime".to_string(),
             "--bin".to_string(),
             "yoi-runtime".to_string(),
+            "--target-dir".to_string(),
+            product_target_dir()?.to_string_lossy().into_owned(),
         ];
         if profile == "release" {
             args.push("--release".to_string());
@@ -106,7 +106,16 @@ fn resolve_worker_binaries() -> Result<WorkerBinaryProviderInfo> {
         build_command = Some(rendered);
     }
 
-    let profile_dir = current_target_profile_dir()?;
+    let profile_dir = product_target_dir()?.join(&profile);
+    let (yoi_path, yoi_provider, yoi_build) = match yoi_override {
+        Some(path) => (path, "YOI_E2E_BIN".to_string(), None),
+        None => (
+            profile_dir.join(executable_name("yoi")),
+            "cargo-build".to_string(),
+            build_command.clone(),
+        ),
+    };
+    records.push(binary_record("yoi", yoi_path, yoi_provider, yoi_build)?);
     let (server_path, server_provider, server_build) = match server_override {
         Some(path) => (path, "YOI_E2E_SERVER_BIN".to_string(), None),
         None => (
@@ -231,6 +240,7 @@ pub struct WorkerE2eEnvironment {
     pub runtime_url: Option<String>,
     server: Option<ManagedProcess>,
     runtime: Option<ManagedProcess>,
+    runtime_public_identity: Option<Value>,
     access_token: Option<String>,
     client: Client,
     binaries: WorkerBinaryProviderInfo,
@@ -292,6 +302,7 @@ impl WorkerE2eEnvironment {
             runtime_url: None,
             server: None,
             runtime: None,
+            runtime_public_identity: None,
             access_token: None,
             client,
             binaries,
@@ -374,6 +385,47 @@ impl WorkerE2eEnvironment {
         Ok(())
     }
 
+    /// Start a store populated by the Backend's typed test-support API. The seed
+    /// supplies fixed catalog IDs, but the bearer must be freshly issued for this
+    /// environment. No database mutation or fixture credential import occurs here.
+    pub fn start_seeded_backend(
+        &mut self,
+        workspace_id: String,
+        runtime_id: String,
+        access_token: String,
+    ) -> Result<()> {
+        if self.server.is_some() || self.runtime.is_some() || self.workspace_id.is_some() {
+            return Err(HarnessError::Protocol(
+                "fixture seed requires an unstarted environment".into(),
+            ));
+        }
+        if workspace_id.is_empty() || runtime_id.is_empty() || access_token.is_empty() {
+            return Err(HarnessError::Protocol(
+                "fixture seed omitted an identity or fresh bearer".into(),
+            ));
+        }
+        if !self.server_data_dir.join("server.db").is_file() {
+            return Err(HarnessError::Protocol(
+                "typed Backend seed has not created server.db".into(),
+            ));
+        }
+        if self.runtime_public_identity.is_some() {
+            if self.runtime_id != runtime_id {
+                return Err(HarnessError::Protocol(
+                    "seeded Runtime ID differs from initialized identity".into(),
+                ));
+            }
+        } else {
+            assert_absent_or_empty(&self.runtime_data_dir, "Runtime data directory")?;
+        }
+        self.workspace_id = Some(workspace_id);
+        self.runtime_id = runtime_id;
+        self.access_token = Some(access_token);
+        self.start_server_process()?;
+        self.export_workspace_public_identity()?;
+        self.write_metadata("seeded-backend-running")
+    }
+
     pub fn start_backend(&mut self) -> Result<()> {
         self.start_empty_backend()?;
         let server_binary = self.binaries.binary("yoi-server")?;
@@ -417,7 +469,15 @@ impl WorkerE2eEnvironment {
             "create Workspace",
         )?;
         let workspace_id = json_string(&created, "/workspace/workspace_id")?;
-        self.workspace_id = Some(workspace_id.clone());
+        self.workspace_id = Some(workspace_id);
+        self.export_workspace_public_identity()?;
+        self.write_metadata("backend-running")?;
+        Ok(())
+    }
+
+    fn export_workspace_public_identity(&self) -> Result<()> {
+        let server_url = self.required_server_url()?;
+        let workspace_id = self.required_workspace_id()?;
         let identity = self.request_json(
             self.client.get(format!(
                 "{server_url}/api/w/{workspace_id}/settings/signing-identity"
@@ -429,17 +489,27 @@ impl WorkerE2eEnvironment {
         })?;
         let bundle_path = self.root.join("workspace-public-identity.json");
         fs::write(&bundle_path, serde_json::to_vec_pretty(&public_bundle)?)?;
-        self.write_metadata("backend-running")?;
         Ok(())
     }
 
     fn start_runtime(&mut self) -> Result<()> {
-        let bundle_path = self.root.join("workspace-public-identity.json");
-        let server_url = self.required_server_url()?.to_string();
-        let workspace_id = self.required_workspace_id()?.to_string();
-        let runtime_binary = self.binaries.binary("yoi-runtime")?;
+        self.start_runtime_with_seed(|_| Ok(()))?;
+        self.assert_connected_and_empty()
+    }
+
+    /// Generate fresh keys before offline Backend registration when fixed IDs are
+    /// required. Returns only the public bundle; no fixture keys are accepted.
+    pub fn initialize_runtime_identity(&mut self, runtime_id: String) -> Result<Value> {
+        if self.runtime_public_identity.is_some() || self.runtime.is_some() {
+            return Err(HarnessError::Protocol(
+                "Runtime identity is already initialized".into(),
+            ));
+        }
+        assert_absent_or_empty(&self.runtime_data_dir, "Runtime data directory")?;
+        self.runtime_id = runtime_id;
+        let binary = self.binaries.binary("yoi-runtime")?;
         self.run_command(
-            &runtime_binary,
+            &binary,
             &[
                 "identity",
                 "init",
@@ -450,8 +520,8 @@ impl WorkerE2eEnvironment {
             ],
             false,
         )?;
-        let runtime_identity = self.run_command(
-            &runtime_binary,
+        let identity = self.run_command(
+            &binary,
             &[
                 "identity",
                 "show",
@@ -461,7 +531,31 @@ impl WorkerE2eEnvironment {
             ],
             false,
         )?;
-        let runtime_identity: Value = serde_json::from_slice(&runtime_identity.stdout)?;
+        let identity: Value = serde_json::from_slice(&identity.stdout)?;
+        self.runtime_public_identity = Some(identity.clone());
+        Ok(identity)
+    }
+
+    /// Initialize fresh Runtime keys/trust, then invoke the typed Runtime seed
+    /// before starting its process. The actual Backend URL is now available.
+    pub fn start_runtime_with_seed(
+        &mut self,
+        seed: impl FnOnce(&Self) -> Result<()>,
+    ) -> Result<()> {
+        if self.runtime.is_some() {
+            return Err(HarnessError::Protocol("Runtime is already running".into()));
+        }
+        if self.runtime_public_identity.is_none() {
+            self.initialize_runtime_identity(self.runtime_id.clone())?;
+        }
+        let runtime_identity = self
+            .runtime_public_identity
+            .clone()
+            .expect("initialized identity");
+        let bundle_path = self.root.join("workspace-public-identity.json");
+        let server_url = self.required_server_url()?.to_string();
+        let workspace_id = self.required_workspace_id()?.to_string();
+        let runtime_binary = self.binaries.binary("yoi-runtime")?;
         self.run_command(
             &runtime_binary,
             &[
@@ -497,6 +591,8 @@ impl WorkerE2eEnvironment {
             ));
         }
 
+        seed(self)?;
+        self.write_metadata("runtime-seeded")?;
         let mut command = self.isolated_command(&runtime_binary);
         command.args([
             "--bind",
@@ -519,22 +615,38 @@ impl WorkerE2eEnvironment {
         self.runtime = Some(runtime);
         self.runtime_url = Some(runtime_url.clone());
 
+        let registered = self.request_json(
+            self.client
+                .get(format!("{server_url}/api/w/{workspace_id}/runtimes")),
+            "observe Runtime registration before endpoint update",
+        )?;
+        let expected_binding_id = registered
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("runtime_id").and_then(Value::as_str) == Some(self.runtime_id.as_str())
+                })
+            })
+            .and_then(|item| item.pointer("/management/binding/binding_id"))
+            .cloned();
         self.request_json(
             self.client
                 .post(format!("{server_url}/api/w/{workspace_id}/runtimes"))
                 .json(&serde_json::json!({
                     "public_bundle": runtime_identity,
                     "display_name": format!("E2E {}", self.runtime_id),
-                    "endpoint": runtime_url
+                    "endpoint": runtime_url,
+                    "expected_binding_id": expected_binding_id,
                 })),
             "register Runtime",
         )?;
-        self.assert_connected_and_empty()?;
+        self.assert_connected()?;
         self.write_metadata("running")?;
         Ok(())
     }
 
-    pub fn assert_connected_and_empty(&self) -> Result<()> {
+    pub fn assert_connected(&self) -> Result<()> {
         let server_url = self.required_server_url()?;
         let workspace_id = self.required_workspace_id()?;
         // connection testは実署名要求。保存済みの接続flagを認証成功の代わりにしない。
@@ -574,11 +686,22 @@ impl WorkerE2eEnvironment {
                 self.runtime_id
             )));
         }
-        let workers = self.request_json(
+        Ok(())
+    }
+
+    pub fn list_workers(&self) -> Result<Value> {
+        let server_url = self.required_server_url()?;
+        let workspace_id = self.required_workspace_id()?;
+        self.request_json(
             self.client
                 .get(format!("{server_url}/api/w/{workspace_id}/workers")),
             "list Workers",
-        )?;
+        )
+    }
+
+    pub fn assert_connected_and_empty(&self) -> Result<()> {
+        self.assert_connected()?;
+        let workers = self.list_workers()?;
         if workers
             .get("items")
             .and_then(Value::as_array)
@@ -586,6 +709,104 @@ impl WorkerE2eEnvironment {
         {
             return Err(HarnessError::Protocol(format!(
                 "fresh Worker list is not empty: {workers}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn worker_url(&self, worker_id: &str, suffix: &str) -> Result<String> {
+        let mut url = reqwest::Url::parse(self.required_server_url()?)
+            .map_err(|error| HarnessError::Protocol(format!("invalid Server URL: {error}")))?;
+        url.path_segments_mut()
+            .map_err(|_| HarnessError::Protocol("Server URL has no path segments".into()))?
+            .extend([
+                "api",
+                "w",
+                self.required_workspace_id()?,
+                "runtimes",
+                &self.runtime_id,
+                "workers",
+                worker_id,
+            ]);
+        if !suffix.is_empty() {
+            url.path_segments_mut().unwrap().extend(suffix.split('/'));
+        }
+        Ok(url.into())
+    }
+
+    pub fn worker_detail(&self, worker_id: &str) -> Result<Value> {
+        self.request_json(
+            self.client.get(self.worker_url(worker_id, "")?),
+            "read Worker detail",
+        )
+    }
+
+    /// Exactly one restore submission. No retries, replacement token or new intent.
+    pub fn restore_worker(
+        &self,
+        worker_id: &str,
+        request_id: &str,
+        expected_observation_token: &str,
+    ) -> Result<Value> {
+        self.request_json(
+            self.client
+                .post(self.worker_url(worker_id, "restore")?)
+                .timeout(STARTUP_WAIT)
+                .json(&serde_json::json!({
+                    "request_id": request_id,
+                    "expected_observation_token": expected_observation_token,
+                })),
+            "restore Worker",
+        )
+    }
+
+    pub fn stop_worker(&self, worker_id: &str) -> Result<Value> {
+        self.request_json(
+            self.client
+                .post(self.worker_url(worker_id, "stop")?)
+                .json(&serde_json::json!({})),
+            "stop Worker",
+        )
+    }
+
+    /// Authorization stays in memory; callers must not persist or debug this request.
+    pub fn worker_protocol_request(&self, worker_id: &str) -> Result<reqwest::blocking::Request> {
+        let token = self.access_token.as_deref().ok_or_else(|| {
+            HarnessError::Protocol("Backend access token is not initialized".into())
+        })?;
+        self.client
+            .get(self.worker_url(worker_id, "protocol/ws")?)
+            .bearer_auth(token)
+            .build()
+            .map_err(|_| HarnessError::Protocol("build Worker protocol request".into()))
+    }
+
+    /// The other environment must reject this environment's fresh bearer even
+    /// when both contain identical Workspace/Runtime/Worker IDs. Never logs tokens.
+    pub fn assert_authentication_isolated_from(&self, other: &Self) -> Result<()> {
+        let token = self
+            .access_token
+            .as_deref()
+            .ok_or_else(|| HarnessError::Protocol("missing source bearer".into()))?;
+        if other.access_token.as_deref() == Some(token) {
+            return Err(HarnessError::Protocol(
+                "environments share authentication material".into(),
+            ));
+        }
+        let (server, workspace) = other.backend_target()?;
+        let response = self
+            .client
+            .get(format!("{server}/api/w/{workspace}/workers"))
+            .bearer_auth(token)
+            .send()
+            .map_err(|_| {
+                HarnessError::Protocol("cross-environment authorization request failed".into())
+            })?;
+        let status = response.status().as_u16();
+        other.append_operation("reject other environment bearer", status)?;
+        if status != 401 {
+            return Err(HarnessError::Protocol(format!(
+                "cross-environment bearer was not rejected with 401: {status}"
             )));
         }
         Ok(())
@@ -636,7 +857,7 @@ impl WorkerE2eEnvironment {
                     "assignee": null,
                     "readiness": null,
                     "risk_flags": [],
-                    "workflow_state": "planning",
+                    "workflow_state": "open",
                     "queued_by": null,
                     "queued_at": null,
                     "repository_key": null,

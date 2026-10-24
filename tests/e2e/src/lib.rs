@@ -1268,7 +1268,11 @@ impl Drop for PanelHarness {
     }
 }
 
+mod fixture_source;
+pub use fixture_source::FixtureSource;
 mod worker_environment;
+mod worker_session;
+pub use worker_session::{WorkerSessionSubscription, validate_full_snapshot};
 
 pub use worker_environment::{
     WorkerBinaryProviderInfo, WorkerE2eEnvironment, WorkerEnvironmentCleanupReport,
@@ -1627,6 +1631,8 @@ fn resolve_yoi_binary() -> Result<BinaryProviderInfo> {
         "e2e-test".to_owned(),
         "--bin".to_owned(),
         "yoi".to_owned(),
+        "--target-dir".to_owned(),
+        tui_product_target_dir()?.to_string_lossy().into_owned(),
     ];
     if test_profile() == "release" {
         args.push("--release".to_owned());
@@ -1648,7 +1654,9 @@ fn resolve_yoi_binary() -> Result<BinaryProviderInfo> {
         });
     }
 
-    let binary = current_target_profile_dir()?.join(binary_name());
+    let binary = tui_product_target_dir()?
+        .join(test_profile())
+        .join(binary_name());
     let info = BinaryProviderInfo {
         provider: "cargo-build".to_owned(),
         binary,
@@ -1673,6 +1681,26 @@ fn workspace_root() -> Result<PathBuf> {
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .ok_or_else(|| HarnessError::Protocol("could not resolve workspace root".to_owned()))
+}
+
+/// Product processes must never reuse the target used by test-support builds.
+fn product_target_dir() -> Result<PathBuf> {
+    dedicated_product_target("e2e-products")
+}
+
+// Existing PTY tests need their observer feature, never on restore binaries.
+fn tui_product_target_dir() -> Result<PathBuf> {
+    dedicated_product_target("e2e-tui-products")
+}
+
+fn dedicated_product_target(name: &str) -> Result<PathBuf> {
+    let target = workspace_root()?.join("target").join(name);
+    if current_target_profile_dir()?.parent() == Some(target.as_path()) {
+        return Err(HarnessError::Protocol(
+            "run support tests outside reserved product binary targets".to_owned(),
+        ));
+    }
+    Ok(target)
 }
 
 fn current_target_profile_dir() -> Result<PathBuf> {
