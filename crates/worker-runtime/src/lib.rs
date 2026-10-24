@@ -34,6 +34,8 @@ pub mod workspace_request;
 
 #[cfg(feature = "fs-store")]
 pub use fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};
+#[cfg(feature = "test-support")]
+pub use fs_store::test_support;
 pub use management::RuntimeOptions;
 pub use runtime::{
     Runtime, RuntimeEventSelectorSubscription, RuntimeSubscriptionRecvError,

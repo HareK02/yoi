@@ -39,6 +39,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
+#[cfg(feature = "test-support")]
+#[path = "test_support.rs"]
+pub mod test_support;
+
 const SCHEMA_VERSION: u32 = 12;
 // Frozen source schemas: do not move their meaning when adding a migration.
 const SOURCE_SCHEMA_VERSION: u32 = 11;

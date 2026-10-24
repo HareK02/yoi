@@ -1389,6 +1389,15 @@ fn bind_workspace_memory_settings(
     Ok(())
 }
 
+/// Read-only validation shared with the offline, feature-gated fixture installer.
+#[cfg(feature = "test-support")]
+pub(crate) fn validate_fixture_restore_metadata(
+    metadata: &session_store::WorkerMetadata,
+    request: &CreateWorkerRequest,
+) -> Result<(), String> {
+    ProfileRuntimeWorkerFactory::manifest_for_restore(metadata, request).map(|_| ())
+}
+
 fn validate_worker_memory_settings(
     manifest: &manifest::WorkerManifest,
     request: &CreateWorkerRequest,
