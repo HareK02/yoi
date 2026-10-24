@@ -37791,9 +37791,13 @@ mod tests {
                     )))
                     .unwrap();
             }
+            let error = write
+                .await
+                .unwrap()
+                .expect_err("mismatched or lost mutation response must remain outcome-unknown");
             assert!(matches!(
-                write.await.unwrap(),
-                Err(workdir::WorkdirError::OutcomeUnknown(_))
+                error.classification_source(),
+                workdir::WorkdirError::OutcomeUnknown(_)
             ));
         }
     }
