@@ -41,13 +41,13 @@ fn backend_panel_loads_backend_owned_tickets_and_supports_reload_navigation_and_
                     &event.data,
                     &ready_ticket_id,
                     "Planning E2E Ticket A",
-                    "planning",
+                    "open",
                 )
                 && has_backend_ticket(
                     &event.data,
                     &planning_ticket_id,
                     "Planning E2E Ticket B",
-                    "planning",
+                    "open",
                 )
         },
     )?;
@@ -82,13 +82,13 @@ fn backend_panel_loads_backend_owned_tickets_and_supports_reload_navigation_and_
                     &event.data,
                     &ready_ticket_id,
                     "Planning E2E Ticket A",
-                    "planning",
+                    "open",
                 )
                 && has_backend_ticket(
                     &event.data,
                     &planning_ticket_id,
                     "Planning E2E Ticket B",
-                    "planning",
+                    "open",
                 )
         },
     )?;
@@ -137,7 +137,7 @@ fn backend_panel_shell_enter_path_uses_the_same_backend_authority() -> yoi_e2e::
                     &event.data,
                     &ready_ticket_id,
                     "Planning E2E Ticket A",
-                    "planning",
+                    "open",
                 )
         },
     )?;
