@@ -35,6 +35,8 @@ pub mod workspace_issuer;
 #[cfg(feature = "http-server")]
 pub mod workspace_request;
 
+#[cfg(feature = "test-support")]
+pub use fs_store::test_support;
 #[cfg(feature = "fs-store")]
 pub use fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};
 pub use management::RuntimeOptions;

@@ -1,0 +1,52 @@
+{
+  "source_revision": "1639be98411921308238b3a6a6e75c784c045156",
+  "model": "codex-oauth/gpt-6.1-sol",
+  "worker_id": "01a1657d-b762-7791-87ae-a49f28cadbce",
+  "session_id": "01a1657d-b818-77c1-bd73-175a27562f63",
+  "rows": [
+    {
+      "entry_id": "01a1657f-18bf-7a03-b8b8-953d27041fe0",
+      "timestamp": 1792704190655,
+      "role": "user",
+      "parts": [
+        {
+          "kind": "text",
+          "content": "これは保存と復元を確認するための人工的な会話です。合言葉は「青い灯台」です。覚えたことを一文で返してください。Toolは使わないでください。"
+        }
+      ]
+    },
+    {
+      "entry_id": "01a1657f-1f55-71d3-b418-8199b863f59a",
+      "timestamp": 1792704192341,
+      "role": "assistant",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "合言葉は「青い灯台」と覚えました。"
+        }
+      ]
+    },
+    {
+      "entry_id": "01a1657f-3053-71f3-bf4f-91290d82488b",
+      "timestamp": 1792704196691,
+      "role": "user",
+      "parts": [
+        {
+          "kind": "text",
+          "content": "先ほどの合言葉は何でしたか？合言葉だけを答えてください。"
+        }
+      ]
+    },
+    {
+      "entry_id": "01a1657f-36ef-78b1-b0c8-b141f13b0c7b",
+      "timestamp": 1792704198383,
+      "role": "assistant",
+      "parts": [
+        {
+          "kind": "text",
+          "text": "青い灯台"
+        }
+      ]
+    }
+  ]
+}

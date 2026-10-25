@@ -28,6 +28,8 @@ pub mod runtime_subscription;
 pub mod server;
 pub mod skills;
 pub mod store;
+#[cfg(feature = "test-support")]
+pub use store::fixture_support as test_support;
 pub mod subjektiv;
 #[cfg(test)]
 mod ticket_browse_performance_tests;

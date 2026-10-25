@@ -19,6 +19,8 @@ required-features = ["ws-server", "fs-store"]
 [features]
 default = ["ws-server", "fs-store"]
 fs-store = ["dep:fs4"]
+# Offline fixture tooling only; never enabled by the product defaults.
+test-support = ["fs-store", "ws-server"]
 http-server = ["dep:axum", "dep:tower", "dep:reqwest"]
 ws-server = ["http-server", "axum/ws", "dep:futures", "tokio/sync"]
 
