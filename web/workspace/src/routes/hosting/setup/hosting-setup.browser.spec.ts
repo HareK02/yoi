@@ -467,33 +467,151 @@ for (const replacement of [null, replacedActor]) {
 
 test("setup logout during native login prompt aborts and never submits the late credential", async () => {
   const { get, fetcher } = boundary();
-  const prompted = gate<void>(); const credential = gate<Credential>();
-  get.mockImplementation(() => { prompted.resolve(); return credential.promise; });
-  render(Setup); await enroll();
-  await fireEvent.click(await screen.findByRole("button", { name: "Sign in with new passkey" }));
+  const prompted = gate<void>();
+  const credential = gate<Credential>();
+  get.mockImplementation(() => {
+    prompted.resolve();
+    return credential.promise;
+  });
+  render(Setup);
+  await enroll();
+  await fireEvent.click(
+    await screen.findByRole("button", { name: "Sign in with new passkey" }),
+  );
   await prompted.promise;
   await changedInAnotherTab(null);
-  const signal = (get.mock.calls[0] as unknown as [CredentialRequestOptions])[0].signal!;
+  const signal = (get.mock.calls[0] as unknown as [CredentialRequestOptions])[0]
+    .signal!;
   expect(signal.aborted).toBe(true);
   credential.resolve(credentialFixture(true));
   await screen.findByRole("alert");
-  expect(fetcher.mock.calls.some(([path]) => path === "/api/auth/passkeys/login/complete")).toBe(false);
-  expect(screen.queryByRole("link", { name: "Open hosting settings" })).toBeNull();
+  expect(
+    fetcher.mock.calls.some(([path]) =>
+      path === "/api/auth/passkeys/login/complete"
+    ),
+  ).toBe(false);
+  expect(screen.queryByRole("link", { name: "Open hosting settings" }))
+    .toBeNull();
 });
 
 test("setup final confirmation rejects replacement session for the same owner", async () => {
-  const { fetcher } = boundary(); const request = fetcher.getMockImplementation()!;
+  const { fetcher } = boundary();
+  const request = fetcher.getMockImplementation()!;
   let accessRead = false;
   fetcher.mockImplementation(async (input, init) => {
     if (String(input) === "/api/hosting/access") accessRead = true;
-    if (String(input) === "/api/auth/whoami" && accessRead) return Response.json({
-      actor: setupActor, authentication_reference: "same-owner-different-session",
-      session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
-    });
+    if (String(input) === "/api/auth/whoami" && accessRead) {
+      return Response.json({
+        actor: setupActor,
+        authentication_reference: "same-owner-different-session",
+        session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+      });
+    }
     return await request(input, init);
   });
-  render(Setup); await enroll();
-  await fireEvent.click(await screen.findByRole("button", { name: "Sign in with new passkey" }));
+  render(Setup);
+  await enroll();
+  await fireEvent.click(
+    await screen.findByRole("button", { name: "Sign in with new passkey" }),
+  );
   await screen.findByRole("alert");
-  expect(screen.queryByRole("link", { name: "Open hosting settings" })).toBeNull();
+  expect(screen.queryByRole("link", { name: "Open hosting settings" }))
+    .toBeNull();
 });
+
+for (
+  const phase of [
+    "initial",
+    "options",
+    "prompt",
+    "pre-complete",
+    "complete",
+    "whoami",
+    "access",
+    "confirmation",
+  ] as const
+) {
+  for (const reason of ["logout", "authentication"] as const) {
+    test(`setup fences shared ${reason} stamp during ${phase} before event delivery`, async () => {
+      const { fetcher, get } = boundary();
+      const request = fetcher.getMockImplementation()!;
+      const started = gate<void>();
+      const pending = gate<void>();
+      let optionsRead = false,
+        promptReturned = false,
+        completionSent = false,
+        accessRead = false,
+        held = false;
+      const hold = async () => {
+        held = true;
+        started.resolve();
+        await pending.promise;
+      };
+      get.mockImplementation(async () => {
+        if (phase === "prompt") await hold();
+        promptReturned = true;
+        return credentialFixture(true);
+      });
+      fetcher.mockImplementation(async (input, init) => {
+        if (new Headers(init?.headers).has("authorization")) {
+          return await request(input, init);
+        }
+        const path = String(input);
+        const point = path === "/api/auth/whoami"
+          ? !optionsRead
+            ? "initial"
+            : !completionSent && promptReturned
+            ? "pre-complete"
+            : accessRead
+            ? "confirmation"
+            : "whoami"
+          : path.endsWith("/login/options")
+          ? "options"
+          : path.endsWith("/login/complete")
+          ? "complete"
+          : path === "/api/hosting/access"
+          ? "access"
+          : null;
+        if (point === "options") optionsRead = true;
+        if (point === "complete") completionSent = true;
+        if (point === "access") accessRead = true;
+        const response = await request(input, init);
+        if (!held && point === phase) await hold();
+        return response;
+      });
+      render(Setup);
+      await enroll();
+      await fireEvent.click(
+        await screen.findByRole("button", { name: "Sign in with new passkey" }),
+      );
+      await started.promise;
+      const generation = browserSession.authenticationGeneration;
+      const stamp = JSON.stringify({ id: crypto.randomUUID(), reason });
+      // 同一documentのsetItemはstorage eventを配送しない。generationを直接変えず順序を固定する。
+      localStorage.setItem("yoi.browser-auth-generation", stamp);
+      expect(browserSession.authenticationGeneration).toBe(generation);
+      pending.resolve();
+      await screen.findByRole("alert");
+      await waitFor(() =>
+        expect(
+          (screen.getByRole("button", {
+            name: "Sign in with new passkey",
+          }) as HTMLButtonElement).disabled,
+        ).toBe(false)
+      );
+      expect(
+        fetcher.mock.calls.filter(([path]) =>
+          path === "/api/auth/passkeys/login/complete"
+        ),
+      ).toHaveLength(
+        ["complete", "whoami", "access", "confirmation"].includes(phase)
+          ? 1
+          : 0,
+      );
+      expect(screen.queryByRole("link", { name: "Open hosting settings" }))
+        .toBeNull();
+      // 古いcatchが新tabのstampを自身のsessionMutationで上書きしない。
+      expect(browserSession.authenticationStamp).toBe(stamp);
+    });
+  }
+}

@@ -236,3 +236,45 @@ test("logout during the activation prompt fences a late credential before comple
   expect(screen.queryByText(/You are signed in/)).toBeNull();
   expect(screen.queryByRole("link", { name: "Open Account" })).toBeNull();
 });
+
+for (const phase of ["prompt", "confirmation"] as const) {
+  for (const reason of ["logout", "authentication"] as const) {
+    test(`activation UI rejects shared ${reason} stamp during ${phase} before event delivery`, async () => {
+      const { create, fetcher } = boundary("success");
+      const started = gate<void>();
+      const pending = gate<void>();
+      const request = fetcher.getMockImplementation()!;
+      if (phase === "prompt") {
+        create.mockImplementation(async () => {
+          started.resolve();
+          await pending.promise;
+          return credentialFixture();
+        });
+      } else {fetcher.mockImplementation(async (input, init) => {
+          if (String(input) === "/api/auth/whoami") {
+            started.resolve();
+            await pending.promise;
+          }
+          return await request(input, init);
+        });}
+      render(Activate);
+      await submit();
+      await started.promise;
+      const generation = browserSession.authenticationGeneration;
+      localStorage.setItem(
+        "yoi.browser-auth-generation",
+        JSON.stringify({ id: crypto.randomUUID(), reason }),
+      );
+      expect(browserSession.authenticationGeneration).toBe(generation);
+      pending.resolve();
+      await screen.findByRole("alert");
+      expect(screen.queryByRole("link", { name: "Open Account" })).toBeNull();
+      expect(screen.queryByText(/You are signed in/)).toBeNull();
+      expect(
+        fetcher.mock.calls.filter(([path]) =>
+          path === "/api/auth/activation/complete"
+        ),
+      ).toHaveLength(phase === "prompt" ? 0 : 1);
+    });
+  }
+}

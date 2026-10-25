@@ -319,3 +319,74 @@ for (const stage of ["prompt", "completion", "confirmation"] as const) {
     },
   );
 }
+
+for (
+  const phase of ["options", "prompt", "complete", "confirmation"] as const
+) {
+  for (const reason of ["logout", "authentication"] as const) {
+    Deno.test(`activation fences shared ${reason} stamp during ${phase} before event delivery`, async () => {
+      const previous = Object.getOwnPropertyDescriptor(
+        globalThis,
+        "localStorage",
+      );
+      let stamp = "initial-operation-stamp";
+      Object.defineProperty(globalThis, "localStorage", {
+        configurable: true,
+        value: { getItem: () => stamp },
+      });
+      const generation = browserSession.authenticationGeneration;
+      const paths: string[] = [];
+      try {
+        await boundary(async (input) => {
+          const path = String(input);
+          paths.push(path);
+          if (
+            (phase === "options" && path.endsWith("/options")) ||
+            (phase === "complete" && path.endsWith("/complete")) ||
+            (phase === "confirmation" && path === "/api/auth/whoami")
+          ) {
+            stamp = JSON.stringify({ id: "other-tab", reason });
+          }
+          return Response.json(
+            path.endsWith("/options")
+              ? registrationOptions
+              : path.endsWith("/complete")
+              ? {
+                user: authUser,
+                authentication_reference: "fixture-authentication",
+              }
+              : confirmedSession(),
+          );
+        }, async () => {
+          if (phase === "prompt") {
+            stamp = JSON.stringify({ id: "other-tab", reason });
+          }
+          return credentialFixture();
+        }, async () => {
+          await rejects(
+            activateWithPasskey(
+              "alice",
+              "synthetic-input-only",
+              new AbortController().signal,
+            ),
+          );
+          equal(browserSession.authenticationGeneration, generation);
+          equal(stamp === "initial-operation-stamp", false);
+          equal(
+            paths.filter((path) => path.endsWith("/complete")).length,
+            phase === "complete" || phase === "confirmation" ? 1 : 0,
+          );
+          equal(paths.includes("/api/auth/whoami"), phase === "confirmation");
+        });
+      } finally {
+        if (previous) {
+          Object.defineProperty(
+            globalThis,
+            "localStorage",
+            previous,
+          );
+        } else Reflect.deleteProperty(globalThis, "localStorage");
+      }
+    });
+  }
+}

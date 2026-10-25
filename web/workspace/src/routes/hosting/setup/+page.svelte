@@ -17,7 +17,8 @@
   let active = true;
 
   let verifiedGeneration: number | null = null;
-  const isCurrent = (generation: number) => active && generation === browserSession.authenticationGeneration;
+  let verifiedStamp: string | null = null;
+  const isCurrent = (generation: number, stamp: string | null) => active && generation === browserSession.authenticationGeneration && stamp === browserSession.authenticationStamp;
   // 初期Bearerでの鍵追加はcookieを使わない。明示Passkey loginのsessionを検証する。
   function matchesSession(expected: AuthUser): boolean {
     const snapshot = browserSession.snapshot;
@@ -30,9 +31,10 @@
     return browserSession.subscribe(() => {
       // 公開pageにはprivate SessionBoundaryの取消がない。成功表示も確認した世代に限る。
       // 後続の再確認/失効/主体変更では明示loginとaccess確認からやり直す。
-      if (!user || verifiedGeneration !== browserSession.authenticationGeneration || !matchesSession(user)) {
+      if (!user || verifiedGeneration !== browserSession.authenticationGeneration || verifiedStamp !== browserSession.authenticationStamp || !matchesSession(user)) {
         verifiedLogin = false;
         verifiedGeneration = null;
+        verifiedStamp = null;
       }
     });
   });
@@ -63,26 +65,27 @@
     error = '';
     sessionMutation();
     let generation = browserSession.authenticationGeneration;
+    let stamp = browserSession.authenticationStamp;
     const operation = new AbortController();
     loginController = operation;
     let promptGeneration: number | null = generation;
     const unsubscribe = browserSession.subscribe(() => {
-      if (promptGeneration !== null && promptGeneration !== browserSession.authenticationGeneration) operation.abort();
+      if (promptGeneration !== null && !isCurrent(promptGeneration, stamp)) operation.abort();
     });
     try {
       const initial = await loadWhoami(operation.signal);
-      if (!isCurrent(generation)) throw new Error('Login superseded');
+      if (!isCurrent(generation, stamp)) throw new Error('Login superseded');
       observeAuthOperation(operation.signal, {
         expected: initial, phase: () => {}, additionAttempt: () => {},
         verifySession: async () => {
-          if (!isCurrent(generation)) operation.abort();
+          if (!isCurrent(generation, stamp)) operation.abort();
           operation.signal.throwIfAborted();
           const current = await loadWhoami(operation.signal);
-          if (!isCurrent(generation) || initial.actor?.user_id !== current.actor?.user_id || initial.actor?.account_id !== current.actor?.account_id || initial.authentication_reference !== current.authentication_reference) throw new Error('Session changed');
+          if (!isCurrent(generation, stamp) || initial.actor?.user_id !== current.actor?.user_id || initial.actor?.account_id !== current.actor?.account_id || initial.authentication_reference !== current.authentication_reference) throw new Error('Session changed');
         },
       });
       const signedIn = await loginWithPasskey(operation.signal);
-      if (!isCurrent(generation)) throw new Error('Login superseded');
+      if (!isCurrent(generation, stamp)) throw new Error('Login superseded');
       if (signedIn.user.user_id !== expected.user_id || signedIn.user.account_id !== expected.account_id) {
         throw new Error('Unexpected login actor');
       }
@@ -90,21 +93,23 @@
       promptGeneration = null;
       sessionMutation();
       generation = browserSession.authenticationGeneration;
+      stamp = browserSession.authenticationStamp;
       await browserSession.refresh();
-      if (!isCurrent(generation) || !matchesSession(expected) || browserSession.snapshot.kind !== 'ready' || browserSession.snapshot.value.authentication_reference !== signedIn.authentication_reference) throw new Error('Session not verified');
+      if (!isCurrent(generation, stamp) || !matchesSession(expected) || browserSession.snapshot.kind !== 'ready' || browserSession.snapshot.value.authentication_reference !== signedIn.authentication_reference) throw new Error('Session not verified');
       const access = await loadHostingAccess();
-      if (!isCurrent(generation) || !access.is_admin) throw new Error('Access not verified');
+      if (!isCurrent(generation, stamp) || !access.is_admin) throw new Error('Access not verified');
       // accessのawait中にもcookie/actorは変わり得る。success公開前の最終確認を行う。
       await browserSession.refresh();
-      if (!isCurrent(generation) || !matchesSession(expected) || browserSession.snapshot.kind !== 'ready' || browserSession.snapshot.value.authentication_reference !== signedIn.authentication_reference) throw new Error('Session superseded');
+      if (!isCurrent(generation, stamp) || !matchesSession(expected) || browserSession.snapshot.kind !== 'ready' || browserSession.snapshot.value.authentication_reference !== signedIn.authentication_reference) throw new Error('Session superseded');
       verifiedGeneration = generation;
+      verifiedStamp = stamp;
       verifiedLogin = true;
       notifySessionChanged();
     } catch {
       if (active) error = 'Passkey login or hosting administrator access could not be verified. Try signing in again, or ask the host operator to check this account.';
       // 応答不明時の再確認は自身がまだ現世代の時だけ。古いfinallyで新logout/loginを
       // invalidateしたり、その確定結果を再取得のloadingへ戻したりしない。
-      if (isCurrent(generation)) {
+      if (isCurrent(generation, stamp)) {
         sessionMutation();
         await browserSession.refresh();
       }
