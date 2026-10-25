@@ -252,12 +252,30 @@ export class BrowserAuth {
     this.busy = true;
     this.error = "";
     this.status = "Checking the saved addition result…";
+    // 保存の履歴は失敗に戻さないが、過去の照合で再追加を許可しない。
+    this.additionSaved = false;
     const generation = browserSession.authenticationGeneration;
+    const stamp = browserSession.authenticationStamp;
     const controller = new AbortController();
     this.controller = controller;
     this.operationGeneration = generation;
+    const assertCurrent = () => {
+      controller.signal.throwIfAborted();
+      if (
+        this.disposed ||
+        generation !== browserSession.authenticationGeneration ||
+        stamp !== browserSession.authenticationStamp
+      ) {
+        throw new AuthOperationError(
+          "confirmation",
+          "session-changed",
+          "unknown",
+        );
+      }
+    };
     try {
       const before = await loadWhoami(controller.signal);
+      assertCurrent();
       if (
         !before.actor || before.actor.user_id !== attempt.expected_user_id ||
         before.actor.account_id !== attempt.expected_account_id
@@ -269,13 +287,10 @@ export class BrowserAuth {
         );
       }
       const result = await readAdditionResult(attempt, controller.signal);
+      assertCurrent();
       const after = await loadWhoami(controller.signal);
-      controller.signal.throwIfAborted();
-      if (
-        this.disposed ||
-        generation !== browserSession.authenticationGeneration ||
-        !sameSession(before, after)
-      ) {
+      assertCurrent();
+      if (!sameSession(before, after)) {
         throw new AuthOperationError(
           "confirmation",
           "session-changed",

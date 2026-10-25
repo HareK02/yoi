@@ -70,6 +70,156 @@ function harness() {
   owners.push(auth);
   return { state, create, get, fetcher, auth };
 }
+function savedAddition() {
+  return Response.json({
+    status: "saved",
+    user: authUser,
+    key: {
+      key_reference: "safe-opaque-reference",
+      created_at: "2026-01-01T00:00:00Z",
+      last_used_at: null,
+      normal_login_verified_at: null,
+    },
+  });
+}
+async function recoveryHarness() {
+  const context = harness();
+  await context.auth.refresh();
+  context.auth.additionAttempt = {
+    challenge_id: "synthetic-addition",
+    expected_user_id: authUser.user_id,
+    expected_account_id: authUser.account_id,
+    expected_authentication_reference: "original-operation-reference",
+  };
+  return context;
+}
+for (const phase of ["initial-whoami", "receipt", "final-whoami"] as const) {
+  for (const reason of ["logout", "authentication"] as const) {
+    test(`recovery ${phase} rejects a shared ${reason} stamp before event delivery`, async () => {
+      const { auth, fetcher } = await recoveryHarness();
+      const started = gate<void>(), response = gate<Response>();
+      let whoami = 0, receiptReads = 0;
+      fetcher.mockImplementation(async (input, init) => {
+        const path = String(input);
+        if (path === "/api/auth/whoami") {
+          ++whoami;
+          if (phase === (whoami === 1 ? "initial-whoami" : "final-whoami")) {
+            started.resolve();
+            return response.promise;
+          }
+          return identity(authUser);
+        }
+        if (path.endsWith("/addition/result")) {
+          ++receiptReads;
+          expect(
+            JSON.parse(String(init?.body)).expected_authentication_reference,
+          )
+            .toBe("original-operation-reference");
+          if (phase === "receipt") {
+            started.resolve();
+            return response.promise;
+          }
+          return savedAddition();
+        }
+        throw new Error("Unexpected recovery endpoint");
+      });
+      const generation = browserSession.authenticationGeneration;
+      const stamp = browserSession.authenticationStamp;
+      const checking = auth.checkAddition();
+      await started.promise;
+      await auth.checkAddition(); // busy recovery cannot issue a second read
+      const changed = JSON.stringify({
+        id: `recovery-${phase}-${reason}`,
+        reason,
+      });
+      localStorage.setItem("yoi.browser-auth-generation", changed);
+      expect(browserSession.authenticationStamp).not.toBe(stamp);
+      expect(browserSession.authenticationGeneration).toBe(generation);
+      response.resolve(
+        phase === "receipt" ? savedAddition() : identity(authUser),
+      );
+      await checking;
+      expect(auth.additionSaved).toBe(false);
+      expect(auth.additionAttempt?.expected_authentication_reference)
+        .toBe("original-operation-reference");
+      expect(auth.status).not.toContain("current session was checked");
+      expect(auth.error).toContain("does not prove failure");
+      expect(receiptReads).toBe(phase === "initial-whoami" ? 0 : 1);
+      expect(whoami).toBe(phase === "final-whoami" ? 2 : 1);
+      expect(localStorage.getItem("yoi.browser-auth-generation")).toBe(changed);
+      expect(
+        fetcher.mock.calls.some(([path]) => String(path).endsWith("/complete")),
+      )
+        .toBe(false);
+    });
+  }
+}
+for (const phase of ["receipt", "final-whoami"] as const) {
+  for (const invalidation of ["cancel", "dispose", "generation"] as const) {
+    test(`recovery ${phase} ignores a delayed saved response after ${invalidation}`, async () => {
+      const { auth, fetcher } = await recoveryHarness();
+      const started = gate<void>(), response = gate<Response>();
+      let whoami = 0;
+      fetcher.mockImplementation(async (input) => {
+        const path = String(input);
+        if (path === "/api/auth/whoami") {
+          if (++whoami === 2 && phase === "final-whoami") {
+            started.resolve();
+            return response.promise;
+          }
+          return identity(authUser);
+        }
+        if (path.endsWith("/addition/result")) {
+          if (phase === "receipt") {
+            started.resolve();
+            return response.promise;
+          }
+          return savedAddition();
+        }
+        throw new Error("Unexpected recovery endpoint");
+      });
+      const checking = auth.checkAddition();
+      await started.promise;
+      if (invalidation === "cancel") auth.cancel();
+      else if (invalidation === "dispose") auth.dispose();
+      else sessionMutation();
+      response.resolve(
+        phase === "receipt" ? savedAddition() : identity(authUser),
+      );
+      await checking;
+      expect(auth.additionSaved).toBe(false);
+      expect(auth.additionAttempt).not.toBeNull();
+      expect(auth.status).not.toContain("current session was checked");
+      expect(whoami).toBe(phase === "receipt" ? 1 : 2);
+      expect(
+        fetcher.mock.calls.some(([path]) => String(path).endsWith("/complete")),
+      )
+        .toBe(false);
+    });
+  }
+}
+test("failed recheck cannot retain repeat-add permission from an older saved confirmation", async () => {
+  const { auth, fetcher } = await recoveryHarness();
+  auth.additionSaved = true;
+  fetcher.mockResolvedValue(identity(null));
+  await auth.checkAddition();
+  expect(auth.additionSaved).toBe(false);
+  expect(auth.additionAttempt).not.toBeNull();
+  expect(auth.error).toContain("does not prove failure");
+});
+test("unknown receipt retains the unresolved attempt and never permits blind repetition", async () => {
+  const { auth, fetcher } = await recoveryHarness();
+  fetcher.mockImplementation(async (input) =>
+    String(input).endsWith("/addition/result")
+      ? Response.json({ status: "unknown" })
+      : identity(authUser)
+  );
+  await auth.checkAddition();
+  expect(auth.additionSaved).toBe(false);
+  expect(auth.additionAttempt).not.toBeNull();
+  expect(auth.status).toContain("still unknown");
+  expect(auth.error).toBe("");
+});
 for (const outcome of ["anonymous", "other-actor", "unavailable"] as const) {
   test(`addition response is not Added when confirming whoami is ${outcome}`, async () => {
     const { auth, state, fetcher } = harness();

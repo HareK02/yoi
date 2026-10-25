@@ -158,6 +158,143 @@ async function submit(name: string) {
   await fireEvent.submit(screen.getByRole("button", { name }).closest("form")!);
 }
 
+for (const phase of ["initial-whoami", "list", "final-whoami"] as const) {
+  for (const reason of ["logout", "authentication"] as const) {
+    test(`registered-key ${phase} confirmation rejects shared ${reason} before event delivery`, async () => {
+      const { fetcher } = boundary({ authenticated: true });
+      render(Account);
+      await screen.findByText(
+        "No registered keys were returned for this account.",
+      );
+      const request = fetcher.getMockImplementation()!;
+      const started = gate<void>(), response = gate<Response>();
+      let whoami = 0, listReads = 0;
+      const metadata = () =>
+        Response.json({
+          user: authUser,
+          keys: [{
+            key_reference: "delayed-key-metadata",
+            created_at: "2026-01-01T00:00:00Z",
+            last_used_at: null,
+            normal_login_verified_at: null,
+          }],
+        });
+      fetcher.mockImplementation(async (input, init) => {
+        const path = String(input);
+        if (path === "/api/auth/whoami") {
+          ++whoami;
+          if (phase === (whoami === 1 ? "initial-whoami" : "final-whoami")) {
+            started.resolve();
+            return response.promise;
+          }
+        }
+        if (path === "/api/auth/passkeys") {
+          ++listReads;
+          if (phase === "list") {
+            started.resolve();
+            return response.promise;
+          }
+          return metadata();
+        }
+        return request(input, init);
+      });
+      const generation = browserSession.authenticationGeneration;
+      const stamp = browserSession.authenticationStamp;
+      await fireEvent.click(
+        screen.getByRole("button", { name: "Refresh registered keys" }),
+      );
+      await started.promise;
+      const changed = JSON.stringify({ id: `keys-${phase}-${reason}`, reason });
+      localStorage.setItem("yoi.browser-auth-generation", changed);
+      expect(browserSession.authenticationStamp).not.toBe(stamp);
+      expect(browserSession.authenticationGeneration).toBe(generation);
+      response.resolve(
+        phase === "list" ? metadata() : await request("/api/auth/whoami"),
+      );
+      await screen.findByText(/Registered keys could not be confirmed/);
+      expect(screen.queryByText("delayed-key-metadata")).toBeNull();
+      expect(listReads).toBe(phase === "initial-whoami" ? 0 : 1);
+      expect(whoami).toBe(phase === "final-whoami" ? 2 : 1);
+      expect(localStorage.getItem("yoi.browser-auth-generation")).toBe(changed);
+      expect(posted(fetcher)).toEqual([]);
+    });
+  }
+}
+
+for (const reason of ["logout", "authentication"] as const) {
+  test(`stale receipt confirmation after shared ${reason} leaves visible repeat-add disabled`, async () => {
+    const { fetcher } = boundary({ authenticated: true });
+    render(Account);
+    await screen.findByText(
+      "No registered keys were returned for this account.",
+    );
+    const request = fetcher.getMockImplementation()!;
+    const started = gate<void>(), response = gate<Response>();
+    let receiptRead = false;
+    fetcher.mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path.endsWith("/addition/complete")) {
+        throw new TypeError("lost response");
+      }
+      if (path.endsWith("/addition/result")) {
+        receiptRead = true;
+        expect(JSON.parse(String(init?.body)).expected_authentication_reference)
+          .toBe("fixture-authentication");
+        return Response.json({
+          status: "saved",
+          user: authUser,
+          key: {
+            key_reference: "saved-but-session-unconfirmed",
+            created_at: "2026-01-01T00:00:00Z",
+            last_used_at: null,
+            normal_login_verified_at: null,
+          },
+        });
+      }
+      if (path === "/api/auth/whoami" && receiptRead) {
+        receiptRead = false;
+        started.resolve();
+        return response.promise;
+      }
+      return request(input, init);
+    });
+    const add = screen.getByRole("button", {
+      name: /Add passkey to/,
+    }) as HTMLButtonElement;
+    await fireEvent.click(add);
+    await screen.findByText(/result is unknown/);
+    await waitFor(() =>
+      expect(screen.queryByText("Checking registered keys…")).toBeNull()
+    );
+    expect(add.disabled).toBe(true);
+    const checking = screen.getByRole("button", {
+      name: "Check addition result",
+    });
+    await waitFor(() =>
+      expect((checking as HTMLButtonElement).disabled).toBe(false)
+    );
+    await fireEvent.click(checking);
+    await started.promise;
+    const generation = browserSession.authenticationGeneration;
+    localStorage.setItem(
+      "yoi.browser-auth-generation",
+      JSON.stringify({ id: `visible-${reason}`, reason }),
+    );
+    expect(browserSession.authenticationGeneration).toBe(generation);
+    response.resolve(await request("/api/auth/whoami"));
+    await screen.findByText(/The addition result could not be read/);
+    await waitFor(() =>
+      expect((checking as HTMLButtonElement).disabled).toBe(false)
+    );
+    expect(screen.queryByText(/Your current session was checked/)).toBeNull();
+    expect(add.disabled).toBe(true);
+    await fireEvent.click(add);
+    expect(
+      posted(fetcher).filter(({ path }) => path.endsWith("/addition/complete")),
+    ).toHaveLength(1);
+  });
+}
+
 test("normal login needs no account ID and links separate registration and code activation", async () => {
   const { fetcher } = boundary({ policy: true });
   page.url = new URL("https://example.test/login?returnTo=%2Faccount");

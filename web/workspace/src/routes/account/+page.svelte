@@ -4,6 +4,7 @@
   import type { PasskeyListResponse } from '#lib/generated/auth-api.ts';
   import { addPasskey, logout, loadPasskeys, loadWhoami } from '#lib/workspace/auth/api.ts';
   import { BrowserAuth } from '#lib/workspace/auth/browser-session.svelte.ts';
+  import { browserSession } from '#lib/workspace/auth/session-state.ts';
   import { loginUrl } from '#lib/workspace/auth/routes.ts';
   import '#lib/workspace/auth/auth-page.css';
 
@@ -22,18 +23,21 @@
     const controller = new AbortController();
     keyController = controller;
     const read = ++keyRead;
+    const generation = browserSession.authenticationGeneration;
+    const stamp = browserSession.authenticationStamp;
+    const assertCurrent = () => {
+      controller.signal.throwIfAborted();
+      if (!active || read !== keyRead || generation !== browserSession.authenticationGeneration || stamp !== browserSession.authenticationStamp) throw new Error('Session changed');
+    };
     keysLoading = true; keysError = '';
     try {
       const before = await loadWhoami(controller.signal);
-      controller.signal.throwIfAborted();
-      if (!active || read !== keyRead) return;
+      assertCurrent();
       if (before.actor?.user_id !== actor.user_id || before.actor.account_id !== actor.account_id) throw new Error('Account changed');
       const result = await loadPasskeys(controller.signal);
-      controller.signal.throwIfAborted();
-      if (!active || read !== keyRead) return;
+      assertCurrent();
       const after = await loadWhoami(controller.signal);
-      controller.signal.throwIfAborted();
-      if (read !== keyRead) return;
+      assertCurrent();
       if (result.user.user_id !== actor.user_id || result.user.account_id !== actor.account_id ||
           after.actor?.user_id !== actor.user_id || after.actor.account_id !== actor.account_id ||
           before.authentication_reference !== after.authentication_reference) throw new Error('Session changed');
