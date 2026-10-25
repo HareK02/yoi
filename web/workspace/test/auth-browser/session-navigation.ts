@@ -431,7 +431,7 @@ export async function sessionNavigation(
     },
   );
   await step(
-    "challenge 401 leaves an authenticated account in place and permits retry",
+    "challenge 401 leaves an authenticated account in place but requires result recovery before another addition",
     async ({ page, go }) => {
       const target = "/account?tab=keys#challenge";
       await go(target, "addition-expired");
@@ -451,7 +451,21 @@ export async function sessionNavigation(
           name: "Add passkey to alice",
           exact: true,
         }).isEnabled(),
-        true,
+        false,
+      );
+      await page.getByRole("button", {
+        name: "Check addition result",
+        exact: true,
+      }).click();
+      await page.getByRole("status").filter({
+        hasText: "addition result is still unknown",
+      }).waitFor();
+      assertEquals(
+        await page.getByRole("button", {
+          name: "Add passkey to alice",
+          exact: true,
+        }).isEnabled(),
+        false,
       );
     },
   );
@@ -464,7 +478,11 @@ export async function sessionNavigation(
       await at(page, "/");
       const wire = await (await page.request.get(`${origin}/api/auth/whoami`))
         .json();
-      assertEquals(wire, { actor: null, session: { kind: "anonymous" } });
+      assertEquals(wire, {
+        actor: null,
+        authentication_reference: null,
+        session: { kind: "anonymous" },
+      });
       await page.evaluate(() => {
         localStorage.clear();
         sessionStorage.clear();

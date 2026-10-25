@@ -298,12 +298,17 @@
       "AuthUserResponse": {
         "additionalProperties": false,
         "properties": {
+          "authentication_reference": {
+            "description": "Comparison evidence for the exact newly issued session, not a credential.",
+            "type": "string"
+          },
           "user": {
             "$ref": "#/components/schemas/AuthenticatedUser"
           }
         },
         "required": [
-          "user"
+          "user",
+          "authentication_reference"
         ],
         "type": "object"
       },
@@ -6709,15 +6714,112 @@
       },
       "PasskeyAdditionOptionsRequest": {
         "additionalProperties": false,
-        "description": "Adds a credential to the current authenticated actor; target identity is never public input.",
+        "description": "Adds to the current actor. Expected identity/binding fields only fence stale UI;\nthey never select an owner or authorize an addition.",
         "properties": {
           "browser_origin": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "expected_account_id": {
+            "type": "string"
+          },
+          "expected_authentication_reference": {
+            "type": "string"
+          },
+          "expected_user_id": {
+            "type": "string"
           }
         },
+        "required": [
+          "expected_user_id",
+          "expected_account_id",
+          "expected_authentication_reference"
+        ],
+        "type": "object"
+      },
+      "PasskeyAdditionResultRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "expected_account_id": {
+            "type": "string"
+          },
+          "expected_authentication_reference": {
+            "description": "Original options authentication reference; the current same-owner session may differ.",
+            "type": "string"
+          },
+          "expected_user_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "challenge_id",
+          "expected_user_id",
+          "expected_account_id",
+          "expected_authentication_reference"
+        ],
+        "type": "object"
+      },
+      "PasskeyAdditionResultResponse": {
+        "description": "Unknown is not proof that registration failed: completion may still be in flight.\nSaved proves the credential commit, not session issuance or current session health.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "status": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "key": {
+                "$ref": "#/components/schemas/PasskeySummary"
+              },
+              "status": {
+                "const": "saved",
+                "type": "string"
+              },
+              "user": {
+                "$ref": "#/components/schemas/AuthenticatedUser"
+              }
+            },
+            "required": [
+              "status",
+              "user",
+              "key"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PasskeyListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "keys": {
+            "items": {
+              "$ref": "#/components/schemas/PasskeySummary"
+            },
+            "type": "array"
+          },
+          "user": {
+            "$ref": "#/components/schemas/AuthenticatedUser"
+          }
+        },
+        "required": [
+          "user",
+          "keys"
+        ],
         "type": "object"
       },
       "PasskeyLoginCompleteRequest": {
@@ -6817,6 +6919,35 @@
         "required": [
           "challenge_id",
           "public_key"
+        ],
+        "type": "object"
+      },
+      "PasskeySummary": {
+        "additionalProperties": false,
+        "description": "Safe account metadata. Neither the WebAuthn credential ID nor key material is exposed.\nNormal-login verification is observed verifier success, not inferred discoverability.",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "key_reference": {
+            "type": "string"
+          },
+          "last_used_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "normal_login_verified_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "key_reference",
+          "created_at"
         ],
         "type": "object"
       },
@@ -15143,6 +15274,13 @@
               }
             ]
           },
+          "authentication_reference": {
+            "description": "Non-secret comparison evidence, never an authentication credential.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "session": {
             "$ref": "#/components/schemas/BrowserSessionState"
           }
@@ -18155,7 +18293,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:5de3f3b716555717d3274b8c6a385fb66624585941628a53b8b3050cb58f8ab7"
+    "x-yoi-source-digest": "sha256:3e33a924668d7f7c07611d45b2fda7f1115c66431b741c94e1ff4e8e3e559b23"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -18589,6 +18727,61 @@
         }
       }
     },
+    "/api/auth/passkeys": {
+      "get": {
+        "operationId": "auth_passkey_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyListResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
     "/api/auth/passkeys/addition/complete": {
       "post": {
         "operationId": "auth_passkey_addition_complete",
@@ -18716,6 +18909,71 @@
             "description": "Error response"
           },
           "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/auth/passkeys/addition/result": {
+      "post": {
+        "operationId": "auth_passkey_addition_result",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyAdditionResultRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PasskeyAdditionResultResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
             "content": {
               "application/json": {
                 "schema": {

@@ -27,6 +27,7 @@ Deno.test("authentication and hosting shells never require Workspace catalog aut
           display_name: "Alice",
           auth_method: "browser_session",
         },
+        authentication_reference: "fixture-authentication",
         session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
       });
     browserSession.invalidate();
@@ -68,7 +69,11 @@ Deno.test("root admission never starts private catalog while anonymous, expired,
         if (condition === "loading") await pending;
         return condition === "error" || condition === "loading"
           ? new Response(null, { status: 503 })
-          : Response.json({ actor: null, session: { kind: condition } });
+          : Response.json({
+            actor: null,
+            authentication_reference: null,
+            session: { kind: condition },
+          });
       };
       let privateCalls = 0;
       const event = {

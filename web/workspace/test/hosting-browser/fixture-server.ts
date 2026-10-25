@@ -19,7 +19,7 @@ const mime: Record<string, string> = {
 };
 const policies = new Map<string, boolean>();
 // 各fixture processはscenarioを逐次実行する。setupのBearer-only要求はcookieを
-// 送らないので、秘密やheadersを読まず直前の合成page条件で応答を選ぶ。
+// 送らないので、Bearer有無と直前の合成page条件で応答を選ぶ。header値は読まない。
 let setupMode: string | null = null;
 Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
   const url = new URL(request.url);
@@ -28,19 +28,27 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
   if (url.pathname === "/hosting/setup" && selected?.startsWith("setup-")) {
     setupMode = selected;
   }
+  const tokenRequest = request.headers.has("authorization");
   const mode = selected ??
+    (tokenRequest ? setupMode : null) ??
     request.headers.get("cookie")?.match(/ui-fixture=([\w-]+)/)?.[1] ??
     (url.pathname.startsWith("/api/auth/passkeys/addition/")
       ? setupMode
       : null) ??
     "admin-on";
   if (selected) policies.delete(mode);
-  const setup = setupProjectionResponse(url.pathname, mode, selected !== null);
+  const setup = setupProjectionResponse(
+    url.pathname,
+    mode,
+    selected !== null,
+    tokenRequest,
+  );
   if (setup) return setup;
   const anonymous = mode.startsWith("anonymous") || mode.startsWith("account-");
   const ordinary = mode.startsWith("ordinary");
   if (url.pathname === "/api/auth/whoami") {
     return Response.json({
+      authentication_reference: anonymous ? null : "fixture-authentication",
       session: !anonymous
         ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
         : { kind: "anonymous" },
@@ -51,6 +59,17 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
         display_name: "Alice",
         auth_method: "browser_session",
       },
+    });
+  }
+  if (url.pathname === "/api/auth/passkeys") {
+    return Response.json({
+      user: {
+        user_id: "fixture-user",
+        account_id: "fixture-account",
+        handle: "alice",
+        display_name: "Alice",
+      },
+      keys: [],
     });
   }
   if (url.pathname === "/api/workspaces") return Response.json([]);

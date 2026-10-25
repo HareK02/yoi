@@ -168,35 +168,62 @@ for (const purpose of ["registration", "addition"] as const) {
     await withBrowserBoundary(async (input, init) => {
       requests.push({ path: String(input), init: init! });
       return Response.json(
-        requests.length === 1 ? registrationOptions : { user: authUser },
+        String(input) === "/api/auth/whoami"
+          ? {
+            actor: { ...authUser, auth_method: "browser_session" },
+            authentication_reference: "fixture-authentication",
+            session: {
+              kind: "authenticated",
+              expires_at: "2099-01-01T00:00:00Z",
+            },
+          }
+          : String(input).endsWith("/options")
+          ? registrationOptions
+          : {
+            user: authUser,
+            authentication_reference: "fixture-authentication",
+          },
       );
     }, async (calls) => {
       const user = purpose === "registration"
         ? await registerPasskey("alice", "Alice")
         : await addPasskey();
-      assertEquals(user, authUser);
+      assertEquals(user, {
+        user: authUser,
+        authentication_reference: "fixture-authentication",
+      });
       assertEquals(calls, { create: 1, get: 0 });
     });
     assertEquals(requests.map(({ path }) => path), [
+      ...(purpose === "addition" ? ["/api/auth/whoami"] : []),
       `/api/auth/passkeys/${purpose}/options`,
       `/api/auth/passkeys/${purpose}/complete`,
     ]);
-    for (const { init } of requests) {
-      assertEquals(init.method, "POST");
+    for (const { path, init } of requests) {
+      assertEquals(
+        init.method ?? "GET",
+        path.endsWith("/whoami") ? "GET" : "POST",
+      );
       assertEquals(init.credentials, "same-origin");
       assertEquals(init.headers, { "content-type": "application/json" });
     }
+    const ceremony = requests.filter(({ path }) => !path.endsWith("/whoami"));
     assertEquals(
-      JSON.parse(String(requests[0].init.body)),
+      JSON.parse(String(ceremony[0].init.body)),
       purpose === "registration"
         ? {
           handle: "alice",
           display_name: "Alice",
           browser_origin: "https://yoi.example",
         }
-        : { browser_origin: "https://yoi.example" },
+        : {
+          expected_user_id: authUser.user_id,
+          expected_account_id: authUser.account_id,
+          expected_authentication_reference: "fixture-authentication",
+          browser_origin: "https://yoi.example",
+        },
     );
-    const complete = JSON.parse(String(requests[1].init.body));
+    const complete = JSON.parse(String(ceremony[1].init.body));
     assertEquals(Object.keys(complete).sort(), ["challenge_id", "credential"]);
     assertEquals(complete.challenge_id, registrationOptions.challenge_id);
     assertEquals(complete.credential.response.attestationObject, "AQID");
@@ -208,13 +235,21 @@ Deno.test("addition rejects expired-session completion without falling back to r
   const paths: string[] = [];
   await withBrowserBoundary(async (input) => {
     paths.push(String(input));
-    return paths.length === 1
+    if (String(input).endsWith("/whoami")) {
+      return Response.json({
+        actor: { ...authUser, auth_method: "browser_session" },
+        authentication_reference: "fixture-authentication",
+        session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+      });
+    }
+    return String(input).endsWith("/options")
       ? Response.json(registrationOptions)
       : new Response(null, { status: 401 });
   }, async () => {
-    await assertRejects(addPasskey(), "Auth request failed (401).");
+    await assertRejects(addPasskey(), "Passkey complete: rejected (rejected).");
   });
   assertEquals(paths, [
+    "/api/auth/whoami",
     "/api/auth/passkeys/addition/options",
     "/api/auth/passkeys/addition/complete",
   ]);
@@ -226,7 +261,10 @@ Deno.test("existing-handle registration rejection never starts WebAuthn or retri
     paths.push(String(input));
     return new Response(null, { status: 409 });
   }, async (calls) => {
-    await assertRejects(registerPasskey("alice"), "Auth request failed (409).");
+    await assertRejects(
+      registerPasskey("alice"),
+      "Passkey options: rejected (not-sent).",
+    );
     assertEquals(calls, { create: 0, get: 0 });
   });
   assertEquals(paths, ["/api/auth/passkeys/registration/options"]);
@@ -251,10 +289,16 @@ Deno.test("login sends the explicit trimmed handle and serializes the assertion"
   await withBrowserBoundary(async (input, init) => {
     requests.push({ path: String(input), init: init! });
     return Response.json(
-      requests.length === 1 ? loginOptions : { user: authUser },
+      requests.length === 1 ? loginOptions : {
+        user: authUser,
+        authentication_reference: "fixture-authentication",
+      },
     );
   }, async (calls) => {
-    assertEquals(await loginWithLegacyPasskey(" alice "), authUser);
+    assertEquals(await loginWithLegacyPasskey(" alice "), {
+      user: authUser,
+      authentication_reference: "fixture-authentication",
+    });
     assertEquals(calls, { create: 0, get: 1 });
   });
   assertEquals(requests.map(({ path }) => path), [

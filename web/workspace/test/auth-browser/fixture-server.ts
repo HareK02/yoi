@@ -158,9 +158,17 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
       return new Response(null, { status: 503 });
     }
     if (mode === "session-malformed") {
-      return Response.json({ actor: { handle: "untrusted" } });
+      return Response.json({
+        authentication_reference: state.signedIn
+          ? "fixture-authentication"
+          : null,
+        actor: { handle: "untrusted" },
+      });
     }
     return Response.json({
+      authentication_reference: state.signedIn
+        ? "fixture-authentication"
+        : null,
       actor: state.signedIn
         ? { ...user, auth_method: "browser_session" }
         : null,
@@ -168,10 +176,24 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
         ? {
           kind: "authenticated",
           expires_at: state.expiresAt ??
-            new Date(Date.now() + 86_400_000).toISOString(),
+            "2099-01-01T00:00:00Z",
         }
         : { kind: state.expired ? "expired" : "anonymous" },
     });
+  }
+  if (path === "/api/auth/passkeys") {
+    return Response.json({
+      user,
+      keys: [{
+        key_reference: "synthetic-safe-key-reference",
+        created_at: "2026-01-01T00:00:00Z",
+        last_used_at: null,
+        normal_login_verified_at: null,
+      }],
+    });
+  }
+  if (path === "/api/auth/passkeys/addition/result") {
+    return Response.json({ status: "unknown" });
   }
   if (path === "/api/auth/registration-policy") {
     if (mode === "policy-loading") return await new Promise<Response>(() => {});
@@ -227,7 +249,11 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
   }
   if (path === "/api/auth/device-login/approve") {
     if (!state.signedIn) return new Response(null, { status: 401 });
-    if (mode === "device-expired") return new Response(null, { status: 410 });
+    if (mode === "device-expired") {
+      return Response.json({
+        message: "expired_device_login: device login code expired",
+      }, { status: 400 });
+    }
     return Response.json({ status: "approved", user });
   }
   const passkey = path.match(
@@ -263,7 +289,10 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
     state.expired = false;
     state.cookieSession = false;
     state.expiresAt = null;
-    return Response.json({ user });
+    return Response.json({
+      user,
+      authentication_reference: "fixture-authentication",
+    });
   }
   if (path === "/api/auth/activation/options") {
     return Response.json(options(false));
@@ -273,7 +302,10 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
     state.expired = false;
     state.cookieSession = false;
     state.expiresAt = null;
-    return Response.json({ user });
+    return Response.json({
+      user,
+      authentication_reference: "fixture-authentication",
+    });
   }
   // Workspace画面の既存fixtureを再利用する。認証/登録/作成APIの代わりにはしない。
   if (workspaceFixture && path.startsWith("/api/w/")) {

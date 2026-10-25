@@ -35,6 +35,7 @@ function session() {
 
 function whoami(authenticated: boolean) {
   return Response.json({
+    authentication_reference: authenticated ? "fixture-authentication" : null,
     session: authenticated
       ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
       : { kind: "anonymous" },
@@ -75,7 +76,10 @@ function boundary(authenticated = false) {
         return new Response(null, { status: state.completeStatus });
       }
       state.authenticated = true;
-      return Response.json({ user: authUser });
+      return Response.json({
+        user: authUser,
+        authentication_reference: "fixture-authentication",
+      });
     }
     throw new Error(`Unexpected API: ${path}`);
   });
@@ -106,6 +110,7 @@ test("loading and failed whoami are not anonymous readiness and cannot start aut
   expect(auth.session).toEqual({
     kind: "ready",
     actor: null,
+    authentication_reference: null,
     session: { kind: "anonymous" },
   });
 });
@@ -162,6 +167,7 @@ test("a delayed pre-logout whoami cannot resurrect the previous actor", async ()
   expect(auth.session).toEqual({
     kind: "ready",
     actor: null,
+    authentication_reference: null,
     session: { kind: "anonymous" },
   });
   oldResponse.resolve(whoami(true));
@@ -169,6 +175,7 @@ test("a delayed pre-logout whoami cannot resurrect the previous actor", async ()
   expect(auth.session).toEqual({
     kind: "ready",
     actor: null,
+    authentication_reference: null,
     session: { kind: "anonymous" },
   });
   expect(auth.status).toBe("Logged out");
@@ -183,26 +190,34 @@ test("busy login rejects duplicate operations and refresh until its post-complet
   const confirmingStarted = gate<void>();
   const request = fetcher.getMockImplementation()!;
   fetcher.mockImplementation((input, init) => {
-    if (String(input) === "/api/auth/whoami") {
+    if (String(input) === "/api/auth/passkeys/login/options") {
+      return options.promise;
+    }
+    if (
+      String(input) === "/api/auth/whoami" &&
+      paths(fetcher).includes("/api/auth/passkeys/login/complete")
+    ) {
       confirmingStarted.resolve();
       return confirming.promise;
     }
     return request(input, init);
   });
-  fetcher.mockReturnValueOnce(options.promise);
   const run = auth.run(
     "Waiting",
     "Logged in",
     (signal) => loginWithPasskey(signal),
   );
   expect(auth.busy).toBe(true);
-  expect(auth.status).toBe("Waiting");
+  expect(auth.status).toMatch(/Checking the account/);
   const duplicate = vi.fn(async () => {});
   expect(await auth.run("duplicate", "incorrect", duplicate)).toBe(false);
   await auth.refresh();
   expect(duplicate).not.toHaveBeenCalled();
-  expect(paths(fetcher)).toEqual([
-    "/api/auth/whoami",
+  // Preflight is asynchronous; wait for the options stage, not an HTTP ordinal.
+  await vi.waitFor(() =>
+    expect(paths(fetcher)).toContain("/api/auth/passkeys/login/options")
+  );
+  expect(paths(fetcher).filter((path) => path !== "/api/auth/whoami")).toEqual([
     "/api/auth/passkeys/login/options",
   ]);
   options.resolve(Response.json(loginOptions));
@@ -212,7 +227,7 @@ test("busy login rejects duplicate operations and refresh until its post-complet
   expect(await auth.run("duplicate", "incorrect", duplicate)).toBe(false);
   await auth.refresh();
   expect(paths(fetcher).filter((path) => path === "/api/auth/whoami"))
-    .toHaveLength(2);
+    .toHaveLength(4);
   confirming.resolve(whoami(true));
   expect(await run).toBe(true);
   expect(auth.busy).toBe(false);
@@ -220,7 +235,9 @@ test("busy login rejects duplicate operations and refresh until its post-complet
   expect(auth.status).toBe("Logged in");
   expect(paths(fetcher)).toEqual([
     "/api/auth/whoami",
+    "/api/auth/whoami",
     "/api/auth/passkeys/login/options",
+    "/api/auth/whoami",
     "/api/auth/passkeys/login/complete",
     "/api/auth/whoami",
   ]);
@@ -236,16 +253,16 @@ for (const status of [400, 401, 410]) {
     expect(result).toBe(false);
     expect(auth.busy).toBe(false);
     expect(auth.status).toBe("");
-    expect(auth.error).toMatch(
-      status === 401
-        ? /Authentication request was rejected/
-        : /The request or authentication challenge is invalid or expired/,
-    );
+    expect(auth.error).toMatch(/server rejected the request or verification/);
+    expect(auth.error).toContain(`[complete/rejected/HTTP-${status}]`);
+    expect(auth.error).toContain("server did not accept completion");
     expect(auth.session.kind).toBe("ready");
     expect(auth.actor?.handle ?? null).toBe(status === 401 ? null : "alice");
     expect(paths(fetcher)).toEqual([
       "/api/auth/whoami",
+      "/api/auth/whoami",
       "/api/auth/passkeys/addition/options",
+      "/api/auth/whoami",
       "/api/auth/passkeys/addition/complete",
       "/api/auth/whoami",
     ]);
@@ -278,22 +295,25 @@ for (
     ).toBe(false);
     expect(auth.error).toMatch(
       name === "NotAllowedError"
-        ? /cancelled or timed out/
+        ? /cancelled, timed out, or found no usable key/
         : name === "NotSupportedError"
-        ? /Completion is not confirmed/
+        ? /supported device/
         : name === "AbortError"
-        ? /Completion is not confirmed/
-        : /Authentication could not be confirmed/,
+        ? /Operation stopped/
+        : /Communication could not be confirmed/,
     );
+    expect(auth.error).toContain("Completion was not sent.");
     expect(auth.error).not.toContain("secret credential detail");
     expect(auth.status).toBe("");
     expect(auth.busy).toBe(false);
     expect(auth.session).toEqual({
       kind: "ready",
       actor: null,
+      authentication_reference: null,
       session: { kind: "anonymous" },
     });
     expect(paths(fetcher)).toEqual([
+      "/api/auth/whoami",
       "/api/auth/whoami",
       "/api/auth/passkeys/login/options",
       "/api/auth/whoami",
@@ -314,14 +334,21 @@ test("completion does not confirm authentication when the subsequent whoami fail
   const { fetcher } = boundary();
   const auth = session();
   await auth.refresh();
+  let completed = false;
   fetcher.mockImplementation(async (input) => {
     const path = String(input);
-    if (path === "/api/auth/whoami") return new Response(null, { status: 503 });
+    if (path === "/api/auth/whoami") {
+      return completed ? new Response(null, { status: 503 }) : whoami(false);
+    }
     if (path === "/api/auth/passkeys/login/options") {
       return Response.json(loginOptions);
     }
     if (path === "/api/auth/passkeys/login/complete") {
-      return Response.json({ user: authUser });
+      completed = true;
+      return Response.json({
+        user: authUser,
+        authentication_reference: "fixture-authentication",
+      });
     }
     throw new Error(`Unexpected API: ${path}`);
   });
@@ -385,14 +412,15 @@ test("dispose aborts WebAuthn without accepting late credentials, while shared s
   expect(auth.session).toEqual({
     kind: "ready",
     actor: null,
+    authentication_reference: null,
     session: { kind: "anonymous" },
   });
   expect(auth.status).toBe("Waiting");
   expect(auth.error).toBe("");
   expect(paths(fetcher)).toEqual([
     "/api/auth/whoami",
-    "/api/auth/passkeys/login/options",
     "/api/auth/whoami",
+    "/api/auth/passkeys/login/options",
   ]);
   expect(
     dispatch.mock.calls.filter(([event]) =>
@@ -409,6 +437,7 @@ test("dispose ignores a completion response even when the HTTP boundary does not
   const started = gate<AbortSignal>();
   fetcher.mockImplementation(async (input, init) => {
     const path = String(input);
+    if (path === "/api/auth/whoami") return whoami(false);
     if (path === "/api/auth/passkeys/login/options") {
       return Response.json(loginOptions);
     }
@@ -427,16 +456,22 @@ test("dispose ignores a completion response even when the HTTP boundary does not
   const signal = await started.promise;
   auth.dispose();
   expect(signal.aborted).toBe(true);
-  response.resolve(Response.json({ user: authUser }));
+  response.resolve(
+    Response.json({
+      user: authUser,
+      authentication_reference: "fixture-authentication",
+    }),
+  );
   expect(await run).toBe(false);
   expect(auth.actor).toBeNull();
-  expect(auth.status).toBe("Waiting");
+  expect(auth.status).toBe("Confirming the operation with the server…");
   expect(auth.error).toBe("");
   expect(paths(fetcher)).toEqual([
     "/api/auth/whoami",
-    "/api/auth/passkeys/login/options",
-    "/api/auth/passkeys/login/complete",
     "/api/auth/whoami",
+    "/api/auth/passkeys/login/options",
+    "/api/auth/whoami",
+    "/api/auth/passkeys/login/complete",
   ]);
   expect(
     dispatch.mock.calls.filter(([event]) =>
@@ -451,15 +486,21 @@ test("dispose during the post-operation whoami prevents its late actor from beco
   await auth.refresh();
   const response = gate<Response>();
   const started = gate<void>();
+  let completed = false;
   fetcher.mockImplementation(async (input) => {
     const path = String(input);
     if (path === "/api/auth/passkeys/login/options") {
       return Response.json(loginOptions);
     }
     if (path === "/api/auth/passkeys/login/complete") {
-      return Response.json({ user: authUser });
+      completed = true;
+      return Response.json({
+        user: authUser,
+        authentication_reference: "fixture-authentication",
+      });
     }
     if (path === "/api/auth/whoami") {
+      if (!completed) return whoami(false);
       started.resolve();
       return await response.promise;
     }
@@ -489,7 +530,10 @@ for (const newer of ["logout", "another-actor"] as const) {
     const started = gate<void>();
     const request = fetcher.getMockImplementation()!;
     fetcher.mockImplementation((input, init) => {
-      if (String(input) === "/api/auth/whoami") {
+      if (
+        String(input) === "/api/auth/whoami" &&
+        paths(fetcher).includes("/api/auth/passkeys/login/complete")
+      ) {
         started.resolve();
         return confirming.promise;
       }
@@ -509,6 +553,7 @@ for (const newer of ["logout", "another-actor"] as const) {
       sessionMutation(newer === "logout" ? "logout" : "authentication");
       fetcher.mockResolvedValueOnce(
         newer === "logout" ? whoami(false) : Response.json({
+          authentication_reference: "other-authentication",
           actor: {
             ...authUser,
             user_id: "other-user",
@@ -552,7 +597,8 @@ for (const purpose of ["login", "addition"] as const) {
           purpose === "login" ? loginWithPasskey(signal) : addPasskey(signal),
       ),
     ).toBe(false);
-    expect(auth.error).toMatch(/cancelled or timed out/);
+    expect(auth.error).toMatch(/cancelled, timed out, or found no usable key/);
+    expect(auth.error).toContain("Completion was not sent.");
     expect(paths(fetcher).some((path) => path.endsWith("/complete"))).toBe(
       false,
     );

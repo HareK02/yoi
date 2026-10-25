@@ -19,6 +19,7 @@ export function setupProjectionResponse(
   path: string,
   mode: string,
   reset: boolean,
+  tokenRequest = false,
 ): Response | null {
   if (!mode.startsWith("setup-")) return null;
   if (reset) stages.delete(mode);
@@ -28,7 +29,17 @@ export function setupProjectionResponse(
     });
   }
   if (path === "/api/auth/whoami") {
+    if (tokenRequest) {
+      return Response.json({
+        actor: { ...user, auth_method: "api_token" },
+        authentication_reference: "fixture-token-binding",
+        session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+      });
+    }
     return Response.json({
+      authentication_reference: stages.get(mode) === "login"
+        ? "fixture-authentication"
+        : null,
       session: stages.get(mode) === "login"
         ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
         : { kind: "anonymous" },
@@ -56,7 +67,10 @@ export function setupProjectionResponse(
   }
   if (path === "/api/auth/passkeys/addition/complete") {
     stages.set(mode, "enrolled");
-    return Response.json({ user });
+    return Response.json({
+      user,
+      authentication_reference: "fixture-authentication",
+    });
   }
   if (path === "/api/auth/passkeys/login/options") {
     return Response.json({
@@ -66,7 +80,10 @@ export function setupProjectionResponse(
   }
   if (path === "/api/auth/passkeys/login/complete") {
     stages.set(mode, "login");
-    return Response.json({ user });
+    return Response.json({
+      user,
+      authentication_reference: "fixture-authentication",
+    });
   }
   return null;
 }

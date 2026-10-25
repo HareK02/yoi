@@ -1,7 +1,7 @@
 import type { ActivationCodeResponse } from "#lib/generated/auth-api.ts";
 import { readBoundedAuthResponseJson } from "./api.ts";
 import { HostingRequestError } from "./hosting.ts";
-import { parseAuthUserResponse } from "./model.ts";
+import { parseAuthUser } from "./model.ts";
 
 // Serverのnormalize_handleと同じASCII正規化。Unicode case foldingはしない。
 export function normalizeActivationHandle(value: string): string {
@@ -57,7 +57,7 @@ export async function issueActivationCode(
       typeof record.expires_at !== "string" ||
       !Number.isFinite(Date.parse(record.expires_at))
     ) throw new Error();
-    const user = parseAuthUserResponse({ user: record.user }).user;
+    const user = parseAuthUser(record.user);
     if (user.handle !== handle) throw new Error();
     signal.throwIfAborted();
     return { user, code: record.code, expires_at: record.expires_at };

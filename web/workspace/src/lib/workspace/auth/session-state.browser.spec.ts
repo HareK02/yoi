@@ -13,13 +13,14 @@ afterEach(() => {
   localStorage.clear();
 });
 const anonymous: WhoamiResponse = {
-  actor: null,
+  actor: null, authentication_reference: null,
   session: { kind: "anonymous" },
 };
-const expired: WhoamiResponse = { actor: null, session: { kind: "expired" } };
+const expired: WhoamiResponse = { actor: null, authentication_reference: null, session: { kind: "expired" } };
 const authenticated = (
   expires_at: string | null = "2099-01-01T00:00:00Z",
 ): WhoamiResponse => ({
+  authentication_reference: "fixture-authentication",
   actor: { ...authUser, auth_method: "browser_session" },
   session: { kind: "authenticated", expires_at },
 });

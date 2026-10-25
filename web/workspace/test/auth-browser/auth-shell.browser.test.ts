@@ -34,6 +34,11 @@ const register = async (page: Page) => {
   await page.getByRole("button", { name: "Register new account", exact: true })
     .click();
 };
+const additionConfirmed = (page: Page) =>
+  page.getByRole("status").filter({
+    hasText:
+      /^Passkey added to your account; the expected session was confirmed\.$/,
+  });
 const count = (mutations: Mutation[], path: string) =>
   mutations.filter((entry) => entry.path === path).length;
 const at = async (page: Page, path: string) => {
@@ -151,7 +156,7 @@ Deno.test("standalone auth separates login, registration, own account and explic
       readyUrl: `${origin}/health`,
     }],
     `${root}/tools/web-ux/scenarios/anonymous-entry.json`,
-    `${root}/target/web-ux/t767-validation/auth-interactions/processes`,
+    `${root}/target/t783/web-shell-final/processes`,
     [],
   );
   let browser: Browser | undefined;
@@ -229,9 +234,7 @@ Deno.test("standalone auth separates login, registration, own account and explic
               name: "Add passkey to alice",
               exact: true,
             }).click();
-            await page.getByRole("status").filter({
-              hasText: /added|registered/i,
-            }).waitFor();
+            await additionConfirmed(page).waitFor();
             const additions = mutations.filter((entry) =>
               entry.path.includes("/addition/")
             );
@@ -239,7 +242,12 @@ Deno.test("standalone auth separates login, registration, own account and explic
               "/api/auth/passkeys/addition/options",
               "/api/auth/passkeys/addition/complete",
             ]);
-            assertEquals(additions[0].keys, ["browser_origin"]);
+            assertEquals(additions[0].keys, [
+              "browser_origin",
+              "expected_account_id",
+              "expected_authentication_reference",
+              "expected_user_id",
+            ]);
             assertEquals(additions[1].keys, ["challenge_id", "credential"]);
             assertEquals(
               mutations.some((entry) => entry.path.includes("/registration/")),
@@ -357,8 +365,7 @@ Deno.test("standalone auth separates login, registration, own account and explic
               name: "Add passkey to alice",
               exact: true,
             }).click();
-            await page.getByRole("status").filter({ hasText: /added/i })
-              .waitFor();
+            await additionConfirmed(page).waitFor();
             assertEquals(
               count(mutations, "/api/auth/passkeys/addition/complete"),
               1,
@@ -784,9 +791,7 @@ Deno.test("standalone auth separates login, registration, own account and explic
                 .__authFixtureRelease()
             );
             if (purpose === "addition") {
-              await page.getByRole("status").filter({
-                hasText: /added|registered/i,
-              }).waitFor();
+              await additionConfirmed(page).waitFor();
             } else await at(page, "/dashboard");
             assertEquals(
               count(mutations, `/api/auth/passkeys/${purpose}/options`),
@@ -813,8 +818,18 @@ Deno.test("standalone auth separates login, registration, own account and explic
             name: "Approve device login",
             exact: true,
           }).click();
-          await page.getByRole("alert").filter({ hasText: /invalid|expired/i })
-            .waitFor();
+          await page.getByRole("alert").filter({
+            hasText:
+              /^Authentication request was rejected \(400\)\. Check your session or restart the operation\.$/,
+          }).waitFor();
+          assertEquals(new URL(page.url()).pathname, "/login/device");
+          assertEquals(
+            await page.getByText(
+              "Device login approved. You can return to the CLI.",
+              { exact: true },
+            ).count(),
+            0,
+          );
           assertEquals(count(mutations, "/api/auth/device-login/approve"), 1);
         }),
     );

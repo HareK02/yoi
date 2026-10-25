@@ -1074,6 +1074,27 @@ impl WorkerE2eEnvironment {
         Ok(output)
     }
 
+    /// browser toolだけに必要なtool探索設定を引き継ぎ、profile・HOME・XDG・一時領域は
+    /// このfixtureへ閉じ込める。DENO_DIR/PLAYWRIGHT_BROWSERS_PATHはインストール済みtoolの
+    /// 供給元であり、製品データや認証情報を引き継ぐ経路にはしない。
+    pub fn browser_command(&self, binary: &Path) -> Result<Command> {
+        let snapshot: std::collections::HashMap<_, _> = std::env::vars_os().collect();
+        let mut command = self.isolated_command(binary);
+        for name in ["PATH", "DENO_DIR", "PLAYWRIGHT_BROWSERS_PATH"] {
+            if let Some(value) = snapshot.get(std::ffi::OsStr::new(name)) {
+                command.env(name, value);
+            }
+        }
+        let temporary = self.root.join("browser-tmp");
+        let cache = self.root.join("browser-cache");
+        fs::create_dir_all(&temporary)?;
+        fs::create_dir_all(&cache)?;
+        command
+            .env("TMPDIR", temporary)
+            .env("XDG_CACHE_HOME", cache);
+        Ok(command)
+    }
+
     fn isolated_command(&self, binary: &Path) -> Command {
         let mut command = Command::new(binary);
         command

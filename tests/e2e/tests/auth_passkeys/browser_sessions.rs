@@ -8,10 +8,11 @@
 //! Deno/Playwright Chromiumと最新production buildが必要な明示選択suite:
 //! `cargo test -p yoi-e2e --features e2e --test auth_passkeys real_backend_browser -- --ignored`
 //! 通常auth_passkeysの成功/ignoreを、このbrowser接続の実行成功とは数えない。
+use super::browser_process::BrowserProcess;
 use super::*;
 use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::Instant;
 use yoi_workspace_server::auth::{
@@ -62,38 +63,6 @@ fn expired_session_fixture(environment: &WorkerE2eEnvironment) -> Result<Value> 
     ]}))
 }
 
-struct BrowserProcess(Option<Child>);
-impl BrowserProcess {
-    fn child(&mut self) -> &mut Child {
-        self.0.as_mut().expect("browser process retained")
-    }
-}
-impl Drop for BrowserProcess {
-    fn drop(&mut self) {
-        let Some(mut child) = self.0.take() else {
-            return;
-        };
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        let pid = child.id() as libc::pid_t;
-        // Denoのsignal handlerがPlaywright/HTTPを閉じる猶予を与える。
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
-        }
-        let (send, receive) = mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            let _ = send.send(child.wait());
-        });
-        if receive.recv_timeout(Duration::from_secs(3)).is_err() {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-        let _ = waiter.join();
-    }
-}
-
 #[test]
 #[ignore = "requires production Web assets, Deno and Playwright Chromium"]
 fn real_backend_browser_cookies_preserve_identity_expiry_return_url_and_explicit_logout() -> Result
@@ -132,7 +101,8 @@ fn real_backend_browser_cookies_preserve_identity_expiry_return_url_and_explicit
     drop(reservation);
     let stderr = std::fs::File::create(environment.artifacts_dir.join("browser.stderr.log"))?;
     let mut process = BrowserProcess(Some(
-        Command::new("deno")
+        environment
+            .browser_command(Path::new("deno"))?
             .current_dir(&root)
             .args([
                 "run",

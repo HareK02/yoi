@@ -56,7 +56,7 @@
 {#if !protectedPage}
   {@render children()}
 {:else}
-  {#if session.kind === 'loading'}
+  {#if session.kind === 'loading' && !admitted}
     <div class="auth-page"><p role="status">Loading session…</p></div>
   {:else if session.kind === 'error'}
     <div class="auth-page">
@@ -66,7 +66,7 @@
     </div>
   {/if}
   {#if session.kind === 'ready' ? session.value.session.kind === 'authenticated' && sameActor : admitted}
-    <!-- 再確認中は表示/操作を停止し、進行中のlogout等をunmountで取消さない。 -->
-    <div hidden={session.kind !== 'ready'} inert={session.kind !== 'ready'}>{@render children()}</div>
+    <!-- 再確認中は既存内容と操作進捗を可視に保ち、操作だけをinertで停止する。 -->
+    <div hidden={session.kind === 'error'} inert={session.kind !== 'ready'}>{@render children()}</div>
   {/if}
 {/if}

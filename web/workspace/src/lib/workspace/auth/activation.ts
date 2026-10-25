@@ -2,7 +2,8 @@ import type {
   ActivationOptionsRequest,
   PasskeyRegistrationCompleteRequest,
 } from "#lib/generated/auth-api.ts";
-import { readBoundedAuthResponseJson } from "./api.ts";
+import { readBoundedAuthResponseJson, loadWhoami } from "./api.ts";
+import { browserSession } from "./session-state.ts";
 import { normalizeActivationHandle } from "./hosting-accounts.ts";
 import {
   type AuthUser,
@@ -19,6 +20,7 @@ export async function activateWithPasskey(
   code: string,
   signal: AbortSignal,
 ): Promise<AuthUser> {
+  const generation = browserSession.authenticationGeneration;
   try {
     handle = normalizeActivationHandle(handle);
     if (window.isSecureContext !== true || !code || code.length > 4096) {
@@ -61,15 +63,19 @@ export async function activateWithPasskey(
     });
     if (!credential) throw new Error("Registration cancelled");
     signal.throwIfAborted();
+    if (generation !== browserSession.authenticationGeneration) throw new Error("Activation superseded");
     const result = parseAuthUserResponse(
       await request("/api/auth/activation/complete", {
         challenge_id: challengeId,
         credential: registrationCredentialToJson(credential),
       }),
-    ).user;
+    );
     signal.throwIfAborted();
-    if (result.handle !== handle) throw new Error("Activation target mismatch");
-    return result;
+    if (result.user.handle !== handle || generation !== browserSession.authenticationGeneration) throw new Error("Activation target mismatch");
+    const current = await loadWhoami(signal);
+    signal.throwIfAborted();
+    if (generation !== browserSession.authenticationGeneration || current.session.kind !== "authenticated" || current.actor?.auth_method !== "browser_session" || current.actor.user_id !== result.user.user_id || current.actor.account_id !== result.user.account_id || current.authentication_reference !== result.authentication_reference) throw new Error("Activation session unconfirmed");
+    return result.user;
   } catch {
     // HTTP/WebAuthn/JSON例外はsecretを含む可能性があるため、本文も例外も転載しない。
     throw new Error("Activation could not be confirmed.");

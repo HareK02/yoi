@@ -228,13 +228,21 @@ fn resolve_whoami_sync(
     use server_api::{BrowserSessionState, WhoamiResponse};
     let anonymous = || WhoamiResponse {
         actor: None,
+        authentication_reference: None,
         session: BrowserSessionState::Anonymous {},
     };
     // Preserve the existing API-token precedence and fallback rules, including expired tokens.
     if let Some((actor, expires_at)) =
-        resolve_credentials_sync(store, bearer, session_token.clone())?
+        resolve_credentials_sync(store, bearer.clone(), session_token.clone())?
     {
+        let credential = match actor.auth_method {
+            ActorAuthMethod::ApiToken => bearer.as_deref(),
+            ActorAuthMethod::BrowserSession => session_token.as_deref(),
+        }
+        .ok_or_else(|| auth_error("auth_required", "authentication binding missing"))?;
+        let authentication_reference = Some(authentication_reference(&token_hash(credential)));
         return Ok(WhoamiResponse {
+            authentication_reference,
             actor: Some(actor),
             session: BrowserSessionState::Authenticated { expires_at },
         });
@@ -255,11 +263,19 @@ fn resolve_whoami_sync(
     if within_session_expiry_grace(&session.expires_at, Utc::now()) {
         return Ok(WhoamiResponse {
             actor: None,
+            authentication_reference: None,
             session: BrowserSessionState::Expired {},
         });
     }
     // A marker for a still-valid session cannot restore authentication after partial deletion.
     Ok(anonymous())
+}
+
+/// Domain-separated public comparison value; never accepted as a credential.
+pub(crate) fn authentication_reference(credential_hash: &str) -> String {
+    token_hash(&format!(
+        "passkey-authentication-reference:{credential_hash}"
+    ))
 }
 
 fn within_session_expiry_grace(expires_at: &str, now: DateTime<Utc>) -> bool {

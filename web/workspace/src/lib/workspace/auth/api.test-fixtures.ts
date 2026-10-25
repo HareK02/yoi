@@ -67,6 +67,7 @@ export function credentialFixture(authentication = false): Credential {
 export function whoamiPayload(actor: unknown = null) {
   return {
     actor,
+    authentication_reference: actor === null ? null : "fixture-authentication",
     session: actor === null
       ? { kind: "anonymous" }
       : { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },

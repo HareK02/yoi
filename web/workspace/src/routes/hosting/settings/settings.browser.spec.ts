@@ -27,6 +27,7 @@ function boundary(
       const path = String(input);
       if (path === "/api/auth/whoami") {
         return Response.json({
+          authentication_reference: persona !== "anonymous" ? "fixture-authentication" : null,
           session: persona !== "anonymous"
             ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
             : { kind: "anonymous" },

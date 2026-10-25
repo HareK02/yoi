@@ -59,7 +59,7 @@ for (const kind of ["anonymous", "expired"] as const) {
     await browserSession.ensure();
     expect(fetcher).toHaveBeenCalledTimes(1);
     fetcher.mockResolvedValueOnce(
-      Response.json({ actor: null, session: { kind } }),
+      Response.json({ authentication_reference: null, actor: null, session: { kind } }),
     );
     await expect(requirePageSession(target)).rejects.toMatchObject({
       status: 307,

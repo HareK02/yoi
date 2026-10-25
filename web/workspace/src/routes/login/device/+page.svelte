@@ -13,11 +13,12 @@
   async function approve() {
     if (auth.busy || !auth.actor || approved || !userCode.trim()) return;
     const code = userCode.trim().toUpperCase();
-    await auth.run('Approving device login…', 'Device login approved. You can return to the CLI.', async (signal) => {
+    const confirmed = await auth.run('Approving device login…', 'Device login approved. You can return to the CLI.', async (signal) => {
       const result = await approveDeviceLogin(code, signal);
       if (result.status !== 'approved') throw new Error('Device approval not confirmed');
-      approved = true;
-    });
+      return result;
+    }, 'device-approval');
+    if (confirmed) approved = true;
   }
   onMount(() => {
     userCode = page.url.searchParams.get('user_code') ?? page.url.searchParams.get('code') ?? '';

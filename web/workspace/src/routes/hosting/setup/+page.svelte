@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { browserSession, observeBrowserSession, sessionMutation } from "#lib/workspace/auth/session-state.ts";
-  import { loginWithPasskey } from '#lib/workspace/auth/api.ts';
+  import { loginWithPasskey, loadWhoami } from '#lib/workspace/auth/api.ts';
+  import { observeAuthOperation } from '#lib/workspace/auth/operation.ts';
   import { enrollHostingPasskey } from '#lib/workspace/auth/hosting-enrollment.ts';
   import { loadHostingAccess, notifySessionChanged } from '#lib/workspace/auth/hosting.ts';
   import type { AuthUser } from '#lib/workspace/auth/model.ts';
@@ -12,6 +13,7 @@
   let verifiedLogin = $state(false);
   let error = $state('');
   const controller = new AbortController();
+  let loginController: AbortController | null = null;
   let active = true;
 
   let verifiedGeneration: number | null = null;
@@ -61,22 +63,40 @@
     error = '';
     sessionMutation();
     let generation = browserSession.authenticationGeneration;
+    const operation = new AbortController();
+    loginController = operation;
+    let promptGeneration: number | null = generation;
+    const unsubscribe = browserSession.subscribe(() => {
+      if (promptGeneration !== null && promptGeneration !== browserSession.authenticationGeneration) operation.abort();
+    });
     try {
-      const signedIn = await loginWithPasskey(controller.signal);
+      const initial = await loadWhoami(operation.signal);
       if (!isCurrent(generation)) throw new Error('Login superseded');
-      if (signedIn.user_id !== expected.user_id || signedIn.account_id !== expected.account_id) {
+      observeAuthOperation(operation.signal, {
+        expected: initial, phase: () => {}, additionAttempt: () => {},
+        verifySession: async () => {
+          if (!isCurrent(generation)) operation.abort();
+          operation.signal.throwIfAborted();
+          const current = await loadWhoami(operation.signal);
+          if (!isCurrent(generation) || initial.actor?.user_id !== current.actor?.user_id || initial.actor?.account_id !== current.actor?.account_id || initial.authentication_reference !== current.authentication_reference) throw new Error('Session changed');
+        },
+      });
+      const signedIn = await loginWithPasskey(operation.signal);
+      if (!isCurrent(generation)) throw new Error('Login superseded');
+      if (signedIn.user.user_id !== expected.user_id || signedIn.user.account_id !== expected.account_id) {
         throw new Error('Unexpected login actor');
       }
       // Set-Cookie後の確認を共有状態へ発行し、操作前/操作中のreadを再利用しない。
+      promptGeneration = null;
       sessionMutation();
       generation = browserSession.authenticationGeneration;
       await browserSession.refresh();
-      if (!isCurrent(generation) || !matchesSession(expected)) throw new Error('Session not verified');
+      if (!isCurrent(generation) || !matchesSession(expected) || browserSession.snapshot.kind !== 'ready' || browserSession.snapshot.value.authentication_reference !== signedIn.authentication_reference) throw new Error('Session not verified');
       const access = await loadHostingAccess();
       if (!isCurrent(generation) || !access.is_admin) throw new Error('Access not verified');
       // accessのawait中にもcookie/actorは変わり得る。success公開前の最終確認を行う。
       await browserSession.refresh();
-      if (!isCurrent(generation) || !matchesSession(expected)) throw new Error('Session superseded');
+      if (!isCurrent(generation) || !matchesSession(expected) || browserSession.snapshot.kind !== 'ready' || browserSession.snapshot.value.authentication_reference !== signedIn.authentication_reference) throw new Error('Session superseded');
       verifiedGeneration = generation;
       verifiedLogin = true;
       notifySessionChanged();
@@ -89,6 +109,7 @@
         await browserSession.refresh();
       }
     } finally {
+      promptGeneration = null; unsubscribe(); loginController = null;
       if (active) busy = false;
     }
   }
@@ -97,6 +118,7 @@
     active = false;
     token = '';
     controller.abort();
+    loginController?.abort();
   });
 </script>
 

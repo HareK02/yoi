@@ -4,6 +4,7 @@ declare const Deno: {
   test(name: string, fn: () => void | Promise<void>): void;
 };
 
+import { AuthOperationError } from "./operation.ts";
 import { loginWithLegacyPasskey, loginWithPasskey } from "./api.ts";
 import {
   authUser,
@@ -64,7 +65,12 @@ async function boundary(
             Response.json(body.handle ? legacyLoginOptions : loginOptions),
           );
         }
-        return Promise.resolve(Response.json({ user: authUser }));
+        return Promise.resolve(
+          Response.json({
+            user: authUser,
+            authentication_reference: "fixture-authentication",
+          }),
+        );
       },
     },
   });
@@ -97,7 +103,7 @@ for (const legacy of [false, true]) {
         await (legacy
           ? loginWithLegacyPasskey(" alice ", signal)
           : loginWithPasskey(signal)),
-        authUser,
+        { user: authUser, authentication_reference: "fixture-authentication" },
       );
       equal(state.requests.map(({ path }) => path), [
         "/api/auth/passkeys/login/options",
@@ -131,8 +137,10 @@ for (const legacy of [false, true]) {
             : loginWithPasskey(controller.signal));
           throw new Error("Unexpected login success");
         } catch (error) {
-          if (!(error instanceof DOMException)) throw error;
-          equal(error.name, late ? "AbortError" : "NotAllowedError");
+          if (!(error instanceof AuthOperationError)) throw error;
+          equal(error.stage, "authenticator");
+          equal(error.reason, late ? "stopped" : "cancelled-or-unavailable");
+          equal(error.outcome, "not-sent");
         }
         equal(state.requests.length, 1);
       });

@@ -8,6 +8,9 @@ import type {
   DeviceLoginPollStatus,
   DeviceLoginStartResponse,
   LogoutResponse,
+  PasskeyListResponse,
+  PasskeySummary,
+  PasskeyAdditionResultResponse,
   PasskeyLoginOptionsResponse,
   PasskeyRegistrationOptionsResponse,
   RequestActor,
@@ -21,6 +24,9 @@ export type {
   AuthPublicConfig,
   DeviceLoginPollResponse,
   DeviceLoginStartResponse,
+  PasskeyListResponse,
+  PasskeySummary,
+  PasskeyAdditionResultResponse,
   PasskeyLoginOptionsResponse,
   PasskeyRegistrationOptionsResponse,
   RequestActor,
@@ -37,8 +43,10 @@ const MAX_DEVICE_LOGIN_SECONDS = 24 * 60 * 60;
 const MAX_WEBAUTHN_TIMEOUT_MS = 10 * 60 * 1000;
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+={0,2}$/;
 
+export class AuthPayloadError extends Error {}
+
 function invalid(path: string, reason: string): never {
-  throw new Error(`Invalid auth payload: ${path} ${reason}.`);
+  throw new AuthPayloadError(`Invalid auth payload: ${path} ${reason}.`);
 }
 
 function asRecord(value: unknown, path: string): Record<string, unknown> {
@@ -119,6 +127,7 @@ function boundedJson(
   if (budget.remainingNodes < 0) invalid(path, "has too many values");
   if (depth > MAX_AUTH_VALUE_DEPTH) invalid(path, "is too deeply nested");
   if (value === null || typeof value === "boolean") return;
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) invalid(path, "contains unsupported binary data");
   if (typeof value === "string") {
     boundedString(value, path, { allowEmpty: true });
     budget.remainingStringUnits -= value.length;
@@ -205,10 +214,10 @@ export function bufferToBase64Url(value: ArrayBuffer): string {
 function parseAuthenticatorTransport(
   value: unknown,
   path: string,
-): AuthenticatorTransport {
+): AuthenticatorTransport | null {
   const transport = boundedString(value, path);
   if (!["ble", "hybrid", "internal", "nfc", "usb"].includes(transport)) {
-    invalid(path, "contains an unknown authenticator transport");
+    return null;
   }
   return transport as AuthenticatorTransport;
 }
@@ -229,9 +238,10 @@ function parseCredentialDescriptor(
     if (descriptor.transports.length > MAX_AUTH_ARRAY_LENGTH) {
       invalid(`${path}.transports`, "has too many items");
     }
-    return descriptor.transports.map((transport, index) =>
-      parseAuthenticatorTransport(transport, `${path}.transports[${index}]`)
-    );
+    return descriptor.transports.flatMap((transport, index) => {
+      const parsed = parseAuthenticatorTransport(transport, `${path}.transports[${index}]`);
+      return parsed === null ? [] : [parsed];
+    });
   })();
   return {
     type: "public-key",
@@ -463,7 +473,8 @@ function parseActor(value: unknown, path: string): RequestActor {
 
 export function parseWhoamiResponse(value: unknown): WhoamiResponse {
   const response = asRecord(value, "whoami");
-  requireExactKeys(response, "whoami", ["actor", "session"]);
+  requireExactKeys(response, "whoami", ["actor", "session", "authentication_reference"]);
+  const authentication_reference = optionalString(response.authentication_reference, "whoami.authentication_reference");
   const actor = response.actor === null
     ? null
     : parseActor(response.actor, "whoami.actor");
@@ -487,7 +498,8 @@ export function parseWhoamiResponse(value: unknown): WhoamiResponse {
         "must identify the server session expiry",
       );
     }
-    return { actor, session: { kind: "authenticated", expires_at: expiry } };
+    if (authentication_reference === null) invalid("whoami", "authenticated session requires comparison evidence");
+    return { actor, authentication_reference, session: { kind: "authenticated", expires_at: expiry } };
   }
   requireExactKeys(session, "whoami.session", ["kind"]);
   if (
@@ -496,7 +508,8 @@ export function parseWhoamiResponse(value: unknown): WhoamiResponse {
   ) {
     invalid("whoami", "inconsistent actor or session state");
   }
-  return { actor: null, session: { kind: session.kind } };
+  if (authentication_reference !== null) invalid("whoami", "anonymous session cannot identify authentication");
+  return { actor: null, authentication_reference: null, session: { kind: session.kind } };
 }
 
 export function parseAuthPublicConfig(value: unknown): AuthPublicConfig {
@@ -537,10 +550,38 @@ export function parseAuthPublicConfig(value: unknown): AuthPublicConfig {
   return result;
 }
 
+export function parseAuthUser(value: unknown): AuthUser {
+  return parseAuthenticatedUser(value, "auth_user.user");
+}
+
 export function parseAuthUserResponse(value: unknown): PasskeyUserResponse {
   const response = asRecord(value, "auth_user");
-  requireExactKeys(response, "auth_user", ["user"]);
-  return { user: parseAuthenticatedUser(response.user, "auth_user.user") };
+  requireExactKeys(response, "auth_user", ["user", "authentication_reference"]);
+  return { user: parseAuthenticatedUser(response.user, "auth_user.user"), authentication_reference: boundedString(response.authentication_reference, "auth_user.authentication_reference") };
+}
+
+function parsePasskeySummary(value: unknown): PasskeySummary {
+  const key = asRecord(value, "passkey_summary");
+  requireExactKeys(key, "passkey_summary", ["key_reference", "created_at", "last_used_at", "normal_login_verified_at"]);
+  const date = (value: unknown): string => {
+    const text = boundedString(value, "passkey_summary.timestamp");
+    if (!Number.isFinite(Date.parse(text))) invalid("passkey_summary.timestamp", "must be a timestamp");
+    return text;
+  };
+  return { key_reference: boundedString(key.key_reference, "passkey_summary.key_reference"), created_at: date(key.created_at), last_used_at: key.last_used_at === null ? null : date(key.last_used_at), normal_login_verified_at: key.normal_login_verified_at === null ? null : date(key.normal_login_verified_at) };
+}
+export function parsePasskeyList(value: unknown): PasskeyListResponse {
+  const list = asRecord(value, "passkey_list");
+  requireExactKeys(list, "passkey_list", ["user", "keys"]);
+  if (!Array.isArray(list.keys) || list.keys.length > MAX_AUTH_ARRAY_LENGTH) invalid("passkey_list.keys", "must be a bounded array");
+  return { user: parseAuthenticatedUser(list.user, "passkey_list.user"), keys: list.keys.map(parsePasskeySummary) };
+}
+export function parseAdditionResult(value: unknown): PasskeyAdditionResultResponse {
+  const result = asRecord(value, "addition_result");
+  if (result.status === "unknown") { requireExactKeys(result, "addition_result", ["status"]); return { status: "unknown" }; }
+  requireExactKeys(result, "addition_result", ["status", "user", "key"]);
+  if (result.status !== "saved") invalid("addition_result", "contains an unknown status");
+  return { status: "saved", user: parseAuthenticatedUser(result.user, "addition_result.user"), key: parsePasskeySummary(result.key) };
 }
 
 export function prepareRegistrationOptions(
@@ -583,11 +624,14 @@ function clientExtensionResults(
   const value = (credential.getClientExtensionResults as () => unknown).call(
     credential,
   );
-  boundedJson(value, "credential.clientExtensionResults");
-  return asRecord(
-    value,
-    "credential.clientExtensionResults",
-  ) as AuthenticationExtensionsClientOutputs;
+  const output = asRecord(value, "credential.clientExtensionResults");
+  // 現Serverが消費するJSON拡張だけを転送する。PRF/largeBlob等の未要求binary
+  // outputsをJSON.stringifyで{}へ変えたり、未使用機能として有効化したりしない。
+  const supported = Object.fromEntries(
+    ["appid", "credProps", "hmacSecret", "credProtect", "minPinLength"].filter(key => key in output).map(key => [key, output[key]]),
+  );
+  boundedJson(supported, "credential.clientExtensionResults");
+  return supported as AuthenticationExtensionsClientOutputs;
 }
 
 export function registrationCredentialToJson(credential: unknown): unknown {
@@ -605,12 +649,12 @@ export function registrationCredentialToJson(credential: unknown): unknown {
   ) {
     invalid("credential.response.transports", "must be a bounded array");
   }
-  const transports = transportsValue.map((transport, index) =>
-    parseAuthenticatorTransport(
-      transport,
-      `credential.response.transports[${index}]`,
-    )
-  );
+  // transportは補助hint。Serverのwebauthn-rsも未知値をUnknownとして無視する。
+  // boundedな新値を理由に、端末上で作成済みの暗号credential全体を捨てない。
+  const transports = transportsValue.flatMap((value, index) => {
+    const transport = boundedString(value, `credential.response.transports[${index}]`);
+    return ["ble", "hybrid", "internal", "nfc", "usb"].includes(transport) ? [transport] : [];
+  });
   const authenticatorAttachment = optionalString(
     core.authenticatorAttachment,
     "credential.authenticatorAttachment",
