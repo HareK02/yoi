@@ -4377,6 +4377,7 @@ where
             return match cleanup {
                 Ok(()) => WorkerExecutionSpawnResult::RolledBack(result),
                 Err(_) => {
+                    let retained_state = worker_state.read().ok().map(|state| state.clone());
                     self.retain_uncertain_unconnected_controller(
                         &worker_ref,
                         handle,
@@ -4390,7 +4391,7 @@ where
                     );
                     WorkerExecutionSpawnResult::ReconciliationRequired {
                         result,
-                        worker_state: None,
+                        worker_state: retained_state,
                         workdir_attachments: workdir_attachment_statuses,
                     }
                 }
