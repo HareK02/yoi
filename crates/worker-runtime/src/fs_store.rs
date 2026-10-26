@@ -1245,6 +1245,7 @@ fn migrate_worker_record(
         migrate_legacy_request_evidence(&mut identity_document)
             .map_err(|message| runtime_store_corrupt(identity_path, message.into()))?;
         migrate_restore_commit_fact(&mut identity_document, identity_path)?;
+        migrate_restore_repair_fact(&mut identity_document, identity_path)?;
         identity_document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
         let aggregate: WorkerAggregateRecord =
             serde_json::from_value(identity_document).map_err(|error| {
@@ -4095,6 +4096,136 @@ mod tests {
         worker.created_at_ms = Some(1);
         opened.store.write_worker_record(&worker).unwrap();
         (temp, opened.store, worker, path)
+    }
+
+    #[test]
+    fn schema_v9_pending_restore_migrates_conservatively_and_survives_reopen() {
+        assert_v9_pending_restore_migration(false);
+    }
+
+    #[test]
+    fn schema_v9_pending_stop_restore_migrates_conservatively_and_survives_reopen() {
+        assert_v9_pending_restore_migration(true);
+    }
+
+    fn assert_v9_pending_restore_migration(under_stop: bool) {
+        // Real store migration/open/writer/reopen, with frozen v9 operation and
+        // admission shapes. No execution backend or recovery is substituted.
+        let (_temp, store, worker, path) = canonical_worker_store();
+        let root = store.root.clone();
+        let mut legacy =
+            serde_json::to_value(WorkerAggregateRecord::from_persisted(&worker)).unwrap();
+        let execution = legacy["execution_state"]["execution"].clone();
+        let restore_id = WorkerLifecycleOperationId::new();
+        let restore = serde_json::json!({
+            "operation_id": restore_id,
+            "mode": "explicit",
+            "request": execution["request"],
+            "binding": execution["binding"],
+            "last_settled_status": legacy["status"]
+        });
+        let operation = if under_stop {
+            serde_json::json!({"operation": "stop", "intent": {
+                "operation_id": WorkerLifecycleOperationId::new(),
+                "pending_restore": restore,
+                "request": execution["request"],
+                "binding": execution["binding"],
+                "restore_intent": execution["restore_intent"],
+                "last_settled_status": legacy["status"]
+            }})
+        } else {
+            serde_json::json!({"operation": "restore", "intent": restore})
+        };
+        legacy["execution_state"] = serde_json::json!({
+            "state": "reconciliation_required", "execution": operation
+        });
+        let token = legacy["restore_guard"]["observation_token"].clone();
+        let owner = |request_id: &str, operation_id, receipt| {
+            serde_json::json!({
+                "fingerprint": format!("intent-{request_id}"),
+                "operation_id": operation_id,
+                "request": {"expected_observation_token": token, "request_id": request_id},
+                "preparation_applied": true,
+                "execution_started": true,
+                "receipt": receipt
+            })
+        };
+        legacy["restore_guard"] = serde_json::json!({
+            "generation": token,
+            "active_request_id": "pending-restore",
+            "owners": {
+                "pending-restore": owner("pending-restore", serde_json::to_value(restore_id).unwrap(), serde_json::Value::Null),
+                "earlier-restore": owner("earlier-restore", serde_json::to_value(WorkerLifecycleOperationId::new()).unwrap(),
+                    serde_json::json!({"state": "rolled_back", "worker": null,
+                        "reason_code": "worker_restore_failed", "message": "retained failure"}))
+            }
+        });
+        legacy["schema_version"] = serde_json::json!(AGGREGATE_SCHEMA_VERSION);
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        write_empty_schema_v8_store(&root);
+        let runtime_path = root.join(RUNTIME_FILE);
+        let mut runtime: serde_json::Value = read_json(&runtime_path, "read fixture").unwrap();
+        runtime["schema_version"] = serde_json::json!(AGGREGATE_SCHEMA_VERSION);
+        fs::write(&runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+        let metadata_path = path.with_file_name(WORKER_METADATA_FILE);
+        let history_path = path.parent().unwrap().join("session/history.json");
+        fs::create_dir_all(history_path.parent().unwrap()).unwrap();
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "worker_name": runtime_worker_name(worker.worker_id),
+            "retained_extension": {"source": "unchanged"}
+        }))
+        .unwrap();
+        let history = b"[{\"role\":\"user\",\"content\":\"retained source\"}]\n";
+        fs::write(&metadata_path, &metadata).unwrap();
+        fs::write(&history_path, history).unwrap();
+        drop(store);
+
+        let mut expected = legacy;
+        expected["schema_version"] = serde_json::json!(SCHEMA_VERSION);
+        let guard = expected["restore_guard"].as_object_mut().unwrap();
+        let token = guard.remove("generation").unwrap();
+        guard.insert("observation_token".into(), token);
+        let intent = &mut expected["execution_state"]["execution"]["intent"];
+        let restore = if under_stop {
+            &mut intent["pending_restore"]
+        } else {
+            intent
+        };
+        restore["commit"] = serde_json::json!("legacy_unknown");
+        restore["source_repair_possible"] = serde_json::json!(true);
+
+        let opened = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+        let persisted = opened.store.read_worker_record(&worker.worker_ref).unwrap();
+        // Compare the persisted aggregate, including both operation IDs, full
+        // request/source references, token, pending owner and terminal receipt.
+        assert_eq!(
+            read_json::<serde_json::Value>(&path, "read migrated Worker").unwrap(),
+            expected
+        );
+        opened.store.write_worker_record(&persisted).unwrap();
+        assert_eq!(
+            read_json::<serde_json::Value>(&path, "read written Worker").unwrap(),
+            expected
+        );
+        drop(opened);
+        let bytes = fs::read(&path).unwrap();
+        let reopened = FsRuntimeStore::open_or_create(root, "test-runtime").unwrap();
+        reopened
+            .store
+            .read_worker_record(&worker.worker_ref)
+            .unwrap();
+        assert_eq!(
+            read_json::<serde_json::Value>(&path, "read reopened Worker").unwrap(),
+            expected
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        // v9 metadata is canonically reformatted; its retained values, unlike
+        // whitespace, are the preservation contract.
+        assert_eq!(
+            read_json::<serde_json::Value>(&metadata_path, "read retained metadata").unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&metadata).unwrap()
+        );
+        assert_eq!(fs::read(&history_path).unwrap(), history);
     }
 
     #[test]
