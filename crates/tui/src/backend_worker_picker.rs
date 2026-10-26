@@ -785,6 +785,12 @@ mod tests {
     #[derive(Default)]
     struct PendingRuntimeBackend {
         operations: std::sync::Mutex<Vec<worker_runtime::execution::WorkerLifecycleOperationId>>,
+        owners: std::sync::Mutex<
+            std::collections::HashMap<
+                worker_runtime::execution::WorkerLifecycleOperationId,
+                worker_runtime::identity::WorkerRef,
+            >,
+        >,
     }
 
     impl worker_runtime::execution::WorkerExecutionBackend for PendingRuntimeBackend {
@@ -806,6 +812,21 @@ mod tests {
             )
         }
 
+        fn restore_recovery_disposition(
+            &self,
+            operation_id: worker_runtime::execution::WorkerLifecycleOperationId,
+            worker_ref: &worker_runtime::identity::WorkerRef,
+        ) -> Option<worker_runtime::execution::RestoreRecoveryDisposition> {
+            use worker_runtime::execution::RestoreRecoveryDisposition as D;
+            Some(
+                if self.owners.lock().unwrap().get(&operation_id) == Some(worker_ref) {
+                    D::Continue
+                } else {
+                    D::Absent
+                },
+            )
+        }
+
         fn restore_worker(
             &self,
             request: worker_runtime::execution::WorkerExecutionRestoreRequest,
@@ -813,6 +834,10 @@ mod tests {
             use worker_runtime::execution::*;
             let mut operations = self.operations.lock().unwrap();
             operations.push(request.operation_id);
+            self.owners
+                .lock()
+                .unwrap()
+                .insert(request.operation_id, request.worker_ref.clone());
             if operations.len() == 1 {
                 WorkerExecutionSpawnResult::ReconciliationRequired {
                     result: WorkerExecutionResult::errored(
