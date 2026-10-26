@@ -2922,8 +2922,15 @@ impl ProfileRuntimeWorkerFactory {
                         .map_err(|_| "restore run artifacts cannot be validated")?;
                     let path = worker::runtime::worker_allocation::default_allocation_path()
                         .map_err(|_| "restore allocation authority unavailable")?;
-                    let table = worker::runtime::worker_allocation::LockFileGuard::open(&path)
+                    let mut table = worker::runtime::worker_allocation::LockFileGuard::open(&path)
                         .map_err(|_| "restore allocation authority unavailable")?;
+                    // Activated process death leaves a durable allocation entry.
+                    // Use the same stale-owner authority as normal registration;
+                    // a live or uninspectable owner must still fence reclamation.
+                    worker::runtime::worker_allocation::reclaim_stale(&mut table);
+                    table
+                        .save()
+                        .map_err(|_| "restore stale allocation cleanup unconfirmed")?;
                     if table
                         .data()
                         .find(&Self::runtime_worker_name_for_ref(&request.worker_ref))
