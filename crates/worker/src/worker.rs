@@ -3335,6 +3335,7 @@ pub struct WorkerStartupFeatureCleanup {
 }
 
 struct StartupFeatureCleanupInner {
+    mcp_discovery: crate::feature::mcp::McpDiscoveryCleanup,
     registries: Mutex<Vec<FeatureBackgroundTaskRegistry>>,
     settlement: tokio::sync::Mutex<
         Option<futures_util::future::BoxFuture<'static, Result<(), crate::hook::HookError>>>,
@@ -3345,10 +3346,15 @@ impl WorkerStartupFeatureCleanup {
     fn new(registry: FeatureBackgroundTaskRegistry) -> Self {
         Self {
             inner: Arc::new(StartupFeatureCleanupInner {
+                mcp_discovery: crate::feature::mcp::McpDiscoveryCleanup::new(),
                 registries: Mutex::new(vec![registry]),
                 settlement: tokio::sync::Mutex::new(None),
             }),
         }
+    }
+
+    pub(crate) fn mcp_discovery(&self) -> crate::feature::mcp::McpDiscoveryCleanup {
+        self.inner.mcp_discovery.clone()
     }
 
     fn retain(&self, registry: FeatureBackgroundTaskRegistry) {
@@ -3370,12 +3376,21 @@ impl WorkerStartupFeatureCleanup {
                 .lock()
                 .expect("startup Feature cleanup poisoned")
                 .clone();
+            let mcp_discovery = self.inner.mcp_discovery.clone();
             Box::pin(async move {
                 let mut failure = None;
                 for registry in registries {
                     if let Err(error) = registry.shutdown().await {
                         failure.get_or_insert(error);
                     }
+                }
+                if let Err(error) = mcp_discovery.shutdown().await {
+                    failure.get_or_insert_with(|| {
+                        crate::hook::HookError::new(
+                            crate::hook::HookErrorCategory::Dependency,
+                            error.to_string(),
+                        )
+                    });
                 }
                 failure.map_or(Ok(()), Err)
             })
@@ -3414,9 +3429,82 @@ impl RestoreCandidateWorkdirCleanup {
 pub struct PreparedRestoredWorker<St: Store> {
     worker: Option<Worker<Box<dyn LlmClient>, St>>,
     closing: bool,
+    activation: Option<RestoredWorkerActivation>,
+}
+
+/// Exact existing restore source retained while a Controller is initialized.
+///
+/// This carries no new Worker identity or execution authority. The host must keep
+/// the per-Worker operation lock and invoke activation only after durable commit.
+/// Controller initialization must not change the captured source before then.
+pub(crate) struct RestoredWorkerActivation {
     metadata: Option<WorkerMetadata>,
     entries: serde_json::Value,
     manifest: serde_json::Value,
+}
+
+impl RestoredWorkerActivation {
+    fn revalidate<St>(&self, worker: &Worker<Box<dyn LlmClient>, St>) -> Result<(), WorkerError>
+    where
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        let changed = |component| WorkerError::RestoreCandidateChanged {
+            worker_name: worker.manifest.worker.name.clone(),
+            component,
+        };
+        if worker.store.read_by_name(&worker.manifest.worker.name)? != self.metadata {
+            return Err(changed("metadata"));
+        }
+        if restore_snapshot_value(&worker.manifest)? != self.manifest {
+            return Err(changed("manifest"));
+        }
+        let entries = worker
+            .store
+            .read_all(worker.session_id(), worker.segment_id())?;
+        if restore_snapshot_value(&entries)? != self.entries {
+            return Err(changed("segment"));
+        }
+        Ok(())
+    }
+
+    /// Acquire the existing top-level writer allocation after commit, checking
+    /// exact source both before and after acquisition, then apply restore effects.
+    /// On failure the Controller still owns the Worker; cleanup handles do not
+    /// establish rollback and allocation release must wait until it is dropped.
+    pub(crate) async fn activate<St>(
+        &self,
+        worker: &mut Worker<Box<dyn LlmClient>, St>,
+    ) -> Result<(), WorkerError>
+    where
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        self.revalidate(worker)
+            .map_err(|error| worker.construction_failure(error))?;
+        let allocate = || -> Result<ScopeAllocationGuard, WorkerError> {
+            let socket_path = dir::default_base()
+                .map_err(ScopeLockError::from)?
+                .join(&worker.manifest.worker.name)
+                .join("sock");
+            Ok(worker_allocation::install_top_level_with_deny(
+                worker.manifest.worker.name.clone(),
+                std::process::id(),
+                socket_path,
+                worker.scope.snapshot().allow_rules(),
+                worker.scope.snapshot().deny_rules(),
+                worker.segment_id(),
+            )?)
+        };
+        worker.scope_allocation =
+            Some(allocate().map_err(|error| worker.construction_failure(error))?);
+        self.revalidate(worker)
+            .map_err(|error| worker.construction_failure(error))?;
+        worker
+            .finish_restored_construction_in_place(false)
+            .await
+            .map_err(|source| WorkerError::RestoreActivationEffects {
+                source: Box::new(source),
+            })
+    }
 }
 
 impl<St> PreparedRestoredWorker<St>
@@ -3460,23 +3548,32 @@ where
     }
 
     fn revalidate(&self, worker: &Worker<Box<dyn LlmClient>, St>) -> Result<(), WorkerError> {
-        let changed = |component| WorkerError::RestoreCandidateChanged {
-            worker_name: worker.manifest.worker.name.clone(),
-            component,
-        };
-        if worker.store.read_by_name(&worker.manifest.worker.name)? != self.metadata {
-            return Err(changed("metadata"));
+        self.activation
+            .as_ref()
+            .expect("restore candidate activation already transferred")
+            .revalidate(worker)
+    }
+
+    /// Transfer the read-only reconstruction for Controller initialization, not
+    /// execution. Validate once without allocation or canonical restore effects;
+    /// the Controller must retain activation until its durable commit succeeds.
+    pub(crate) fn into_controller_parts(
+        mut self,
+    ) -> Result<(Worker<Box<dyn LlmClient>, St>, RestoredWorkerActivation), WorkerError> {
+        let worker = self
+            .worker
+            .take()
+            .ok_or(WorkerError::RestoreCandidateClosing)?;
+        if self.closing {
+            return Err(worker.construction_failure(WorkerError::RestoreCandidateClosing));
         }
-        if restore_snapshot_value(&worker.manifest)? != self.manifest {
-            return Err(changed("manifest"));
-        }
-        let entries = worker
-            .store
-            .read_all(worker.session_id(), worker.segment_id())?;
-        if restore_snapshot_value(&entries)? != self.entries {
-            return Err(changed("segment"));
-        }
-        Ok(())
+        self.revalidate(&worker)
+            .map_err(|error| worker.construction_failure(error))?;
+        let activation = self
+            .activation
+            .take()
+            .expect("restore candidate activation already transferred");
+        Ok((worker, activation))
     }
 
     /// Acquire writer allocation only after exact source validation, validate
@@ -9730,9 +9827,11 @@ where
         let mut candidate = PreparedRestoredWorker {
             worker: Some(worker),
             closing: false,
-            metadata,
-            entries: entries_snapshot,
-            manifest: manifest_snapshot,
+            activation: Some(RestoredWorkerActivation {
+                metadata,
+                entries: entries_snapshot,
+                manifest: manifest_snapshot,
+            }),
         };
         if let Err(error) = candidate.revalidate(candidate.worker()) {
             let worker = candidate.worker.take().expect("candidate just constructed");
@@ -9742,6 +9841,16 @@ where
     }
 
     async fn finish_restored_construction(mut self) -> Result<Self, WorkerError> {
+        self.finish_restored_construction_in_place(true).await?;
+        Ok(self)
+    }
+
+    /// Apply the same restore effects while an initialized Controller retains
+    /// ownership. Errors retain cleanup handles, but do not drop this Worker.
+    async fn finish_restored_construction_in_place(
+        &mut self,
+        reclaim_delegations: bool,
+    ) -> Result<(), WorkerError> {
         self.pending_submission_handle()
             .reconcile_uploaded_file_pins()
             .map_err(|error| self.construction_failure(error.into()))?;
@@ -9752,10 +9861,12 @@ where
             segment_id: self.segment_id(),
         })
         .map_err(|error| self.construction_failure(error))?;
-        self.reconcile_restored_delegations()
-            .await
-            .map_err(|error| self.construction_failure(error))?;
-        Ok(self)
+        if reclaim_delegations {
+            self.reconcile_restored_delegations()
+                .await
+                .map_err(|error| self.construction_failure(error))?;
+        }
+        Ok(())
     }
 
     async fn reconcile_restored_delegations(&mut self) -> Result<(), WorkerError> {
@@ -10596,8 +10707,10 @@ fn compact_failure_category(error: &WorkerError) -> CompactFailureCategory {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
-    /// A constructor failed after acquiring resources. Retain these handles until
-    /// explicit cleanup succeeds; the Worker has dropped before this is returned.
+    /// A construction or activation step failed after acquiring resources. Retain
+    /// these handles until explicit cleanup succeeds. Consuming constructors drop
+    /// the Worker before returning; in-place activation leaves its owner responsible
+    /// for dropping it before allocation release.
     #[error("{source}")]
     ConstructionCleanup {
         #[source]

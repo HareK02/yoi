@@ -340,6 +340,84 @@ pub struct SpawnedWorkerRegistryLoad {
     pub reclaimed_unreachable: bool,
 }
 
+/// Read-only restore preparation using the registry that will be published by the Host.
+/// The Host must retain its lifecycle exclusion from preparation through application;
+/// the metadata reread detects source drift, but is not an atomic store transaction.
+/// Dropping an unapplied plan does not reclaim legacy child state.
+pub(crate) struct PreparedSpawnedWorkerRegistryLoad<St> {
+    pub(crate) registry: Arc<SpawnedWorkerRegistry>,
+    /// Projected outcome, not evidence that reclamation has already happened.
+    pub(crate) reclaimed_unreachable: bool,
+    runtime_dir: Arc<RuntimeDir>,
+    store: St,
+    worker_name: String,
+    parent_scope: Option<SharedScope>,
+    persisted_children: Vec<WorkerSpawnedChild>,
+    valid_records: Vec<SpawnedWorkerRecord>,
+    legacy_projection_exists: bool,
+}
+
+impl<St> PreparedSpawnedWorkerRegistryLoad<St>
+where
+    St: WorkerMetadataStore + Clone + Send + Sync + 'static,
+{
+    /// Apply only after all other fallible tool initialization, before socket publication.
+    /// Effects retain their original order: projection, canonical reclaim history, then
+    /// allocation/scope. An error may follow committed effects; no rollback is attempted.
+    pub(crate) async fn apply(&mut self) -> io::Result<SpawnedWorkerRegistryLoad> {
+        let metadata = self
+            .store
+            .read_by_name(&self.worker_name)
+            .map_err(store_error_to_io)?;
+        let reclaimed: Vec<_> = self
+            .persisted_children
+            .iter()
+            .map(reclaimed_child_from_metadata)
+            .collect();
+        // A prior apply may have committed the canonical reclaim and then failed
+        // in allocation/scope cleanup. Under the host's same lifecycle lock,
+        // confirm its exact retained facts rather than appending them again.
+        let already_reclaimed = !reclaimed.is_empty()
+            && metadata.as_ref().is_some_and(|metadata| {
+                metadata.spawned_children.is_empty()
+                    && metadata.reclaimed_children.ends_with(&reclaimed)
+            });
+        if !already_reclaimed
+            && metadata
+                .as_ref()
+                .map(|metadata| metadata.spawned_children.as_slice())
+                .unwrap_or_default()
+                != self.persisted_children.as_slice()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "spawned-child metadata changed after registry preparation",
+            ));
+        }
+
+        // Runtime projection is migration input only; the normal Internal registry is never
+        // materialized into spawned_workers.json. Only existence was captured, not its contents.
+        if !self.persisted_children.is_empty() || self.legacy_projection_exists {
+            self.runtime_dir.write_spawned_workers(&[]).await?;
+        }
+        if !reclaimed.is_empty() && !already_reclaimed {
+            self.store
+                .reclaim_spawned_children(&self.worker_name, reclaimed)
+                .map_err(store_error_to_io)?;
+        }
+        for record in &self.valid_records {
+            reclaim_record(&self.worker_name, self.parent_scope.as_ref(), record)?;
+        }
+
+        let reclaimed_unreachable = self.reclaimed_unreachable;
+        self.reclaimed_unreachable = false;
+        Ok(SpawnedWorkerRegistryLoad {
+            registry: self.registry.clone(),
+            reclaimed_unreachable,
+        })
+    }
+}
+
 impl SpawnedWorkerRegistry {
     pub(crate) fn bash_output(&self) -> tools::bash_output::BashOutputView {
         self.bash_output.lock().unwrap().clone()
@@ -429,6 +507,23 @@ impl SpawnedWorkerRegistry {
     where
         St: WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
+        Self::prepare_from_worker_state_with_reclaim(runtime_dir, store, worker_name, parent_scope)?
+            .apply()
+            .await
+    }
+
+    /// Capture legacy child facts without starting children or changing metadata,
+    /// projection, allocation, or scope. Tool initialization must clone this registry,
+    /// not construct a replacement, and defer reclamation to the owned plan's `apply`.
+    pub(crate) fn prepare_from_worker_state_with_reclaim<St>(
+        runtime_dir: Arc<RuntimeDir>,
+        store: St,
+        worker_name: String,
+        parent_scope: Option<SharedScope>,
+    ) -> io::Result<PreparedSpawnedWorkerRegistryLoad<St>>
+    where
+        St: WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
         let metadata = store
             .read_by_name(&worker_name)
             .map_err(store_error_to_io)?;
@@ -442,54 +537,33 @@ impl SpawnedWorkerRegistry {
                 Ok(record) => {
                     warn!(
                         worker = %record.worker_name,
-                        "reclaiming legacy persisted process SubWorker during Internal session restore"
+                        "captured legacy persisted process SubWorker for reclamation during Internal session restore"
                     );
                     valid_records.push(record);
                 }
                 Err(error) => warn!(
                     error = %error,
                     worker = %child.worker_name,
-                    "clearing corrupt legacy persisted process SubWorker record"
+                    "captured corrupt legacy persisted process SubWorker record for clearing"
                 ),
             }
         }
 
-        // Runtime projection is migration input only; the normal Internal registry is never
-        // materialized into spawned_workers.json.
         let legacy_projection_exists = runtime_dir.path().join("spawned_workers.json").exists();
-        if !persisted_children.is_empty() || legacy_projection_exists {
-            runtime_dir.write_spawned_workers(&[]).await?;
-        }
-        if !persisted_children.is_empty() {
-            let reclaimed = persisted_children
-                .iter()
-                .map(reclaimed_child_from_metadata)
-                .collect();
-            store
-                .reclaim_spawned_children(&worker_name, reclaimed)
-                .map_err(store_error_to_io)?;
-        }
-        for record in &valid_records {
-            reclaim_record(&worker_name, parent_scope.as_ref(), record)?;
-        }
-
-        Ok(SpawnedWorkerRegistryLoad {
-            registry: Arc::new(Self {
-                internal_records: std::sync::Mutex::new(Vec::new()),
-                service_records: std::sync::Mutex::new(Vec::new()),
-                #[cfg(test)]
-                fail_service_stops: std::sync::Mutex::new(HashMap::new()),
-                internal_names: std::sync::Mutex::new(HashSet::new()),
-                internal_shutting_down: AtomicBool::new(false),
-                pending_internal_spawns: AtomicUsize::new(0),
-                pending_internal_notify: Notify::new(),
-                internal_spawn_cleanup_failed: AtomicBool::new(false),
-                parent_scope,
-                bash_output: Mutex::new(tools::bash_output::BashOutputView::new()),
-                parent_protocol: Mutex::new(None),
-                protocol_publish_lock: Arc::new(Mutex::new(())),
-            }),
+        let registry = match &parent_scope {
+            Some(scope) => Self::new_internal(worker_name.clone(), scope.clone()),
+            None => Self::new(runtime_dir.clone()),
+        };
+        Ok(PreparedSpawnedWorkerRegistryLoad {
+            registry,
             reclaimed_unreachable: !persisted_children.is_empty(),
+            runtime_dir,
+            store,
+            worker_name,
+            parent_scope,
+            persisted_children,
+            valid_records,
+            legacy_projection_exists,
         })
     }
 
@@ -1140,6 +1214,10 @@ impl Drop for SpawnedWorkerRegistry {
             .filter(|record| !record.scope_reclaimed.load(Ordering::Acquire))
             .flat_map(delegated_write_rules)
             .collect::<Vec<_>>();
+        // Empty prepared registries own no delegations, including when abandoned or rejected.
+        if write_rules.is_empty() {
+            return;
+        }
         let _ = parent_scope.update(|current| current.with_removed_deny_rules(write_rules));
     }
 }
@@ -1165,19 +1243,18 @@ fn reclaim_record(
     parent_scope: Option<&SharedScope>,
     record: &SpawnedWorkerRecord,
 ) -> io::Result<()> {
-    if let Ok(path) = worker_allocation::default_allocation_path() {
-        if let Ok(mut guard) = worker_allocation::LockFileGuard::open(&path) {
-            match worker_allocation::reclaim_delegated_scope(
-                &mut guard,
-                parent_name,
-                &record.worker_name,
-                &record.scope_delegated,
-            ) {
-                Ok(()) | Err(worker_allocation::ScopeLockError::UnknownWorker(_)) => {}
-                Err(error) => return Err(io::Error::other(error)),
-            }
-        }
+    let path = worker_allocation::default_allocation_path().map_err(io::Error::other)?;
+    let mut guard = worker_allocation::LockFileGuard::open(&path).map_err(io::Error::other)?;
+    match worker_allocation::reclaim_delegated_scope(
+        &mut guard,
+        parent_name,
+        &record.worker_name,
+        &record.scope_delegated,
+    ) {
+        Ok(()) | Err(worker_allocation::ScopeLockError::UnknownWorker(_)) => {}
+        Err(error) => return Err(io::Error::other(error)),
     }
+    drop(guard);
     if let Some(parent_scope) = parent_scope {
         let write_rules = record
             .scope_delegated
@@ -1240,16 +1317,267 @@ fn store_error_to_io(error: WorkerStoreError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    //! Legacy restore cases connect the registry to canonical aggregate storage,
+    //! runtime projections, and temporary SharedScope rules. Successful apply uses
+    //! a corrupt legacy record to exercise durable clearing without consulting the
+    //! process-global legacy allocation file; valid-record scope reclaim is also
+    //! covered by the existing external restore test.
+
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use manifest::{Scope, ScopeConfig};
-    use session_store::LogEntry;
+    use session_store::{LogEntry, WorkerAggregateStore, WorkerMetadata, WorkerSpawnedScopeRule};
+    use tempfile::TempDir;
 
     use super::*;
     use crate::internal_worker::{
         InternalWorkerSessionStatus, test_internal_worker_session,
         test_internal_worker_session_with_greeting,
     };
+
+    struct LegacyRestoreFixture {
+        runtime_dir: Arc<RuntimeDir>,
+        store: WorkerAggregateStore,
+        parent_scope: SharedScope,
+        scope_root: PathBuf,
+        metadata_path: PathBuf,
+        // Keep all storage and scope paths alive until the other fixture fields are dropped.
+        _root: TempDir,
+    }
+
+    impl LegacyRestoreFixture {
+        async fn new(permission: &str) -> Self {
+            let root = TempDir::new().unwrap();
+            let scope_root = root.path().join("scope");
+            std::fs::create_dir(&scope_root).unwrap();
+            let aggregate = root.path().join("aggregate");
+            let store = WorkerAggregateStore::new(&aggregate, "parent").unwrap();
+            let runtime_dir = Arc::new(
+                RuntimeDir::create(&root.path().join("runtime"), "parent")
+                    .await
+                    .unwrap(),
+            );
+            let mut metadata =
+                WorkerMetadata::new("parent", None).with_workspace_id("restore-test-workspace");
+            metadata.spawned_children.push(WorkerSpawnedChild {
+                worker_name: "legacy-child".into(),
+                socket_path: root.path().join("legacy.sock"),
+                callback_address: runtime_dir.socket_path(),
+                scope_delegated: vec![WorkerSpawnedScopeRule {
+                    target: scope_root.clone(),
+                    permission: permission.into(),
+                    recursive: true,
+                    symlink_policy: Default::default(),
+                }],
+            });
+            store.write(&metadata).unwrap();
+            let write_rule = ScopeRule {
+                target: scope_root.clone(),
+                permission: Permission::Write,
+                recursive: true,
+                symlink_policy: Default::default(),
+            };
+            let parent_scope = SharedScope::new(
+                Scope::from_config(&ScopeConfig {
+                    allow: vec![write_rule.clone()],
+                    deny: vec![write_rule],
+                })
+                .unwrap(),
+            );
+            Self {
+                runtime_dir,
+                store,
+                parent_scope,
+                scope_root,
+                metadata_path: aggregate.join("metadata.json"),
+                _root: root,
+            }
+        }
+
+        fn prepare(&self) -> PreparedSpawnedWorkerRegistryLoad<WorkerAggregateStore> {
+            SpawnedWorkerRegistry::prepare_from_worker_state_with_reclaim(
+                self.runtime_dir.clone(),
+                self.store.clone(),
+                "parent".into(),
+                Some(self.parent_scope.clone()),
+            )
+            .unwrap()
+        }
+
+        fn projection_path(&self) -> PathBuf {
+            self.runtime_dir.path().join("spawned_workers.json")
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_preparation_and_abandonment_leave_legacy_state_unchanged() {
+        for projection_exists in [false, true] {
+            let fixture = LegacyRestoreFixture::new("write").await;
+            if projection_exists {
+                // Projection contents are deliberately not decoded during preparation.
+                std::fs::write(fixture.projection_path(), b"obsolete projection").unwrap();
+            }
+            let metadata_before = std::fs::read(&fixture.metadata_path).unwrap();
+            let projection_before = std::fs::read(fixture.projection_path()).ok();
+            let scope_before = fixture.parent_scope.snapshot();
+            assert!(!scope_before.is_writable(&fixture.scope_root));
+
+            let prepared = fixture.prepare();
+
+            assert!(prepared.reclaimed_unreachable);
+            assert!(prepared.registry.list_internal().is_empty());
+            assert!(prepared.registry.internal_worker_snapshots().is_empty());
+            assert_eq!(
+                std::fs::read(&fixture.metadata_path).unwrap(),
+                metadata_before
+            );
+            assert_eq!(
+                std::fs::read(fixture.projection_path()).ok(),
+                projection_before
+            );
+            assert!(Arc::ptr_eq(&scope_before, &fixture.parent_scope.snapshot()));
+            assert!(!fixture.runtime_dir.socket_path().exists());
+            drop(prepared);
+            assert_eq!(
+                std::fs::read(&fixture.metadata_path).unwrap(),
+                metadata_before
+            );
+            assert_eq!(
+                std::fs::read(fixture.projection_path()).ok(),
+                projection_before
+            );
+            assert!(Arc::ptr_eq(&scope_before, &fixture.parent_scope.snapshot()));
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_apply_clears_canonical_children_and_projection_on_same_registry() {
+        let fixture = LegacyRestoreFixture::new("unsupported-legacy-permission").await;
+        std::fs::write(fixture.projection_path(), b"obsolete projection").unwrap();
+        let scope_before = fixture.parent_scope.snapshot();
+        let mut prepared = fixture.prepare();
+        let shared_registry = prepared.registry.clone();
+        // Unrelated metadata may advance while tools are initialized.
+        fixture.store.add_peer("parent", "new-peer").unwrap();
+        let mut expected = fixture.store.read_by_name("parent").unwrap().unwrap();
+        expected.reclaimed_children.extend(
+            expected
+                .spawned_children
+                .iter()
+                .map(reclaimed_child_from_metadata),
+        );
+        expected.spawned_children.clear();
+
+        let loaded = prepared.apply().await.unwrap();
+
+        assert!(loaded.reclaimed_unreachable);
+        assert!(Arc::ptr_eq(&shared_registry, &loaded.registry));
+        assert!(shared_registry.list_internal().is_empty());
+        assert_eq!(
+            fixture.store.read_by_name("parent").unwrap(),
+            Some(expected)
+        );
+        let projection: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture.projection_path()).unwrap()).unwrap();
+        assert_eq!(projection, serde_json::json!([]));
+        // Corrupt records are audited and cleared, not interpreted as scope grants.
+        assert!(Arc::ptr_eq(&scope_before, &fixture.parent_scope.snapshot()));
+        assert!(
+            !fixture
+                .parent_scope
+                .snapshot()
+                .is_writable(&fixture.scope_root)
+        );
+        assert!(!fixture.runtime_dir.socket_path().exists());
+    }
+
+    #[tokio::test]
+    async fn prepared_apply_rejects_child_source_drift_before_any_effects() {
+        for drift in ["scope", "socket", "removal", "metadata-deletion"] {
+            let fixture = LegacyRestoreFixture::new("write").await;
+            std::fs::write(fixture.projection_path(), b"obsolete projection").unwrap();
+            let scope_before = fixture.parent_scope.snapshot();
+            let mut prepared = fixture.prepare();
+            if drift == "metadata-deletion" {
+                fixture.store.delete_by_name("parent").unwrap();
+            } else {
+                fixture
+                    .store
+                    .update_by_name("parent", |metadata| match drift {
+                        "scope" => {
+                            metadata.spawned_children[0].scope_delegated[0].recursive = false
+                        }
+                        "socket" => {
+                            metadata.spawned_children[0].socket_path =
+                                fixture.runtime_dir.path().join("replacement.sock");
+                        }
+                        "removal" => metadata.spawned_children.clear(),
+                        _ => unreachable!(),
+                    })
+                    .unwrap();
+            }
+            let metadata_before = std::fs::read(&fixture.metadata_path).ok();
+            let projection_before = std::fs::read(fixture.projection_path()).unwrap();
+
+            let error = prepared
+                .apply()
+                .await
+                .err()
+                .expect("source drift must fail");
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(std::fs::read(&fixture.metadata_path).ok(), metadata_before);
+            assert_eq!(
+                std::fs::read(fixture.projection_path()).unwrap(),
+                projection_before
+            );
+            assert!(Arc::ptr_eq(&scope_before, &fixture.parent_scope.snapshot()));
+            assert!(!fixture.runtime_dir.socket_path().exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_apply_clears_projection_only_without_reporting_child_reclaim() {
+        let fixture = LegacyRestoreFixture::new("write").await;
+        fixture
+            .store
+            .set_spawned_children("parent", Vec::new())
+            .unwrap();
+        std::fs::write(fixture.projection_path(), b"obsolete projection").unwrap();
+        let metadata_before = std::fs::read(&fixture.metadata_path).unwrap();
+        let mut prepared = fixture.prepare();
+        assert!(!prepared.reclaimed_unreachable);
+
+        let loaded = prepared.apply().await.unwrap();
+
+        assert!(!loaded.reclaimed_unreachable);
+        assert_eq!(
+            std::fs::read(&fixture.metadata_path).unwrap(),
+            metadata_before
+        );
+        let projection: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture.projection_path()).unwrap()).unwrap();
+        assert_eq!(projection, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn prepared_apply_projection_failure_keeps_canonical_children_and_scope() {
+        let fixture = LegacyRestoreFixture::new("write").await;
+        std::fs::create_dir(fixture.projection_path()).unwrap();
+        let metadata_before = std::fs::read(&fixture.metadata_path).unwrap();
+        let scope_before = fixture.parent_scope.snapshot();
+        let mut prepared = fixture.prepare();
+
+        assert!(prepared.apply().await.is_err());
+
+        assert_eq!(
+            std::fs::read(&fixture.metadata_path).unwrap(),
+            metadata_before
+        );
+        assert!(fixture.projection_path().is_dir());
+        assert!(Arc::ptr_eq(&scope_before, &fixture.parent_scope.snapshot()));
+    }
 
     fn registry() -> Arc<SpawnedWorkerRegistry> {
         let scope = Scope::from_config(&ScopeConfig {

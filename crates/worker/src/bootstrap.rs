@@ -323,3 +323,223 @@ where
         }
     }
 }
+
+/// Host bindings for one unpublished restored Controller. These do not expose
+/// Worker execution or permit arbitrary mutation during preparation.
+pub struct RestoredControllerBindings {
+    pub backend_job: Option<crate::BackendJobExecutionBinding>,
+    pub workdir_sessions: std::sync::Arc<workdir::WorkdirSessionRouter>,
+    pub observation_provider:
+        Option<std::sync::Arc<dyn crate::feature::builtin::WorkerObservationProvider>>,
+    pub subjektiv_attached: bool,
+}
+
+/// The same real receiver, snapshot sources and paired subscription retained
+/// privately across the Runtime's durable restore decision.
+pub struct UnpublishedRestoredController<St: Store> {
+    initialized: Option<crate::controller::InitializedWorkerController<Box<dyn LlmClient>, St>>,
+    activation: Option<crate::worker::RestoredWorkerActivation>,
+    streams: Option<crate::ipc::protocol_session::WorkerProtocolSessionStreams>,
+    subjektiv_attached: bool,
+    effects_applied: bool,
+    activation_failed: bool,
+    closing: bool,
+}
+
+pub struct ActivatedRestoredController {
+    pub controller: BootstrappedWorker,
+    pub streams: crate::ipc::protocol_session::WorkerProtocolSessionStreams,
+}
+
+impl<St> PreparedRestoredWorker<St>
+where
+    St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+{
+    pub fn workspace_client_handle(
+        &mut self,
+    ) -> Result<std::sync::Arc<dyn crate::WorkspaceClient>, WorkerError> {
+        Ok(self.worker_mut()?.workspace_client_handle())
+    }
+
+    pub fn retain_startup_feature_cleanup(
+        &mut self,
+    ) -> Result<crate::WorkerStartupFeatureCleanup, WorkerError> {
+        Ok(self.worker_mut()?.retain_startup_feature_cleanup())
+    }
+
+    /// Initialize the real Controller without allocation, canonical restore
+    /// writes, attribution changes, registry reclamation or input consumption.
+    /// MCP discovery and Feature tasks belong to the retained startup cleanup.
+    pub async fn prepare_runtime_controller(
+        mut self,
+        run_dir: &std::path::Path,
+        transport: WorkerControllerTransport,
+        bindings: RestoredControllerBindings,
+    ) -> Result<UnpublishedRestoredController<St>, WorkerBootstrapError> {
+        let worker = self.worker_mut().map_err(WorkerBootstrapError::Worker)?;
+        if let Some(binding) = bindings.backend_job {
+            worker.bind_backend_job(binding).map_err(|error| {
+                WorkerBootstrapError::Worker(WorkerError::FeatureLifecycle(error.into()))
+            })?;
+        }
+        worker
+            .workdir_sessions()
+            .close_all()
+            .await
+            .map_err(|error| {
+                WorkerBootstrapError::Worker(WorkerError::FeatureLifecycle(error.to_string()))
+            })?;
+        worker.bind_workdir_sessions(bindings.workdir_sessions);
+        worker.bind_worker_observation_provider(bindings.observation_provider);
+        let flow_enabled = worker.manifest().feature.flow.enabled;
+        if flow_enabled {
+            let report = worker
+                .install_runtime_flow_transition_feature()
+                .map_err(|error| {
+                    WorkerBootstrapError::Worker(WorkerError::FeatureLifecycle(error))
+                })?;
+            if report.reports.iter().any(|report| !report.installed) {
+                return Err(WorkerBootstrapError::Worker(WorkerError::FeatureLifecycle(
+                    "Flow transition installation refused".into(),
+                )));
+            }
+        }
+        let (worker, activation) = self
+            .into_controller_parts()
+            .map_err(WorkerBootstrapError::Worker)?;
+        let initialized = WorkerController::initialize_restored(worker, run_dir, transport)
+            .await
+            .map_err(|source| WorkerBootstrapError::Controller {
+                source,
+                cleanup_failed: true,
+            })?;
+        if flow_enabled {
+            initialized.handle.shared_state.enable_flow_transition();
+        }
+        let streams = {
+            let _guard = initialized.handle.protocol_snapshot_publish_guard();
+            crate::ipc::protocol_session::subscribe_worker_protocol_session(&initialized.handle)
+        };
+        Ok(UnpublishedRestoredController {
+            initialized: Some(initialized),
+            activation: Some(activation),
+            streams: Some(streams),
+            subjektiv_attached: bindings.subjektiv_attached,
+            effects_applied: false,
+            activation_failed: false,
+            closing: false,
+        })
+    }
+}
+
+impl<St> UnpublishedRestoredController<St>
+where
+    St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+{
+    pub fn snapshot(&self) -> &protocol::Event {
+        &self
+            .streams
+            .as_ref()
+            .expect("unpublished restore streams")
+            .snapshot_event
+    }
+
+    /// Only publication failures after confirmed effects can retry on this
+    /// exact owner. Partial activation must be reconciled, never blindly rerun.
+    pub fn can_retry_publication(&self) -> bool {
+        self.initialized.is_some()
+            && self.effects_applied
+            && !self.activation_failed
+            && !self.closing
+    }
+
+    /// Apply canonical restore effects after the host's durable decision, while
+    /// retaining the same private Controller for subsequent publication.
+    pub async fn apply_effects(&mut self) -> Result<(), WorkerBootstrapError> {
+        let initialized = self
+            .initialized
+            .as_mut()
+            .ok_or_else(|| WorkerBootstrapError::Worker(WorkerError::RestoreCandidateClosing))?;
+        if self.activation_failed || self.closing {
+            return Err(WorkerBootstrapError::Worker(
+                WorkerError::RestoreCandidateClosing,
+            ));
+        }
+        if !self.effects_applied {
+            self.activation_failed = true;
+            self.activation
+                .as_ref()
+                .expect("restore activation")
+                .activate(&mut initialized.worker)
+                .await
+                .map_err(WorkerBootstrapError::Worker)?;
+            initialized
+                .worker
+                .finalize_subjektiv_session_attribution(
+                    self.subjektiv_attached,
+                    crate::SubjektivSessionAttributionLifecycle::RestoredSession,
+                )
+                .map_err(WorkerBootstrapError::Worker)?;
+            self.effects_applied = true;
+            self.activation_failed = false;
+            self.activation = None;
+        }
+        Ok(())
+    }
+
+    pub fn allocation_cleanup(
+        &self,
+    ) -> Option<crate::runtime::worker_allocation::ScopeAllocationCleanup> {
+        self.initialized
+            .as_ref()
+            .and_then(|initialized| initialized.worker.restore_allocation_cleanup_handle())
+    }
+
+    pub async fn activate(&mut self) -> Result<ActivatedRestoredController, WorkerBootstrapError> {
+        self.apply_effects().await?;
+        let initialized = self
+            .initialized
+            .as_mut()
+            .expect("same initialized Controller");
+        let publication = initialized.prepare_publication().await.map_err(|source| {
+            WorkerBootstrapError::Controller {
+                source,
+                cleanup_failed: true,
+            }
+        })?;
+        let initialized = self
+            .initialized
+            .take()
+            .expect("same initialized Controller");
+        let (handle, shutdown, controller_task) = initialized.start(publication);
+        Ok(ActivatedRestoredController {
+            controller: BootstrappedWorker {
+                handle,
+                shutdown,
+                controller_task,
+            },
+            streams: self.streams.take().expect("same paired subscription"),
+        })
+    }
+
+    pub async fn discard(&mut self) -> Result<(), WorkerError> {
+        self.closing = true;
+        if let Some(initialized) = self.initialized.as_mut() {
+            initialized
+                .worker
+                .retain_startup_feature_cleanup()
+                .shutdown()
+                .await
+                .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?;
+            initialized
+                .worker
+                .workdir_sessions()
+                .close_all()
+                .await
+                .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?;
+        }
+        self.streams = None;
+        self.initialized = None;
+        Ok(())
+    }
+}
