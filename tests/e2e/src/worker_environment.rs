@@ -1,3 +1,6 @@
+#[path = "worker_environment/response_loss.rs"]
+mod response_loss;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -571,12 +574,7 @@ impl WorkerE2eEnvironment {
         if self.runtime_public_identity.is_none() {
             self.initialize_runtime_identity(self.runtime_id.clone())?;
         }
-        let runtime_identity = self
-            .runtime_public_identity
-            .clone()
-            .expect("initialized identity");
         let bundle_path = self.root.join("workspace-public-identity.json");
-        let server_url = self.required_server_url()?.to_string();
         let workspace_id = self.required_workspace_id()?.to_string();
         let runtime_binary = self.binaries.binary("yoi-runtime")?;
         self.run_command(
@@ -616,6 +614,20 @@ impl WorkerE2eEnvironment {
 
         seed(self)?;
         self.write_metadata("runtime-seeded")?;
+        self.start_runtime_process()
+    }
+
+    fn start_runtime_process(&mut self) -> Result<()> {
+        if self.runtime.is_some() {
+            return Err(HarnessError::Protocol("Runtime is already running".into()));
+        }
+        let runtime_binary = self.binaries.binary("yoi-runtime")?;
+        let runtime_identity = self
+            .runtime_public_identity
+            .clone()
+            .ok_or_else(|| HarnessError::Protocol("Runtime identity is not initialized".into()))?;
+        let server_url = self.required_server_url()?.to_string();
+        let workspace_id = self.required_workspace_id()?.to_string();
         let mut command = self.isolated_command(&runtime_binary);
         command.args([
             "--bind",
@@ -667,6 +679,36 @@ impl WorkerE2eEnvironment {
         self.assert_connected()?;
         self.write_metadata("running")?;
         Ok(())
+    }
+
+    /// Kill/reap only the Runtime child owned by this environment, retaining roots
+    /// and identities. Restart neither seeds storage nor rotates restore requests.
+    pub fn crash_and_restart_runtime(&mut self) -> Result<()> {
+        let runtime = self
+            .runtime
+            .as_mut()
+            .ok_or_else(|| HarnessError::Protocol("Runtime is not running".into()))?;
+        let pid = runtime.id();
+        let status = runtime.kill_and_reap(EXIT_WAIT)?;
+        runtime.join_readers_until(Instant::now() + EXIT_WAIT)?;
+        fs::write(
+            self.artifacts_dir.join("runtime-crash.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "owned_pid": pid, "reaped": true, "exit_status": status.to_string(),
+                "same_runtime_id": self.runtime_id,
+            }))?,
+        )?;
+        self.runtime.take();
+        for stream in ["stdout", "stderr"] {
+            fs::rename(
+                self.artifacts_dir.join(format!("runtime.{stream}.log")),
+                self.artifacts_dir
+                    .join(format!("runtime-before-crash.{stream}.log")),
+            )?;
+        }
+        self.runtime_url = None;
+        self.runtime_shutdown = WorkerProcessShutdownOutcome::NotStarted;
+        self.start_runtime_process()
     }
 
     pub fn assert_connected(&self) -> Result<()> {
@@ -750,6 +792,38 @@ impl WorkerE2eEnvironment {
                 })),
             "restore Worker",
         )
+    }
+
+    /// Forward one unchanged public restore request through an owned loopback
+    /// relay, consume its complete upstream response, and close without delivering
+    /// any response bytes. The returned JSON is relay evidence, not caller success.
+    pub fn restore_worker_losing_response(
+        &self,
+        worker_id: &str,
+        request_id: &str,
+        expected_observation_token: &str,
+    ) -> Result<Value> {
+        let token = self.access_token.as_deref().ok_or_else(|| {
+            HarnessError::Protocol("Backend access token is not initialized".into())
+        })?;
+        let request = self
+            .client
+            .post(self.worker_url(worker_id, "restore")?)
+            .bearer_auth(token)
+            .header(reqwest::header::CONNECTION, "close")
+            .timeout(STARTUP_WAIT + EXIT_WAIT)
+            .json(&serde_json::json!({
+                "request_id": request_id,
+                "expected_observation_token": expected_observation_token,
+            }))
+            .build()
+            .map_err(|_| HarnessError::Protocol("build response-loss request".into()))?;
+        let evidence = response_loss::drop_response(&self.client, request)?;
+        self.append_operation(
+            "restore response consumed by relay, caller transport failed",
+            0,
+        )?;
+        Ok(evidence)
     }
 
     pub fn stop_worker(&self, worker_id: &str) -> Result<Value> {
