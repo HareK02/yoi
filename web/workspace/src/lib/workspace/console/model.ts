@@ -201,6 +201,8 @@ export type ConsoleProjection = {
   lines: ConsoleLine[];
   tasks: ConsoleTask[];
   taskNextId: number;
+  /** Task calls arrive both live and committed; apply each call only once. */
+  appliedTaskCallIds: ReadonlySet<string>;
   status: string | null;
   workerState: WorkerStateSnapshot | null;
   compaction: InFlightCompaction | null;
@@ -308,6 +310,7 @@ export function emptyConsoleProjection(): ConsoleProjection {
     lines: [],
     tasks: [],
     taskNextId: 1,
+    appliedTaskCallIds: new Set(),
     status: null,
     workerState: null,
     compaction: null,
@@ -1153,6 +1156,7 @@ export function applyProtocolEvent(
     lines: [...projection.lines],
     tasks: [...projection.tasks],
     taskNextId: projection.taskNextId,
+    appliedTaskCallIds: projection.appliedTaskCallIds,
     status: projection.status,
     workerState: projection.workerState,
     compaction: projection.compaction,
@@ -1279,7 +1283,7 @@ export function applyProtocolEvent(
         argsStream: event.data.arguments,
         state: "running",
       });
-      applyTaskTool(next, event.data.name, event.data.arguments);
+      applyTaskTool(next, event.data.id, event.data.name, event.data.arguments);
       break;
     case "tool_result":
       attachToolResult(next, envelope.eventId, event.data.id, {
@@ -1326,6 +1330,7 @@ export function applyProtocolEvent(
       next.lines = snapshot.lines;
       next.tasks = snapshot.tasks;
       next.taskNextId = snapshot.taskNextId;
+      next.appliedTaskCallIds = snapshot.appliedTaskCallIds;
       appendSnapshotInFlightLines(
         next,
         event.data.in_flight?.blocks ?? [],
@@ -1416,6 +1421,7 @@ export function applyProtocolEvent(
       next.lines = [...segment.lines, ...retainedErrors, ...retainedCompaction];
       next.tasks = segment.tasks;
       next.taskNextId = segment.taskNextId;
+      next.appliedTaskCallIds = segment.appliedTaskCallIds;
       next.workerMetadata = metadataWithoutContext(next.workerMetadata);
       break;
     }
@@ -2409,9 +2415,15 @@ function usageText(
 
 function applyTaskTool(
   projection: ConsoleProjection,
+  callId: string,
   name: string,
   argumentsJson: string,
 ): void {
+  if (name !== "TaskCreate" && name !== "TaskUpdate") return;
+  if (projection.appliedTaskCallIds.has(callId)) return;
+  // Fence task mutations, not tool-row reconciliation or corrected results.
+  // Copy on write so previously returned projections remain unchanged.
+  projection.appliedTaskCallIds = new Set(projection.appliedTaskCallIds).add(callId);
   const state = applyTaskToolCall(
     { tasks: projection.tasks, nextTaskId: projection.taskNextId },
     name,
@@ -2448,6 +2460,7 @@ function snapshotProjectionFromSession(
     lines: [],
     tasks: [],
     taskNextId: 1,
+    appliedTaskCallIds: new Set(),
     status: null,
     workerState: null,
     compaction: null,
@@ -2715,10 +2728,11 @@ function applyLoggedItem(
     case "tool_call": {
       const name = stringField(item, "name") ?? "Tool";
       const argumentsJson = stringField(item, "arguments") ?? "";
+      const callId = stringField(item, "call_id") ?? eventId;
       upsertToolCall(
         projection,
         eventId,
-        stringField(item, "call_id") ?? eventId,
+        callId,
         {
           name,
           arguments: argumentsJson,
@@ -2726,7 +2740,7 @@ function applyLoggedItem(
           state: "running",
         },
       );
-      applyTaskTool(projection, name, argumentsJson);
+      applyTaskTool(projection, callId, name, argumentsJson);
       break;
     }
     case "tool_result":

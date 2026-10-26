@@ -1015,6 +1015,55 @@ test("mini task summary opens and closes details without a header Tasks button",
   expect(summary.getAttribute("aria-expanded")).toBe("false");
 });
 
+test.each([false, true])("live and committed TaskCreate render one task (committed first: %s)", async (committedFirst) => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
+  render(ConsolePage, { data: pageData() });
+  await waitFor(() => expect(multiplexer.subscribe).toHaveBeenCalledOnce());
+  latestListener().onFrame(subscribedFrame(emptySession()));
+  await screen.findByText("No conversation to display");
+  const entry = {
+    kind: "tool_call" as const, entry_id: "task-create", timestamp: 1,
+    provenance: "model_output" as const, derived_from: [],
+    call_id: "task-call", name: "TaskCreate",
+    arguments: JSON.stringify({ subject: "Inspect live tasks", description: "One task per call" }),
+  };
+  const live: ProtocolEvent = { event: "tool_call_done", data: {
+    id: entry.call_id, name: entry.name, arguments: entry.arguments,
+  } };
+  const committed: ProtocolEvent = { event: "session_entry_committed", data: { entry } };
+  protocolEvent({ event: "tool_call_start", data: { id: entry.call_id, name: entry.name } });
+  protocolEvent(committedFirst ? committed : live);
+  const summary = await screen.findByRole("button", { name: /1 task — pending/ });
+  await fireEvent.click(summary);
+  const pane = await screen.findByRole("complementary", { name: "Worker tasks" });
+  expect(within(pane).getAllByRole("listitem")).toHaveLength(1);
+  protocolEvent(committedFirst ? live : committed);
+  protocolEvent(live);
+  protocolEvent(committed);
+  await settleMicrotasks();
+  expect(within(pane).getAllByRole("listitem")).toHaveLength(1);
+  expect(within(pane).getByText("Inspect live tasks")).toBeTruthy();
+  expect(screen.getByRole("button", { name: /1 task — pending/ })).toBeTruthy();
+
+  // Reconnecting from the committed snapshot must produce exactly the same list.
+  const session = emptySession();
+  session.entries.push(entry);
+  latestListener().onFrame(subscribedFrame(session));
+  protocolEvent(committed);
+  await settleMicrotasks();
+  const restoredPane = screen.getByRole("complementary", { name: "Worker tasks" });
+  expect(within(restoredPane).getAllByRole("listitem")).toHaveLength(1);
+  expect(within(restoredPane).getByText("#1")).toBeTruthy();
+
+  // Identical text in a different call is a genuinely separate task.
+  protocolEvent({ event: "tool_call_done", data: { ...live.data, id: "second-task-call" } });
+  protocolEvent({ event: "session_entry_committed", data: {
+    entry: { ...entry, entry_id: "second-task-entry", call_id: "second-task-call" },
+  } });
+  await waitFor(() => expect(within(restoredPane).getAllByRole("listitem")).toHaveLength(2));
+  expect(within(restoredPane).getByText("#2")).toBeTruthy();
+});
+
 test("latest jump is icon-only, hidden at the bottom, and resumes following streamed output", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => Response.json({ availability: "live_protocol" })));
   const view = render(ConsolePage, { data: pageData() });

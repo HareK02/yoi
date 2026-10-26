@@ -3025,6 +3025,128 @@ Deno.test("projectConsole mirrors live TaskCreate and TaskUpdate calls", () => {
   }]);
 });
 
+function taskCallEntry(
+  callId: string,
+  name = "TaskCreate",
+  args: object = { subject: "Inspect tasks", description: "Task detail" },
+): Extract<SessionSnapshotEntry, { kind: "tool_call" }> {
+  return {
+    kind: "tool_call", entry_id: `entry:${callId}`, timestamp: 1,
+    provenance: "model_output", derived_from: [],
+    call_id: callId, name, arguments: JSON.stringify(args),
+  };
+}
+
+function taskLiveEvent(entry: ReturnType<typeof taskCallEntry>): Event {
+  return { event: "tool_call_done", data: {
+    id: entry.call_id, name: entry.name, arguments: entry.arguments,
+  } };
+}
+
+function taskCommitEvent(entry: SessionSnapshotEntry): Event {
+  return { event: "session_entry_committed", data: { entry } };
+}
+
+Deno.test("Tasks apply each call once across live, committed and replay events", () => {
+  const first = taskCallEntry("first");
+  const second = taskCallEntry("second"); // Identical arguments, distinct call.
+  for (const committedFirst of [false, true]) {
+    const projector = createConsoleProjector();
+    for (const entry of [first, second]) {
+      const events = [taskLiveEvent(entry), taskCommitEvent(entry)];
+      if (committedFirst) events.reverse();
+      const initial = projector.append([{ eventId: `${entry.call_id}:first`, event: events[0] }]);
+      const expected = initial.tasks;
+      const reconciled = projector.append([
+        { eventId: `${entry.call_id}:second`, event: events[1] },
+        { eventId: `${entry.call_id}:replay-live`, event: taskLiveEvent(entry) },
+        { eventId: `${entry.call_id}:replay-commit`, event: taskCommitEvent(entry) },
+      ]);
+      assertEquals(reconciled.tasks, expected);
+      assertEquals(initial.tasks, expected);
+    }
+    const result = projector.snapshot();
+    assertEquals(result.tasks.map((task) => task.taskid), [1, 2]);
+    assertEquals(result.taskNextId, 3);
+    assertEquals(result.lines.filter((line) => line.kind === "tool").length, 2);
+  }
+});
+
+Deno.test("Tasks snapshot and segment rebuild retain call deduplication and reset old state", () => {
+  const entry = taskCallEntry("retained");
+  const discarded = taskCallEntry("discarded");
+  const snapshot = snapshotEvent("/repo") as SnapshotEvent;
+  snapshot.data.session.entries = [entry];
+  for (const event of [snapshot, { event: "segment_rotated", data: { session: snapshot.data.session } } satisfies Event]) {
+    const projector = createConsoleProjector();
+    projector.append([
+      { eventId: "old", event: taskLiveEvent(discarded) },
+      { eventId: "live", event: taskLiveEvent(entry) },
+      { eventId: "commit", event: taskCommitEvent(entry) },
+    ]);
+    const rebuilt = projector.append([{ eventId: "rebuild", event }]);
+    const replayed = projector.append([
+      { eventId: "replayed-live", event: taskLiveEvent(entry) },
+      { eventId: "replayed-commit", event: taskCommitEvent(entry) },
+    ]);
+    assertEquals(replayed.tasks, rebuilt.tasks);
+    assertEquals(replayed.tasks.map((task) => task.taskid), [1]);
+    assertEquals(replayed.taskNextId, 2);
+    const fresh = projector.append([{ eventId: "new", event: taskLiveEvent(discarded) }]);
+    assertEquals(fresh.tasks.map((task) => task.taskid), [1, 2]);
+  }
+});
+
+Deno.test("Tasks late call replay cannot undo updates or resurrect deleted tasks", () => {
+  const create = taskCallEntry("create");
+  const start = taskCallEntry("start", "TaskUpdate", { taskid: 1, status: "inprogress" });
+  const complete = taskCallEntry("complete", "TaskUpdate", { taskid: 1, status: "completed" });
+  const remove = taskCallEntry("remove", "TaskUpdate", { taskid: 1, status: "deleted" });
+  const projector = createConsoleProjector();
+  for (const entry of [create, start, complete]) {
+    projector.append([{ eventId: entry.call_id, event: taskLiveEvent(entry) }]);
+  }
+  const completed = projector.append([{ eventId: "late-start", event: taskCommitEvent(start) }]);
+  assertEquals(completed.tasks[0].status, "completed");
+  const deleted = projector.append([
+    { eventId: "remove", event: taskLiveEvent(remove) },
+    { eventId: "late-create", event: taskCommitEvent(create) },
+    { eventId: "late-complete", event: taskCommitEvent(complete) },
+  ]);
+  assertEquals(deleted.tasks, []);
+  assertEquals(deleted.taskNextId, 2);
+});
+
+Deno.test("Tasks deduplication does not suppress committed tool result corrections", () => {
+  const entry = taskCallEntry("create");
+  const result: SessionSnapshotEntry = {
+    kind: "tool_result", entry_id: "result", timestamp: 2,
+    provenance: "tool_output", derived_from: [], call_id: entry.call_id,
+    summary: "Created task", content: "original result", is_error: false, attachments: [],
+  };
+  const projection = projectConsole([
+    { eventId: "live", event: taskLiveEvent(entry) },
+    { eventId: "commit", event: taskCommitEvent(entry) },
+    { eventId: "result", event: taskCommitEvent(result) },
+    { eventId: "correction", event: taskCommitEvent({ ...result, content: "corrected result" }) },
+  ]);
+  assertEquals(projection.tasks.length, 1);
+  assertEquals(projection.lines[0].toolCall?.output, "corrected result");
+});
+
+Deno.test("Tasks call identities are scoped to each Worker projection", () => {
+  const entry = taskCallEntry("shared-call-id");
+  const worker = { session_id: "child", name: "child", parent_session_id: "parent", kind: "sub_worker" as const };
+  const projection = projectConsole([
+    { eventId: "parent-live", event: taskLiveEvent(entry) },
+    { eventId: "child-live", event: { event: "internal_worker", data: { worker, event: taskLiveEvent(entry) } } },
+    { eventId: "parent-commit", event: taskCommitEvent(entry) },
+    { eventId: "child-commit", event: { event: "internal_worker", data: { worker, event: taskCommitEvent(entry) } } },
+  ]);
+  assertEquals(projection.tasks.length, 1);
+  assertEquals(projection.internalWorkers[0].console.tasks, projection.tasks);
+});
+
 Deno.test("Internal Worker output stays separate and follows parent stream arrival order", () => {
   const worker = {
     session_id: "child-session",
