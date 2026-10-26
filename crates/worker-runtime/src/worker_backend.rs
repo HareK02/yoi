@@ -539,6 +539,16 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
     ) -> Result<(), String> {
         Ok(())
     }
+
+    /// Retire observation of this exact Controller after confirmed cleanup.
+    /// Called under the same per-Worker lock as publication and replacement.
+    fn deactivate_stopped_controller(
+        &self,
+        _worker_ref: &WorkerRef,
+        _handle: &WorkerHandle,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Production factory that resolves a normal Worker profile and spawns it under
@@ -574,6 +584,21 @@ impl RuntimeWorkerObservationHub {
                 sink: handle.sink.clone(),
             },
         );
+        Ok(())
+    }
+
+    fn unregister(&self, worker_ref: &WorkerRef, handle: &WorkerHandle) -> Result<(), String> {
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| "Worker observation registry lock is poisoned".to_string())?;
+        if workers.get(worker_ref).is_some_and(|entry| {
+            entry
+                .shared_state
+                .ptr_eq(&Arc::downgrade(&handle.shared_state))
+        }) {
+            workers.remove(worker_ref);
+        }
         Ok(())
     }
 
@@ -2560,6 +2585,14 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         self.observation_hub
             .register(worker_ref.clone(), workspace_id.map(str::to_string), handle)
     }
+
+    fn deactivate_stopped_controller(
+        &self,
+        worker_ref: &WorkerRef,
+        handle: &WorkerHandle,
+    ) -> Result<(), String> {
+        self.observation_hub.unregister(worker_ref, handle)
+    }
 }
 
 type ProfileRestoreStore = CombinedStore<WorkerSessionStore, WorkerAggregateStore>;
@@ -4461,6 +4494,14 @@ where
         };
 
         if let Err(message) = self.cleanup_execution_resources(&execution) {
+            return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
+        }
+        // External consumers may retain a closed handle indefinitely. Weak
+        // shared-state liveness is not evidence of a published execution.
+        if let Err(message) = self
+            .factory
+            .deactivate_stopped_controller(worker_ref, &execution.handle)
+        {
             return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
         }
 
