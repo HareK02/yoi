@@ -1499,4 +1499,6 @@ mod publication {
         fixture.assert_released();
         fixture.assert_quiet();
     }
+
+    include!("worker_backend_restore_registration_tests.rs");
 }

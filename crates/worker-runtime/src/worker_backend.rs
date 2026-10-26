@@ -555,7 +555,15 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
 /// `WorkerController`.
 #[derive(Default)]
 struct RuntimeWorkerObservationHub {
+    #[cfg(test)]
+    registration_gate: Mutex<Option<RestoreHubRegistrationGate>>,
     workers: Mutex<HashMap<WorkerRef, RuntimeObservedWorker>>,
+}
+
+#[cfg(test)]
+struct RestoreHubRegistrationGate {
+    gate: crate::execution::RestoreTestGate<WorkerHandle>,
+    fail: bool,
 }
 
 #[derive(Clone)]
@@ -584,6 +592,17 @@ impl RuntimeWorkerObservationHub {
                 sink: handle.sink.clone(),
             },
         );
+        drop(workers);
+        #[cfg(test)]
+        {
+            let gate = self.registration_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.gate.wait(handle.clone());
+                if gate.fail {
+                    return Err("injected post-insert hub registration failure".into());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -837,6 +856,7 @@ struct FailedRestoreResources {
 #[cfg(test)]
 #[derive(Default)]
 struct RestoreFaults {
+    effects_calls: std::sync::atomic::AtomicUsize,
     fail_at: Mutex<Option<RuntimeRestoreStage>>,
     executions: std::sync::atomic::AtomicUsize,
     cleanup_fail: AtomicBool,
@@ -2694,6 +2714,11 @@ impl RuntimeRestoreCandidate for ProfileRestoreCandidate {
             failure.io_kind = io_kind;
             failure
         };
+        #[cfg(test)]
+        self.factory
+            .restore_faults
+            .effects_calls
+            .fetch_add(1, Ordering::SeqCst);
         prepared.apply_effects().await.map_err(&map_error)?;
         self.factory
             .failed_restore_resources
@@ -3392,6 +3417,8 @@ struct SubjectControllerReservation {
 
 /// Worker execution backend backed by real worker crate Workers.
 pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
+    #[cfg(test)]
+    bridge_fault: Mutex<Option<crate::execution::RestoreTestGate<WorkerHandle>>>,
     backend_id: String,
     factory: Arc<F>,
     working_directory_materializer: Option<Arc<dyn WorkingDirectoryMaterializer>>,
@@ -3427,6 +3454,8 @@ where
             .build()
             .map_err(|err| format!("failed to build worker adapter runtime: {err}"))?;
         Ok(Self {
+            #[cfg(test)]
+            bridge_fault: Mutex::default(),
             backend_id: DEFAULT_BACKEND_ID.to_string(),
             factory: Arc::new(factory),
             working_directory_materializer: None,
@@ -4160,6 +4189,14 @@ where
                 )
                 .map_err(|error| error.to_string())?;
             bridge.snapshot_pending = false;
+        }
+        #[cfg(test)]
+        {
+            let fault = self.bridge_fault.lock().unwrap().take();
+            if let Some(fault) = fault {
+                fault.wait(handle.clone());
+                return Err("injected bridge task admission failure after snapshot".into());
+            }
         }
         let streams = bridge.streams.clone();
         let bridge_context = bridge.context.clone();

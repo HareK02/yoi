@@ -128,6 +128,13 @@ pub struct FsRuntimeStore {
     worker_write_fault: Arc<AtomicU8>,
     #[cfg(test)]
     worker_reconcile_sync_fault: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    worker_reconcile_read_fault: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    worker_reconcile_counts: Arc<(
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+    )>,
 }
 
 impl PartialEq for FsRuntimeStore {
@@ -172,6 +179,20 @@ impl FsRuntimeStore {
     pub(crate) fn fail_next_worker_reconcile_sync(&self) {
         self.worker_reconcile_sync_fault
             .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_worker_reconcile_read(&self) {
+        self.worker_reconcile_read_fault
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_worker_reconcile_counts(&self) -> (usize, usize) {
+        (
+            self.worker_reconcile_counts.0.load(Ordering::Acquire),
+            self.worker_reconcile_counts.1.load(Ordering::Acquire),
+        )
     }
 
     pub(crate) fn open_or_create(
@@ -235,6 +256,10 @@ impl FsRuntimeStore {
             worker_write_fault: Arc::new(AtomicU8::new(AtomicWriteFault::None as u8)),
             #[cfg(test)]
             worker_reconcile_sync_fault: Default::default(),
+            #[cfg(test)]
+            worker_reconcile_read_fault: Default::default(),
+            #[cfg(test)]
+            worker_reconcile_counts: Default::default(),
         };
         let state = if snapshot_exists {
             Some(store.load_runtime_state()?)
@@ -298,7 +323,15 @@ impl FsRuntimeStore {
         &self,
         worker_ref: &WorkerRef,
     ) -> Result<PersistedWorkerRecord, RuntimeError> {
+        #[cfg(test)]
+        self.worker_reconcile_counts
+            .0
+            .fetch_add(1, Ordering::AcqRel);
         self.read_durable_worker_record_with_sync(worker_ref, |file| {
+            #[cfg(test)]
+            self.worker_reconcile_counts
+                .1
+                .fetch_add(1, Ordering::AcqRel);
             #[cfg(test)]
             if self
                 .worker_reconcile_sync_fault
@@ -336,6 +369,17 @@ impl FsRuntimeStore {
             return Err(RuntimeError::InvalidRequest(
                 "Worker aggregate reconciliation requires the Runtime store owner lock".to_string(),
             ));
+        }
+        #[cfg(test)]
+        if self
+            .worker_reconcile_read_fault
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(RuntimeError::StoreCommitOutcomeUnknown {
+                operation: "read reconciled Worker aggregate",
+                path: self.worker_dir(&worker_ref.worker_id).join(WORKER_FILE),
+                source: std::io::Error::other("injected reconciliation read failure"),
+            });
         }
         let (record, file) = self.read_worker_record_file(worker_ref)?;
         let worker_dir = self.worker_dir(&worker_ref.worker_id);
@@ -1724,6 +1768,10 @@ fn validate_current_runtime_store(root: &Path) -> Result<(), RuntimeError> {
         worker_write_fault: Arc::new(AtomicU8::new(AtomicWriteFault::None as u8)),
         #[cfg(test)]
         worker_reconcile_sync_fault: Default::default(),
+        #[cfg(test)]
+        worker_reconcile_read_fault: Default::default(),
+        #[cfg(test)]
+        worker_reconcile_counts: Default::default(),
     };
     store.load_runtime_state().map(|_| ())
 }
@@ -1735,6 +1783,10 @@ fn validate_completed_migration_staging(root: &Path) -> Result<(), RuntimeError>
         worker_write_fault: Arc::new(AtomicU8::new(AtomicWriteFault::None as u8)),
         #[cfg(test)]
         worker_reconcile_sync_fault: Default::default(),
+        #[cfg(test)]
+        worker_reconcile_read_fault: Default::default(),
+        #[cfg(test)]
+        worker_reconcile_counts: Default::default(),
     };
     let state = store.load_runtime_state()?;
     if let Some(worker) = state.workers.values().find(|worker| {

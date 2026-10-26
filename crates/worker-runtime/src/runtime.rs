@@ -2340,6 +2340,48 @@ impl Runtime {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_terminal_receipt_gate(
+        &self,
+        gate: crate::execution::RestoreTestGate<WorkerLifecycleOperationId>,
+    ) {
+        assert!(
+            self.restore_continuations
+                .terminal_receipt_gate
+                .lock()
+                .unwrap()
+                .replace(gate)
+                .is_none()
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_restore_context(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> (
+        WorkerLifecycleOperationId,
+        crate::execution::WorkerExecutionContext,
+        bool,
+    ) {
+        let state = self.lock().unwrap();
+        let worker = state.worker(worker_ref).unwrap();
+        assert!(
+            worker
+                .restore_guard
+                .owners
+                .values()
+                .all(|owner| owner.receipt.is_none())
+        );
+        (
+            worker.pending_restore.unwrap().operation_id,
+            worker.restore_candidate_context.clone().unwrap(),
+            state
+                .unreconciled_worker_writes
+                .contains(&worker_ref.worker_id),
+        )
+    }
+
     // Seed durable crash checkpoints without launching a second Controller.
     // Tests then reopen the real store with empty backend resource maps.
     #[cfg(all(test, feature = "fs-store"))]
@@ -2511,6 +2553,24 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         if result.state == WorkerRestoreState::ReconciliationRequired {
             return Ok(());
+        }
+        #[cfg(test)]
+        if result.state == WorkerRestoreState::Accepted {
+            let gate = self
+                .restore_continuations
+                .terminal_receipt_gate
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(gate) = gate {
+                let operation = self
+                    .lock()?
+                    .worker(worker_ref)?
+                    .pending_restore
+                    .expect("terminal receipt follows committed operation")
+                    .operation_id;
+                gate.wait(operation);
+            }
         }
         let mut state = self.lock()?;
         let mut candidate = state.worker(worker_ref)?.clone();

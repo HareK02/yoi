@@ -215,6 +215,38 @@ impl WorkerExecutionResult {
     }
 }
 
+// Private one-shot synchronization at real publication boundaries. Disconnect
+// releases the waiter during unwinding; timeout bounds a forgotten test owner.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct RestoreTestGate<T> {
+    pub(crate) entered: std::sync::mpsc::Sender<T>,
+    pub(crate) release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl<T> RestoreTestGate<T> {
+    pub(crate) fn wait(self, evidence: T) {
+        let _ = self.entered.send(evidence);
+        assert!(
+            !matches!(
+                self.release
+                    .recv_timeout(std::time::Duration::from_secs(30)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "publication test gate timed out"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "ws-server"))]
+#[derive(Debug)]
+pub(crate) struct RestoreFlushFault {
+    pub(crate) remaining_successes: usize,
+    pub(crate) gate: RestoreTestGate<protocol::Event>,
+    pub(crate) restored: std::sync::mpsc::Sender<Vec<protocol::Event>>,
+}
+
 /// Runtime hooks available to an execution backend for one Worker.
 #[cfg(feature = "ws-server")]
 type WorkerObservationPublisher = Arc<
@@ -249,6 +281,8 @@ pub struct WorkerExecutionContext {
     observation_publisher: WorkerObservationPublisher,
     #[cfg(feature = "ws-server")]
     publication_state: Arc<Mutex<WorkerExecutionPublicationState>>,
+    #[cfg(all(test, feature = "ws-server"))]
+    flush_fault: Arc<Mutex<Option<RestoreFlushFault>>>,
 }
 
 impl WorkerExecutionContext {
@@ -262,6 +296,8 @@ impl WorkerExecutionContext {
             restore_progress: None,
             restore_repair_authorizer: None,
             observation_publisher,
+            #[cfg(test)]
+            flush_fault: Arc::default(),
             publication_state: Arc::new(Mutex::new(WorkerExecutionPublicationState::Active)),
         }
     }
@@ -276,6 +312,8 @@ impl WorkerExecutionContext {
             restore_progress: None,
             restore_repair_authorizer: None,
             observation_publisher,
+            #[cfg(test)]
+            flush_fault: Arc::default(),
             publication_state: Arc::new(Mutex::new(WorkerExecutionPublicationState::Pending(
                 VecDeque::new(),
             ))),
@@ -386,17 +424,62 @@ impl WorkerExecutionContext {
             let Some(event) = event else {
                 return Ok(());
             };
-            if let Err(error) = (self.observation_publisher)(self.worker_ref.clone(), event.clone())
-            {
+            #[cfg(test)]
+            let fault = {
+                let mut fault = self.flush_fault.lock().unwrap();
+                if fault.as_ref().is_some_and(|f| f.remaining_successes == 0) {
+                    fault.take()
+                } else {
+                    if let Some(fault) = fault.as_mut() {
+                        fault.remaining_successes -= 1;
+                    }
+                    None
+                }
+            };
+            #[cfg(test)]
+            let mut restored = None;
+            #[cfg(test)]
+            let publication = if let Some(fault) = fault {
+                restored = Some(fault.restored);
+                fault.gate.wait(event.clone());
+                Err(RuntimeError::InvalidRequest(
+                    "injected buffered publication failure".into(),
+                ))
+            } else {
+                (self.observation_publisher)(self.worker_ref.clone(), event.clone())
+            };
+            #[cfg(not(test))]
+            let publication = (self.observation_publisher)(self.worker_ref.clone(), event.clone());
+            if let Err(error) = publication {
                 let mut state = self
                     .publication_state
                     .lock()
                     .map_err(|_| RuntimeError::StatePoisoned)?;
                 if let WorkerExecutionPublicationState::Activating(events) = &mut *state {
                     events.push_front(event);
+                    #[cfg(test)]
+                    if let Some(restored) = restored {
+                        let _ = restored.send(events.iter().cloned().collect());
+                    }
                 }
                 return Err(error);
             }
+        }
+    }
+
+    #[cfg(all(test, feature = "ws-server"))]
+    pub(crate) fn test_fail_flush(&self, fault: RestoreFlushFault) {
+        assert!(self.flush_fault.lock().unwrap().replace(fault).is_none());
+    }
+
+    #[cfg(all(test, feature = "ws-server"))]
+    pub(crate) fn test_buffered_events(&self) -> Vec<protocol::Event> {
+        match &*self.publication_state.lock().unwrap() {
+            WorkerExecutionPublicationState::Pending(events)
+            | WorkerExecutionPublicationState::Activating(events) => {
+                events.iter().cloned().collect()
+            }
+            _ => Vec::new(),
         }
     }
 

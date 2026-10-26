@@ -20,6 +20,9 @@ pub(super) struct RestoreContinuations {
     owners: Mutex<HashMap<Key, Arc<Continuation>>>,
     #[cfg(test)]
     paused: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(super) terminal_receipt_gate:
+        Mutex<Option<crate::execution::RestoreTestGate<WorkerLifecycleOperationId>>>,
 }
 
 #[derive(Debug, Default)]
