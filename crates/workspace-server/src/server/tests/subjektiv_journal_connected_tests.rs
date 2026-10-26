@@ -1088,6 +1088,14 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for RestoreAuthFactory
         self.inner
             .activate_restored_controller(worker_ref, workspace_id, handle)
     }
+
+    fn deactivate_stopped_controller(
+        &self,
+        worker_ref: &worker_runtime::identity::WorkerRef,
+        handle: &worker::WorkerHandle,
+    ) -> std::result::Result<(), String> {
+        self.inner.deactivate_stopped_controller(worker_ref, handle)
+    }
 }
 
 struct RestoreAuthCandidate {
@@ -1099,6 +1107,14 @@ struct RestoreAuthCandidate {
 impl worker_runtime::worker_backend::RuntimeRestoreCandidate for RestoreAuthCandidate {
     fn initial_state(&self) -> protocol::WorkerStateSnapshot {
         self.inner.initial_state()
+    }
+
+    fn has_durable_effects(&self) -> bool {
+        self.inner.has_durable_effects()
+    }
+
+    fn can_retry_publication(&self) -> bool {
+        self.inner.can_retry_publication()
     }
 
     async fn activate(
@@ -1345,6 +1361,32 @@ enabled = false
         request: worker_runtime::execution::WorkerExecutionRestoreRequest,
     ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
         self.inner.restore_worker(request)
+    }
+    fn restore_recovery_disposition(
+        &self,
+        id: worker_runtime::execution::WorkerLifecycleOperationId,
+        worker: &worker_runtime::identity::WorkerRef,
+    ) -> Option<worker_runtime::execution::RestoreRecoveryDisposition> {
+        self.inner.restore_recovery_disposition(id, worker)
+    }
+    // This caller-replay fixture gates repair/prepare to inspect the durable
+    // lost-response state before its next explicit call. Runtime continuation
+    // itself is covered with the unwrapped backend in the Runtime suite.
+    fn supports_restore_continuation(&self) -> bool {
+        false
+    }
+    fn reclaim_uncommitted_restore(
+        &self,
+        request: worker_runtime::execution::WorkerExecutionRestoreRequest,
+    ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+        self.inner.reclaim_uncommitted_restore(request)
+    }
+    fn discard_uncommitted_restore(
+        &self,
+        id: worker_runtime::execution::WorkerLifecycleOperationId,
+        worker: &worker_runtime::identity::WorkerRef,
+    ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+        self.inner.discard_uncommitted_restore(id, worker)
     }
     fn reconcile_restore(
         &self,
@@ -1798,6 +1840,7 @@ async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publicati
         "the same production signer must be accepted before trust revocation"
     );
     requests.lock().unwrap().clear();
+    fixture.callbacks.lock().unwrap().clear();
     let runtime = api.runtime.clone();
     let target = worker.clone();
     let intent = request.clone();
@@ -1816,13 +1859,20 @@ async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publicati
         "preparation must not consume saved input or append history"
     );
     assert_eq!(metadata.read_by_name(&name).unwrap().unwrap(), saved);
-    assert!(
-        requests
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(path, _)| !path.ends_with("/subjektiv/sessions")),
-        "publication authorization belongs after candidate preparation"
+    {
+        let callbacks = fixture.callbacks.lock().unwrap();
+        assert_eq!(
+            callbacks.len(),
+            1,
+            "prepare verifies current Host authority"
+        );
+        assert_eq!(callbacks[0]["create_if_missing"], false);
+        assert_eq!(callbacks[0]["session_id"], active.session_id.to_string());
+    }
+    assert_eq!(probe.publications.load(SeqCst), 0);
+    assert_eq!(
+        store.subject_session_attributions(subject_id).unwrap(),
+        attributions
     );
     let prepared_record: Value =
         serde_json::from_slice(&std::fs::read(aggregate.join("worker.json")).unwrap()).unwrap();
