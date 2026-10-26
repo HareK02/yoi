@@ -628,6 +628,12 @@ fn published_terminal_receipt_fault(fault: TerminalFault) {
     let scope = fixture.request.workspace_scope.clone().unwrap();
     let request = runtime.test_restore_request(&worker_ref);
     let observations = runtime.subscribe_worker_observation().unwrap();
+    let mut catalog = runtime
+        .subscribe_event_selector_scoped(
+            &scope,
+            protocol::subscription::EventSubscriptionSelector::RuntimeWorkers,
+        )
+        .unwrap();
     let (release, entered, gate) = publication_gate();
     runtime.test_terminal_receipt_gate(gate);
     let restoring = {
@@ -772,6 +778,38 @@ fn published_terminal_receipt_fault(fault: TerminalFault) {
     assert_eq!(fixture.backend.workers.lock().unwrap().len(), 1);
     assert_real_attach(&fixture, &old);
     assert_single_publication(&fixture, 1);
+    // A canonical terminal reread may bypass the final redundant upsert. The
+    // original subscriber must still have the current state and observation token.
+    let fresh_catalog = runtime
+        .subscribe_event_selector_scoped(
+            &scope,
+            protocol::subscription::EventSubscriptionSelector::RuntimeWorkers,
+        )
+        .unwrap();
+    let protocol::subscription::SubscriptionSnapshot::Workers { workers } =
+        fresh_catalog.snapshot()
+    else {
+        panic!("Runtime catalog must return Workers");
+    };
+    assert_eq!(workers.len(), 1);
+    let mut last_applied = None;
+    use futures::FutureExt;
+    while let Some(update) = catalog.recv().now_or_never() {
+        match update.unwrap().payload {
+            protocol::subscription::SubscriptionEventPayload::WorkerUpserted { worker } => {
+                last_applied = Some(worker);
+            }
+            payload => panic!("unexpected catalog update: {payload:?}"),
+        }
+    }
+    assert!(
+        serde_json::to_value(last_applied.expect("restore must publish its catalog state"))
+            .unwrap()
+            == serde_json::to_value(&workers[0]).unwrap(),
+        "original catalog subscriber diverged after {fault:?}"
+    );
+    drop(fresh_catalog);
+    drop(catalog);
     alert_marker(&old, "terminal-after-recovery");
     let _observations = observe_publication_markers(
         &fixture,
