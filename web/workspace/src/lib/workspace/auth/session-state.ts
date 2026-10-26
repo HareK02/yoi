@@ -17,6 +17,10 @@ export class SessionState {
   private listeners = new Set<(state: SessionSnapshot) => void>();
   private stale = true;
 
+  get authenticationStamp(): string | null {
+    return storageStamp();
+  }
+
   get authenticationGeneration(): number {
     return this.generation;
   }
@@ -38,7 +42,7 @@ export class SessionState {
     ++this.generation;
     this.pending = null;
     this.stale = true;
-    if (!preserveSnapshot) this.publish({ kind: "loading" });
+    this.publish(preserveSnapshot ? this.snapshot : { kind: "loading" });
   }
 
   // Page load owns freshness. Components mounted after it reuse that result.
@@ -100,8 +104,9 @@ export const browserSession = new SessionState();
 
 export function sessionMutation(
   reason: "authentication" | "logout" = "authentication",
+  preserveSnapshot = false,
 ): void {
-  browserSession.invalidate();
+  browserSession.invalidate(preserveSnapshot);
   const message = JSON.stringify({ id: crypto.randomUUID(), reason });
   try {
     localStorage.setItem(GENERATION_KEY, message);

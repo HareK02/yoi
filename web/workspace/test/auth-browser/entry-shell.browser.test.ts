@@ -554,7 +554,7 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
             },
           );
           await step(
-            "SPA page access checks once without hiding the admitted page",
+            "SPA page access checks once and fences key-list reads without hiding the admitted page",
             async (page) => {
               let checks = 0;
               page.on("request", (request) => {
@@ -582,6 +582,7 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
                 await page.getByRole("link", { name: "Account", exact: true })
                   .click();
                 await requested;
+                assertEquals(checks, 2);
                 assertEquals(
                   await page.getByRole("heading", {
                     name: "Dashboard",
@@ -599,7 +600,10 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
                   exact: true,
                 }).waitFor();
                 assertEquals(new URL(page.url()).pathname, "/account");
-                assertEquals(checks, 2);
+                await page.getByRole("list", { name: "Registered keys" })
+                  .waitFor();
+                // page入場の一回に加え、本人鍵一覧は読取りの前後で本人bindingを確認する。
+                assertEquals(checks, 4);
               } finally {
                 release();
               }

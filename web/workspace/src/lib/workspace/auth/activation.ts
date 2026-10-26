@@ -2,7 +2,8 @@ import type {
   ActivationOptionsRequest,
   PasskeyRegistrationCompleteRequest,
 } from "#lib/generated/auth-api.ts";
-import { readBoundedAuthResponseJson } from "./api.ts";
+import { loadWhoami, readBoundedAuthResponseJson } from "./api.ts";
+import { browserSession } from "./session-state.ts";
 import { normalizeActivationHandle } from "./hosting-accounts.ts";
 import {
   type AuthUser,
@@ -19,6 +20,16 @@ export async function activateWithPasskey(
   code: string,
   signal: AbortSignal,
 ): Promise<AuthUser> {
+  const generation = browserSession.authenticationGeneration;
+  const stamp = browserSession.authenticationStamp;
+  // 別tabのstorage event配送より先にcredential/応答が返っても送信・適用しない。
+  const assertCurrent = () => {
+    signal.throwIfAborted();
+    if (
+      generation !== browserSession.authenticationGeneration ||
+      stamp !== browserSession.authenticationStamp
+    ) throw new Error("Activation superseded");
+  };
   try {
     handle = normalizeActivationHandle(handle);
     if (window.isSecureContext !== true || !code || code.length > 4096) {
@@ -28,7 +39,7 @@ export async function activateWithPasskey(
       path: "/api/auth/activation/options" | "/api/auth/activation/complete",
       body: ActivationOptionsRequest | PasskeyRegistrationCompleteRequest,
     ): Promise<unknown> => {
-      signal.throwIfAborted();
+      assertCurrent();
       const response = await fetch(path, {
         method: "POST",
         credentials: "same-origin",
@@ -44,7 +55,9 @@ export async function activateWithPasskey(
         await response.body?.cancel();
         throw new Error("Activation rejected");
       }
-      return await readBoundedAuthResponseJson(response);
+      const result = await readBoundedAuthResponseJson(response);
+      assertCurrent();
+      return result;
     };
     const options = await request("/api/auth/activation/options", {
       handle,
@@ -54,22 +67,33 @@ export async function activateWithPasskey(
     code = "";
     const publicKey = prepareRegistrationOptions(options);
     const challengeId = (options as { challenge_id: string }).challenge_id;
-    signal.throwIfAborted();
+    assertCurrent();
     const credential = await navigator.credentials.create({
       publicKey,
       signal,
     });
     if (!credential) throw new Error("Registration cancelled");
-    signal.throwIfAborted();
+    assertCurrent();
     const result = parseAuthUserResponse(
       await request("/api/auth/activation/complete", {
         challenge_id: challengeId,
         credential: registrationCredentialToJson(credential),
       }),
-    ).user;
-    signal.throwIfAborted();
-    if (result.handle !== handle) throw new Error("Activation target mismatch");
-    return result;
+    );
+    assertCurrent();
+    if (result.user.handle !== handle) {
+      throw new Error("Activation target mismatch");
+    }
+    const current = await loadWhoami(signal);
+    assertCurrent();
+    if (
+      current.session.kind !== "authenticated" ||
+      current.actor?.auth_method !== "browser_session" ||
+      current.actor.user_id !== result.user.user_id ||
+      current.actor.account_id !== result.user.account_id ||
+      current.authentication_reference !== result.authentication_reference
+    ) throw new Error("Activation session unconfirmed");
+    return result.user;
   } catch {
     // HTTP/WebAuthn/JSON例外はsecretを含む可能性があるため、本文も例外も転載しない。
     throw new Error("Activation could not be confirmed.");

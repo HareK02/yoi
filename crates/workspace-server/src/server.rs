@@ -6970,6 +6970,12 @@ fn generated_auth_contract_router(service: ServerApiContractService) -> Router {
         .merge(server_api::server_api_axum::hosting_settings_update(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::auth_passkey_list(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::auth_passkey_addition_result(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::auth_passkey_addition_options(
             service.clone(),
         ))
@@ -8179,6 +8185,65 @@ impl server_api::ServerApi for ServerApiContractService {
         )
     }
 
+    async fn auth_passkey_list(
+        &self,
+        context: server_api::ServerRequestContext,
+    ) -> std::result::Result<server_api::PasskeyListResponse, server_api::RepositoryApiError> {
+        let headers = contract_request_headers(&context)?;
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let (user, _) = passkey_owner_authority(&api, &headers, false)?;
+                Ok::<_, ApiError>(server_api::PasskeyListResponse {
+                    keys: api.store.list_passkey_summaries(&user.user_id)?,
+                    user: user_response(user),
+                })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn auth_passkey_addition_result(
+        &self,
+        context: server_api::ServerRequestContext,
+        request: server_api::PasskeyAdditionResultRequest,
+    ) -> std::result::Result<
+        server_api::PasskeyAdditionResultResponse,
+        server_api::RepositoryApiError,
+    > {
+        let headers = contract_request_headers(&context)?;
+        let api = self.auth_api();
+        api.store
+            .db_executor()
+            .run(move || {
+                let (user, _) = passkey_addition_authority(&api, &headers)?;
+                if user.user_id != request.expected_user_id
+                    || user.account_id != request.expected_account_id
+                {
+                    return Err(auth_error(
+                        "passkey_authentication_changed",
+                        "current authenticated owner does not match the operation owner",
+                    )
+                    .into());
+                }
+                let key = api.store.read_passkey_addition_result(
+                    &user.user_id,
+                    &request.expected_authentication_reference,
+                    &request.challenge_id,
+                )?;
+                Ok::<_, ApiError>(match key {
+                    Some(key) => server_api::PasskeyAdditionResultResponse::Saved {
+                        user: user_response(user),
+                        key,
+                    },
+                    None => server_api::PasskeyAdditionResultResponse::Unknown {},
+                })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
     async fn auth_passkey_addition_options(
         &self,
         context: server_api::ServerRequestContext,
@@ -8191,6 +8256,13 @@ impl server_api::ServerApi for ServerApiContractService {
             .db_executor()
             .run(move || {
                 let (user, authentication) = passkey_addition_authority(&api, &headers)?;
+                require_expected_passkey_owner(
+                    &user,
+                    &authentication,
+                    &request.expected_user_id,
+                    &request.expected_account_id,
+                    &request.expected_authentication_reference,
+                )?;
                 start_passkey_registration(
                     &api,
                     &headers,
@@ -30162,6 +30234,14 @@ fn passkey_addition_authority(
     api: &ServerAuthApi,
     headers: &HeaderMap,
 ) -> ApiResult<(UserRecord, PasskeyAuthenticationBinding)> {
+    passkey_owner_authority(api, headers, true)
+}
+
+fn passkey_owner_authority(
+    api: &ServerAuthApi,
+    headers: &HeaderMap,
+    require_origin: bool,
+) -> ApiResult<(UserRecord, PasskeyAuthenticationBinding)> {
     let auth = auth_public_config(&api.config);
     let actor = crate::auth::resolve_request_actor_sync(
         api.store.as_ref(),
@@ -30176,7 +30256,7 @@ fn passkey_addition_authority(
     })?;
     let binding = match actor.auth_method {
         ActorAuthMethod::BrowserSession => {
-            if request_origin(headers).as_deref() != Some(auth.origin.as_str()) {
+            if require_origin && request_origin(headers).as_deref() != Some(auth.origin.as_str()) {
                 return Err(Error::WorkspacePermissionDenied(
                     "cookie-authenticated passkey addition requires the configured Browser origin"
                         .into(),
@@ -30206,6 +30286,26 @@ fn passkey_addition_authority(
         .into());
     }
     Ok((user, binding))
+}
+
+fn require_expected_passkey_owner(
+    user: &UserRecord,
+    binding: &PasskeyAuthenticationBinding,
+    expected_user_id: &str,
+    expected_account_id: &str,
+    expected_authentication_reference: &str,
+) -> ApiResult<()> {
+    if user.user_id != expected_user_id
+        || user.account_id != expected_account_id
+        || binding.reference() != expected_authentication_reference
+    {
+        return Err(auth_error(
+            "passkey_authentication_changed",
+            "authentication changed; refresh account before starting another operation",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn start_passkey_registration(
@@ -30289,7 +30389,11 @@ fn start_passkey_registration(
 /// Credential commit precedes session issuance. If issuing the session or
 /// delivering the response fails, the credential can already exist: log in with
 /// that key rather than overwriting it or replaying the consumed completion.
-/// After an unknown commit outcome, try login first. Restart new-account
+/// Own additions save a receipt atomically with the credential: a currently
+/// authenticated same owner can inspect it using the original operation binding
+/// reference even if the response body was lost after Set-Cookie took effect.
+/// This read does not authorize a completion or prove current session health.
+/// For unknown new-account outcomes, try login first. Restart new-account
 /// enrollment with fresh options only for an unused handle with no persisted
 /// identity; legacy pre-created identities follow the migration policy on
 /// [`PasskeyRegistrationEnvelope`]. Neither recovery path requires DB edits.
@@ -30313,6 +30417,7 @@ fn complete_passkey_enrollment(
     request: PasskeyRegistrationCompleteRequest,
     completion: EnrollmentCompletion<'_>,
 ) -> ApiResult<(AuthUserResponse, server_api::SetCookieHeader)> {
+    let is_addition = matches!(&completion, EnrollmentCompletion::Addition(_));
     let authority = match completion {
         EnrollmentCompletion::Addition(headers) => Some(passkey_addition_authority(api, headers)?),
         _ => None,
@@ -30398,7 +30503,7 @@ fn complete_passkey_enrollment(
                 &error.to_string(),
             )
         })?;
-    api.store.register_verified_passkey(
+    api.store.register_verified_passkey_with_result(
         &envelope.target,
         &PasskeyCredentialRecord {
             credential_id: passkey_credential_id(&passkey)?,
@@ -30411,6 +30516,7 @@ fn complete_passkey_enrollment(
             created_at: crate::auth::now_rfc3339(),
             last_used_at: None,
         },
+        is_addition.then_some(request.challenge_id.as_str()),
     )?;
     issue_browser_session(api, user)
 }
@@ -30580,6 +30686,7 @@ fn complete_passkey_login(
         .into());
     }
     let webauthn = webauthn_for_challenge(&api.config, &challenge)?;
+    let normal_login = matches!(state, PasskeyLoginState::Discoverable(_));
     let auth_result = match state {
         PasskeyLoginState::Discoverable(state) => {
             // userHandle is unsigned routing data, never identity authority. The
@@ -30635,7 +30742,7 @@ fn complete_passkey_login(
         .map_err(|error| auth_error("webauthn_state_serialize_failed", &error.to_string()))?;
     api.store
         .upsert_passkey_credential(&PasskeyCredentialRecord {
-            credential_id,
+            credential_id: credential_id.clone(),
             user_id: user.user_id.clone(),
             public_key_cose,
             transports_json: stored.transports_json,
@@ -30643,6 +30750,10 @@ fn complete_passkey_login(
             created_at: stored.created_at,
             last_used_at: Some(crate::auth::now_rfc3339()),
         })?;
+    if normal_login {
+        api.store
+            .mark_passkey_normal_login_verified(&credential_id, &crate::auth::now_rfc3339())?;
+    }
     issue_browser_session(api, user)
 }
 
@@ -30668,6 +30779,9 @@ fn issue_browser_session(
     Ok((
         AuthUserResponse {
             user: user_response(user),
+            authentication_reference: crate::auth::authentication_reference(&token_hash(
+                &session_token,
+            )),
         },
         server_api::SetCookieHeader::new(cookie),
     ))
@@ -52401,6 +52515,7 @@ mod tests {
 
         include!("server_activation_tests.rs");
         include!("server_discoverable_tests.rs");
+        include!("server_passkey_results_tests.rs");
 
         const ORIGIN_URL: &str = "https://workspace.test";
         type Authenticator = ResidentAuthenticator;
@@ -52454,7 +52569,59 @@ mod tests {
                 origin: Option<&str>,
                 body: Value,
             ) -> (StatusCode, HeaderMap, Value) {
+                let mut body = body;
+                if path == "/api/auth/passkeys/addition/options"
+                    && body.get("expected_user_id").is_none()
+                {
+                    let expected = self.expected_owner(cookie, bearer).await;
+                    for (field, value) in expected.as_object().unwrap() {
+                        body[field] = value.clone();
+                    }
+                }
                 Self::post_to(self.app.clone(), path, cookie, bearer, origin, body).await
+            }
+
+            async fn get_authenticated(
+                &self,
+                path: &str,
+                cookie: Option<&str>,
+                bearer: Option<&str>,
+            ) -> (StatusCode, Value) {
+                let mut request = Request::builder().uri(path);
+                if let Some(cookie) = cookie {
+                    request = request.header(axum::http::header::COOKIE, cookie);
+                }
+                if let Some(bearer) = bearer {
+                    request = request.header(
+                        axum::http::header::AUTHORIZATION,
+                        format!("Bearer {bearer}"),
+                    );
+                }
+                let response = self
+                    .app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+                let status = response.status();
+                let body = serde_json::from_slice(
+                    &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                )
+                .unwrap();
+                (status, body)
+            }
+
+            async fn expected_owner(&self, cookie: Option<&str>, bearer: Option<&str>) -> Value {
+                let (status, whoami) = self
+                    .get_authenticated("/api/auth/whoami", cookie, bearer)
+                    .await;
+                assert_eq!(status, StatusCode::OK);
+                serde_json::json!({
+                    "expected_user_id": whoami["actor"]["user_id"].as_str().unwrap_or("absent"),
+                    "expected_account_id": whoami["actor"]["account_id"].as_str().unwrap_or("absent"),
+                    "expected_authentication_reference": whoami["authentication_reference"].as_str().unwrap_or("absent"),
+                })
             }
 
             async fn post_to(
@@ -52612,6 +52779,14 @@ mod tests {
                     .next()
                     .unwrap()
                     .to_string();
+                let (status, whoami) = self
+                    .get_authenticated("/api/auth/whoami", Some(&cookie), None)
+                    .await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(
+                    body["authentication_reference"] == whoami["authentication_reference"],
+                    "completion must identify its exact issued session"
+                );
                 (
                     cookie,
                     serde_json::from_value::<AuthUserResponse>(body)
@@ -52699,6 +52874,14 @@ mod tests {
                     .next()
                     .unwrap()
                     .to_string();
+                let (status, whoami) = self
+                    .get_authenticated("/api/auth/whoami", Some(&cookie), None)
+                    .await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(
+                    body["authentication_reference"] == whoami["authentication_reference"],
+                    "login completion must identify its exact issued session"
+                );
                 (
                     cookie,
                     serde_json::from_value::<AuthUserResponse>(body)
@@ -53222,6 +53405,9 @@ mod tests {
                 .auth_passkey_addition_options(
                     context,
                     server_api::PasskeyAdditionOptionsRequest {
+                        expected_user_id: user.user_id.clone(),
+                        expected_account_id: user.account_id.clone(),
+                        expected_authentication_reference: "not-authority".into(),
                         browser_origin: Some(ORIGIN_URL.into()),
                     },
                 )
@@ -53236,6 +53422,9 @@ mod tests {
                 .auth_passkey_addition_options(
                     context,
                     server_api::PasskeyAdditionOptionsRequest {
+                        expected_user_id: user.user_id.clone(),
+                        expected_account_id: user.account_id.clone(),
+                        expected_authentication_reference: "not-authority".into(),
                         browser_origin: Some(ORIGIN_URL.into()),
                     },
                 )
@@ -54241,7 +54430,7 @@ mod tests {
                     .header(axum::http::header::COOKIE, &marker)
                     .header(ORIGIN, &auth.origin)
                     .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(r#"{"expected_user_id":"absent","expected_account_id":"absent","expected_authentication_reference":"absent"}"#))
                     .unwrap(),
             )
             .await

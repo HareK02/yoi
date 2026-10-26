@@ -41,6 +41,7 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
   if (path === "/api/workspaces") return new Response(null, { status: 503 });
   if (path === "/api/auth/whoami") {
     return Response.json({
+      authentication_reference: mode !== "anonymous" ? "fixture-authentication" : null,
       session: mode !== "anonymous"
         ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
         : { kind: "anonymous" },
@@ -89,7 +90,7 @@ Deno.serve({ hostname: "127.0.0.1", port: Number(port) }, async (request) => {
     if (mode === "activation-unknown") {
       return new Response(null, { status: 503 });
     }
-    return Response.json({ user });
+    return Response.json({ user, authentication_reference: "fixture-authentication" });
   }
   if (path.startsWith("/api/")) return new Response(null, { status: 404 });
   const file = join(root, decodeURIComponent(path));

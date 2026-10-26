@@ -21,13 +21,33 @@ export type RequestActor = { user_id: string, account_id: string, handle: string
 
 export type BrowserSessionState = { "kind": "anonymous", } | { "kind": "authenticated", expires_at: string | null, } | { "kind": "expired", };
 
-export type WhoamiResponse = { actor: RequestActor | null, session: BrowserSessionState, };
+export type WhoamiResponse = { actor: RequestActor | null, session: BrowserSessionState,
+/**
+ * Non-secret comparison evidence, never an authentication credential.
+ */
+authentication_reference: string | null, };
 
 export type AuthBootstrapUserRequest = { handle: string, display_name?: string | null, };
 
-export type AuthUserResponse = { user: AuthenticatedUser, };
+export type AuthUserResponse = { user: AuthenticatedUser,
+/**
+ * Comparison evidence for the exact newly issued session, not a credential.
+ */
+authentication_reference: string, };
 
-export type PasskeyAdditionOptionsRequest = { browser_origin?: string | null, };
+export type PasskeyAdditionOptionsRequest = { expected_user_id: string, expected_account_id: string, expected_authentication_reference: string, browser_origin?: string | null, };
+
+export type PasskeySummary = { key_reference: string, created_at: string, last_used_at: string | null, normal_login_verified_at: string | null, };
+
+export type PasskeyListResponse = { user: AuthenticatedUser, keys: Array<PasskeySummary>, };
+
+export type PasskeyAdditionResultRequest = { challenge_id: string, expected_user_id: string, expected_account_id: string,
+/**
+ * Original options authentication reference; the current same-owner session may differ.
+ */
+expected_authentication_reference: string, };
+
+export type PasskeyAdditionResultResponse = { "status": "unknown", } | { "status": "saved", user: AuthenticatedUser, key: PasskeySummary, };
 
 export type PasskeyRegistrationOptionsRequest = { handle: string, display_name?: string | null, browser_origin?: string | null, };
 

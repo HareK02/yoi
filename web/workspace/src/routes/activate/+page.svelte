@@ -3,6 +3,7 @@
   import { activateWithPasskey } from '#lib/workspace/auth/activation.ts';
   import { normalizeActivationHandle } from '#lib/workspace/auth/hosting-accounts.ts';
   import { notifySessionChanged } from '#lib/workspace/auth/hosting.ts';
+  import { browserSession } from '#lib/workspace/auth/session-state.ts';
   import type { AuthUser } from '#lib/workspace/auth/model.ts';
 
   let handle = $state('');
@@ -19,12 +20,15 @@
     try { handle = normalizeActivationHandle(handle); }
     catch { error = 'Check the account ID supplied by your administrator.'; return; }
     const current = ++generation;
+    const authGeneration = browserSession.authenticationGeneration;
+    const authStamp = browserSession.authenticationStamp;
     controller = new AbortController(); busy = true; error = '';
     const pending = activateWithPasskey(handle, code, controller.signal);
     code = '';
     try {
       const confirmed = await pending;
       if (current !== generation) return;
+      if (authGeneration !== browserSession.authenticationGeneration || authStamp !== browserSession.authenticationStamp) throw new Error('Activation superseded');
       user = confirmed;
       notifySessionChanged();
     } catch {

@@ -22,6 +22,7 @@ function boundary(
   const fetcher = vi.fn<typeof fetch>(async (input, init) => {
     if (input === "/api/auth/whoami") {
       return Response.json({
+        authentication_reference: mode !== "anonymous" ? "fixture-authentication" : null,
         session: mode !== "anonymous"
           ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
           : { kind: "anonymous" },

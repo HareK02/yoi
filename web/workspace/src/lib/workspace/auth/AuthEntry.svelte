@@ -108,7 +108,7 @@
       <details class="legacy-login" bind:open={legacyOpen}>
         <summary>Use an older key with account ID</summary>
         <form onsubmit={(event) => { event.preventDefault(); void submit(true); }}>
-          <p class="muted">If an older key is not listed or cannot sign in above, use compatibility login. After login, open <a href="/account">Account</a> and add a discoverable passkey for ID-free login. Your existing keys are preserved.</p>
+          <p class="muted">If an older key is not listed or cannot sign in above, use compatibility login. After login, open <a href="/account">Account</a> to inspect keys and verify migration. Adding with the same older-key authenticator may be excluded; use a different saved-key provider or authenticator. Keep older keys until normal ID-free login to the intended account is tested.</p>
           <label>Account ID (handle)
             <input bind:value={handle} required maxlength="128" autocomplete="username" autocapitalize="off" spellcheck="false" disabled={auth.busy} aria-describedby="legacy-id-help" />
           </label>
@@ -131,6 +131,7 @@
     {/if}
   {/if}
   {#if auth.status}<p role="status">{auth.status}</p>{/if}
+  {#if auth.busy}<button type="button" onclick={() => auth.cancel()}>Stop waiting</button>{/if}
   {#if auth.error}<p role="alert" class="error">{auth.error}</p>{/if}
   <nav aria-label="Authentication">
     {#if mode === 'login' && auth.session.kind === 'ready' && !auth.actor}

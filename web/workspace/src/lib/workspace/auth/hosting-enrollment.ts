@@ -6,6 +6,7 @@ import { readBoundedAuthResponseJson } from "./api.ts";
 import {
   type AuthUser,
   parseAuthUserResponse,
+  parseWhoamiResponse,
   prepareRegistrationOptions,
   registrationCredentialToJson,
 } from "./model.ts";
@@ -26,13 +27,14 @@ export async function enrollHostingPasskey(
     }
     const request = async (
       path:
+        | "/api/auth/whoami"
         | "/api/auth/passkeys/addition/options"
         | "/api/auth/passkeys/addition/complete",
-      body: PasskeyAdditionOptionsRequest | PasskeyRegistrationCompleteRequest,
+      body?: PasskeyAdditionOptionsRequest | PasskeyRegistrationCompleteRequest,
     ): Promise<unknown> => {
       signal.throwIfAborted();
       const response = await fetch(path, {
-        method: "POST",
+        method: path === "/api/auth/whoami" ? "GET" : "POST",
         // Bearerの失効を既存cookieで補わない。設定用tokenだけで本人を決め、
         // completionのcookieも受け取らず、次の明示Passkey loginでsessionを作る。
         credentials: "omit",
@@ -53,7 +55,12 @@ export async function enrollHostingPasskey(
       }
       return await readBoundedAuthResponseJson(response);
     };
+    const identity = parseWhoamiResponse(await request("/api/auth/whoami"));
+    if (!identity.actor || !identity.authentication_reference || identity.actor.auth_method !== "api_token") throw new Error("Setup identity unconfirmed");
     const options = await request("/api/auth/passkeys/addition/options", {
+      expected_user_id: identity.actor.user_id,
+      expected_account_id: identity.actor.account_id,
+      expected_authentication_reference: identity.authentication_reference,
       browser_origin: window.location.origin,
     });
     const publicKey = prepareRegistrationOptions(options);

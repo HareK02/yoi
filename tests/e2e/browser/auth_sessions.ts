@@ -4,7 +4,7 @@
 // 固定expiry/短命cookieを作る明示fixtureだけが発行境界を代替し、実分類はBackendへ委ねる。
 // navigator.credentialsのみRustのResidentAuthenticatorへ接続する（物理認証器ではない）。
 import { assert, assertEquals } from "@std/assert";
-import { extname, join, normalize } from "@std/path";
+import { serveProductionShell } from "./static_shell.ts";
 import { type Browser, type BrowserContext, chromium } from "playwright";
 
 const [backend, origin, build, handle] = Deno.args;
@@ -13,82 +13,43 @@ if (!backend || !origin || !build || !handle) {
     "Expected isolated Backend URL, browser origin, production build, handle",
   );
 }
-await Deno.stat(join(build, "index.html")); // 暗黙buildや別asset rootへのfallbackはしない。
-const mime: Record<string, string> = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript",
-  ".css": "text/css",
-  ".json": "application/json",
-  ".svg": "image/svg+xml",
-  ".png": "image/png",
-  ".woff2": "font/woff2",
-  ".ico": "image/x-icon",
-};
-const server = Deno.serve({
-  hostname: "127.0.0.1",
-  port: Number(new URL(origin).port),
-  onListen() {},
-}, async (request) => {
-  const url = new URL(request.url);
-  if (url.pathname === "/__e2e/expired-session" && request.method === "POST") {
-    if (request.headers.get("origin") !== origin) {
-      return new Response(null, { status: 403 });
+const server = await serveProductionShell(
+  backend,
+  origin,
+  build,
+  async (request) => {
+    const url = new URL(request.url);
+    if (
+      url.pathname === "/__e2e/expired-session" && request.method === "POST"
+    ) {
+      if (request.headers.get("origin") !== origin) {
+        return new Response(null, { status: 403 });
+      }
+      // Rustは環境専用DBの実登録userへ公開store APIで保存する。secretをbody/ログへ出さない。
+      const fixture = await bridge("expired-session", {}) as {
+        set_cookies: string[];
+      };
+      const headers = new Headers({ "cache-control": "no-store" });
+      for (const cookie of fixture.set_cookies) {
+        headers.append("set-cookie", cookie);
+      }
+      return new Response(null, { status: 204, headers });
     }
-    // Rustは環境専用DBの実登録userへ公開store APIで保存する。secretをbody/ログへ出さない。
-    const fixture = await bridge("expired-session", {}) as {
-      set_cookies: string[];
-    };
-    const headers = new Headers({ "cache-control": "no-store" });
-    for (const cookie of fixture.set_cookies) {
-      headers.append("set-cookie", cookie);
+    if (
+      url.pathname === "/__e2e/primary-cookie-present" &&
+      request.method === "GET"
+    ) {
+      // HTTPで受け取ったprimaryの有無だけを返す。値、marker、DB状態は公開しない。
+      const present = request.headers.get("cookie")?.split(";").some((pair) =>
+        pair.trim().split("=", 1)[0] === "yoi_workspace_session"
+      ) ?? false;
+      return Response.json(present, {
+        headers: { "cache-control": "no-store" },
+      });
     }
-    return new Response(null, { status: 204, headers });
-  }
-  if (
-    url.pathname === "/__e2e/primary-cookie-present" && request.method === "GET"
-  ) {
-    // HTTPで受け取ったprimaryの有無だけを返す。値、marker、DB状態は公開しない。
-    const present = request.headers.get("cookie")?.split(";").some((pair) =>
-      pair.trim().split("=", 1)[0] === "yoi_workspace_session"
-    ) ?? false;
-    return Response.json(present, { headers: { "cache-control": "no-store" } });
-  }
-  if (url.pathname.startsWith("/api/")) {
-    const headers = new Headers(request.headers);
-    headers.delete("host");
-    headers.delete("connection");
-    // OriginとCookieを保持し、Set-Cookieを含む実応答をそのまま返す。
-    return await fetch(new URL(url.pathname + url.search, backend), {
-      method: request.method,
-      headers,
-      body: ["GET", "HEAD"].includes(request.method)
-        ? undefined
-        : await request.arrayBuffer(),
-      redirect: "manual",
-    });
-  }
-  const relative = normalize(url.pathname.replace(/^\/+/, "") || "index.html");
-  if (relative.startsWith("..")) {
-    return new Response("not found", { status: 404 });
-  }
-  let file = join(build, relative);
-  try {
-    if ((await Deno.stat(file)).isDirectory) file = join(file, "index.html");
-    return new Response(await Deno.readFile(file), {
-      headers: {
-        "content-type": mime[extname(file)] ?? "application/octet-stream",
-      },
-    });
-  } catch (error) {
-    if (!(error instanceof Deno.errors.NotFound)) throw error;
-    if (url.pathname.startsWith("/_app/")) {
-      return new Response("not found", { status: 404 });
-    }
-    return new Response(await Deno.readFile(join(build, "index.html")), {
-      headers: { "content-type": mime[".html"] },
-    });
-  }
-});
+    return undefined;
+  },
+);
 
 // 逐次ceremony/fixtureだけを扱う短いNDJSON bridge。署名/cookieをartifactへ記録しない。
 const input = Deno.stdin.readable.pipeThrough(new TextDecoderStream())
@@ -313,7 +274,8 @@ try {
 
   // 14日実時間の前進ではない。固定expiry実store recordとMax-Age=2のHTTP cookieで、
   // 自然消失後のmarker→実whoami→製品loader/router→実署名loginの接続を検証する。
-  const expiredTarget = "/dashboard?view=workspaces&filter=a%2Fb&ratio=100%25#selected%25";
+  const expiredTarget =
+    "/dashboard?view=workspaces&filter=a%2Fb&ratio=100%25#selected%25";
   const catalogResponse = () =>
     page.waitForResponse((response) =>
       new URL(response.url()).pathname === "/api/workspaces" &&
@@ -360,6 +322,7 @@ try {
   assert(expiredCookieNames.includes(marker.name));
   assertEquals(await whoami(), {
     actor: null,
+    authentication_reference: null,
     session: { kind: "expired" },
   });
   privateRequests.length = 0;
@@ -383,7 +346,11 @@ try {
     [],
     "expired reload must gate the real private catalog loader",
   );
-  assertEquals(await whoami(), { actor: null, session: { kind: "expired" } });
+  assertEquals(await whoami(), {
+    actor: null,
+    authentication_reference: null,
+    session: { kind: "expired" },
+  });
   await page.reload();
   await at(expiredLogin);
   await page.getByRole("button", { name: "Log in with passkey", exact: true })
@@ -416,7 +383,11 @@ try {
   // authenticatedにもexpiredにもならない。これを14日経過の成功とは数えない。
   await context.clearCookies({ name: session.name });
   const partial = await whoami();
-  assertEquals(partial, { actor: null, session: { kind: "anonymous" } });
+  assertEquals(partial, {
+    actor: null,
+    authentication_reference: null,
+    session: { kind: "anonymous" },
+  });
   await page.reload();
   await at("/");
   await context.clearCookies();

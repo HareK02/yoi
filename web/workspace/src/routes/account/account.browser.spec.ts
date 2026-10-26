@@ -63,6 +63,9 @@ function boundary({
         return new Response(null, { status: state.whoamiStatus });
       }
       return Response.json({
+        authentication_reference: state.authenticated
+          ? "fixture-authentication"
+          : null,
         session: state.authenticated
           ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
           : { kind: "anonymous" },
@@ -70,6 +73,9 @@ function boundary({
           ? { ...authUser, auth_method: "browser_session" }
           : null,
       });
+    }
+    if (path === "/api/auth/passkeys") {
+      return Response.json({ user: authUser, keys: [] });
     }
     if (path === "/api/auth/registration-policy") {
       if (state.policy === "loading") return await policyResponse.promise;
@@ -97,7 +103,10 @@ function boundary({
         return new Response(null, { status: state.completeStatus });
       }
       state.authenticated = true;
-      return Response.json({ user: authUser });
+      return Response.json({
+        user: authUser,
+        authentication_reference: "fixture-authentication",
+      });
     }
     if (path === "/api/auth/logout") {
       state.authenticated = false;
@@ -147,6 +156,143 @@ async function enterIdentity(registering = false) {
 
 async function submit(name: string) {
   await fireEvent.submit(screen.getByRole("button", { name }).closest("form")!);
+}
+
+for (const phase of ["initial-whoami", "list", "final-whoami"] as const) {
+  for (const reason of ["logout", "authentication"] as const) {
+    test(`registered-key ${phase} confirmation rejects shared ${reason} before event delivery`, async () => {
+      const { fetcher } = boundary({ authenticated: true });
+      render(Account);
+      await screen.findByText(
+        "No registered keys were returned for this account.",
+      );
+      const request = fetcher.getMockImplementation()!;
+      const started = gate<void>(), response = gate<Response>();
+      let whoami = 0, listReads = 0;
+      const metadata = () =>
+        Response.json({
+          user: authUser,
+          keys: [{
+            key_reference: "delayed-key-metadata",
+            created_at: "2026-01-01T00:00:00Z",
+            last_used_at: null,
+            normal_login_verified_at: null,
+          }],
+        });
+      fetcher.mockImplementation(async (input, init) => {
+        const path = String(input);
+        if (path === "/api/auth/whoami") {
+          ++whoami;
+          if (phase === (whoami === 1 ? "initial-whoami" : "final-whoami")) {
+            started.resolve();
+            return response.promise;
+          }
+        }
+        if (path === "/api/auth/passkeys") {
+          ++listReads;
+          if (phase === "list") {
+            started.resolve();
+            return response.promise;
+          }
+          return metadata();
+        }
+        return request(input, init);
+      });
+      const generation = browserSession.authenticationGeneration;
+      const stamp = browserSession.authenticationStamp;
+      await fireEvent.click(
+        screen.getByRole("button", { name: "Refresh registered keys" }),
+      );
+      await started.promise;
+      const changed = JSON.stringify({ id: `keys-${phase}-${reason}`, reason });
+      localStorage.setItem("yoi.browser-auth-generation", changed);
+      expect(browserSession.authenticationStamp).not.toBe(stamp);
+      expect(browserSession.authenticationGeneration).toBe(generation);
+      response.resolve(
+        phase === "list" ? metadata() : await request("/api/auth/whoami"),
+      );
+      await screen.findByText(/Registered keys could not be confirmed/);
+      expect(screen.queryByText("delayed-key-metadata")).toBeNull();
+      expect(listReads).toBe(phase === "initial-whoami" ? 0 : 1);
+      expect(whoami).toBe(phase === "final-whoami" ? 2 : 1);
+      expect(localStorage.getItem("yoi.browser-auth-generation")).toBe(changed);
+      expect(posted(fetcher)).toEqual([]);
+    });
+  }
+}
+
+for (const reason of ["logout", "authentication"] as const) {
+  test(`stale receipt confirmation after shared ${reason} leaves visible repeat-add disabled`, async () => {
+    const { fetcher } = boundary({ authenticated: true });
+    render(Account);
+    await screen.findByText(
+      "No registered keys were returned for this account.",
+    );
+    const request = fetcher.getMockImplementation()!;
+    const started = gate<void>(), response = gate<Response>();
+    let receiptRead = false;
+    fetcher.mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path.endsWith("/addition/complete")) {
+        throw new TypeError("lost response");
+      }
+      if (path.endsWith("/addition/result")) {
+        receiptRead = true;
+        expect(JSON.parse(String(init?.body)).expected_authentication_reference)
+          .toBe("fixture-authentication");
+        return Response.json({
+          status: "saved",
+          user: authUser,
+          key: {
+            key_reference: "saved-but-session-unconfirmed",
+            created_at: "2026-01-01T00:00:00Z",
+            last_used_at: null,
+            normal_login_verified_at: null,
+          },
+        });
+      }
+      if (path === "/api/auth/whoami" && receiptRead) {
+        receiptRead = false;
+        started.resolve();
+        return response.promise;
+      }
+      return request(input, init);
+    });
+    const add = screen.getByRole("button", {
+      name: /Add passkey to/,
+    }) as HTMLButtonElement;
+    await fireEvent.click(add);
+    await screen.findByText(/result is unknown/);
+    await waitFor(() =>
+      expect(screen.queryByText("Checking registered keys…")).toBeNull()
+    );
+    expect(add.disabled).toBe(true);
+    const checking = screen.getByRole("button", {
+      name: "Check addition result",
+    });
+    await waitFor(() =>
+      expect((checking as HTMLButtonElement).disabled).toBe(false)
+    );
+    await fireEvent.click(checking);
+    await started.promise;
+    const generation = browserSession.authenticationGeneration;
+    localStorage.setItem(
+      "yoi.browser-auth-generation",
+      JSON.stringify({ id: `visible-${reason}`, reason }),
+    );
+    expect(browserSession.authenticationGeneration).toBe(generation);
+    response.resolve(await request("/api/auth/whoami"));
+    await screen.findByText(/The addition result could not be read/);
+    await waitFor(() =>
+      expect((checking as HTMLButtonElement).disabled).toBe(false)
+    );
+    expect(screen.queryByText(/Your current session was checked/)).toBeNull();
+    expect(add.disabled).toBe(true);
+    await fireEvent.click(add);
+    expect(
+      posted(fetcher).filter(({ path }) => path.endsWith("/addition/complete")),
+    ).toHaveLength(1);
+  });
 }
 
 test("normal login needs no account ID and links separate registration and code activation", async () => {
@@ -231,19 +377,23 @@ for (
     expect(get).toHaveBeenCalledOnce();
     expect(create).not.toHaveBeenCalled();
     expect(apiPaths(fetcher).filter((path) => path === "/api/auth/whoami"))
-      .toHaveLength(2);
+      .toHaveLength(4);
     expect(apiPaths(fetcher)).not.toContain("/api/auth/device-login/approve");
   });
 }
 
 test("successful login completion without confirmed whoami never navigates", async () => {
-  const { state, get } = boundary();
+  const { state, fetcher } = boundary();
+  const request = fetcher.getMockImplementation()!;
+  fetcher.mockImplementation(async (input, init) => {
+    const response = await request(input, init);
+    if (String(input) === "/api/auth/passkeys/login/complete") {
+      state.whoamiStatus = 503;
+    }
+    return response;
+  });
   render(Login);
   await enterIdentity();
-  get.mockImplementationOnce(async () => {
-    state.whoamiStatus = 503;
-    return credentialFixture(true);
-  });
   await submit("Log in with passkey");
   await screen.findByText(/Your session could not be loaded/);
   expect(goto).not.toHaveBeenCalled();
@@ -347,7 +497,7 @@ test("policy disabled during WebAuthn rejects registration, reloads policy and n
   await waitFor(() => expect(create).toHaveBeenCalledOnce());
   state.completeStatus = 403;
   credential.resolve(credentialFixture());
-  await screen.findByText("Auth request failed (403).");
+  await screen.findByText(/\[complete\/rejected\/HTTP-403\]/);
   await screen.findByText(/New account registration is disabled/);
   expect(screen.queryByRole("button", { name: "Register new account" }))
     .toBeNull();
@@ -376,7 +526,9 @@ test("account displays the current identity without editable target fields and a
   await fireEvent.click(
     screen.getByRole("button", { name: "Add passkey to alice" }),
   );
-  await screen.findByText("Passkey added to your account.");
+  await screen.findByText(
+    "Passkey added to your account; the expected session was confirmed.",
+  );
   await waitFor(() =>
     expect(
       (screen.getByRole("button", { name: "Log out" }) as HTMLButtonElement)
@@ -388,7 +540,12 @@ test("account displays the current identity without editable target fields and a
     "/api/auth/passkeys/addition/options",
     "/api/auth/passkeys/addition/complete",
   ]);
-  expect(requests[0].body).toEqual({ browser_origin: window.location.origin });
+  expect(requests[0].body).toEqual({
+    browser_origin: window.location.origin,
+    expected_user_id: authUser.user_id,
+    expected_account_id: authUser.account_id,
+    expected_authentication_reference: "fixture-authentication",
+  });
   expect(Object.keys(requests[1].body).sort()).toEqual([
     "challenge_id",
     "credential",
@@ -485,11 +642,18 @@ test("logout confirms the server session is cleared and returns to the public ho
   expect(posted(fetcher)).toEqual([
     { path: "/api/auth/logout", body: {}, credentials: "same-origin" },
   ]);
-  expect(apiPaths(fetcher)).toEqual([
+  const paths = apiPaths(fetcher);
+  expect(paths[0]).toBe("/api/auth/whoami");
+  expect(paths.slice(paths.indexOf("/api/auth/logout") + 1)).toContain(
     "/api/auth/whoami",
-    "/api/auth/logout",
-    "/api/auth/whoami",
-  ]);
+  );
+  expect(
+    paths.every((path) =>
+      ["/api/auth/whoami", "/api/auth/logout", "/api/auth/passkeys"].includes(
+        path,
+      )
+    ),
+  ).toBe(true);
   expect(screen.queryByRole("button", { name: /Add passkey/ })).toBeNull();
 });
 
@@ -499,10 +663,14 @@ test("expired addition revokes stale identity without silently retrying as regis
   await fireEvent.click(
     await screen.findByRole("button", { name: "Add passkey to alice" }),
   );
-  await screen.findByText(/Authentication request was rejected/);
+  await screen.findByText(/server rejected the request or verification/);
   await screen.findByRole("link", { name: "Log in to your account" });
   expect(screen.queryByRole("button", { name: /Add passkey/ })).toBeNull();
-  expect(screen.queryByText("Passkey added to your account.")).toBeNull();
+  expect(
+    screen.queryByText(
+      "Passkey added to your account; the expected session was confirmed.",
+    ),
+  ).toBeNull();
   expect(posted(fetcher).map(({ path }) => path)).toEqual([
     "/api/auth/passkeys/addition/options",
     "/api/auth/passkeys/addition/complete",
@@ -545,7 +713,13 @@ test("WebAuthn cancellation is visible, sends no completion, and allows an expli
   await enterIdentity();
   await submit("Log in with passkey");
   await screen.findByText(
-    "Passkey operation was cancelled or timed out, or no matching key was found. Completion is not confirmed. Use a supported device and try again.",
+    /cancelled, timed out, or found no usable key/,
+  );
+  expect(screen.getByRole("alert").textContent).toContain(
+    "Completion was not sent.",
+  );
+  expect(screen.getByRole("alert").textContent).toContain(
+    "[authenticator/cancelled-or-unavailable]",
   );
   await waitFor(() =>
     expect(
@@ -651,7 +825,12 @@ test("device approval locks its code and rejects a second submit while the serve
     name: "Approve device login",
   });
   const response = gate<Response>();
-  fetcher.mockReturnValueOnce(response.promise);
+  const request = fetcher.getMockImplementation()!;
+  fetcher.mockImplementation((input, init) =>
+    String(input) === "/api/auth/device-login/approve"
+      ? response.promise
+      : request(input, init)
+  );
   const form = approve.closest("form")!;
   await fireEvent.submit(form);
   await screen.findByText("Approving device login…");
@@ -659,9 +838,11 @@ test("device approval locks its code and rejects a second submit while the serve
   expect((screen.getByLabelText("User code") as HTMLInputElement).disabled)
     .toBe(true);
   await fireEvent.submit(form);
-  expect(posted(fetcher).map(({ path }) => path)).toEqual([
-    "/api/auth/device-login/approve",
-  ]);
+  await waitFor(() =>
+    expect(posted(fetcher).map(({ path }) => path)).toEqual([
+      "/api/auth/device-login/approve",
+    ])
+  );
   response.resolve(Response.json({ status: "approved", user: authUser }));
   await screen.findByText("Device login approved. You can return to the CLI.");
   expect(posted(fetcher)).toHaveLength(1);
@@ -679,11 +860,8 @@ for (const status of [401, 410]) {
       (await screen.findByRole("button", { name: "Approve device login" }))
         .closest("form")!,
     );
-    await screen.findByText(
-      status === 401
-        ? /Authentication request was rejected/
-        : /The request or authentication challenge is invalid or expired/,
-    );
+    await screen.findByText(/Authentication request was rejected/);
+    expect(screen.getByRole("alert").textContent).toContain("(" + status + ")");
     expect(
       screen.queryByText("Device login approved. You can return to the CLI."),
     ).toBeNull();
@@ -721,7 +899,7 @@ test("compatibility login keeps its selected form and ID after cancellation and 
     target: { value: "alice" },
   });
   await submit("Log in with older key");
-  await screen.findByText(/cancelled or timed out/);
+  await screen.findByText(/cancelled, timed out, or found no usable key/);
   await screen.findByText("Use an older key with account ID");
   expect(
     (screen.getByText("Use an older key with account ID").closest(

@@ -119,7 +119,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 102;
+const LATEST_SCHEMA_VERSION: i64 = 103;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -437,6 +437,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "Durable failed Subject creation recovery",
         apply: migrate_subject_create_recovery_v101_to_v102,
     },
+    Migration {
+        version: 103,
+        name: "Passkey metadata and atomic addition results",
+        apply: migrate_passkey_results_v102_to_v103,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -747,6 +752,15 @@ pub enum PasskeyRegistrationTarget {
 pub enum PasskeyAuthenticationBinding {
     BrowserSession(String),
     ApiToken(String),
+}
+
+impl PasskeyAuthenticationBinding {
+    pub(crate) fn reference(&self) -> String {
+        let hash = match self {
+            Self::BrowserSession(hash) | Self::ApiToken(hash) => hash,
+        };
+        crate::auth::authentication_reference(hash)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1713,6 +1727,27 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         &self,
         target: &PasskeyRegistrationTarget,
         credential: &PasskeyCredentialRecord,
+    ) -> Result<()> {
+        self.register_verified_passkey_with_result(target, credential, None)
+    }
+    /// Receipt and credential commit together; no receipt claims session issuance.
+    fn register_verified_passkey_with_result(
+        &self,
+        target: &PasskeyRegistrationTarget,
+        credential: &PasskeyCredentialRecord,
+        addition_challenge_id: Option<&str>,
+    ) -> Result<()>;
+    fn list_passkey_summaries(&self, user_id: &str) -> Result<Vec<server_api::PasskeySummary>>;
+    fn read_passkey_addition_result(
+        &self,
+        user_id: &str,
+        original_authentication_reference: &str,
+        challenge_id: &str,
+    ) -> Result<Option<server_api::PasskeySummary>>;
+    fn mark_passkey_normal_login_verified(
+        &self,
+        credential_id: &str,
+        verified_at: &str,
     ) -> Result<()>;
     fn upsert_passkey_credential(&self, record: &PasskeyCredentialRecord) -> Result<()>;
     fn get_passkey_credential(
@@ -6972,10 +7007,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn register_verified_passkey(
+    fn register_verified_passkey_with_result(
         &self,
         target: &PasskeyRegistrationTarget,
         credential: &PasskeyCredentialRecord,
+        addition_challenge_id: Option<&str>,
     ) -> Result<()> {
         self.with_immediate_transaction(|tx| {
             let user = match target {
@@ -7042,11 +7078,71 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 "INSERT INTO passkey_credentials (credential_id, user_id, public_key_cose, transports_json, sign_count, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![credential.credential_id, credential.user_id, credential.public_key_cose, credential.transports_json, credential.sign_count, credential.created_at, credential.last_used_at],
             )?;
+            if let Some(challenge_id) = addition_challenge_id {
+                let PasskeyRegistrationTarget::Addition { user, authentication } = target else {
+                    return Err(crate::auth::auth_error("passkey_target_mismatch", "receipt requires an addition"));
+                };
+                tx.execute(
+                    "INSERT INTO passkey_addition_receipts(challenge_id, credential_id, user_id, authentication_reference) VALUES (?1, ?2, ?3, ?4)",
+                    params![challenge_id, credential.credential_id, user.user_id, authentication.reference()],
+                )?;
+            }
             if let PasskeyRegistrationTarget::Activation { user, issuance_id } = target {
                 if tx.execute("DELETE FROM user_activations WHERE user_id=?1 AND issuance_id=?2", params![user.user_id, issuance_id])? != 1 {
                     return Err(crate::auth::auth_error("activation_code_invalid", "activation issuance no longer exists"));
                 }
             }
+            Ok(())
+        })
+    }
+
+    fn list_passkey_summaries(&self, user_id: &str) -> Result<Vec<server_api::PasskeySummary>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT m.key_reference, c.created_at, c.last_used_at, m.normal_login_verified_at
+                 FROM passkey_credentials c JOIN passkey_metadata m USING(credential_id)
+                 WHERE c.user_id = ?1 ORDER BY c.created_at, m.key_reference",
+            )?;
+            let rows = stmt.query_map([user_id], read_passkey_summary)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn read_passkey_addition_result(
+        &self,
+        user_id: &str,
+        original_authentication_reference: &str,
+        challenge_id: &str,
+    ) -> Result<Option<server_api::PasskeySummary>> {
+        self.with_conn(|conn| {
+            // Current authenticated ownership authorizes reading. The original
+            // binding reference identifies the saved operation, not the current
+            // session: Set-Cookie may have arrived even if its body was lost.
+            let result = conn.query_row(
+                "SELECT m.key_reference, c.created_at, c.last_used_at, m.normal_login_verified_at, r.authentication_reference
+                 FROM passkey_addition_receipts r
+                 JOIN passkey_credentials c USING(credential_id)
+                 JOIN passkey_metadata m USING(credential_id)
+                 WHERE r.challenge_id = ?1 AND r.user_id = ?2 AND c.user_id = ?2",
+                params![challenge_id, user_id],
+                |row| Ok((read_passkey_summary(row)?, row.get::<_, String>(4)?)),
+            ).optional()?;
+            match result {
+                Some((key, reference)) if reference == original_authentication_reference => Ok(Some(key)),
+                Some(_) => Err(crate::auth::auth_error("passkey_result_binding_mismatch", "original operation authentication reference does not match")),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn mark_passkey_normal_login_verified(
+        &self,
+        credential_id: &str,
+        verified_at: &str,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute("UPDATE passkey_metadata SET normal_login_verified_at = ?2 WHERE credential_id = ?1", params![credential_id, verified_at])?;
             Ok(())
         })
     }
@@ -11911,6 +12007,15 @@ fn passkey_select_sql(where_clause: &str) -> String {
     )
 }
 
+fn read_passkey_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<server_api::PasskeySummary> {
+    Ok(server_api::PasskeySummary {
+        key_reference: row.get(0)?,
+        created_at: row.get(1)?,
+        last_used_at: row.get(2)?,
+        normal_login_verified_at: row.get(3)?,
+    })
+}
+
 fn read_passkey_credential_record(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<PasskeyCredentialRecord> {
@@ -15164,6 +15269,22 @@ fn migrate_result_reports_v97_to_v98(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_passkey_results_v102_to_v103(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 102 {
+        return Err(Error::Store(
+            "Passkey results migration requires schema 102".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(include_str!("passkey_results_schema.sql"))?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(103,?1)",
+        ["Passkey metadata and atomic addition results"],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_subject_create_recovery_v101_to_v102(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 101 {
         return Err(Error::Store(
@@ -15255,6 +15376,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
 fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure_from_sql(conn, include_str!("latest_schema.sql"), true)?;
     conn.execute_batch(include_str!("activation_schema.sql"))?;
+    conn.execute_batch(include_str!("passkey_results_schema.sql"))?;
     Ok(())
 }
 
@@ -18948,6 +19070,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:100, name:"Provisional users and scoped passkey activation".into()},
                 WorkspaceSchemaMigrationStep {version:101, name:"Durable explicit Subject body release".into()},
                 WorkspaceSchemaMigrationStep {version:102, name:"Durable failed Subject creation recovery".into()},
+                WorkspaceSchemaMigrationStep {version:103, name:"Passkey metadata and atomic addition results".into()},
             ]
         );
 
@@ -19060,6 +19183,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (100, "Provisional users and scoped passkey activation".to_string()),
 (101, "Durable explicit Subject body release".to_string()),
 (102, "Durable failed Subject creation recovery".to_string()),
+(103, "Passkey metadata and atomic addition results".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -21289,6 +21413,83 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     }
 
     #[test]
+    fn passkey_results_migration_preserves_old_keys_unknown_confirmation_and_rolls_back() {
+        for baseline in [50, 102] {
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("server.db");
+            if baseline == 50 {
+                prepare_schema_v50(&database, None);
+            } else {
+                prepare_retained_schema(&database, baseline);
+            }
+            let conn = Connection::open(&database).unwrap();
+            configure_sqlite(&conn).unwrap();
+            conn.execute_batch(r#"INSERT INTO accounts(account_id, kind, handle, display_name, created_at, updated_at)
+                VALUES('account-old', 'user', 'old', 'Old', 'created', 'updated');
+                INSERT INTO users(user_id, account_id, handle, display_name, created_at, updated_at)
+                VALUES('user-old', 'account-old', 'old', 'Old', 'created', 'updated');
+                INSERT INTO passkey_credentials(credential_id, user_id, public_key_cose, transports_json, sign_count, created_at, last_used_at)
+                VALUES('old-key', 'user-old', 'unchanged-key-material', '["internal"]', 7, 'created-key', 'used-key');"#)
+                .unwrap();
+            if baseline == 102 {
+                conn.execute_batch("CREATE TRIGGER interrupt_passkey_migration BEFORE INSERT ON __yoi_schema_migrations
+                    WHEN NEW.version=103 BEGIN SELECT RAISE(ABORT, 'synthetic migration interruption'); END;").unwrap();
+                assert!(migrate_passkey_results_v102_to_v103(&conn).is_err());
+                assert_eq!(current_schema_version(&conn).unwrap(), 102);
+                assert!(!table_exists(&conn, "passkey_metadata").unwrap());
+                assert!(!table_exists(&conn, "passkey_addition_receipts").unwrap());
+                conn.execute_batch("DROP TRIGGER interrupt_passkey_migration")
+                    .unwrap();
+            }
+            drop(conn);
+            let preflight = SqliteWorkspaceStore::migration_plan(&database).unwrap();
+            assert!(preflight.migration_required());
+            // Preflight must not install metadata in the source database.
+            let conn = Connection::open(&database).unwrap();
+            assert!(!table_exists(&conn, "passkey_metadata").unwrap());
+            drop(conn);
+            let migrated = SqliteWorkspaceStore::open_for_test(&database).unwrap();
+            let record = migrated.get_passkey_credential("old-key").unwrap().unwrap();
+            assert_eq!(record.public_key_cose, "unchanged-key-material");
+            assert_eq!(record.sign_count, 7);
+            assert_eq!(record.last_used_at.as_deref(), Some("used-key"));
+            let summary = migrated
+                .list_passkey_summaries("user-old")
+                .unwrap()
+                .remove(0);
+            assert_eq!(summary.created_at, "created-key");
+            assert_eq!(summary.last_used_at.as_deref(), Some("used-key"));
+            assert!(summary.normal_login_verified_at.is_none());
+            assert_eq!(summary.key_reference.len(), 32);
+            let fresh = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+            let schema = |conn: &Connection| -> Result<Vec<(String, String)>> {
+                let mut stmt = conn.prepare("SELECT name, sql FROM sqlite_schema WHERE name IN
+                    ('passkey_metadata', 'passkey_metadata_insert', 'passkey_addition_receipts') ORDER BY name")?;
+                Ok(stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?)
+            };
+            assert_eq!(
+                migrated.with_conn(schema).unwrap(),
+                fresh.with_conn(schema).unwrap()
+            );
+            migrated.with_conn(|conn| {
+                assert!(conn.execute("INSERT INTO passkey_metadata(credential_id,key_reference) VALUES('missing-key','ref')", []).is_err());
+                assert!(conn.execute("INSERT INTO passkey_addition_receipts(challenge_id,credential_id,user_id,authentication_reference)
+                    VALUES('operation','missing-key','user-old','{}')", []).is_err());
+                assert_eq!(conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, u64>(0))?, 0);
+                Ok(())
+            }).unwrap();
+            drop(migrated);
+            let reopened = SqliteWorkspaceStore::open_for_test(&database).unwrap();
+            assert_eq!(
+                reopened.list_passkey_summaries("user-old").unwrap(),
+                vec![summary]
+            );
+        }
+    }
+
+    #[test]
     fn subject_create_recovery_migration_is_atomic_and_matches_fresh_schema() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("server.db");
@@ -21327,7 +21528,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         drop(conn);
         let reopened = SqliteWorkspaceStore::open_for_test(&database).unwrap();
         reopened
-            .with_conn(|c| verify_schema_history(c, 102))
+            .with_conn(|c| verify_schema_history(c, LATEST_SCHEMA_VERSION))
             .unwrap();
     }
 
@@ -22266,7 +22467,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (99, "Explicit hosting administrators and self-registration policy".into()),
                          (100, "Provisional users and scoped passkey activation".into()),
                          (101, "Durable explicit Subject body release".into()),
-                         (102, "Durable failed Subject creation recovery".into())]);
+                         (102, "Durable failed Subject creation recovery".into()),
+                         (103, "Passkey metadata and atomic addition results".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

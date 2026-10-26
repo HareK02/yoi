@@ -4,8 +4,9 @@
 //! `cargo test -p yoi-e2e --features e2e --test auth_passkeys`で明示選択する。
 //! binary供給、HOME/XDG/DB/動的port、readiness、ログ、RAII回収は共有harnessが所有する。
 //! 通常ケースのHTTPはproxy／redirect／cookie storeなし、各要求にtimeoutを設ける。
-//! 実Server CLIにはstatic assets設定経路がない。追加の明示選択browser_sessionsだけが
-//! 本番static shellをloopback proxyで実Backendへ接続し、Cookieの自然消失と復帰を検証する。
+//! 実Server CLIにはstatic assets設定経路がない。明示選択browser_sessionsは本番static shellを
+//! loopback proxyで実Backendへ接続し、Cookieの自然消失と復帰を検証する。
+//! native_migrationは同じshellと実BackendをChromium native WebAuthn/CTAP2へ接続する。
 //! 固定expiry sessionを公開store APIで作るfixture境界と、14日実時間経過の未検証は同moduleに記す。
 
 use std::error::Error;
@@ -21,8 +22,8 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use server_api::{
-    ActorAuthMethod, AuthUserResponse, AuthenticatedUser, PasskeyLoginCompleteRequest,
-    PasskeyLoginOptionsResponse, PasskeyRegistrationCompleteRequest,
+    ActorAuthMethod, AuthUserResponse, AuthenticatedUser, PasskeyAdditionOptionsRequest,
+    PasskeyLoginCompleteRequest, PasskeyLoginOptionsResponse, PasskeyRegistrationCompleteRequest,
     PasskeyRegistrationOptionsResponse, WhoamiResponse,
 };
 #[path = "../src/resident_authenticator.rs"]
@@ -30,8 +31,12 @@ mod resident_model;
 use resident_model::ResidentAuthenticator;
 use yoi_e2e::WorkerE2eEnvironment;
 
+#[path = "auth_passkeys/browser_process.rs"]
+mod browser_process;
 #[path = "auth_passkeys/browser_sessions.rs"]
 mod browser_sessions;
+#[path = "auth_passkeys/native_migration.rs"]
+mod native_migration;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 const BROWSER_ORIGIN: &str = "http://localhost:5173";
@@ -270,6 +275,29 @@ fn logout(client: &Client, base: &str, artifacts: &Path, cookie: &str) -> Result
     Ok(())
 }
 
+// fixtureも現在の本人/認証bindingをwhoamiから取得する。期待値は対象を選ぶ権限ではない。
+fn addition_expectation(
+    request: RequestBuilder,
+    artifacts: &Path,
+) -> Result<PasskeyAdditionOptionsRequest> {
+    let identity: WhoamiResponse = decode(send(
+        request,
+        "read addition owner and authentication reference",
+        artifacts,
+    )?)?;
+    let actor = identity
+        .actor
+        .ok_or("addition fixture requires an authenticated actor")?;
+    Ok(PasskeyAdditionOptionsRequest {
+        expected_user_id: actor.user_id,
+        expected_account_id: actor.account_id,
+        expected_authentication_reference: identity
+            .authentication_reference
+            .ok_or("missing addition authentication reference")?,
+        browser_origin: Some(BROWSER_ORIGIN.to_owned()),
+    })
+}
+
 fn host_admin_login(
     environment: &WorkerE2eEnvironment,
     client: &Client,
@@ -291,11 +319,17 @@ fn host_admin_login(
     let bearer = setup["access_token"]
         .as_str()
         .ok_or("host setup omitted initial bearer")?;
+    let addition_body = addition_expectation(
+        client
+            .get(format!("{base}/api/auth/whoami"))
+            .bearer_auth(bearer),
+        artifacts,
+    )?;
     let options: PasskeyRegistrationOptionsResponse = decode(send(
         client
             .post(format!("{base}/api/auth/passkeys/addition/options"))
             .bearer_auth(bearer)
-            .json(&json!({"browser_origin": BROWSER_ORIGIN})),
+            .json(&addition_body),
         "host-created administrator bearer starts actor-derived passkey addition",
         artifacts,
     )?)?;
@@ -348,6 +382,12 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
     policy(&client, base, artifacts, false)?;
     let mut admin_key = ResidentAuthenticator::new(true);
     let (admin, admin_cookie) = host_admin_login(&environment, &client, &mut admin_key)?;
+    let admin_addition = addition_expectation(
+        client
+            .get(format!("{base}/api/auth/whoami"))
+            .header(COOKIE, &admin_cookie),
+        artifacts,
+    )?;
     policy(&client, base, artifacts, false)?;
     set_policy(&client, base, artifacts, &admin_cookie, true)?;
     let whoami: Value = decode(send(
@@ -379,7 +419,7 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
             client
                 .post(format!("{base}/api/auth/passkeys/addition/options"))
                 .header(ORIGIN, BROWSER_ORIGIN)
-                .json(&json!({"browser_origin": BROWSER_ORIGIN})),
+                .json(&admin_addition),
             "unauthenticated addition options",
             artifacts,
         )?,
@@ -445,12 +485,18 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
     )?)?;
     assert!(options.public_key.public_key.allow_credentials.is_empty());
 
+    let addition_body = addition_expectation(
+        client
+            .get(format!("{base}/api/auth/whoami"))
+            .header(COOKIE, &cookie),
+        artifacts,
+    )?;
     for (field, value) in [
         ("handle", &other.user.handle),
         ("user_id", &other.user.user_id),
         ("account_id", &other.user.account_id),
     ] {
-        let mut body = json!({"browser_origin": BROWSER_ORIGIN});
+        let mut body = serde_json::to_value(&addition_body)?;
         body[field] = json!(value);
         rejected(
             send(
@@ -470,7 +516,7 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
         let mut request = client
             .post(format!("{base}/api/auth/passkeys/addition/options"))
             .header(COOKIE, &cookie)
-            .json(&json!({"browser_origin": BROWSER_ORIGIN}));
+            .json(&addition_body);
         if let Some(origin) = origin {
             request = request.header(ORIGIN, origin);
         }
@@ -490,7 +536,7 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
             .post(format!("{base}/api/auth/passkeys/addition/options"))
             .header(COOKIE, &cookie)
             .header(ORIGIN, BROWSER_ORIGIN)
-            .json(&json!({"browser_origin": BROWSER_ORIGIN})),
+            .json(&addition_body),
         "authenticated self addition options",
         artifacts,
     )?)?;
@@ -591,7 +637,7 @@ fn disabled_registration_preserves_existing_login_self_addition_and_workspace_ow
                     .post(format!("{base}/api/auth/passkeys/addition/options"))
                     .header(COOKIE, revoked_cookie)
                     .header(ORIGIN, BROWSER_ORIGIN)
-                    .json(&json!({"browser_origin": BROWSER_ORIGIN})),
+                    .json(&addition_body),
                 "logout prevents further self addition with the old cookie",
                 artifacts,
             )?,
@@ -1797,7 +1843,8 @@ fn activation_codes_challenges_and_unverified_state_cannot_cross_account_or_purp
             client.post(format!("{base}/api/auth/device-login/approve")).header(ORIGIN, BROWSER_ORIGIN)
                 .json(&json!({"user_code": flow["user_code"]})),
             client.post(format!("{base}/api/auth/passkeys/addition/options")).header(ORIGIN, BROWSER_ORIGIN)
-                .json(&json!({"browser_origin": BROWSER_ORIGIN})),
+                .json(&json!({"browser_origin": BROWSER_ORIGIN, "expected_user_id": issue.user.user_id,
+                    "expected_account_id": issue.user.account_id, "expected_authentication_reference": "unauthenticated-fixture-not-a-credential"})),
         ];
         for mut request in requests {
             if let Some(bearer) = bearer {
@@ -1901,7 +1948,12 @@ fn activation_codes_challenges_and_unverified_state_cannot_cross_account_or_purp
             .post(format!("{base}/api/auth/passkeys/addition/options"))
             .header(COOKIE, &cookie)
             .header(ORIGIN, BROWSER_ORIGIN)
-            .json(&json!({"browser_origin": BROWSER_ORIGIN})),
+            .json(&addition_expectation(
+                client
+                    .get(format!("{base}/api/auth/whoami"))
+                    .header(COOKIE, &cookie),
+                artifacts,
+            )?),
         "start distinct authenticated self-addition ceremony",
         artifacts,
     )?)?;

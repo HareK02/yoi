@@ -2,6 +2,7 @@ import {
   authenticationCredentialToJson,
   base64UrlToBuffer,
   bufferToBase64Url,
+  parseAuthUserResponse,
   parseDeviceLoginPollResponse,
   parseDeviceLoginStartResponse,
   parseWhoamiResponse,
@@ -119,12 +120,21 @@ Deno.test("prepareLoginOptions decodes challenge and allowed credential ids", ()
 
 Deno.test("whoami rejects unknown auth methods and extra fields", () => {
   assertEquals(
-    parseWhoamiResponse({ actor: null, session: { kind: "anonymous" } }),
-    { actor: null, session: { kind: "anonymous" } },
+    parseWhoamiResponse({
+      actor: null,
+      authentication_reference: null,
+      session: { kind: "anonymous" },
+    }),
+    {
+      actor: null,
+      authentication_reference: null,
+      session: { kind: "anonymous" },
+    },
   );
   assertThrows(
     () =>
       parseWhoamiResponse({
+        authentication_reference: "fixture-authentication",
         session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
         actor: {
           user_id: "user-1",
@@ -137,7 +147,12 @@ Deno.test("whoami rejects unknown auth methods and extra fields", () => {
     "unknown auth method",
   );
   assertThrows(
-    () => parseWhoamiResponse({ actor: null, token: "secret" }),
+    () =>
+      parseWhoamiResponse({
+        actor: null,
+        authentication_reference: null,
+        token: "secret",
+      }),
     "unexpected whoami field",
   );
 });
@@ -197,7 +212,11 @@ Deno.test("auth validation enforces cumulative budgets without echoing unknown k
 
   const attackerKey = `secret-${"x".repeat(512)}`;
   try {
-    parseWhoamiResponse({ actor: null, [attackerKey]: true });
+    parseWhoamiResponse({
+      actor: null,
+      authentication_reference: null,
+      [attackerKey]: true,
+    });
     throw new Error("expected an error");
   } catch (error) {
     if (!(error instanceof Error) || error.message.includes(attackerKey)) {
@@ -248,23 +267,153 @@ Deno.test("whoami fails closed on actor-state mismatch and malformed expiry", ()
   };
   for (
     const payload of [
-      { actor, session: { kind: "anonymous" } },
-      { actor, session: { kind: "expired" } },
+      { actor, authentication_reference: null, session: { kind: "anonymous" } },
+      { actor, authentication_reference: null, session: { kind: "expired" } },
       {
         actor: null,
+        authentication_reference: null,
         session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
       },
-      { actor, session: { kind: "authenticated", expires_at: null } },
-      { actor, session: { kind: "authenticated", expires_at: "tomorrow" } },
-      { actor: null, session: { kind: "future" } },
+      {
+        actor,
+        authentication_reference: "fixture-authentication",
+        session: { kind: "authenticated", expires_at: null },
+      },
+      {
+        actor,
+        authentication_reference: "fixture-authentication",
+        session: { kind: "authenticated", expires_at: "tomorrow" },
+      },
       {
         actor: null,
+        authentication_reference: null,
+        session: { kind: "future" },
+      },
+      {
+        actor: null,
+        authentication_reference: null,
         session: { kind: "expired", expires_at: "2099-01-01T00:00:00Z" },
       },
     ]
   ) assertThrows(() => parseWhoamiResponse(payload), "inconsistent whoami");
   assertEquals(
-    parseWhoamiResponse({ actor: null, session: { kind: "expired" } }),
-    { actor: null, session: { kind: "expired" } },
+    parseWhoamiResponse({
+      actor: null,
+      authentication_reference: null,
+      session: { kind: "expired" },
+    }),
+    {
+      actor: null,
+      authentication_reference: null,
+      session: { kind: "expired" },
+    },
+  );
+});
+
+Deno.test("whoami and completion require explicit consistent authentication references", () => {
+  const user = {
+    user_id: "u",
+    account_id: "a",
+    handle: "alice",
+    display_name: "Alice",
+  };
+  const authenticated = {
+    actor: { ...user, auth_method: "browser_session" },
+    session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+  } as const;
+  for (const reference of [undefined, null, "", 42, "x".repeat(16385)]) {
+    assertThrows(
+      () =>
+        parseWhoamiResponse({
+          ...authenticated,
+          authentication_reference: reference,
+        }),
+      "invalid authenticated reference",
+    );
+    assertThrows(
+      () =>
+        parseAuthUserResponse({ user, authentication_reference: reference }),
+      "invalid issuance reference",
+    );
+  }
+  for (const kind of ["anonymous", "expired"]) {
+    assertThrows(
+      () => parseWhoamiResponse({ actor: null, session: { kind } }),
+      "missing anonymous reference",
+    );
+    assertThrows(
+      () =>
+        parseWhoamiResponse({
+          actor: null,
+          authentication_reference: "issued",
+          session: { kind },
+        }),
+      "anonymous reference must be null",
+    );
+  }
+  const completion = { user, authentication_reference: "issued" };
+  assertEquals(parseAuthUserResponse(completion), completion);
+  assertEquals(
+    parseWhoamiResponse({
+      ...authenticated,
+      authentication_reference: "issued",
+    }),
+    {
+      actor: authenticated.actor,
+      authentication_reference: "issued",
+      session: authenticated.session,
+    },
+  );
+});
+
+Deno.test("bounded future transports do not discard a created credential and required crypto bytes stay validated", () => {
+  const bytes = new Uint8Array([1, 2, 3]).buffer;
+  const credential = {
+    id: "AQID",
+    rawId: bytes,
+    type: "public-key",
+    getClientExtensionResults: () => ({
+      credProps: { rk: true },
+      prf: { results: { first: bytes } },
+      largeBlob: { blob: bytes },
+    }),
+    response: {
+      clientDataJSON: bytes,
+      attestationObject: bytes,
+      getTransports: () => ["internal", "hybrid", "future-bounded-transport"],
+    },
+  };
+  const converted = registrationCredentialToJson(credential) as {
+    response: { transports: string[] };
+    clientExtensionResults: unknown;
+  };
+  assertEquals(converted.response.transports, ["internal", "hybrid"]);
+  assertEquals(converted.clientExtensionResults, { credProps: { rk: true } });
+  assertThrows(
+    () =>
+      registrationCredentialToJson({
+        ...credential,
+        response: { ...credential.response, clientDataJSON: "not-binary" },
+      }),
+    "required client data remains binary",
+  );
+  assertThrows(
+    () =>
+      registrationCredentialToJson({
+        ...credential,
+        response: {
+          ...credential.response,
+          getTransports: () => ["x".repeat(16385)],
+        },
+      }),
+    "transport bound remains enforced",
+  );
+  assertThrows(
+    () =>
+      registrationCredentialToJson({
+        ...credential,
+        getClientExtensionResults: () => ({ credProps: { rk: bytes } }),
+      }),
+    "supported JSON extension never silently converts binary to an empty object",
   );
 });

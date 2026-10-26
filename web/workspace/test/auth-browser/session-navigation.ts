@@ -239,6 +239,10 @@ export async function sessionNavigation(
           name: "Add passkey to alice",
           exact: true,
         }).waitFor();
+        // Accountの初期metadata確認はwhoamiを前後で読む。完了を可視結果で
+        // 待ち、短命cookieの観測へ初期requestを混入させない。
+        await page.getByRole("list", { name: "Registered keys", exact: true })
+          .waitFor();
         const armed = await control(page, "arm-cookie");
         assert(armed.headers()["set-cookie"].includes("Max-Age=3"));
         const cookie = (await page.context().cookies()).find((c) =>
@@ -361,6 +365,10 @@ export async function sessionNavigation(
       await go("/account?tab=keys#stale", "account");
       await page.getByRole("button", { name: "Log out", exact: true })
         .waitFor();
+      // 保留するのは明示refresh。初期metadata requestは離脱時にabortされる
+      // 別のlifetimeなので、先に完了させる。
+      await page.getByRole("list", { name: "Registered keys", exact: true })
+        .waitFor();
       let started!: () => void;
       let failed!: (error: unknown) => void;
       let release!: () => void;
@@ -433,7 +441,7 @@ export async function sessionNavigation(
     },
   );
   await step(
-    "challenge 401 leaves an authenticated account in place and permits retry",
+    "challenge 401 leaves an authenticated account in place but requires result recovery before another addition",
     async ({ page, go }) => {
       const target = "/account?tab=keys#challenge";
       await go(target, "addition-expired");
@@ -453,7 +461,21 @@ export async function sessionNavigation(
           name: "Add passkey to alice",
           exact: true,
         }).isEnabled(),
-        true,
+        false,
+      );
+      await page.getByRole("button", {
+        name: "Check addition result",
+        exact: true,
+      }).click();
+      await page.getByRole("status").filter({
+        hasText: "addition result is still unknown",
+      }).waitFor();
+      assertEquals(
+        await page.getByRole("button", {
+          name: "Add passkey to alice",
+          exact: true,
+        }).isEnabled(),
+        false,
       );
     },
   );
@@ -466,7 +488,11 @@ export async function sessionNavigation(
       await at(page, "/");
       const wire = await (await page.request.get(`${origin}/api/auth/whoami`))
         .json();
-      assertEquals(wire, { actor: null, session: { kind: "anonymous" } });
+      assertEquals(wire, {
+        actor: null,
+        authentication_reference: null,
+        session: { kind: "anonymous" },
+      });
       await page.evaluate(() => {
         localStorage.clear();
         sessionStorage.clear();
@@ -487,6 +513,9 @@ export async function sessionNavigation(
           name: "Add passkey to alice",
           exact: true,
         }).waitFor();
+        // 初期metadata確認のwhoamiをlifecycle event由来と誤計数しない。
+        await page.getByRole("list", { name: "Registered keys", exact: true })
+          .waitFor();
         await control(page, "expire");
         let checks = 0;
         page.on("request", (request) => {

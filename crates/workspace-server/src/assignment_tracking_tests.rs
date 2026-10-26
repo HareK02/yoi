@@ -476,7 +476,8 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                     (99, "Explicit hosting administrators and self-registration policy".into()),
                     (100, "Provisional users and scoped passkey activation".into()),
                     (101, "Durable explicit Subject body release".into()),
-                    (102, "Durable failed Subject creation recovery".into())
+                    (102, "Durable failed Subject creation recovery".into()),
+                    (103, "Passkey metadata and atomic addition results".into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {

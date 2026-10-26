@@ -53,6 +53,7 @@ function boundary() {
         if (state.sessionGate) return state.sessionGate.promise;
         return state.whoamiStatus === 200
           ? Response.json({
+            authentication_reference: state.signedIn ? "fixture-authentication" : null,
             session: state.signedIn
               ? { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" }
               : { kind: "anonymous" },
@@ -326,6 +327,7 @@ test("pending create remains single during an explicit authentication change and
   expect(goto).not.toHaveBeenCalled();
   state.sessionGate.resolve(
     Response.json({
+      authentication_reference: "fixture-authentication",
       session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
       actor: { ...authUser, auth_method: "browser_session" },
     }),

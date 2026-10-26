@@ -7,6 +7,16 @@ import {
   registrationOptions,
 } from "./api.test-fixtures.ts";
 
+const bearerIdentity = {
+  actor: { ...authUser, auth_method: "api_token" },
+  authentication_reference: "fixture-bearer-authentication",
+  session: { kind: "authenticated", expires_at: null },
+};
+const completion = {
+  user: authUser,
+  authentication_reference: "fixture-issued-authentication",
+};
+
 function equal(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error("Values differ");
@@ -65,9 +75,11 @@ Deno.test("host enrollment sends bearer only to same-origin addition endpoints, 
   await boundary(async (input, init) => {
     requests.push({ path: String(input), init: init! });
     return Response.json(
-      String(input).endsWith("/options")
+      String(input).endsWith("/whoami")
+        ? bearerIdentity
+        : String(input).endsWith("/options")
         ? registrationOptions
-        : { user: authUser },
+        : completion,
     );
   }, async () => {
     equal(
@@ -75,11 +87,13 @@ Deno.test("host enrollment sends bearer only to same-origin addition endpoints, 
       authUser,
     );
     equal(requests.map((request) => request.path), [
+      "/api/auth/whoami",
       "/api/auth/passkeys/addition/options",
       "/api/auth/passkeys/addition/complete",
     ]);
-    for (const { init } of requests) {
-      equal(init.method, "POST");
+    for (const { path, init } of requests) {
+      equal(init.method, path.endsWith("/whoami") ? "GET" : "POST");
+      equal(new Headers(init.headers).has("cookie"), false);
       equal(init.credentials, "omit");
       equal(init.mode, "same-origin");
       equal(init.redirect, "error");
@@ -91,10 +105,15 @@ Deno.test("host enrollment sends bearer only to same-origin addition endpoints, 
       );
       equal(String(init.body).includes("host-test-token"), false);
     }
-    equal(JSON.parse(String(requests[0].init.body)), {
+    equal(requests[0].init.body, undefined);
+    equal(JSON.parse(String(requests[1].init.body)), {
+      expected_user_id: authUser.user_id,
+      expected_account_id: authUser.account_id,
+      expected_authentication_reference:
+        bearerIdentity.authentication_reference,
       browser_origin: "https://yoi.example",
     });
-    const complete = JSON.parse(String(requests[1].init.body));
+    const complete = JSON.parse(String(requests[2].init.body));
     equal(Object.keys(complete).sort(), ["challenge_id", "credential"]);
     equal(complete.challenge_id, registrationOptions.challenge_id);
     equal(complete.credential.response.attestationObject, "AQID");
@@ -151,29 +170,46 @@ Deno.test("host enrollment validates options before opening credential prompt", 
     }]
   ) {
     let calls = 0;
-    await boundary(async () => Response.json(payload), async () => {
-      await rejects(
-        enrollHostingPasskey("host-test-token", new AbortController().signal),
-      );
-      equal(calls, 0);
-    }, async () => {
-      calls++;
-      return credentialFixture();
-    });
+    await boundary(
+      async (input) =>
+        Response.json(
+          String(input).endsWith("/whoami") ? bearerIdentity : payload,
+        ),
+      async () => {
+        await rejects(
+          enrollHostingPasskey("host-test-token", new AbortController().signal),
+        );
+        equal(calls, 0);
+      },
+      async () => {
+        calls++;
+        return credentialFixture();
+      },
+    );
   }
 });
 
 Deno.test("host enrollment cancellation and teardown prevent completion", async () => {
   for (const abort of [false, true]) {
     const controller = new AbortController();
-    let requests = 0;
-    await boundary(async () => {
-      requests++;
-      return Response.json(registrationOptions);
+    const requests: string[] = [];
+    let prompts = 0;
+    await boundary(async (input) => {
+      requests.push(String(input));
+      return Response.json(
+        String(input).endsWith("/whoami")
+          ? bearerIdentity
+          : registrationOptions,
+      );
     }, async () => {
       await rejects(enrollHostingPasskey("host-test-token", controller.signal));
-      equal(requests, 1);
+      equal(requests, [
+        "/api/auth/whoami",
+        "/api/auth/passkeys/addition/options",
+      ]);
+      equal(prompts, 1);
     }, async () => {
+      prompts++;
       if (abort) {
         controller.abort();
         return credentialFixture();
@@ -188,6 +224,9 @@ Deno.test("host enrollment cannot confirm a rejected, lost or malformed completi
     let calls = 0;
     await boundary(async (input) => {
       calls++;
+      if (String(input).endsWith("/whoami")) {
+        return Response.json(bearerIdentity);
+      }
       if (String(input).endsWith("/options")) {
         return Response.json(registrationOptions);
       }
@@ -201,7 +240,7 @@ Deno.test("host enrollment cannot confirm a rejected, lost or malformed completi
       await rejects(
         enrollHostingPasskey("host-test-token", new AbortController().signal),
       );
-      equal(calls, 2);
+      equal(calls, 3);
     });
   }
 });

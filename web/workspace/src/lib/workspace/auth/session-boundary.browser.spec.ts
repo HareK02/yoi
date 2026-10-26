@@ -43,7 +43,7 @@ test("active expired state removes private content and preserves browser query a
   vi.stubGlobal(
     "fetch",
     vi.fn(async () =>
-      Response.json({ actor: null, session: { kind: "expired" } })
+      Response.json({ authentication_reference: null, actor: null, session: { kind: "expired" } })
     ),
   );
   await browserSession.refresh();
@@ -62,7 +62,7 @@ test("navigation admission does not redirect to the old page return URL", async 
   vi.stubGlobal(
     "fetch",
     vi.fn(async () =>
-      Response.json({ actor: null, session: { kind: "expired" } })
+      Response.json({ authentication_reference: null, actor: null, session: { kind: "expired" } })
     ),
   );
   await browserSession.refresh();

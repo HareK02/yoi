@@ -225,6 +225,10 @@ impl_openapi_schema!(
     PasskeyLoginOptionsResponse,
     PasskeyLoginCompleteRequest,
     PasskeyAdditionOptionsRequest,
+    PasskeySummary,
+    PasskeyListResponse,
+    PasskeyAdditionResultRequest,
+    PasskeyAdditionResultResponse,
     PasskeyRegistrationOptionsRequest,
     PasskeyRegistrationOptionsResponse,
     PasskeyRegistrationCompleteRequest,
@@ -647,6 +651,33 @@ pub trait ServerApi {
         &self,
         #[body] request: PasskeyRegistrationCompleteRequest,
     ) -> Result<server_api_responses::AuthPasskeyRegistrationComplete, RepositoryApiError>;
+
+    #[get(
+        "/api/auth/passkeys",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn auth_passkey_list(
+        &self,
+        #[extension] context: ServerRequestContext,
+    ) -> Result<PasskeyListResponse, RepositoryApiError>;
+
+    #[post(
+        "/api/auth/passkeys/addition/result",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [403, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn auth_passkey_addition_result(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[body] request: PasskeyAdditionResultRequest,
+    ) -> Result<PasskeyAdditionResultResponse, RepositoryApiError>;
 
     #[post(
         "/api/auth/passkeys/addition/options",
@@ -4115,6 +4146,8 @@ impl RequestActor {
 pub struct WhoamiResponse {
     pub actor: Option<RequestActor>,
     pub session: BrowserSessionState,
+    /// Non-secret comparison evidence, never an authentication credential.
+    pub authentication_reference: Option<String>,
 }
 
 /// Browser navigation evidence, not an authorization grant or a generic 401 classification.
@@ -4142,6 +4175,8 @@ pub struct AuthBootstrapUserRequest {
 #[serde(deny_unknown_fields)]
 pub struct AuthUserResponse {
     pub user: AuthenticatedUser,
+    /// Comparison evidence for the exact newly issued session, not a credential.
+    pub authentication_reference: String,
 }
 
 /// Starts new-account registration only; an existing handle is never interpreted as key addition.
@@ -4158,14 +4193,62 @@ pub struct PasskeyRegistrationOptionsRequest {
     pub browser_origin: Option<String>,
 }
 
-/// Adds a credential to the current authenticated actor; target identity is never public input.
+/// Adds to the current actor. Expected identity/binding fields only fence stale UI;
+/// they never select an owner or authorize an addition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct PasskeyAdditionOptionsRequest {
+    pub expected_user_id: String,
+    pub expected_account_id: String,
+    pub expected_authentication_reference: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub browser_origin: Option<String>,
+}
+
+/// Safe account metadata. Neither the WebAuthn credential ID nor key material is exposed.
+/// Normal-login verification is observed verifier success, not inferred discoverability.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeySummary {
+    pub key_reference: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub normal_login_verified_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyListResponse {
+    pub user: AuthenticatedUser,
+    pub keys: Vec<PasskeySummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PasskeyAdditionResultRequest {
+    pub challenge_id: String,
+    pub expected_user_id: String,
+    pub expected_account_id: String,
+    /// Original options authentication reference; the current same-owner session may differ.
+    pub expected_authentication_reference: String,
+}
+
+/// Unknown is not proof that registration failed: completion may still be in flight.
+/// Saved proves the credential commit, not session issuance or current session health.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PasskeyAdditionResultResponse {
+    Unknown {},
+    Saved {
+        user: AuthenticatedUser,
+        key: PasskeySummary,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -11642,6 +11725,10 @@ pub fn auth_api_typescript() -> String {
         AuthBootstrapUserRequest::decl(&config),
         AuthUserResponse::decl(&config),
         PasskeyAdditionOptionsRequest::decl(&config),
+        PasskeySummary::decl(&config),
+        PasskeyListResponse::decl(&config),
+        PasskeyAdditionResultRequest::decl(&config),
+        PasskeyAdditionResultResponse::decl(&config),
         PasskeyRegistrationOptionsRequest::decl(&config),
         PasskeyRegistrationOptionsResponse::decl(&config),
         PasskeyRegistrationCompleteRequest::decl(&config),
@@ -14069,7 +14156,8 @@ mod tests {
                 "display_name": "Hare",
                 "auth_method": "browser_session"
             },
-            "session": { "kind": "authenticated", "expires_at": "2026-10-20T00:00:00Z" }
+            "session": { "kind": "authenticated", "expires_at": "2026-10-20T00:00:00Z" },
+            "authentication_reference": "synthetic-session-reference"
         });
         let decoded = serde_json::from_value::<WhoamiResponse>(whoami.clone())
             .expect("server whoami fixture should match shared DTO");
@@ -14091,7 +14179,8 @@ mod tests {
                 "account_id": "account-1",
                 "handle": "hare",
                 "display_name": "Hare"
-            }
+            },
+            "authentication_reference": "synthetic-session-reference"
         });
         let decoded = serde_json::from_value::<AuthUserResponse>(auth_user.clone())
             .expect("server auth-user fixture should match shared DTO");
@@ -14264,7 +14353,7 @@ mod tests {
             serde_json::json!({"kind":"expired"}),
             serde_json::json!({"kind":"authenticated", "expires_at":null}),
         ] {
-            let value = serde_json::json!({"actor":null, "session":session});
+            let value = serde_json::json!({"actor":null, "session":session, "authentication_reference": null});
             let response: WhoamiResponse = serde_json::from_value(value.clone()).unwrap();
             assert_eq!(serde_json::to_value(response).unwrap(), value);
         }
@@ -14802,8 +14891,26 @@ mod openapi_artifact_tests {
             );
         }
         assert!(
-            serde_json::from_value::<PasskeyAdditionOptionsRequest>(serde_json::json!({})).is_ok()
+            serde_json::from_value::<PasskeyAdditionOptionsRequest>(serde_json::json!({})).is_err()
         );
+    }
+
+    #[test]
+    fn passkey_addition_requires_expected_owner_and_binding() {
+        let expected = serde_json::json!({
+            "expected_user_id": "user-a", "expected_account_id": "account-a",
+            "expected_authentication_reference": "reference"
+        });
+        assert!(serde_json::from_value::<PasskeyAdditionOptionsRequest>(expected.clone()).is_ok());
+        for field in [
+            "expected_user_id",
+            "expected_account_id",
+            "expected_authentication_reference",
+        ] {
+            let mut missing = expected.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<PasskeyAdditionOptionsRequest>(missing).is_err());
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@
 - [`WorkerE2eEnvironment`]: Backend／Runtime用プロセスとfixtureの管理。
 - [`FixtureSource`]: 提供資産の全ファイルSHA-256記録、独立copy、原本不変の検証。
 - [`WorkerSessionSubscription`]: 公開Worker WebSocketの初期full Snapshot照合と停止確認。モデル呼出しは行わない。
+- `tests/auth_passkeys/native_migration.rs`・`browser/native_passkey_migration.ts`: 実Backend／本番shell／Chromium native CTAP2の旧鍵移行。fixture境界・未確認範囲・明示選択コマンドはmoduleに置く。通常suiteやsoftware authenticatorの成功で代替しない。
 
 ## 固定Workerの段階起動
 

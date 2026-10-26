@@ -57,7 +57,7 @@ beforeEach(() => {
     "fetch",
     vi.fn(async (input) => {
       if (String(input) === "/api/auth/whoami") {
-        return Response.json({ session: { kind: "anonymous" }, actor: null });
+        return Response.json({ session: { kind: "anonymous" }, authentication_reference: null, actor: null });
       }
       throw new Error(`Unexpected request ${input}`);
     }),
