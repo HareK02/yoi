@@ -1084,9 +1084,9 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for RestoreAuthFactory
         worker_ref: &worker_runtime::identity::WorkerRef,
         workspace_id: Option<&str>,
         handle: &worker::WorkerHandle,
-    ) {
+    ) -> std::result::Result<(), String> {
         self.inner
-            .activate_restored_controller(worker_ref, workspace_id, handle);
+            .activate_restored_controller(worker_ref, workspace_id, handle)
     }
 }
 
