@@ -600,6 +600,23 @@ mod publication {
             ));
         }
         assert_ne!(replacement.restore_operation_id, Some(started.operation_id));
+        // Recovering the superseded intent must not settle or mutate the new
+        // execution, even though both requests address the same WorkerRef.
+        let replacement_owner = replacement.restore_operation_id;
+        let replay = runtime
+            .restore_worker_operation_scoped(scope, &worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(replay.state, server_api::WorkerRestoreState::Superseded);
+        let saved = runtime
+            .test_runtime_store()
+            .read_worker_record(&worker_ref)
+            .unwrap();
+        let guard = serde_json::to_value(&saved.restore_guard).unwrap();
+        assert_eq!(guard["owners"][&request.request_id], superseded);
+        assert_eq!(
+            fixture.backend.workers.lock().unwrap()[&worker_ref].restore_operation_id,
+            replacement_owner
+        );
         assert_eq!(fixture.backend.workers.lock().unwrap().len(), 1);
         assert_eq!(
             fixture
@@ -613,20 +630,27 @@ mod publication {
         // A diagnostic event on the retained old endpoint must never enter the
         // new bridge, and a command on that closed endpoint must not be rerouted.
         alert_marker(&old, "superseded-old-after-replacement");
-        let old_command = old.clone();
-        assert!(
-            fixture
-                .backend
-                .run_on_adapter_runtime(async move {
-                    old_command
-                        .send(Method::Pause {
-                            command: protocol::WorkerCommandEnvelope::new(77111),
-                        })
-                        .await
-                        .map_err(|error| error.to_string())
-                })
-                .is_err()
-        );
+        for method in [
+            Method::Pause {
+                command: protocol::WorkerCommandEnvelope::new(77111),
+            },
+            Method::Shutdown {
+                command: protocol::WorkerCommandEnvelope::new(77112),
+            },
+        ] {
+            let old_command = old.clone();
+            assert!(
+                fixture
+                    .backend
+                    .run_on_adapter_runtime(async move {
+                        old_command
+                            .send(method)
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                    .is_err()
+            );
+        }
         assert_eq!(
             replacement.handle.shared_state.snapshot().state,
             protocol::WorkerState::Idle
