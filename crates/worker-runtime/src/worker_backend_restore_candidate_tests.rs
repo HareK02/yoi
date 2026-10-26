@@ -165,23 +165,35 @@ mod restore_candidate {
         }
 
         fn with_transport(transport: WorkerControllerTransport) -> Self {
+            Self::with_seed(transport, false)
+        }
+
+        fn no_model() -> Self {
+            Self::with_seed(WorkerControllerTransport::InProcess, true)
+        }
+
+        fn with_seed(transport: WorkerControllerTransport, no_model: bool) -> Self {
             let root = restore_failure_tempdir();
-            let model = MockClient::sequential(vec![
-                MockResponse::Complete(vec![
-                    LlmEvent::tool_use_start(0, "candidate-task-probe", "TaskCreate"),
-                    LlmEvent::tool_input_delta(
-                        0,
-                        r#"{"subject":"Activated candidate","description":"Execution probe"}"#,
-                    ),
-                    LlmEvent::tool_use_stop(0),
-                    LlmEvent::Status(StatusEvent {
-                        status: ResponseStatus::Completed,
-                    }),
-                ]),
-                MockResponse::Complete(simple_text_events()),
-                MockResponse::Complete(simple_text_events()),
-                MockResponse::Complete(simple_text_events()),
-            ]);
+            let model = if no_model {
+                MockClient::new(Vec::new())
+            } else {
+                MockClient::sequential(vec![
+                    MockResponse::Complete(vec![
+                        LlmEvent::tool_use_start(0, "candidate-task-probe", "TaskCreate"),
+                        LlmEvent::tool_input_delta(
+                            0,
+                            r#"{"subject":"Activated candidate","description":"Execution probe"}"#,
+                        ),
+                        LlmEvent::tool_use_stop(0),
+                        LlmEvent::Status(StatusEvent {
+                            status: ResponseStatus::Completed,
+                        }),
+                    ]),
+                    MockResponse::Complete(simple_text_events()),
+                    MockResponse::Complete(simple_text_events()),
+                    MockResponse::Complete(simple_text_events()),
+                ])
+            };
             let injected = model.clone();
             let mut factory = ProfileRuntimeWorkerFactory::new(root.path())
                 .with_runtime_store_dir(root.path())
@@ -264,15 +276,19 @@ mod restore_candidate {
                     let aggregate = fixture_root.join("workers").join(worker_ref.worker_id.to_string());
                     let session = WorkerSessionStore::new(aggregate.join("session")).unwrap();
                     let metadata = WorkerAggregateStore::new(&aggregate, &manifest.worker.name).unwrap();
-                    let mut engine = Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
-                        MockClient::sequential(vec![MockResponse::Hang(simple_text_events().into_iter().take(2).collect())]),
-                    );
+                    let seed_model = if no_model {
+                        MockClient::new(Vec::new())
+                    } else {
+                        MockClient::sequential(vec![MockResponse::Hang(simple_text_events().into_iter().take(2).collect())])
+                    };
+                    let mut engine = Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(seed_model);
                     engine.set_system_prompt("Committed restore candidate fixture prompt");
                     let mut worker = Worker::new(
                         manifest.clone(),
                         engine,
                         CombinedStore::new(session.clone(), metadata.clone()),
                         RuntimeWorkspaceBackendRef::from_worker_request(&create, Some("candidate-runtime"))
+                            .unwrap()
                             .worker_context(&worker_ref, Some(&crate::runtime::RuntimeWorkspaceScope::new(
                                 "workspace-saved-subjektiv", "server-main",
                             )), None, None, None, None),
@@ -282,51 +298,60 @@ mod restore_candidate {
                     worker.enable_worker_metadata_write_through().unwrap();
                     worker.materialize_durable_session_head().await.unwrap();
                     let (session_id, segment_id) = (worker.session_id(), worker.segment_id());
-                    let workspace_client = worker.workspace_client_handle();
-                    let started = PreparedWorker::new(
-                        worker,
-                        WorkerBootstrapLayout::RuntimeManagedRun { run_dir: fixture_root.join("seed") },
-                        WorkerControllerTransport::InProcess,
-                    ).start().await.unwrap();
-                    let mut seed = SeedController(Some(RuntimeWorkerController {
-                        handle: started.handle,
-                        shutdown: Arc::new(tokio::sync::Mutex::new(Some(started.shutdown))),
-                        controller_task: started.controller_task,
-                        workspace_client,
-                    }));
-                    let handle = seed.0.as_ref().unwrap().handle.clone();
-                    let mut started_events = handle.subscribe();
-                    submit(&handle, "candidate-setup-turn").await;
-                    // Running and streaming observations can arrive in either
-                    // order. Do not discard TextDelta while awaiting WorkerState.
-                    let mut running = handle.shared_state.catalog_status() == WorkerStatus::Running;
-                    let mut streaming = false;
-                    receive_matching(&mut started_events, "seed running and streaming", |event| {
-                        if let Event::WorkerState { snapshot } = event {
-                            running |= snapshot.catalog_status() == protocol::WorkerStatus::Running;
-                        }
-                        streaming |= matches!(event, Event::TextDelta { .. });
-                        running && streaming
-                    }).await;
-                    let state = Arc::new(RwLock::new(handle.shared_state.snapshot()));
-                    let mut events = handle.subscribe();
-                    handle.send(Method::Pause { command: next_internal_command(&state).unwrap() })
-                        .await.unwrap();
-                    receive_matching(&mut events, "seed pause acknowledgement", |event| {
-                        matches!(event, Event::WorkerState { snapshot }
-                            if snapshot.catalog_status() == protocol::WorkerStatus::Paused)
-                    }).await;
-                    let mut receipts = Vec::new();
-                    for id in [FIRST, SECOND] {
-                        let receipt = submit(&handle, id).await;
-                        assert!(matches!(receipt, Event::SubmissionAccepted {
-                            disposition: protocol::SubmissionDisposition::Queued, ..
+                    let receipts = if no_model {
+                        // Persist a real empty Session without starting a seed
+                        // Controller or submitting any model input.
+                        drop(worker);
+                        Vec::new()
+                    } else {
+                        let workspace_client = worker.workspace_client_handle();
+                        let started = PreparedWorker::new(
+                            worker,
+                            WorkerBootstrapLayout::RuntimeManagedRun { run_dir: fixture_root.join("seed") },
+                            WorkerControllerTransport::InProcess,
+                        ).start().await.unwrap();
+                        let mut seed = SeedController(Some(RuntimeWorkerController {
+                            handle: started.handle,
+                            shutdown: Arc::new(tokio::sync::Mutex::new(Some(started.shutdown))),
+                            controller_task: started.controller_task,
+                            workspace_client,
+                            restore_streams: None,
                         }));
-                        receipts.push(serde_json::to_value(receipt).unwrap());
-                        if id == FIRST { notify(&handle).await; }
-                    }
-                    assert_eq!(pending(&handle).await.submissions.len(), 2);
-                    shutdown_profile_controller(seed.0.take().unwrap()).await;
+                        let handle = seed.0.as_ref().unwrap().handle.clone();
+                        let mut started_events = handle.subscribe();
+                        submit(&handle, "candidate-setup-turn").await;
+                        // Running and streaming observations can arrive in either
+                        // order. Do not discard TextDelta while awaiting WorkerState.
+                        let mut running = handle.shared_state.catalog_status() == WorkerStatus::Running;
+                        let mut streaming = false;
+                        receive_matching(&mut started_events, "seed running and streaming", |event| {
+                            if let Event::WorkerState { snapshot } = event {
+                                running |= snapshot.catalog_status() == protocol::WorkerStatus::Running;
+                            }
+                            streaming |= matches!(event, Event::TextDelta { .. });
+                            running && streaming
+                        }).await;
+                        let state = Arc::new(RwLock::new(handle.shared_state.snapshot()));
+                        let mut events = handle.subscribe();
+                        handle.send(Method::Pause { command: next_internal_command(&state).unwrap() })
+                            .await.unwrap();
+                        receive_matching(&mut events, "seed pause acknowledgement", |event| {
+                            matches!(event, Event::WorkerState { snapshot }
+                                if snapshot.catalog_status() == protocol::WorkerStatus::Paused)
+                        }).await;
+                        let mut receipts = Vec::new();
+                        for id in [FIRST, SECOND] {
+                            let receipt = submit(&handle, id).await;
+                            assert!(matches!(receipt, Event::SubmissionAccepted {
+                                disposition: protocol::SubmissionDisposition::Queued, ..
+                            }));
+                            receipts.push(serde_json::to_value(receipt).unwrap());
+                            if id == FIRST { notify(&handle).await; }
+                        }
+                        assert_eq!(pending(&handle).await.submissions.len(), 2);
+                        shutdown_profile_controller(seed.0.take().unwrap()).await;
+                        receipts
+                    };
                     // This orphan pin would be removed by the normal activation
                     // reconciliation. Preparation and discard must leave it alone.
                     let orphan = session.write_uploaded_file(
@@ -358,15 +383,17 @@ mod restore_candidate {
                 host,
                 _root: root,
             };
-            let checkpoint = queue_checkpoint(&fixture.entries());
-            assert_eq!(checkpoint["pending"].as_array().unwrap().len(), 2);
-            assert_eq!(
-                checkpoint["pending_notifications"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                1
-            );
+            if !no_model {
+                let checkpoint = queue_checkpoint(&fixture.entries());
+                assert_eq!(checkpoint["pending"].as_array().unwrap().len(), 2);
+                assert_eq!(
+                    checkpoint["pending_notifications"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
             fixture.assert_quiet();
             fixture
         }
@@ -443,14 +470,23 @@ mod restore_candidate {
                     .get(&self.request.worker_ref)
                     .is_none()
             );
-            assert!(
-                !self
-                    .backend
-                    .factory
-                    .worker_restore_run_dir(&self.request.worker_ref, self.request.operation_id,)
-                    .unwrap()
-                    .exists()
-            );
+            let run_dir = self.backend.factory.worker_restore_run_dir(
+                &self.request.worker_ref, self.request.operation_id,
+            ).unwrap();
+            // Private initialization owns only disposable operation-scoped run
+            // artifacts. It has not published a listener, liveness files or a
+            // delegated-child projection, and canonical files are checked by
+            // each caller independently.
+            let mut artifacts = std::fs::read_dir(&run_dir).unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect::<Vec<_>>();
+            artifacts.sort();
+            assert_eq!(artifacts, ["artifacts", "spawned", "worker.err.log", "worker.out.log"]);
+            for log in ["worker.err.log", "worker.out.log"] {
+                assert_eq!(std::fs::metadata(run_dir.join(log)).unwrap().len(), 0);
+            }
+            for directory in ["artifacts", "spawned"] {
+                assert_eq!(std::fs::read_dir(run_dir.join(directory)).unwrap().count(), 0);
+            }
             let table = worker::runtime::worker_allocation::LockFileGuard::open(
                 &worker::runtime::worker_allocation::default_allocation_path().unwrap(),
             )
@@ -519,6 +555,588 @@ mod restore_candidate {
                 });
             }
         }
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn session_availability_requires_attachable_current_controller() {
+        let fixture = Fixture::no_model();
+        let worker_ref = &fixture.request.worker_ref;
+        let observe = || {
+            fixture
+                .backend
+                .worker_session(WorkerSessionObservationRequest {
+                    worker_ref: worker_ref.clone(),
+                })
+        };
+        let assert_retained = |availability| {
+            assert!(matches!(
+                availability,
+                runtime_api::WorkerSessionAvailability::RetainedSnapshot { identity, .. }
+                    if identity.session_id == fixture.session_id.to_string()
+                        && identity.segment_id == fixture.segment_id.to_string()
+            ));
+        };
+        fixture.prepare();
+        assert_retained(observe());
+        let pending = fixture
+            .backend
+            .pending_restore(worker_ref)
+            .unwrap()
+            .unwrap();
+        fixture
+            .backend
+            .activate_restored_worker(fixture.request.operation_id, worker_ref)
+            .unwrap();
+        let execution = fixture.backend.workers.lock().unwrap()[worker_ref].clone();
+        assert!(!execution.handle.protocol_is_closed());
+        assert!(!execution.shutdown_requested.load(Ordering::Acquire));
+        assert!(matches!(
+            observe(),
+            runtime_api::WorkerSessionAvailability::LiveProtocol
+        ));
+        #[cfg(feature = "ws-server")]
+        let transport = fixture
+            .backend
+            .clone()
+            .attach_worker_protocol(worker_ref)
+            .unwrap();
+        #[cfg(feature = "ws-server")]
+        transport.validate().unwrap();
+
+        // Retain the same real operation owner alongside its registered actual
+        // Controller to exercise the pending-resource visibility guard alone.
+        let operation_lock = fixture.backend.worker_lock(worker_ref).unwrap();
+        {
+            let _guard = operation_lock.lock().unwrap();
+            fixture
+                .backend
+                .pending_restores
+                .lock()
+                .unwrap()
+                .insert(worker_ref.clone(), pending);
+        }
+        let pending_session = observe();
+        #[cfg(feature = "ws-server")]
+        let pending_protocol = (
+            transport.validate(),
+            fixture.backend.clone().attach_worker_protocol(worker_ref),
+        );
+        // Reset injected visibility before assertions so Fixture can also stop
+        // and release its allocation when an assertion unwinds.
+        {
+            let _guard = operation_lock.lock().unwrap();
+            fixture.backend.remove_pending_restore(worker_ref).unwrap();
+        }
+        assert_retained(pending_session);
+        #[cfg(feature = "ws-server")]
+        {
+            assert!(pending_protocol.0.is_err());
+            assert!(matches!(
+                pending_protocol.1,
+                Err(error) if error.outcome == crate::execution::WorkerExecutionOutcome::Busy
+            ));
+        }
+        assert!(matches!(
+            observe(),
+            runtime_api::WorkerSessionAvailability::LiveProtocol
+        ));
+        {
+            let _guard = operation_lock.lock().unwrap();
+            execution.shutdown_requested.store(true, Ordering::Release);
+        }
+        let stopping_session = observe();
+        #[cfg(feature = "ws-server")]
+        let stopping_protocol = (
+            transport.validate(),
+            fixture.backend.clone().attach_worker_protocol(worker_ref),
+        );
+        {
+            let _guard = operation_lock.lock().unwrap();
+            execution.shutdown_requested.store(false, Ordering::Release);
+        }
+        assert!(!execution.handle.protocol_is_closed());
+        assert_retained(stopping_session);
+        #[cfg(feature = "ws-server")]
+        {
+            assert!(stopping_protocol.0.is_err());
+            assert!(stopping_protocol.1.is_err());
+            transport.validate().unwrap();
+        }
+        assert!(matches!(
+            observe(),
+            runtime_api::WorkerSessionAvailability::LiveProtocol
+        ));
+        let handle = execution.handle.clone();
+        let command = next_internal_command(&execution.worker_state).unwrap();
+        fixture
+            .backend
+            .run_on_adapter_runtime(async move {
+                handle
+                    .send(Method::Shutdown { command })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                tokio::time::timeout(WAIT, handle.protocol_closed())
+                    .await
+                    .map_err(|_| "Controller did not close".to_string())?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(execution.handle.protocol_is_closed());
+        assert!(!execution.shutdown_requested.load(Ordering::Acquire));
+        assert!(
+            fixture
+                .backend
+                .workers
+                .lock()
+                .unwrap()
+                .contains_key(worker_ref)
+        );
+        assert_retained(observe());
+        #[cfg(feature = "ws-server")]
+        {
+            assert!(transport.validate().is_err());
+            assert!(
+                fixture
+                    .backend
+                    .clone()
+                    .attach_worker_protocol(worker_ref)
+                    .is_err()
+            );
+        }
+        assert!(fixture.backend.stop_worker(worker_ref).is_accepted());
+        #[cfg(feature = "ws-server")]
+        drop(transport);
+        drop(execution);
+        fixture.assert_released();
+        fixture.assert_quiet();
+    }
+
+    // Connects Profile restore activation to ordinary protocol input and the
+    // durable Paused boundary; Runtime admission/Accepted ordering is outside it.
+    #[test]
+    #[cfg(feature = "ws-server")]
+    #[serial_test::serial(worker_allocation)]
+    fn activated_empty_candidate_accepts_body_input_and_queues_while_paused() {
+        use crate::execution::WorkerProtocolTransport;
+
+        const S1: &str = "candidate-body-s1";
+        const S2: &str = "candidate-body-s2";
+        const IDLE_ONLY: &str = "candidate-body-idle-only";
+        const OUTPUT: &str = "committed candidate output before pause";
+
+        // Keep one real connection (paired full snapshot + subscription) for
+        // every method and observation. Never reconnect to hide missing events.
+        fn observe(
+            backend: &WorkerRuntimeExecutionBackend,
+            mut transport: WorkerProtocolTransport,
+            phase: &'static str,
+            no_new_run: bool,
+            mut matches: impl FnMut(&Event) -> bool + Send + 'static,
+        ) -> (WorkerProtocolTransport, Event) {
+            backend
+                .run_on_adapter_runtime(async move {
+                    let mut seen = Vec::new();
+                    let matched = tokio::time::timeout(WAIT, async {
+                        loop {
+                            let event = transport
+                                .events
+                                .recv()
+                                .await
+                                .expect("attached protocol stream");
+                            seen.push(format!("{event:?}"));
+                            if no_new_run {
+                                assert!(
+                                    !matches!(
+                                        event,
+                                        Event::InvokeStart { .. }
+                                            | Event::TurnStart { .. }
+                                            | Event::UserMessage { .. }
+                                            | Event::TextDelta { .. }
+                                            | Event::TextDone { .. }
+                                    ),
+                                    "paused input started another run during {phase}: {event:?}"
+                                );
+                            }
+                            if matches(&event) {
+                                break event;
+                            }
+                            assert!(
+                                !matches!(
+                                    event,
+                                    Event::Error { .. }
+                                        | Event::SubmissionRejected { .. }
+                                        | Event::NotificationRejected { .. }
+                                        | Event::Shutdown
+                                ),
+                                "unexpected protocol failure during {phase}: {event:?}"
+                            );
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("protocol deadline during {phase}; observed {seen:?}")
+                    });
+                    Ok((transport, matched))
+                })
+                .unwrap()
+        }
+
+        fn user_inputs(entries: &[LogEntry]) -> Vec<Vec<protocol::Segment>> {
+            entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    LogEntry::AnnotatedUserInput { segments, .. } => Some(segments.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // Declaration order keeps the bootstrap runtime (which owns the
+        // existing loopback Host task) alive through Fixture::drop, even on panic.
+        let bootstrap_backend;
+        let mut fixture = Fixture::no_model();
+        let script = MockClient::sequential(vec![MockResponse::Hang(vec![
+            LlmEvent::text_block_start(0),
+            LlmEvent::text_delta(0, OUTPUT),
+            LlmEvent::text_block_stop(0, None),
+        ])]);
+        // Hang explicitly chains stream::pending() after a complete text block.
+        // Hang([]) would exercise pre-token rollback instead of durable Paused.
+        let injected = script.clone();
+        let factory = fixture
+            .backend
+            .factory
+            .as_ref()
+            .clone()
+            .with_spawn_model_client_factory(move || Box::new(injected.clone()));
+        bootstrap_backend = std::mem::replace(
+            &mut fixture.backend,
+            Arc::new(WorkerRuntimeExecutionBackend::new(factory).unwrap()),
+        );
+        let worker_ref = &fixture.request.worker_ref;
+        assert!(user_inputs(&fixture.entries()).is_empty());
+        assert!(
+            !fixture
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, LogEntry::Invoke { .. }))
+        );
+        let before = fixture.canonical_files();
+        fixture.prepare(); // actual Profile prepare_restore; not MockFactory::spawn
+        fixture.assert_quiet(); // independent empty bootstrap client remains unused
+        assert_eq!(script.call_count.load(Ordering::SeqCst), 0);
+        assert!(script.captured.lock().unwrap().is_empty());
+        assert_eq!(fixture.canonical_files(), before);
+        assert!(
+            fixture
+                .backend
+                .clone()
+                .attach_worker_protocol(worker_ref)
+                .is_err()
+        );
+        fixture
+            .backend
+            .activate_restored_worker(fixture.request.operation_id, worker_ref)
+            .unwrap();
+        let execution = fixture.backend.workers.lock().unwrap()[worker_ref].clone();
+        let transport = fixture
+            .backend
+            .clone()
+            .attach_worker_protocol(worker_ref)
+            .unwrap();
+        transport.validate().unwrap();
+        assert!(
+            matches!(
+                &transport.snapshot,
+                Event::Snapshot { session, state, in_flight, .. }
+                    if state.state == protocol::WorkerState::Idle
+                        && session.pending_submissions == protocol::PendingSubmissionsSnapshot::default()
+                        && session == &session_store::public_snapshot::project_current_session_snapshot(&fixture.entries())
+                        && in_flight.is_empty()
+            ),
+            "expected full input-ready snapshot: {:?}",
+            transport.snapshot
+        );
+        assert!(user_inputs(&fixture.entries()).is_empty());
+        assert_eq!(script.call_count.load(Ordering::SeqCst), 0);
+
+        assert!(
+            transport
+                .dispatch(Method::submit_text(S1, S1))
+                .unwrap()
+                .is_empty()
+        );
+        let (transport, _) = observe(
+            &fixture.backend,
+            transport,
+            "S1 committed and streaming",
+            false,
+            {
+                let (mut accepted, mut user_message, mut running, mut text_done) =
+                    (false, false, false, false);
+                move |event| {
+                    match event {
+                        Event::SubmissionAccepted {
+                            submission_request_id,
+                            disposition,
+                            ..
+                        } if submission_request_id == S1 => {
+                            assert_eq!(*disposition, protocol::SubmissionDisposition::Started);
+                            accepted = true;
+                        }
+                        Event::UserMessage { segments, .. } => {
+                            assert_eq!(segments, &vec![protocol::Segment::text(S1)]);
+                            user_message = true;
+                        }
+                        Event::WorkerState { snapshot } => {
+                            running |= snapshot.state
+                                == protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                                    protocol::WorkerRunState::Running,
+                                ));
+                        }
+                        Event::TextDone { text } => {
+                            assert_eq!(text, OUTPUT);
+                            text_done = true;
+                        }
+                        _ => {}
+                    }
+                    accepted && user_message && running && text_done
+                }
+            },
+        );
+        // Started is only an admission receipt. Require the actual canonical
+        // AnnotatedUserInput plus its model-visible history before sending Pause.
+        assert_eq!(
+            user_inputs(&fixture.entries()),
+            vec![vec![protocol::Segment::text(S1)]]
+        );
+        let history = session_store::collect_state(&fixture.entries()).annotated_history;
+        assert!(history.iter().any(|entry| matches!(
+            &entry.item, LoggedItem::Message { content, .. }
+                if content.iter().any(|part| matches!(part, LoggedContentPart::Text { text } if text == S1))
+        )));
+        assert_eq!(script.call_count.load(Ordering::SeqCst), 1);
+        let pause = next_internal_command(&execution.worker_state).unwrap();
+        transport
+            .dispatch(Method::Pause { command: pause })
+            .unwrap();
+        let (transport, _) = observe(&fixture.backend, transport, "Pause completion", false, {
+            let (mut acknowledged, mut paused, mut ended) = (false, false, false);
+            move |event| {
+                match event {
+                    Event::CommandAcknowledged { acknowledgement }
+                        if acknowledgement.command_id == pause.command_id =>
+                    {
+                        assert_eq!(acknowledgement.command, protocol::WorkerCommandKind::Pause);
+                        assert_eq!(
+                            acknowledgement.disposition,
+                            protocol::WorkerCommandDisposition::Accepted
+                        );
+                        acknowledged = true;
+                    }
+                    Event::WorkerState { snapshot } => {
+                        paused |= snapshot.state
+                            == protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                                protocol::WorkerRunState::Paused,
+                            ));
+                    }
+                    Event::RunEnd { result } => {
+                        assert_eq!(*result, protocol::RunResult::Paused);
+                        ended = true;
+                    }
+                    _ => {}
+                }
+                acknowledged && paused && ended
+            }
+        });
+        assert_eq!(
+            execution.handle.shared_state.snapshot().state,
+            protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Paused
+            ))
+        );
+        let paused_entries = fixture.entries();
+        assert_eq!(
+            user_inputs(&paused_entries),
+            vec![vec![protocol::Segment::text(S1)]]
+        );
+        let invokes = paused_entries
+            .iter()
+            .filter(|entry| matches!(entry, LogEntry::Invoke { .. }))
+            .count();
+        assert_eq!(invokes, 1);
+        // The hanging model response has not appended a final assistant item.
+        // Prove the actual durable Paused boundary, not a streaming TextDone's
+        // assumed equivalence to a completed assistant history message.
+        assert!(paused_entries.iter().any(|entry| matches!(
+            entry,
+            LogEntry::RunCompleted {
+                interrupted: true,
+                result: agen::EngineResult::Paused,
+                ..
+            }
+        )));
+
+        transport.dispatch(Method::submit_text(S2, S2)).unwrap();
+        let (transport, queued) = observe(
+            &fixture.backend,
+            transport,
+            "S2 Queued receipt",
+            true,
+            |event| matches!(event, Event::SubmissionAccepted { submission_request_id, .. } if submission_request_id == S2),
+        );
+        let submission_id = match &queued {
+            Event::SubmissionAccepted {
+                submission_id,
+                disposition,
+                ..
+            } => {
+                assert_eq!(*disposition, protocol::SubmissionDisposition::Queued);
+                submission_id.clone()
+            }
+            _ => unreachable!(),
+        };
+        let checkpoint = queue_checkpoint(&fixture.entries());
+        assert_eq!(checkpoint["pending"].as_array().unwrap().len(), 1);
+        assert_eq!(checkpoint["pending"][0]["submission_request_id"], S2);
+        assert_eq!(checkpoint["pending"][0]["submission_id"], submission_id);
+        assert_eq!(
+            checkpoint["pending"][0]["input"],
+            serde_json::to_value(vec![protocol::Segment::text(S2)]).unwrap()
+        );
+        let receipts = checkpoint["receipts"].as_array().unwrap();
+        let s2_receipts: Vec<_> = receipts
+            .iter()
+            .filter(|receipt| receipt["submission_request_id"] == S2)
+            .collect();
+        assert_eq!(s2_receipts.len(), 1);
+        assert_eq!(s2_receipts[0]["submission_id"], submission_id);
+        assert_eq!(s2_receipts[0]["disposition"], "queued");
+        transport.dispatch(Method::ListPendingSubmissions).unwrap();
+        let (transport, listed) = observe(
+            &fixture.backend,
+            transport,
+            "S2 pending list",
+            true,
+            |event| matches!(event, Event::PendingSubmissionsChanged { .. }),
+        );
+        let pending = match listed {
+            Event::PendingSubmissionsChanged { pending } => pending,
+            _ => unreachable!(),
+        };
+        assert_eq!(pending.submissions.len(), 1);
+        assert_eq!(pending.head_id.as_deref(), Some(submission_id.as_str()));
+        assert_eq!(pending.submissions[0].submission_id, submission_id);
+
+        let before_retry = fixture.canonical_files();
+        transport.dispatch(Method::submit_text(S2, S2)).unwrap();
+        let (transport, replay) = observe(
+            &fixture.backend,
+            transport,
+            "S2 exact retry",
+            true,
+            |event| matches!(event, Event::SubmissionAccepted { submission_request_id, .. } if submission_request_id == S2),
+        );
+        assert_eq!(
+            serde_json::to_value(replay).unwrap(),
+            serde_json::to_value(queued).unwrap()
+        );
+        assert_eq!(fixture.canonical_files(), before_retry);
+        transport.dispatch(Method::ListPendingSubmissions).unwrap();
+        let (transport, listed) = observe(
+            &fixture.backend,
+            transport,
+            "retry retains one pending",
+            true,
+            |event| matches!(event, Event::PendingSubmissionsChanged { .. }),
+        );
+        assert!(
+            matches!(listed, Event::PendingSubmissionsChanged { pending: actual } if actual == pending)
+        );
+
+        // Idle-only admission is a different contract from ordinary Submit:
+        // observe the real rejection on this connection, not a Queued receipt.
+        let mut idle_only = WorkerInput::user(IDLE_ONLY);
+        idle_only.kind = WorkerInputKind::UserIfIdle;
+        idle_only.submission_request_id = Some(IDLE_ONLY.into());
+        let rejected = fixture.backend.dispatch_input(worker_ref, idle_only);
+        assert!(!rejected.is_accepted(), "{rejected:?}");
+        assert!(
+            rejected.message_or_default().contains("WorkerNotify"),
+            "{rejected:?}"
+        );
+        let (transport, _) = observe(
+            &fixture.backend,
+            transport,
+            "Paused idle-only rejection",
+            true,
+            |event| {
+                matches!(event, Event::SubmissionRejected { submission_request_id, message }
+                if submission_request_id == IDLE_ONLY && message.contains("WorkerNotify"))
+            },
+        );
+        assert_eq!(fixture.canonical_files(), before_retry);
+        assert_eq!(queue_checkpoint(&fixture.entries()), checkpoint);
+
+        transport
+            .dispatch(Method::CancelPendingSubmission { submission_id })
+            .unwrap();
+        let (transport, _) = observe(&fixture.backend, transport, "cancel S2", true, |event| {
+            matches!(event, Event::PendingSubmissionsChanged { pending }
+                if pending.submissions.is_empty() && pending.head_id.is_none())
+        });
+        transport.dispatch(Method::ListPendingSubmissions).unwrap();
+        let (transport, _) = observe(
+            &fixture.backend,
+            transport,
+            "empty pending list after cancel",
+            true,
+            |event| {
+                matches!(event, Event::PendingSubmissionsChanged { pending }
+                if pending == &protocol::PendingSubmissionsSnapshot::default())
+            },
+        );
+        let entries = fixture.entries();
+        assert!(
+            queue_checkpoint(&entries)["pending"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            user_inputs(&entries),
+            vec![vec![protocol::Segment::text(S1)]]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| matches!(entry, LogEntry::Invoke { .. }))
+                .count(),
+            invokes
+        );
+        assert_eq!(
+            execution.handle.shared_state.snapshot().state,
+            protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
+                protocol::WorkerRunState::Paused
+            ))
+        );
+        assert_eq!(script.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(script.captured.lock().unwrap().len(), 1);
+        fixture.assert_quiet();
+        transport.validate().unwrap();
+        // Normal Stop owns shutdown and the Controller/transport abort+join
+        // barrier; do not simulate closure or inject a terminal state.
+        assert!(fixture.backend.stop_worker(worker_ref).is_accepted());
+        assert!(execution.handle.protocol_is_closed());
+        assert!(execution.tasks.tasks.lock().unwrap().is_empty());
+        assert!(transport.validate().is_err());
+        drop(transport);
+        drop(execution);
+        fixture.assert_released();
+        assert_eq!(script.call_count.load(Ordering::SeqCst), 1);
+        drop(fixture);
+        drop(bootstrap_backend);
     }
 
     #[test]
@@ -896,6 +1514,7 @@ mod restore_candidate {
         }
     }
 
+    #[cfg(feature = "fs-store")]
     #[test]
     #[serial_test::serial(worker_allocation)]
     fn attachment_preparation_replay_cannot_hide_logical_authority_revocation() {
@@ -1101,4 +1720,6 @@ mod restore_candidate {
             server_api::WorkerRestoreState::Accepted
         );
     }
+
+    include!("worker_backend_restore_publication_tests.rs");
 }

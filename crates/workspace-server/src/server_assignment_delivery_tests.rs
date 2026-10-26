@@ -835,6 +835,7 @@ impl DeliveryWorkerFactory {
             shutdown: Arc::new(tokio::sync::Mutex::new(Some(started.shutdown))),
             controller_task: started.controller_task,
             workspace_client,
+            restore_streams: None,
         })
     }
 }

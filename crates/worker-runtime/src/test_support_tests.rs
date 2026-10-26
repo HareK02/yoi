@@ -563,6 +563,7 @@ fn extraction_rejects_nonstopped_pending_schema_and_metadata_mismatch() {
                     PersistedWorkerLifecycleOperation::Restore(PersistedWorkerRestoreOperation {
                         operation_id: WorkerLifecycleOperationId::new(),
                         mode: PersistedWorkerRestoreMode::Explicit,
+                        commit: crate::runtime::RestoreCommitFact::NotCommitted,
                         request: request(),
                         binding: None,
                         last_settled_status: WorkerStatus::Stopped,
@@ -630,6 +631,38 @@ fn extraction_rejects_nonstopped_pending_schema_and_metadata_mismatch() {
         acquire_runtime_store_owner_lock(worker.parent().unwrap().parent().unwrap()).unwrap();
     assert!(StoppedWorkerTemplate::extract(&worker).is_err());
     drop(held);
+}
+
+#[test]
+fn schema_v12_settled_template_installs_current_aggregate_without_rewriting_session() {
+    let (_source, _, mut template) = source();
+    template.runtime_schema_version = RESTORE_ADMISSION_SCHEMA_VERSION;
+    let bytes = serde_json::to_vec(&template).unwrap();
+    let (_target, options) = destination(&template);
+    template.install(&options, request(), &resolved()).unwrap();
+    assert_eq!(serde_json::to_vec(&template).unwrap(), bytes);
+    let worker = options.root.join(WORKERS_DIR).join(worker_id().to_string());
+    assert_eq!(
+        fs::read(worker.join("session/session.json")).unwrap(),
+        template.session_manifest
+    );
+    assert_eq!(
+        fs::read(worker.join(format!("session/segments/{}.jsonl", template.segment_id))).unwrap(),
+        template.segment_jsonl
+    );
+    let aggregate: WorkerAggregateRecord =
+        read_bounded_json(&worker.join(WORKER_FILE), "read installed fixture").unwrap();
+    let saved = aggregate.validate(&worker.join(WORKER_FILE)).unwrap();
+    assert_eq!(saved.status, WorkerStatus::Stopped);
+    assert!(matches!(
+        saved.execution_state,
+        PersistedWorkerExecutionState::Available(_)
+    ));
+    // Unsupported template schemas do not enter the versioned reader.
+    template.runtime_schema_version = RESTORE_ADMISSION_SCHEMA_VERSION - 1;
+    assert!(template.validate_shape().is_err());
+    template.runtime_schema_version = SCHEMA_VERSION + 1;
+    assert!(template.validate_shape().is_err());
 }
 
 #[test]

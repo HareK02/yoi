@@ -1,6 +1,8 @@
+#[cfg(feature = "http-server")]
 use crate::auth::BACKEND_RESOURCE_FETCH_PERMISSION;
 use crate::identity::WorkerId;
 use crate::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveRef, sha256_hex};
+#[cfg(feature = "http-server")]
 use crate::workspace_request::RuntimeWorkspaceRequestClient;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

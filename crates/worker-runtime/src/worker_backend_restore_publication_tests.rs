@@ -1,0 +1,535 @@
+// Included in restore_candidate: real Runtime catalog/store, Profile candidate,
+// Controller and protocol; only the non-network model client and loopback
+// Workspace transport are substituted. These are ordinary integration tests,
+// not product-process E2E or live model generation.
+#[cfg(all(feature = "fs-store", feature = "ws-server"))]
+mod publication {
+    use super::*;
+    use crate::fs_store::{
+        AtomicWriteFault, FsRuntimeStoreOptions, PersistedWorkerExecution,
+        PersistedWorkerExecutionState, PersistedWorkerRecord,
+    };
+
+    fn stopped_runtime(fixture: &Fixture) -> EmbeddedRuntime {
+        let options = FsRuntimeStoreOptions {
+            root: fixture._root.path().join("catalog"),
+            runtime_id: "candidate-runtime".into(),
+            display_name: None,
+        };
+        let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+            options.clone(),
+            fixture.backend.clone(),
+        )
+        .unwrap();
+        let create = fixture.request.request.clone();
+        let worker_ref = fixture.request.worker_ref.clone();
+        runtime
+            .test_runtime_store()
+            .write_worker_record(&PersistedWorkerRecord {
+                restore_guard: crate::runtime::RestoreGuard::default(),
+                worker_ref: worker_ref.clone(),
+                worker_id: worker_ref.worker_id,
+                profile: create.profile.clone(),
+                display_name: None,
+                profile_source: create.profile_source.reference(),
+                config_bundle: create.config_bundle.clone(),
+                created_at_ms: None,
+                status: crate::catalog::WorkerStatus::Stopped,
+                last_finished_submission_request_id: None,
+                execution_state: PersistedWorkerExecutionState::Available(
+                    PersistedWorkerExecution {
+                        request: create,
+                        binding: None,
+                        restore_intent: crate::catalog::WorkerRestoreIntent::Explicit,
+                    },
+                ),
+                workspace_id: Some(
+                    fixture
+                        .request
+                        .workspace_scope
+                        .as_ref()
+                        .unwrap()
+                        .workspace_id
+                        .clone(),
+                ),
+                workdir_attachments: Vec::new(),
+                logical_workdir_attachments: Vec::new(),
+            })
+            .unwrap();
+        drop(runtime);
+        EmbeddedRuntime::with_fs_store_and_execution_backend(options, fixture.backend.clone())
+            .unwrap()
+    }
+
+    fn durable_operation(
+        runtime: &EmbeddedRuntime,
+        worker_ref: &WorkerRef,
+    ) -> Option<crate::fs_store::PersistedWorkerRestoreOperation> {
+        let loaded = runtime.test_runtime_store().load_runtime_state().unwrap();
+        match &loaded.workers[&worker_ref.worker_id].execution_state {
+            PersistedWorkerExecutionState::ReconciliationRequired(
+                crate::fs_store::PersistedWorkerLifecycleOperation::Restore(operation),
+            ) => Some(operation.clone()),
+            _ => None,
+        }
+    }
+
+    fn prepared_gate(fixture: &Fixture) -> (Arc<tokio::sync::Notify>, mpsc::Receiver<Event>) {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (entered, received) = mpsc::channel();
+        *fixture
+            .backend
+            .factory
+            .restore_faults
+            .prepared_gate
+            .lock()
+            .unwrap() = Some(release.clone());
+        *fixture
+            .backend
+            .factory
+            .restore_faults
+            .prepared_entered
+            .lock()
+            .unwrap() = Some(entered);
+        (release, received)
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn runtime_accepted_follows_real_prepared_snapshot_commit_attach_and_input() {
+        let bootstrap_backend;
+        let mut fixture = Fixture::no_model();
+        let script = MockClient::sequential(vec![MockResponse::Complete(simple_text_events())]);
+        let injected = script.clone();
+        let factory = fixture
+            .backend
+            .factory
+            .as_ref()
+            .clone()
+            .with_spawn_model_client_factory(move || Box::new(injected.clone()));
+        bootstrap_backend = std::mem::replace(
+            &mut fixture.backend,
+            Arc::new(WorkerRuntimeExecutionBackend::new(factory).unwrap()),
+        );
+        let runtime = Arc::new(stopped_runtime(&fixture));
+        let worker_ref = fixture.request.worker_ref.clone();
+        let scope = fixture.request.workspace_scope.clone().unwrap();
+        let request = runtime.test_restore_request(&worker_ref);
+        let before = fixture.canonical_files();
+        let (release, prepared) = prepared_gate(&fixture);
+        let restoring = {
+            let runtime = runtime.clone();
+            let worker_ref = worker_ref.clone();
+            let scope = scope.clone();
+            let request = request.clone();
+            std::thread::spawn(move || {
+                runtime.restore_worker_operation_scoped(&scope, &worker_ref, request)
+            })
+        };
+        let snapshot = prepared.recv_timeout(WAIT).unwrap();
+        assert!(
+            matches!(&snapshot, Event::Snapshot { session, greeting, state, in_flight, .. }
+            if session == &session_store::public_snapshot::project_current_session_snapshot(&fixture.entries())
+                && !greeting.tools.is_empty() && state.state == protocol::WorkerState::Idle && in_flight.is_empty())
+        );
+        let pending = durable_operation(&runtime, &worker_ref).unwrap();
+        assert_eq!(
+            pending.commit,
+            crate::runtime::RestoreCommitFact::NotCommitted
+        );
+        assert_eq!(fixture.canonical_files(), before);
+        fixture.assert_quiet();
+        fixture.assert_no_allocation();
+        assert!(fixture.backend.workers.lock().unwrap().is_empty());
+        assert!(
+            fixture
+                .backend
+                .factory
+                .observation_hub
+                .get(&worker_ref)
+                .is_none()
+        );
+        // External attach shares the in-flight backend operation lock; do not
+        // synchronously acquire that lock while this test holds its prepare gate.
+        // The empty execution registry and absent hub/allocation prove private
+        // ownership here; attach is exercised immediately after Accepted below.
+        assert_eq!(script.call_count.load(Ordering::SeqCst), 0);
+        release.notify_one();
+        let accepted = restoring.join().unwrap().unwrap();
+        assert_eq!(
+            accepted.state,
+            server_api::WorkerRestoreState::Accepted,
+            "{accepted:?}"
+        );
+        assert!(durable_operation(&runtime, &worker_ref).is_none());
+        let loaded = runtime.test_runtime_store().load_runtime_state().unwrap();
+        let guard =
+            serde_json::to_value(&loaded.workers[&worker_ref.worker_id].restore_guard).unwrap();
+        assert!(!guard["owners"][&request.request_id]["receipt"].is_null());
+        assert_eq!(
+            fixture
+                .backend
+                .factory
+                .restore_faults
+                .executions
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert!(
+            fixture
+                .backend
+                .factory
+                .observation_hub
+                .get(&worker_ref)
+                .is_some()
+        );
+        let mut transport = fixture
+            .backend
+            .clone()
+            .attach_worker_protocol(&worker_ref)
+            .unwrap();
+        transport.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&transport.snapshot).unwrap(),
+            serde_json::to_value(snapshot).unwrap()
+        );
+        assert!(matches!(
+            fixture
+                .backend
+                .worker_session(crate::execution::WorkerSessionObservationRequest {
+                    worker_ref: worker_ref.clone(),
+                }),
+            runtime_api::WorkerSessionAvailability::LiveProtocol
+        ));
+        transport
+            .dispatch(Method::submit_text(
+                "vertical-body-input",
+                "vertical-body-input",
+            ))
+            .unwrap();
+        fixture
+            .backend
+            .run_on_adapter_runtime(async move {
+                let (mut admitted, mut committed, mut text, mut ended) =
+                    (false, false, false, false);
+                tokio::time::timeout(WAIT, async {
+                    while !(admitted && committed && text && ended) {
+                        match transport.events.recv().await.unwrap() {
+                            Event::SubmissionAccepted {
+                                submission_request_id,
+                                ..
+                            } if submission_request_id == "vertical-body-input" => admitted = true,
+                            Event::UserMessage { segments, .. } => {
+                                assert_eq!(
+                                    segments,
+                                    vec![protocol::Segment::text("vertical-body-input")]
+                                );
+                                committed = true;
+                            }
+                            Event::TextDone { text: output } => {
+                                assert_eq!(output, "hello from worker");
+                                text = true;
+                            }
+                            Event::RunEnd { .. } => ended = true,
+                            Event::SubmissionRejected { .. } | Event::Error { .. } => {
+                                panic!("normal input rejected after Accepted")
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| "normal input did not settle".to_string())?;
+                // Capture and release the whole transport, not only its events field;
+                // its dispatch/validation closures retain the actual execution.
+                drop(transport);
+                Ok(())
+            })
+            .unwrap();
+        assert!(fixture.entries().iter().any(
+            |entry| matches!(entry, LogEntry::AnnotatedUserInput { segments, .. }
+            if segments == &vec![protocol::Segment::text("vertical-body-input")])
+        ));
+        assert_eq!(script.call_count.load(Ordering::SeqCst), 1);
+        let replay = runtime
+            .restore_worker_operation_scoped(&scope, &worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(replay.state, server_api::WorkerRestoreState::Accepted);
+        assert_eq!(
+            fixture
+                .backend
+                .factory
+                .restore_faults
+                .executions
+                .load(Ordering::SeqCst),
+            1
+        );
+        let mut stale = request;
+        stale.request_id = "vertical-new-stale-intent".into();
+        assert!(
+            matches!(runtime.restore_worker_operation_scoped(&scope, &worker_ref, stale), Err(crate::error::RuntimeError::RestoreObservationConflict { worker_id }) if worker_id == worker_ref.worker_id)
+        );
+        runtime
+            .stop_worker_scoped(&scope, &worker_ref, None)
+            .unwrap();
+        fixture.assert_released();
+        assert_eq!(script.call_count.load(Ordering::SeqCst), 1);
+        drop(runtime);
+        drop(bootstrap_backend);
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn decision_write_faults_preserve_prepared_owner_or_confirm_uncommitted_cleanup() {
+        for (fault, sync_unknown) in [
+            (AtomicWriteFault::BeforeRename, false),
+            (AtomicWriteFault::AfterRename, false),
+            (AtomicWriteFault::AfterRename, true),
+        ] {
+            let fixture = Fixture::no_model();
+            let runtime = Arc::new(stopped_runtime(&fixture));
+            let worker_ref = fixture.request.worker_ref.clone();
+            let scope = fixture.request.workspace_scope.clone().unwrap();
+            let request = runtime.test_restore_request(&worker_ref);
+            let before = fixture.canonical_files();
+            let (release, prepared) = prepared_gate(&fixture);
+            let restoring = {
+                let runtime = runtime.clone();
+                let worker_ref = worker_ref.clone();
+                let scope = scope.clone();
+                let request = request.clone();
+                std::thread::spawn(move || {
+                    runtime.restore_worker_operation_scoped(&scope, &worker_ref, request)
+                })
+            };
+            prepared.recv_timeout(WAIT).unwrap();
+            let operation = durable_operation(&runtime, &worker_ref).unwrap();
+            assert_eq!(
+                operation.commit,
+                crate::runtime::RestoreCommitFact::NotCommitted
+            );
+            runtime.test_runtime_store().fail_next_worker_write(fault);
+            if sync_unknown {
+                runtime
+                    .test_runtime_store()
+                    .fail_next_worker_reconcile_sync();
+            }
+            release.notify_one();
+            let result = restoring.join().unwrap().unwrap();
+            match fault {
+                AtomicWriteFault::BeforeRename => {
+                    assert_eq!(
+                        result.state,
+                        server_api::WorkerRestoreState::RolledBack,
+                        "{result:?}"
+                    );
+                    assert_eq!(fixture.canonical_files(), before);
+                    fixture.assert_released();
+                }
+                AtomicWriteFault::AfterRename if !sync_unknown => {
+                    assert_eq!(
+                        result.state,
+                        server_api::WorkerRestoreState::Accepted,
+                        "{result:?}"
+                    );
+                    let transport = fixture
+                        .backend
+                        .clone()
+                        .attach_worker_protocol(&worker_ref)
+                        .unwrap();
+                    transport.validate().unwrap();
+                    drop(transport);
+                    runtime
+                        .stop_worker_scoped(&scope, &worker_ref, None)
+                        .unwrap();
+                    fixture.assert_released();
+                }
+                AtomicWriteFault::AfterRename => {
+                    assert_eq!(
+                        result.state,
+                        server_api::WorkerRestoreState::ReconciliationRequired,
+                        "{result:?}"
+                    );
+                    assert_eq!(
+                        durable_operation(&runtime, &worker_ref)
+                            .unwrap()
+                            .operation_id,
+                        operation.operation_id
+                    );
+                    assert_eq!(
+                        durable_operation(&runtime, &worker_ref).unwrap().commit,
+                        crate::runtime::RestoreCommitFact::Committed
+                    );
+                    assert!(fixture.backend.workers.lock().unwrap().is_empty());
+                    fixture.assert_no_allocation();
+                    assert_eq!(fixture.canonical_files(), before);
+                    let replay = runtime
+                        .restore_worker_operation_scoped(&scope, &worker_ref, request)
+                        .unwrap();
+                    assert_eq!(
+                        replay.state,
+                        server_api::WorkerRestoreState::Accepted,
+                        "{replay:?}"
+                    );
+                    assert_eq!(
+                        fixture
+                            .backend
+                            .factory
+                            .restore_faults
+                            .executions
+                            .load(Ordering::SeqCst),
+                        1
+                    );
+                    runtime
+                        .stop_worker_scoped(&scope, &worker_ref, None)
+                        .unwrap();
+                    fixture.assert_released();
+                }
+                _ => unreachable!(),
+            }
+            fixture.assert_quiet();
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn uncommitted_cleanup_failure_fences_discarding_candidate_from_activation() {
+        let fixture = Fixture::no_model();
+        let runtime = Arc::new(stopped_runtime(&fixture));
+        let worker_ref = fixture.request.worker_ref.clone();
+        let scope = fixture.request.workspace_scope.clone().unwrap();
+        let request = runtime.test_restore_request(&worker_ref);
+        let before = fixture.canonical_files();
+        let (release, prepared) = prepared_gate(&fixture);
+        let restoring = {
+            let runtime = runtime.clone();
+            let worker_ref = worker_ref.clone();
+            let scope = scope.clone();
+            let request = request.clone();
+            std::thread::spawn(move || {
+                runtime.restore_worker_operation_scoped(&scope, &worker_ref, request)
+            })
+        };
+        prepared.recv_timeout(WAIT).unwrap();
+        runtime.test_runtime_store().fail_next_worker_write(AtomicWriteFault::BeforeRename);
+        fixture.backend.factory.restore_faults.cleanup_fail.store(true, Ordering::SeqCst);
+        release.notify_one();
+        let failed = restoring.join().unwrap().unwrap();
+        assert_eq!(failed.state, server_api::WorkerRestoreState::ReconciliationRequired, "{failed:?}");
+        let pending = fixture.backend.pending_restore(&worker_ref).unwrap().unwrap();
+        assert!(matches!(pending.discard_result.lock().unwrap().as_ref(), Some(Err(_))));
+        assert_eq!(durable_operation(&runtime, &worker_ref).unwrap().commit, crate::runtime::RestoreCommitFact::NotCommitted);
+        for cleanup_fails in [true, false] {
+            fixture.backend.factory.restore_faults.cleanup_fail.store(cleanup_fails, Ordering::SeqCst);
+            let replay = runtime.restore_worker_operation_scoped(&scope, &worker_ref, request.clone()).unwrap();
+            assert_eq!(replay.state, server_api::WorkerRestoreState::ReconciliationRequired, "discarding candidate must not activate: {replay:?}");
+            assert!(fixture.backend.workers.lock().unwrap().is_empty());
+            assert!(fixture.backend.factory.observation_hub.get(&worker_ref).is_none());
+            assert!(fixture.backend.clone().attach_worker_protocol(&worker_ref).is_err());
+            assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.canonical_files(), before);
+            fixture.assert_no_allocation();
+            fixture.assert_quiet();
+        }
+        // Explicit teardown verifies this retained owner's cleanup. Autonomous
+        // cleanup convergence is a separate operation-driver contract.
+        drop(pending);
+        runtime.stop_worker_scoped(&scope, &worker_ref, None).unwrap();
+        fixture.assert_released();
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn publication_failure_retains_same_committed_candidate_without_reconstruction() {
+        let fixture = Fixture::no_model();
+        let runtime = stopped_runtime(&fixture);
+        let worker_ref = fixture.request.worker_ref.clone();
+        let scope = fixture.request.workspace_scope.clone().unwrap();
+        let request = runtime.test_restore_request(&worker_ref);
+        fixture
+            .backend
+            .factory
+            .restore_faults
+            .publication_failure
+            .store(true, Ordering::SeqCst);
+        let failed = runtime
+            .restore_worker_operation_scoped(&scope, &worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(
+            failed.state,
+            server_api::WorkerRestoreState::ReconciliationRequired,
+            "{failed:?}"
+        );
+        let pending = fixture
+            .backend
+            .pending_restore(&worker_ref)
+            .unwrap()
+            .unwrap();
+        assert!(pending.owns_prepared_candidate());
+        assert!(pending.activation_started.load(Ordering::SeqCst));
+        assert!(
+            pending
+                .result
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .can_retry_publication()
+        );
+        let durable = durable_operation(&runtime, &worker_ref).unwrap();
+        assert_eq!(durable.operation_id, pending.request.operation_id);
+        assert_eq!(durable.commit, crate::runtime::RestoreCommitFact::Committed);
+        assert!(fixture.backend.workers.lock().unwrap().is_empty());
+        assert!(
+            fixture
+                .backend
+                .factory
+                .observation_hub
+                .get(&worker_ref)
+                .is_none()
+        );
+        assert!(
+            fixture
+                .backend
+                .clone()
+                .attach_worker_protocol(&worker_ref)
+                .is_err()
+        );
+        fixture.assert_quiet();
+        let result = runtime
+            .restore_worker_operation_scoped(&scope, &worker_ref, request)
+            .unwrap();
+        assert_eq!(
+            result.state,
+            server_api::WorkerRestoreState::Accepted,
+            "{result:?}"
+        );
+        let execution = fixture.backend.workers.lock().unwrap()[&worker_ref].clone();
+        assert_eq!(execution.restore_operation_id, Some(durable.operation_id));
+        assert_eq!(
+            fixture
+                .backend
+                .factory
+                .restore_faults
+                .executions
+                .load(Ordering::SeqCst),
+            1
+        );
+        let transport = fixture
+            .backend
+            .clone()
+            .attach_worker_protocol(&worker_ref)
+            .unwrap();
+        transport.validate().unwrap();
+        drop(transport);
+        drop(execution);
+        drop(pending);
+        runtime
+            .stop_worker_scoped(&scope, &worker_ref, None)
+            .unwrap();
+        fixture.assert_released();
+        fixture.assert_quiet();
+    }
+}

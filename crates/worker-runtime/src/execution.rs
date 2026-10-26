@@ -650,6 +650,24 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         self.restore_worker(request)
     }
 
+    /// Discard only the exact unpublished operation after Runtime has proved
+    /// its durable decision uncommitted. This is not Stop and must not affect a
+    /// connected execution. RolledBack requires confirmed cleanup and no repair.
+    fn discard_uncommitted_restore(
+        &self,
+        _operation_id: WorkerLifecycleOperationId,
+        _worker_ref: &WorkerRef,
+    ) -> WorkerExecutionSpawnResult {
+        WorkerExecutionSpawnResult::ReconciliationRequired {
+            result: WorkerExecutionResult::unsupported(
+                WorkerExecutionOperation::Restore,
+                "backend cannot confirm unpublished restore cleanup",
+            ),
+            worker_state: None,
+            workdir_attachments: Vec::new(),
+        }
+    }
+
     fn activate_restored_worker(
         &self,
         _operation_id: WorkerLifecycleOperationId,
@@ -925,6 +943,15 @@ impl WorkerExecutionBackendRef {
         request: WorkerExecutionRestoreRequest,
     ) -> WorkerExecutionSpawnResult {
         self.backend.reconcile_restore(request)
+    }
+
+    pub(crate) fn discard_uncommitted_restore(
+        &self,
+        operation_id: WorkerLifecycleOperationId,
+        worker_ref: &WorkerRef,
+    ) -> WorkerExecutionSpawnResult {
+        self.backend
+            .discard_uncommitted_restore(operation_id, worker_ref)
     }
 
     pub(crate) fn activate_restored_worker(

@@ -2,26 +2,6 @@
 // Worker/bootstrap, local Git Workdir provider, and allocation table. External
 // model I/O is replaced for saved-input coverage; this is not product E2E.
 
-use crate::restore_test_environment::require_restore_test_environment;
-
-fn restore_failure_tempdir() -> tempfile::TempDir {
-    require_restore_test_environment();
-    // Explicitly stay inside this checkout, even when TMPDIR points elsewhere.
-    // Keep fixture components short; no symlink/alias to evade socket limits.
-    let target = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("target");
-    fs::create_dir_all(&target).unwrap();
-    tempfile::Builder::new()
-        .prefix("r")
-        .rand_bytes(3)
-        .tempdir_in(target)
-        .unwrap()
-}
-
 struct RestoreOpenCountingMaterializer {
     inner: RuntimeGitMaterializer,
     opens: Arc<AtomicUsize>,
@@ -705,13 +685,8 @@ impl ProfileFailureFixture {
 #[test]
 #[serial_test::serial(worker_allocation)]
 fn profile_restore_prior_effects_survive_read_only_reprepare_failure() {
-    for (activation_stage, read_stage) in [
-        (RuntimeRestoreStage::Feature, RuntimeRestoreStage::Metadata),
-        (
-            RuntimeRestoreStage::Controller,
-            RuntimeRestoreStage::Reconstruction,
-        ),
-    ] {
+    for read_stage in [RuntimeRestoreStage::Metadata, RuntimeRestoreStage::Reconstruction] {
+        let activation_stage = RuntimeRestoreStage::ActivationEffects;
         let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
         let (artifacts, pinned) = fixture.pin_unclaimed_restore_upload();
         fixture.fail(activation_stage);
@@ -908,7 +883,7 @@ fn profile_restore_prior_effects_from_pending_head_repair_survive_read_only_repr
 fn profile_restore_prior_effects_survive_rebuilt_candidate_pre_effect_activation_failure() {
     let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
     let (artifacts, pinned) = fixture.pin_unclaimed_restore_upload();
-    fixture.fail(RuntimeRestoreStage::Feature);
+    fixture.fail(RuntimeRestoreStage::ActivationEffects);
     let request = fixture
         .runtime
         .test_restore_request(&fixture.worker.worker_ref);
@@ -926,7 +901,7 @@ fn profile_restore_prior_effects_survive_rebuilt_candidate_pre_effect_activation
         .pending_restore(&fixture.worker.worker_ref)
         .unwrap()
         .unwrap();
-    fixture.assert_retained_restore_effects(&request, &pending, RuntimeRestoreStage::Feature);
+    fixture.assert_retained_restore_effects(&request, &pending, RuntimeRestoreStage::ActivationEffects);
     let effected = persisted_files(&artifacts);
     assert_ne!(effected, pinned);
 
@@ -1215,7 +1190,7 @@ fn profile_restore_multistage_failure_cleans_then_fresh_restore_without_stop() {
 #[serial_test::serial(worker_allocation)]
 fn profile_restore_cleanup_failure_retains_owner_and_cause_without_opening_deferred_provider() {
     let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
-    fixture.fail(RuntimeRestoreStage::Feature);
+    fixture.fail(RuntimeRestoreStage::ActivationEffects);
     fixture
         .backend
         .factory
@@ -1256,7 +1231,7 @@ fn profile_restore_cleanup_failure_retains_owner_and_cause_without_opening_defer
     {
         let retained = pending.result.lock().unwrap();
         let failure = retained.as_ref().unwrap().as_ref().err().unwrap();
-        assert_eq!(failure.stage, RuntimeRestoreStage::Feature);
+        assert_eq!(failure.stage, RuntimeRestoreStage::ActivationEffects);
         assert_eq!(failure.resources, RuntimeRestoreResources::WorkerStartup);
         assert_eq!(
             failure.cleanup,
@@ -1281,12 +1256,17 @@ fn profile_restore_cleanup_failure_retains_owner_and_cause_without_opening_defer
     assert!(!pending.request.deferred_workdir_sessions.is_empty());
     assert_eq!(owned.operation_id, pending.request.operation_id);
     assert!(owned.allocation.is_some());
+    // The private Controller has already closed its router before the later
+    // factory cleanup fault. Keep the remaining cleanup owner, not live aliases.
+    assert!(!owned.sessions.is_empty());
     assert!(
         owned
             .sessions
             .iter()
-            .any(|sessions| !sessions.aliases().is_empty())
+            .all(|sessions| sessions.aliases().is_empty())
     );
+    // Raw deferred handles are closed by factory cleanup after this injected
+    // fault is removed; do not open them while cleanup is still pending.
     let repeat = fixture
         .runtime
         .restore_worker_operation(&fixture.worker.worker_ref, request.clone())
@@ -1484,7 +1464,7 @@ async fn failed_restore_raw_cleanup_is_operation_bound_and_does_not_follow_reuse
 fn profile_restore_cleanup_timeout_keeps_running_join_and_late_failure_reconciles_without_execution()
  {
     let fixture = ProfileFailureFixture::new(Duration::from_secs(2));
-    fixture.fail(RuntimeRestoreStage::Feature);
+    fixture.fail(RuntimeRestoreStage::ActivationEffects);
     let release = Arc::new(tokio::sync::Notify::new());
     let (entered_tx, entered) = mpsc::channel();
     *fixture
@@ -1579,7 +1559,7 @@ fn profile_restore_cleanup_timeout_keeps_running_join_and_late_failure_reconcile
 #[cfg(unix)]
 #[test]
 #[serial_test::serial(worker_allocation)]
-fn profile_restore_real_socket_start_failure_removes_partial_run_and_allocation() {
+fn profile_restore_real_socket_failure_retains_committed_candidate_until_cleanup() {
     let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
     fixture
         .backend
@@ -1601,7 +1581,7 @@ fn profile_restore_real_socket_start_failure_removes_partial_run_and_allocation(
     );
     let diagnostic = serde_json::to_string(&result).unwrap();
     assert!(
-        diagnostic.contains("controller startup failed"),
+        diagnostic.contains("publication failed"),
         "{diagnostic}"
     );
     assert!(diagnostic.contains("InvalidInput"), "{diagnostic}");
@@ -1624,15 +1604,14 @@ fn profile_restore_real_socket_start_failure_removes_partial_run_and_allocation(
     assert!(!diagnostic.contains(&fixture.root.path().to_string_lossy().to_string()));
     assert!(!socket.exists());
     assert!(fixture.backend.workers.lock().unwrap().is_empty());
-    assert!(
-        fixture
-            .backend
-            .factory
-            .failed_restore_resources
-            .lock()
-            .unwrap()
-            .is_empty()
-    );
+    assert!(pending.owns_prepared_candidate());
+    assert!(pending.result.lock().unwrap().as_ref().unwrap().as_ref().unwrap().can_retry_publication());
+    assert!(fixture.backend.factory.failed_restore_resources.lock().unwrap()[&fixture.worker.worker_ref].allocation.is_some());
+    let durable: serde_json::Value = serde_json::from_slice(&fs::read(
+        fixture.root.path().join("s/workers").join(fixture.worker.worker_ref.worker_id.to_string()).join("worker.json")
+    ).unwrap()).unwrap();
+    assert_eq!(durable["execution_state"]["execution"]["intent"]["commit"], "committed");
+    assert!(durable["restore_guard"]["owners"][&request.request_id]["receipt"].is_null());
     assert!(
         fixture
             .backend
@@ -1647,10 +1626,14 @@ fn profile_restore_real_socket_start_failure_removes_partial_run_and_allocation(
         .restore_faults
         .socket_failure
         .store(false, Ordering::SeqCst);
-    eprintln!(
-        "restore-fault stage=socket-start real-bootstrap=true partial-run=removed allocation=released"
-    );
-    fixture.resume_same_operation(request, operation_id);
+    // A real permanent path-limit error cannot be repaired by silently
+    // constructing another endpoint/transport. Explicit cleanup settles the
+    // retained owner. This case does not assert autonomous terminal handling.
+    drop(pending);
+    fixture.runtime.stop_worker(&fixture.worker.worker_ref, None).unwrap();
+    fixture.assert_released();
+    assert!(!socket.parent().unwrap().exists());
+    assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), 1);
 }
 
 #[test]

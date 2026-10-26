@@ -47,18 +47,26 @@ impl ProfileRuntimeWorkerFactory {
         let workspace = RuntimeWorkspaceBackendRef::from_worker_request(
             &request.request,
             self.runtime_id.as_deref(),
-        );
+        )
+        .map_err(cause)?;
+        #[cfg(feature = "http-server")]
         let request_client = request
             .request
             .workspace_api
             .as_ref()
             .and_then(|api| self.workspace_request_clients.get(&api.workspace_id));
         let context = workspace.worker_context(
+            #[cfg(feature = "http-server")]
             &request.worker_ref,
+            #[cfg(feature = "http-server")]
             request.workspace_scope.as_ref(),
+            #[cfg(feature = "http-server")]
             self.worker_mutation_identity.as_ref(),
+            #[cfg(feature = "http-server")]
             request_client,
+            #[cfg(feature = "http-server")]
             self.embedded_worker_mutation_dispatcher.as_ref(),
+            #[cfg(feature = "http-server")]
             Some(self.prompt_projection_cache.clone()),
         );
         if pending && context.workspace_id().is_some() {
