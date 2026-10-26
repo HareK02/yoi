@@ -71,6 +71,11 @@ fn legacy_content_database(path: &Path) -> (Connection, String) {
         conn.execute("INSERT INTO workspace_config_tree_revisions VALUES('space',?1,?2,'toolchain','projection',?3,?4,'{}')",
             params![ordinal,snapshot.digest,manifest,created]).unwrap();
     }
+    seed_legacy_content_job(&conn);
+    (conn, snapshot.digest)
+}
+
+fn seed_legacy_content_job(conn: &Connection) {
     let request = BackendJobRequest {
         job_id: "legacy-job".into(),
         purpose: "migration_test".into(),
@@ -93,7 +98,19 @@ fn legacy_content_database(path: &Path) -> (Connection, String) {
         VALUES('space','legacy-job','legacy-job:attempt:1',1,'old-number','dispatched','runtime','worker','2026-08-14T00:00:00Z','2026-08-13T00:00:00Z','2026-08-13T00:00:00Z');
         INSERT INTO backend_job_deliveries(workspace_id,delivery_id,job_id,attempt_id,target_runtime_id,target_worker_id,state,created_at,updated_at)
         VALUES('space','delivery','legacy-job','legacy-job:attempt:1','runtime','target','pending','created','updated');") .unwrap();
-    (conn, snapshot.digest)
+}
+
+// Replay/resource checks use the current Store only after the full retained chain.
+// Keep the focused partial DDL fixture above for the cutover's schema assertions.
+fn legacy_content_job_database(path: &Path) -> Connection {
+    super::tests::prepare_retained_schema(path, 85);
+    let conn = Connection::open(path).unwrap();
+    configure_sqlite(&conn).unwrap();
+    conn.execute_batch("INSERT INTO accounts VALUES('owner','user','owner','Owner','created','updated');
+        INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
+        VALUES('space','owner','Space','active','created','updated');").unwrap();
+    seed_legacy_content_job(&conn);
+    conn
 }
 
 #[test]
@@ -432,7 +449,7 @@ fn content_cutover_reserved_only_releases_resource_but_uncertain_dispatch_keeps_
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("content.db");
-        let (conn, _) = legacy_content_database(&path);
+        let conn = legacy_content_job_database(&path);
         conn.execute(
             "UPDATE backend_job_attempts SET state=?1,
             runtime_id=CASE WHEN ?1='reserved' THEN NULL ELSE runtime_id END,
@@ -441,11 +458,22 @@ fn content_cutover_reserved_only_releases_resource_but_uncertain_dispatch_keeps_
         )
         .unwrap();
         migrate_content_state_v85_to_v86(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 86);
+        let cutover: (String, String, Option<String>) = conn.query_row(
+            "SELECT j.state,a.state,a.worker_cleanup_state FROM backend_jobs j JOIN backend_job_attempts a USING(workspace_id,job_id)",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            cutover,
+            if state == "reserved" {
+                ("failed".into(), "failed".into(), Some("completed".into()))
+            } else {
+                ("unknown".into(), "unknown".into(), Some("pending".into()))
+            }
+        );
+        apply_migrations(&conn).unwrap();
         drop(conn);
-        let store = SqliteWorkspaceStore {
-            db_executor: crate::db_executor::DbExecutor::shared(),
-            conn: Arc::new(Mutex::new(Connection::open(path).unwrap())),
-        };
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let job = store
             .get_backend_job("space", "legacy-job")
             .unwrap()
@@ -478,7 +506,7 @@ fn content_cutover_reserved_only_releases_resource_but_uncertain_dispatch_keeps_
 fn content_cutover_completed_result_cleanup_and_replay_remain_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("content.db");
-    let (conn, _) = legacy_content_database(&path);
+    let conn = legacy_content_job_database(&path);
     let result = serde_json::json!({"finding":"preserved"});
     let (digest, encoded) = job::result_digest(&result, 4096).unwrap();
     conn.execute("UPDATE backend_jobs SET state='completed',result_json=?1,result_digest=?2,completed_at='finished'",params![encoded,digest]).unwrap();
@@ -490,11 +518,23 @@ fn content_cutover_completed_result_cleanup_and_replay_remain_unchanged() {
     )
     .unwrap();
     migrate_content_state_v85_to_v86(&conn).unwrap();
+    assert_eq!(current_schema_version(&conn).unwrap(), 86);
+    let cutover: (String, String, String, String) = conn.query_row(
+        "SELECT j.state,j.result_json,a.worker_cleanup_state,a.worker_cleanup_completed_at FROM backend_jobs j JOIN backend_job_attempts a USING(workspace_id,job_id)",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    ).unwrap();
+    assert_eq!(
+        cutover,
+        (
+            "completed".into(),
+            encoded,
+            "completed".into(),
+            "cleaned".into()
+        )
+    );
+    apply_migrations(&conn).unwrap();
     drop(conn);
-    let store = SqliteWorkspaceStore {
-        db_executor: crate::db_executor::DbExecutor::shared(),
-        conn: Arc::new(Mutex::new(Connection::open(path).unwrap())),
-    };
+    let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     let job = store
         .get_backend_job("space", "legacy-job")
         .unwrap()

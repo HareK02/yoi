@@ -4949,6 +4949,133 @@ impl Runtime {
             .map_err(crate::retention::retention_error)
     }
 
+    /// Freeze committed original public bodies once; no catalog/read pagination
+    /// or restored Worker is involved. Publication and erasure share this fence.
+    #[cfg(feature = "fs-store")]
+    pub fn session_recording_capture_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        request: &runtime_api::SessionRecordingCaptureRequest,
+    ) -> runtime_api::SessionRecordingCaptureAvailability {
+        use crate::worker_backend::SessionMaterialSourceError as Error;
+        use runtime_api::{
+            SessionPublicUnavailableReason as R, SessionRecordingCaptureAvailability as A,
+        };
+        use session_store::public_material::{PublicMaterialError as E, PublicMaterialLimits};
+        let result = (|| -> Result<_, Error> {
+            if scope.workspace_id != request.workspace_id {
+                return Err("Session Workspace scope mismatch".into());
+            }
+            if !(1..=4096).contains(&request.max_entries)
+                || !(1024..=4 * 1024 * 1024).contains(&request.max_serialized_bytes)
+            {
+                return Err(E::ResourceLimit.into());
+            }
+            let session = request
+                .expected_session_id
+                .parse::<session_store::SessionId>()
+                .map_err(|_| "Invalid Session identity")?;
+            // Resolve attribution without reading archive bodies. Do not acquire
+            // the Runtime mutex under the Session lock: archive execution takes
+            // those locks in the opposite order.
+            let (root, archive) = self
+                .resolve_session_public_source_with_validation(scope, &request.source, false)
+                .map_err(|e| e.to_string())?;
+            let runtime_dir = {
+                let state = self.lock().map_err(|e| e.to_string())?;
+                state
+                    .fs_store()
+                    .ok_or("Session storage unavailable")?
+                    .runtime_dir()
+                    .to_path_buf()
+            };
+            // This is the storage append fence used by live Runtime publishers,
+            // also fencing archive transfer and erase. Resolve the pointer under it.
+            let retention = crate::retention::runtime_session_retention(&runtime_dir);
+            let guard = retention.lock_live(session).map_err(|error| match error {
+                session_store::StoreError::SessionErased(_) => E::Erased,
+                _ => E::Unavailable,
+            })?;
+            let mut archive_to_verify = None;
+            let active = match (&request.source, archive) {
+                (runtime_api::SessionPublicSource::Retained { worker_id }, None) => {
+                    let metadata = session_store::worker_metadata::WorkerAggregateStore::open_read_only(
+                        root.parent().ok_or("Session root is unavailable")?,
+                        crate::worker_backend::ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&WorkerRef::new(*worker_id)),
+                    ).and_then(|store| store.read_read_only()).map_err(|e| e.to_string())?.ok_or("Session metadata missing")?;
+                    if metadata.workspace_id.as_deref() != Some(scope.workspace_id.as_str()) {
+                        return Err("Session Workspace mismatch".into());
+                    }
+                    let active = metadata.active.ok_or("Session active pointer missing")?;
+                    if active.session_id != session {
+                        return Err("Session identity mismatch".into());
+                    }
+                    match active.segment_id {
+                        Some(segment) => segment,
+                        None if request.start
+                            == session_store::capture::RecordingPosition::default()
+                            && crate::retention::unmaterialized_session(
+                                root.parent().ok_or("Session root unavailable")?,
+                                &scope.workspace_id,
+                            )
+                            .map_err(|e| e.to_string())?
+                                == Some(session) =>
+                        {
+                            return Ok(A::NotMaterialized {
+                                session_id: session.to_string(),
+                            });
+                        }
+                        None => return Err("Session active Segment missing".into()),
+                    }
+                }
+                (runtime_api::SessionPublicSource::Archived { archive_id }, Some(manifest)) => {
+                    archive_to_verify = Some((archive_id, manifest.clone()));
+                    if manifest.source_session_id != request.expected_session_id {
+                        return Err("Archive Session identity mismatch".into());
+                    }
+                    manifest
+                        .source_active_segment_id
+                        .ok_or("Archive active Segment missing")?
+                }
+                _ => return Err("Session source unavailable".into()),
+            };
+            let slice = session_store::capture::capture_recording_slice_worker_guarded(
+                &root,
+                session,
+                active,
+                PublicMaterialLimits::default(),
+                request.start,
+                request.max_entries,
+                request.max_serialized_bytes,
+                &guard,
+            )?;
+            if let Some((archive_id, manifest)) = archive_to_verify {
+                // Validate archive checksums only after capture froze every file
+                // end, still under the same publication/erase fence.
+                let (verified, verified_root) = FsWorkerRetentionProvider::new(&runtime_dir)
+                    .session_archive(archive_id)
+                    .map_err(|e| e.to_string())?;
+                if verified != manifest || verified_root != root {
+                    return Err(E::Changed.into());
+                }
+            }
+            Ok(A::Captured { slice })
+        })();
+        match result {
+            Ok(availability) => availability,
+            Err(error) => A::Unavailable {
+                reason: match error {
+                    Error::Material(E::ResourceLimit) => R::ResourceLimit,
+                    Error::Material(E::InvalidOffset | E::Changed) => R::InvalidCursor,
+                    Error::Material(E::Missing | E::Erased) => R::RetentionMissing,
+                    Error::Material(E::Inconsistent | E::Record(_)) => R::CorruptLog,
+                    _ => R::StorageUnavailable,
+                },
+                message: "Committed Session recording capture unavailable".into(),
+            },
+        }
+    }
+
     #[cfg(feature = "fs-store")]
     pub fn session_material_catalog_scoped(
         &self,

@@ -144,6 +144,42 @@ mod tests {
     }
 
     #[test]
+    fn legacy_archive_input_erasure_preserves_fingerprints_and_attempt_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.sqlite3");
+        seed(&path, 2);
+        let mut store = JobStore::open(&path).unwrap();
+        let before: (String, String) = store
+            .conn
+            .query_row(
+                "SELECT fingerprint,attempts_json FROM legacy_job_archive WHERE job_id='done'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let snapshot = store.get("done").unwrap();
+        store
+            .reclaim_input(
+                "done",
+                &snapshot.input_digest,
+                JobInputRetirementReason::ExplicitErasure,
+            )
+            .unwrap();
+        let (body, fingerprint, attempts): (String,String,String) = store.conn.query_row("SELECT request_json,fingerprint,attempts_json FROM legacy_job_archive WHERE job_id='done'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert!(serde_json::from_str::<Value>(&body).unwrap()["input"].is_null());
+        assert_eq!((fingerprint, attempts), before);
+        assert!(store.conn.execute_batch("UPDATE legacy_job_archive SET request_json=json_set(request_json,'$.input','restored') WHERE job_id='done'").is_err());
+        drop(store);
+        let mut reopened = JobStore::open(&path).unwrap();
+        let receipt = reopened
+            .reserve_granted(request("done"), snapshot.domain_grant)
+            .unwrap();
+        assert_eq!(receipt.state, JobState::Completed);
+        assert_eq!(receipt.input_disposition, JobInputDisposition::Erased);
+        assert!(receipt.load_executable_request().is_err());
+    }
+
+    #[test]
     fn legacy_versions_preserve_intent_receipts_attempts_grants_and_replay() {
         for version in [1, 2] {
             let dir = tempfile::tempdir().unwrap();

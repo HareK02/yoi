@@ -730,7 +730,7 @@ impl ProfileRuntimeWorkerFactory {
             .map_err(|error| format!("failed to clean restore run artifacts: {error}"))
     }
 
-    fn runtime_worker_name_for_ref(worker_ref: &crate::identity::WorkerRef) -> String {
+    pub(crate) fn runtime_worker_name_for_ref(worker_ref: &crate::identity::WorkerRef) -> String {
         format!("worker-runtime-{}", worker_ref.worker_id)
     }
 

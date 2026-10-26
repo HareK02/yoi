@@ -615,10 +615,14 @@ async fn headless_unix_client_uses_production_history_lease_and_local_authority(
     use tokio::io::AsyncWriteExt;
 
     let temp = tempfile::tempdir()?;
-    // Only the transport endpoint needs a short private pathname. Persistence remains the
-    // same production store exercised by the in-process Host tests above.
-    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))?;
-    let endpoint_path = temp.path().join("operator.sock");
+    // Shorten only the owned endpoint's components, preserving the harness TMPDIR
+    // even when it is checkout-local. No process-global cwd or external /tmp fallback.
+    let socket_dir = tempfile::Builder::new()
+        .prefix("")
+        .rand_bytes(4)
+        .tempdir()?;
+    std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    let endpoint_path = socket_dir.path().join("s");
     let endpoint = standalone::UnixEndpoint::bind(&endpoint_path)?;
     let state_dir = temp.path().join("state");
     let launch = StandaloneLaunchConfig::new(

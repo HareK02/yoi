@@ -4,7 +4,7 @@ use super::*;
 use crate::backend_job::{
     BackendJobGrants, BackendJobRecord, SubjektivJournalGrant, journal_serialization_key,
 };
-use subjektiv::journal::recording::{JournalMaterial, select_materials_bounded};
+use subjektiv::journal::recording::JournalInput;
 use subjektiv::journal::transport::*;
 use subjektiv::journal::{self, *};
 
@@ -92,18 +92,80 @@ pub(super) fn prepare(api: &WorkspaceApi, reservation: &BackendJobReservation) -
     };
     let store = store(api)?;
     let host = host(api, &store, grant)?;
-    store
-        .prepare_journal_generation(
+    let input = saved_input(&reservation.job.request, grant)?;
+    let g = store
+        .prepare_journal_input(
             &host,
-            &grant.journal_id,
+            &input,
             subjektiv::api::JobAttemptBinding {
                 job_id: reservation.job.request.job_id.clone(),
                 attempt_id: reservation.attempt.attempt_id.clone(),
             },
-            grant.selected_ranges.clone(),
         )
         .map_err(domain)?;
+    input.validate_generation(&g).map_err(domain)?;
     Ok(())
+}
+
+fn legacy_descriptor(request: &BackendJobRequest) -> bool {
+    let Some(grant) = request.grants.subjektiv_journal.as_ref() else {
+        return false;
+    };
+    let Some(object) = request.input.as_object() else {
+        return false;
+    };
+    object.len() == 2
+        && object.get("journal_id").and_then(|v| v.as_str()) == Some(&grant.journal_id)
+        && object.get("selected_ranges")
+            == serde_json::to_value(&grant.selected_ranges).ok().as_ref()
+}
+
+/// Retire only the explicitly recognized descriptor wire. Malformed body snapshots are
+/// failures, not migration requests and never a reason to reselect from current Sessions.
+pub(super) fn migrate_reserved_legacy(
+    api: &WorkspaceApi,
+    reservation: &BackendJobReservation,
+) -> Result<bool> {
+    if !legacy_descriptor(&reservation.job.request) {
+        return Ok(false);
+    }
+    reservation.job.load_executable_request()?;
+    close(api, &reservation.job.request, &reservation.attempt)?;
+    api.store.finish_backend_job_attempt(
+        api.workspace_id(),
+        &reservation.job.request.job_id,
+        &reservation.attempt.attempt_id,
+        BackendJobAttemptState::Failed,
+        "journal_descriptor_invalidated",
+        "Descriptor-only Journal input retired; saved checkpoints retained",
+        &Utc::now().to_rfc3339(),
+    )?;
+    api.store.reclaim_backend_job_input(
+        api.workspace_id(),
+        &reservation.job.request.job_id,
+        &reservation.job.input_digest,
+        crate::backend_job::JobInputRetirementReason::LegacyInvalidation,
+    )?;
+    let queued = api.clone();
+    let request = reservation.job.request.clone();
+    api.host_executors.host()?.dispatch(move || {
+        drain_after_completion(&queued, &request);
+    })?;
+    Ok(true)
+}
+
+fn saved_input(request: &BackendJobRequest, grant: &SubjektivJournalGrant) -> Result<JournalInput> {
+    let input = JournalInput::decode(&request.input).map_err(domain)?;
+    if input.subject_id != grant.subject_id
+        || input.journal_id != grant.journal_id
+        || input.capture.session_id != grant.session_id
+        || input.selected_ranges != grant.selected_ranges
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "Journal saved input/capability mismatch".into(),
+        ));
+    }
+    Ok(input)
 }
 
 fn live(
@@ -125,6 +187,7 @@ fn live(
         .store
         .get_backend_job(api.workspace_id(), &binding.job_id)?
         .ok_or_else(|| Error::WorkspacePermissionDenied("Journal Job missing".into()))?;
+    job.load_executable_request()?;
     let attempt = api
         .store
         .get_backend_job_attempt(api.workspace_id(), &binding.job_id, &binding.attempt_id)?
@@ -180,15 +243,44 @@ pub(super) fn execute(
     worker: &RuntimeWorkerRef,
     request: JournalJobRequest,
 ) -> Result<JournalJobResponse> {
+    let (grant, _, _) = live(api, worker)?;
+    let gate = lifecycle_lock(api, &grant.subject_id)?;
+    let _guard = gate
+        .lock()
+        .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
+    // Dispatch holds this same gate until matching Runtime acceptance is attested.
+    // Revalidate after waiting: erasure, cancellation or replacement may have won.
     let (grant, job, attempt) = live(api, worker)?;
     let store = store(api)?;
     let host = host(api, &store, &grant)?;
     let g = generation(&store, &host, &grant, &job, &attempt)?;
+    let input = saved_input(&job.request, &grant)?;
+    input.validate_generation(&g).map_err(domain)?;
     let ctx = JournalJobContext::validated(&store, &host, &g.id, g.job.clone()).map_err(domain)?;
-    journal::service::execute_bounded(&store, &ctx, request, |source, start, limit| {
-        read_source(api, &grant, source, start, limit)
-            .map_err(|e| JournalError::Conflict(e.to_string()))
-    })
+    journal::service::execute_snapshot(&store, &ctx, &attempt.input_digest, request).map_err(domain)
+}
+
+/// Called only after matching tracked Runtime acceptance of the exact rendered saved input.
+/// The durable request and Worker binding alone do not establish body delivery.
+pub(super) fn attest_delivery(
+    api: &WorkspaceApi,
+    reservation: &BackendJobReservation,
+) -> Result<()> {
+    let Some(grant) = &reservation.job.request.grants.subjektiv_journal else {
+        return Ok(());
+    };
+    let input = saved_input(&reservation.job.request, grant)?;
+    let store = store(api)?;
+    let host = host(api, &store, grant)?;
+    let g = generation(&store, &host, grant, &reservation.job, &reservation.attempt)?;
+    input.validate_generation(&g).map_err(domain)?;
+    let ctx = JournalJobContext::validated(&store, &host, &g.id, g.job.clone()).map_err(domain)?;
+    journal::service::attest_input_delivery(
+        &store,
+        &ctx,
+        &reservation.attempt.input_digest,
+        &input.selected_ranges,
+    )
     .map_err(domain)
 }
 
@@ -196,21 +288,29 @@ pub(super) fn finish(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> Result<JournalJobCompletion> {
+    let (grant, _, _) = live(api, worker)?;
+    let gate = lifecycle_lock(api, &grant.subject_id)?;
+    let _guard = gate
+        .lock()
+        .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
+    // Dispatch holds this same gate until matching Runtime acceptance is attested.
+    // Revalidate after waiting: erasure, cancellation or replacement may have won.
     let (grant, job, attempt) = live(api, worker)?;
     let store = store(api)?;
     let host = host(api, &store, &grant)?;
+    let input = saved_input(&job.request, &grant)?;
     // prepare is an exact binding lookup too, including the saved completion of a closed generation.
     let g = store
-        .prepare_journal_generation(
+        .prepare_journal_input(
             &host,
-            &grant.journal_id,
+            &input,
             subjektiv::api::JobAttemptBinding {
                 job_id: job.request.job_id,
                 attempt_id: attempt.attempt_id,
             },
-            grant.selected_ranges.clone(),
         )
         .map_err(domain)?;
+    input.validate_generation(&g).map_err(domain)?;
     let ctx = JournalJobContext::validated_recovery(&store, &host, &g.id, g.job.clone())
         .map_err(domain)?;
     journal::service::finish(&store, &ctx).map_err(domain)
@@ -275,21 +375,6 @@ pub(super) fn close(
         }
     }
     Ok(())
-}
-
-fn read_source(
-    api: &WorkspaceApi,
-    grant: &SubjektivJournalGrant,
-    source: &JournalSource,
-    start: u64,
-    limit: usize,
-) -> Result<JournalMaterial> {
-    let store = store(api)?;
-    let attr = store
-        .session_attribution(&grant.session_id)
-        .map_err(|e| Error::Store(e.to_string()))?
-        .ok_or_else(|| Error::WorkspacePermissionDenied("Session attribution absent".into()))?;
-    read_canonical(&material_reader(api, &attr)?, source, start, limit)
 }
 
 pub(super) fn bind_host_session(
@@ -524,22 +609,63 @@ fn dispatch(
             .close_journal_generation(&host, &g.id, &g.job)
             .map_err(domain)?;
     }
-    let reader = material_reader(api, &attribution)?;
-    let materials = select_materials_bounded(
-        &store,
-        &host,
-        journal_id,
-        96 * 1024,
-        |source, start, limit| {
-            read_canonical(&reader, source, start, limit)
-                .map_err(|e| JournalError::Conflict(e.to_string()))
-        },
-    )
+    let mut after = None;
+    loop {
+        let jobs = api.store.list_backend_journal_jobs(
+            api.workspace_id(),
+            &attribution.session_id,
+            after.as_deref(),
+            100,
+        )?;
+        for job in &jobs {
+            if job
+                .request
+                .grants
+                .subjektiv_journal
+                .as_ref()
+                .is_none_or(|g| g.journal_id != journal_id)
+                || job.input_disposition != crate::backend_job::JobInputDisposition::Available
+            {
+                continue;
+            }
+            if job.state == BackendJobState::Pending || job.state == BackendJobState::Unknown {
+                return Ok(());
+            }
+            if job.state == BackendJobState::Failed && !legacy_descriptor(&job.request) {
+                job.load_executable_request()?;
+                saved_input(
+                    &job.request,
+                    job.request
+                        .grants
+                        .subjektiv_journal
+                        .as_ref()
+                        .expect("checked Journal grant"),
+                )?;
+                let reservation = api.store.reserve_backend_job_retry(
+                    api.workspace_id(),
+                    &job.request.job_id,
+                    &Utc::now().to_rfc3339(),
+                )?;
+                return queue_reservation(api, reservation);
+            }
+        }
+        if jobs.len() < 100 {
+            break;
+        }
+        after = jobs.last().map(|j| j.request.job_id.clone());
+    }
+    let input = JournalInput::build(&store, &host, journal_id, |order, offset, budget| {
+        capture_input(api, &attribution, order, offset, budget)
+            .map_err(|e| JournalError::Conflict(e.to_string()))
+    })
     .map_err(domain)?;
-    if materials.is_empty() {
+    if input.selected_ranges.is_empty() {
         return Ok(());
     }
-    let request = recording_request(&host, attribution, journal_id, materials)?;
+    store
+        .accept_journal_sources(&host, "Session activity", &input.selected_ranges)
+        .map_err(domain)?;
+    let request = recording_request(&host, attribution, journal_id, input)?;
     // The intent is saved before generation binding or dispatch. If binding/dispatch fails,
     // Reserved recovery repeats this exact intent, never creates a replacement blindly.
     api.resolve_backend_job_profile(&request)?;
@@ -548,6 +674,10 @@ fn dispatch(
         &request,
         &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
     )?;
+    queue_reservation(api, reservation)
+}
+
+fn queue_reservation(api: &WorkspaceApi, reservation: BackendJobReservation) -> Result<()> {
     let queued = api.clone();
     if let Err(error)=api.host_executors.host()?.dispatch(move || {
         if let Err(error)=queued.dispatch_backend_job_reservation(reservation) {
@@ -578,33 +708,21 @@ fn admit_sources(
         ));
     }
     let mut id = store.journal_for_session(&host).map_err(domain)?;
-    let reader = material_reader(api, &attribution)?;
-    if reader.not_materialized {
-        if store.journal_retention_required(&host).map_err(domain)? {
-            return Err(Error::RepositoryConflict(
-                "Admitted Journal original Session is not materialized".into(),
-            ));
-        }
-        retain_source(
-            api.runtime.as_ref(),
-            api.workspace_id(),
-            &attribution,
-            material_source(api, &attribution)?,
-            true,
-        )?;
-        return Ok(JournalRecordingResponse::NoNewSources);
-    }
+    let (order, offset) = if let Some(id) = id.as_deref() {
+        let journal = store.read_journal(&host, id).map_err(domain)?;
+        (journal.process_order, journal.process_byte)
+    } else {
+        (0, 0)
+    };
+    let capture = capture_input(api, &attribution, order, offset, 48 * 1024)?;
     retain_source(
         api.runtime.as_ref(),
         api.workspace_id(),
         &attribution,
         material_source(api, &attribution)?,
-        false,
+        capture.segment_id == "not-materialized",
     )?;
-    let sources: Vec<_> = reader
-        .descriptors()
-        .map(|d| source_from_descriptor(&attribution.session_id, d))
-        .collect();
+    let sources = journal::recording::capture_ranges(&capture).map_err(domain)?;
     for batch in sources.chunks(MAX_JOURNAL_RANGES) {
         id = Some(
             store
@@ -995,7 +1113,7 @@ pub(super) fn release_subject(
             {
                 // Legacy saved-before-admission Sessions are not optional. Prove canonical
                 // source identity first, then bind only this original Host-attributed Session.
-                let _canonical = material_reader(api, &attr)?;
+                let _canonical = capture_input(api, &attr, 0, 0, 48 * 1024)?;
                 let host =
                     JournalHostContext::validated_session(&store, attr.clone()).map_err(domain)?;
                 if host
@@ -1281,80 +1399,6 @@ fn material_source(
         },
     )
 }
-fn material_reader<'a>(
-    api: &'a WorkspaceApi,
-    attribution: &crate::subjektiv::SubjectSessionAttribution,
-) -> Result<MaterialReader<'a>> {
-    MaterialReader::open(
-        api.runtime.as_ref(),
-        api.workspace_id(),
-        &attribution.runtime_id,
-        material_source(api, attribution)?,
-        &attribution.session_id,
-    )
-}
-fn source_from_descriptor(
-    session: &str,
-    d: &session_store::public_material::PublicMaterialDescriptor,
-) -> JournalSourceRange {
-    JournalSourceRange {
-        source: JournalSource {
-            session_id: session.into(),
-            pointer: JournalSourcePointer {
-                segment_id: d.identity.segment_id,
-                entry_ref: d.identity.entry_ref.clone(),
-            },
-            order: d.canonical_order,
-            content_sha256: d.sha256.clone(),
-            total_bytes: d.total_bytes,
-        },
-        bytes: JournalByteRange {
-            start: 0,
-            end: d.total_bytes,
-        },
-    }
-}
-fn read_canonical(
-    reader: &MaterialReader<'_>,
-    source: &JournalSource,
-    start: u64,
-    limit: usize,
-) -> Result<JournalMaterial> {
-    if reader.session_id != source.session_id {
-        return Err(Error::WorkspacePermissionDenied(
-            "Journal source Session mismatch".into(),
-        ));
-    }
-    let descriptor = reader
-        .descriptors()
-        .find(|d| source_from_descriptor(&source.session_id, d).source == *source)
-        .ok_or_else(|| {
-            Error::Store("Journal original public source changed or unavailable".into())
-        })?;
-    // The reader streams the complete canonical digest while returning only this bounded window.
-    let page = reader
-        .read_content(descriptor, start, limit)
-        .map_err(|e| Error::Store(e.to_string()))?;
-    if page.sha256 != source.content_sha256
-        || page.total_bytes != source.total_bytes
-        || page.next_offset != start.saturating_add(page.content.len() as u64)
-    {
-        return Err(Error::RepositoryConflict(
-            "Journal canonical source identity changed".into(),
-        ));
-    }
-    Ok(JournalMaterial {
-        range: JournalSourceRange {
-            source: source.clone(),
-            bytes: JournalByteRange {
-                start,
-                end: page.next_offset,
-            },
-        },
-        text: page.content,
-    })
-}
-
 /// Close the first-run save/notification gap: Runtime can commit an initial turn before
 /// the create handler has finalized the Backend registry required by recording callbacks.
 /// Reconcile only after creation succeeds, using the ordinary current-owner/Feature checks.
@@ -1475,7 +1519,7 @@ pub(super) fn recording_request(
     host: &JournalHostContext,
     attribution: crate::subjektiv::SubjectSessionAttribution,
     journal_id: &str,
-    materials: Vec<journal::recording::JournalMaterial>,
+    input: JournalInput,
 ) -> Result<BackendJobRequest> {
     let binding_id = host
         .writer_binding_id()
@@ -1488,18 +1532,88 @@ pub(super) fn recording_request(
         subject_id: attribution.subject_id,
         session_id: attribution.session_id,
         journal_id: journal_id.into(),
-        selected_ranges: materials.iter().map(|m| m.range.clone()).collect(),
+        selected_ranges: input.selected_ranges.clone(),
     };
-    Ok(BackendJobRequest {
-        job_id:format!("journal-recording:{}",Uuid::new_v4()),purpose:"subjektiv_journal".into(),
-        input_ref:format!("subjektiv://{}/journal/{journal_id}",grant.subject_id),
-        input:serde_json::json!({"journal_id":journal_id,"selected_ranges":grant.selected_ranges}),
-        instruction:"Record ONLY this frozen original public selected_ranges prefix. The input contains descriptors, NOT source bodies. First ReadJournalState and use bounded ReadJournalText Source until every byte of every selected range is returned; record operations are refused until then. ReadJournalText also exposes initial/current position/open text. Sequentially save CreateJournalEntry/RewriteJournalEntry/FixJournalEntry, update current position and CheckpointJournal using retained record receipts. Never infer event completion from turn/task/job/compaction boundaries. Preserve exact operation ID/full input after unknown outcomes. SubmitBackendJobResult only after the full selected prefix has a saved checkpoint; no aggregate JournalRecordResult.".into(),
-        profile:"builtin:subjektiv-journal-recording".into(),
-        grants:BackendJobGrants {subjektiv_journal:Some(grant),..Default::default()},
-        serialization_key:Some(journal_serialization_key(journal_id)),source_worker:None,notification_target:None,
-        limits:crate::backend_job::BackendJobLimits {timeout_seconds:600,..Default::default()},
-    })
+    let request = BackendJobRequest {
+        job_id: format!("journal-recording:{}",Uuid::new_v4()), purpose: "subjektiv_journal".into(),
+        input_ref: format!("subjektiv://{}/journal/{journal_id}",grant.subject_id),
+        input: serde_json::to_value(input).map_err(|e| Error::Store(e.to_string()))?,
+        instruction: "Record ONLY the immutable body-bearing capture supplied in this input. These exact canonical source bytes, identities and ranges are the whole input for this Job; do not fetch original Sessions or use ReadJournalText Source. First ReadJournalState; initial/current Journal position/open text remain separately paged by ReadJournalText. Sequentially save CreateJournalEntry/RewriteJournalEntry/FixJournalEntry, current position and receipt-backed CheckpointJournal. Input delivery is not understanding or reflection. Never infer event completion from turn/task/job/compaction boundaries. Preserve exact operation ID/full input after Unknown. SubmitBackendJobResult only after the complete selected prefix has a saved checkpoint; no aggregate JournalRecordResult.".into(),
+        profile: "builtin:subjektiv-journal-recording".into(),
+        grants: BackendJobGrants { subjektiv_journal: Some(grant), ..Default::default() },
+        serialization_key: Some(journal_serialization_key(journal_id)), source_worker: None, notification_target: None,
+        limits: crate::backend_job::BackendJobLimits { timeout_seconds: 600, ..Default::default() },
+    };
+    saved_input(
+        &request,
+        request
+            .grants
+            .subjektiv_journal
+            .as_ref()
+            .expect("constructed grant"),
+    )?;
+    request.validate()?;
+    Ok(request)
+}
+
+pub(super) fn capture_input(
+    api: &WorkspaceApi,
+    attr: &crate::subjektiv::SubjectSessionAttribution,
+    order: u64,
+    offset: u64,
+    budget: usize,
+) -> Result<session_store::capture::CaptureDto> {
+    match api
+        .runtime
+        .session_recording_capture(
+            &attr.runtime_id,
+            runtime_api::SessionRecordingCaptureRequest {
+                workspace_id: api.workspace_id().into(),
+                source: material_source(api, attr)?,
+                expected_session_id: attr.session_id.clone(),
+                start: session_store::capture::RecordingPosition {
+                    canonical_order: order,
+                    byte_offset: offset,
+                },
+                max_entries: MAX_JOURNAL_RANGES,
+                max_serialized_bytes: budget,
+            },
+        )
+        .map_err(RuntimeRegistryError::into_error)?
+    {
+        runtime_api::SessionRecordingCaptureAvailability::Captured { slice } => {
+            if slice.capture.session_id != attr.session_id
+                || serde_json::to_vec(&slice)
+                    .map_err(|e| Error::Store(e.to_string()))?
+                    .len()
+                    > budget
+            {
+                return Err(Error::RepositoryConflict(
+                    "recording capture identity/budget mismatch".into(),
+                ));
+            }
+            Ok(slice.capture)
+        }
+        runtime_api::SessionRecordingCaptureAvailability::NotMaterialized { session_id }
+            if session_id == attr.session_id && order == 0 && offset == 0 =>
+        {
+            Ok(session_store::capture::CaptureDto {
+                version: 1,
+                session_id,
+                segment_id: "not-materialized".into(),
+                view_entry_count: 0,
+                entries: vec![],
+            })
+        }
+        runtime_api::SessionRecordingCaptureAvailability::Unavailable { reason, .. } => {
+            Err(Error::Store(format!(
+                "committed Journal capture unavailable ({reason:?}); no latest-source fallback"
+            )))
+        }
+        _ => Err(Error::Store(
+            "committed Journal capture identity mismatch; no latest-source fallback".into(),
+        )),
+    }
 }
 
 fn removal_attribution(
@@ -1574,6 +1688,16 @@ fn finish_erased_release(
         return Err(Error::WorkspacePermissionDenied(
             "explicit erase tombstone missing".into(),
         ));
+    }
+    for session in store
+        .subject_session_attributions(&attr.subject_id)
+        .map_err(|e| Error::Store(e.to_string()))?
+        .into_iter()
+        .filter(|session| {
+            session.runtime_id == attr.runtime_id && session.worker_id == attr.worker_id
+        })
+    {
+        require_erased_job_copies(api, &session.session_id)?;
     }
     // Pre-binding bodies have no write token. This stable receipt label is not a writer
     // grant: the domain erase operation records an inactive lifetime without binding Sessions.
@@ -1835,183 +1959,6 @@ pub(super) async fn finish_route(
 }
 
 /// A bounded Runtime transport view, not a second history index or a local-path fallback.
-/// Reopening it observes a new catalog; each generation still compares its frozen source identity.
-struct MaterialReader<'a> {
-    runtime: &'a RuntimeRegistry,
-    workspace_id: &'a str,
-    runtime_id: String,
-    source: runtime_api::SessionPublicSource,
-    session_id: String,
-    not_materialized: bool,
-    descriptors: Vec<session_store::public_material::PublicMaterialDescriptor>,
-}
-fn material_descriptor(
-    d: runtime_api::SessionMaterialDescriptor,
-) -> Result<session_store::public_material::PublicMaterialDescriptor> {
-    Ok(session_store::public_material::PublicMaterialDescriptor {
-        identity: session_store::public_material::PublicMaterialIdentity {
-            segment_id: Uuid::parse_str(&d.segment_id).map_err(|e| Error::Store(e.to_string()))?,
-            entry_ref: d.entry_ref,
-        },
-        canonical_order: d.canonical_order,
-        origin: serde_json::from_str(&d.origin_json).map_err(|e| Error::Store(e.to_string()))?,
-        sha256: d.sha256,
-        total_bytes: d.total_bytes,
-    })
-}
-impl<'a> MaterialReader<'a> {
-    fn open(
-        runtime: &'a RuntimeRegistry,
-        workspace_id: &'a str,
-        runtime_id: &str,
-        source: runtime_api::SessionPublicSource,
-        session_id: &str,
-    ) -> Result<Self> {
-        let mut descriptors = Vec::new();
-        let mut offset = 0;
-        let mut condition = None;
-        loop {
-            let page = match runtime
-                .session_material_catalog(
-                    runtime_id,
-                    runtime_api::SessionMaterialCatalogRequest {
-                        workspace_id: workspace_id.into(),
-                        source: source.clone(),
-                        expected_session_id: session_id.into(),
-                        expected_catalog_sha256: condition.clone(),
-                        offset,
-                        limit: 100,
-                    },
-                )
-                .map_err(|e| e.into_error())?
-            {
-                runtime_api::SessionMaterialCatalogAvailability::NotMaterialized {
-                    session_id: observed,
-                } => {
-                    if observed != session_id || offset != 0 || condition.is_some() {
-                        return Err(Error::RepositoryConflict(
-                            "Journal Session materialization proof changed during catalog read"
-                                .into(),
-                        ));
-                    }
-                    return Ok(Self {
-                        runtime,
-                        workspace_id,
-                        runtime_id: runtime_id.into(),
-                        source,
-                        session_id: session_id.into(),
-                        not_materialized: true,
-                        descriptors,
-                    });
-                }
-                runtime_api::SessionMaterialCatalogAvailability::Page { page } => page,
-                runtime_api::SessionMaterialCatalogAvailability::Unavailable {
-                    reason,
-                    message,
-                } => {
-                    return Err(Error::Store(format!(
-                        "Journal original material unavailable ({reason:?}): {message}"
-                    )));
-                }
-            };
-            if page.session_id != session_id
-                || condition
-                    .as_ref()
-                    .is_some_and(|c| c != &page.catalog_sha256)
-                || page.descriptors.len() > 100
-                || descriptors.len().saturating_add(page.descriptors.len()) > 1_000_000
-            {
-                return Err(Error::RepositoryConflict(
-                    "Journal canonical Session catalog changed or exceeded its bound".into(),
-                ));
-            }
-            condition = Some(page.catalog_sha256);
-            for d in page.descriptors {
-                let d = material_descriptor(d)?;
-                if d.canonical_order != descriptors.len() as u64 {
-                    return Err(Error::RepositoryConflict(
-                        "Journal canonical catalog order is discontinuous".into(),
-                    ));
-                }
-                descriptors.push(d);
-            }
-            match page.next_offset {
-                Some(next) if next > offset && next == descriptors.len() as u64 => offset = next,
-                None => break,
-                _ => {
-                    return Err(Error::RepositoryConflict(
-                        "Journal catalog continuation did not advance".into(),
-                    ));
-                }
-            }
-        }
-        Ok(Self {
-            runtime,
-            workspace_id,
-            runtime_id: runtime_id.into(),
-            source,
-            session_id: session_id.into(),
-            not_materialized: false,
-            descriptors,
-        })
-    }
-    fn descriptors(
-        &self,
-    ) -> impl Iterator<Item = &session_store::public_material::PublicMaterialDescriptor> {
-        self.descriptors.iter()
-    }
-    fn read_content(
-        &self,
-        descriptor: &session_store::public_material::PublicMaterialDescriptor,
-        offset: u64,
-        limit: usize,
-    ) -> Result<session_store::public_material::PublicMaterialContent> {
-        let page = match self
-            .runtime
-            .session_material_read(
-                &self.runtime_id,
-                runtime_api::SessionMaterialReadRequest {
-                    workspace_id: self.workspace_id.into(),
-                    source: self.source.clone(),
-                    expected_session_id: self.session_id.clone(),
-                    expected_descriptor: runtime_api::SessionMaterialDescriptor {
-                        segment_id: descriptor.identity.segment_id.to_string(),
-                        entry_ref: descriptor.identity.entry_ref.clone(),
-                        canonical_order: descriptor.canonical_order,
-                        origin_json: serde_json::to_string(&descriptor.origin)
-                            .map_err(|e| Error::Store(e.to_string()))?,
-                        sha256: descriptor.sha256.clone(),
-                        total_bytes: descriptor.total_bytes,
-                    },
-                    byte_offset: offset,
-                    max_content_bytes: limit.clamp(4, 16 * 1024),
-                },
-            )
-            .map_err(|e| e.into_error())?
-        {
-            runtime_api::SessionMaterialReadAvailability::Page { page } => page,
-            runtime_api::SessionMaterialReadAvailability::Unavailable { reason, message } => {
-                return Err(Error::Store(format!(
-                    "Journal original material read unavailable ({reason:?}): {message}"
-                )));
-            }
-        };
-        if material_descriptor(page.descriptor)? != *descriptor
-            || page.content.len() > limit.clamp(4, 16 * 1024)
-        {
-            return Err(Error::RepositoryConflict(
-                "Journal canonical material identity changed".into(),
-            ));
-        }
-        Ok(session_store::public_material::PublicMaterialContent {
-            content: page.content,
-            next_offset: page.next_offset,
-            total_bytes: descriptor.total_bytes,
-            sha256: descriptor.sha256.clone(),
-        })
-    }
-}
-
 fn erase_source(
     runtime: &RuntimeRegistry,
     workspace: &str,
@@ -2145,17 +2092,29 @@ pub(super) fn reconcile_unknown(
     let host = host(api, &store, grant)?;
     let erased = store.journal_session_erased(&host).map_err(domain)?;
     if !erased {
-        let g = store
-            .prepare_journal_generation(
-                &host,
-                &grant.journal_id,
-                subjektiv::api::JobAttemptBinding {
-                    job_id: job.request.job_id.clone(),
-                    attempt_id: attempt.attempt_id.clone(),
-                },
-                grant.selected_ranges.clone(),
-            )
-            .map_err(domain)?;
+        job.load_executable_request()?;
+        let binding = subjektiv::api::JobAttemptBinding {
+            job_id: job.request.job_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+        };
+        let g = if legacy_descriptor(&job.request) {
+            // Only reconcile already-saved legacy receipts; never redispatch descriptors.
+            store
+                .prepare_journal_generation(
+                    &host,
+                    &grant.journal_id,
+                    binding,
+                    grant.selected_ranges.clone(),
+                )
+                .map_err(domain)?
+        } else {
+            let input = saved_input(&job.request, grant)?;
+            let generation = store
+                .prepare_journal_input(&host, &input, binding)
+                .map_err(domain)?;
+            input.validate_generation(&generation).map_err(domain)?;
+            generation
+        };
         let ctx = JournalJobContext::validated_recovery(&store, &host, &g.id, g.job.clone())
             .map_err(domain)?;
         match journal::service::finish(&store, &ctx) {
@@ -2187,6 +2146,14 @@ pub(super) fn reconcile_unknown(
                 );
                 if current.worker_cleanup_state == Some(BackendJobWorkerCleanupState::Completed) {
                     drain_after_completion(api, &job.request);
+                    if job.input_disposition == crate::backend_job::JobInputDisposition::Available {
+                        api.store.reclaim_backend_job_input(
+                            api.workspace_id(),
+                            &job.request.job_id,
+                            &job.input_digest,
+                            crate::backend_job::JobInputRetirementReason::Completed,
+                        )?;
+                    }
                 } else {
                     api.schedule_backend_job_worker_cleanup(&current);
                 }
@@ -2226,8 +2193,8 @@ pub(super) fn reconcile_unknown(
         &Utc::now().to_rfc3339(),
     )?;
     if !erased {
-        // The old immutable input may include reflected bytes. Select the remaining
-        // prefix afresh only AFTER definitive lifecycle/domain fences; never replace Unknown.
+        // Resume the same saved body input only after canonical execution/domain fences.
+        // dispatch selects its retained intent before it can capture any newer source.
         let attr = store
             .session_attribution(&grant.session_id)
             .map_err(|e| Error::Store(e.to_string()))?
@@ -2256,6 +2223,30 @@ fn reconcile_session_jobs(
                 .store
                 .get_backend_job_attempt(api.workspace_id(), &job.request.job_id, &id)?
                 .ok_or_else(|| Error::Store("Journal current attempt missing".into()))?;
+            if !erased
+                && legacy_descriptor(&job.request)
+                && job.input_disposition == crate::backend_job::JobInputDisposition::Available
+            {
+                job.load_executable_request()?;
+                close(api, &job.request, &attempt)?;
+                if !attempt.state.terminal() {
+                    attempt = api.store.finish_backend_job_attempt(
+                        api.workspace_id(),
+                        &job.request.job_id,
+                        &id,
+                        BackendJobAttemptState::Failed,
+                        "journal_descriptor_invalidated",
+                        "Descriptor-only Journal input retired; saved checkpoints retained",
+                        &Utc::now().to_rfc3339(),
+                    )?;
+                }
+                api.store.reclaim_backend_job_input(
+                    api.workspace_id(),
+                    &job.request.job_id,
+                    &job.input_digest,
+                    crate::backend_job::JobInputRetirementReason::LegacyInvalidation,
+                )?;
+            }
             if erased && !attempt.state.terminal() {
                 // The domain tombstone precedes this cancellation and also fences any
                 // crash window before it. No erased Job can prepare or use tools again.
@@ -2268,6 +2259,30 @@ fn reconcile_session_jobs(
                     "Source Session was explicitly erased",
                     &Utc::now().to_rfc3339(),
                 )?;
+            }
+            if erased {
+                api.store.reclaim_backend_job_input(
+                    api.workspace_id(),
+                    &job.request.job_id,
+                    &job.input_digest,
+                    crate::backend_job::JobInputRetirementReason::ExplicitErasure,
+                )?;
+                // Every historical execution can own a delivered copy, not just the current
+                // attempt or an unacknowledged result. Cleanup is canonical Purge and retryable.
+                for number in 1..=job.current_attempt {
+                    let historical_id = crate::backend_job::attempt_id(&job.request.job_id, number);
+                    let historical = api
+                        .store
+                        .get_backend_job_attempt(
+                            api.workspace_id(),
+                            &job.request.job_id,
+                            &historical_id,
+                        )?
+                        .ok_or_else(|| Error::Store("historical Journal attempt missing".into()))?;
+                    if historical.state.terminal() {
+                        api.schedule_backend_job_worker_cleanup(&historical);
+                    }
+                }
             }
             if attempt.state == BackendJobAttemptState::Unknown {
                 reconcile_unknown(api, job, &attempt)?;
@@ -2282,6 +2297,41 @@ fn reconcile_session_jobs(
         after = jobs.last().map(|j| j.request.job_id.clone());
     }
     Ok(())
+}
+
+fn require_erased_job_copies(api: &WorkspaceApi, session: &str) -> Result<()> {
+    let mut after = None;
+    loop {
+        let jobs = api.store.list_backend_journal_jobs(
+            api.workspace_id(),
+            session,
+            after.as_deref(),
+            100,
+        )?;
+        for job in &jobs {
+            if job.input_disposition != crate::backend_job::JobInputDisposition::Erased {
+                return Err(Error::RepositoryConflict(
+                    "Journal input erasure remains incomplete".into(),
+                ));
+            }
+            for number in 1..=job.current_attempt {
+                let id = crate::backend_job::attempt_id(&job.request.job_id, number);
+                let attempt = api
+                    .store
+                    .get_backend_job_attempt(api.workspace_id(), &job.request.job_id, &id)?
+                    .ok_or_else(|| Error::Store("erased Journal attempt missing".into()))?;
+                if attempt.worker.is_some()
+                    && attempt.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed)
+                {
+                    return Err(Error::RepositoryConflict("Journal delivered-copy Purge remains pending; retry the same erasure after cleanup".into()));
+                }
+            }
+        }
+        if jobs.len() < 100 {
+            return Ok(());
+        }
+        after = jobs.last().map(|j| j.request.job_id.clone());
+    }
 }
 
 impl WorkspaceApi {
@@ -2301,6 +2351,10 @@ impl WorkspaceApi {
             .ok_or_else(|| {
                 Error::WorkspacePermissionDenied("Session attribution missing".into())
             })?;
+        let gate = lifecycle_lock(self, &attr.subject_id)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
         let host = JournalHostContext::validated_session(&store, attr.clone()).map_err(domain)?;
         store
             .erase_journal_session(&host, request_id)
@@ -2311,7 +2365,8 @@ impl WorkspaceApi {
             self.workspace_id(),
             &attr,
             material_source(self, &attr)?,
-        )
+        )?;
+        require_erased_job_copies(self, &attr.session_id)
     }
 }
 

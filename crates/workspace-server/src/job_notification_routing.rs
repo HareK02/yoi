@@ -2,8 +2,8 @@
 //! lifecycle, are the durable source. Fixed Worker recipients never follow leases.
 use super::*;
 use crate::backend_job::{
-    BackendJobAttemptState, BackendJobDeliveryRecord, BackendJobDeliveryState,
-    BackendJobResultAcceptance, BackendJobState,
+    BackendJobAttemptState, BackendJobDeliveryRecord, BackendJobDeliveryState, BackendJobRequest,
+    BackendJobState,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +103,32 @@ pub(in crate::store) fn install(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+struct NotificationResultSnapshot {
+    request: BackendJobRequest,
+    result: Option<serde_json::Value>,
+    result_digest: Option<String>,
+}
+
+// The schema-96 import runs before later Job lifecycle migrations. Read only
+// the retained result envelope, not the executable Job's current-schema columns.
+fn read_result_snapshot(
+    conn: &Connection,
+    workspace: &str,
+    job: &str,
+) -> Result<NotificationResultSnapshot> {
+    let (request, result, result_digest): (String, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT request_json, result_json, result_digest FROM backend_jobs WHERE workspace_id=?1 AND job_id=?2",
+            params![workspace, job],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    Ok(NotificationResultSnapshot {
+        request: decode(&request)?,
+        result: result.map(|value| decode(&value)).transpose()?,
+        result_digest,
+    })
+}
+
 pub(in crate::store) fn capture(
     conn: &Connection,
     workspace: &str,
@@ -115,8 +141,7 @@ pub(in crate::store) fn capture(
         attempt_id: attempt.into(),
         delivery_id: id.clone(),
     };
-    let job = read_backend_job(conn, workspace, job)?
-        .ok_or_else(|| Error::Store("Job notification source missing".into()))?;
+    let job = read_result_snapshot(conn, workspace, job)?;
     let target = &job.request.notification_target;
     let facts = serde_json::json!({"principal_kind":if target.is_some(){Some("worker")}else{None}, "principal_id":null,"runtime_id":target.as_ref().map(|w|&w.runtime_id),"worker_id":target.as_ref().map(|w|&w.worker_id),"status":null,"case_state":"open","released":false,"backend_job":source,"recipient_kind":"fixed_worker","job_purpose":job.request.purpose,"result_digest":job.result_digest});
     conn.execute("INSERT OR IGNORE INTO notification_sources(workspace_id,ticket_id,input_event_id,role,assignment_id,kind,facts_json) VALUES(?1,NULL,?2,'backend_job','','backend_job_result',?3)",params![workspace,id,json(&facts)?])?;
@@ -290,22 +315,13 @@ fn import_legacy(conn: &Connection, workspace: &str, job_id: &str, attempt_id: &
             | "notification_too_large",
         ) => ("defer", NotificationReason::SourceUnavailable),
         _ => {
-            let job = read_backend_job(conn, workspace, job_id)?
-                .ok_or_else(|| Error::Store("Legacy Job result missing".into()))?;
-            let attempt = read_backend_job_attempt(conn, workspace, job_id, attempt_id)?
-                .ok_or_else(|| Error::Store("Legacy Job attempt missing".into()))?;
-            let acceptance = BackendJobResultAcceptance {
-                job,
-                attempt,
-                replayed: true,
-            };
-            let facts = if acceptance.job.request.notification_target.as_ref() != Some(&old.target)
-            {
+            let snapshot = read_result_snapshot(conn, workspace, job_id)?;
+            let facts = if snapshot.request.notification_target.as_ref() != Some(&old.target) {
                 JobNotificationFacts::Failed(NotificationFailureCode::PreparationFailed)
             } else {
-                legacy_result_facts(&acceptance)
+                legacy_result_facts(&snapshot, job_id, attempt_id)
             };
-            let decision = policy(acceptance.job.request.notification_target.is_some(), &facts);
+            let decision = policy(snapshot.request.notification_target.is_some(), &facts);
             match facts {
                 JobNotificationFacts::Result(body) => content = Some(body),
                 JobNotificationFacts::Failed(code) => failure = Some(code),
@@ -338,28 +354,26 @@ fn import_legacy(conn: &Connection, workspace: &str, job_id: &str, attempt_id: &
     Ok(())
 }
 
-fn legacy_result_facts(acceptance: &BackendJobResultAcceptance) -> JobNotificationFacts {
-    let content = if acceptance.job.request.purpose == crate::ticket_item_checker::PURPOSE {
-        let Some(result) = &acceptance.job.result else {
+fn legacy_result_facts(
+    snapshot: &NotificationResultSnapshot,
+    job_id: &str,
+    attempt_id: &str,
+) -> JobNotificationFacts {
+    let content = if snapshot.request.purpose == crate::ticket_item_checker::PURPOSE {
+        let Some(result) = &snapshot.result else {
             return JobNotificationFacts::Failed(NotificationFailureCode::InvalidResult);
         };
-        match crate::ticket_item_checker::validate_result(&acceptance.job.request.input, result) {
+        match crate::ticket_item_checker::validate_result(&snapshot.request.input, result) {
             Ok(result) if result.findings.is_empty() => return JobNotificationFacts::NoFindings,
             Ok(_) => {}
             Err(_) => return JobNotificationFacts::Failed(NotificationFailureCode::InvalidResult),
         }
-        crate::ticket_item_checker::render_result(acceptance)
+        crate::ticket_item_checker::render_result(&snapshot.request.input, result)
     } else {
         Ok(format!(
-            "Backend Job `{}` completed attempt `{}` for `{}`. Durable result digest: {}.",
-            acceptance.job.request.job_id,
-            acceptance.attempt.attempt_id,
-            acceptance.job.request.purpose,
-            acceptance
-                .job
-                .result_digest
-                .as_deref()
-                .unwrap_or("unavailable")
+            "Backend Job `{job_id}` completed attempt `{attempt_id}` for `{}`. Durable result digest: {}.",
+            snapshot.request.purpose,
+            snapshot.result_digest.as_deref().unwrap_or("unavailable")
         ))
     };
     match content {

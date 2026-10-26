@@ -3990,6 +3990,7 @@ dependencies = [
  "protocol",
  "serde",
  "serde_json",
+ "session-store",
  "tokio",
  "workdir",
 ]
@@ -4783,12 +4784,14 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "feature-storage",
+ "job",
  "manifest",
  "memory",
  "rusqlite",
  "serde",
  "serde_json",
  "server-api",
+ "session-store",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",

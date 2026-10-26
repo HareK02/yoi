@@ -4635,11 +4635,79 @@ impl WorkspaceApi {
         &self,
         reservation: BackendJobReservation,
     ) -> Result<BackendJobReservation> {
+        // Reread even a terminal/stale reservation before deciding whether it can
+        // dispatch or replay: an explicit erasure may have retired its saved input.
+        let journal_gate = reservation
+            .job
+            .request
+            .grants
+            .subjektiv_journal
+            .as_ref()
+            .map(|grant| subjektiv_journal::lifecycle_lock(self, &grant.subject_id))
+            .transpose()?;
+        let _journal_guard = journal_gate
+            .as_ref()
+            .map(|gate| {
+                gate.lock()
+                    .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))
+            })
+            .transpose()?;
+        let current_job = self
+            .store
+            .get_backend_job(&self.config.workspace_id, &reservation.job.request.job_id)?
+            .ok_or_else(|| Error::Store("reserved Backend Job disappeared".into()))?;
+        let current_attempt = self
+            .store
+            .get_backend_job_attempt(
+                &self.config.workspace_id,
+                &reservation.job.request.job_id,
+                &reservation.attempt.attempt_id,
+            )?
+            .ok_or_else(|| Error::Store("reserved Backend attempt disappeared".into()))?;
+        let reservation = BackendJobReservation {
+            job: current_job,
+            attempt: current_attempt,
+            replayed: reservation.replayed,
+            resource_reused: reservation.resource_reused,
+        };
+        if matches!(
+            reservation.job.input_disposition,
+            crate::backend_job::JobInputDisposition::Erased
+                | crate::backend_job::JobInputDisposition::Invalidated
+        ) {
+            return Err(Error::WorkspacePermissionDenied(
+                "erased or invalidated Backend Job input cannot dispatch".into(),
+            ));
+        }
         if reservation.job.state != BackendJobState::Pending
             || reservation.attempt.state != BackendJobAttemptState::Reserved
             || reservation.attempt.worker.is_some()
         {
-            return Ok(reservation);
+            return Ok(BackendJobReservation {
+                replayed: true,
+                ..reservation
+            });
+        }
+        reservation.job.load_executable_request()?;
+        if subjektiv_journal::migrate_reserved_legacy(self, &reservation)? {
+            let job = self
+                .store
+                .get_backend_job(self.workspace_id(), &reservation.job.request.job_id)?
+                .ok_or_else(|| Error::Store("retired legacy Job missing".into()))?;
+            let attempt = self
+                .store
+                .get_backend_job_attempt(
+                    self.workspace_id(),
+                    &reservation.job.request.job_id,
+                    &reservation.attempt.attempt_id,
+                )?
+                .ok_or_else(|| Error::Store("retired legacy attempt missing".into()))?;
+            return Ok(BackendJobReservation {
+                job,
+                attempt,
+                replayed: reservation.replayed,
+                resource_reused: reservation.resource_reused,
+            });
         }
         subjektiv_journal::prepare(self, &reservation)?;
         let (reservation, claimed) = self.store.claim_backend_job_attempt_dispatch(
@@ -4844,6 +4912,7 @@ impl WorkspaceApi {
                     .to_string(),
             });
         }
+        subjektiv_journal::attest_delivery(self, &reservation)?;
         let job = self
             .store
             .get_backend_job(&self.config.workspace_id, &request.job_id)?
@@ -5220,6 +5289,16 @@ impl WorkspaceApi {
                     subjektiv_journal::close(self, &job.request, &current)?;
                     if current.state == BackendJobAttemptState::Completed {
                         subjektiv_journal::drain_after_completion(self, &job.request);
+                        if job.input_disposition
+                            == crate::backend_job::JobInputDisposition::Available
+                        {
+                            self.store.reclaim_backend_job_input(
+                                self.workspace_id(),
+                                job_id,
+                                &job.input_digest,
+                                crate::backend_job::JobInputRetirementReason::Completed,
+                            )?;
+                        }
                     }
                 }
             }

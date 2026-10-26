@@ -13,6 +13,14 @@
 //! observation share only this domain; they do not enable or modify each other's Features.
 //! The provider owns authorization to recapture a current Worker. A capture itself proves neither
 //! completion nor approval and grants no business-mutation authority.
+//!
+//! Recording Hosts use the common committed replay through the guarded APIs below.
+//! [`recording_catalog_worker_guarded`] and [`recording_catalog_fs_guarded`] expose
+//! descriptors only to an admission callback under the caller's existing publication/
+//! erasure guard and persisted active selector, without allocating a full body DTO.
+//! [`capture_recording_slice_worker_guarded`] and [`capture_recording_slice_fs_guarded`]
+//! separately construct bounded body-bearing inputs. Admission descriptors are not
+//! sufficient Job inputs; saved recording DTOs are read/sliced without live storage.
 
 use std::sync::Arc;
 
@@ -21,12 +29,14 @@ use crate::{
     LoggedSessionHistoryOrigin as HistoryOrigin,
 };
 mod body;
+mod recording;
 use agen::{HistoryEntry, Item, Role};
 pub use body::*;
 use protocol::{
     SessionContentPart, SessionEntryProvenance, SessionMessageRole, SessionSnapshot,
     SessionSnapshotEntryData,
 };
+pub use recording::*;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -50,7 +60,8 @@ impl SessionEntryRef {
     pub fn parse(value: &str) -> Option<Self> {
         let suffix = value.strip_prefix('E')?;
         if suffix.is_empty()
-            || suffix.len() > 64
+            // Legacy Host boundary identities contain both Session and Segment UUIDs.
+            || suffix.len() > 256
             || !suffix
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
@@ -822,7 +833,7 @@ impl SessionCapture {
     }
 }
 
-fn public_provenance(origin: &HistoryOrigin) -> SessionEntryProvenance {
+pub(crate) fn public_provenance(origin: &HistoryOrigin) -> SessionEntryProvenance {
     match origin {
         HistoryOrigin::HumanInput { .. } | HistoryOrigin::LocalHumanInput => {
             SessionEntryProvenance::HumanInput

@@ -444,6 +444,31 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         material_pin(&self.state, request, true)
     }
 
+    async fn session_recording_capture(
+        &self,
+        request: runtime_api::SessionRecordingCaptureRequest,
+    ) -> Result<runtime_api::SessionRecordingCaptureAvailability, runtime_api::RuntimeApiError>
+    {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        #[cfg(feature = "fs-store")]
+        {
+            Ok(self
+                .state
+                .runtime
+                .session_recording_capture_scoped(&scope, &request))
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = scope;
+            Ok(
+                runtime_api::SessionRecordingCaptureAvailability::Unavailable {
+                    reason: runtime_api::SessionPublicUnavailableReason::StorageUnavailable,
+                    message: "Committed Session storage unavailable".into(),
+                },
+            )
+        }
+    }
+
     async fn session_material_catalog(
         &self,
         request: runtime_api::SessionMaterialCatalogRequest,

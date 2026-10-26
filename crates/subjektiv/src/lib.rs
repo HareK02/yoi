@@ -639,6 +639,11 @@ static MIGRATIONS: &[FeatureMigration] = &[
         "add explicit Subject permission sources and immutable child execution grants",
         permissions::migrate,
     ),
+    FeatureMigration::new(
+        13,
+        "bind Journal generation delivery to immutable Job input digest",
+        journal::service::migrate_input_delivery,
+    ),
 ];
 
 pub const REGISTRATION: FeatureRegistration =

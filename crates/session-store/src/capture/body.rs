@@ -5,7 +5,7 @@
 use super::*;
 use serde::de::Error as _;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 pub const CAPTURE_VERSION: u32 = 1;
@@ -81,6 +81,17 @@ impl CaptureContentPart {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CaptureBody {
+    /// Canonical recording bytes retain the historical Journal descriptor contract.
+    /// A nonzero offset or short text is an explicit fragment, never a full body.
+    /// History entries retain their original raw segment-history row, including
+    /// hidden rows in the count. A typed Host boundary has no history row: its
+    /// `source.entry_index` is the next-history gap at the original boundary.
+    CanonicalPublic {
+        descriptor: crate::public_material::PublicMaterialDescriptor,
+        byte_offset: u64,
+        text: String,
+        boundary: Option<crate::public_material::PublicRunBoundary>,
+    },
     Message {
         role: CaptureRole,
         content: Vec<CaptureContentPart>,
@@ -175,6 +186,7 @@ impl CaptureBody {
 
     pub(super) fn to_item(&self) -> Item {
         match self {
+            Self::CanonicalPublic { text, .. } => Item::system_message(text.clone()),
             Self::Message { role, content } => Item::Message {
                 id: None,
                 status: None,
@@ -214,6 +226,7 @@ impl CaptureBody {
 
     fn fields(&self) -> Vec<(RawField, &str)> {
         match self {
+            Self::CanonicalPublic { text, .. } => vec![(RawField::CanonicalPublic, text)],
             Self::Message { content, .. } => content
                 .iter()
                 .enumerate()
@@ -235,6 +248,16 @@ impl CaptureBody {
 
     fn metadata(&self, field: RawField) -> CaptureBodyMetadata {
         match self {
+            Self::CanonicalPublic {
+                descriptor,
+                byte_offset,
+                boundary,
+                ..
+            } => CaptureBodyMetadata::CanonicalPublic {
+                descriptor: descriptor.clone(),
+                byte_offset: *byte_offset,
+                boundary: *boundary,
+            },
             Self::Message { role, content } => CaptureBodyMetadata::Message {
                 role: *role,
                 refusal: matches!(field, RawField::MessagePart(i) if matches!(content.get(i), Some(CaptureContentPart::Refusal { .. }))),
@@ -264,6 +287,9 @@ impl CaptureBody {
 #[serde(deny_unknown_fields)]
 pub struct CaptureSource {
     pub segment_id: String,
+    /// Original raw segment-history position, not captured/public view order.
+    /// For `CanonicalPublic` Host boundaries only, this is the next-history gap;
+    /// several typed Host events may share that gap with the following history row.
     pub entry_index: u64,
     pub provenance: SessionEntryProvenance,
     /// Full original origin when supplied by the committed-history adapter.
@@ -375,7 +401,7 @@ impl Write for ByteCounter {
     }
 }
 
-fn json_size<T: Serialize>(value: &T, limit: usize) -> Result<usize, CaptureError> {
+pub(super) fn json_size<T: Serialize>(value: &T, limit: usize) -> Result<usize, CaptureError> {
     let mut counter = ByteCounter { bytes: 0, limit };
     serde_json::to_writer(&mut counter, value).map_err(|_| CaptureError::ResourceLimit)?;
     Ok(counter.bytes)
@@ -403,6 +429,7 @@ impl CaptureDto {
         identity(&self.segment_id, limits)?;
         let mut ids = HashSet::new();
         let mut sources = HashSet::new();
+        let mut recording_source_floor = HashMap::<&str, u64>::new();
         let mut previous = None;
         for entry in &self.entries {
             identity(&entry.entry_id, limits)?;
@@ -419,7 +446,16 @@ impl CaptureDto {
             }
             previous = Some(entry.order);
             identity(&entry.source.segment_id, limits)?;
-            if !sources.insert((&entry.source.segment_id, entry.source.entry_index)) {
+            let host_boundary = matches!(
+                &entry.body,
+                CaptureBody::CanonicalPublic {
+                    boundary: Some(_),
+                    ..
+                }
+            );
+            if !host_boundary
+                && !sources.insert((&entry.source.segment_id, entry.source.entry_index))
+            {
                 return Err(CaptureError::Invalid("duplicate source position"));
             }
             if !entry.policy.any() {
@@ -443,6 +479,79 @@ impl CaptureDto {
                 }
             }
             match &entry.body {
+                CaptureBody::CanonicalPublic {
+                    descriptor,
+                    byte_offset,
+                    text,
+                    boundary,
+                } => {
+                    if descriptor.identity.entry_ref != format!("E{}", entry.entry_id)
+                        || descriptor.identity.segment_id.to_string() != entry.source.segment_id
+                        || descriptor.canonical_order != entry.order
+                        || text.is_empty()
+                        || descriptor.total_bytes == 0
+                        || byte_offset
+                            .checked_add(text.len() as u64)
+                            .is_none_or(|end| end > descriptor.total_bytes)
+                        || descriptor.sha256.len() != 64
+                        || !descriptor
+                            .sha256
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                        || !entry.policy.recording_material
+                        || entry.policy.memory_evidence
+                        || entry.policy.observation_readable
+                    {
+                        return Err(CaptureError::Invalid("canonical descriptor"));
+                    }
+                    match (&descriptor.origin, &entry.source.history_origin, boundary) {
+                        (
+                            crate::public_material::PublicMaterialOrigin::History { origin },
+                            Some(stored),
+                            None,
+                        ) if origin == stored => {}
+                        (
+                            crate::public_material::PublicMaterialOrigin::HostRunBoundary,
+                            None,
+                            Some(_),
+                        ) => {}
+                        _ => return Err(CaptureError::Invalid("canonical origin")),
+                    }
+                    // A partial DTO cannot prove the hidden history extent, but can
+                    // reject aliases and reversals of original per-Segment positions.
+                    // Host events anchor a gap, not a fabricated history row.
+                    let floor = recording_source_floor
+                        .entry(&entry.source.segment_id)
+                        .or_default();
+                    if entry.source.entry_index < *floor {
+                        return Err(CaptureError::Invalid("recording source position order"));
+                    }
+                    *floor = if boundary.is_some() {
+                        entry.source.entry_index
+                    } else {
+                        entry
+                            .source
+                            .entry_index
+                            .checked_add(1)
+                            .ok_or(CaptureError::Invalid("source position overflow"))?
+                    };
+                    if *byte_offset == 0 && text.len() as u64 == descriptor.total_bytes {
+                        let digest: String = Sha256::digest(text.as_bytes())
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect();
+                        if digest != descriptor.sha256 {
+                            return Err(CaptureError::Invalid("canonical digest"));
+                        }
+                        if let Some(boundary) = boundary {
+                            let expected =
+                                serde_json::json!({"kind":"run_boundary", "boundary":boundary});
+                            if serde_json::from_str::<serde_json::Value>(text)? != expected {
+                                return Err(CaptureError::Invalid("run boundary body"));
+                            }
+                        }
+                    }
+                }
                 CaptureBody::Message { content, .. } if content.is_empty() => {
                     return Err(CaptureError::Invalid("empty message parts"));
                 }
@@ -493,6 +602,7 @@ pub struct ScopedSessionEntryRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RawField {
+    CanonicalPublic,
     MessagePart(usize),
     PublicSystem,
     ToolArguments,
@@ -515,6 +625,11 @@ pub struct RawRead {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CaptureBodyMetadata {
+    CanonicalPublic {
+        descriptor: crate::public_material::PublicMaterialDescriptor,
+        byte_offset: u64,
+        boundary: Option<crate::public_material::PublicRunBoundary>,
+    },
     Message {
         role: CaptureRole,
         refusal: bool,

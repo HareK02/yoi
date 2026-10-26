@@ -179,11 +179,11 @@ async fn builtin_journal_profile_installs_only_bound_tools_and_finalizes_saved_s
         call(SUBMIT_JOB_RESULT_TOOL, json!({"result":{}})),
         prose(),
     ]);
-    // This runner/Feature fixture has no selected sources; descriptor delivery gates
-    // for nonempty ranges are owned and tested by the Subjektiv service.
+    // This runner/Feature fixture has no selected sources; actual body-bearing input,
+    // trusted delivery and checkpoint gates are covered by the Host integration suites.
     let mut journal_request = request("builtin:subjektiv-journal-recording");
-    journal_request.input = json!({"selected_ranges":[],"origins":[]});
-    journal_request.instruction = "Read immutable selected_ranges through ReadJournalText Source before recording; descriptors are not source bodies.".into();
+    journal_request.input = json!({"selected_ranges":[],"capture":{"entries":[]}});
+    journal_request.instruction = "Record only the immutable canonical bodies in this Job input. Do not read original Sessions through ReadJournalText Source.".into();
     let job = prepare_job_from_registry_with_grant(
         &journal_request,
         root.path(),
@@ -249,7 +249,7 @@ async fn builtin_journal_profile_installs_only_bound_tools_and_finalizes_saved_s
             "ReadJournalText",
             "Source",
             "content_token",
-            "Conflict",
+            "input digest",
         ] {
             assert!(
                 prompt.contains(contract),

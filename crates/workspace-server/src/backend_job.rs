@@ -463,10 +463,52 @@ impl BackendJobRequest {
     }
 }
 
+/// Availability of the immutable input body, independent of execution outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobInputDisposition {
+    Available,
+    Reclaimed,
+    Erased,
+    Invalidated,
+}
+
+impl JobInputDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Reclaimed => "reclaimed",
+            Self::Erased => "erased",
+            Self::Invalidated => "invalidated",
+        }
+    }
+}
+
+/// Host-authorized retirement; erasure and legacy invalidation do not change outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobInputRetirementReason {
+    Completed,
+    ExplicitErasure,
+    LegacyInvalidation,
+}
+
+impl JobInputRetirementReason {
+    pub fn disposition(self) -> JobInputDisposition {
+        match self {
+            Self::Completed => JobInputDisposition::Reclaimed,
+            Self::ExplicitErasure => JobInputDisposition::Erased,
+            Self::LegacyInvalidation => JobInputDisposition::Invalidated,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BackendJobRecord {
     pub workspace_id: String,
+    /// Receipt metadata. After retirement `input` is null; use the verified loader to execute.
     pub request: BackendJobRequest,
+    pub input_digest: String,
+    pub input_disposition: JobInputDisposition,
     pub intent_fingerprint: String,
     pub state: BackendJobState,
     pub current_attempt: u8,
@@ -477,6 +519,28 @@ pub struct BackendJobRecord {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+}
+
+impl BackendJobRecord {
+    /// Verify the original immutable body and envelope before any execution or retry.
+    /// No Session read or replay request may repair unavailable/corrupt input.
+    pub fn load_executable_request(&self) -> Result<&BackendJobRequest> {
+        if self.input_disposition != JobInputDisposition::Available {
+            return Err(Error::InvalidInput(format!(
+                "Backend Job input is {}",
+                self.input_disposition.as_str()
+            )));
+        }
+        self.request.validate()?;
+        if self.request.input_digest()? != self.input_digest
+            || self.request.fingerprint()? != self.intent_fingerprint
+        {
+            return Err(Error::Store(
+                "Backend Job immutable input or intent fingerprint mismatch".into(),
+            ));
+        }
+        Ok(&self.request)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -665,6 +729,8 @@ mod tests {
                 "workspace_id": "workspace-a",
                 "request": request(),
                 "intent_fingerprint": request().fingerprint().unwrap(),
+                "input_digest": request().input_digest().unwrap(),
+                "input_disposition": "available",
                 "state": "pending",
                 "current_attempt": 2,
                 "created_at": "created",
@@ -1124,3 +1190,17 @@ mod tests {
         }
     }
 }
+
+pub(crate) const INPUT_RETENTION_TRIGGERS: &str = r#"
+CREATE TRIGGER backend_job_identity_immutable BEFORE UPDATE OF
+    workspace_id, job_id, purpose, input_digest, input_ref, resource_key, intent_fingerprint ON backend_jobs
+BEGIN SELECT RAISE(ABORT, 'immutable Backend Job identity'); END;
+CREATE TRIGGER backend_job_input_retirement BEFORE UPDATE OF request_json, input_disposition ON backend_jobs
+WHEN (
+    ((OLD.input_disposition = 'available' AND NEW.input_disposition IN ('reclaimed','erased','invalidated'))
+      OR (OLD.input_disposition IN ('reclaimed','invalidated') AND NEW.input_disposition = 'erased'))
+    AND json_remove(NEW.request_json,'$.input') = json_remove(OLD.request_json,'$.input')
+    AND json_type(NEW.request_json,'$.input') = 'null'
+) IS NOT TRUE
+BEGIN SELECT RAISE(ABORT, 'immutable Backend Job input retirement'); END;
+"#;

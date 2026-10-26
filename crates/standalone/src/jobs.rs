@@ -26,7 +26,10 @@ use job::{JobRequest, JobResultSubmission};
 use tokio::sync::watch;
 
 use crate::job_store::JobStore;
-pub use crate::job_store::{JobAttempt, JobAttemptState, JobSnapshot, JobState, JobStoreError};
+pub use crate::job_store::{
+    JobAttempt, JobAttemptState, JobInputDisposition, JobInputRetirementReason, JobSnapshot,
+    JobState, JobStoreError,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum JobServiceError {
@@ -40,6 +43,8 @@ pub enum JobServiceError {
     Capacity,
     #[error("standalone Job cleanup failed: {0}")]
     Cleanup(String),
+    #[error("standalone Job shutdown is incomplete; execution resources are still owned")]
+    ShutdownIncomplete,
 }
 
 pub(crate) trait JobAttemptFence: Send + Sync {
@@ -173,6 +178,36 @@ impl StandaloneJobs {
         Ok(self.with_store(|store| store.reserve(request))?)
     }
 
+    /// Enumerate historical domain snapshots for a Session, including retired input receipts.
+    pub fn list_session_snapshots(
+        &self,
+        session_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JobSnapshot>, JobServiceError> {
+        self.with_store(|store| store.list_session_snapshots(session_id, after, limit))
+    }
+
+    /// Retire body only. The caller fences domain effects/delivered snapshots before erasure.
+    /// Normal reclamation also requires that execution cleanup has finished.
+    pub fn reclaim_input(
+        &self,
+        job_id: &str,
+        expected_input_digest: &str,
+        reason: JobInputRetirementReason,
+    ) -> Result<JobSnapshot, JobServiceError> {
+        let executions = self.executions.lock().expect("Job executions poisoned");
+        if reason == JobInputRetirementReason::Completed
+            && executions
+                .jobs
+                .get(job_id)
+                .is_some_and(|execution| !execution.task.is_finished())
+        {
+            return Err(JobServiceError::Capacity);
+        }
+        self.with_store(|store| store.reclaim_input(job_id, expected_input_digest, reason))
+    }
+
     pub fn get(&self, job_id: &str) -> Result<JobSnapshot, JobServiceError> {
         Ok(self.with_store(|store| store.get(job_id))?)
     }
@@ -274,6 +309,12 @@ impl StandaloneJobs {
         job_id: &str,
         client: Option<Box<dyn LlmClient>>,
     ) -> Result<(), JobServiceError> {
+        // Preparation owns copies of the immutable input and domain adapter too. Exclude
+        // owner shutdown before creating them, not only before publishing the task.
+        let mut executions = self.executions.lock().expect("Job executions poisoned");
+        if executions.closed {
+            return Err(JobServiceError::Closed);
+        }
         let client = client.or_else(|| {
             self.model_client
                 .lock()
@@ -282,16 +323,14 @@ impl StandaloneJobs {
                 .map(|c| c.clone_boxed())
         });
         let snapshot = self.get(job_id)?;
+        snapshot.load_executable_request()?;
         let timeout = Duration::from_secs(u64::from(snapshot.request.limits.timeout_seconds));
         let deadline = tokio::time::Instant::now() + timeout;
         let fence: Arc<dyn JobAttemptFence> = Arc::new(BoundAttemptFence {
             store: self.store.clone(),
             job_id: job_id.into(),
             attempt_id: snapshot.attempt.attempt_id.clone(),
-            input_digest: snapshot
-                .request
-                .input_digest()
-                .map_err(JobStoreError::from)?,
+            input_digest: snapshot.input_digest.clone(),
             deadline,
         });
         let grant = match (
@@ -311,10 +350,6 @@ impl StandaloneJobs {
         let prepared =
             worker::job::prepare_job_with_grant(&snapshot.request, &self.cwd, client, grant)
                 .map_err(|error| JobServiceError::Configuration(error.to_string()))?;
-        let mut executions = self.executions.lock().expect("Job executions poisoned");
-        if executions.closed {
-            return Err(JobServiceError::Closed);
-        }
         executions.jobs.retain(|_, run| {
             !(run.task.is_finished() && matches!(run.complete.borrow().as_ref(), Some(Ok(()))))
         });
@@ -367,10 +402,7 @@ impl StandaloneJobs {
             store: store.clone(),
             job_id: id.clone(),
             attempt_id: attempt_id.clone(),
-            input_digest: snapshot
-                .request
-                .input_digest()
-                .map_err(JobStoreError::from)?,
+            input_digest: snapshot.input_digest.clone(),
             deadline,
         });
         let (cancel, mut cancellation) = watch::channel(false);
@@ -446,23 +478,25 @@ impl StandaloneJobs {
                 .clone()
                 .expect("completion");
             result.map_err(JobServiceError::Cleanup)?;
-            let task = {
-                let mut executions = self.executions.lock().expect("Job executions poisoned");
-                if executions
-                    .jobs
-                    .get(job_id)
-                    .is_some_and(|run| run.attempt_id == attempt)
-                {
-                    executions.jobs.remove(job_id)
-                } else {
-                    None
-                }
-            };
-            if let Some(execution) = task {
-                execution
-                    .task
-                    .await
-                    .map_err(|error| JobServiceError::Cleanup(error.to_string()))??;
+            // Completion is published immediately before the task returns. Do not remove
+            // its ownership record until the runtime confirms that return (and future drop).
+            while self
+                .executions
+                .lock()
+                .expect("Job executions poisoned")
+                .jobs
+                .get(job_id)
+                .is_some_and(|run| run.attempt_id == attempt && !run.task.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+            let mut executions = self.executions.lock().expect("Job executions poisoned");
+            if executions
+                .jobs
+                .get(job_id)
+                .is_some_and(|run| run.attempt_id == attempt)
+            {
+                executions.jobs.remove(job_id);
             }
         }
         self.get(job_id)
@@ -476,33 +510,63 @@ impl StandaloneJobs {
         }
     }
 
-    pub(crate) async fn shutdown(&self) -> Result<(), JobServiceError> {
+    /// Initiate owner shutdown without blocking a synchronous caller. Success confirms all
+    /// local executions have returned, including request/history and Feature cleanup. An
+    /// incomplete/error result retains the service resources and must retain the Host lease.
+    pub(crate) fn try_shutdown(&self) -> Result<(), JobServiceError> {
         self.close();
-        let tasks = {
-            let mut executions = self.executions.lock().expect("Job executions poisoned");
-            std::mem::take(&mut executions.jobs)
-        };
-        let mut error = None;
-        for execution in tasks.into_values() {
-            match execution.task.await {
-                Ok(Ok(())) => {}
-                Ok(Err(failure)) => {
-                    error = Some(failure);
-                }
-                Err(failure) => {
-                    error = Some(JobServiceError::Cleanup(failure.to_string()));
+        let mut executions = self.executions.lock().expect("Job executions poisoned");
+        for execution in executions.jobs.values() {
+            if !execution.task.is_finished() {
+                return Err(JobServiceError::ShutdownIncomplete);
+            }
+            match execution.complete.borrow().as_ref() {
+                Some(Ok(())) => {}
+                Some(Err(error)) => return Err(JobServiceError::Cleanup(error.clone())),
+                None => {
+                    return Err(JobServiceError::Cleanup(
+                        "Internal Worker ended without cleanup confirmation".into(),
+                    ));
                 }
             }
         }
-        // Close SQLite before the Host releases its lease. Cloned handles may
-        // outlive the Host but cannot mutate or retain the live connection.
+        executions.jobs.clear();
+        // Retained external handles share these slots; they cannot retain a live store,
+        // provider or model client after successful owner shutdown.
         self.store.lock().expect("Job store poisoned").take();
         self.domain.lock().expect("Job domain poisoned").take();
         self.model_client
             .lock()
             .expect("Job model transport poisoned")
             .take();
-        error.map_or(Ok(()), Err)
+        Ok(())
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<(), JobServiceError> {
+        self.close();
+        let completions: Vec<_> = self
+            .executions
+            .lock()
+            .expect("Job executions poisoned")
+            .jobs
+            .values()
+            .map(|execution| execution.complete.clone())
+            .collect();
+        // Never take execution ownership out of the shared service across an await: a
+        // cancelled shutdown future or a concurrent close must still see the barrier.
+        for mut completion in completions {
+            completion
+                .wait_for(Option::is_some)
+                .await
+                .map_err(|error| JobServiceError::Cleanup(error.to_string()))?;
+        }
+        loop {
+            match self.try_shutdown() {
+                // Only the task's final return follows its completion notification.
+                Err(JobServiceError::ShutdownIncomplete) => tokio::task::yield_now().await,
+                result => return result,
+            }
+        }
     }
 }
 
@@ -574,7 +638,8 @@ impl JobAttemptFence for BoundAttemptFence {
         if snapshot.state != JobState::Pending
             || snapshot.attempt.state != JobAttemptState::Dispatched
             || snapshot.attempt.attempt_id != self.attempt_id
-            || snapshot.request.input_digest().map_err(|e| e.to_string())? != self.input_digest
+            || snapshot.input_digest != self.input_digest
+            || snapshot.input_disposition != JobInputDisposition::Available
         {
             return Err("Job domain grant is not bound to the current live attempt".into());
         }

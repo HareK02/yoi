@@ -479,38 +479,28 @@ fn journal_response(request: &Request) -> Vec<LlmEvent> {
             }),
         );
     }
-    for (index, range) in state["selected_ranges"]
-        .as_array()
-        .unwrap()
+    let input: Value = request
+        .items
         .iter()
-        .enumerate()
-    {
-        let mut offset = range["bytes"]["start"].as_u64().unwrap();
-        let mut token = Value::Null;
-        loop {
-            let id = format!("journal-source-{index}-{offset}");
-            match result(&id) {
-                Some(page) => match page["value"]["next_byte"].as_u64() {
-                    Some(next) => {
-                        assert!(next > offset);
-                        offset = next;
-                        token = page["value"]["content_token"].clone();
-                    }
-                    None => break,
-                },
-                None => {
-                    return tool(
-                        &id,
-                        "ReadJournalText",
-                        json!({
-                            "target":{"target":"source","pointer":range["source"]["pointer"]},
-                            "offset":offset,"limit":subjektiv::journal::MAX_JOURNAL_READ_BYTES,"content_token":token
-                        }),
-                    );
-                }
-            }
-        }
-    }
+        .filter_map(Item::as_text)
+        .find_map(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("input_json: "))
+        })
+        .map(|json| serde_json::from_str(json).unwrap())
+        .expect("saved direct Journal input");
+    let input = subjektiv::journal::recording::JournalInput::decode(&input).unwrap();
+    assert_eq!(
+        serde_json::to_value(&input.selected_ranges).unwrap(),
+        state["selected_ranges"]
+    );
+    assert!(
+        input
+            .capture
+            .entries
+            .iter()
+            .all(|entry| input.capture.recording_text(entry.order).is_ok())
+    );
     let (name, action) = if state["current_open"].is_null() {
         (
             "CreateJournalEntry",

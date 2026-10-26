@@ -1326,6 +1326,13 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         Err("Session source permanent erasure is unavailable on this Runtime".into())
     }
 
+    fn session_recording_capture(
+        &self,
+        _request: runtime_api::SessionRecordingCaptureRequest,
+    ) -> Result<runtime_api::SessionRecordingCaptureAvailability, String> {
+        Err("committed recording capture is unavailable on this Runtime".into())
+    }
+
     fn session_material_catalog(
         &self,
         _request: runtime_api::SessionMaterialCatalogRequest,
@@ -2332,6 +2339,21 @@ impl RuntimeRegistry {
             .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
                 runtime_id: runtime_id.into(),
                 code: "session_material_erase_failed".into(),
+                message,
+            })
+    }
+
+    pub fn session_recording_capture(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SessionRecordingCaptureRequest,
+    ) -> Result<runtime_api::SessionRecordingCaptureAvailability, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .session_recording_capture(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "session_recording_capture_failed".into(),
                 message,
             })
     }
@@ -3439,6 +3461,19 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         Ok(runtime_api::SessionMaterialEraseResponse {
             session_id: request.expected_session_id,
         })
+    }
+
+    fn session_recording_capture(
+        &self,
+        request: runtime_api::SessionRecordingCaptureRequest,
+    ) -> Result<runtime_api::SessionRecordingCaptureAvailability, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err("recording capture Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        Ok(self
+            .runtime
+            .session_recording_capture_scoped(&scope, &request))
     }
 
     fn session_material_catalog(
@@ -5673,6 +5708,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             self.request_timeout,
             MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
             move |client| async move { client.session_material_erase(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
+    fn session_recording_capture(
+        &self,
+        request: runtime_api::SessionRecordingCaptureRequest,
+    ) -> Result<runtime_api::SessionRecordingCaptureAvailability, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.session_recording_capture(request).await },
         )
         .map_err(|diagnostic| diagnostic.message)
     }

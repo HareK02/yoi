@@ -14,10 +14,33 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Default)]
 struct ConnectedJournalModel {
     dialogs: Arc<Mutex<Vec<Request>>>,
+    journal_inputs: Arc<Mutex<Vec<String>>>,
 }
 
 impl ConnectedJournalModel {
     fn journal_response(request: &Request) -> Vec<Event> {
+        // Consume the actual Controller-rendered input, not a fixture generation or
+        // a Source tool response. Decode also checks complete bodies/ranges/digests.
+        let envelope = request
+            .items
+            .iter()
+            .filter_map(Item::as_text)
+            .find(|text| text.lines().any(|line| line.starts_with("input_json: ")))
+            .expect("rendered immutable Backend Job envelope");
+        let input_json = envelope
+            .lines()
+            .find_map(|line| line.strip_prefix("input_json: "))
+            .unwrap();
+        let input_value: Value = serde_json::from_str(input_json).unwrap();
+        let frozen = subjektiv::journal::recording::JournalInput::decode(&input_value).unwrap();
+        assert_eq!(
+            serde_json::to_string(&input_value).unwrap(),
+            input_json,
+            "render preserves the exact persisted JSON bytes"
+        );
+        assert!(frozen.capture.entries.iter().all(|entry| matches!(
+            &entry.body, session_store::capture::CaptureBody::CanonicalPublic { text, .. } if !text.is_empty())));
+        let ranges = serde_json::to_value(&frozen.selected_ranges).unwrap();
         // Runtime Controllers deliberately retain alias-routed core schemas for their
         // lifetime even with zero attachments. Verify invocation authority, not schema
         // absence (standalone Internal Jobs use a different composition).
@@ -89,7 +112,7 @@ impl ConnectedJournalModel {
                     "request_id":format!("checkpoint:{}",state["value"]["generation_id"].as_str().unwrap()),
                     "expected_state":position["value"]["state_token"],
                     "action":{"action":"checkpoint","record_operation_ids":[format!("record:{}",state["value"]["generation_id"].as_str().unwrap())]},
-                    "covered_ranges":state["value"]["selected_ranges"],
+                    "covered_ranges":ranges,
                 }),
             )
         } else if let Some(record) = result("record") {
@@ -106,41 +129,14 @@ impl ConnectedJournalModel {
             )
         } else if let Some(state) = result("state") {
             let state = &state["value"];
-            // Deliver the actual frozen Runtime source through authenticated Job tools, rather
-            // than injecting a fixture Journal or claiming unseen source was processed.
-            for (index, range) in state["selected_ranges"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .enumerate()
-            {
-                let mut offset = range["bytes"]["start"].as_u64().unwrap();
-                let mut token = Value::Null;
-                loop {
-                    let id = format!("source-{index}-{offset}");
-                    if let Some(page) = result(&id) {
-                        let page = &page["value"];
-                        if let Some(next) = page["next_byte"].as_u64() {
-                            assert!(next > offset);
-                            offset = next;
-                            token = page["content_token"].clone();
-                        } else {
-                            break;
-                        }
-                    } else {
-                        assert!(
-                            request
-                                .tools
-                                .iter()
-                                .any(|tool| tool.name == "ReadJournalText")
-                        );
-                        return vec![Event::tool_use_start(0, &id, "ReadJournalText"), Event::tool_input_delta(0, json!({
-                            "target":{"target":"source","pointer":range["source"]["pointer"]},
-                            "offset":offset,"limit":MAX_JOURNAL_READ_BYTES,"content_token":token,
-                        }).to_string()), Event::tool_use_stop(0)];
-                    }
-                }
-            }
+            assert_eq!(
+                state["selected_ranges"], ranges,
+                "mutation coverage must come from the rendered frozen input"
+            );
+            assert_eq!(
+                state["initial_journal"]["state_token"],
+                input_value["initial_state_token"]
+            );
             let (tool, action) = if state["current_open"].is_null() {
                 (
                     "CreateJournalEntry",
@@ -158,7 +154,7 @@ impl ConnectedJournalModel {
                 json!({
                     "request_id":format!("record:{}",state["generation_id"].as_str().unwrap()),
                     "expected_state":state["current_journal"]["state_token"],
-                    "action":action,"covered_ranges":state["selected_ranges"],
+                    "action":action,"covered_ranges":ranges,
                 }),
             )
         } else {
@@ -209,6 +205,18 @@ impl LlmClient for ConnectedJournalModel {
             .iter()
             .any(|tool| tool.name == "ReadJournalState")
         {
+            let envelope = request
+                .items
+                .iter()
+                .filter_map(Item::as_text)
+                .find(|text| text.lines().any(|line| line.starts_with("input_json: ")))
+                .expect("actual Journal input in model render")
+                .to_owned();
+            let mut inputs = self.journal_inputs.lock().unwrap();
+            if !inputs.contains(&envelope) {
+                inputs.push(envelope);
+            }
+            drop(inputs);
             Self::journal_response(&request)
         } else if request.tools.iter().any(|tool| {
             matches!(
@@ -458,6 +466,29 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         .store
         .list_backend_journal_jobs(TEST_WORKSPACE_ID, &old_attr.session_id, None, 100)
         .unwrap();
+    // Compare actual render with the durable identity, even if completion already
+    // reclaimed the input body. Reconstituting only for comparison is test-local.
+    for saved in &recorded {
+        let inputs = model.journal_inputs.lock().unwrap();
+        let prefix = format!("job_id: {}", saved.request.job_id);
+        let rendered = inputs
+            .iter()
+            .find(|text| text.lines().any(|line| line == prefix))
+            .expect("every saved Journal Job reached the real Controller");
+        let actual = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix("input_json: "))
+            .unwrap();
+        let mut original = saved.request.clone();
+        original.input = serde_json::from_str(actual).unwrap();
+        assert_eq!(original.input_digest().unwrap(), saved.input_digest);
+        let attempt = crate::backend_job::attempt_id(&saved.request.job_id, saved.current_attempt);
+        assert_eq!(*rendered, original.worker_input(&attempt).unwrap());
+        let input = subjektiv::journal::recording::JournalInput::decode(&original.input).unwrap();
+        assert_eq!(input.capture.session_id, old_attr.session_id);
+        assert!(actual.contains("User chose B rather than A"));
+        assert!(actual.contains("Partial B implementation"));
+    }
     let uncertain_job = &recorded[0].request.job_id;
     let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
     let saved_result: (String, String) = conn.query_row(

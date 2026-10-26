@@ -3,6 +3,1572 @@
 //! runtime or provider is started. Temporary storage owns cleanup. Receipt insertion faults are
 //! deterministic SQLite triggers, not a claim of arbitrary process-crash durability.
 
+mod input_delivery {
+    use super::*;
+    use transport::{JournalJobRequest as Request, JournalJobResponse as Response};
+
+    fn job_request(body: &str) -> ::job::JobRequest {
+        ::job::JobRequest {
+            job_id: "immutable-body-job".into(),
+            purpose: "Journal input delivery gate".into(),
+            input_ref: "journal:immutable-input".into(),
+            input: serde_json::json!({ "raw_body": body }),
+            instruction: "Record the immutable input body".into(),
+            profile: "builtin:subjektiv-journal-recording".into(),
+            serialization_key: None,
+            limits: Default::default(),
+        }
+    }
+
+    fn digest() -> String {
+        job_request("保存済みの公開原文本文と経緯")
+            .input_digest()
+            .unwrap()
+    }
+
+    fn malformed_digests() -> Vec<String> {
+        vec![
+            String::new(),
+            "sha256:not-a-digest".into(),
+            "a".repeat(64),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}", "g".repeat(64)),
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}", "a".repeat(65)),
+            format!("SHA256:{}", "a".repeat(64)),
+        ]
+    }
+
+    fn run(f: &Fixture, ctx: &JournalJobContext, request: Request) -> JournalResult<Response> {
+        service::execute_snapshot(f.store(), ctx, &digest(), request)
+    }
+
+    fn attest(f: &Fixture, ctx: &JournalJobContext) {
+        service::attest_input_delivery(f.store(), ctx, &digest(), &f.ranges).unwrap();
+    }
+
+    #[test]
+    fn input_attestation_does_not_advance_journal_progress_and_replays_after_reopen() {
+        let mut f = Fixture::new();
+        let (generation, ctx) = f.generation("immutable-input", f.ranges.clone());
+        let before = f.state();
+        let sources = f.sources();
+        attest(&f, &ctx);
+        attest(&f, &ctx);
+        assert_eq!(f.state(), before);
+        assert_eq!(f.sources(), sources);
+        assert!(f.entries().is_empty());
+        assert!(matches!(
+            service::finish(f.store(), &ctx),
+            Err(JournalError::Conflict(_))
+        ));
+        assert!(f.store().journal_retention_required(&f.host).unwrap());
+        f.reopen();
+        attest(&f, &ctx);
+        assert_eq!(f.state(), before);
+        assert_eq!(f.sources(), sources);
+        f.store()
+            .database
+            .try_with_connection(|tx| {
+                let saved: (String, String) = tx.query_row(
+                    "SELECT generation_id,input_digest FROM journal_generation_input_deliveries",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                assert_eq!(saved, (generation.id.clone(), digest()));
+                let source_deliveries: u64 = tx.query_row(
+                    "SELECT COUNT(*) FROM journal_generation_deliveries",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let receipts: u64 =
+                    tx.query_row("SELECT COUNT(*) FROM journal_operations", [], |r| r.get(0))?;
+                assert_eq!((source_deliveries, receipts), (0, 0));
+                Ok::<_, JournalError>(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn snapshot_gate_requires_matching_digest_and_exact_generation_selection() {
+        let mut f = Fixture::new();
+        let (generation, ctx) = f.generation("digest-binding", f.ranges.clone());
+        let record = f.operation("record", open_action("ongoing"), f.ranges.clone());
+        for request in [
+            Request::ReadState,
+            Request::Execute {
+                operation: record.clone(),
+            },
+        ] {
+            assert!(matches!(
+                run(&f, &ctx, request),
+                Err(JournalError::Conflict(_))
+            ));
+        }
+        let mut changed = f.ranges.clone();
+        changed[0].bytes.start += 1;
+        for selection in [
+            changed,
+            f.ranges[1..].to_vec(),
+            f.ranges.iter().rev().cloned().collect(),
+        ] {
+            assert!(matches!(
+                service::attest_input_delivery(f.store(), &ctx, &digest(), &selection),
+                Err(JournalError::Conflict(_))
+            ));
+        }
+        for malformed in malformed_digests() {
+            assert!(matches!(
+                service::attest_input_delivery(f.store(), &ctx, &malformed, &f.ranges),
+                Err(JournalError::InvalidInput(_))
+            ));
+        }
+        attest(&f, &ctx);
+        f.reopen();
+        let different = job_request("改変された公開原文本文")
+            .input_digest()
+            .unwrap();
+        assert_ne!(different, digest());
+        assert!(matches!(
+            service::attest_input_delivery(f.store(), &ctx, &different, &f.ranges),
+            Err(JournalError::Conflict(_))
+        ));
+        assert!(matches!(
+            service::execute_snapshot(f.store(), &ctx, &different, Request::ReadState),
+            Err(JournalError::Conflict(_))
+        ));
+        assert!(matches!(
+            service::execute_snapshot(
+                f.store(),
+                &ctx,
+                &different,
+                Request::Execute {
+                    operation: record.clone()
+                }
+            ),
+            Err(JournalError::Conflict(_))
+        ));
+        assert!(matches!(
+            run(&f, &ctx, Request::Execute { operation: record }),
+            Ok(Response::Saved(_))
+        ));
+        f.close(&generation);
+        let (_, replacement) = f.generation("replacement-input", f.ranges.clone());
+        assert!(matches!(
+            run(&f, &replacement, Request::ReadState),
+            Err(JournalError::Conflict(_))
+        ));
+        attest(&f, &replacement);
+        assert!(matches!(
+            run(&f, &replacement, Request::ReadState),
+            Ok(Response::State(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_execution_reads_journal_only_and_keeps_receipt_checkpoint_and_position_constraints()
+    {
+        let mut f = Fixture::new();
+        let (_, ctx) = f.generation("source-free", f.ranges.clone());
+        attest(&f, &ctx);
+        let source = Request::ReadText {
+            read: transport::JournalTextRead {
+                target: transport::JournalTextTarget::Source {
+                    pointer: f.ranges[0].source.pointer.clone(),
+                },
+                offset: 0,
+                limit: MAX_JOURNAL_READ_BYTES,
+                content_token: None,
+            },
+        };
+        let error = run(&f, &ctx, source).unwrap_err();
+        assert!(
+            matches!(error, JournalError::PermissionDenied(ref message) if message.contains("Source target") && message.contains("immutable Job input"))
+        );
+        let record = f.operation("saved-record", open_action("ongoing"), f.ranges.clone());
+        let request = Request::Execute {
+            operation: record.clone(),
+        };
+        let receipt = run(&f, &ctx, request.clone()).unwrap();
+        // The lost response is recovered from the same operation after closing/reopening SQLite.
+        f.reopen();
+        assert_eq!(run(&f, &ctx, request).unwrap(), receipt);
+        assert_eq!(f.entries().len(), 1);
+        assert_eq!(f.state().0.process_order, 0);
+        assert!(matches!(
+            service::finish(f.store(), &ctx),
+            Err(JournalError::Conflict(_))
+        ));
+        let position = f.operation(
+            "saved-position",
+            JournalAction::UpdatePosition {
+                current_position: "現在地".into(),
+            },
+            vec![],
+        );
+        run(
+            &f,
+            &ctx,
+            Request::Execute {
+                operation: position,
+            },
+        )
+        .unwrap();
+        for evidence in [
+            vec![],
+            vec!["missing-record".into()],
+            vec!["saved-position".into()],
+        ] {
+            let operation = f.operation(
+                "invalid-checkpoint",
+                JournalAction::Checkpoint {
+                    record_operation_ids: evidence,
+                },
+                f.ranges.clone(),
+            );
+            assert!(run(&f, &ctx, Request::Execute { operation }).is_err());
+            assert_eq!(
+                (f.state().0.process_order, f.state().0.process_byte),
+                (0, 0)
+            );
+        }
+        for (snapshot, expected) in [
+            (transport::JournalSnapshot::Initial, ""),
+            (transport::JournalSnapshot::Current, "現在地"),
+        ] {
+            let response = run(
+                &f,
+                &ctx,
+                Request::ReadText {
+                    read: transport::JournalTextRead {
+                        target: transport::JournalTextTarget::Position { snapshot },
+                        offset: 0,
+                        limit: 100,
+                        content_token: None,
+                    },
+                },
+            )
+            .unwrap();
+            assert!(matches!(response, Response::Text(page) if page.text == expected));
+        }
+        for target in [
+            transport::JournalTextTarget::OpenBody {
+                snapshot: transport::JournalSnapshot::Current,
+            },
+            transport::JournalTextTarget::OpenOngoing {
+                snapshot: transport::JournalSnapshot::Current,
+            },
+        ] {
+            assert!(matches!(
+                run(
+                    &f,
+                    &ctx,
+                    Request::ReadText {
+                        read: transport::JournalTextRead {
+                            target,
+                            offset: 0,
+                            limit: 100,
+                            content_token: None
+                        }
+                    }
+                ),
+                Ok(Response::Text(_))
+            ));
+        }
+        assert!(matches!(
+            run(
+                &f,
+                &ctx,
+                Request::QueryOperation {
+                    request_id: record.request_id.clone()
+                }
+            ),
+            Ok(Response::Operation(Some(_)))
+        ));
+        assert!(
+            matches!(run(&f, &ctx, Request::ListOperations { after: None, limit: 32 }), Ok(Response::Operations(page)) if page.items.len() == 2)
+        );
+        assert!(
+            matches!(run(&f, &ctx, Request::ReadOperationCoverage { request_id: record.request_id.clone(), offset: 0, limit: 32 }), Ok(Response::Coverage(page)) if page.items == f.ranges)
+        );
+        let checkpoint = f.operation(
+            "checkpoint",
+            JournalAction::Checkpoint {
+                record_operation_ids: vec![record.request_id],
+            },
+            f.ranges.clone(),
+        );
+        run(
+            &f,
+            &ctx,
+            Request::Execute {
+                operation: checkpoint,
+            },
+        )
+        .unwrap();
+        f.reopen();
+        assert_eq!(
+            (f.state().0.process_order, f.state().0.process_byte),
+            (2, 0)
+        );
+        assert!(!f.store().journal_retention_required(&f.host).unwrap());
+        let completion = service::finish(f.store(), &ctx).unwrap();
+        assert_eq!((completion.process_order, completion.process_byte), (2, 0));
+        assert!(matches!(
+            run(&f, &ctx, Request::ReadState),
+            Err(JournalError::Conflict(_))
+        ));
+        assert!(matches!(
+            service::attest_input_delivery(f.store(), &ctx, &digest(), &f.ranges),
+            Err(JournalError::Conflict(_))
+        ));
+        assert_eq!(service::finish(f.store(), &ctx).unwrap(), completion);
+        let attr = f.host.attribution.as_ref().unwrap();
+        let binding = f
+            .store()
+            .claim_journal_writer(&f.host.subject_id, &attr.runtime_id, &attr.worker_id)
+            .unwrap();
+        f.store().release_journal_writer(&binding).unwrap();
+        assert!(matches!(
+            service::attest_input_delivery(f.store(), &ctx, &digest(), &f.ranges),
+            Err(JournalError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            run(&f, &ctx, Request::ReadState),
+            Err(JournalError::PermissionDenied(_))
+        ));
+    }
+
+    #[test]
+    fn retired_subject_rejects_late_attestation_and_snapshot_execution() {
+        let mut f = Fixture::new();
+        let (_, ctx) = f.generation("retired-input", f.ranges.clone());
+        attest(&f, &ctx);
+        let operation = f.operation(
+            "late-retired-record",
+            open_action("must not save"),
+            f.ranges.clone(),
+        );
+        f.store().retire_subject(&f.host.subject_id).unwrap();
+        f.reopen();
+        assert!(matches!(
+            service::attest_input_delivery(f.store(), &ctx, &digest(), &f.ranges),
+            Err(JournalError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            run(&f, &ctx, Request::ReadState),
+            Err(JournalError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            run(&f, &ctx, Request::Execute { operation }),
+            Err(JournalError::PermissionDenied(_))
+        ));
+        assert!(f.entries().is_empty());
+    }
+
+    #[test]
+    fn legacy_source_delivery_cannot_satisfy_immutable_input_gate() {
+        let f = Fixture::with_sizes(&[8]);
+        let (_, ctx) = f.generation("legacy-read", f.ranges.clone());
+        service::execute_bounded(
+            f.store(),
+            &ctx,
+            Request::ReadText {
+                read: transport::JournalTextRead {
+                    target: transport::JournalTextTarget::Source {
+                        pointer: f.ranges[0].source.pointer.clone(),
+                    },
+                    offset: 0,
+                    limit: 8,
+                    content_token: None,
+                },
+            },
+            |source, _, _| {
+                Ok(recording::JournalMaterial {
+                    range: JournalSourceRange {
+                        source: source.clone(),
+                        bytes: JournalByteRange { start: 0, end: 8 },
+                    },
+                    text: "12345678".into(),
+                })
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            run(&f, &ctx, Request::ReadState),
+            Err(JournalError::Conflict(_))
+        ));
+        assert!(matches!(
+            run(
+                &f,
+                &ctx,
+                Request::Execute {
+                    operation: f.operation("new-record", open_action("ongoing"), f.ranges.clone())
+                }
+            ),
+            Err(JournalError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn input_delivery_migration_preserves_existing_subjects_and_enforces_binding_constraints() {
+        // Exercise the oldest Journal baseline, the immediate predecessor and fresh creation.
+        for baseline in [
+            &crate::MIGRATIONS[..7],
+            &crate::MIGRATIONS[..12],
+            crate::MIGRATIONS,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("migration");
+            let manager = FeatureStorage::new(&root);
+            let scope = manager.scope("input-delivery-upgrade").unwrap();
+            let registration = scope
+                .register(feature_storage::FeatureRegistration::new(
+                    crate::SUBJEKTIV_FEATURE_ID,
+                    baseline,
+                ))
+                .unwrap();
+            let store = SubjektivStore::open(&scope, &registration).unwrap();
+            let subject = store
+                .create_subject_with_behavior(
+                    SubjectRole::new("preserved").unwrap(),
+                    "Existing behavior".into(),
+                )
+                .unwrap();
+            drop(store);
+            drop(scope);
+            manager.shutdown().unwrap();
+            drop(manager);
+
+            let manager = FeatureStorage::new(&root);
+            let scope = manager.scope("input-delivery-upgrade").unwrap();
+            let registration = SubjektivStore::register(&scope).unwrap();
+            let store = SubjektivStore::open(&scope, &registration).unwrap();
+            assert_eq!(store.subject(&subject.id).unwrap(), Some(subject.clone()));
+            let host = session_host(&store, &subject.id, "migration-session");
+            let ranges = vec![source_range("migration-session", 0, 8)];
+            let id = store
+                .accept_journal_sources(&host, "Migration", &ranges)
+                .unwrap();
+            let binding = JobAttemptBinding {
+                job_id: "migration-job".into(),
+                attempt_id: "attempt".into(),
+            };
+            let generation = store
+                .prepare_journal_generation(&host, &id, binding.clone(), ranges.clone())
+                .unwrap();
+            let ctx = JournalJobContext::validated(&store, &host, &generation.id, binding).unwrap();
+            service::attest_input_delivery(&store, &ctx, &digest(), &ranges).unwrap();
+            store
+                .close_journal_generation(&host, &generation.id, &generation.job)
+                .unwrap();
+            let second = store
+                .prepare_journal_generation(
+                    &host,
+                    &id,
+                    JobAttemptBinding {
+                        job_id: "next-migration-job".into(),
+                        attempt_id: "attempt".into(),
+                    },
+                    ranges.clone(),
+                )
+                .unwrap();
+            store.database.try_transaction(|tx| {
+                let columns = tx.prepare("PRAGMA table_info(journal_generation_input_deliveries)")?.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>()?;
+                assert_eq!(columns, ["generation_id", "input_digest"]);
+                assert!(tx.execute("INSERT INTO journal_generation_input_deliveries VALUES(?1,?2)", rusqlite::params![generation.id, digest()]).is_err());
+                assert!(tx.execute("INSERT INTO journal_generation_input_deliveries VALUES('missing-generation',?1)", [digest()]).is_err());
+                assert!(tx.execute("UPDATE journal_generation_input_deliveries SET input_digest=?1", [job_request("changed body").input_digest().unwrap()]).is_err());
+                // Digest validation is a schema constraint as well as an API boundary check.
+                for invalid in malformed_digests() {
+                    assert!(tx.execute("INSERT INTO journal_generation_input_deliveries VALUES(?1,?2)", rusqlite::params![second.id, invalid]).is_err());
+                }
+                let saved: String = tx.query_row("SELECT input_digest FROM journal_generation_input_deliveries WHERE generation_id=?1", [&generation.id], |r| r.get(0))?;
+                assert_eq!(saved, digest());
+                Ok::<_, JournalError>(())
+            }).unwrap();
+            drop(store);
+            drop(scope);
+            manager.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn input_delivery_migration_failure_rolls_back_table_creation_and_retries() {
+        // A colliding trigger is created before migration so failure occurs after its new table DDL.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("rollback");
+        let manager = FeatureStorage::new(&root);
+        let scope = manager.scope("input-delivery-rollback").unwrap();
+        let registration = scope
+            .register(feature_storage::FeatureRegistration::new(
+                crate::SUBJEKTIV_FEATURE_ID,
+                &crate::MIGRATIONS[..12],
+            ))
+            .unwrap();
+        let store = SubjektivStore::open(&scope, &registration).unwrap();
+        let subject = store
+            .create_subject_with_behavior(
+                SubjectRole::new("preserved").unwrap(),
+                "Retain on failure".into(),
+            )
+            .unwrap();
+        store.database.try_transaction(|tx| {
+            tx.execute_batch("CREATE TRIGGER journal_generation_input_delivery_no_update BEFORE UPDATE ON subjects BEGIN SELECT RAISE(ABORT, 'injected migration collision'); END;")?;
+            Ok::<_, JournalError>(())
+        }).unwrap();
+        drop(store);
+        drop(scope);
+        manager.shutdown().unwrap();
+        drop(manager);
+
+        let manager = FeatureStorage::new(&root);
+        let scope = manager.scope("input-delivery-rollback").unwrap();
+        let registration = SubjektivStore::register(&scope).unwrap();
+        assert!(matches!(
+            SubjektivStore::open(&scope, &registration),
+            Err(crate::SubjektivError::Storage(
+                feature_storage::FeatureStorageError::MigrationFailed { .. }
+            ))
+        ));
+        drop(scope);
+        manager.shutdown().unwrap();
+        drop(manager);
+
+        let manager = FeatureStorage::new(&root);
+        let scope = manager.scope("input-delivery-rollback").unwrap();
+        let registration = scope
+            .register(feature_storage::FeatureRegistration::new(
+                crate::SUBJEKTIV_FEATURE_ID,
+                &crate::MIGRATIONS[..12],
+            ))
+            .unwrap();
+        let store = SubjektivStore::open(&scope, &registration).unwrap();
+        assert_eq!(store.subject(&subject.id).unwrap(), Some(subject.clone()));
+        store.database.try_transaction(|tx| {
+            assert!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='journal_generation_input_deliveries')", [], |r| r.get::<_, bool>(0))?);
+            tx.execute_batch("DROP TRIGGER journal_generation_input_delivery_no_update")?;
+            Ok::<_, JournalError>(())
+        }).unwrap();
+        drop(store);
+        drop(scope);
+        manager.shutdown().unwrap();
+        drop(manager);
+
+        let manager = FeatureStorage::new(&root);
+        let scope = manager.scope("input-delivery-rollback").unwrap();
+        let registration = SubjektivStore::register(&scope).unwrap();
+        let store = SubjektivStore::open(&scope, &registration).unwrap();
+        assert_eq!(store.subject(&subject.id).unwrap(), Some(subject));
+        store.database.try_with_connection(|tx| {
+            assert!(tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='journal_generation_input_deliveries')", [], |r| r.get::<_, bool>(0))?);
+            Ok::<_, JournalError>(())
+        }).unwrap();
+        drop(store);
+        drop(scope);
+        manager.shutdown().unwrap();
+    }
+
+    #[test]
+    fn late_input_attestation_and_execution_cannot_revive_cancelled_or_erased_generations() {
+        for erased in [false, true] {
+            let mut f = Fixture::new();
+            let (generation, ctx) = f.generation("late-input", f.ranges.clone());
+            attest(&f, &ctx);
+            let record = f.operation(
+                "late-record",
+                open_action("must not save"),
+                f.ranges.clone(),
+            );
+            if erased {
+                f.store()
+                    .erase_journal_session(&f.host, "erase-input")
+                    .unwrap();
+            } else {
+                f.close(&generation);
+                f.generation("replacement", f.ranges.clone());
+            }
+            f.reopen();
+            assert!(service::attest_input_delivery(f.store(), &ctx, &digest(), &f.ranges).is_err());
+            assert!(run(&f, &ctx, Request::ReadState).is_err());
+            assert!(run(&f, &ctx, Request::Execute { operation: record }).is_err());
+            f.store()
+                .database
+                .try_with_connection(|tx| {
+                    let count: u64 = tx.query_row(
+                        "SELECT COUNT(*) FROM journal_generation_input_deliveries",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    assert_eq!(count, u64::from(!erased));
+                    let records: u64 =
+                        tx.query_row("SELECT COUNT(*) FROM journal_operations", [], |r| r.get(0))?;
+                    assert_eq!(records, 0);
+                    Ok::<_, JournalError>(())
+                })
+                .unwrap();
+        }
+    }
+}
+
+mod snapshot_inputs {
+    //! Component coverage joins shared canonical values, Journal input construction, SQLite
+    //! generations, and the production snapshot service. Synthetic Host-attested captures and
+    //! a saved Job file replace only capture/dispatch ownership; no Worker or Session reader runs.
+    use super::*;
+    use recording::JournalInput;
+    use session_store::capture::{
+        CaptureBody, CaptureDto, CaptureEntryDto, CaptureLimits, CaptureSource, CaptureUsePolicy,
+        RecordingPosition,
+    };
+    use session_store::public_material::{
+        PublicMaterialDescriptor, PublicMaterialIdentity, PublicMaterialOrigin,
+    };
+    use transport::{JournalJobRequest as Request, JournalJobResponse as Response};
+
+    fn canonical_capture(session: &str, bodies: &[String]) -> CaptureDto {
+        let capture = CaptureDto {
+            version: 1,
+            session_id: session.into(),
+            segment_id: Uuid::from_u128(3).to_string(),
+            view_entry_count: bodies.len() as u64,
+            entries: bodies
+                .iter()
+                .enumerate()
+                .map(|(index, body)| {
+                    let segment_id = Uuid::from_u128(1 + (index / 50) as u128);
+                    let entry_id = format!("synthetic-{index}");
+                    let origin = session_store::LoggedSessionHistoryOrigin::LocalHumanInput;
+                    CaptureEntryDto {
+                        entry_id: entry_id.clone(),
+                        order: index as u64,
+                        source: CaptureSource {
+                            segment_id: segment_id.to_string(),
+                            entry_index: index as u64,
+                            provenance: serde_json::from_value(serde_json::json!("human_input"))
+                                .unwrap(),
+                            history_origin: Some(origin.clone()),
+                            derived_from: vec![],
+                        },
+                        policy: CaptureUsePolicy {
+                            recording_material: true,
+                            memory_evidence: false,
+                            observation_readable: false,
+                        },
+                        body: CaptureBody::CanonicalPublic {
+                            descriptor: PublicMaterialDescriptor {
+                                identity: PublicMaterialIdentity {
+                                    segment_id,
+                                    entry_ref: format!("E{entry_id}"),
+                                },
+                                canonical_order: index as u64,
+                                origin: PublicMaterialOrigin::History { origin },
+                                sha256: Sha256::digest(body.as_bytes())
+                                    .iter()
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect(),
+                                total_bytes: body.len() as u64,
+                            },
+                            byte_offset: 0,
+                            text: body.clone(),
+                            boundary: None,
+                        },
+                    }
+                })
+                .collect(),
+        };
+        capture.validate(CaptureLimits::default()).unwrap();
+        capture
+    }
+
+    fn admitted_capture(
+        f: &Fixture,
+        bodies: &[String],
+    ) -> (JournalHostContext, String, CaptureDto) {
+        let host = session_host(f.store(), &f.host.subject_id, "canonical-input-session");
+        let capture = canonical_capture("canonical-input-session", bodies);
+        let mut journal_id = None;
+        for ranges in recording::capture_ranges(&capture)
+            .unwrap()
+            .chunks(MAX_JOURNAL_RANGES)
+        {
+            let id = f
+                .store()
+                .accept_journal_sources(&host, "Canonical input", ranges)
+                .unwrap();
+            if let Some(prior) = &journal_id {
+                assert_eq!(prior, &id);
+            }
+            journal_id = Some(id);
+        }
+        (host, journal_id.unwrap(), capture)
+    }
+
+    fn operation(
+        f: &Fixture,
+        host: &JournalHostContext,
+        id: &str,
+        request_id: &str,
+        action: JournalAction,
+        ranges: Vec<JournalSourceRange>,
+    ) -> JournalOperation {
+        JournalOperation {
+            request_id: request_id.into(),
+            expected_state: f.store().read_journal(host, id).unwrap().state_token,
+            action,
+            covered_ranges: ranges,
+        }
+    }
+
+    fn seed_initial_state(
+        f: &Fixture,
+        host: &JournalHostContext,
+        id: &str,
+        ranges: Vec<JournalSourceRange>,
+    ) {
+        let binding = JobAttemptBinding {
+            job_id: "seed-initial-state".into(),
+            attempt_id: "seed-attempt".into(),
+        };
+        let generation = f
+            .store()
+            .prepare_journal_generation(host, id, binding.clone(), ranges)
+            .unwrap();
+        let ctx = JournalJobContext::validated(f.store(), host, &generation.id, binding).unwrap();
+        f.store()
+            .execute_journal(
+                &ctx,
+                operation(
+                    f,
+                    host,
+                    id,
+                    "seed-open",
+                    open_action(&"Original full open body 日本語\n\"\\".repeat(300)),
+                    vec![],
+                ),
+            )
+            .unwrap();
+        f.store()
+            .execute_journal(
+                &ctx,
+                operation(
+                    f,
+                    host,
+                    id,
+                    "seed-position",
+                    JournalAction::UpdatePosition {
+                        current_position: "Initial position 日本語\n\"\\".repeat(200),
+                    },
+                    vec![],
+                ),
+            )
+            .unwrap();
+        f.store()
+            .close_journal_generation(host, &generation.id, &generation.job)
+            .unwrap();
+    }
+
+    fn job_request(job_id: &str, input: &JournalInput) -> ::job::JobRequest {
+        let request = ::job::JobRequest {
+            job_id: job_id.into(),
+            purpose: "Journal canonical input".into(),
+            input_ref: format!("journal:{}", input.journal_id),
+            input: serde_json::to_value(input).unwrap(),
+            instruction: "Process saved immutable bodies only".into(),
+            profile: "builtin:subjektiv-journal-recording".into(),
+            serialization_key: None,
+            limits: Default::default(),
+        };
+        request.validate().unwrap();
+        request
+    }
+
+    fn run(
+        f: &Fixture,
+        ctx: &JournalJobContext,
+        request: &::job::JobRequest,
+        action: Request,
+    ) -> JournalResult<Response> {
+        service::execute_snapshot(f.store(), ctx, &request.input_digest().unwrap(), action)
+    }
+
+    #[test]
+    fn complete_input_budget_and_successive_canonical_prefixes_preserve_all_escaped_utf8_bytes() {
+        let f = Fixture::new();
+        let mut bodies: Vec<_> = (0..131)
+            .map(|i| format!("[user {i}] 公開原文\n\"\\\u{1}\t").repeat(8))
+            .collect();
+        bodies[60] = "[long public result] 日本語🦀\n\"\\\u{1}\t".repeat(14_000);
+        let (host, id, capture) = admitted_capture(&f, &bodies);
+        let all_ranges = recording::capture_ranges(&capture).unwrap();
+        seed_initial_state(&f, &host, &id, all_ranges[..1].to_vec());
+        let mut reconstructed = vec![String::new(); bodies.len()];
+        let mut jobs = 0;
+        let mut partial = false;
+        for step in 0..20 {
+            let before = f.store().journal_resume_state(&host, &id).unwrap();
+            if before.0.process_order == bodies.len() as u64 {
+                break;
+            }
+            let callback_count = std::cell::Cell::new(0);
+            let input = JournalInput::build(f.store(), &host, &id, |order, byte, budget| {
+                callback_count.set(callback_count.get() + 1);
+                assert_eq!(
+                    (order, byte),
+                    (before.0.process_order, before.0.process_byte)
+                );
+                Ok(capture
+                    .recording_slice(
+                        RecordingPosition {
+                            canonical_order: order,
+                            byte_offset: byte,
+                        },
+                        MAX_JOURNAL_RANGES,
+                        budget,
+                    )
+                    .unwrap()
+                    .capture)
+            })
+            .unwrap();
+            assert_eq!(callback_count.get(), 1);
+            let request = job_request(&format!("bounded-{step}"), &input);
+            assert!(
+                serde_json::to_vec(&request.input).unwrap().len() <= ::job::MAX_JOB_INPUT_BYTES
+            );
+            assert_eq!(JournalInput::decode(&request.input).unwrap(), input);
+            assert_eq!(input.initial_state_token, before.0.state_token);
+            assert_eq!(
+                input.initial_open_id,
+                before.1.as_ref().map(|e| e.id.clone())
+            );
+            let binding = JobAttemptBinding {
+                job_id: request.job_id.clone(),
+                attempt_id: "attempt".into(),
+            };
+            let generation = f
+                .store()
+                .prepare_journal_input(&host, &input, binding.clone())
+                .unwrap();
+            input.validate_generation(&generation).unwrap();
+            let ctx =
+                JournalJobContext::validated(f.store(), &host, &generation.id, binding).unwrap();
+            service::attest_input_delivery(
+                f.store(),
+                &ctx,
+                &request.input_digest().unwrap(),
+                &input.selected_ranges,
+            )
+            .unwrap();
+            // Capture, input construction, generation preparation and delivery cannot reflect bytes.
+            assert_eq!(f.store().journal_resume_state(&host, &id).unwrap(), before);
+            for range in &input.selected_ranges {
+                let (_, offset, text) = input.capture.recording_text(range.source.order).unwrap();
+                let target = &mut reconstructed[range.source.order as usize];
+                assert_eq!(offset, target.len() as u64);
+                assert_eq!(range.bytes.start, offset);
+                assert_eq!(range.bytes.end, offset + text.len() as u64);
+                assert_eq!(
+                    text,
+                    &bodies[range.source.order as usize]
+                        [range.bytes.start as usize..range.bytes.end as usize]
+                );
+                target.push_str(text);
+                partial |= range.bytes.end < range.source.total_bytes;
+            }
+            let record_id = format!("bounded-record-{step}");
+            run(
+                &f,
+                &ctx,
+                &request,
+                Request::Execute {
+                    operation: operation(
+                        &f,
+                        &host,
+                        &id,
+                        &record_id,
+                        JournalAction::ConfirmUnchanged,
+                        input.selected_ranges.clone(),
+                    ),
+                },
+            )
+            .unwrap();
+            run(
+                &f,
+                &ctx,
+                &request,
+                Request::Execute {
+                    operation: operation(
+                        &f,
+                        &host,
+                        &id,
+                        &format!("bounded-position-{step}"),
+                        JournalAction::UpdatePosition {
+                            current_position: format!("Processed prefix {step}"),
+                        },
+                        vec![],
+                    ),
+                },
+            )
+            .unwrap();
+            run(
+                &f,
+                &ctx,
+                &request,
+                Request::Execute {
+                    operation: operation(
+                        &f,
+                        &host,
+                        &id,
+                        &format!("bounded-checkpoint-{step}"),
+                        JournalAction::Checkpoint {
+                            record_operation_ids: vec![record_id],
+                        },
+                        input.selected_ranges,
+                    ),
+                },
+            )
+            .unwrap();
+            service::finish(f.store(), &ctx).unwrap();
+            jobs += 1;
+        }
+        assert!(
+            jobs > 2,
+            "the long escaped input and 131 entries must require multiple prefixes"
+        );
+        assert!(
+            partial,
+            "a long UTF-8 body must be split, not previewed or dropped"
+        );
+        assert_eq!(reconstructed, bodies);
+        let journal = f.store().read_journal(&host, &id).unwrap();
+        assert_eq!((journal.process_order, journal.process_byte), (131, 0));
+        for range in all_ranges {
+            assert_eq!(
+                f.store()
+                    .read_journal_source(&host, &id, range.source.order)
+                    .unwrap()
+                    .reflected_bytes,
+                range.source.total_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn journal_input_decode_rejects_mismatched_ranges_policy_session_tampered_text_and_missing_body()
+     {
+        let f = Fixture::new();
+        let (host, id, capture) = admitted_capture(
+            &f,
+            &["[user] 公開原文\n".into(), "[user] 次の原文\n".into()],
+        );
+        let input =
+            JournalInput::build(f.store(), &host, &id, |_, _, _| Ok(capture.clone())).unwrap();
+        let original = serde_json::to_value(input).unwrap();
+        let cases: &[(&str, fn(&mut serde_json::Value))] = &[
+            ("range", |v| {
+                v["selected_ranges"][0]["bytes"]["end"] = serde_json::json!(1)
+            }),
+            ("recording policy", |v| {
+                v["capture"]["entries"][0]["policy"]["recording_material"] =
+                    serde_json::json!(false)
+            }),
+            ("cross-purpose policy", |v| {
+                v["capture"]["entries"][0]["policy"]["memory_evidence"] = serde_json::json!(true)
+            }),
+            ("session", |v| {
+                v["capture"]["session_id"] = serde_json::json!("different-session")
+            }),
+            ("full text digest", |v| {
+                let text = &mut v["capture"]["entries"][0]["body"]["text"];
+                *text = serde_json::json!("X".repeat(text.as_str().unwrap().len()));
+            }),
+            ("Journal version", |v| v["version"] = serde_json::json!(2)),
+            ("capture version", |v| {
+                v["capture"]["version"] = serde_json::json!(2)
+            }),
+            ("missing body", |v| {
+                v["capture"]["entries"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("body");
+            }),
+            ("missing text", |v| {
+                v["capture"]["entries"][0]["body"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("text");
+            }),
+        ];
+        for (name, corrupt) in cases {
+            let mut value = original.clone();
+            corrupt(&mut value);
+            assert!(
+                JournalInput::decode(&value).is_err(),
+                "accepted corrupt input: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn released_writer_recovers_exact_saved_input_and_completion_without_renewing_mutation_authority()
+     {
+        let mut f = Fixture::new();
+        // This Subject has only the tested Session; unrelated fixture history must not
+        // participate in the writer's pending-source release protection.
+        let subject = f
+            .store()
+            .create_subject_with_behavior(
+                SubjectRole::new("completion-recovery").unwrap(),
+                String::new(),
+            )
+            .unwrap();
+        let host = session_host(f.store(), &subject.id, "released-completion-session");
+        let writer = f
+            .store()
+            .claim_journal_writer(&subject.id, "runtime", "worker")
+            .unwrap();
+        let capture = canonical_capture(
+            "released-completion-session",
+            &["[user] 記録済みの公開本文\n".into()],
+        );
+        let ranges = recording::capture_ranges(&capture).unwrap();
+        let id = f
+            .store()
+            .accept_journal_sources(&host, "Retained completion", &ranges)
+            .unwrap();
+        seed_initial_state(&f, &host, &id, ranges.clone());
+        let input = JournalInput::build(f.store(), &host, &id, |_, _, _| Ok(capture)).unwrap();
+        let request = job_request("retained-completion-job", &input);
+        let saved_request = serde_json::to_vec(&request).unwrap();
+        let binding = JobAttemptBinding {
+            job_id: request.job_id.clone(),
+            attempt_id: "original-attempt".into(),
+        };
+        let generation = f
+            .store()
+            .prepare_journal_input(&host, &input, binding.clone())
+            .unwrap();
+        let old_ctx =
+            JournalJobContext::validated(f.store(), &host, &generation.id, binding.clone())
+                .unwrap();
+        service::attest_input_delivery(
+            f.store(),
+            &old_ctx,
+            &request.input_digest().unwrap(),
+            &input.selected_ranges,
+        )
+        .unwrap();
+        run(
+            &f,
+            &old_ctx,
+            &request,
+            Request::Execute {
+                operation: operation(
+                    &f,
+                    &host,
+                    &id,
+                    "completed-record",
+                    JournalAction::ConfirmUnchanged,
+                    ranges.clone(),
+                ),
+            },
+        )
+        .unwrap();
+        run(
+            &f,
+            &old_ctx,
+            &request,
+            Request::Execute {
+                operation: operation(
+                    &f,
+                    &host,
+                    &id,
+                    "completed-position",
+                    JournalAction::UpdatePosition {
+                        current_position: "Saved position after all selected input".into(),
+                    },
+                    vec![],
+                ),
+            },
+        )
+        .unwrap();
+        run(
+            &f,
+            &old_ctx,
+            &request,
+            Request::Execute {
+                operation: operation(
+                    &f,
+                    &host,
+                    &id,
+                    "completed-checkpoint",
+                    JournalAction::Checkpoint {
+                        record_operation_ids: vec!["completed-record".into()],
+                    },
+                    ranges,
+                ),
+            },
+        )
+        .unwrap();
+        let saved_completion = service::finish(f.store(), &old_ctx).unwrap();
+        let finished_journal = f.store().read_journal(&host, &id).unwrap();
+        assert_eq!(
+            (
+                saved_completion.process_order,
+                saved_completion.process_byte
+            ),
+            (1, 0)
+        );
+        f.store().release_journal_writer(&writer).unwrap();
+        assert!(
+            f.store()
+                .journal_worker_was_released(&subject.id, "runtime", "worker")
+                .unwrap()
+        );
+        f.reopen();
+
+        // Reconciliation reads the same immutable Job input, not a new capture or the
+        // current Journal projection. Release did not erase this retained completion.
+        let request: ::job::JobRequest = serde_json::from_slice(&saved_request).unwrap();
+        let input = JournalInput::decode(&request.input).unwrap();
+        let retained = f
+            .store()
+            .prepare_journal_input(&host, &input, binding.clone())
+            .unwrap();
+        assert_eq!(retained, generation);
+        let recovery =
+            JournalJobContext::validated_recovery(f.store(), &host, &retained.id, binding.clone())
+                .unwrap();
+        assert_eq!(
+            service::finish(f.store(), &recovery).unwrap(),
+            saved_completion
+        );
+        assert_eq!(
+            f.store().read_journal(&host, &id).unwrap(),
+            finished_journal
+        );
+        assert!(matches!(
+            JournalJobContext::validated(f.store(), &host, &retained.id, binding.clone()),
+            Err(JournalError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            f.store().prepare_journal_input(
+                &host,
+                &input,
+                JobAttemptBinding {
+                    job_id: binding.job_id.clone(),
+                    attempt_id: "new-attempt".into()
+                }
+            ),
+            Err(JournalError::PermissionDenied(_))
+        ));
+        let mut changed = input.clone();
+        changed.initial_state_token.push('x');
+        assert!(matches!(
+            f.store().prepare_journal_input(&host, &changed, binding),
+            Err(JournalError::Conflict(_))
+        ));
+        let late_mutation = operation(
+            &f,
+            &host,
+            &id,
+            "late-released-position",
+            JournalAction::UpdatePosition {
+                current_position: "Must not replace saved position".into(),
+            },
+            vec![],
+        );
+        assert!(matches!(
+            run(
+                &f,
+                &old_ctx,
+                &request,
+                Request::Execute {
+                    operation: late_mutation.clone()
+                }
+            ),
+            Err(JournalError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            f.store().execute_journal(&recovery, late_mutation),
+            Err(JournalError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            service::attest_input_delivery(
+                f.store(),
+                &old_ctx,
+                &request.input_digest().unwrap(),
+                &input.selected_ranges
+            ),
+            Err(JournalError::PermissionDenied(_))
+        ));
+        assert_eq!(
+            f.store().read_journal(&host, &id).unwrap(),
+            finished_journal
+        );
+        assert_eq!(
+            service::finish(f.store(), &recovery).unwrap(),
+            saved_completion
+        );
+    }
+
+    #[test]
+    fn journal_input_generation_validation_rejects_foreign_scope_and_changed_initial_proof() {
+        let f = Fixture::new();
+        let (host, id, capture) = admitted_capture(&f, &["[user] original canonical body".into()]);
+        let ranges = recording::capture_ranges(&capture).unwrap();
+        seed_initial_state(&f, &host, &id, ranges);
+        let input = JournalInput::build(f.store(), &host, &id, |_, _, _| Ok(capture)).unwrap();
+        let generation = f
+            .store()
+            .prepare_journal_input(
+                &host,
+                &input,
+                JobAttemptBinding {
+                    job_id: "generation-proof".into(),
+                    attempt_id: "attempt".into(),
+                },
+            )
+            .unwrap();
+        input.validate_generation(&generation).unwrap();
+        let cases: &[(&str, fn(&mut JournalGeneration))] = &[
+            ("Journal", |g| g.journal_id.push('x')),
+            ("Subject", |g| g.initial_journal.subject_id.push('x')),
+            ("Session", |g| g.initial_journal.source_session_id.push('x')),
+            ("initial content condition", |g| {
+                g.initial_journal.state_token.push('x')
+            }),
+            ("initial open entry", |g| {
+                g.initial_open.as_mut().unwrap().id.push('x')
+            }),
+            ("previous fixed boundary", |g| {
+                g.previous_fixed_end = Some(g.selected_ranges[0].source.pointer.clone())
+            }),
+            ("selection", |g| g.selected_ranges[0].bytes.end -= 1),
+        ];
+        for (name, change) in cases {
+            let mut changed = generation.clone();
+            change(&mut changed);
+            assert!(
+                matches!(
+                    input.validate_generation(&changed),
+                    Err(JournalError::Conflict(_))
+                ),
+                "accepted changed generation proof: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_saved_job_input_rebinds_full_initial_snapshot_and_reuses_partial_record_receipts_after_reopen()
+     {
+        let mut f = Fixture::new();
+        let bodies = vec![
+            "[user] 最初の原文は長いUTF8\n".repeat(30),
+            "[user] 続きの確定原文\n".repeat(20),
+        ];
+        let (host, id, capture) = admitted_capture(&f, &bodies);
+        let ranges = recording::capture_ranges(&capture).unwrap();
+        seed_initial_state(&f, &host, &id, ranges.clone());
+        let input = JournalInput::build(f.store(), &host, &id, |_, _, _| Ok(capture)).unwrap();
+        let request = job_request("durable-saved-input", &input);
+        let saved_path = f.temp.path().join("immutable-job.json");
+        std::fs::write(&saved_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let first_binding = JobAttemptBinding {
+            job_id: request.job_id.clone(),
+            attempt_id: "first".into(),
+        };
+        let first = f
+            .store()
+            .prepare_journal_input(&host, &input, first_binding.clone())
+            .unwrap();
+        assert_eq!(
+            f.store()
+                .prepare_journal_input(&host, &input, first_binding.clone())
+                .unwrap(),
+            first
+        );
+        input.validate_generation(&first).unwrap();
+        let first_ctx =
+            JournalJobContext::validated(f.store(), &host, &first.id, first_binding).unwrap();
+        service::attest_input_delivery(
+            f.store(),
+            &first_ctx,
+            &request.input_digest().unwrap(),
+            &input.selected_ranges,
+        )
+        .unwrap();
+        let record = operation(
+            &f,
+            &host,
+            &id,
+            "durable-record",
+            JournalAction::Rewrite {
+                entry_id: first.initial_open.as_ref().unwrap().id.clone(),
+                title: "Saved activity".into(),
+                body: "Both original ranges reflected in this record".into(),
+                ongoing: "Continue work".into(),
+            },
+            ranges.clone(),
+        );
+        let saved_record = run(
+            &f,
+            &first_ctx,
+            &request,
+            Request::Execute {
+                operation: record.clone(),
+            },
+        )
+        .unwrap();
+        let saved_position = run(
+            &f,
+            &first_ctx,
+            &request,
+            Request::Execute {
+                operation: operation(
+                    &f,
+                    &host,
+                    &id,
+                    "first-position",
+                    JournalAction::UpdatePosition {
+                        current_position: "Position after the successful record".into(),
+                    },
+                    vec![],
+                ),
+            },
+        )
+        .unwrap();
+        let mut cut = bodies[0].len() / 2;
+        while !bodies[0].is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let saved_checkpoint = run(
+            &f,
+            &first_ctx,
+            &request,
+            Request::Execute {
+                operation: operation(
+                    &f,
+                    &host,
+                    &id,
+                    "partial-checkpoint",
+                    JournalAction::Checkpoint {
+                        record_operation_ids: vec![record.request_id.clone()],
+                    },
+                    vec![fragment(&ranges[0], 0, cut as u64)],
+                ),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                f.store().read_journal(&host, &id).unwrap().process_order,
+                f.store().read_journal(&host, &id).unwrap().process_byte
+            ),
+            (0, cut as u64)
+        );
+        f.store()
+            .close_journal_generation(&host, &first.id, &first.job)
+            .unwrap();
+        f.reopen();
+        // Only the saved input and SQLite are reopened. There is no latest-source callback.
+        let retry_request: ::job::JobRequest =
+            serde_json::from_slice(&std::fs::read(saved_path).unwrap()).unwrap();
+        assert_eq!(retry_request, request);
+        let retry_input = JournalInput::decode(&retry_request.input).unwrap();
+        let retry_binding = JobAttemptBinding {
+            job_id: retry_request.job_id.clone(),
+            attempt_id: "second".into(),
+        };
+        let mut changed_initial = retry_input.clone();
+        changed_initial.initial_state_token.push('x');
+        assert!(matches!(
+            changed_initial.validate_generation(&first),
+            Err(JournalError::Conflict(_))
+        ));
+        assert!(matches!(
+            f.store()
+                .prepare_journal_input(&host, &changed_initial, retry_binding.clone()),
+            Err(JournalError::Conflict(_))
+        ));
+        assert!(matches!(
+            f.store().prepare_journal_input(
+                &host,
+                &retry_input,
+                JobAttemptBinding {
+                    job_id: "different-job-cannot-borrow-initial-proof".into(),
+                    attempt_id: "attempt".into()
+                }
+            ),
+            Err(JournalError::Conflict(_))
+        ));
+        let retry = f
+            .store()
+            .prepare_journal_input(&host, &retry_input, retry_binding.clone())
+            .unwrap();
+        assert_ne!(retry.id, first.id);
+        assert_eq!(retry.initial_journal, first.initial_journal);
+        assert_eq!(retry.initial_open, first.initial_open);
+        assert_eq!(retry.previous_fixed_end, first.previous_fixed_end);
+        assert_eq!(retry.selected_ranges, first.selected_ranges);
+        assert_ne!(
+            retry.initial_journal.state_token,
+            f.store().read_journal(&host, &id).unwrap().state_token
+        );
+        retry_input.validate_generation(&retry).unwrap();
+        assert_eq!(
+            f.store()
+                .prepare_journal_input(&host, &retry_input, retry_binding.clone())
+                .unwrap(),
+            retry
+        );
+        let retry_ctx =
+            JournalJobContext::validated(f.store(), &host, &retry.id, retry_binding).unwrap();
+        service::attest_input_delivery(
+            f.store(),
+            &retry_ctx,
+            &retry_request.input_digest().unwrap(),
+            &retry_input.selected_ranges,
+        )
+        .unwrap();
+        assert!(matches!(
+            run(&f, &first_ctx, &request, Request::ReadState),
+            Err(JournalError::Conflict(_))
+        ));
+        assert!(matches!(
+            run(
+                &f,
+                &first_ctx,
+                &request,
+                Request::Execute {
+                    operation: operation(
+                        &f,
+                        &host,
+                        &id,
+                        "late-first-attempt",
+                        JournalAction::ConfirmUnchanged,
+                        ranges.clone()
+                    )
+                }
+            ),
+            Err(JournalError::Conflict(_))
+        ));
+        for (request_id, saved) in [
+            (record.request_id.as_str(), saved_record),
+            ("first-position", saved_position),
+            ("partial-checkpoint", saved_checkpoint),
+        ] {
+            let Response::Saved(receipt) = saved else {
+                panic!("saved operation receipt expected")
+            };
+            assert_eq!(
+                f.store()
+                    .query_journal_operation(&host, &id, request_id)
+                    .unwrap(),
+                Some(receipt)
+            );
+        }
+        assert!(
+            matches!(run(&f, &retry_ctx, &retry_request, Request::ReadOperationCoverage { request_id: record.request_id.clone(), offset: 0, limit: 32 }), Ok(Response::Coverage(page)) if page.items == ranges)
+        );
+        for (target, expected) in [
+            (
+                transport::JournalTextTarget::Position {
+                    snapshot: transport::JournalSnapshot::Initial,
+                },
+                first.initial_journal.current_position.clone(),
+            ),
+            (
+                transport::JournalTextTarget::OpenBody {
+                    snapshot: transport::JournalSnapshot::Initial,
+                },
+                first.initial_open.as_ref().unwrap().body.clone(),
+            ),
+            (
+                transport::JournalTextTarget::OpenOngoing {
+                    snapshot: transport::JournalSnapshot::Initial,
+                },
+                first.initial_open.as_ref().unwrap().ongoing.clone(),
+            ),
+        ] {
+            assert!(
+                matches!(run(&f, &retry_ctx, &retry_request, Request::ReadText { read: transport::JournalTextRead { target, offset: 0, limit: MAX_JOURNAL_READ_BYTES, content_token: None } }), Ok(Response::Text(page)) if page.text == expected)
+            );
+        }
+        let remainder = vec![
+            fragment(&ranges[0], cut as u64, ranges[0].bytes.end),
+            ranges[1].clone(),
+        ];
+        let missing_position = operation(
+            &f,
+            &host,
+            &id,
+            "retry-checkpoint-needs-position",
+            JournalAction::Checkpoint {
+                record_operation_ids: vec![record.request_id.clone()],
+            },
+            remainder.clone(),
+        );
+        assert!(matches!(
+            run(
+                &f,
+                &retry_ctx,
+                &retry_request,
+                Request::Execute {
+                    operation: missing_position
+                }
+            ),
+            Err(JournalError::Conflict(_))
+        ));
+        run(
+            &f,
+            &retry_ctx,
+            &retry_request,
+            Request::Execute {
+                operation: operation(
+                    &f,
+                    &host,
+                    &id,
+                    "retry-position",
+                    JournalAction::UpdatePosition {
+                        current_position: "Retry confirmed saved activity".into(),
+                    },
+                    vec![],
+                ),
+            },
+        )
+        .unwrap();
+        run(
+            &f,
+            &retry_ctx,
+            &retry_request,
+            Request::Execute {
+                operation: operation(
+                    &f,
+                    &host,
+                    &id,
+                    "remainder-checkpoint",
+                    JournalAction::Checkpoint {
+                        record_operation_ids: vec![record.request_id],
+                    },
+                    remainder,
+                ),
+            },
+        )
+        .unwrap();
+        let completion = service::finish(f.store(), &retry_ctx).unwrap();
+        assert_eq!((completion.process_order, completion.process_byte), (2, 0));
+        assert_eq!(
+            f.store()
+                .list_journal_entries(&host, &id, None, 32)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+    }
+}
+
 use super::*;
 use crate::SubjectRole;
 use feature_storage::{FeatureStorage, ScopedFeatureStorage};
