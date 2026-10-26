@@ -378,6 +378,10 @@ impl StoppedWorkerTemplate {
             worker_write_fault: Arc::new(AtomicU8::new(AtomicWriteFault::None as u8)),
             #[cfg(test)]
             worker_reconcile_sync_fault: Default::default(),
+            #[cfg(test)]
+            worker_reconcile_read_fault: Default::default(),
+            #[cfg(test)]
+            worker_reconcile_counts: Default::default(),
         };
         let result = (|| {
             let worker = PersistedWorkerRecord {
