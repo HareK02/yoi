@@ -21,6 +21,7 @@
   import SidebarFrame from '#lib/workspace/sidebar/SidebarFrame.svelte';
   import SidebarToggleIcon from '#lib/workspace/sidebar/SidebarToggleIcon.svelte';
   import { SIDEBAR_CONTEXT, type SidebarController, type SidebarSnippet } from '#lib/workspace/sidebar/context.ts';
+  import { swipeSidebar } from '#lib/workspace/sidebar/swipe-sidebar.ts';
   import { createOverrideStack } from '#lib/workspace/sidebar/override-stack.ts';
   import '../app.css';
   import type { LayoutProps } from './$types';
@@ -111,7 +112,14 @@
 {#if page.url.pathname !== '/' && page.url.pathname !== '/account'}
   <WorkspaceAlerts />
 {/if}
-<div class="app-shell" class:sidebar-open={sidebarOpen} class:sidebar-hover-mode={sidebarMode === 'hover'}>
+<div
+  use:swipeSidebar={{
+    enabled: () => mobileLayout.current && authenticated,
+    isOpen: () => sidebarOpen,
+    setOpen: (open) => { sidebarTransientOpen = open; },
+  }}
+  class="app-shell" class:sidebar-open={sidebarOpen} class:sidebar-hover-mode={sidebarMode === 'hover'}
+>
   <SidebarFrame
     mode={sidebarMode}
     open={sidebarOpen}

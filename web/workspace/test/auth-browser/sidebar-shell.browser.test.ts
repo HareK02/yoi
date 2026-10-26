@@ -3,6 +3,7 @@
 import { assertEquals } from "@std/assert";
 import { resolve } from "@std/path";
 import { chromium } from "playwright";
+import { sidebarSwipe } from "./sidebar-swipe.ts";
 import {
   startOwnedProcesses,
   stopOwnedProcesses,
@@ -37,6 +38,7 @@ Deno.test("only authenticated account and home show the sidebar; public entry re
   try {
     const browser = await chromium.launch();
     try {
+      await sidebarSwipe(t, browser, origin);
       for (const width of [1440, 390]) {
         for (
           const [path, mode] of [
