@@ -1747,7 +1747,23 @@ fn ticket_event(
 ) -> Result<(), MergeRequestError> {
     let ticket = &mr.ticket_ids[0];
     let n:i64=t.query_row("SELECT COALESCE(MAX(event_index),-1)+1 FROM typed_ticket_events WHERE workspace_id=?1 AND ticket_id=?2",params![mr.workspace_id,ticket],|r|r.get(0))?;
-    t.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,author,at,from_state,to_state,heading,body)VALUES(?1,?2,?3,'comment',?4,?5,NULL,NULL,'Merge Request integrated',?6)",params![mr.workspace_id,ticket,n,format!("worker:{}:{}",e.merged_by.runtime_id,e.merged_by.worker_id),e.created_at.to_rfc3339(),format!("Merge Request `{}` integrated approved source ref `{}`; Ticket remains in progress until guarded Ticket completion.",mr.merge_request_id,e.approved_source_ref)])?;
+    t.execute(
+        "INSERT INTO typed_ticket_events(
+             workspace_id,ticket_id,event_index,kind,author,at,from_state,to_state,heading,body,event_ref
+         ) VALUES(?1,?2,?3,'comment',?4,?5,NULL,NULL,'Merge Request integrated',?6,?7)",
+        params![
+            mr.workspace_id,
+            ticket,
+            n,
+            format!("worker:{}:{}", e.merged_by.runtime_id, e.merged_by.worker_id),
+            e.created_at.to_rfc3339(),
+            format!(
+                "Merge Request `{}` integrated approved source ref `{}`; Ticket remains in progress until guarded Ticket completion.",
+                mr.merge_request_id, e.approved_source_ref
+            ),
+            format!("{ticket}:{n}"),
+        ],
+    )?;
     for (k, v) in [
         ("implementation_assignment_id", a),
         ("merge_request_id", &mr.merge_request_id),

@@ -53,8 +53,8 @@ fn fixture() -> (tempfile::TempDir, MergeRequestStore) {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("db");
     let c = Connection::open(&p).unwrap();
-    c.execute_batch("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY);CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE ticket_current_worker_assignments(workspace_id TEXT,ticket_id TEXT,assignment_id TEXT,runtime_id TEXT,worker_id TEXT,updated_at TEXT,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,workflow_state TEXT,workflow_state_explicit INTEGER,updated_at TEXT,title TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_ticket_targets(workspace_id TEXT,ticket_id TEXT,ordinal INTEGER,repository_key TEXT,ref_selector TEXT,access TEXT);CREATE TABLE typed_ticket_events(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,kind TEXT,author TEXT,at TEXT,from_state TEXT,to_state TEXT,heading TEXT,body TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index));CREATE TABLE typed_ticket_event_attributes(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,key TEXT,value TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index,key));INSERT INTO workspaces VALUES('W');INSERT INTO repositories VALUES('W','R');INSERT INTO repositories VALUES('W','R2');INSERT INTO ticket_current_worker_assignments VALUES('W','T','A','runtime','coder','t');INSERT INTO typed_tickets VALUES('W','T','inprogress',1,'t','Title','Requirements');CREATE VIEW ticket_active_worker_assignments AS SELECT current.* FROM ticket_current_worker_assignments current JOIN typed_tickets ticket ON ticket.workspace_id=current.workspace_id AND ticket.ticket_id=current.ticket_id WHERE ticket.workflow_state NOT IN ('done','closed');").unwrap();
-    c.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,body) VALUES('W','T',-1,'comment','Requirements')",[]).unwrap();
+    c.execute_batch("CREATE TABLE workspaces(workspace_id TEXT PRIMARY KEY);CREATE TABLE repositories(workspace_id TEXT,repository_id TEXT,PRIMARY KEY(workspace_id,repository_id));CREATE TABLE ticket_current_worker_assignments(workspace_id TEXT,ticket_id TEXT,assignment_id TEXT,runtime_id TEXT,worker_id TEXT,updated_at TEXT,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_tickets(workspace_id TEXT,ticket_id TEXT,workflow_state TEXT,workflow_state_explicit INTEGER,updated_at TEXT,title TEXT NOT NULL,body TEXT NOT NULL,PRIMARY KEY(workspace_id,ticket_id));CREATE TABLE typed_ticket_targets(workspace_id TEXT,ticket_id TEXT,ordinal INTEGER,repository_key TEXT,ref_selector TEXT,access TEXT);CREATE TABLE typed_ticket_events(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,kind TEXT,author TEXT,at TEXT,from_state TEXT,to_state TEXT,heading TEXT,body TEXT,event_ref TEXT NOT NULL DEFAULT '',PRIMARY KEY(workspace_id,ticket_id,event_index),UNIQUE(workspace_id,ticket_id,event_ref));CREATE TABLE typed_ticket_event_attributes(workspace_id TEXT,ticket_id TEXT,event_index INTEGER,key TEXT,value TEXT,PRIMARY KEY(workspace_id,ticket_id,event_index,key));INSERT INTO workspaces VALUES('W');INSERT INTO repositories VALUES('W','R');INSERT INTO repositories VALUES('W','R2');INSERT INTO ticket_current_worker_assignments VALUES('W','T','A','runtime','coder','t');INSERT INTO typed_tickets VALUES('W','T','inprogress',1,'t','Title','Requirements');CREATE VIEW ticket_active_worker_assignments AS SELECT current.* FROM ticket_current_worker_assignments current JOIN typed_tickets ticket ON ticket.workspace_id=current.workspace_id AND ticket.ticket_id=current.ticket_id WHERE ticket.workflow_state NOT IN ('done','closed');").unwrap();
+    c.execute("INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,body,event_ref) VALUES('W','T',-1,'comment','Requirements','T:-1')",[]).unwrap();
     drop(c);
     let a = Assignments(Arc::new(Mutex::new(CurrentAssignment {
         assignment_id: "A".into(),
@@ -457,6 +457,18 @@ fn integration_preserves_selectors_ticket_state_and_assignment_and_replays_its_m
         .unwrap();
     assert_eq!(replayed, merged);
     let connection = Connection::open(d.path().join("db")).unwrap();
+    let ticket_refs = connection
+        .prepare("SELECT event_ref FROM typed_ticket_events WHERE event_index >= 0")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        ticket_refs,
+        vec!["T:0"],
+        "replay must not append another post"
+    );
     let (state, active): (String, bool) = connection.query_row(
         "SELECT workflow_state, EXISTS(SELECT 1 FROM ticket_active_worker_assignments WHERE workspace_id='W' AND ticket_id='T') FROM typed_tickets WHERE workspace_id='W' AND ticket_id='T'",
         [],
@@ -477,6 +489,87 @@ fn integration_preserves_selectors_ticket_state_and_assignment_and_replays_its_m
         assert!(!json.contains(banned), "{banned} in {json}")
     }
 }
+#[test]
+fn integration_post_failure_rolls_back_and_same_operation_recovers_with_legacy_empty_ref() {
+    let (dir, store) = fixture();
+    open(&store);
+    let review = approve(&store, "source", "approved");
+    request(&store, "source", "pending");
+    let completion = CompleteMergeRequest {
+        merge_request_id: "MR".into(),
+        ticket_id: "T".into(),
+        operation_id: "recover-integration".into(),
+        approval_event_id: review.event_id,
+        current_subject_ref: "source".into(),
+        target_ref_before: "before".into(),
+        target_ref_after: "after".into(),
+        strategy: MergeStrategy::FastForward,
+        resolution: ConflictResolution::None,
+        auth: auth(),
+        now: at(5),
+    };
+    let connection = Connection::open(dir.path().join("db")).unwrap();
+    // Retain a comment written before integration populated event_ref.
+    connection.execute_batch(
+        "INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,kind,body,event_ref)
+         VALUES('W','T',0,'comment','Legacy integration','');
+         CREATE TRIGGER reject_integration_post BEFORE INSERT ON typed_ticket_events
+         WHEN NEW.heading='Merge Request integrated'
+         BEGIN SELECT RAISE(ABORT,'injected integration post failure'); END;",
+    ).unwrap();
+    let before = store.get_by_id("W", "MR").unwrap();
+    let error = store.complete(completion.clone()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected integration post failure")
+    );
+    let failed = store.get_by_id("W", "MR").unwrap();
+    assert_eq!(failed.state, MergeRequestState::Open);
+    assert_eq!(failed.thread, before.thread);
+    assert!(store.authorize_review_submission("MR", "pending").is_ok());
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM typed_ticket_event_attributes",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER reject_integration_post")
+        .unwrap();
+    let merged = store.complete(completion.clone()).unwrap();
+    assert_eq!(store.complete(completion).unwrap(), merged);
+    assert_eq!(
+        store.get_by_id("W", "MR").unwrap().state,
+        MergeRequestState::Merged
+    );
+    assert!(store.authorize_review_submission("MR", "pending").is_err());
+    let posts = connection
+        .prepare("SELECT event_ref,body FROM typed_ticket_events WHERE event_index >= 0 ORDER BY event_index")
+        .unwrap()
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        posts.len(),
+        2,
+        "retry and replay must append exactly one post"
+    );
+    assert_eq!(posts[0], (String::new(), "Legacy integration".into()));
+    assert_eq!(posts[1].0, "T:1");
+    assert!(posts[1].1.contains("`MR`"));
+    assert_eq!(connection.query_row(
+        "SELECT value FROM typed_ticket_event_attributes WHERE event_index=1 AND key='operation_id'",
+        [], |row| row.get::<_, String>(0),
+    ).unwrap(), "recover-integration");
+}
+
 #[test]
 fn source_move_cancels_submission_and_old_approval_is_reusable_when_source_returns() {
     let (_d, s) = fixture();
@@ -955,7 +1048,7 @@ fn ticket_rescope_requires_fresh_review_before_merge_and_remains_recoverable() {
     let connection = Connection::open(dir.path().join("db")).unwrap();
     connection
         .execute_batch(
-            "UPDATE typed_tickets SET title='Rescoped' WHERE workspace_id='W' AND ticket_id='T'; INSERT INTO typed_ticket_events VALUES('W','T',1,'item_edit','user','t2',NULL,NULL,NULL,NULL)",
+            "UPDATE typed_tickets SET title='Rescoped' WHERE workspace_id='W' AND ticket_id='T'; INSERT INTO typed_ticket_events VALUES('W','T',1,'item_edit','user','t2',NULL,NULL,NULL,NULL,'T:1')",
         )
         .unwrap();
     connection
@@ -1082,7 +1175,7 @@ fn ticket_rescope_after_integration_accepts_fresh_requirement_attestation() {
     let connection = Connection::open(dir.path().join("db")).unwrap();
     connection
         .execute_batch(
-            "UPDATE typed_tickets SET title='Rescoped' WHERE workspace_id='W' AND ticket_id='T'; INSERT INTO typed_ticket_events VALUES('W','T',1,'item_edit','user','t2',NULL,NULL,NULL,NULL)",
+            "UPDATE typed_tickets SET title='Rescoped' WHERE workspace_id='W' AND ticket_id='T'; INSERT INTO typed_ticket_events VALUES('W','T',1,'item_edit','user','t2',NULL,NULL,NULL,NULL,'T:1')",
         )
         .unwrap();
     connection
@@ -1307,6 +1400,24 @@ fn partial_and_full_integration_retain_ticket_state_and_active_assignment() {
     assert_eq!(second_request.merged_result().unwrap(), &second_merge);
     assert_eq!(first_request.integration_approval().unwrap(), &first);
     assert_eq!(second_request.integration_approval().unwrap(), &second);
+    let posts = connection
+        .prepare(
+            "SELECT event.event_ref, attribute.value
+             FROM typed_ticket_events event
+             JOIN typed_ticket_event_attributes attribute USING(workspace_id,ticket_id,event_index)
+             WHERE attribute.key='merge_request_id' ORDER BY event.event_index",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        posts,
+        vec![("T:0".into(), "MR".into()), ("T:1".into(), "MR-2".into())]
+    );
 }
 
 #[test]
@@ -1324,7 +1435,7 @@ fn historical_ticket_completion_payload_remains_readable_and_unchanged_on_migrat
     }"#;
     connection.execute_batch(
         "UPDATE typed_tickets SET workflow_state='done' WHERE workspace_id='W' AND ticket_id='T';
-         INSERT INTO typed_ticket_events VALUES('W','T',0,'state_changed','worker:runtime:coder','2026-07-26T12:00:07Z','inprogress','done','Ticket requirements completed','historical body');"
+         INSERT INTO typed_ticket_events VALUES('W','T',0,'state_changed','worker:runtime:coder','2026-07-26T12:00:07Z','inprogress','done','Ticket requirements completed','historical body','T:0');"
     ).unwrap();
     connection
         .execute(

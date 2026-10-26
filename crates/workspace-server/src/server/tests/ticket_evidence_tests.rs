@@ -19,6 +19,57 @@ const EVIDENCE_SOURCE: &str = "immutable-approved-source";
 const EVIDENCE_TARGET: &str = "immutable-target-result";
 
 #[tokio::test]
+async fn integration_preserves_legacy_empty_post_ref_and_exposes_new_ref_with_server_schema() {
+    let fixture = EvidenceApiFixture::new().await;
+    let approval = fixture.approve("integration-post-ref");
+    let connection = Connection::open(&fixture.api.config.database_path).unwrap();
+    let legacy_index: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(event_index),-1)+1 FROM typed_ticket_events WHERE workspace_id=?1 AND ticket_id=?2",
+        params![TEST_WORKSPACE_ID, fixture.ticket_id], |row| row.get(0),
+    ).unwrap();
+    connection.execute(
+        "INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body)
+         VALUES(?1,?2,?3,'','comment','Legacy integration')",
+        params![TEST_WORKSPACE_ID, fixture.ticket_id, legacy_index],
+    ).unwrap();
+
+    let merged = fixture.integrate(&approval);
+    assert_eq!(fixture.integrate(&approval), merged);
+    let detail = fixture
+        .backend
+        .show(fixture.ticket_id.clone().into())
+        .unwrap();
+    let legacy = detail
+        .events
+        .iter()
+        .find(|event| event.body.as_str() == "Legacy integration")
+        .unwrap();
+    assert_eq!(legacy.event_ref, "");
+    let integrations = detail
+        .events
+        .iter()
+        .filter(|event| {
+            event.attributes.get("merge_request_id").map(String::as_str) == Some(EVIDENCE_MR)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        integrations.len(),
+        1,
+        "completion replay must not duplicate the Ticket post"
+    );
+    assert_eq!(
+        integrations[0].event_ref,
+        format!("{}:{}", fixture.ticket_id, legacy_index + 1)
+    );
+    assert_eq!(
+        integrations[0].attributes["operation_id"],
+        "evidence-integration"
+    );
+    let shown = fixture.show().await;
+    assert_eq!(shown.merge_requests[0].state, "merged");
+}
+
+#[tokio::test]
 async fn ticket_browse_does_not_observe_sources_but_authoritative_query_and_show_still_do() {
     struct CountingObserver(Arc<std::sync::atomic::AtomicUsize>);
     impl crate::authority::TicketSourceCommitResolver for CountingObserver {
