@@ -2455,25 +2455,27 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 .await
                 .map_err(|_| RuntimeRestoreCleanupFailure::Workdir)?;
         }
-        if let Some(resources) = retained {
-            if let Some(allocation) = resources.allocation {
-                allocation
-                    .release()
-                    .map_err(|_| RuntimeRestoreCleanupFailure::Allocation)?;
-            } else {
-                // Reconstruction may fail before returning its allocation guard.
-                // Absence is checked at the allocation authority, not inferred from Err.
-                let path = worker::runtime::worker_allocation::default_allocation_path()
-                    .map_err(|_| RuntimeRestoreCleanupFailure::Allocation)?;
-                let table = worker::runtime::worker_allocation::LockFileGuard::open(&path)
-                    .map_err(|_| RuntimeRestoreCleanupFailure::Allocation)?;
-                if table
-                    .data()
-                    .find(&Self::runtime_worker_name_for_ref(&request.worker_ref))
-                    .is_some()
-                {
-                    return Err(RuntimeRestoreCleanupFailure::Allocation);
-                }
+        if let Some(allocation) = retained
+            .as_ref()
+            .and_then(|resources| resources.allocation.as_ref())
+        {
+            allocation
+                .release()
+                .map_err(|_| RuntimeRestoreCleanupFailure::Allocation)?;
+        } else {
+            // A cold restart loses the retained map as well as allocation guards.
+            // Prove absence at the allocation authority even with an empty map;
+            // never release a possibly different owner by Worker name.
+            let path = worker::runtime::worker_allocation::default_allocation_path()
+                .map_err(|_| RuntimeRestoreCleanupFailure::Allocation)?;
+            let table = worker::runtime::worker_allocation::LockFileGuard::open(&path)
+                .map_err(|_| RuntimeRestoreCleanupFailure::Allocation)?;
+            if table
+                .data()
+                .find(&Self::runtime_worker_name_for_ref(&request.worker_ref))
+                .is_some()
+            {
+                return Err(RuntimeRestoreCleanupFailure::Allocation);
             }
         }
         // restore_controller starts the Controller only as its final fallible
@@ -2486,10 +2488,18 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .map_err(|_| RuntimeRestoreCleanupFailure::Artifacts)?;
         Self::remove_restore_run_artifacts(&run_dir)
             .map_err(|_| RuntimeRestoreCleanupFailure::Artifacts)?;
-        self.failed_restore_resources
+        let mut resources = self
+            .failed_restore_resources
             .lock()
-            .map_err(|_| RuntimeRestoreCleanupFailure::Ownership)?
-            .remove(&request.worker_ref);
+            .map_err(|_| RuntimeRestoreCleanupFailure::Ownership)?;
+        if resources
+            .get(&request.worker_ref)
+            .is_some_and(|owner| owner.operation_id != request.operation_id)
+        {
+            return Err(RuntimeRestoreCleanupFailure::Ownership);
+        }
+        resources.remove(&request.worker_ref);
+        drop(resources);
         self.observation_hub.get(&request.worker_ref);
         Ok(())
     }
@@ -2763,6 +2773,29 @@ impl ProfileRuntimeWorkerFactory {
             let run_dir = self
                 .worker_restore_run_dir(&request.worker_ref, request.operation_id)
                 .map_err(|_| "restore run directory unavailable")?;
+            // A process restart loses the candidate, not its exact operation's
+            // disposable directory. Never infer writer absence from empty maps.
+            match std::fs::symlink_metadata(&run_dir) {
+                Ok(_) => {
+                    self.stopped_restore_run_dirs(&request.worker_ref)
+                        .map_err(|_| "restore run artifacts cannot be validated")?;
+                    let path = worker::runtime::worker_allocation::default_allocation_path()
+                        .map_err(|_| "restore allocation authority unavailable")?;
+                    let table = worker::runtime::worker_allocation::LockFileGuard::open(&path)
+                        .map_err(|_| "restore allocation authority unavailable")?;
+                    if table
+                        .data()
+                        .find(&Self::runtime_worker_name_for_ref(&request.worker_ref))
+                        .is_some()
+                    {
+                        return Err("restore run directory still has an allocation owner");
+                    }
+                    Self::remove_restore_run_artifacts(&run_dir)
+                        .map_err(|_| "restore run artifacts cannot be reclaimed")?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("restore run artifacts cannot be inspected"),
+            }
             let transport = self.controller_transport;
             #[cfg(test)]
             let transport = if self.restore_faults.socket_failure.load(Ordering::SeqCst) {
@@ -3138,6 +3171,9 @@ struct RuntimeWorkerExecution {
 // marker. Timeout never drops the factory future or a late Controller result.
 struct PendingRuntimeRestore {
     request: WorkerExecutionRestoreRequest,
+    // Transient ownership mode, not a durable phase. Cold restart reclamation
+    // must never enter preparation, canonical repair, or activation.
+    cleanup_only: bool,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     task_in_flight: AtomicBool,
     result: Mutex<Option<Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure>>>,
@@ -3469,6 +3505,7 @@ where
         pending: &Arc<PendingRuntimeRestore>,
         resume_activation: bool,
     ) -> Result<(), String> {
+        let resume_activation = resume_activation && !pending.cleanup_only;
         let failure = pending
             .result
             .lock()
@@ -5317,6 +5354,16 @@ where
             }
         };
         if let Some(pending) = admitted_pending.as_ref() {
+            if pending.cleanup_only {
+                return WorkerExecutionSpawnResult::ReconciliationRequired {
+                    result: WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Restore,
+                        "cleanup-only restore cannot prepare or reconstruct execution",
+                    ),
+                    worker_state: None,
+                    workdir_attachments: pending.request.previous_workdir_attachments.clone(),
+                };
+            }
             if request.request != pending.request.request
                 || request.workspace_scope != pending.request.workspace_scope
                 || request.logical_workdir_attachments
@@ -5378,6 +5425,7 @@ where
                     .remove(&worker_ref);
                 let pending = Arc::new(PendingRuntimeRestore {
                     request: request.clone(),
+                    cleanup_only: false,
                     task: tokio::sync::Mutex::new(None),
                     task_in_flight: AtomicBool::new(false),
                     result: Mutex::new(None),
@@ -5593,17 +5641,23 @@ where
         }
     }
 
+    fn supports_restore_continuation(&self) -> bool {
+        true
+    }
+
     fn restore_recovery_disposition(
         &self,
         operation_id: crate::execution::WorkerLifecycleOperationId,
         worker_ref: &WorkerRef,
     ) -> Option<crate::execution::RestoreRecoveryDisposition> {
         use crate::execution::RestoreRecoveryDisposition as D;
-        let pending = self.pending_restore(worker_ref).ok().flatten();
+        let pending = self.pending_restore(worker_ref).ok()?;
         Some(match pending {
             Some(pending) if pending.request.operation_id == operation_id => {
                 if pending.task_in_flight.load(Ordering::Acquire) {
                     D::InFlight
+                } else if pending.cleanup_only {
+                    D::Reclaim
                 } else if pending
                     .discard_result
                     .lock()
@@ -5625,8 +5679,130 @@ where
                     D::Continue
                 }
             }
-            _ => D::Continue,
+            _ => {
+                let workers = self.workers.lock().ok()?;
+                if workers
+                    .get(worker_ref)
+                    .is_some_and(|execution| execution.restore_operation_id == Some(operation_id))
+                {
+                    D::Continue
+                } else {
+                    D::Absent
+                }
+            }
         })
+    }
+
+    fn reclaim_uncommitted_restore(
+        &self,
+        request: WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        let reclaimed = (|| -> Result<WorkerExecutionSpawnResult, String> {
+            let worker_ref = &request.worker_ref;
+            let operation_id = request.operation_id;
+            let operation_lock = self.worker_lock(worker_ref)?;
+            let _guard = operation_lock
+                .lock()
+                .map_err(|_| "worker operation lock is poisoned")?;
+            if request.context.worker_ref() != worker_ref {
+                return Err("restore cleanup context does not match Worker authority".into());
+            }
+            if self
+                .workers
+                .lock()
+                .map_err(|_| "worker registry lock is poisoned")?
+                .contains_key(worker_ref)
+            {
+                return Err("uncommitted reclaim cannot target a connected execution".into());
+            }
+            let pending = match self.pending_restore(worker_ref)? {
+                Some(pending) => {
+                    if pending.request.operation_id != operation_id || !pending.cleanup_only {
+                        return Err(
+                            "uncommitted reclaim cannot replace an in-memory restore owner".into(),
+                        );
+                    }
+                    if request.request != pending.request.request
+                        || request.workspace_scope != pending.request.workspace_scope
+                        || request.logical_workdir_attachments
+                            != pending.request.logical_workdir_attachments
+                        || request.previous_workdir_attachments
+                            != pending.request.previous_workdir_attachments
+                        || request.source_repair_possible != pending.request.source_repair_possible
+                    {
+                        return Err(
+                            "current Worker authority differs from the owned restore cleanup"
+                                .into(),
+                        );
+                    }
+                    pending
+                }
+                None => {
+                    if let Some(result) = self.completed_restore_failure(operation_id, worker_ref) {
+                        return Ok(result);
+                    }
+                    let mut failure = RuntimeRestoreFailure::unproven(
+                        RuntimeRestoreStage::Controller,
+                        "restore decision was not committed before restart",
+                    );
+                    failure.durable_effects_possible = request.source_repair_possible;
+                    let pending = Arc::new(PendingRuntimeRestore {
+                        request: request.clone(),
+                        cleanup_only: true,
+                        task: tokio::sync::Mutex::new(None),
+                        task_in_flight: AtomicBool::new(false),
+                        result: Mutex::new(Some(Err(failure))),
+                        activated: Mutex::new(None),
+                        activation_started: AtomicBool::new(false),
+                        discard_started: AtomicBool::new(false),
+                        discard_result: Mutex::new(None),
+                        failure: Mutex::new(None),
+                    });
+                    self.pending_restores
+                        .lock()
+                        .map_err(|_| "pending restore resources lock is poisoned")?
+                        .insert(worker_ref.clone(), pending.clone());
+                    pending
+                }
+            };
+            // Join the prior task before retrying. A timeout retains this owner,
+            // its original context notifier, and its exact task/JoinHandle.
+            self.wait_pending_restore(&pending, self.spawn_restore_timeout)?;
+            self.retry_pending_restore_cleanup(&pending, false)?;
+            self.wait_pending_restore(&pending, self.spawn_restore_timeout)?;
+            let failure = pending
+                .result
+                .lock()
+                .map_err(|_| "restore result lock is poisoned")?
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .cloned()
+                .ok_or("restore cleanup has no retained failure result")?;
+            if failure.needs_cleanup() {
+                return Err(failure.to_string());
+            }
+            if failure.durable_effects_possible {
+                return Err("Restore resource cleanup is confirmed; possible earlier canonical effects still require reconciliation".into());
+            }
+            self.completed_restore_failures
+                .lock()
+                .map_err(|_| "restore failure receipts lock is poisoned")?
+                .insert(worker_ref.clone(), (operation_id, failure.clone()));
+            self.remove_pending_restore(worker_ref)?;
+            Ok(WorkerExecutionSpawnResult::RolledBack(
+                WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Restore,
+                    failure.to_string(),
+                ),
+            ))
+        })();
+        reclaimed.unwrap_or_else(
+            |message| WorkerExecutionSpawnResult::ReconciliationRequired {
+                result: WorkerExecutionResult::errored(WorkerExecutionOperation::Restore, message),
+                worker_state: None,
+                workdir_attachments: request.previous_workdir_attachments.clone(),
+            },
+        )
     }
 
     fn discard_uncommitted_restore(
@@ -5643,6 +5819,7 @@ where
                 .pending_restore(worker_ref)?
                 .ok_or("unpublished restore owner is unavailable")?;
             if pending.request.operation_id != operation_id
+                || pending.cleanup_only
                 || pending.activation_started.load(Ordering::Acquire)
             {
                 return Err(
@@ -5783,6 +5960,9 @@ where
         if let Some(pending) = self.pending_restore(worker_ref)? {
             if pending.request.operation_id != operation_id {
                 return Err("restored Worker operation identity does not match".into());
+            }
+            if pending.cleanup_only {
+                return Err("cleanup-only restore cannot activate execution".into());
             }
             self.wait_pending_restore(&pending, self.spawn_restore_timeout)?;
             if pending.owns_prepared_candidate() {
@@ -7696,6 +7876,7 @@ mod tests {
             worker_ref.clone(),
             Arc::new(PendingRuntimeRestore {
                 request: direct_restore_request(worker_ref.clone()),
+                cleanup_only: false,
                 task: tokio::sync::Mutex::new(None),
                 task_in_flight: AtomicBool::new(false),
                 result: Mutex::new(None),
@@ -7740,6 +7921,7 @@ mod tests {
             .unwrap();
         let pending = Arc::new(PendingRuntimeRestore {
             request: request.clone(),
+            cleanup_only: false,
             task: tokio::sync::Mutex::new(Some(failed)),
             task_in_flight: AtomicBool::new(false),
             result: Mutex::new(None),
@@ -10253,6 +10435,309 @@ mod tests {
             deferred_workdir_sessions: BTreeMap::new(),
             config_bundle: None,
         }
+    }
+
+    // Backend component seam only: no saved Worker, model, or Controller is
+    // constructed. Any accidental preparation/recovery is an immediate failure.
+    struct CleanupOnlyFactory {
+        cleanup_calls: Arc<AtomicUsize>,
+        cleanup_allowed: Arc<AtomicBool>,
+        release: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait]
+    impl RuntimeWorkerFactory for CleanupOnlyFactory {
+        async fn spawn_controller(
+            &self,
+            _: WorkerExecutionSpawnRequest,
+        ) -> Result<RuntimeWorkerController, String> {
+            panic!("reclaim must not spawn")
+        }
+
+        async fn preflight_restore(&self, _: &WorkerExecutionRestoreRequest) -> Result<(), String> {
+            panic!("reclaim must not preflight preparation")
+        }
+
+        async fn recover_restore_source(
+            &self,
+            _: &WorkerExecutionRestoreRequest,
+        ) -> Result<bool, RuntimeRestoreFailure> {
+            panic!("reclaim must not repair canonical source")
+        }
+
+        async fn prepare_restore(
+            &self,
+            _: WorkerExecutionRestoreRequest,
+        ) -> Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure> {
+            panic!("reclaim must not prepare")
+        }
+
+        async fn cleanup_failed_restore(
+            &self,
+            _: &WorkerExecutionRestoreRequest,
+        ) -> Result<(), RuntimeRestoreCleanupFailure> {
+            if self.cleanup_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                if let Some(release) = &self.release {
+                    release.notified().await;
+                }
+            }
+            if self.cleanup_allowed.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(RuntimeRestoreCleanupFailure::Workdir)
+            }
+        }
+
+        async fn reconcile_stopped_worker(&self, _: &WorkerRef) -> Result<(), String> {
+            panic!("reclaim must not clean all Worker operations through Stop")
+        }
+    }
+
+    #[test]
+    fn cold_reclaim_retries_cleanup_only_and_keeps_cleaned_receipt_idempotent() {
+        use crate::execution::RestoreRecoveryDisposition as D;
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let cleanup_allowed = Arc::new(AtomicBool::new(false));
+        let backend = WorkerRuntimeExecutionBackend::new(CleanupOnlyFactory {
+            cleanup_calls: cleanup_calls.clone(),
+            cleanup_allowed: cleanup_allowed.clone(),
+            release: None,
+        })
+        .unwrap();
+        let request = direct_restore_request(WorkerRef::new(WorkerId::now_v7()));
+        let worker_ref = &request.worker_ref;
+        assert_eq!(
+            backend.restore_recovery_disposition(request.operation_id, worker_ref),
+            Some(D::Absent)
+        );
+        assert!(matches!(
+            backend.reclaim_uncommitted_restore(request.clone()),
+            WorkerExecutionSpawnResult::ReconciliationRequired { .. }
+        ));
+        let owner = backend.pending_restore(worker_ref).unwrap().unwrap();
+        assert!(owner.cleanup_only);
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backend.restore_recovery_disposition(request.operation_id, worker_ref),
+            Some(D::Reclaim)
+        );
+        // Wrong operation and changed authority must not replace or retry it.
+        let mut different = request.clone();
+        different.operation_id = crate::execution::WorkerLifecycleOperationId::new();
+        assert!(matches!(
+            backend.reclaim_uncommitted_restore(different),
+            WorkerExecutionSpawnResult::ReconciliationRequired { .. }
+        ));
+        let mut mismatched = request.clone();
+        mismatched.request = create_request("changed cleanup authority");
+        assert!(matches!(
+            backend.reclaim_uncommitted_restore(mismatched),
+            WorkerExecutionSpawnResult::ReconciliationRequired { .. }
+        ));
+        assert!(Arc::ptr_eq(
+            &owner,
+            &backend.pending_restore(worker_ref).unwrap().unwrap()
+        ));
+        // Erroneous generic callers cannot reconstruct, activate, or substitute
+        // in-process candidate discard for cold cleanup.
+        assert!(matches!(
+            backend.restore_worker(request.clone()),
+            WorkerExecutionSpawnResult::ReconciliationRequired { .. }
+        ));
+        assert!(
+            backend
+                .activate_restored_worker(request.operation_id, worker_ref)
+                .is_err()
+        );
+        assert!(matches!(
+            backend.discard_uncommitted_restore(request.operation_id, worker_ref),
+            WorkerExecutionSpawnResult::ReconciliationRequired { .. }
+        ));
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+        cleanup_allowed.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            backend.reclaim_uncommitted_restore(request.clone()),
+            WorkerExecutionSpawnResult::RolledBack(_)
+        ));
+        assert!(backend.pending_restore(worker_ref).unwrap().is_none());
+        assert!(matches!(
+            backend.reclaim_uncommitted_restore(request.clone()),
+            WorkerExecutionSpawnResult::RolledBack(_)
+        ));
+        assert!(matches!(
+            backend.restore_worker(request),
+            WorkerExecutionSpawnResult::RolledBack(_)
+        ));
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 2);
+        assert!(backend.workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cold_reclaim_preserves_possible_effects_without_repreparing() {
+        use crate::execution::RestoreRecoveryDisposition as D;
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let backend = WorkerRuntimeExecutionBackend::new(CleanupOnlyFactory {
+            cleanup_calls: cleanup_calls.clone(),
+            cleanup_allowed: Arc::new(AtomicBool::new(true)),
+            release: None,
+        })
+        .unwrap();
+        let mut request = direct_restore_request(WorkerRef::new(WorkerId::now_v7()));
+        request.source_repair_possible = true;
+        for _ in 0..2 {
+            assert!(matches!(
+                backend.reclaim_uncommitted_restore(request.clone()),
+                WorkerExecutionSpawnResult::ReconciliationRequired { .. }
+            ));
+        }
+        let owner = backend
+            .pending_restore(&request.worker_ref)
+            .unwrap()
+            .unwrap();
+        assert!(owner.cleanup_only);
+        let retained = owner.result.lock().unwrap();
+        let failure = retained.as_ref().unwrap().as_ref().err().unwrap();
+        assert!(failure.durable_effects_possible);
+        assert_eq!(failure.cleanup, RuntimeRestoreCleanup::Confirmed);
+        drop(retained);
+        // Even an internal retry with the wrong resume flag cannot prepare.
+        backend.retry_pending_restore_cleanup(&owner, true).unwrap();
+        assert!(owner.task.try_lock().unwrap().is_none());
+        assert!(
+            backend
+                .completed_restore_failure(request.operation_id, &request.worker_ref)
+                .is_none()
+        );
+        assert_eq!(
+            backend.restore_recovery_disposition(request.operation_id, &request.worker_ref),
+            Some(D::Reclaim)
+        );
+        assert!(matches!(
+            backend.reconcile_restore(request.clone()),
+            WorkerExecutionSpawnResult::ReconciliationRequired { .. }
+        ));
+        assert!(
+            backend
+                .activate_restored_worker(request.operation_id, &request.worker_ref)
+                .is_err()
+        );
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cold_reclaim_timeout_retains_same_task_and_notifies_before_cleanup_retry() {
+        use crate::execution::RestoreRecoveryDisposition as D;
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let cleanup_allowed = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut backend = WorkerRuntimeExecutionBackend::new(CleanupOnlyFactory {
+            cleanup_calls: cleanup_calls.clone(),
+            cleanup_allowed: cleanup_allowed.clone(),
+            release: Some(release.clone()),
+        })
+        .unwrap()
+        .with_spawn_restore_timeout(Duration::from_millis(1));
+        let mut request = direct_restore_request(WorkerRef::new(WorkerId::now_v7()));
+        let (progress, progressed) = mpsc::channel();
+        request.context = request
+            .context
+            .with_restore_progress(Arc::new(move |operation| {
+                let _ = progress.send(operation);
+            }));
+        assert!(matches!(
+            backend.reclaim_uncommitted_restore(request.clone()),
+            WorkerExecutionSpawnResult::ReconciliationRequired { .. }
+        ));
+        let owner = backend
+            .pending_restore(&request.worker_ref)
+            .unwrap()
+            .unwrap();
+        let task_id = owner.task.try_lock().unwrap().as_ref().unwrap().id();
+        assert_eq!(
+            backend.restore_recovery_disposition(request.operation_id, &request.worker_ref),
+            Some(D::InFlight)
+        );
+        assert!(matches!(
+            backend.reclaim_uncommitted_restore(request.clone()),
+            WorkerExecutionSpawnResult::ReconciliationRequired { .. }
+        ));
+        assert!(Arc::ptr_eq(
+            &owner,
+            &backend
+                .pending_restore(&request.worker_ref)
+                .unwrap()
+                .unwrap()
+        ));
+        assert_eq!(
+            owner.task.try_lock().unwrap().as_ref().unwrap().id(),
+            task_id
+        );
+        release.notify_one();
+        assert_eq!(
+            progressed.recv_timeout(Duration::from_secs(5)).unwrap(),
+            request.operation_id
+        );
+        backend
+            .wait_pending_restore(&owner, Duration::from_secs(5))
+            .unwrap();
+        assert!(owner.task.try_lock().unwrap().is_none());
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backend.restore_recovery_disposition(request.operation_id, &request.worker_ref),
+            Some(D::Reclaim)
+        );
+        backend.spawn_restore_timeout = Duration::from_secs(5);
+        cleanup_allowed.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            backend.reclaim_uncommitted_restore(request.clone()),
+            WorkerExecutionSpawnResult::RolledBack(_)
+        ));
+        assert_eq!(
+            progressed.recv_timeout(Duration::from_secs(5)).unwrap(),
+            request.operation_id
+        );
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 2);
+        assert!(backend.workers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cold_reclaim_refuses_existing_candidate_owner_even_for_same_operation() {
+        let backend = WorkerRuntimeExecutionBackend::new(CleanupOnlyFactory {
+            cleanup_calls: Arc::new(AtomicUsize::new(0)),
+            cleanup_allowed: Arc::new(AtomicBool::new(true)),
+            release: None,
+        })
+        .unwrap();
+        let request = direct_restore_request(WorkerRef::new(WorkerId::now_v7()));
+        let owner = Arc::new(PendingRuntimeRestore {
+            request: request.clone(),
+            cleanup_only: false,
+            task: tokio::sync::Mutex::new(None),
+            task_in_flight: AtomicBool::new(false),
+            result: Mutex::new(None),
+            activated: Mutex::new(None),
+            activation_started: AtomicBool::new(false),
+            discard_started: AtomicBool::new(false),
+            discard_result: Mutex::new(None),
+            failure: Mutex::new(None),
+        });
+        backend
+            .pending_restores
+            .lock()
+            .unwrap()
+            .insert(request.worker_ref.clone(), owner.clone());
+        assert!(matches!(
+            backend.reclaim_uncommitted_restore(request.clone()),
+            WorkerExecutionSpawnResult::ReconciliationRequired { .. }
+        ));
+        assert!(Arc::ptr_eq(
+            &owner,
+            &backend
+                .pending_restore(&request.worker_ref)
+                .unwrap()
+                .unwrap()
+        ));
+        assert_eq!(backend.factory.cleanup_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

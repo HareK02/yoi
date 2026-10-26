@@ -193,6 +193,18 @@ max_tokens = 100
         self.inner.restore_worker(request)
     }
 
+    fn restore_recovery_disposition(
+        &self,
+        operation_id: crate::execution::WorkerLifecycleOperationId,
+        worker_ref: &WorkerRef,
+    ) -> Option<crate::execution::RestoreRecoveryDisposition> {
+        self.inner.restore_recovery_disposition(operation_id, worker_ref)
+    }
+
+    fn reclaim_uncommitted_restore(&self, request: WorkerExecutionRestoreRequest) -> WorkerExecutionSpawnResult {
+        self.inner.reclaim_uncommitted_restore(request)
+    }
+
     fn reconcile_restore(
         &self,
         request: WorkerExecutionRestoreRequest,

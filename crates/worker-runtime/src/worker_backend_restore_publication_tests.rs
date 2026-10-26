@@ -96,6 +96,133 @@ mod publication {
 
     #[test]
     #[serial_test::serial(worker_allocation)]
+    fn startup_fault_recovery_retains_cleanup_or_committed_reconstruction_without_repost() {
+        use crate::runtime::RestoreCommitFact as F;
+        for committed in [false, true] {
+            let fixture = Fixture::no_model();
+            let runtime = stopped_runtime(&fixture);
+            let worker_ref = fixture.request.worker_ref.clone();
+            let request = runtime.test_restore_request(&worker_ref);
+            runtime.coordinate_worker_restore_operation(&worker_ref, runtime_api::WorkerRestoreCoordinationRequest {
+                expected_observation_token: request.expected_observation_token.clone(),
+                request_id: request.request_id.clone(), preparation: request.preparation.clone(),
+            }, fixture.request.workspace_scope.as_ref()).unwrap();
+            let operation = runtime.test_stage_restore_checkpoint(&worker_ref, if committed { F::Committed } else { F::NotCommitted }, false);
+            let before = fixture.canonical_files();
+            drop(runtime);
+            if committed {
+                *fixture.backend.factory.restore_faults.fail_at.lock().unwrap() = Some(RuntimeRestoreStage::Metadata);
+            } else {
+                fixture.backend.factory.restore_faults.cleanup_fail.store(true, Ordering::SeqCst);
+            }
+            let options = FsRuntimeStoreOptions::new(fixture._root.path().join("catalog")).with_runtime_id("candidate-runtime");
+            let restarted = EmbeddedRuntime::with_fs_store_and_execution_backend(options, fixture.backend.clone()).unwrap();
+            let pause = restarted.test_pause_restore_continuation();
+            assert_eq!(durable_operation(&restarted, &worker_ref).unwrap().operation_id, operation);
+            assert!(fixture.backend.completed_restore_failure(operation, &worker_ref).is_none());
+            assert!(fixture.backend.workers.lock().unwrap().is_empty());
+            *fixture.backend.factory.restore_faults.fail_at.lock().unwrap() = None;
+            fixture.backend.factory.restore_faults.cleanup_fail.store(false, Ordering::SeqCst);
+            drop(pause);
+            restarted.test_wait_restore_continuation(&worker_ref, operation, WAIT);
+            let receipt = restarted.restore_worker_operation(&worker_ref, request).unwrap();
+            assert_eq!(receipt.state, if committed { server_api::WorkerRestoreState::Accepted } else { server_api::WorkerRestoreState::RolledBack });
+            if committed {
+                let transport = fixture.backend.clone().attach_worker_protocol(&worker_ref).unwrap();
+                transport.validate().unwrap();
+                drop(transport);
+                restarted.stop_worker(&worker_ref, None).unwrap();
+            } else {
+                assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.canonical_files(), before);
+            }
+            fixture.assert_released();
+            fixture.assert_quiet();
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn startup_dispatches_saved_decisions_without_replaying_uncommitted_execution() {
+        use crate::runtime::RestoreCommitFact as F;
+        for (commit, repaired, expected) in [
+            (F::NotCommitted, false, server_api::WorkerRestoreState::RolledBack),
+            (F::NotCommitted, true, server_api::WorkerRestoreState::ReconciliationRequired),
+            (F::Committed, false, server_api::WorkerRestoreState::Accepted),
+            (F::LegacyUnknown, true, server_api::WorkerRestoreState::ReconciliationRequired),
+        ] {
+            let fixture = Fixture::no_model();
+            let runtime = stopped_runtime(&fixture);
+            let worker_ref = fixture.request.worker_ref.clone();
+            let scope = fixture.request.workspace_scope.as_ref().unwrap();
+            let request = runtime.test_restore_request(&worker_ref);
+            assert!(runtime.coordinate_worker_restore_operation(&worker_ref, runtime_api::WorkerRestoreCoordinationRequest {
+                expected_observation_token: request.expected_observation_token.clone(),
+                request_id: request.request_id.clone(),
+                preparation: request.preparation.clone(),
+            }, Some(scope)).unwrap().0.is_none());
+            let operation = runtime.test_stage_restore_checkpoint(&worker_ref, commit, repaired);
+            let before = fixture.canonical_files();
+            let run = fixture.backend.factory.worker_restore_run_dir(&worker_ref, operation).unwrap();
+            std::fs::create_dir_all(&run).unwrap();
+            std::fs::write(run.join("before-restart.marker"), "disposable").unwrap();
+            if commit == F::NotCommitted && !repaired {
+                // Fixture for an interrupted automatic restore. A rollback must
+                // not leave an active/Automatic projection that restores again.
+                let store = runtime.test_runtime_store();
+                let mut record = store.read_worker_record(&worker_ref).unwrap();
+                record.status = crate::catalog::WorkerStatus::Idle;
+                let PersistedWorkerExecutionState::ReconciliationRequired(
+                    crate::fs_store::PersistedWorkerLifecycleOperation::Restore(saved),
+                ) = &mut record.execution_state else { panic!("pending fixture") };
+                saved.mode = crate::fs_store::PersistedWorkerRestoreMode::Automatic;
+                saved.last_settled_status = crate::catalog::WorkerStatus::Idle;
+                saved.binding = Some(crate::fs_store::PersistedWorkerExecutionBinding {});
+                store.write_worker_record(&record).unwrap();
+            }
+            drop(runtime);
+            assert!(fixture.backend.pending_restore(&worker_ref).unwrap().is_none());
+            assert!(fixture.backend.workers.lock().unwrap().is_empty());
+            let options = FsRuntimeStoreOptions::new(fixture._root.path().join("catalog")).with_runtime_id("candidate-runtime");
+            let restarted = EmbeddedRuntime::with_fs_store_and_execution_backend(options.clone(), fixture.backend.clone()).unwrap();
+            if expected == server_api::WorkerRestoreState::ReconciliationRequired {
+                let reason = restarted.test_wait_restore_continuation_parked(&worker_ref, operation, WAIT);
+                assert!(!reason.is_empty());
+                let pending = durable_operation(&restarted, &worker_ref).unwrap();
+                assert_eq!(pending.operation_id, operation);
+                assert_eq!(pending.commit, commit);
+                assert_eq!(pending.source_repair_possible, repaired);
+            }
+            assert!(restarted.worker_detail(&worker_ref).is_ok(), "{commit:?}: {:?}", restarted.diagnostics());
+            let receipt = restarted.restore_worker_operation(&worker_ref, request.clone()).unwrap();
+            assert_eq!(receipt.state, expected, "{commit:?}: {receipt:?}; backend failure: {:?}", fixture.backend.completed_restore_failure(operation, &worker_ref));
+            assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), usize::from(commit == F::Committed));
+            if commit == F::Committed {
+                let transport = fixture.backend.clone().attach_worker_protocol(&worker_ref).unwrap();
+                transport.validate().unwrap();
+                drop(transport);
+            } else {
+                assert_eq!(fixture.canonical_files(), before);
+                assert!(fixture.backend.workers.lock().unwrap().is_empty());
+                assert!(fixture.backend.factory.observation_hub.get(&worker_ref).is_none());
+                assert_eq!(run.exists(), commit == F::LegacyUnknown);
+            }
+            if expected == server_api::WorkerRestoreState::RolledBack {
+                assert_eq!(restarted.worker_detail(&worker_ref).unwrap().status, crate::catalog::WorkerStatus::Stopped);
+                drop(restarted);
+                let second = EmbeddedRuntime::with_fs_store_and_execution_backend(options, fixture.backend.clone()).unwrap();
+                assert_eq!(second.restore_worker_operation_scoped(scope, &worker_ref, request).unwrap(), receipt);
+                assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), 0);
+            } else {
+                restarted.stop_worker_scoped(scope, &worker_ref, None).unwrap();
+            }
+            fixture.assert_released();
+            fixture.assert_quiet();
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
     fn stop_timeout_retains_autonomous_late_cleanup_and_blocks_remove_until_confirmed() {
         let mut fixture = Fixture::no_model();
         Arc::get_mut(&mut fixture.backend).unwrap().spawn_restore_timeout = Duration::from_millis(250);

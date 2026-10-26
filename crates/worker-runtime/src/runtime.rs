@@ -171,6 +171,12 @@ enum WorkerRestoreMode {
     Automatic,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RestoreRecoveryAction {
+    Continue,
+    ReclaimUncommitted,
+}
+
 #[cfg(feature = "fs-store")]
 impl From<WorkerRestoreMode> for PersistedWorkerRestoreMode {
     fn from(mode: WorkerRestoreMode) -> Self {
@@ -2332,6 +2338,56 @@ impl Runtime {
         }
     }
 
+    // Seed durable crash checkpoints without launching a second Controller.
+    // Tests then reopen the real store with empty backend resource maps.
+    #[cfg(all(test, feature = "fs-store"))]
+    pub(crate) fn test_stage_restore_checkpoint(
+        &self,
+        worker_ref: &WorkerRef,
+        commit: RestoreCommitFact,
+        source_repair_possible: bool,
+    ) -> WorkerLifecycleOperationId {
+        let lease = self.worker_operation_lock(worker_ref.worker_id).unwrap();
+        let _guard = lease.lock().unwrap();
+        let operation = self
+            .lock()
+            .unwrap()
+            .worker(worker_ref)
+            .unwrap()
+            .pending_restore
+            .unwrap();
+        self.begin_restore_operation(
+            worker_ref,
+            operation.operation_id,
+            operation.mode,
+            self.restore_candidate_execution_context(worker_ref.clone()),
+        )
+        .unwrap();
+        if source_repair_possible {
+            self.restore_repair_authorizer(worker_ref.clone())(operation.operation_id).unwrap();
+        }
+        match commit {
+            RestoreCommitFact::Committed => {
+                self.commit_restored_worker_execution(
+                    worker_ref,
+                    protocol::WorkerStatus::Idle.into(),
+                    WorkerStatus::Idle,
+                    Vec::new(),
+                )
+                .unwrap();
+            }
+            RestoreCommitFact::LegacyUnknown => {
+                let mut state = self.lock().unwrap();
+                let mut worker = state.worker(worker_ref).unwrap().clone();
+                worker.pending_restore.as_mut().unwrap().commit = commit;
+                state.persist_restore_worker_record(&worker).unwrap();
+                state.workers.insert(worker_ref.worker_id, worker);
+            }
+            RestoreCommitFact::NotCommitted => {}
+        }
+        operation.operation_id
+    }
+
     #[cfg(test)]
     pub(crate) fn test_restore_request(
         &self,
@@ -2357,6 +2413,19 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
         mode: WorkerRestoreMode,
+    ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
+        self.restore_admitted_with_recovery_under_lock(
+            worker_ref,
+            mode,
+            RestoreRecoveryAction::Continue,
+        )
+    }
+
+    fn restore_admitted_with_recovery_under_lock(
+        &self,
+        worker_ref: &WorkerRef,
+        mode: WorkerRestoreMode,
+        recovery: RestoreRecoveryAction,
     ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
         self.lock()?
             .ensure_subject_not_reserved(worker_ref, false)?;
@@ -2407,14 +2476,28 @@ impl Runtime {
                     }
                 };
                 if let Some(detail) = committed_detail {
-                    // Recover a receipt gap without launching execution again.
+                    // A historical binding is not current readiness. The exact
+                    // execution must still attest its operation and endpoint.
+                    let backend = self.lock()?.execution_backend.clone();
+                    let readiness = backend
+                        .ok_or_else(|| "Runtime has no Worker execution backend".to_owned())
+                        .and_then(|backend| {
+                            backend.activate_restored_worker(owner.operation_id, worker_ref)
+                        });
+                    if let Err(message) = readiness {
+                        return Ok(RuntimeWorkerRestoreResult::failed(
+                            WorkerRestoreState::ReconciliationRequired,
+                            "worker_restore_saved_binding_not_ready",
+                            sanitize_worker_create_failure_message(&message),
+                        ));
+                    }
                     let result = RuntimeWorkerRestoreResult::accepted(detail);
                     self.finish_restore_receipt(worker_ref, &result)?;
                     return Ok(result);
                 }
             }
         }
-        let result = self.restore_worker_under_lock(worker_ref, mode)?;
+        let result = self.restore_worker_with_recovery_under_lock(worker_ref, mode, recovery)?;
         self.finish_restore_receipt(worker_ref, &result)?;
         Ok(result)
     }
@@ -2451,6 +2534,19 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
         mode: WorkerRestoreMode,
+    ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
+        self.restore_worker_with_recovery_under_lock(
+            worker_ref,
+            mode,
+            RestoreRecoveryAction::Continue,
+        )
+    }
+
+    fn restore_worker_with_recovery_under_lock(
+        &self,
+        worker_ref: &WorkerRef,
+        mode: WorkerRestoreMode,
+        recovery: RestoreRecoveryAction,
     ) -> Result<RuntimeWorkerRestoreResult, RuntimeError> {
         self.lock()?
             .ensure_subject_not_reserved(worker_ref, false)?;
@@ -2562,8 +2658,12 @@ impl Runtime {
                     .cloned()
             });
             let request = WorkerExecutionRestoreRequest {
-                source_repair_possible: pending_restore
-                    .is_some_and(|pending| pending.source_repair_possible),
+                // A committed decision also permits canonical activation effects.
+                // Cold reconstruction must retain that possibility through even a
+                // read-only failure, not cache it as an uncommitted rollback.
+                source_repair_possible: pending_restore.is_some_and(|pending| {
+                    pending.source_repair_possible || pending.commit == RestoreCommitFact::Committed
+                }),
                 operation_id,
                 worker_ref: worker_ref.clone(),
                 request: worker_request,
@@ -2585,6 +2685,27 @@ impl Runtime {
             )
         };
 
+        let uncommitted = self
+            .lock()?
+            .worker(worker_ref)?
+            .pending_restore
+            .is_some_and(|pending| {
+                pending.operation_id == operation_id
+                    && pending.commit == RestoreCommitFact::NotCommitted
+            });
+        let reclaim = uncommitted
+            && (recovery == RestoreRecoveryAction::ReclaimUncommitted
+                || (reconcile
+                    && match backend.restore_recovery_disposition(operation_id, worker_ref) {
+                        Some(crate::execution::RestoreRecoveryDisposition::Reclaim) | None => true,
+                        Some(crate::execution::RestoreRecoveryDisposition::Absent) => self
+                            .lock()?
+                            .worker(worker_ref)?
+                            .restore_candidate_context
+                            .is_none(),
+                        Some(_) => false,
+                    }));
+        let reconcile = reconcile || reclaim;
         if !reconcile && let Err(result) = backend.preflight_restore(&request) {
             // A preflight may attest an already-connected Controller snapshot.
             // Repeated restore is read-only; do not replace its operation owner.
@@ -2643,6 +2764,8 @@ impl Runtime {
         let has_completed_failure = completed_failure.is_some();
         let restore_result = if let Some(result) = completed_failure {
             result
+        } else if reclaim {
+            backend.reclaim_uncommitted_restore(request)
         } else if reconcile {
             backend.reconcile_restore(request)
         } else {
@@ -4205,6 +4328,7 @@ impl Runtime {
                 .lock()
                 .map_err(|_| RuntimeError::StatePoisoned)?;
             if let Err(error) = self.reconcile_pending_stop_under_lock(&worker_ref) {
+                self.ensure_restore_continuation(&worker_ref)?;
                 tracing::warn!(
                     worker_id = %worker_ref.worker_id,
                     error = %error,
@@ -4242,8 +4366,34 @@ impl Runtime {
             let _operation_guard = operation_lock
                 .lock()
                 .map_err(|_| RuntimeError::StatePoisoned)?;
-            let result = self.restore_admitted_worker_under_lock(&worker_ref, mode)?;
-            self.record_startup_restore_result(&worker_ref, &result)?;
+            let recovery = {
+                let mut state = self.lock()?;
+                state.refresh_uncertain_worker_write(&worker_ref)?;
+                let pending = state.worker(&worker_ref)?.pending_restore;
+                let retained = pending.is_some_and(|pending| {
+                    state.execution_backend.as_ref().is_some_and(|backend| {
+                        matches!(
+                            backend.restore_recovery_disposition(pending.operation_id, &worker_ref),
+                            Some(
+                                crate::execution::RestoreRecoveryDisposition::Continue
+                                    | crate::execution::RestoreRecoveryDisposition::InFlight
+                                    | crate::execution::RestoreRecoveryDisposition::Discard
+                            )
+                        )
+                    })
+                });
+                if pending.is_some_and(|pending| pending.commit == RestoreCommitFact::NotCommitted)
+                    && !retained
+                {
+                    RestoreRecoveryAction::ReclaimUncommitted
+                } else {
+                    RestoreRecoveryAction::Continue
+                }
+            };
+            let result =
+                self.restore_admitted_with_recovery_under_lock(&worker_ref, mode, recovery);
+            self.ensure_restore_continuation(&worker_ref)?;
+            self.record_startup_restore_result(&worker_ref, &result?)?;
         }
 
         for worker_ref in candidates {
@@ -4252,8 +4402,9 @@ impl Runtime {
                 .lock()
                 .map_err(|_| RuntimeError::StatePoisoned)?;
             let result =
-                self.restore_admitted_worker_under_lock(&worker_ref, WorkerRestoreMode::Automatic)?;
-            self.record_startup_restore_result(&worker_ref, &result)?;
+                self.restore_admitted_worker_under_lock(&worker_ref, WorkerRestoreMode::Automatic);
+            self.ensure_restore_continuation(&worker_ref)?;
+            self.record_startup_restore_result(&worker_ref, &result?)?;
         }
         Ok(())
     }
@@ -8411,6 +8562,7 @@ mod tests {
         restore_gate: Mutex<Option<Arc<RestoreGate>>>,
         restore_count: Mutex<u64>,
         restore_operation_ids: Mutex<Vec<WorkerLifecycleOperationId>>,
+        reclaim_operation_ids: Mutex<Vec<WorkerLifecycleOperationId>>,
         activation_result: Mutex<Option<Result<(), String>>>,
         activation_gate: Mutex<Option<Arc<RestoreGate>>>,
         activation_operation_ids: Mutex<Vec<WorkerLifecycleOperationId>>,
@@ -8705,6 +8857,57 @@ mod tests {
                         },
                     )
                     .collect(),
+            }
+        }
+
+        fn restore_recovery_disposition(
+            &self,
+            operation_id: WorkerLifecycleOperationId,
+            _worker_ref: &WorkerRef,
+        ) -> Option<crate::execution::RestoreRecoveryDisposition> {
+            Some(
+                if self
+                    .restore_operation_ids
+                    .lock()
+                    .unwrap()
+                    .contains(&operation_id)
+                {
+                    crate::execution::RestoreRecoveryDisposition::Continue
+                } else {
+                    crate::execution::RestoreRecoveryDisposition::Absent
+                },
+            )
+        }
+
+        fn reclaim_uncommitted_restore(
+            &self,
+            request: WorkerExecutionRestoreRequest,
+        ) -> WorkerExecutionSpawnResult {
+            self.reclaim_operation_ids
+                .lock()
+                .unwrap()
+                .push(request.operation_id);
+            assert!(
+                !self
+                    .contexts
+                    .lock()
+                    .unwrap()
+                    .contains_key(&request.worker_ref.worker_id)
+            );
+            if request.source_repair_possible {
+                WorkerExecutionSpawnResult::ReconciliationRequired {
+                    result: WorkerExecutionResult::errored(
+                        WorkerExecutionOperation::Restore,
+                        "prior repair may remain",
+                    ),
+                    worker_state: None,
+                    workdir_attachments: Vec::new(),
+                }
+            } else {
+                WorkerExecutionSpawnResult::RolledBack(WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Restore,
+                    "cold request resources confirmed absent",
+                ))
             }
         }
 
@@ -9242,7 +9445,9 @@ mod tests {
                 Some(&owner),
             )
             .unwrap();
-        assert_eq!(result.unwrap().state, WorkerRestoreState::Accepted);
+        assert_eq!(result.unwrap().state, WorkerRestoreState::RolledBack);
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(backend.reclaim_operation_ids.lock().unwrap().len(), 1);
         assert!(preparation.is_none());
         assert!(
             runtime
@@ -11212,7 +11417,7 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn restore_guard_interrupted_preparation_replays_original_pending_operation() {
+    fn restore_guard_interrupted_preparation_reclaims_original_pending_operation() {
         let dir = tempfile::tempdir().unwrap();
         let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
             .with_runtime_id("guard-partial-preparation");
@@ -11280,10 +11485,10 @@ mod tests {
         let receipt = resumed
             .restore_worker_operation(&worker.worker_ref, request)
             .unwrap();
-        assert_eq!(receipt.state, WorkerRestoreState::Accepted);
-        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(receipt.state, WorkerRestoreState::RolledBack);
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
         assert_eq!(
-            backend.restore_operation_ids.lock().unwrap().as_slice(),
+            backend.reclaim_operation_ids.lock().unwrap().as_slice(),
             &[operation_id]
         );
         assert!(
@@ -11422,7 +11627,7 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn restore_guard_unknown_preparation_write_retries_same_pending_operation() {
+    fn restore_guard_unknown_preparation_write_reclaims_same_pending_operation() {
         let dir = tempfile::tempdir().unwrap();
         let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
             .with_runtime_id("guard-unknown-preparation");
@@ -11484,12 +11689,16 @@ mod tests {
                 .restore_worker_operation(&worker.worker_ref, request)
                 .unwrap()
                 .state,
-            WorkerRestoreState::Accepted
+            WorkerRestoreState::RolledBack
         );
-        assert_eq!(*resumed_backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(*resumed_backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(
+            resumed_backend.reclaim_operation_ids.lock().unwrap().len(),
+            1
+        );
         assert_eq!(
             resumed.worker_detail(&worker.worker_ref).unwrap().status,
-            WorkerStatus::Idle
+            WorkerStatus::Stopped
         );
     }
 
@@ -11667,7 +11876,7 @@ mod tests {
             Runtime::with_fs_store_and_execution_backend(options, resumed_backend.clone()).unwrap();
         assert_eq!(
             resumed_backend
-                .restore_operation_ids
+                .reclaim_operation_ids
                 .lock()
                 .unwrap()
                 .as_slice(),
@@ -11676,8 +11885,8 @@ mod tests {
         let receipt = resumed
             .restore_worker_operation(&worker.worker_ref, request)
             .unwrap();
-        assert_eq!(receipt.state, WorkerRestoreState::Accepted);
-        assert_eq!(*resumed_backend.restore_count.lock().unwrap(), 1);
+        assert_eq!(receipt.state, WorkerRestoreState::RolledBack);
+        assert_eq!(*resumed_backend.restore_count.lock().unwrap(), 0);
     }
 
     #[test]
@@ -15521,6 +15730,21 @@ mod tests {
             restarted_backend.clone(),
         )
         .unwrap();
+        assert_eq!(
+            restarted_backend
+                .reclaim_operation_ids
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[operation_id]
+        );
+        assert_eq!(*restarted_backend.restore_count.lock().unwrap(), 0);
+        assert_eq!(
+            restarted.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+        // A deliberate fresh intent may restore after the old uncommitted
+        // request was reclaimed. It must allocate a different operation.
         let retry = restarted
             .restore_worker_operation(
                 &worker.worker_ref,
@@ -15529,13 +15753,9 @@ mod tests {
             .unwrap();
         assert_eq!(retry.state, WorkerRestoreState::Accepted);
         assert_eq!(*restarted_backend.restore_count.lock().unwrap(), 1);
-        assert_eq!(
-            restarted_backend
-                .restore_operation_ids
-                .lock()
-                .unwrap()
-                .as_slice(),
-            &[operation_id]
+        assert_ne!(
+            restarted_backend.restore_operation_ids.lock().unwrap()[0],
+            operation_id
         );
         assert!(
             restarted

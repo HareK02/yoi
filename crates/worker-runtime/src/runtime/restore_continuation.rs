@@ -266,9 +266,10 @@ impl Runtime {
             let Some(backend) = &state.execution_backend else {
                 return Ok(());
             };
-            if backend
-                .restore_recovery_disposition(operation, &worker_ref)
-                .is_none()
+            if !backend.supports_restore_continuation()
+                || backend
+                    .restore_recovery_disposition(operation, &worker_ref)
+                    .is_none()
             {
                 return Ok(());
             }
@@ -396,6 +397,10 @@ impl Runtime {
                             "worker_restore_rolled_back",
                             result.message_or_default(),
                         );
+                        #[cfg(feature = "fs-store")]
+                        self.lock()?
+                            .record_restore_failure(worker_ref, &result, &receipt)?;
+                        #[cfg(not(feature = "fs-store"))]
                         self.settle_restore_rollback(worker_ref, &receipt)?;
                         return Ok(Step::Finished);
                     }

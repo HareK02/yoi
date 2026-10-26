@@ -621,9 +621,13 @@ impl fmt::Debug for WorkerProtocolTransport {
 /// authority: Runtime must reread its decision before choosing any action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestoreRecoveryDisposition {
+    /// No live or pending owner for this exact operation. Not cleanup evidence.
+    Absent,
     InFlight,
     Continue,
     Discard,
+    /// A retained cleanup-only owner; never reconstruct or activate it.
+    Reclaim,
 }
 
 /// The connection selects this backend; WorkerRef identifies an execution,
@@ -704,8 +708,15 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         None
     }
 
-    /// Opt in to Runtime-owned continuation. Waiting is signaled through the
-    /// original execution context; no callback may wait for Runtime locks.
+    /// Opt in to Runtime-owned autonomous restore continuation. Pending tasks
+    /// signal completion through the original execution context; callbacks must
+    /// not wait for Runtime locks. Independent of resource disposition support.
+    fn supports_restore_continuation(&self) -> bool {
+        false
+    }
+
+    /// Describe exact operation resource ownership for warm/cold recovery
+    /// dispatch. This does not opt in to callbacks or autonomous continuation.
     fn restore_recovery_disposition(
         &self,
         _operation_id: WorkerLifecycleOperationId,
@@ -719,6 +730,24 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         request: WorkerExecutionRestoreRequest,
     ) -> WorkerExecutionSpawnResult {
         self.restore_worker(request)
+    }
+
+    /// Reclaim an uncommitted operation after restart without preparing,
+    /// repairing, or activating a replacement candidate. Runtime must establish
+    /// the durable uncommitted decision before calling this seam. Unsupported
+    /// cleanup is uncertainty, never a successful rollback.
+    fn reclaim_uncommitted_restore(
+        &self,
+        _request: WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        WorkerExecutionSpawnResult::ReconciliationRequired {
+            result: WorkerExecutionResult::unsupported(
+                WorkerExecutionOperation::Restore,
+                "backend cannot reclaim an uncommitted restore after restart",
+            ),
+            worker_state: None,
+            workdir_attachments: Vec::new(),
+        }
     }
 
     /// Discard only the exact unpublished operation after Runtime has proved
@@ -1009,6 +1038,10 @@ impl WorkerExecutionBackendRef {
             .completed_restore_failure(operation_id, worker_ref)
     }
 
+    pub(crate) fn supports_restore_continuation(&self) -> bool {
+        self.backend.supports_restore_continuation()
+    }
+
     pub(crate) fn restore_recovery_disposition(
         &self,
         operation_id: WorkerLifecycleOperationId,
@@ -1023,6 +1056,13 @@ impl WorkerExecutionBackendRef {
         request: WorkerExecutionRestoreRequest,
     ) -> WorkerExecutionSpawnResult {
         self.backend.reconcile_restore(request)
+    }
+
+    pub(crate) fn reclaim_uncommitted_restore(
+        &self,
+        request: WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        self.backend.reclaim_uncommitted_restore(request)
     }
 
     pub(crate) fn discard_uncommitted_restore(
