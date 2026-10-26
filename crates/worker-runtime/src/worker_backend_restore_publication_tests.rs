@@ -94,6 +94,647 @@ mod publication {
         (release, received)
     }
 
+    // One-shot sender Drop is the RAII release, including a panic before the
+    // explicit release. The task also has a 30s fail-safe independent of Drop.
+    struct ActivationRelease(tokio::sync::oneshot::Sender<()>);
+
+    impl ActivationRelease {
+        fn release(self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    fn activation_gate(
+        fixture: &Fixture,
+        started: bool,
+    ) -> (ActivationRelease, mpsc::Receiver<RestoreActivationEvidence>) {
+        let (release, receiver) = tokio::sync::oneshot::channel();
+        let (entered, evidence) = mpsc::channel();
+        let faults = &fixture.backend.factory.restore_faults;
+        let slot = if started {
+            &faults.activation_started_gate
+        } else {
+            &faults.activation_effects_gate
+        };
+        assert!(
+            slot.lock()
+                .unwrap()
+                .replace(RestoreActivationGate {
+                    entered,
+                    release: receiver
+                })
+                .is_none()
+        );
+        (ActivationRelease(release), evidence)
+    }
+
+    fn restore_owner(
+        runtime: &EmbeddedRuntime,
+        worker_ref: &WorkerRef,
+        request_id: &str,
+    ) -> serde_json::Value {
+        let record = runtime
+            .test_runtime_store()
+            .read_worker_record(worker_ref)
+            .unwrap();
+        let guard = serde_json::to_value(&record.restore_guard).unwrap();
+        assert_eq!(guard["owners"].as_object().unwrap().len(), 1);
+        assert!(
+            guard["owners"]
+                .as_object()
+                .unwrap()
+                .contains_key(request_id)
+        );
+        guard["owners"][request_id].clone()
+    }
+
+    fn assert_activation_owned(
+        fixture: &Fixture,
+        runtime: &EmbeddedRuntime,
+        request_id: &str,
+        evidence: &RestoreActivationEvidence,
+    ) -> Arc<PendingRuntimeRestore> {
+        let worker_ref = &fixture.request.worker_ref;
+        let durable = durable_operation(runtime, worker_ref).unwrap();
+        assert_eq!(durable.commit, crate::runtime::RestoreCommitFact::Committed);
+        assert_eq!(durable.operation_id, evidence.operation_id);
+        let owner = restore_owner(runtime, worker_ref, request_id);
+        assert_eq!(
+            owner["operation_id"],
+            serde_json::to_value(evidence.operation_id).unwrap()
+        );
+        assert!(
+            owner["receipt"].is_null(),
+            "committed activation cannot have a terminal receipt yet"
+        );
+        let pending = fixture
+            .backend
+            .pending_restore(worker_ref)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.request.operation_id, evidence.operation_id);
+        assert!(pending.activation_started.load(Ordering::Acquire));
+        assert!(pending.task_in_flight.load(Ordering::Acquire));
+        assert!(pending.task.try_lock().unwrap().is_some());
+        assert!(
+            pending.result.lock().unwrap().is_none(),
+            "the task, not another caller, owns the candidate"
+        );
+        assert!(pending.activated.lock().unwrap().is_none());
+        assert!(evidence.allocation_retained);
+        assert!(fixture.backend.workers.lock().unwrap().is_empty());
+        assert!(
+            fixture
+                .backend
+                .factory
+                .observation_hub
+                .get(worker_ref)
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .factory
+                .restore_faults
+                .executions
+                .load(Ordering::SeqCst),
+            1
+        );
+        fixture.assert_quiet();
+        pending
+    }
+
+    fn alert_marker(handle: &WorkerHandle, marker: &str) {
+        handle.alerter.alert(
+            protocol::AlertLevel::Warn,
+            protocol::AlertSource::Worker,
+            marker.into(),
+        );
+    }
+
+    fn is_marker(event: &Event, marker: &str) -> bool {
+        matches!(event, Event::Alert(alert) if alert.message == marker)
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn postcommit_activation_timeout_autonomously_publishes_same_controller_and_paired_streams() {
+        let mut fixture = Fixture::no_model();
+        Arc::get_mut(&mut fixture.backend)
+            .unwrap()
+            .spawn_restore_timeout = Duration::from_millis(250);
+        let runtime = stopped_runtime(&fixture);
+        let worker_ref = fixture.request.worker_ref.clone();
+        let scope = fixture.request.workspace_scope.as_ref().unwrap();
+        let request = runtime.test_restore_request(&worker_ref);
+        let (effects_release, effects_entered) = activation_gate(&fixture, false);
+        let (started_release, started_entered) = activation_gate(&fixture, true);
+        let observations = runtime.subscribe_worker_observation().unwrap();
+        let first = runtime
+            .restore_worker_operation_scoped(scope, &worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(
+            first.state,
+            server_api::WorkerRestoreState::ReconciliationRequired
+        );
+        let effects = effects_entered.recv_timeout(WAIT).unwrap();
+        assert!(effects.handle.is_none());
+        let pending = assert_activation_owned(&fixture, &runtime, &request.request_id, &effects);
+        let canonical = fixture.canonical_files();
+        let owner = restore_owner(&runtime, &worker_ref, &request.request_id);
+        effects_release.release();
+        let started = started_entered.recv_timeout(WAIT).unwrap();
+        let same_pending =
+            assert_activation_owned(&fixture, &runtime, &request.request_id, &started);
+        assert!(Arc::ptr_eq(&pending, &same_pending));
+        assert_eq!(effects.candidate, started.candidate);
+        assert_eq!(
+            serde_json::to_value(&effects.snapshot).unwrap(),
+            serde_json::to_value(&started.snapshot).unwrap()
+        );
+        assert_eq!(
+            restore_owner(&runtime, &worker_ref, &request.request_id),
+            owner
+        );
+        let old = started.handle.unwrap();
+        assert!(!old.protocol_is_closed());
+        // This live event is queued on the precommit paired receiver. A newly
+        // subscribed bridge would miss it; it is not in its original snapshot.
+        alert_marker(&old, "activation-paired-before-publication");
+        started_release.release();
+        runtime.test_wait_restore_continuation(&worker_ref, started.operation_id, WAIT);
+        assert!(durable_operation(&runtime, &worker_ref).is_none());
+        let settled = restore_owner(&runtime, &worker_ref, &request.request_id);
+        assert_eq!(settled["operation_id"], owner["operation_id"]);
+        assert_eq!(settled["receipt"]["state"], "accepted");
+        let execution = fixture.backend.workers.lock().unwrap()[&worker_ref].clone();
+        assert!(old.same_controller(&execution.handle));
+        assert_eq!(execution.restore_operation_id, Some(started.operation_id));
+        assert_eq!(fixture.backend.workers.lock().unwrap().len(), 1);
+        assert_eq!(
+            fixture
+                .backend
+                .factory
+                .restore_faults
+                .executions
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .factory
+                .restore_faults
+                .publication_attempts
+                .load(Ordering::SeqCst),
+            1
+        );
+        let transport = fixture
+            .backend
+            .clone()
+            .attach_worker_protocol(&worker_ref)
+            .unwrap();
+        transport.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&transport.snapshot).unwrap(),
+            serde_json::to_value(&effects.snapshot).unwrap()
+        );
+        fixture
+            .backend
+            .run_on_adapter_runtime(async move {
+                let mut observations = observations;
+                tokio::time::timeout(WAIT, async {
+                    loop {
+                        let observed = observations.recv().await.unwrap();
+                        if is_marker(&observed.payload, "activation-paired-before-publication") {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| "paired receiver lost its prepublication event".to_string())?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            fixture.canonical_files() == canonical,
+            "canonical files changed unexpectedly"
+        );
+        drop(transport);
+        drop(execution);
+        drop(pending);
+        drop(same_pending);
+        runtime
+            .stop_worker_scoped(scope, &worker_ref, None)
+            .unwrap();
+        assert!(old.protocol_is_closed());
+        fixture.assert_released();
+        fixture.assert_quiet();
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn postcommit_activation_timeout_late_nonretryable_failure_never_fakes_rollback() {
+        for cleanup_fails in [false, true] {
+            let mut fixture = Fixture::no_model();
+            Arc::get_mut(&mut fixture.backend)
+                .unwrap()
+                .spawn_restore_timeout = Duration::from_millis(250);
+            let runtime = stopped_runtime(&fixture);
+            let worker_ref = fixture.request.worker_ref.clone();
+            let scope = fixture.request.workspace_scope.as_ref().unwrap();
+            let request = runtime.test_restore_request(&worker_ref);
+            let (release, entered) = activation_gate(&fixture, false);
+            let faults = &fixture.backend.factory.restore_faults;
+            *faults.fail_at.lock().unwrap() = Some(RuntimeRestoreStage::ActivationEffects);
+            faults.cleanup_fail.store(cleanup_fails, Ordering::SeqCst);
+            let first = runtime
+                .restore_worker_operation_scoped(scope, &worker_ref, request.clone())
+                .unwrap();
+            assert_eq!(
+                first.state,
+                server_api::WorkerRestoreState::ReconciliationRequired
+            );
+            let effects = entered.recv_timeout(WAIT).unwrap();
+            let pending =
+                assert_activation_owned(&fixture, &runtime, &request.request_id, &effects);
+            let canonical = fixture.canonical_files();
+            release.release();
+            if cleanup_fails {
+                let reason = runtime.test_wait_restore_continuation_parked(
+                    &worker_ref,
+                    effects.operation_id,
+                    WAIT,
+                );
+                assert!(!reason.is_empty());
+                let failure = pending
+                    .activated
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .err()
+                    .unwrap()
+                    .clone();
+                assert_eq!(failure.stage, RuntimeRestoreStage::ActivationEffects);
+                assert!(failure.durable_effects_possible);
+                assert!(failure.needs_cleanup());
+                assert!(matches!(failure.cleanup, RuntimeRestoreCleanup::Failed(_)));
+                let durable = durable_operation(&runtime, &worker_ref).unwrap();
+                assert_eq!(durable.operation_id, effects.operation_id);
+                assert_eq!(durable.commit, crate::runtime::RestoreCommitFact::Committed);
+                assert!(
+                    restore_owner(&runtime, &worker_ref, &request.request_id)["receipt"].is_null()
+                );
+                assert!(Arc::ptr_eq(
+                    &pending,
+                    &fixture
+                        .backend
+                        .pending_restore(&worker_ref)
+                        .unwrap()
+                        .unwrap()
+                ));
+                assert!(fixture.backend.workers.lock().unwrap().is_empty());
+                assert!(
+                    fixture
+                        .backend
+                        .factory
+                        .observation_hub
+                        .get(&worker_ref)
+                        .is_none()
+                );
+                assert!(
+                    fixture
+                        .backend
+                        .completed_restore_failure(effects.operation_id, &worker_ref)
+                        .is_none()
+                );
+                assert_eq!(faults.executions.load(Ordering::SeqCst), 1);
+                // Obstruction proof ends here. Stop below is fixture teardown,
+                // not an autonomous terminal-failure/success claim.
+                faults.cleanup_fail.store(false, Ordering::SeqCst);
+            } else {
+                // A nonretryable candidate must be discarded, not reactivated.
+                // Reconstruction belongs to the same committed operation.
+                runtime.test_wait_restore_continuation(&worker_ref, effects.operation_id, WAIT);
+                let settled = restore_owner(&runtime, &worker_ref, &request.request_id);
+                assert_eq!(settled["receipt"]["state"], "accepted");
+                assert_eq!(
+                    fixture.backend.workers.lock().unwrap()[&worker_ref].restore_operation_id,
+                    Some(effects.operation_id)
+                );
+                assert_eq!(faults.executions.load(Ordering::SeqCst), 2);
+                assert_eq!(faults.publication_attempts.load(Ordering::SeqCst), 1);
+                let transport = fixture
+                    .backend
+                    .clone()
+                    .attach_worker_protocol(&worker_ref)
+                    .unwrap();
+                transport.validate().unwrap();
+                drop(transport);
+            }
+            assert!(
+                fixture.canonical_files() == canonical,
+                "canonical files changed unexpectedly"
+            );
+            drop(pending);
+            runtime
+                .stop_worker_scoped(scope, &worker_ref, None)
+                .unwrap();
+            fixture.assert_released();
+            fixture.assert_quiet();
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn postcommit_activation_timeout_stop_remove_fence_late_cleanup_then_fresh_replacement() {
+        let mut fixture = Fixture::no_model();
+        Arc::get_mut(&mut fixture.backend)
+            .unwrap()
+            .spawn_restore_timeout = Duration::from_millis(250);
+        let runtime = stopped_runtime(&fixture);
+        let pause = runtime.test_pause_restore_continuation();
+        let worker_ref = fixture.request.worker_ref.clone();
+        let scope = fixture.request.workspace_scope.as_ref().unwrap();
+        let request = runtime.test_restore_request(&worker_ref);
+        let (release, entered) = activation_gate(&fixture, true);
+        let first = runtime
+            .restore_worker_operation_scoped(scope, &worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(
+            first.state,
+            server_api::WorkerRestoreState::ReconciliationRequired
+        );
+        let started = entered.recv_timeout(WAIT).unwrap();
+        let pending = assert_activation_owned(&fixture, &runtime, &request.request_id, &started);
+        let old = started.handle.unwrap();
+        let canonical = fixture.canonical_files();
+        alert_marker(&old, "superseded-old-buffered");
+        let stop_error = runtime
+            .stop_worker_scoped(scope, &worker_ref, None)
+            .unwrap_err();
+        assert!(
+            stop_error
+                .to_string()
+                .contains("restore factory is still pending"),
+            "Stop must time out joining the activation task"
+        );
+        let remove_error = runtime
+            .delete_worker_scoped(scope, &worker_ref)
+            .unwrap_err();
+        assert!(
+            remove_error
+                .to_string()
+                .contains("pending stop reconciliation"),
+            "Remove must be fenced by the unresolved Stop"
+        );
+        assert!(Arc::ptr_eq(
+            &pending,
+            &fixture
+                .backend
+                .pending_restore(&worker_ref)
+                .unwrap()
+                .unwrap()
+        ));
+        assert_ne!(
+            runtime.worker_detail(&worker_ref).unwrap().status,
+            crate::catalog::WorkerStatus::Stopped
+        );
+        assert!(restore_owner(&runtime, &worker_ref, &request.request_id)["receipt"].is_null());
+        assert!(pending.task_in_flight.load(Ordering::Acquire));
+        assert!(!old.protocol_is_closed());
+        assert!(fixture.backend.workers.lock().unwrap().is_empty());
+        assert!(
+            fixture
+                .backend
+                .factory
+                .observation_hub
+                .get(&worker_ref)
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .factory
+                .restore_faults
+                .executions
+                .load(Ordering::SeqCst),
+            1
+        );
+        release.release();
+        drop(pause);
+        runtime.test_wait_restore_continuation(
+            &worker_ref,
+            started.operation_id,
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            runtime.worker_detail(&worker_ref).unwrap().status,
+            crate::catalog::WorkerStatus::Stopped
+        );
+        assert!(old.protocol_is_closed());
+        assert!(!pending.task_in_flight.load(Ordering::Acquire));
+        assert!(
+            pending.task.try_lock().unwrap().is_none(),
+            "late task must have been joined"
+        );
+        fixture.assert_released();
+        // Confirmed Stop deletes the fixture orphan upload, not its Session,
+        // metadata, or committed entries. Keep the comparison content-private.
+        let mut stopped_canonical = canonical.clone();
+        let orphans = canonical
+            .keys()
+            .filter(|path| {
+                path.parent() == Some(std::path::Path::new("session/artifacts/paste"))
+                    && path.to_string_lossy().ends_with(".file.json")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(orphans.len(), 1);
+        stopped_canonical.remove(&orphans[0]);
+        assert!(
+            fixture.canonical_files() == stopped_canonical,
+            "Stop must remove only the disposable orphan upload"
+        );
+        let superseded = restore_owner(&runtime, &worker_ref, &request.request_id);
+        assert_eq!(superseded["receipt"]["state"], "superseded");
+        assert!(
+            runtime
+                .read_worker_observation_events(
+                    &worker_ref,
+                    crate::observation::WorkerObservationCursor::zero()
+                )
+                .unwrap()
+                .is_empty()
+        );
+        // Only a fresh request from a fresh observation may create a replacement.
+        let replacement_request = runtime.test_restore_request(&worker_ref);
+        assert_ne!(replacement_request.request_id, request.request_id);
+        let accepted = runtime
+            .restore_worker_operation_scoped(scope, &worker_ref, replacement_request)
+            .unwrap();
+        assert_eq!(accepted.state, server_api::WorkerRestoreState::Accepted);
+        let replacement = fixture.backend.workers.lock().unwrap()[&worker_ref].clone();
+        assert!(!old.same_controller(&replacement.handle));
+        {
+            // Even a late retirement callback identifies the actual old
+            // Controller, never whichever execution now has this WorkerRef.
+            let lock = fixture.backend.worker_lock(&worker_ref).unwrap();
+            let _guard = lock.lock().unwrap();
+            fixture
+                .backend
+                .factory
+                .deactivate_stopped_controller(&worker_ref, &old)
+                .unwrap();
+            let (_, observed_state, _) = fixture
+                .backend
+                .factory
+                .observation_hub
+                .get(&worker_ref)
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                &observed_state,
+                &replacement.handle.shared_state
+            ));
+        }
+        assert_ne!(replacement.restore_operation_id, Some(started.operation_id));
+        assert_eq!(fixture.backend.workers.lock().unwrap().len(), 1);
+        assert_eq!(
+            fixture
+                .backend
+                .factory
+                .restore_faults
+                .executions
+                .load(Ordering::SeqCst),
+            2
+        );
+        // A diagnostic event on the retained old endpoint must never enter the
+        // new bridge, and a command on that closed endpoint must not be rerouted.
+        alert_marker(&old, "superseded-old-after-replacement");
+        let old_command = old.clone();
+        assert!(
+            fixture
+                .backend
+                .run_on_adapter_runtime(async move {
+                    old_command
+                        .send(Method::Pause {
+                            command: protocol::WorkerCommandEnvelope::new(77111),
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+                .is_err()
+        );
+        assert_eq!(
+            replacement.handle.shared_state.snapshot().state,
+            protocol::WorkerState::Idle
+        );
+        let transport = fixture
+            .backend
+            .clone()
+            .attach_worker_protocol(&worker_ref)
+            .unwrap();
+        transport.validate().unwrap();
+        let mut observations = runtime.subscribe_worker_observation().unwrap();
+        alert_marker(&replacement.handle, "replacement-live-barrier");
+        fixture
+            .backend
+            .run_on_adapter_runtime(async move {
+                tokio::time::timeout(WAIT, async {
+                    loop {
+                        let observed = observations.recv().await.unwrap();
+                        assert!(!is_marker(&observed.payload, "superseded-old-buffered"));
+                        assert!(!is_marker(
+                            &observed.payload,
+                            "superseded-old-after-replacement"
+                        ));
+                        if is_marker(&observed.payload, "replacement-live-barrier") {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| "replacement bridge did not progress".to_string())?;
+                Ok(())
+            })
+            .unwrap();
+        let events = runtime
+            .read_worker_observation_events(
+                &worker_ref,
+                crate::observation::WorkerObservationCursor::zero(),
+            )
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| is_marker(&event.payload, "superseded-old-buffered")
+                    || is_marker(&event.payload, "superseded-old-after-replacement"))
+        );
+        assert!(
+            fixture.canonical_files() == stopped_canonical,
+            "replacement changed canonical Session content"
+        );
+        drop(transport);
+        drop(replacement);
+        drop(pending);
+        runtime
+            .stop_worker_scoped(scope, &worker_ref, None)
+            .unwrap();
+        fixture.assert_released();
+        fixture.assert_quiet();
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn postcommit_activation_timeout_gate_release_on_panic_keeps_owned_task_bounded() {
+        let mut fixture = Fixture::no_model();
+        Arc::get_mut(&mut fixture.backend)
+            .unwrap()
+            .spawn_restore_timeout = Duration::from_millis(250);
+        let runtime = stopped_runtime(&fixture);
+        let worker_ref = fixture.request.worker_ref.clone();
+        let scope = fixture.request.workspace_scope.as_ref().unwrap();
+        let request = runtime.test_restore_request(&worker_ref);
+        let (release, entered) = activation_gate(&fixture, true);
+        let first = runtime
+            .restore_worker_operation_scoped(scope, &worker_ref, request.clone())
+            .unwrap();
+        assert_eq!(
+            first.state,
+            server_api::WorkerRestoreState::ReconciliationRequired
+        );
+        let started = entered.recv_timeout(WAIT).unwrap();
+        let pending = assert_activation_owned(&fixture, &runtime, &request.request_id, &started);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _release_on_unwind = release;
+            panic!("intentional test-owner unwind at activation gate");
+        }));
+        assert!(panic.is_err());
+        runtime.test_wait_restore_continuation(&worker_ref, started.operation_id, WAIT);
+        assert_eq!(
+            restore_owner(&runtime, &worker_ref, &request.request_id)["receipt"]["state"],
+            "accepted"
+        );
+        assert!(!pending.task_in_flight.load(Ordering::Acquire));
+        assert!(pending.task.try_lock().unwrap().is_none());
+        assert!(
+            started
+                .handle
+                .as_ref()
+                .unwrap()
+                .same_controller(&fixture.backend.workers.lock().unwrap()[&worker_ref].handle)
+        );
+        drop(pending);
+        runtime
+            .stop_worker_scoped(scope, &worker_ref, None)
+            .unwrap();
+        assert!(started.handle.unwrap().protocol_is_closed());
+        fixture.assert_released();
+        fixture.assert_quiet();
+    }
+
     #[test]
     #[serial_test::serial(worker_allocation)]
     fn startup_fault_recovery_retains_cleanup_or_committed_reconstruction_without_repost() {

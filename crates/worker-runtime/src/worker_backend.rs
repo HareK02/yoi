@@ -847,8 +847,41 @@ struct RestoreFaults {
     factory_entered: Mutex<Option<mpsc::Sender<()>>>,
     prepared_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     prepared_entered: Mutex<Option<mpsc::Sender<protocol::Event>>>,
+    activation_effects_gate: Mutex<Option<RestoreActivationGate>>,
+    activation_started_gate: Mutex<Option<RestoreActivationGate>>,
     cleanup_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     cleanup_entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+// Test-only synchronization inside the real postcommit candidate, not around
+// factory preparation. The receiver is moved into the operation-owned task;
+// dropping the one-shot sender releases it even during test unwinding.
+#[cfg(test)]
+struct RestoreActivationGate {
+    entered: mpsc::Sender<RestoreActivationEvidence>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct RestoreActivationEvidence {
+    operation_id: crate::execution::WorkerLifecycleOperationId,
+    candidate: usize,
+    snapshot: Event,
+    handle: Option<WorkerHandle>,
+    allocation_retained: bool,
+}
+
+#[cfg(test)]
+impl RestoreActivationGate {
+    async fn wait(self, evidence: RestoreActivationEvidence) {
+        let _ = self.entered.send(evidence);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), self.release)
+                .await
+                .is_ok(),
+            "test did not release the internal restore activation gate"
+        );
+    }
 }
 
 impl ProfileRuntimeWorkerFactory {
@@ -2631,6 +2664,8 @@ impl RuntimeRestoreCandidate for ProfileRestoreCandidate {
     }
 
     async fn activate(&mut self) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
+        #[cfg(test)]
+        let candidate_identity = self as *const Self as usize;
         let prepared = self.prepared.as_mut().ok_or_else(|| {
             RuntimeRestoreFailure::unproven(
                 RuntimeRestoreStage::Controller,
@@ -2668,6 +2703,30 @@ impl RuntimeRestoreCandidate for ProfileRestoreCandidate {
             .expect("retained restore owner")
             .allocation = prepared.allocation_cleanup();
         #[cfg(test)]
+        {
+            let gate = self
+                .factory
+                .restore_faults
+                .activation_effects_gate
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(gate) = gate {
+                let allocation_retained = self.factory.failed_restore_resources.lock().unwrap()
+                    [&self.request.worker_ref]
+                    .allocation
+                    .is_some();
+                gate.wait(RestoreActivationEvidence {
+                    operation_id: self.request.operation_id,
+                    candidate: candidate_identity,
+                    snapshot: prepared.snapshot().clone(),
+                    handle: None,
+                    allocation_retained,
+                })
+                .await;
+            }
+        }
+        #[cfg(test)]
         if self
             .factory
             .restore_checkpoint(RuntimeRestoreStage::ActivationEffects)
@@ -2703,6 +2762,30 @@ impl RuntimeRestoreCandidate for ProfileRestoreCandidate {
         }
         .await
         .map_err(map_error)?;
+        #[cfg(test)]
+        {
+            let gate = self
+                .factory
+                .restore_faults
+                .activation_started_gate
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(gate) = gate {
+                let allocation_retained = self.factory.failed_restore_resources.lock().unwrap()
+                    [&self.request.worker_ref]
+                    .allocation
+                    .is_some();
+                gate.wait(RestoreActivationEvidence {
+                    operation_id: self.request.operation_id,
+                    candidate: candidate_identity,
+                    snapshot: started.streams.snapshot_event.clone(),
+                    handle: Some(started.controller.handle.clone()),
+                    allocation_retained,
+                })
+                .await;
+            }
+        }
         self.prepared = None;
         self.factory
             .failed_restore_resources
