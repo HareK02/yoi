@@ -708,6 +708,14 @@
       pointer-events: none;
       transition-delay: 0s, var(--sidebar-motion-duration);
     }
+    /* Preview is visual only: closed content stays inert until committed.
+       Pointer events remain with the original touch target during the drag. */
+    .app-shell.sidebar-swiping .sidebar-frame {
+      transform: translateX(var(--sidebar-swipe-offset));
+      visibility: visible;
+      transition: none;
+      pointer-events: none;
+    }
     .sidebar-frame .sidebar-frame-content,
     .sidebar-frame.folded .sidebar-frame-content {
       transform: none;

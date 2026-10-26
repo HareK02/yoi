@@ -114,8 +114,9 @@
 {/if}
 <div
   use:swipeSidebar={{
-    enabled: () => mobileLayout.current && authenticated,
-    isOpen: () => sidebarOpen,
+    enabled: mobileLayout.current && authenticated,
+    open: sidebarOpen,
+    route: page.url.href,
     setOpen: (open) => { sidebarTransientOpen = open; },
   }}
   class="app-shell" class:sidebar-open={sidebarOpen} class:sidebar-hover-mode={sidebarMode === 'hover'}
