@@ -834,7 +834,10 @@ mod tests {
         assert!(common.contains("target-only movement preserves approval"));
         assert!(reviewer.contains("complete linked MR/result snapshot"));
         assert!(reviewer.contains("Submit `ReviewMergeRequest` once"));
-        assert!(reviewer.contains("without modifying implementation files"));
+        assert!(reviewer.contains("Bash"));
+        assert!(reviewer.contains("Git"));
+        assert!(!reviewer.contains("without modifying"));
+        assert!(!reviewer.contains("read-only"));
     }
 
     #[test]
