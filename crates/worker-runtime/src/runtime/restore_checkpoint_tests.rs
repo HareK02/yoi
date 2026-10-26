@@ -14,6 +14,7 @@ fn checkpoint_stages_ack_canonical_decision_and_eof_resumes_same_operation_once(
         (RestoreCheckpointStage::PreparedNotCommitted, "release"),
         (RestoreCheckpointStage::CommittedPreterminal, "eof"),
         (RestoreCheckpointStage::CommittedPreterminal, "timeout"),
+        (RestoreCheckpointStage::ActivatedPreterminal, "release"),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let backend = Arc::new(TestExecutionBackend::default());
@@ -79,14 +80,19 @@ fn checkpoint_stages_ack_canonical_decision_and_eof_resumes_same_operation_once(
             match stage {
                 RestoreCheckpointStage::PreparedNotCommitted =>
                     RestoreCheckpointCommit::NotCommitted,
-                RestoreCheckpointStage::CommittedPreterminal => RestoreCheckpointCommit::Committed,
+                RestoreCheckpointStage::CommittedPreterminal
+                | RestoreCheckpointStage::ActivatedPreterminal => RestoreCheckpointCommit::Committed,
             }
         );
         assert_eq!(
             backend.restore_operation_ids.lock().unwrap().as_slice(),
             &[ack.operation_id]
         );
-        assert!(backend.activation_operation_ids.lock().unwrap().is_empty());
+        if stage == RestoreCheckpointStage::ActivatedPreterminal {
+            assert_eq!(backend.activation_operation_ids.lock().unwrap().as_slice(), &[ack.operation_id]);
+        } else {
+            assert!(backend.activation_operation_ids.lock().unwrap().is_empty());
+        }
         assert!(received.try_recv().is_err());
         let canonical = runtime_store(&runtime)
             .read_durable_worker_record(&worker.worker_ref)
@@ -255,6 +261,8 @@ fn checkpoint_verification_requires_canonical_worker_operation_commit_and_absent
             .restore_checkpoint_ack(&config, &worker.worker_ref, operation)
             .is_err()
     );
+    config.stage = RestoreCheckpointStage::ActivatedPreterminal;
+    assert!(runtime.restore_checkpoint_ack(&config, &worker.worker_ref, operation).is_err());
     config.stage = RestoreCheckpointStage::PreparedNotCommitted;
     runtime_store(&runtime).fail_next_worker_reconcile_sync();
     assert!(

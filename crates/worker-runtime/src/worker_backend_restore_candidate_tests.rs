@@ -559,6 +559,40 @@ mod restore_candidate {
 
     #[test]
     #[serial_test::serial(worker_allocation)]
+    fn restore_run_reclamation_preserves_live_allocation_owner() {
+        let fixture = Fixture::no_model();
+        let factory = fixture.backend.factory.clone();
+        let request = fixture.request.clone();
+        let run = factory
+            .worker_restore_run_dir(&request.worker_ref, request.operation_id)
+            .unwrap();
+        fs::create_dir_all(&run).unwrap();
+        fs::write(run.join("retained-owner"), b"live allocation").unwrap();
+        let name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&request.worker_ref);
+        let allocation = worker::runtime::worker_allocation::install_top_level(
+            name.clone(), std::process::id(), run.join("worker.sock"),
+            Vec::new(), fixture.segment_id,
+        ).unwrap();
+        let failure = fixture.backend.run_on_adapter_runtime(async move {
+            match factory.prepare_restore(request).await {
+                Err(failure) => Ok(failure),
+                Ok(_) => Err("live allocation unexpectedly reclaimed".into()),
+            }
+        }).unwrap();
+        assert_eq!(failure.stage, RuntimeRestoreStage::Controller);
+        assert_eq!(failure.cause, "restore run directory still has an allocation owner");
+        let table = worker::runtime::worker_allocation::LockFileGuard::open(
+            &worker::runtime::worker_allocation::default_allocation_path().unwrap(),
+        ).unwrap();
+        assert_eq!(table.data().find(&name).unwrap().pid, std::process::id());
+        assert_eq!(fs::read(run.join("retained-owner")).unwrap(), b"live allocation");
+        drop(table);
+        drop(allocation);
+        fixture.assert_quiet();
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
     fn session_availability_requires_attachable_current_controller() {
         let fixture = Fixture::no_model();
         let worker_ref = &fixture.request.worker_ref;

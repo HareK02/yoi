@@ -75,7 +75,8 @@ impl Runtime {
         };
         let expected = match config.stage {
             RestoreCheckpointStage::PreparedNotCommitted => RestoreCommitFact::NotCommitted,
-            RestoreCheckpointStage::CommittedPreterminal => RestoreCommitFact::Committed,
+            RestoreCheckpointStage::CommittedPreterminal
+            | RestoreCheckpointStage::ActivatedPreterminal => RestoreCommitFact::Committed,
         };
         if config.worker_id != worker_ref.worker_id
             || pending.operation_id != operation_id

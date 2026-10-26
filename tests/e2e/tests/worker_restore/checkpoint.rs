@@ -1,4 +1,6 @@
 //! Opt-in real-process checkpoint cases; never substitute the featureless lane.
+#[path = "repair.rs"]
+mod repair;
 use super::*;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};

@@ -2871,6 +2871,12 @@ impl Runtime {
                                 sanitize_worker_create_failure_message(&error),
                             ));
                         }
+                        #[cfg(feature = "restore-checkpoints")]
+                        self.test_restore_checkpoint(
+                            worker_ref,
+                            operation_id,
+                            crate::restore_checkpoints::RestoreCheckpointStage::ActivatedPreterminal,
+                        );
                         if let Err(error) =
                             self.activate_restore_candidate_context(worker_ref, &candidate_context)
                         {

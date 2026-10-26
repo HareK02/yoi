@@ -25,6 +25,7 @@ pub const MAX_RESTORE_CHECKPOINT_ACK_BYTES: usize = 4096;
 pub enum RestoreCheckpointStage {
     PreparedNotCommitted,
     CommittedPreterminal,
+    ActivatedPreterminal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
