@@ -118,8 +118,8 @@ function boundary() {
   };
 }
 for (const policy of [true, false, "error", "loading"] as const) {
-  test(`public home keeps login and exposes registration only for confirmed allowed policy: ${policy}`, async () => {
-    const { state, workspaceCalls } = boundary();
+  test(`public home routes account actions through login without loading registration policy: ${policy}`, async () => {
+    const { state, fetcher, workspaceCalls } = boundary();
     state.policy = policy;
     state.catalogStatus = 401;
     render(Home);
@@ -128,22 +128,15 @@ for (const policy of [true, false, "error", "loading"] as const) {
         "href",
       ),
     ).toBe("/login");
-    if (policy === true) {
-      expect(
-        (await screen.findByRole("link", { name: "Create a new account" }))
-          .getAttribute("href"),
-      ).toBe("/register?returnTo=%2Fdashboard");
-    } else {
-      await screen.findByText(
-        policy === false
-          ? /registration is disabled/
-          : policy === "error"
-          ? /availability is unknown/
-          : /Checking registration/,
-      );
-      expect(screen.queryByRole("link", { name: "Create a new account" }))
-        .toBeNull();
-    }
+    expect(screen.queryByRole("link", { name: "Create a new account" }))
+      .toBeNull();
+    expect(
+      screen.queryByRole("link", { name: "Activate an account with a code" }),
+    )
+      .toBeNull();
+    expect(screen.queryByText(/registration/i)).toBeNull();
+    expect(fetcher.mock.calls.map(([path]) => String(path)))
+      .not.toContain("/api/auth/registration-policy");
     expect(workspaceCalls()).toEqual([]);
     expect(screen.queryByText(/No accessible Workspaces/)).toBeNull();
   });

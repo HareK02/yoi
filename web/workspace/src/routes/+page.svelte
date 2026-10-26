@@ -2,7 +2,6 @@
   import { onMount } from 'svelte';
   import { BrowserAuth } from '#lib/workspace/auth/browser-session.svelte.ts';
   import { AUTHENTICATED_HOME } from '#lib/workspace/auth/routes.ts';
-  import RegistrationLink from '#lib/workspace/auth/RegistrationLink.svelte';
   import AccountNavigation from '#lib/workspace/auth/AccountNavigation.svelte';
   import '#lib/workspace/auth/auth-page.css';
 
@@ -31,8 +30,6 @@
       {#key auth.actor.account_id}<AccountNavigation />{/key}
     {:else}
       <a class="entry-primary" href="/login">Log in</a>
-      <RegistrationLink />
-      <a href="/activate">Activate an account with a code</a>
     {/if}
   </section>
 </div>

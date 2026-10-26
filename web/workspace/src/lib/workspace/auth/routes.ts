@@ -80,8 +80,9 @@ export function isPublicPage(path: string): boolean {
     .includes(path);
 }
 
+// 認証入口は独立したshellを使う。本人用/accountは通常のナビゲーションを残す。
 export function isAuthPage(path: string): boolean {
-  return ["/login", "/register", "/account", "/activate", "/login/device"]
+  return ["/login", "/register", "/activate", "/login/device"]
     .includes(path);
 }
 

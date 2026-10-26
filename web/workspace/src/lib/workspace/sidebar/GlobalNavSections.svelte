@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { WorkspaceCatalogRecord } from "#lib/workspace/api/workspace-catalog.ts";
   import { onMount, untrack } from "svelte";
-  import { loadWhoami } from "#lib/workspace/auth/api.ts";
+  import { browserSession } from '#lib/workspace/auth/session-state.ts';
   import { loadHostingAccess, SESSION_CHANGED_EVENT } from "#lib/workspace/auth/hosting.ts";
 
   let mounted = $state(false);
@@ -12,8 +12,9 @@
     const request = ++accessRequest;
     isAdmin = false;
     try {
-      const whoami = await loadWhoami();
-      if (request !== accessRequest || !whoami.actor) return;
+      // ページが確認したsessionを共有し、Sidebar追加でwhoamiの再取得を増やさない。
+      const session = browserSession.snapshot;
+      if (session.kind !== 'ready' || !session.value.actor) return;
       const access = await loadHostingAccess();
       if (request === accessRequest) isAdmin = access.is_admin;
     } catch {
@@ -24,10 +25,12 @@
   onMount(() => {
     mounted = true;
     const refresh = () => { void refreshAccess(); };
+    const unsubscribe = browserSession.subscribe(refresh);
     window.addEventListener(SESSION_CHANGED_EVENT, refresh);
     window.addEventListener("focus", refresh);
     return () => {
       ++accessRequest;
+      unsubscribe();
       window.removeEventListener(SESSION_CHANGED_EVENT, refresh);
       window.removeEventListener("focus", refresh);
     };

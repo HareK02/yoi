@@ -1344,7 +1344,7 @@ Deno.test("Root chrome owns global navigation and scoped override slots", async 
       globalNavSections.includes("workspace.display_name") &&
       globalNavSections.includes("workspaceHref(workspace.workspace_id)") &&
       rootLayout.includes("observeDeferred(() => data.deferredCatalog") &&
-      rootLayout.includes("workspaces={catalog.data?.accessibleWorkspaces ?? null}") &&
+      rootLayout.includes("workspaces={page.url.pathname === '/' ? null : catalog.data?.accessibleWorkspaces ?? null}") &&
       rootLayout.includes("workspaceError={catalog.data?.workspaceCatalogError}") &&
       rootLayoutLoad.includes("deferredCatalog: settle(") &&
       rootLayoutLoad.includes("listWorkspaces(fetch)") &&

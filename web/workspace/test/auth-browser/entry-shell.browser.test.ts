@@ -11,7 +11,7 @@ import {
 const root = resolve(import.meta.dirname!, "../../../..");
 const origin = "http://127.0.0.1:15411";
 const ready = (page: Page, name: string) =>
-  page.getByRole("link", { name, exact: true }).waitFor();
+  page.getByRole("main").getByRole("link", { name, exact: true }).waitFor();
 async function focusWithoutSessionCheck(page: Page) {
   let checks = 0;
   const observe = (request: import("playwright").Request) => {
@@ -123,6 +123,24 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
                 await page.getByRole("heading", { name: "Yoi", exact: true })
                   .waitFor();
                 await ready(page, "Log in");
+                assertEquals(
+                  await page.locator(
+                    'a[href^="/register"], a[href="/activate"]',
+                  ).count(),
+                  0,
+                );
+                assertEquals(await page.getByText(/registration/i).count(), 0);
+                await page.getByRole("link", { name: "Log in", exact: true })
+                  .click();
+                await page.getByRole("button", { name: "Log in with passkey" })
+                  .waitFor();
+                assertEquals(
+                  await page.getByRole("link", {
+                    name: "Activate an account with a code",
+                    exact: true,
+                  }).getAttribute("href"),
+                  "/activate",
+                );
                 if (mode === "anonymous") {
                   await ready(page, "Create a new account");
                   assertEquals(
@@ -139,19 +157,6 @@ Deno.test("public entry isolates Workspace authority and authenticated dashboard
                       ? /availability is unknown/
                       : /Checking registration/,
                   ).waitFor();
-                  assertEquals(
-                    await page.getByRole("link", {
-                      name: "Create a new account",
-                    }).count(),
-                    0,
-                  );
-                }
-                await page.getByRole("link", { name: "Log in", exact: true })
-                  .click();
-                await page.getByRole("button", { name: "Log in with passkey" })
-                  .waitFor();
-                if (mode === "policy-disabled") {
-                  await page.getByText(/registration is disabled/).waitFor();
                   assertEquals(
                     await page.getByRole("link", {
                       name: "Create a new account",

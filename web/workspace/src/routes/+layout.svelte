@@ -6,7 +6,8 @@
   // MobileはSidebarがHeader下を占有する間mainをinertにし、隠れた内容へfocusを入れない。
   import SessionBoundary from '#lib/workspace/auth/SessionBoundary.svelte';
   import { page } from '$app/state';
-  import { setContext } from 'svelte';
+  import { onMount, setContext } from 'svelte';
+  import { browserSession, type SessionSnapshot } from '#lib/workspace/auth/session-state.ts';
   import { MediaQuery } from 'svelte/reactivity';
   import WorkspaceAlerts from '#lib/workspace/alerts/WorkspaceAlerts.svelte';
   import { dismissWorkspaceAlert, pushWorkspaceAlert } from '#lib/workspace/alerts/store.ts';
@@ -28,8 +29,11 @@
 
   let { children, data }: LayoutProps = $props();
   import { isAuthPage } from '#lib/workspace/auth/routes.ts';
-  // 公開入口・認証・Workspace選択はWorkspace catalogやSidebarに依存しない。
-  const standalone = $derived(page.url.pathname === '/' || page.url.pathname === '/dashboard' || isAuthPage(page.url.pathname) || page.url.pathname.startsWith('/hosting/'));
+  let session = $state<SessionSnapshot>(browserSession.snapshot);
+  onMount(() => browserSession.subscribe((snapshot) => { session = snapshot; }));
+  const authenticated = $derived(session.kind === 'ready' && session.value.session.kind === 'authenticated');
+  // 公開トップのSidebarはログイン確認済みの場合だけ表示する。
+  const standalone = $derived((page.url.pathname === '/' && !authenticated) || page.url.pathname === '/dashboard' || isAuthPage(page.url.pathname) || page.url.pathname.startsWith('/hosting/'));
   const catalog = observeDeferred(() => data.deferredCatalog, () => 'catalog');
   let sidebar = $state<SidebarSnippet | null>(null);
   const sidebarOverrides = createOverrideStack<SidebarSnippet>((activeSidebar) => {
@@ -103,7 +107,10 @@
     {@render children()}
   </main>
 {:else}
-<WorkspaceAlerts />
+<!-- Workspace通知は公開トップや本人設定へ持ち越さない。 -->
+{#if page.url.pathname !== '/' && page.url.pathname !== '/account'}
+  <WorkspaceAlerts />
+{/if}
 <div class="app-shell" class:sidebar-open={sidebarOpen} class:sidebar-hover-mode={sidebarMode === 'hover'}>
   <SidebarFrame
     mode={sidebarMode}
@@ -115,7 +122,7 @@
     <GlobalSidebar
       currentPath={page.url.pathname}
       content={sidebar}
-      workspaces={catalog.data?.accessibleWorkspaces ?? null}
+      workspaces={page.url.pathname === '/' ? null : catalog.data?.accessibleWorkspaces ?? null}
       workspaceError={catalog.data?.workspaceCatalogError}
     />
   </SidebarFrame>

@@ -10,7 +10,6 @@ Deno.test("authentication and hosting shells never require Workspace catalog aut
       "/activate",
       "/login",
       "/register",
-      "/account",
       "/login/device",
       "/hosting/accounts",
       "/hosting/settings",
@@ -44,6 +43,45 @@ Deno.test("authentication and hosting shells never require Workspace catalog aut
       data: { accessibleWorkspaces: [], workspaceCatalogError: null },
     });
     assertEquals(calls, 0);
+    browserSession.dispose();
+    globalThis.fetch = original;
+  }
+});
+
+Deno.test("account loads its sidebar catalog without making catalog failure an admission failure", async () => {
+  const original = globalThis.fetch;
+  try {
+    globalThis.fetch = async () =>
+      Response.json({
+        actor: {
+          user_id: "u",
+          account_id: "a",
+          handle: "alice",
+          display_name: "Alice",
+          auth_method: "browser_session",
+        },
+        session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+      });
+    browserSession.invalidate();
+    let calls = 0;
+    const event = {
+      depends: () => {},
+      url: new URL("https://workspace.test/account"),
+      fetch: () => {
+        calls++;
+        throw new Error("Workspace catalog unavailable");
+      },
+    } as unknown as Parameters<typeof load>[0];
+    const result = await load(event);
+    assertEquals(calls, 1);
+    assertEquals(await result.deferredCatalog, {
+      ok: true,
+      data: {
+        accessibleWorkspaces: [],
+        workspaceCatalogError: "Workspace catalog unavailable",
+      },
+    });
+  } finally {
     browserSession.dispose();
     globalThis.fetch = original;
   }

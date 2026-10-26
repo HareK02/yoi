@@ -10,7 +10,22 @@ function assertEquals(
     );
   }
 }
-import { authEntryUrl, loginUrl, safeReturnTo } from "./routes.ts";
+import {
+  authEntryUrl,
+  isAuthPage,
+  isPublicPage,
+  loginUrl,
+  safeReturnTo,
+} from "./routes.ts";
+
+Deno.test("account uses the authenticated app shell, not the standalone auth entry shell", () => {
+  assertEquals(String(isAuthPage("/account")), "false");
+  assertEquals(String(isPublicPage("/account")), "false");
+  for (const path of ["/login", "/register", "/activate", "/login/device"]) {
+    assertEquals(String(isAuthPage(path)), "true", path);
+    assertEquals(String(isPublicPage(path)), "true", path);
+  }
+});
 
 Deno.test("return destination preserves query and fragment only on known app screens", () => {
   for (

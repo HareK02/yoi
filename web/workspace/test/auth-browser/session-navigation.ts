@@ -289,7 +289,9 @@ export async function sessionNavigation(
         if (active) {
           await at(page, target);
           assertEquals(await page.getByText("Loading session…").count(), 0);
-          await page.getByRole("link", { name: "Dashboard / Workspaces" })
+          await page.getByRole("main").getByRole("link", {
+            name: "Dashboard / Workspaces",
+          })
             .click();
           await at(page, loginTarget("/dashboard"));
           await login(page);

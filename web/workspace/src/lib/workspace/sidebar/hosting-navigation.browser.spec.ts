@@ -4,9 +4,11 @@ import { afterEach, expect, test, vi } from "vitest";
 import GlobalNavSections from "./GlobalNavSections.svelte";
 import { authUser } from "#lib/workspace/auth/api.test-fixtures.ts";
 import { notifySessionChanged } from "#lib/workspace/auth/hosting.ts";
+import { browserSession } from "#lib/workspace/auth/session-state.ts";
 
 afterEach(() => {
   cleanup();
+  browserSession.invalidate();
   vi.unstubAllGlobals();
 });
 
@@ -33,6 +35,7 @@ for (
       throw new Error(`Unexpected API ${input}`);
     });
     vi.stubGlobal("fetch", fetcher);
+    await browserSession.refresh();
     render(GlobalNavSections, {
       currentPath: "/hosting/settings",
       workspaces: [],
@@ -45,6 +48,7 @@ for (
       expect(link.getAttribute("href")).toBe("/hosting/settings");
       expect(link.getAttribute("aria-current")).toBe("page");
       actor = false;
+      await browserSession.refresh();
       notifySessionChanged();
       await waitFor(() =>
         expect(screen.queryByRole("link", { name: "Hosting settings" }))

@@ -22,7 +22,7 @@
     "generate:ticket-api": "cd ../.. && cargo run -q -p server-api --example generate_ticket_api_types",
     "check:ticket-api": "cd ../.. && cargo run -q -p server-api --example generate_ticket_api_types -- --check",
     "test:browser:auth": "mkdir -p ../../target/web-ux/tmp && TMPDIR=../../target/web-ux/tmp deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/auth-browser/auth-shell.browser.test.ts",
-    "test:browser:entry": "mkdir -p ../../target/web-ux/tmp && TMPDIR=../../target/web-ux/tmp deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/auth-browser/entry-shell.browser.test.ts"
+    "test:browser:entry": "mkdir -p ../../target/web-ux/tmp && TMPDIR=../../target/web-ux/tmp deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/auth-browser/entry-shell.browser.test.ts test/auth-browser/sidebar-shell.browser.test.ts"
   },
   "imports": {
     "@sveltejs/adapter-static": "npm:@sveltejs/adapter-static@4.0.0",
