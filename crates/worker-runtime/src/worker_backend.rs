@@ -2974,11 +2974,22 @@ impl ProfileRuntimeWorkerFactory {
 
 #[derive(Clone)]
 struct RuntimeExecutionTaskScope {
+    #[cfg(feature = "ws-server")]
+    protocol_bridge: Arc<Mutex<Option<RuntimeProtocolBridge>>>,
     tasks: Arc<Mutex<Vec<Arc<RuntimeExecutionTask>>>>,
     shutdown_admission: Arc<tokio::sync::Mutex<Option<RuntimeShutdownAdmission>>>,
     // Actual unconnected Controllers whose cleanup failed, owned by this
     // execution's structured scope. No WorkerRef index or presence mirror.
     cleanup_candidates: Arc<Mutex<Vec<Arc<RuntimeWorkerExecution>>>>,
+}
+
+// The structured scope owns the original paired subscription until task admission
+// succeeds. A failed spawn drops a future, not the committed Controller's streams.
+#[cfg(feature = "ws-server")]
+struct RuntimeProtocolBridge {
+    context: crate::execution::WorkerExecutionContext,
+    streams: Arc<Mutex<Option<worker::ipc::protocol_session::WorkerProtocolSessionStreams>>>,
+    snapshot_pending: bool,
 }
 
 // Evidence for one exact command on this actual Controller. Keep the send task
@@ -3062,6 +3073,8 @@ struct RuntimeExecutionTaskCompletion {
 impl RuntimeExecutionTaskScope {
     fn new(controller_task: tokio::task::JoinHandle<()>) -> Self {
         let scope = Self {
+            #[cfg(feature = "ws-server")]
+            protocol_bridge: Arc::default(),
             tasks: Arc::new(Mutex::new(Vec::new())),
             shutdown_admission: Arc::new(tokio::sync::Mutex::new(None)),
             cleanup_candidates: Arc::new(Mutex::new(Vec::new())),
@@ -4117,6 +4130,108 @@ where
         )
     }
 
+    #[cfg(feature = "ws-server")]
+    fn start_protocol_bridge(
+        &self,
+        handle: &WorkerHandle,
+        worker_state: &Arc<RwLock<protocol::WorkerStateSnapshot>>,
+        tasks: &RuntimeExecutionTaskScope,
+    ) -> Result<(), String> {
+        let mut retained = tasks
+            .protocol_bridge
+            .lock()
+            .map_err(|_| "protocol bridge owner lock is poisoned".to_string())?;
+        let Some(bridge) = retained.as_mut() else {
+            return Ok(());
+        };
+        if bridge.snapshot_pending {
+            let streams = bridge
+                .streams
+                .lock()
+                .map_err(|_| "protocol streams lock is poisoned")?;
+            bridge
+                .context
+                .publish_protocol_event(
+                    streams
+                        .as_ref()
+                        .expect("unadmitted bridge owns streams")
+                        .snapshot_event
+                        .clone(),
+                )
+                .map_err(|error| error.to_string())?;
+            bridge.snapshot_pending = false;
+        }
+        let streams = bridge.streams.clone();
+        let bridge_context = bridge.context.clone();
+        let bridge_worker_state = worker_state.clone();
+        let bridge_handle = handle.clone();
+        let task = self.spawn_on_adapter_runtime(async move {
+            let streams = streams.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take().expect("one bridge consumes the paired subscription");
+            let mut events = streams.events;
+            let mut entry_events = streams.log_entries;
+                loop {
+                    tokio::select! {
+                        event = events.recv() => {
+                            match event {
+                                Ok(event) => {
+                                    let mut event = match bridge_handle.alerter.freshen_event(event) {
+                                        Ok(event) => event,
+                                        Err(_) => {
+                                            // This shared bridge also carries Worker state: do
+                                            // not terminate it when a bounded Alert was evicted.
+                                            // Replace both receivers with the paired snapshot.
+                                            let replacement = subscribe_worker_protocol_session(&bridge_handle);
+                                            events = replacement.events;
+                                            entry_events = replacement.log_entries;
+                                            let mut snapshot = replacement.snapshot_event;
+                                            if apply_protocol_worker_state(&bridge_worker_state, &mut snapshot).is_err() {
+                                                break;
+                                            }
+                                            let _ = bridge_context.publish_protocol_event(snapshot);
+                                            for alert in replacement.alert_snapshot {
+                                                let _ = bridge_context.publish_protocol_event(Event::Alert(alert));
+                                            }
+                                            continue;
+                                        }
+                                    };
+                                    match apply_protocol_worker_state(&bridge_worker_state, &mut event) {
+                                        Ok(true) => {
+                                            let _ = bridge_context.publish_protocol_event(event);
+                                        }
+                                        Ok(false) => {}
+                                        Err(message) => {
+                                            let _ = bridge_context.publish_protocol_event(Event::Error {
+                                                code: protocol::ErrorCode::Internal,
+                                                message: format!("worker state stream rejected: {message}"),
+                                            });
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                        entry = entry_events.recv() => {
+                            match entry {
+                                Ok(entry) => {
+                                    if let Some(event) = live_log_entry_event(entry) {
+                                        let _ = bridge_context.publish_protocol_event(event);
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    }
+                }
+        })?;
+        tasks.push("protocol bridge", task, true);
+        *retained = None;
+        Ok(())
+    }
+
     // Own the actual Controller scope before doing any fallible connection work.
     // The split also permits testing duplicate cleanup with an already-pending
     // real admission waiter, rather than relying on a scheduler race.
@@ -4189,121 +4304,60 @@ where
             };
         }
         #[cfg(feature = "ws-server")]
+        let bridge_failure = {
+            *tasks
+                .protocol_bridge
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RuntimeProtocolBridge {
+                context: bridge_context,
+                streams: Arc::new(Mutex::new(Some(streams))),
+                snapshot_pending: restore_operation_id.is_some(),
+            });
+            self.start_protocol_bridge(&handle, &worker_state, &tasks)
+                .err()
+        };
+        #[cfg(not(feature = "ws-server"))]
+        let bridge_failure: Option<String> = None;
+        if let Some(message) = bridge_failure
+            .as_ref()
+            .filter(|_| restore_operation_id.is_none())
         {
-            let mut events = streams.events;
-            let mut entry_events = streams.log_entries;
-            let bridge_worker_state = worker_state.clone();
-            let bridge_handle = handle.clone();
-            let initial_publication = if restore_operation_id.is_some() {
-                bridge_context
-                    .publish_protocol_event(streams.snapshot_event.clone())
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            } else {
-                Ok(())
-            };
-            let bridge_task = match initial_publication.and_then(|()| self.spawn_on_adapter_runtime(async move {
-                loop {
-                    tokio::select! {
-                        event = events.recv() => {
-                            match event {
-                                Ok(event) => {
-                                    let mut event = match bridge_handle.alerter.freshen_event(event) {
-                                        Ok(event) => event,
-                                        Err(_) => {
-                                            // This shared bridge also carries Worker state: do
-                                            // not terminate it when a bounded Alert was evicted.
-                                            // Replace both receivers with the paired snapshot.
-                                            let replacement = subscribe_worker_protocol_session(&bridge_handle);
-                                            events = replacement.events;
-                                            entry_events = replacement.log_entries;
-                                            let mut snapshot = replacement.snapshot_event;
-                                            if apply_protocol_worker_state(&bridge_worker_state, &mut snapshot).is_err() {
-                                                break;
-                                            }
-                                            let _ = bridge_context.publish_protocol_event(snapshot);
-                                            for alert in replacement.alert_snapshot {
-                                                let _ = bridge_context.publish_protocol_event(Event::Alert(alert));
-                                            }
-                                            continue;
-                                        }
-                                    };
-                                    match apply_protocol_worker_state(&bridge_worker_state, &mut event) {
-                                        Ok(true) => {
-                                            let _ = bridge_context.publish_protocol_event(event);
-                                        }
-                                        Ok(false) => {}
-                                        Err(message) => {
-                                            let _ = bridge_context.publish_protocol_event(Event::Error {
-                                                code: protocol::ErrorCode::Internal,
-                                                message: format!("worker state stream rejected: {message}"),
-                                            });
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
-                        entry = entry_events.recv() => {
-                            match entry {
-                                Ok(entry) => {
-                                    if let Some(event) = live_log_entry_event(entry) {
-                                        let _ = bridge_context.publish_protocol_event(event);
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
+            drop(workers);
+            let cleanup = self.cleanup_unconnected_controller(
+                &handle,
+                &shutdown,
+                &tasks,
+                &shutdown_requested,
+                &worker_state,
+            );
+            let result = WorkerExecutionResult::errored(
+                operation,
+                match &cleanup {
+                    Ok(()) => message.clone(),
+                    Err(cleanup) => format!("{message}; controller cleanup failed: {cleanup}"),
+                },
+            );
+            return match cleanup {
+                Ok(()) => WorkerExecutionSpawnResult::RolledBack(result),
+                Err(_) => {
+                    self.retain_uncertain_unconnected_controller(
+                        &worker_ref,
+                        handle,
+                        shutdown,
+                        shutdown_requested,
+                        tasks,
+                        worker_state,
+                        workspace_client,
+                        restore_operation_id,
+                        workdir_attachment_statuses.clone(),
+                    );
+                    WorkerExecutionSpawnResult::ReconciliationRequired {
+                        result,
+                        worker_state: None,
+                        workdir_attachments: workdir_attachment_statuses,
                     }
                 }
-            })) {
-                Ok(task) => task,
-                Err(message) => {
-                    drop(workers);
-                    let cleanup = self.cleanup_unconnected_controller(
-                        &handle,
-                        &shutdown,
-                        &tasks,
-                        &shutdown_requested,
-                        &worker_state,
-                    );
-                    let result = WorkerExecutionResult::errored(
-                        operation,
-                        match &cleanup {
-                            Ok(()) => message,
-                            Err(cleanup) => {
-                                format!("{message}; controller cleanup failed: {cleanup}")
-                            }
-                        },
-                    );
-                    return match cleanup {
-                        Ok(()) => WorkerExecutionSpawnResult::RolledBack(result),
-                        Err(_) => {
-                            let retained_state = worker_state.read().ok().map(|state| state.clone());
-                            self.retain_uncertain_unconnected_controller(
-                                &worker_ref,
-                                handle,
-                                shutdown,
-                                shutdown_requested,
-                                tasks,
-                                worker_state,
-                                workspace_client,
-                                restore_operation_id,
-                                workdir_attachment_statuses.clone(),
-                            );
-                            WorkerExecutionSpawnResult::ReconciliationRequired {
-                                result,
-                                worker_state: retained_state,
-                                workdir_attachments: workdir_attachment_statuses,
-                            }
-                        }
-                    };
-                }
             };
-            tasks.push("protocol bridge", bridge_task, true);
         }
         #[cfg(not(feature = "ws-server"))]
         {
@@ -4332,6 +4386,15 @@ where
             },
         );
 
+        if let Some(message) = bridge_failure {
+            // A committed restore retains this exact execution and its unadmitted
+            // paired bridge in the structured scope. Cleanup is not rollback.
+            return WorkerExecutionSpawnResult::ReconciliationRequired {
+                result: WorkerExecutionResult::errored(operation, message),
+                worker_state: Some(connected_worker_state),
+                workdir_attachments: workdir_attachment_statuses,
+            };
+        }
         WorkerExecutionSpawnResult::Connected {
             worker_state: connected_worker_state,
             workdir_attachments: workdir_attachment_statuses,
@@ -6188,7 +6251,20 @@ where
                 WorkerExecutionSpawnResult::Connected { .. } => {
                     self.remove_pending_restore(worker_ref)?
                 }
-                other => return Err(format!("restore activation connection failed: {other:?}")),
+                other => {
+                    if self
+                        .workers
+                        .lock()
+                        .map_err(|_| "worker registry lock is poisoned")?
+                        .get(worker_ref)
+                        .is_some_and(|execution| {
+                            execution.restore_operation_id == Some(operation_id)
+                        })
+                    {
+                        self.remove_pending_restore(worker_ref)?;
+                    }
+                    return Err(format!("restore activation connection failed: {other:?}"));
+                }
             }
         }
         let workers = self
@@ -6206,6 +6282,8 @@ where
         {
             return Err("restored Worker protocol endpoint is not attachable".into());
         }
+        #[cfg(feature = "ws-server")]
+        self.start_protocol_bridge(&execution.handle, &execution.worker_state, &execution.tasks)?;
         self.factory.activate_restored_controller(
             worker_ref,
             execution.workspace_id.as_deref(),
