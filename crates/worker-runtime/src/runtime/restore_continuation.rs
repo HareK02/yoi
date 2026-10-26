@@ -330,6 +330,22 @@ impl Runtime {
             Err(std::sync::TryLockError::WouldBlock) => return Ok(Step::Contended),
             Err(_) => return Err(RuntimeError::StatePoisoned),
         };
+        let stop_is_owned = {
+            let mut state = self.lock()?;
+            state.ensure_running()?;
+            state.refresh_uncertain_worker_write(worker_ref)?;
+            let worker = state.worker(worker_ref)?;
+            worker.pending_stop.is_some()
+                && worker
+                    .pending_restore
+                    .is_some_and(|pending| pending.operation_id == operation)
+        };
+        if stop_is_owned {
+            // Stop supersedes publication, not ownership of late resources.
+            // Retain this same continuation until its cleanup is confirmed.
+            self.reconcile_pending_stop_under_lock(worker_ref)?;
+            return Ok(Step::Finished);
+        }
         let (backend, pending) = {
             let mut state = self.lock()?;
             state.ensure_running()?;

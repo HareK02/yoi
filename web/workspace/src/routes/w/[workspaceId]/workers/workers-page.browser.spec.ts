@@ -427,7 +427,12 @@ test.each(["switch", "dispose"] as const)(
 );
 
 function restoreResponse(
-  state: "accepted" | "rejected" | "rolled_back" | "reconciliation_required",
+  state:
+    | "accepted"
+    | "rejected"
+    | "rolled_back"
+    | "superseded"
+    | "reconciliation_required",
   extra = {},
 ) {
   return Response.json({
@@ -461,7 +466,13 @@ test.each(["stopped", "idle", "running", "paused", "unavailable"] as const)(
 );
 
 test.each(
-  ["accepted", "rejected", "rolled_back", "reconciliation_required"] as const,
+  [
+    "accepted",
+    "rejected",
+    "rolled_back",
+    "superseded",
+    "reconciliation_required",
+  ] as const,
 )(
   "Restore classifies %s through the shared helper, without treating HTTP 200 as success",
   async (state) => {
@@ -470,10 +481,11 @@ test.each(
     const unsubscribe = workspaceAlerts.subscribe((value) => {
       alerts = value;
     });
-    const request = vi.fn(async (input: RequestInfo | URL) =>
-      String(input).endsWith("/restore")
-        ? restoreResponse(state)
-        : Response.json(plan())
+    const request = vi.fn(
+      async (input: RequestInfo | URL, _init?: RequestInit) =>
+        String(input).endsWith("/restore")
+          ? restoreResponse(state)
+          : Response.json(plan()),
     );
     vi.stubGlobal("fetch", request);
     render(WorkersPage, { data: data() });
@@ -498,6 +510,16 @@ test.each(
         screen.queryByRole("button", { name: "Retry Restore Catalog worker" }),
       ),
     ).toBe(state === "reconciliation_required");
+    expect(
+      request.mock.calls.filter(([url]) => String(url).endsWith("/restore")),
+    ).toHaveLength(1);
+    expect(
+      request.mock.calls
+        .filter(([, init]) => init?.method && init.method !== "GET")
+        .map(([url]) => String(url)),
+    ).toEqual([
+      "/api/w/page-test/runtimes/runtime-a/workers/worker-a/restore",
+    ]);
     // The response is never projected into the catalog by the action.
     expect(screen.getByRole("cell", { name: "stopped" })).toBeTruthy();
     unsubscribe();

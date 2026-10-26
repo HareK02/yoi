@@ -225,6 +225,28 @@ impl RuntimeWorkerRestoreResult {
         }
     }
 
+    fn superseded_by_stop(pending: Option<PendingWorkerRestore>) -> Self {
+        let (code, message) = match pending {
+            Some(pending) if pending.commit == RestoreCommitFact::Committed => (
+                "worker_restore_committed_then_stopped",
+                "Restore committed, then its execution was stopped; prior durable effects are not rolled back",
+            ),
+            Some(pending) if pending.commit == RestoreCommitFact::LegacyUnknown => (
+                "worker_restore_unknown_decision_then_stopped",
+                "Restore execution was stopped; its earlier commit decision remains unknown",
+            ),
+            Some(pending) if pending.source_repair_possible => (
+                "worker_restore_source_repair_then_stopped",
+                "Uncommitted Restore was stopped; prior source repair effects may remain",
+            ),
+            _ => (
+                "worker_restore_superseded_by_stop",
+                "Worker Restore was superseded by confirmed Stop",
+            ),
+        };
+        Self::failed(WorkerRestoreState::Superseded, code, message)
+    }
+
     fn into_legacy_result(self) -> Result<WorkerDetail, RuntimeError> {
         match (self.state, self.worker) {
             (WorkerRestoreState::Accepted, Some(worker)) => Ok(worker),
@@ -3684,11 +3706,7 @@ impl Runtime {
             worker.restore_guard.rotate();
             worker
                 .restore_guard
-                .finish(RuntimeWorkerRestoreResult::failed(
-                    WorkerRestoreState::RolledBack,
-                    "worker_restore_superseded_by_stop",
-                    "Worker Restore was superseded by Stop",
-                ));
+                .finish(RuntimeWorkerRestoreResult::superseded_by_stop(None));
             state.persist_worker_record(&worker)?;
             let ack = WorkerLifecycleAck {
                 worker_ref: worker_ref.clone(),
@@ -4250,6 +4268,7 @@ impl Runtime {
             WorkerRestoreState::Accepted => return Ok(()),
             WorkerRestoreState::Rejected
             | WorkerRestoreState::RolledBack
+            | WorkerRestoreState::Superseded
             | WorkerRestoreState::ReconciliationRequired => {}
         }
         let mut state = self.lock()?;
@@ -4363,6 +4382,8 @@ impl Runtime {
                 worker_ref.worker_id
             )));
         }
+        let restore_receipt =
+            RuntimeWorkerRestoreResult::superseded_by_stop(candidate.pending_restore);
         candidate.pending_stop = None;
         candidate.pending_restore = None;
         if let Some(context) = candidate.restore_candidate_context.take() {
@@ -4373,13 +4394,7 @@ impl Runtime {
         candidate.worker_state = None;
         candidate.restore_intent = WorkerRestoreIntent::Explicit;
 
-        candidate
-            .restore_guard
-            .finish(RuntimeWorkerRestoreResult::failed(
-                WorkerRestoreState::RolledBack,
-                "worker_restore_superseded_by_stop",
-                "Worker Restore was superseded by Stop",
-            ));
+        candidate.restore_guard.finish(restore_receipt);
         candidate.internal_workers.clear();
         state.persist_worker_record(&candidate)?;
         let ack = WorkerLifecycleAck {
@@ -15135,6 +15150,104 @@ mod tests {
                     .settle_restore_rollback(&worker.worker_ref, &rollback)
                     .is_err()
             );
+        }
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn stop_retains_restore_decision_evidence_in_superseded_receipt_across_restart() {
+        // Component scope: real Runtime admission and durable store; execution
+        // is substituted. Controller shutdown races are covered separately.
+        for (commit, repaired, code) in [
+            (
+                RestoreCommitFact::NotCommitted,
+                false,
+                "worker_restore_superseded_by_stop",
+            ),
+            (
+                RestoreCommitFact::NotCommitted,
+                true,
+                "worker_restore_source_repair_then_stopped",
+            ),
+            (
+                RestoreCommitFact::Committed,
+                false,
+                "worker_restore_committed_then_stopped",
+            ),
+            (
+                RestoreCommitFact::LegacyUnknown,
+                true,
+                "worker_restore_unknown_decision_then_stopped",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
+                .with_runtime_id("stop-restore-evidence");
+            let backend = Arc::new(TestExecutionBackend::default());
+            let runtime =
+                Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone())
+                    .unwrap();
+            runtime.store_config_bundle(test_bundle()).unwrap();
+            let worker = runtime
+                .create_worker(task_request("stop restore evidence"))
+                .unwrap();
+            runtime.stop_worker(&worker.worker_ref, None).unwrap();
+            let request = runtime.test_restore_request(&worker.worker_ref);
+            *backend.restore_result.lock().unwrap() = Some(WorkerExecutionSpawnResult::Errored(
+                WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Restore,
+                    "publication not confirmed",
+                ),
+            ));
+            assert_eq!(
+                runtime
+                    .restore_worker_operation(&worker.worker_ref, request.clone())
+                    .unwrap()
+                    .state,
+                WorkerRestoreState::ReconciliationRequired
+            );
+            {
+                // Fixture represents each canonical checkpoint. Stop must keep
+                // its classification, rather than infer rollback from cleanup.
+                let mut state = runtime.lock().unwrap();
+                let record = state.worker_mut(&worker.worker_ref).unwrap();
+                let pending = record.pending_restore.as_mut().unwrap();
+                pending.commit = commit;
+                pending.source_repair_possible = repaired;
+                state.persist_worker(&worker.worker_id).unwrap();
+            }
+            runtime.stop_worker(&worker.worker_ref, None).unwrap();
+            let receipt = runtime
+                .restore_worker_operation(&worker.worker_ref, request.clone())
+                .unwrap();
+            assert_eq!(receipt.state, WorkerRestoreState::Superseded);
+            assert_eq!(receipt.reason_code.as_deref(), Some(code));
+            assert!(receipt.worker.is_none());
+            drop(runtime);
+            let restarted_backend = Arc::new(TestExecutionBackend::default());
+            let restarted =
+                Runtime::with_fs_store_and_execution_backend(options, restarted_backend.clone())
+                    .unwrap();
+            assert_eq!(
+                restarted
+                    .restore_worker_operation(&worker.worker_ref, request.clone())
+                    .unwrap(),
+                receipt
+            );
+            assert_eq!(*restarted_backend.restore_count.lock().unwrap(), 0);
+            assert_eq!(
+                restarted.worker_detail(&worker.worker_ref).unwrap().status,
+                WorkerStatus::Stopped
+            );
+            let mut input = WorkerInput::user("must not revive");
+            input.kind = WorkerInputKind::UserIfIdle;
+            assert!(restarted.send_input(&worker.worker_ref, input).is_err());
+            let mut stale = request;
+            stale.request_id = "new-intent-with-old-token".into();
+            assert!(matches!(
+                restarted.restore_worker_operation(&worker.worker_ref, stale),
+                Err(RuntimeError::RestoreObservationConflict { .. })
+            ));
         }
     }
 

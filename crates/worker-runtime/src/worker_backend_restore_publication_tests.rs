@@ -96,6 +96,43 @@ mod publication {
 
     #[test]
     #[serial_test::serial(worker_allocation)]
+    fn stop_timeout_retains_autonomous_late_cleanup_and_blocks_remove_until_confirmed() {
+        let mut fixture = Fixture::no_model();
+        Arc::get_mut(&mut fixture.backend).unwrap().spawn_restore_timeout = Duration::from_millis(250);
+        let runtime = stopped_runtime(&fixture);
+        let pause = runtime.test_pause_restore_continuation();
+        let worker_ref = fixture.request.worker_ref.clone();
+        let scope = fixture.request.workspace_scope.as_ref().unwrap();
+        let request = runtime.test_restore_request(&worker_ref);
+        let before = fixture.canonical_files();
+        let (release, prepared) = prepared_gate(&fixture);
+        let result = runtime.restore_worker_operation_scoped(scope, &worker_ref, request.clone()).unwrap();
+        prepared.recv_timeout(WAIT).unwrap();
+        assert_eq!(result.state, server_api::WorkerRestoreState::ReconciliationRequired);
+        let operation = durable_operation(&runtime, &worker_ref).unwrap();
+        assert!(runtime.stop_worker_scoped(scope, &worker_ref, None).is_err());
+        assert!(runtime.delete_worker_scoped(scope, &worker_ref).is_err());
+        assert!(fixture.backend.workers.lock().unwrap().is_empty());
+        release.notify_one();
+        drop(pause);
+        runtime.test_wait_restore_continuation(&worker_ref, operation.operation_id, WAIT);
+        assert_eq!(runtime.worker_detail(&worker_ref).unwrap().status, crate::catalog::WorkerStatus::Stopped);
+        assert!(durable_operation(&runtime, &worker_ref).is_none());
+        assert!(fixture.backend.pending_restore(&worker_ref).unwrap().is_none());
+        assert!(fixture.backend.workers.lock().unwrap().is_empty());
+        assert!(fixture.backend.factory.observation_hub.get(&worker_ref).is_none());
+        assert!(fixture.backend.clone().attach_worker_protocol(&worker_ref).is_err());
+        let receipt = runtime.restore_worker_operation_scoped(scope, &worker_ref, request).unwrap();
+        assert_eq!(receipt.state, server_api::WorkerRestoreState::Superseded);
+        assert_eq!(receipt.reason_code.as_deref(), Some("worker_restore_superseded_by_stop"));
+        assert_eq!(fixture.canonical_files(), before);
+        fixture.assert_released();
+        fixture.assert_quiet();
+        assert!(runtime.delete_worker_scoped(scope, &worker_ref).unwrap().deleted);
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
     fn autonomous_late_prepare_and_publication_settle_without_another_request() {
         for publication_failure in [false, true] {
             let mut fixture = Fixture::no_model();

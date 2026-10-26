@@ -173,12 +173,13 @@ function restoredWorker() {
     restore_observation_token: "generation-b",
   };
 }
-Deno.test("Restore parser preserves all four states and optional Workspace summary", () => {
+Deno.test("Restore parser preserves typed outcomes and optional Workspace summary", () => {
   for (
     const state of [
       "accepted",
       "rejected",
       "rolled_back",
+      "superseded",
       "reconciliation_required",
     ]
   ) {

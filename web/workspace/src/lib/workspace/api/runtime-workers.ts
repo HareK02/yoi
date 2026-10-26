@@ -363,8 +363,13 @@ export function parseWorkerRestoreResponse(
   exactKeys(result, ["state"], ["diagnostics", "worker"], `${path}.result`);
   const state = boundedString(result.state, `${path}.result.state`);
   if (
-    !["accepted", "rejected", "rolled_back", "reconciliation_required"]
-      .includes(state)
+    ![
+      "accepted",
+      "rejected",
+      "rolled_back",
+      "superseded",
+      "reconciliation_required",
+    ].includes(state)
   ) {
     fail(`${path}.result.state`, "has an unknown value");
   }

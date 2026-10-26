@@ -694,6 +694,9 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
                         server_api::WorkerRestoreState::RolledBack => {
                             runtime_api::WorkerRestoreState::RolledBack
                         }
+                        server_api::WorkerRestoreState::Superseded => {
+                            runtime_api::WorkerRestoreState::Superseded
+                        }
                         server_api::WorkerRestoreState::ReconciliationRequired => {
                             runtime_api::WorkerRestoreState::ReconciliationRequired
                         }
@@ -743,6 +746,9 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
                 }
                 server_api::WorkerRestoreState::RolledBack => {
                     runtime_api::WorkerRestoreState::RolledBack
+                }
+                server_api::WorkerRestoreState::Superseded => {
+                    runtime_api::WorkerRestoreState::Superseded
                 }
                 server_api::WorkerRestoreState::ReconciliationRequired => {
                     runtime_api::WorkerRestoreState::ReconciliationRequired

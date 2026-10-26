@@ -1119,39 +1119,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_resume_does_not_observe_or_open_retained_state() {
-        let lifecycle = FakeBackendWorkerLifecycle {
-            restore_response: restore_response(BackendWorkerRestoreState::Rejected),
-            observation: session_observation(serde_json::json!({
-                "availability": "unavailable",
-                "reason": "retention_missing",
-                "message": "must not be opened"
-            })),
-            calls: std::sync::Mutex::new(Vec::new()),
-        };
-        let target = client::BackendRuntimeTarget::new(
-            "http://127.0.0.1:3000",
-            "workspace-a",
-            "runtime-a",
-            "worker-a",
-        );
+    async fn settled_nonaccepted_resume_does_not_retry_observe_or_open_retained_state() {
+        for state in [
+            BackendWorkerRestoreState::Rejected,
+            BackendWorkerRestoreState::RolledBack,
+            BackendWorkerRestoreState::Superseded,
+        ] {
+            let lifecycle = FakeBackendWorkerLifecycle {
+                restore_response: restore_response(state),
+                observation: session_observation(serde_json::json!({
+                    "availability": "unavailable",
+                    "reason": "retention_missing",
+                    "message": "must not be opened"
+                })),
+                calls: std::sync::Mutex::new(Vec::new()),
+            };
+            let target = client::BackendRuntimeTarget::new(
+                "http://127.0.0.1:3000",
+                "workspace-a",
+                "runtime-a",
+                "worker-a",
+            );
 
-        let error = prepare_selected_worker(
-            &lifecycle,
-            target,
-            BackendWorkerPickerIntent::Resume,
-            Some(client::BackendWorkerRestoreRequest {
-                expected_observation_token: "observed-worker-state".into(),
-                request_id: "resume-operation".into(),
-            }),
-            |_| Ok(false),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+            let error = prepare_selected_worker(
+                &lifecycle,
+                target,
+                BackendWorkerPickerIntent::Resume,
+                Some(client::BackendWorkerRestoreRequest {
+                    expected_observation_token: "observed-worker-state".into(),
+                    request_id: "resume-operation".into(),
+                }),
+                |_| panic!("settled nonaccepted restore must not offer recovery retry"),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
 
-        assert!(error.contains("Rejected"));
-        assert_eq!(*lifecycle.calls.lock().unwrap(), ["restore"]);
+            assert!(error.contains(&format!("{state:?}")));
+            assert_eq!(*lifecycle.calls.lock().unwrap(), ["restore"]);
+        }
     }
 
     #[test]
@@ -1176,6 +1182,7 @@ mod tests {
         for state in [
             BackendWorkerRestoreState::Rejected,
             BackendWorkerRestoreState::RolledBack,
+            BackendWorkerRestoreState::Superseded,
             BackendWorkerRestoreState::ReconciliationRequired,
         ] {
             let mut response = restore_response(state);

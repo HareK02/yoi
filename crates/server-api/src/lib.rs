@@ -544,8 +544,9 @@ pub struct WorkspaceWorkerSessionHistoryResponse {
 /// comparisons do not replace admission checks under the Runtime operation lock; conflicts do
 /// not trigger automatic token replacement.
 /// [`WorkerRestoreState`] Accepted means Restore committed, not that the subsequent run succeeded.
-/// Distinguish read-only preflight Rejected, confirmed RolledBack after side effects, and
-/// ReconciliationRequired needing settled-state checks. Response loss does not imply rollback.
+/// Distinguish read-only preflight Rejected, confirmed RolledBack after side effects,
+/// Superseded by a later Stop, and ReconciliationRequired needing settled-state checks.
+/// Response loss does not imply rollback.
 #[api(reqwest, axum, openapi)]
 pub trait ServerApi {
     #[get("/health", status = 200, error_status = 400)]
@@ -10566,8 +10567,8 @@ pub enum WorkerOperationState {
 /// Cross-layer outcome of an explicit Worker restore operation.
 ///
 /// `Rejected` is reserved for read-only preflight failures. Once live restore
-/// work starts, failure is either a confirmed `RolledBack` operation or a
-/// `ReconciliationRequired` result whose commit state must be reread/retried.
+/// work starts, distinguish confirmed `RolledBack`, unresolved
+/// `ReconciliationRequired`, and a later Stop's `Superseded` outcome.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -10575,6 +10576,8 @@ pub enum WorkerRestoreState {
     Accepted,
     Rejected,
     RolledBack,
+    /// A later Stop superseded this restore; neither rollback nor prior Accepted is asserted.
+    Superseded,
     ReconciliationRequired,
 }
 
@@ -12668,6 +12671,7 @@ mod tests {
             (WorkerRestoreState::Accepted, "accepted"),
             (WorkerRestoreState::Rejected, "rejected"),
             (WorkerRestoreState::RolledBack, "rolled_back"),
+            (WorkerRestoreState::Superseded, "superseded"),
             (
                 WorkerRestoreState::ReconciliationRequired,
                 "reconciliation_required",
