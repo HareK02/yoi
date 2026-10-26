@@ -564,6 +564,7 @@ fn extraction_rejects_nonstopped_pending_schema_and_metadata_mismatch() {
                         operation_id: WorkerLifecycleOperationId::new(),
                         mode: PersistedWorkerRestoreMode::Explicit,
                         commit: crate::runtime::RestoreCommitFact::NotCommitted,
+                        source_repair_possible: false,
                         request: request(),
                         binding: None,
                         last_settled_status: WorkerStatus::Stopped,

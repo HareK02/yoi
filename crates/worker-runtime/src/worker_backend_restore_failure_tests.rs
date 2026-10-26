@@ -688,6 +688,7 @@ fn profile_restore_prior_effects_survive_read_only_reprepare_failure() {
     for read_stage in [RuntimeRestoreStage::Metadata, RuntimeRestoreStage::Reconstruction] {
         let activation_stage = RuntimeRestoreStage::ActivationEffects;
         let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
+    let _pause = fixture.runtime.test_pause_restore_continuation();
         let (artifacts, pinned) = fixture.pin_unclaimed_restore_upload();
         fixture.fail(activation_stage);
         let request = fixture
@@ -882,6 +883,7 @@ fn profile_restore_prior_effects_from_pending_head_repair_survive_read_only_repr
 #[serial_test::serial(worker_allocation)]
 fn profile_restore_prior_effects_survive_rebuilt_candidate_pre_effect_activation_failure() {
     let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
+    let _pause = fixture.runtime.test_pause_restore_continuation();
     let (artifacts, pinned) = fixture.pin_unclaimed_restore_upload();
     fixture.fail(RuntimeRestoreStage::ActivationEffects);
     let request = fixture

@@ -242,6 +242,9 @@ enum WorkerExecutionPublicationState {
 #[derive(Clone)]
 pub struct WorkerExecutionContext {
     worker_ref: WorkerRef,
+    restore_progress: Option<Arc<dyn Fn(WorkerLifecycleOperationId) + Send + Sync>>,
+    restore_repair_authorizer:
+        Option<Arc<dyn Fn(WorkerLifecycleOperationId) -> Result<(), RuntimeError> + Send + Sync>>,
     #[cfg(feature = "ws-server")]
     observation_publisher: WorkerObservationPublisher,
     #[cfg(feature = "ws-server")]
@@ -256,6 +259,8 @@ impl WorkerExecutionContext {
     ) -> Self {
         Self {
             worker_ref,
+            restore_progress: None,
+            restore_repair_authorizer: None,
             observation_publisher,
             publication_state: Arc::new(Mutex::new(WorkerExecutionPublicationState::Active)),
         }
@@ -268,6 +273,8 @@ impl WorkerExecutionContext {
     ) -> Self {
         Self {
             worker_ref,
+            restore_progress: None,
+            restore_repair_authorizer: None,
             observation_publisher,
             publication_state: Arc::new(Mutex::new(WorkerExecutionPublicationState::Pending(
                 VecDeque::new(),
@@ -277,12 +284,56 @@ impl WorkerExecutionContext {
 
     #[cfg(not(feature = "ws-server"))]
     pub(crate) fn new(worker_ref: WorkerRef) -> Self {
-        Self { worker_ref }
+        Self {
+            worker_ref,
+            restore_progress: None,
+            restore_repair_authorizer: None,
+        }
     }
 
     #[cfg(not(feature = "ws-server"))]
     pub(crate) fn candidate(worker_ref: WorkerRef) -> Self {
-        Self { worker_ref }
+        Self {
+            worker_ref,
+            restore_progress: None,
+            restore_repair_authorizer: None,
+        }
+    }
+
+    pub(crate) fn with_restore_repair_authorizer(
+        mut self,
+        authorizer: Arc<
+            dyn Fn(WorkerLifecycleOperationId) -> Result<(), RuntimeError> + Send + Sync,
+        >,
+    ) -> Self {
+        self.restore_repair_authorizer = Some(authorizer);
+        self
+    }
+
+    pub(crate) fn authorize_restore_source_repair(
+        &self,
+        operation: WorkerLifecycleOperationId,
+    ) -> Result<(), RuntimeError> {
+        match &self.restore_repair_authorizer {
+            Some(authorizer) => authorizer(operation),
+            // Direct factory/component users own their source repair separately;
+            // only Runtime contexts carry a Runtime aggregate authority callback.
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn with_restore_progress(
+        mut self,
+        progress: Arc<dyn Fn(WorkerLifecycleOperationId) + Send + Sync>,
+    ) -> Self {
+        self.restore_progress = Some(progress);
+        self
+    }
+
+    pub(crate) fn restore_progressed(&self, operation_id: WorkerLifecycleOperationId) {
+        if let Some(progress) = &self.restore_progress {
+            progress(operation_id);
+        }
     }
 
     pub fn worker_ref(&self) -> &WorkerRef {
@@ -424,6 +475,7 @@ pub struct WorkerExecutionSpawnRequest {
 /// Request passed to a [`WorkerExecutionBackend`] when restoring a persisted Worker.
 #[derive(Clone, Debug)]
 pub struct WorkerExecutionRestoreRequest {
+    pub source_repair_possible: bool,
     pub operation_id: WorkerLifecycleOperationId,
     pub worker_ref: WorkerRef,
     pub request: crate::catalog::CreateWorkerRequest,
@@ -565,6 +617,15 @@ impl fmt::Debug for WorkerProtocolTransport {
     }
 }
 
+/// Derived resource disposition for an existing restore owner. Not durable
+/// authority: Runtime must reread its decision before choosing any action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreRecoveryDisposition {
+    InFlight,
+    Continue,
+    Discard,
+}
+
 /// The connection selects this backend; WorkerRef identifies an execution,
 /// never a capability or authorization token.
 pub trait WorkerExecutionBackend: Send + Sync + 'static {
@@ -640,6 +701,16 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         _operation_id: WorkerLifecycleOperationId,
         _worker_ref: &WorkerRef,
     ) -> Option<WorkerExecutionSpawnResult> {
+        None
+    }
+
+    /// Opt in to Runtime-owned continuation. Waiting is signaled through the
+    /// original execution context; no callback may wait for Runtime locks.
+    fn restore_recovery_disposition(
+        &self,
+        _operation_id: WorkerLifecycleOperationId,
+        _worker_ref: &WorkerRef,
+    ) -> Option<RestoreRecoveryDisposition> {
         None
     }
 
@@ -936,6 +1007,15 @@ impl WorkerExecutionBackendRef {
     ) -> Option<WorkerExecutionSpawnResult> {
         self.backend
             .completed_restore_failure(operation_id, worker_ref)
+    }
+
+    pub(crate) fn restore_recovery_disposition(
+        &self,
+        operation_id: WorkerLifecycleOperationId,
+        worker_ref: &WorkerRef,
+    ) -> Option<RestoreRecoveryDisposition> {
+        self.backend
+            .restore_recovery_disposition(operation_id, worker_ref)
     }
 
     pub(crate) fn reconcile_restore(

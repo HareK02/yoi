@@ -370,10 +370,23 @@ async fn prepare_restore_operation<F: RuntimeWorkerFactory + ?Sized>(
     factory: &F,
     request: WorkerExecutionRestoreRequest,
 ) -> Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure> {
+    let prior_effects = request.source_repair_possible;
     factory.preflight_restore(&request).await.map_err(|_| {
-        RuntimeRestoreFailure::refused(RuntimeRestoreStage::Preflight, "restore preflight refused")
+        let mut failure = RuntimeRestoreFailure::refused(
+            RuntimeRestoreStage::Preflight,
+            "restore preflight refused",
+        );
+        failure.durable_effects_possible = prior_effects;
+        failure
     })?;
-    let repaired = factory.recover_restore_source(&request).await?;
+    let repaired = factory
+        .recover_restore_source(&request)
+        .await
+        .map_err(|mut failure| {
+            failure.durable_effects_possible |= prior_effects;
+            failure
+        })?
+        || prior_effects;
     let candidate = factory
         .prepare_restore(request)
         .await
@@ -804,6 +817,7 @@ struct RestoreFaults {
     cleanup_fail: AtomicBool,
     socket_failure: AtomicBool,
     publication_failure: AtomicBool,
+    publication_attempts: std::sync::atomic::AtomicUsize,
     factory_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     factory_entered: Mutex<Option<mpsc::Sender<()>>>,
     prepared_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -2626,6 +2640,11 @@ impl RuntimeRestoreCandidate for ProfileRestoreCandidate {
         }
         let started = async {
             #[cfg(test)]
+            self.factory
+                .restore_faults
+                .publication_attempts
+                .fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
             if self
                 .factory
                 .restore_faults
@@ -3120,6 +3139,7 @@ struct RuntimeWorkerExecution {
 struct PendingRuntimeRestore {
     request: WorkerExecutionRestoreRequest,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task_in_flight: AtomicBool,
     result: Mutex<Option<Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure>>>,
     activated: Mutex<Option<Result<RuntimeWorkerController, RuntimeRestoreFailure>>>,
     // Monotonic for this operation, not a claim that its current candidate has
@@ -3131,7 +3151,24 @@ struct PendingRuntimeRestore {
     failure: Mutex<Option<String>>,
 }
 
+struct RestoreTaskCompletion(Arc<PendingRuntimeRestore>);
+
+impl Drop for RestoreTaskCompletion {
+    fn drop(&mut self) {
+        self.0.task_in_flight.store(false, Ordering::Release);
+        self.0
+            .request
+            .context
+            .restore_progressed(self.0.request.operation_id);
+    }
+}
+
 impl PendingRuntimeRestore {
+    fn task_completion(self: &Arc<Self>) -> RestoreTaskCompletion {
+        self.task_in_flight.store(true, Ordering::Release);
+        RestoreTaskCompletion(self.clone())
+    }
+
     fn owns_prepared_candidate(&self) -> bool {
         matches!(
             self.result
@@ -3455,7 +3492,9 @@ where
             if task.is_some() {
                 return Err("restore task has not been joined".into());
             }
+            let completion = pending.task_completion();
             *task = Some(self.spawn_on_adapter_runtime(async move {
+                let _completion = completion;
                 if resume_activation
                     && !failure.needs_cleanup()
                     && (failure.durable_effects_possible
@@ -5340,6 +5379,7 @@ where
                 let pending = Arc::new(PendingRuntimeRestore {
                     request: request.clone(),
                     task: tokio::sync::Mutex::new(None),
+                    task_in_flight: AtomicBool::new(false),
                     result: Mutex::new(None),
                     activated: Mutex::new(None),
                     activation_started: AtomicBool::new(false),
@@ -5361,7 +5401,9 @@ where
                 resources.insert(worker_ref.clone(), Arc::clone(&pending));
                 let factory = Arc::clone(&self.factory);
                 let result_owner = Arc::clone(&pending);
+                let completion = pending.task_completion();
                 let task = self.spawn_on_adapter_runtime(async move {
+                    let _completion = completion;
                     let result = match prepare_restore_operation(factory.as_ref(), request.clone())
                         .await
                     {
@@ -5551,6 +5593,42 @@ where
         }
     }
 
+    fn restore_recovery_disposition(
+        &self,
+        operation_id: crate::execution::WorkerLifecycleOperationId,
+        worker_ref: &WorkerRef,
+    ) -> Option<crate::execution::RestoreRecoveryDisposition> {
+        use crate::execution::RestoreRecoveryDisposition as D;
+        let pending = self.pending_restore(worker_ref).ok().flatten();
+        Some(match pending {
+            Some(pending) if pending.request.operation_id == operation_id => {
+                if pending.task_in_flight.load(Ordering::Acquire) {
+                    D::InFlight
+                } else if pending
+                    .discard_result
+                    .lock()
+                    .ok()
+                    .is_some_and(|r| matches!(*r, Some(Ok(()))))
+                {
+                    // Cleanup is proven; prior repair effects may now require
+                    // reconstruction, not repeated discard of a closed candidate.
+                    D::Continue
+                } else if pending.discard_started.load(Ordering::Acquire)
+                    || pending
+                        .discard_result
+                        .lock()
+                        .ok()
+                        .is_some_and(|r| r.is_some())
+                {
+                    D::Discard
+                } else {
+                    D::Continue
+                }
+            }
+            _ => D::Continue,
+        })
+    }
+
     fn discard_uncommitted_restore(
         &self,
         operation_id: crate::execution::WorkerLifecycleOperationId,
@@ -5582,8 +5660,10 @@ where
             self.wait_pending_restore(&pending, self.spawn_restore_timeout)?;
             if !pending.discard_started.swap(true, Ordering::AcqRel) {
                 let owner = pending.clone();
+                let completion = pending.task_completion();
                 let task =
                     self.spawn_on_adapter_runtime(async move {
+                        let _completion = completion;
                         let retained = owner
                             .result
                             .lock()
@@ -5709,8 +5789,10 @@ where
                 pending.activation_started.store(true, Ordering::Release);
                 let owner = pending.clone();
                 let factory = self.factory.clone();
+                let completion = pending.task_completion();
                 let task =
                     self.spawn_on_adapter_runtime(async move {
+                        let _completion = completion;
                         let candidate = owner
                             .result
                             .lock()
@@ -6683,6 +6765,7 @@ mod tests {
             });
         store.write(&metadata).unwrap();
         WorkerExecutionRestoreRequest {
+            source_repair_possible: false,
             operation_id: crate::execution::WorkerLifecycleOperationId::new(),
             worker_ref: worker_ref.clone(),
             request,
@@ -7614,6 +7697,7 @@ mod tests {
             Arc::new(PendingRuntimeRestore {
                 request: direct_restore_request(worker_ref.clone()),
                 task: tokio::sync::Mutex::new(None),
+                task_in_flight: AtomicBool::new(false),
                 result: Mutex::new(None),
                 activated: Mutex::new(None),
                 activation_started: AtomicBool::new(false),
@@ -7657,6 +7741,7 @@ mod tests {
         let pending = Arc::new(PendingRuntimeRestore {
             request: request.clone(),
             task: tokio::sync::Mutex::new(Some(failed)),
+            task_in_flight: AtomicBool::new(false),
             result: Mutex::new(None),
             activated: Mutex::new(None),
             activation_started: AtomicBool::new(false),
@@ -10156,6 +10241,7 @@ mod tests {
 
     fn direct_restore_request(worker_ref: WorkerRef) -> WorkerExecutionRestoreRequest {
         WorkerExecutionRestoreRequest {
+            source_repair_possible: false,
             operation_id: crate::execution::WorkerLifecycleOperationId::new(),
             request: create_request("pending operation"),
             workspace_scope: None,
@@ -10729,6 +10815,7 @@ mod tests {
             .with_runtime_store_dir(&runtime_store_dir)
             .with_remote_worker_mutation_identity(identity)
             .restore_controller(WorkerExecutionRestoreRequest {
+                source_repair_possible: false,
                 operation_id: crate::execution::WorkerLifecycleOperationId::new(),
                 worker_ref: worker_ref.clone(),
                 request,
@@ -10826,6 +10913,7 @@ mod tests {
             .with_runtime_store_dir(&runtime_store_dir)
             .with_controller_transport(WorkerControllerTransport::InProcess)
             .restore_controller(WorkerExecutionRestoreRequest {
+                source_repair_possible: false,
                 operation_id: crate::execution::WorkerLifecycleOperationId::new(),
                 worker_ref: worker_ref.clone(),
                 request: create_request("embedded restore"),
@@ -10990,6 +11078,7 @@ mod tests {
         runtime.stop_worker(&worker.worker_ref, None).unwrap();
         let operation_id = crate::execution::WorkerLifecycleOperationId::new();
         let restore_request = WorkerExecutionRestoreRequest {
+            source_repair_possible: false,
             operation_id,
             worker_ref: worker.worker_ref.clone(),
             request,
@@ -11383,6 +11472,7 @@ mod tests {
         let detail = runtime.create_worker(request.clone()).unwrap();
         runtime.stop_worker(&detail.worker_ref, None).unwrap();
         let restore = WorkerExecutionRestoreRequest {
+            source_repair_possible: false,
             operation_id: crate::execution::WorkerLifecycleOperationId::new(),
             worker_ref: detail.worker_ref.clone(),
             request,

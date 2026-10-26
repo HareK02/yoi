@@ -43,7 +43,8 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 #[path = "test_support.rs"]
 pub mod test_support;
 
-pub(crate) const SCHEMA_VERSION: u32 = 13;
+pub(crate) const SCHEMA_VERSION: u32 = 14;
+const RESTORE_DECISION_SCHEMA_VERSION: u32 = 13;
 const RESTORE_ADMISSION_SCHEMA_VERSION: u32 = 12;
 // Frozen source schemas: do not move their meaning when adding a migration.
 const SOURCE_SCHEMA_VERSION: u32 = 11;
@@ -653,6 +654,7 @@ pub(crate) struct PersistedWorkerRestoreOperation {
     pub(crate) operation_id: WorkerLifecycleOperationId,
     pub(crate) mode: PersistedWorkerRestoreMode,
     pub(crate) commit: crate::runtime::RestoreCommitFact,
+    pub(crate) source_repair_possible: bool,
     pub(crate) request: CreateWorkerRequest,
     pub(crate) binding: Option<PersistedWorkerExecutionBinding>,
     pub(crate) last_settled_status: WorkerStatus,
@@ -829,11 +831,12 @@ fn plan_runtime_store_migration(
             | EXECUTION_SCHEMA_VERSION
             | SOURCE_SCHEMA_VERSION
             | RESTORE_ADMISSION_SCHEMA_VERSION
+            | RESTORE_DECISION_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -1165,7 +1168,10 @@ fn migrate_worker_record(
 ) -> Result<WorkerAggregateRecord, RuntimeError> {
     if matches!(
         source_schema_version,
-        EXECUTION_SCHEMA_VERSION | SOURCE_SCHEMA_VERSION | RESTORE_ADMISSION_SCHEMA_VERSION
+        EXECUTION_SCHEMA_VERSION
+            | SOURCE_SCHEMA_VERSION
+            | RESTORE_ADMISSION_SCHEMA_VERSION
+            | RESTORE_DECISION_SCHEMA_VERSION
     ) {
         // Admission identity survives migration. Older pending records did not
         // distinguish a committed decision from preparation or failed cleanup.
@@ -1179,7 +1185,10 @@ fn migrate_worker_record(
                 "Worker schema does not match Runtime migration source".into(),
             ));
         }
-        migrate_restore_commit_fact(&mut identity_document, identity_path)?;
+        if source_schema_version != RESTORE_DECISION_SCHEMA_VERSION {
+            migrate_restore_commit_fact(&mut identity_document, identity_path)?;
+        }
+        migrate_restore_repair_fact(&mut identity_document, identity_path)?;
         identity_document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
         let aggregate: WorkerAggregateRecord = serde_json::from_value(identity_document)
             .map_err(|error| runtime_store_corrupt(identity_path, error.to_string()))?;
@@ -1288,6 +1297,42 @@ fn migrate_restore_commit_fact(
             return Err(runtime_store_corrupt(
                 path,
                 "legacy Restore contains unexpected commit evidence".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Earlier writers could repair another canonical store before commit without
+// retaining that authority in this aggregate. Missing evidence is never false.
+fn migrate_restore_repair_fact(
+    document: &mut serde_json::Value,
+    path: &Path,
+) -> Result<(), RuntimeError> {
+    let execution = &mut document["execution_state"];
+    if execution["state"] != "reconciliation_required" {
+        return Ok(());
+    }
+    let operation = &mut execution["execution"];
+    let restore = match operation["operation"].as_str() {
+        Some("restore") => Some(&mut operation["intent"]),
+        Some("stop") => operation["intent"]
+            .as_object_mut()
+            .and_then(|stop| stop.get_mut("pending_restore"))
+            .filter(|restore| !restore.is_null()),
+        _ => None,
+    };
+    if let Some(restore) = restore {
+        let restore = restore.as_object_mut().ok_or_else(|| {
+            runtime_store_corrupt(path, "legacy pending Restore must be an object".into())
+        })?;
+        if restore
+            .insert("source_repair_possible".into(), serde_json::json!(true))
+            .is_some()
+        {
+            return Err(runtime_store_corrupt(
+                path,
+                "legacy Restore contains unexpected source repair evidence".into(),
             ));
         }
     }
@@ -1608,7 +1653,7 @@ fn migrate_runtime_document(
         .or_insert_with(|| serde_json::json!({}));
     if !matches!(
         source_schema_version,
-        SOURCE_SCHEMA_VERSION | RESTORE_ADMISSION_SCHEMA_VERSION
+        SOURCE_SCHEMA_VERSION | RESTORE_ADMISSION_SCHEMA_VERSION | RESTORE_DECISION_SCHEMA_VERSION
     ) {
         object.remove("workers");
         // This legacy cache is not Runtime lifecycle or restore authority. Bundles
@@ -2148,7 +2193,9 @@ fn migrate_runtime_store_in_place(
         if let Some(metadata) = metadata
             && !matches!(
                 plan.current_schema_version,
-                SOURCE_SCHEMA_VERSION | RESTORE_ADMISSION_SCHEMA_VERSION
+                SOURCE_SCHEMA_VERSION
+                    | RESTORE_ADMISSION_SCHEMA_VERSION
+                    | RESTORE_DECISION_SCHEMA_VERSION
             )
         {
             atomic_write_json(
@@ -4001,7 +4048,13 @@ mod tests {
     #[test]
     fn legacy_pending_restore_migrates_as_unknown_and_preserves_stop_ownership() {
         use crate::runtime::RestoreCommitFact;
-        for under_stop in [false, true] {
+        for (source_schema, under_stop) in [
+            RESTORE_ADMISSION_SCHEMA_VERSION,
+            RESTORE_DECISION_SCHEMA_VERSION,
+        ]
+        .into_iter()
+        .flat_map(|schema| [false, true].map(move |stop| (schema, stop)))
+        {
             let (_temp, store, mut worker, path) = canonical_worker_store();
             let root = store.root.clone();
             let PersistedWorkerExecutionState::Available(execution) =
@@ -4013,6 +4066,7 @@ mod tests {
                 operation_id: WorkerLifecycleOperationId::new(),
                 mode: PersistedWorkerRestoreMode::Explicit,
                 commit: RestoreCommitFact::Committed,
+                source_repair_possible: false,
                 request: execution.request.clone(),
                 binding: execution.binding.clone(),
                 last_settled_status: worker.status,
@@ -4033,21 +4087,27 @@ mod tests {
                 PersistedWorkerExecutionState::ReconciliationRequired(operation);
             let mut legacy =
                 serde_json::to_value(WorkerAggregateRecord::from_persisted(&worker)).unwrap();
-            legacy["schema_version"] = serde_json::json!(RESTORE_ADMISSION_SCHEMA_VERSION);
+            legacy["schema_version"] = serde_json::json!(source_schema);
             let intent = &mut legacy["execution_state"]["execution"]["intent"];
             let restore = if under_stop {
                 &mut intent["pending_restore"]
             } else {
                 intent
             };
-            restore.as_object_mut().unwrap().remove("commit");
+            if source_schema == RESTORE_ADMISSION_SCHEMA_VERSION {
+                restore.as_object_mut().unwrap().remove("commit");
+            }
+            restore
+                .as_object_mut()
+                .unwrap()
+                .remove("source_repair_possible");
             let expected_request = restore["request"].clone();
             let before_guard = legacy["restore_guard"].clone();
             fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
             write_empty_schema_v8_store(&root);
             let runtime_path = root.join(RUNTIME_FILE);
             let mut runtime: serde_json::Value = read_json(&runtime_path, "read fixture").unwrap();
-            runtime["schema_version"] = serde_json::json!(RESTORE_ADMISSION_SCHEMA_VERSION);
+            runtime["schema_version"] = serde_json::json!(source_schema);
             fs::write(&runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
             drop(store);
 
@@ -4062,7 +4122,18 @@ mod tests {
                 PersistedWorkerLifecycleOperation::Restore(restore) => restore,
                 PersistedWorkerLifecycleOperation::Stop(stop) => stop.pending_restore.unwrap(),
             };
-            assert_eq!(restored.commit, RestoreCommitFact::LegacyUnknown);
+            assert_eq!(
+                restored.commit,
+                if source_schema == RESTORE_DECISION_SCHEMA_VERSION {
+                    RestoreCommitFact::Committed
+                } else {
+                    RestoreCommitFact::LegacyUnknown
+                }
+            );
+            assert!(
+                restored.source_repair_possible,
+                "older source-repair effects must remain possible"
+            );
             assert_eq!(
                 serde_json::to_value(restored.request).unwrap(),
                 expected_request

@@ -96,6 +96,141 @@ mod publication {
 
     #[test]
     #[serial_test::serial(worker_allocation)]
+    fn autonomous_late_prepare_and_publication_settle_without_another_request() {
+        for publication_failure in [false, true] {
+            let mut fixture = Fixture::no_model();
+            Arc::get_mut(&mut fixture.backend).unwrap().spawn_restore_timeout = Duration::from_millis(250);
+            let runtime = stopped_runtime(&fixture);
+            let worker_ref = fixture.request.worker_ref.clone();
+            let request = runtime.test_restore_request(&worker_ref);
+            let (release, prepared) = prepared_gate(&fixture);
+            fixture.backend.factory.restore_faults.publication_failure.store(publication_failure, Ordering::SeqCst);
+            let first = runtime.restore_worker_operation_scoped(fixture.request.workspace_scope.as_ref().unwrap(), &worker_ref, request.clone()).unwrap();
+            prepared.recv_timeout(WAIT).unwrap();
+            assert_eq!(first.state, server_api::WorkerRestoreState::ReconciliationRequired);
+            let operation = durable_operation(&runtime, &worker_ref).unwrap();
+            assert_eq!(operation.commit, crate::runtime::RestoreCommitFact::NotCommitted);
+            fixture.assert_no_allocation();
+            release.notify_one();
+            runtime.test_wait_restore_continuation(&worker_ref, operation.operation_id, WAIT);
+            let loaded = runtime.test_runtime_store().load_runtime_state().unwrap();
+            let receipt = serde_json::to_value(&loaded.workers[&worker_ref.worker_id].restore_guard).unwrap();
+            assert_eq!(receipt["owners"][&request.request_id]["receipt"]["state"], "accepted");
+            assert!(durable_operation(&runtime, &worker_ref).is_none());
+            let transport = fixture.backend.clone().attach_worker_protocol(&worker_ref).unwrap();
+            transport.validate().unwrap();
+            drop(transport);
+            assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), 1);
+            fixture.assert_quiet();
+            runtime.stop_worker_scoped(fixture.request.workspace_scope.as_ref().unwrap(), &worker_ref, None).unwrap();
+            fixture.assert_released();
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn autonomous_cleanup_dispatch_settles_uncommitted_candidate_without_repost_or_stop() {
+        let fixture = Fixture::no_model();
+        let runtime = Arc::new(stopped_runtime(&fixture));
+        let pause = runtime.test_pause_restore_continuation();
+        let worker_ref = fixture.request.worker_ref.clone();
+        let scope = fixture.request.workspace_scope.clone().unwrap();
+        let request = runtime.test_restore_request(&worker_ref);
+        let before = fixture.canonical_files();
+        let (release, prepared) = prepared_gate(&fixture);
+        let restoring = {
+            let runtime = runtime.clone();
+            let worker_ref = worker_ref.clone();
+            let scope = scope.clone();
+            let request = request.clone();
+            std::thread::spawn(move || runtime.restore_worker_operation_scoped(&scope, &worker_ref, request))
+        };
+        prepared.recv_timeout(WAIT).unwrap();
+        runtime.test_runtime_store().fail_next_worker_write(AtomicWriteFault::BeforeRename);
+        fixture.backend.factory.restore_faults.cleanup_fail.store(true, Ordering::SeqCst);
+        release.notify_one();
+        let first = restoring.join().unwrap().unwrap();
+        assert_eq!(first.state, server_api::WorkerRestoreState::ReconciliationRequired);
+        let operation = durable_operation(&runtime, &worker_ref).unwrap();
+        assert_eq!(operation.commit, crate::runtime::RestoreCommitFact::NotCommitted);
+        let pending = fixture.backend.pending_restore(&worker_ref).unwrap().unwrap();
+        assert!(matches!(pending.discard_result.lock().unwrap().as_ref(), Some(Err(_))));
+        fixture.backend.factory.restore_faults.cleanup_fail.store(false, Ordering::SeqCst);
+        drop(pending);
+        drop(pause);
+        runtime.test_wait_restore_continuation(&worker_ref, operation.operation_id, WAIT);
+        let loaded = runtime.test_runtime_store().load_runtime_state().unwrap();
+        let receipt = serde_json::to_value(&loaded.workers[&worker_ref.worker_id].restore_guard).unwrap();
+        assert_eq!(receipt["owners"][&request.request_id]["receipt"]["state"], "rolled_back");
+        assert_eq!(fixture.canonical_files(), before);
+        assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), 1);
+        fixture.assert_released();
+        fixture.assert_quiet();
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn autonomous_unchanged_publication_obstruction_parks_without_false_terminal_outcome() {
+        let fixture = Fixture::no_model();
+        let runtime = stopped_runtime(&fixture);
+        let worker_ref = fixture.request.worker_ref.clone();
+        fixture.backend.factory.restore_faults.socket_failure.store(true, Ordering::SeqCst);
+        let request = runtime.test_restore_request(&worker_ref);
+        let first = runtime.restore_worker_operation_scoped(fixture.request.workspace_scope.as_ref().unwrap(), &worker_ref, request.clone()).unwrap();
+        assert_eq!(first.state, server_api::WorkerRestoreState::ReconciliationRequired);
+        let pending = fixture.backend.pending_restore(&worker_ref).unwrap().unwrap();
+        let reason = runtime.test_wait_restore_continuation_parked(&worker_ref, pending.request.operation_id, WAIT);
+        assert!(reason.contains("publication failed"), "{reason}");
+        let durable = durable_operation(&runtime, &worker_ref).unwrap();
+        assert_eq!(durable.commit, crate::runtime::RestoreCommitFact::Committed);
+        let loaded = runtime.test_runtime_store().load_runtime_state().unwrap();
+        let guard = serde_json::to_value(&loaded.workers[&worker_ref.worker_id].restore_guard).unwrap();
+        assert!(guard["owners"][&request.request_id]["receipt"].is_null());
+        assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), 1);
+        // Initial call plus at most four backed-off continuation attempts. The
+        // parked condition is observed directly, not guessed using a sleep.
+        assert!(fixture.backend.factory.restore_faults.publication_attempts.load(Ordering::SeqCst) <= 5);
+        assert!(fixture.backend.workers.lock().unwrap().is_empty());
+        assert!(fixture.backend.factory.observation_hub.get(&worker_ref).is_none());
+        drop(pending);
+        // Permanent path-length obstruction: explicit fixture teardown only,
+        // not the successful completion path asserted by autonomous tests.
+        runtime.stop_worker_scoped(fixture.request.workspace_scope.as_ref().unwrap(), &worker_ref, None).unwrap();
+        fixture.assert_released();
+        fixture.assert_quiet();
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn autonomous_late_failure_settles_without_another_request() {
+        let mut fixture = Fixture::no_model();
+        Arc::get_mut(&mut fixture.backend).unwrap().spawn_restore_timeout = Duration::from_millis(250);
+        let runtime = stopped_runtime(&fixture);
+        let worker_ref = fixture.request.worker_ref.clone();
+        let request = runtime.test_restore_request(&worker_ref);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (entered, prepared) = mpsc::channel();
+        *fixture.backend.factory.restore_faults.factory_gate.lock().unwrap() = Some(release.clone());
+        *fixture.backend.factory.restore_faults.factory_entered.lock().unwrap() = Some(entered);
+        *fixture.backend.factory.restore_faults.fail_at.lock().unwrap() = Some(RuntimeRestoreStage::Feature);
+        let before = fixture.canonical_files();
+        let first = runtime.restore_worker_operation_scoped(fixture.request.workspace_scope.as_ref().unwrap(), &worker_ref, request.clone()).unwrap();
+        prepared.recv_timeout(WAIT).unwrap();
+        assert_eq!(first.state, server_api::WorkerRestoreState::ReconciliationRequired);
+        let operation = durable_operation(&runtime, &worker_ref).unwrap();
+        release.notify_one();
+        runtime.test_wait_restore_continuation(&worker_ref, operation.operation_id, WAIT);
+        let loaded = runtime.test_runtime_store().load_runtime_state().unwrap();
+        let receipt = serde_json::to_value(&loaded.workers[&worker_ref.worker_id].restore_guard).unwrap();
+        assert_eq!(receipt["owners"][&request.request_id]["receipt"]["state"], "rolled_back");
+        assert_eq!(fixture.canonical_files(), before);
+        assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), 1);
+        fixture.assert_released();
+        fixture.assert_quiet();
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
     fn runtime_accepted_follows_real_prepared_snapshot_commit_attach_and_input() {
         let bootstrap_backend;
         let mut fixture = Fixture::no_model();
@@ -288,6 +423,7 @@ mod publication {
         ] {
             let fixture = Fixture::no_model();
             let runtime = Arc::new(stopped_runtime(&fixture));
+            let _pause = runtime.test_pause_restore_continuation();
             let worker_ref = fixture.request.worker_ref.clone();
             let scope = fixture.request.workspace_scope.clone().unwrap();
             let request = runtime.test_restore_request(&worker_ref);
@@ -396,6 +532,7 @@ mod publication {
     fn uncommitted_cleanup_failure_fences_discarding_candidate_from_activation() {
         let fixture = Fixture::no_model();
         let runtime = Arc::new(stopped_runtime(&fixture));
+        let _pause = runtime.test_pause_restore_continuation();
         let worker_ref = fixture.request.worker_ref.clone();
         let scope = fixture.request.workspace_scope.clone().unwrap();
         let request = runtime.test_restore_request(&worker_ref);
@@ -443,6 +580,7 @@ mod publication {
     fn publication_failure_retains_same_committed_candidate_without_reconstruction() {
         let fixture = Fixture::no_model();
         let runtime = stopped_runtime(&fixture);
+        let _pause = runtime.test_pause_restore_continuation();
         let worker_ref = fixture.request.worker_ref.clone();
         let scope = fixture.request.workspace_scope.clone().unwrap();
         let request = runtime.test_restore_request(&worker_ref);

@@ -33,6 +33,10 @@ impl ProfileRuntimeWorkerFactory {
         if !pending && !incomplete {
             return Ok(false);
         }
+        request
+            .context
+            .authorize_restore_source_repair(request.operation_id)
+            .map_err(|_| cause("canonical source repair authority is not durably confirmed"))?;
         // The accepted Runtime operation already owns this Session. Its stable
         // Session identity and sole committed seed, not a new restore request,
         // are used to reconcile an interrupted first-head publication.

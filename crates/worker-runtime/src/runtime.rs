@@ -1,3 +1,4 @@
+mod restore_continuation;
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, LogicalWorkdirAttachment, ProfileSelector,
     ProfileSourceArchiveSource, RepositoryRefObservation, RepositoryRefObservationRequest,
@@ -323,6 +324,7 @@ impl Drop for RuntimeEventSelectorSubscription {
 pub struct Runtime {
     inner: Arc<Mutex<RuntimeState>>,
     worker_operations: Arc<Mutex<BTreeMap<WorkerId, Arc<Mutex<()>>>>>,
+    restore_continuations: Arc<restore_continuation::RestoreContinuations>,
 }
 
 struct WorkerOperationLease {
@@ -586,6 +588,7 @@ impl Runtime {
         Self {
             inner: Arc::new(Mutex::new(state)),
             worker_operations: Arc::new(Mutex::new(BTreeMap::new())),
+            restore_continuations: Arc::default(),
         }
     }
 
@@ -662,6 +665,7 @@ impl Runtime {
         let runtime = Self {
             inner: Arc::new(Mutex::new(state)),
             worker_operations: Arc::new(Mutex::new(BTreeMap::new())),
+            restore_continuations: Arc::default(),
         };
         runtime.restore_persisted_worker_executions()?;
         Ok(runtime)
@@ -2230,6 +2234,7 @@ impl Runtime {
                         operation_id: WorkerLifecycleOperationId::new(),
                         mode: WorkerRestoreMode::Explicit,
                         commit: RestoreCommitFact::NotCommitted,
+                        source_repair_possible: false,
                         last_settled_status: candidate.status,
                     });
                 let operation_id = pending.operation_id;
@@ -2256,6 +2261,10 @@ impl Runtime {
                 match state.persist_restore_worker_record(&candidate) {
                     Ok(()) => {}
                     Err(error @ RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
+                        drop(state);
+                        if !coordinate {
+                            self.start_restore_continuation(worker_ref.clone(), operation_id)?;
+                        }
                         return Ok((
                             Some(RuntimeWorkerRestoreResult::failed(
                                 WorkerRestoreState::ReconciliationRequired,
@@ -2287,8 +2296,10 @@ impl Runtime {
                 return Ok((None, owner.request.preparation.clone()));
             }
         }
-        self.restore_admitted_worker_under_lock(worker_ref, WorkerRestoreMode::Explicit)
-            .map(|result| (Some(result), None))
+        let result =
+            self.restore_admitted_worker_under_lock(worker_ref, WorkerRestoreMode::Explicit);
+        self.ensure_restore_continuation(worker_ref)?;
+        result.map(|result| (Some(result), None))
     }
 
     #[cfg(all(test, feature = "fs-store"))]
@@ -2529,6 +2540,8 @@ impl Runtime {
                     .cloned()
             });
             let request = WorkerExecutionRestoreRequest {
+                source_repair_possible: pending_restore
+                    .is_some_and(|pending| pending.source_repair_possible),
                 operation_id,
                 worker_ref: worker_ref.clone(),
                 request: worker_request,
@@ -4075,12 +4088,26 @@ impl Runtime {
         crate::execution::WorkerExecutionContext::new(worker_ref)
     }
 
+    fn restore_progress_notifier(
+        &self,
+        worker_ref: WorkerRef,
+    ) -> Arc<dyn Fn(WorkerLifecycleOperationId) + Send + Sync> {
+        let continuations = Arc::downgrade(&self.restore_continuations);
+        Arc::new(move |operation| {
+            if let Some(continuations) = continuations.upgrade() {
+                continuations.signal(&worker_ref, operation);
+            }
+        })
+    }
+
     #[cfg(feature = "ws-server")]
     fn restore_candidate_execution_context(
         &self,
         worker_ref: WorkerRef,
     ) -> crate::execution::WorkerExecutionContext {
         let runtime = Arc::downgrade(&self.inner);
+        let progress = self.restore_progress_notifier(worker_ref.clone());
+        let repair = self.restore_repair_authorizer(worker_ref.clone());
         crate::execution::WorkerExecutionContext::candidate(
             worker_ref,
             Arc::new(move |worker_ref, payload| {
@@ -4101,6 +4128,8 @@ impl Runtime {
                 Ok(state.push_worker_observation_event(worker_ref, payload))
             }),
         )
+        .with_restore_progress(progress)
+        .with_restore_repair_authorizer(repair)
     }
 
     #[cfg(not(feature = "ws-server"))]
@@ -4108,7 +4137,11 @@ impl Runtime {
         &self,
         worker_ref: WorkerRef,
     ) -> crate::execution::WorkerExecutionContext {
+        let progress = self.restore_progress_notifier(worker_ref.clone());
+        let repair = self.restore_repair_authorizer(worker_ref.clone());
         crate::execution::WorkerExecutionContext::candidate(worker_ref)
+            .with_restore_progress(progress)
+            .with_restore_repair_authorizer(repair)
     }
 
     #[cfg(feature = "fs-store")]
@@ -4410,6 +4443,9 @@ impl Runtime {
             commit: candidate
                 .pending_restore
                 .map_or(RestoreCommitFact::NotCommitted, |pending| pending.commit),
+            source_repair_possible: candidate
+                .pending_restore
+                .is_some_and(|pending| pending.source_repair_possible),
             last_settled_status: candidate.status,
         });
         candidate.restore_candidate_context = Some(candidate_context);
@@ -6327,6 +6363,9 @@ struct PendingWorkerRestore {
     operation_id: WorkerLifecycleOperationId,
     mode: WorkerRestoreMode,
     commit: RestoreCommitFact,
+    // False proves Runtime never granted this operation authority to repair
+    // canonical source before its decision. True includes legacy uncertainty.
+    source_repair_possible: bool,
     last_settled_status: WorkerStatus,
 }
 
@@ -6460,10 +6499,9 @@ struct WorkerRecord {
 
 impl WorkerRecord {
     fn ensure_restore_rollback_allowed(&self) -> Result<(), RuntimeError> {
-        if self
-            .pending_restore
-            .is_some_and(|pending| pending.commit != RestoreCommitFact::NotCommitted)
-        {
+        if self.pending_restore.is_some_and(|pending| {
+            pending.commit != RestoreCommitFact::NotCommitted || pending.source_repair_possible
+        }) {
             return Err(RuntimeError::InvalidRequest(
                 "A committed or legacy-unknown Restore cannot be settled as a rollback".into(),
             ));
@@ -6682,6 +6720,7 @@ impl WorkerRecord {
                             operation_id: operation.operation_id,
                             mode: operation.mode.into(),
                             commit: operation.commit,
+                            source_repair_possible: operation.source_repair_possible,
                             last_settled_status: operation.last_settled_status,
                         }),
                         None,
@@ -6698,6 +6737,7 @@ impl WorkerRecord {
                             operation_id: restore.operation_id,
                             mode: restore.mode.into(),
                             commit: restore.commit,
+                            source_repair_possible: restore.source_repair_possible,
                             last_settled_status: restore.last_settled_status,
                         }),
                     Some(PendingWorkerStop {
@@ -6762,6 +6802,7 @@ impl WorkerRecord {
                             operation_id: restore.operation_id,
                             mode: restore.mode.into(),
                             commit: restore.commit,
+                            source_repair_possible: restore.source_repair_possible,
                             request: self
                                 .request
                                 .clone()
@@ -6786,6 +6827,7 @@ impl WorkerRecord {
                     operation_id: pending.operation_id,
                     mode: pending.mode.into(),
                     commit: pending.commit,
+                    source_repair_possible: pending.source_repair_possible,
                     request,
                     binding: self
                         .execution_bound
@@ -9156,6 +9198,7 @@ mod tests {
             operation_id: WorkerLifecycleOperationId::new(),
             mode: WorkerRestoreMode::Explicit,
             commit: RestoreCommitFact::NotCommitted,
+            source_repair_possible: false,
             last_settled_status: WorkerStatus::Stopped,
         });
         let id = "workdir-irrelevant-to-recovery";
@@ -13588,7 +13631,7 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains(
-            "unsupported Runtime store schema version 2; expected 6, 7, 8, 9, 10, 11, 12, or 13"
+            "unsupported Runtime store schema version 2; expected 6, 7, 8, 9, 10, 11, 12, 13, or 14"
         ));
 
         let _ = std::fs::remove_dir_all(root);
@@ -15012,6 +15055,87 @@ mod tests {
         assert!(!execution_path.exists());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn restore_source_repair_authority_is_durable_before_effects_without_reentering_lifecycle_lock()
+    {
+        for fault in [
+            None,
+            Some(crate::fs_store::AtomicWriteFault::BeforeRename),
+            Some(crate::fs_store::AtomicWriteFault::AfterRename),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let options = FsRuntimeStoreOptions::new(dir.path().join("runtime"))
+                .with_runtime_id("repair-authority");
+            let runtime = Runtime::with_fs_store_and_execution_backend(
+                options,
+                Arc::new(TestExecutionBackend::default()),
+            )
+            .unwrap();
+            runtime.store_config_bundle(test_bundle()).unwrap();
+            let worker = runtime
+                .create_worker(task_request("repair authority"))
+                .unwrap();
+            runtime.stop_worker(&worker.worker_ref, None).unwrap();
+            let lease = runtime.worker_operation_lock(worker.worker_id).unwrap();
+            let _guard = lease.lock().unwrap();
+            let operation = WorkerLifecycleOperationId::new();
+            runtime
+                .begin_restore_operation(
+                    &worker.worker_ref,
+                    operation,
+                    WorkerRestoreMode::Explicit,
+                    runtime.restore_candidate_execution_context(worker.worker_ref.clone()),
+                )
+                .unwrap();
+            if let Some(fault) = fault {
+                runtime_store(&runtime).fail_next_worker_write(fault);
+                if matches!(fault, crate::fs_store::AtomicWriteFault::AfterRename) {
+                    runtime_store(&runtime).fail_next_worker_reconcile_sync();
+                }
+            }
+            let authorizer = runtime.restore_repair_authorizer(worker.worker_ref.clone());
+            let callback = authorizer.clone();
+            let (sent, received) = std::sync::mpsc::channel();
+            let task = std::thread::spawn(move || sent.send(callback(operation)).unwrap());
+            // The lifecycle lock above remains held while this exact factory
+            // callback persists its grant. Waiting on that lock would deadlock.
+            let granted = received
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("repair callback reentered lifecycle lock");
+            task.join().unwrap();
+            assert_eq!(granted.is_ok(), fault.is_none());
+            let saved = runtime_store(&runtime)
+                .read_worker_record(&worker.worker_ref)
+                .unwrap();
+            let PersistedWorkerExecutionState::ReconciliationRequired(
+                PersistedWorkerLifecycleOperation::Restore(saved),
+            ) = saved.execution_state
+            else {
+                panic!("repair grant lost operation")
+            };
+            assert_eq!(saved.operation_id, operation);
+            assert_eq!(saved.commit, RestoreCommitFact::NotCommitted);
+            assert_eq!(
+                saved.source_repair_possible,
+                !matches!(fault, Some(crate::fs_store::AtomicWriteFault::BeforeRename))
+            );
+            // A denied/unknown grant must not authorize external repair. Once
+            // storage is healthy the same operation reconciles, never a new ID.
+            authorizer(operation).unwrap();
+            let rollback = RuntimeWorkerRestoreResult::failed(
+                WorkerRestoreState::RolledBack,
+                "unsafe",
+                "repair effects may exist",
+            );
+            assert!(
+                runtime
+                    .settle_restore_rollback(&worker.worker_ref, &rollback)
+                    .is_err()
+            );
+        }
     }
 
     #[cfg(feature = "fs-store")]
