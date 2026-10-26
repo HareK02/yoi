@@ -39,6 +39,24 @@ process終了ケースはそのAccepted receipt確認後に環境が所有する
 
 これは**commit済みかつterminal receipt保存後**のprocess終了であり、未commit候補やcommit直後・receipt前の終了証明ではない。固定Codex資産へSubmit/Notifyを送らないため、通常入力・Paused admissionの製品E2Eの証明でもない。検証jobはこの明示targetを選択する必要があり、通常suiteだけでは代替しない。
 
+## Opt-in Runtime checkpoint process試験
+
+上のfeatureless製品4case（target内の既存seed projection試験1件とは別）に加え、`restore-checkpoints`を明示した実Runtimeで2つのlive windowを試験する。このfeatureはoffline fixture-supportと独立しており、通常RuntimeではCLI入口も環境変数による入口も無い。
+
+```sh
+# 同期を有効にしたRuntimeだけを専用targetへ。通常製品binaryを上書きしない。
+cargo build --locked -p worker-runtime --bin yoi-runtime \
+  --features restore-checkpoints --target-dir target/e2e-checkpoint-products
+cargo test --locked -p yoi-e2e --features e2e,restore-checkpoints \
+  --test worker_restore checkpoint:: -- --test-threads=1
+```
+
+`WorkerE2eEnvironment::use_checkpoint_runtime`はその環境のRuntime binary/hashと、隔離root内の明示configだけを選択する。global provider・環境変数・通常起動への暗黙設定は変更しない。configは一度だけCLIへ渡し、再起動時は渡さない。test側のlink featureをfeatureless製品binaryへ混入させない。
+
+共有harnessはloopback ackのstage/Worker/operation/PID/nonceを確認し、直ちに所有childをkill/reapする。**offline正本を確認してから**同roots/identity/trustを再起動するため、ack後のdeadlineとの競合を成功扱いしない。NotCommittedの実私有候補は同operationのcleanup-only→RolledBack/Stopped、Committed/preterminalは同じdecision→実protocol/full Session snapshot→Acceptedへ回収する。元のrequest/token、owner数1、同operation、stale fresh intent拒否、保存source hash、restore run path数、最終cleanupを検証する。JSONでpending状態を作らず、seedは初回のみ。
+
+明示解除・peer EOF・observer scopeの意図的panicも試験する。gateの8秒deadlineとscoped HTTP callの15秒deadlineが待機を制限し、通常operationの継続後に環境のRAIIがprocess/rootを回収する。これはtest scope失敗の回収証明であり、OSによるharness強制終了や電源断の一般的な保証ではない。原fixtureへのSubmit/Notifyや実モデル呼出しは行わない。checkpoint ack/at-death/recovery、kill/reap、binary/hashとcleanup artifactはfeaturelessログと分けて報告する。
+
 通常のharness回帰試験（製品processは起動しない）:
 
 ```sh

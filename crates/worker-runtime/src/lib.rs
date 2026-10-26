@@ -16,6 +16,8 @@ pub mod management;
 pub mod observation;
 pub mod profile_archive;
 pub mod resource;
+#[cfg(feature = "restore-checkpoints")]
+pub mod restore_checkpoints;
 #[cfg(test)]
 #[path = "../../../tests/support/restore_environment.rs"]
 mod restore_test_environment;

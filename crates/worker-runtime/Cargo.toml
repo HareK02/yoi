@@ -21,6 +21,8 @@ default = ["ws-server", "fs-store"]
 fs-store = ["dep:fs4"]
 # Offline fixture tooling only; never enabled by the product defaults.
 test-support = ["fs-store", "ws-server"]
+# Explicit process-test synchronization; independent of offline fixture tooling.
+restore-checkpoints = ["fs-store"]
 http-server = ["dep:axum", "dep:tower", "dep:reqwest"]
 ws-server = ["http-server", "axum/ws", "tokio/sync"]
 

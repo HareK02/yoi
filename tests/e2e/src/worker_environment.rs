@@ -266,6 +266,8 @@ pub struct WorkerE2eEnvironment {
     access_token: Option<String>,
     client: Client,
     binaries: WorkerBinaryProviderInfo,
+    #[cfg(feature = "restore-checkpoints")]
+    restore_checkpoint_config: Option<PathBuf>,
 }
 
 impl WorkerE2eEnvironment {
@@ -331,9 +333,47 @@ impl WorkerE2eEnvironment {
             access_token: None,
             client,
             binaries,
+            #[cfg(feature = "restore-checkpoints")]
+            restore_checkpoint_config: None,
         };
         environment.write_metadata("created")?;
         Ok(environment)
+    }
+
+    /// Select the separately built test-enabled Runtime for this environment
+    /// only. The checkpoint file must already belong to its isolated root.
+    #[cfg(feature = "restore-checkpoints")]
+    pub fn use_checkpoint_runtime(&mut self, binary: PathBuf, config: &Path) -> Result<()> {
+        if self.runtime.is_some() || self.server.is_some() {
+            return Err(HarnessError::Protocol(
+                "checkpoint selection requires an unstarted environment".into(),
+            ));
+        }
+        let config = config.canonicalize()?;
+        if !config.starts_with(self.root.canonicalize()?) || !config.is_file() {
+            return Err(HarnessError::Protocol(
+                "checkpoint config is outside the owned environment".into(),
+            ));
+        }
+        let record = binary_record(
+            "yoi-runtime",
+            binary.canonicalize()?,
+            "restore-checkpoints-opt-in".into(),
+            None,
+        )?;
+        let runtime = self
+            .binaries
+            .binaries
+            .iter_mut()
+            .find(|record| record.name == "yoi-runtime")
+            .ok_or_else(|| HarnessError::Protocol("missing Runtime binary record".into()))?;
+        *runtime = record;
+        self.restore_checkpoint_config = Some(config);
+        fs::write(
+            self.artifacts_dir.join("binary-provider.json"),
+            serde_json::to_vec_pretty(&self.binaries)?,
+        )?;
+        Ok(())
     }
 
     pub fn start(&mut self) -> Result<()> {
@@ -639,6 +679,10 @@ impl WorkerE2eEnvironment {
             "--fs-root",
             self.runtime_data_dir.to_string_lossy().as_ref(),
         ]);
+        #[cfg(feature = "restore-checkpoints")]
+        if let Some(config) = self.restore_checkpoint_config.take() {
+            command.arg("--test-restore-checkpoint").arg(config);
+        }
         let runtime = ManagedProcess::spawn(
             "runtime",
             command,
@@ -684,6 +728,13 @@ impl WorkerE2eEnvironment {
     /// Kill/reap only the Runtime child owned by this environment, retaining roots
     /// and identities. Restart neither seeds storage nor rotates restore requests.
     pub fn crash_and_restart_runtime(&mut self) -> Result<()> {
+        self.crash_runtime()?;
+        self.start_runtime_process()
+    }
+
+    /// Leave the owned Runtime reaped and offline for read-only canonical crash
+    /// inspection before restart. No root, identity or request is recreated.
+    pub fn crash_runtime(&mut self) -> Result<()> {
         let runtime = self
             .runtime
             .as_mut()
@@ -708,6 +759,17 @@ impl WorkerE2eEnvironment {
         }
         self.runtime_url = None;
         self.runtime_shutdown = WorkerProcessShutdownOutcome::NotStarted;
+        Ok(())
+    }
+
+    /// Restart the previously initialized identity without seed or checkpoint flags.
+    #[cfg(feature = "restore-checkpoints")]
+    pub fn restart_runtime_after_crash(&mut self) -> Result<()> {
+        if self.runtime.is_some() || self.runtime_public_identity.is_none() {
+            return Err(HarnessError::Protocol(
+                "Runtime is not an offline initialized child".into(),
+            ));
+        }
         self.start_runtime_process()
     }
 
@@ -792,6 +854,37 @@ impl WorkerE2eEnvironment {
                 })),
             "restore Worker",
         )
+    }
+
+    /// Build one authenticated call that may run in a scoped test thread while
+    /// the owner observes a checkpoint. The HTTP request deadline bounds joining
+    /// that thread even on test failure; credentials never enter artifacts.
+    #[cfg(feature = "restore-checkpoints")]
+    pub fn pending_restore_call(
+        &self,
+        worker_id: &str,
+        request_id: &str,
+        expected_observation_token: &str,
+    ) -> Result<impl FnOnce() -> Result<Value> + Send + 'static + use<>> {
+        let token = self.access_token.as_deref().ok_or_else(|| {
+            HarnessError::Protocol("Backend access token is not initialized".into())
+        })?;
+        let request = self
+            .client
+            .post(self.worker_url(worker_id, "restore")?)
+            .bearer_auth(token)
+            .timeout(STARTUP_WAIT)
+            .json(&serde_json::json!({"request_id": request_id,
+                "expected_observation_token": expected_observation_token}))
+            .build()
+            .map_err(|_| HarnessError::Protocol("build pending restore request".into()))?;
+        let client = self.client.clone();
+        Ok(move || {
+            let response = client
+                .execute(request)
+                .map_err(|_| HarnessError::Protocol("pending restore transport failed".into()))?;
+            decode_api_response(response, "pending restore")
+        })
     }
 
     /// Forward one unchanged public restore request through an owned loopback

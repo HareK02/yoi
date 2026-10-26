@@ -1,3 +1,5 @@
+#[cfg(feature = "restore-checkpoints")]
+mod restore_checkpoint;
 mod restore_continuation;
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, LogicalWorkdirAttachment, ProfileSelector,
@@ -2776,6 +2778,12 @@ impl Runtime {
                 worker_state,
                 workdir_attachments,
             } => {
+                #[cfg(feature = "restore-checkpoints")]
+                self.test_restore_checkpoint(
+                    worker_ref,
+                    operation_id,
+                    crate::restore_checkpoints::RestoreCheckpointStage::PreparedNotCommitted,
+                );
                 let commit = self.commit_restored_worker_execution(
                     worker_ref,
                     worker_state.clone(),
@@ -2784,6 +2792,12 @@ impl Runtime {
                 );
                 match commit {
                     Ok(_) => {
+                        #[cfg(feature = "restore-checkpoints")]
+                        self.test_restore_checkpoint(
+                            worker_ref,
+                            operation_id,
+                            crate::restore_checkpoints::RestoreCheckpointStage::CommittedPreterminal,
+                        );
                         if let Err(error) =
                             backend.activate_restored_worker(operation_id, worker_ref)
                         {
@@ -5419,6 +5433,8 @@ impl std::fmt::Debug for BackendResourceClientRef {
 
 #[derive(Debug)]
 struct RuntimeState {
+    #[cfg(feature = "restore-checkpoints")]
+    restore_checkpoint: Option<crate::restore_checkpoints::RestoreCheckpointConfig>,
     display_name: Option<String>,
     backend: RuntimeBackendKind,
     /// Backend-bound stable identity used for cross-boundary retention evidence.
@@ -5466,6 +5482,8 @@ impl RuntimeState {
             display_name,
             backend: RuntimeBackendKind::Memory,
             runtime_identity: None,
+            #[cfg(feature = "restore-checkpoints")]
+            restore_checkpoint: None,
             persistence: RuntimePersistence::Memory,
             status: RuntimeStatus::Running,
             execution_backend: None,
@@ -5500,6 +5518,8 @@ impl RuntimeState {
             display_name,
             backend: RuntimeBackendKind::FsStore,
             runtime_identity: None,
+            #[cfg(feature = "restore-checkpoints")]
+            restore_checkpoint: None,
             persistence: RuntimePersistence::Fs(store),
             status: RuntimeStatus::Running,
             execution_backend: None,
@@ -5550,6 +5570,8 @@ impl RuntimeState {
             display_name: persisted.display_name,
             backend: RuntimeBackendKind::FsStore,
             runtime_identity: None,
+            #[cfg(feature = "restore-checkpoints")]
+            restore_checkpoint: None,
             persistence: RuntimePersistence::Fs(store),
             status: persisted.status,
             execution_backend: None,
@@ -7553,6 +7575,10 @@ fn subscription_worker_state(status: WorkerStatus) -> SubscriptionWorkerState {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "restore-checkpoints")]
+    mod restore_checkpoint_tests {
+        include!("runtime/restore_checkpoint_tests.rs");
+    }
     use super::*;
     use crate::catalog::{
         ConfigBundleRef, MaterializerKind, ProfileSelector, RepositoryMaterializationContext,

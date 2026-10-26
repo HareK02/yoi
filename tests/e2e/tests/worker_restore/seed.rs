@@ -42,7 +42,10 @@ pub struct Installed {
 }
 
 pub fn start(fixture: &Fixture) -> Result<Installed> {
-    let mut environment = WorkerE2eEnvironment::new()?;
+    start_in(fixture, WorkerE2eEnvironment::new()?)
+}
+
+pub fn start_in(fixture: &Fixture, mut environment: WorkerE2eEnvironment) -> Result<Installed> {
     super::phase(&environment, "fixture-copy-verify")?;
     let copy = environment.root.join("provided-fixture");
     fixture.source.copy_to(&copy)?;

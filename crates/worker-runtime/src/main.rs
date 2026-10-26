@@ -117,6 +117,12 @@ fn run() -> Result<(), ProcessError> {
         let listener = tokio::net::TcpListener::bind(config.http.bind_addr).await?;
         let local_addr = listener.local_addr()?;
         let worker_runtime = build_runtime(&config)?;
+        #[cfg(feature = "restore-checkpoints")]
+        if let Some(checkpoint) = &config.test_restore_checkpoint {
+            worker_runtime
+                .install_test_restore_checkpoint(checkpoint.clone())
+                .map_err(ProcessError::Runtime)?;
+        }
         eprintln!(
             "yoi-runtime listening on {local_addr}; intended client is a trusted backend/proxy, not a browser"
         );
@@ -391,6 +397,21 @@ where
         let (flag, inline_value) = split_flag_value(arg)?;
         match flag.as_str() {
             "--help" | "-h" => return Ok(None),
+            #[cfg(feature = "restore-checkpoints")]
+            "--test-restore-checkpoint" => {
+                let path = take_value(&flag, inline_value, &mut args)?;
+                if config.test_restore_checkpoint.is_some() {
+                    return Err(ProcessError::usage(
+                        "--test-restore-checkpoint may only be specified once".into(),
+                    ));
+                }
+                config.test_restore_checkpoint = Some(
+                    worker_runtime::restore_checkpoints::RestoreCheckpointConfig::from_path(
+                        Path::new(&path),
+                    )
+                    .map_err(ProcessError::Runtime)?,
+                );
+            }
             "--bind" => {
                 let value = take_value(&flag, inline_value, &mut args)?;
                 config.http.bind_addr = value.parse::<SocketAddr>().map_err(|error| {
@@ -465,6 +486,12 @@ where
     }
 
     apply_store_selection(&mut config);
+    #[cfg(feature = "restore-checkpoints")]
+    if config.test_restore_checkpoint.is_some() && config.no_store {
+        return Err(ProcessError::usage(
+            "--test-restore-checkpoint requires an fs Runtime store".into(),
+        ));
+    }
     Ok(Some(config))
 }
 
@@ -521,6 +548,8 @@ struct ProcessConfig {
     no_store: bool,
     backend_resource_endpoint: Option<String>,
     backend_resource_token: Option<String>,
+    #[cfg(feature = "restore-checkpoints")]
+    test_restore_checkpoint: Option<worker_runtime::restore_checkpoints::RestoreCheckpointConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -542,6 +571,8 @@ impl ProcessConfig {
             no_store: false,
             backend_resource_endpoint: None,
             backend_resource_token: None,
+            #[cfg(feature = "restore-checkpoints")]
+            test_restore_checkpoint: None,
         })
     }
 
@@ -1226,6 +1257,47 @@ Auth commands:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_cli_is_absent_by_default() {
+        let config = parse_args([] as [&str; 0]).unwrap().unwrap();
+        #[cfg(feature = "restore-checkpoints")]
+        assert!(config.test_restore_checkpoint.is_none());
+        #[cfg(not(feature = "restore-checkpoints"))]
+        {
+            let _ = config;
+            let error = parse_args(["--test-restore-checkpoint", "never-opened.json"]).unwrap_err();
+            assert!(error.to_string().contains("unknown argument"));
+        }
+    }
+
+    #[cfg(feature = "restore-checkpoints")]
+    #[test]
+    fn checkpoint_cli_requires_valid_explicit_file_and_fs_store() {
+        use worker_runtime::restore_checkpoints::{
+            RestoreCheckpointConfig, RestoreCheckpointStage,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.json");
+        let checkpoint = RestoreCheckpointConfig {
+            endpoint: "127.0.0.1:1234".parse().unwrap(),
+            worker_id: protocol::WorkerId::now_v7(),
+            stage: RestoreCheckpointStage::CommittedPreterminal,
+            nonce: "cli-test".into(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        let args = ["--test-restore-checkpoint", path.to_str().unwrap()];
+        let config = parse_args(args).unwrap().unwrap();
+        assert_eq!(config.test_restore_checkpoint, Some(checkpoint));
+        assert!(parse_args([args[0], args[1], "--no-store"]).is_err());
+        assert!(parse_args([args[0], args[1], args[0], args[1]]).is_err());
+        assert!(parse_args([args[0]]).is_err());
+        std::fs::write(&path, b"private-invalid-body").unwrap();
+        let error = parse_args(args).unwrap_err().to_string();
+        assert!(!error.contains("private-invalid-body"));
+        std::fs::remove_file(&path).unwrap();
+        assert!(parse_args(args).is_err());
+    }
 
     #[test]
     fn help_does_not_start_server() {

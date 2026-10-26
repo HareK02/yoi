@@ -39,3 +39,30 @@ not stripped or rewritten. Portability/secret-marker checks do not replace
 review of the supplied artificial conversation or its independently verified hashes.
 The installer refuses any destination content other than initialized `auth.toml`;
 interrupted publication is fail-closed, not an overwrite/recovery facility.
+
+## Owned-process Restore checkpoints
+
+The independent, nondefault `restore-checkpoints` feature exists only for explicit
+process tests in the shared `tests/e2e` harness. Offline `test-support` does not enable
+it. Normal binaries reject `--test-restore-checkpoint`; no environment variable or
+HTTP endpoint activates this facility. Do not deploy a checkpoint-enabled binary
+as a replacement for the default product.
+
+A test-enabled Runtime accepts `--test-restore-checkpoint <config.json>` with a
+bounded regular JSON file selecting a loopback socket, Worker ID, one stage and a
+diagnostic nonce. The nonce is only a handshake label, never execution identity,
+request authority or routing state. The one-shot stages are real prepared candidate
+with `NotCommitted`, and durable `Committed` before activation/terminal receipt.
+Before acknowledging, the existing bounded canonical reader validates the exact
+Worker/operation/decision, syncs its file/directories and requires no saved receipt.
+No pending JSON is fabricated and no lifecycle work is skipped.
+
+The Runtime sends bounded newline-delimited JSON evidence, then waits at most eight
+seconds for byte `R`. EOF, invalid reply, unavailable peer or deadline releases the
+wait into the original operation. The Runtime-state mutex is not held across that
+wait; existing per-Worker ownership still covers the actual candidate and cleanup.
+The harness verifies the ack, kills/reaps only its owned child and inspects the
+canonical aggregate offline before restarting the same roots/identity without the
+checkpoint flag or another fixture install. These tests are a separate cfg/binary
+lane from featureless product regression; they do not certify arbitrary OS failure,
+external power loss or a real model call.

@@ -1,4 +1,7 @@
 //! Fixed, externally supplied Worker restore. Never generates a fixture or sends model input.
+#[cfg(feature = "restore-checkpoints")]
+#[path = "worker_restore/checkpoint.rs"]
+mod checkpoint;
 #[path = "worker_restore/fixture.rs"]
 mod fixture;
 #[path = "worker_restore/seed.rs"]
