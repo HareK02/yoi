@@ -510,7 +510,11 @@ mod tests {
 
     fn state() -> MemoryStagingOutputState {
         MemoryStagingOutputState::new(
-            SessionCapture::new("segment-1", vec![Item::user_message("durable decision")]),
+            SessionCapture::new(
+                "session",
+                "segment-1",
+                vec![Item::user_message("durable decision")],
+            ),
             crate::worker::marker_workspace_client(None, "test-backend"),
             SourceRef {
                 segment_id: "segment-1".to_string(),
@@ -537,6 +541,7 @@ mod tests {
     #[test]
     fn render_input_uses_session_entry_refs_and_new_tool_names() {
         let view = SessionCapture::new(
+            "session",
             "segment-1",
             vec![
                 Item::user_message("preference"),
@@ -586,7 +591,11 @@ mod tests {
     async fn subjektiv_destination_sends_committed_session_without_subject_scope() {
         let client = Arc::new(RecordingSubjektivClient::default());
         let state = MemoryStagingOutputState::new_subjektiv(
-            SessionCapture::new("segment-1", vec![Item::user_message("durable decision")]),
+            SessionCapture::new(
+                "session",
+                "segment-1",
+                vec![Item::user_message("durable decision")],
+            ),
             {
                 let mut host = crate::subjektiv::test_connection(client.clone());
                 host.context.session_id = "session-committed".into();
@@ -629,5 +638,54 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:?}").contains("unknown SessionEntryRef"));
+    }
+    #[tokio::test]
+    async fn staging_roundtripped_mixed_sources_uses_original_evidence_ranges_not_view_order() {
+        let client = Arc::new(RecordingSubjektivClient::default());
+        let mut dto = SessionCapture::new(
+            "session",
+            "view",
+            vec![
+                Item::user_message("first"),
+                Item::assistant_message("second"),
+            ],
+        )
+        .to_dto();
+        dto.entries[0].source.segment_id = "original-a".into();
+        dto.entries[0].source.entry_index = 80;
+        dto.entries[1].source.segment_id = "original-b".into();
+        dto.entries[1].source.entry_index = 3;
+        let limits = crate::session_capture::CaptureLimits::default();
+        let view = SessionCapture::decode(&dto.encode(limits).unwrap(), limits).unwrap();
+        let state = MemoryStagingOutputState::new_subjektiv(
+            view,
+            crate::subjektiv::test_connection(client.clone()),
+            SourceRef {
+                segment_id: "view".into(),
+                range: [0, 1],
+            },
+            "run".into(),
+        );
+        StageMemoryCandidateTool { state }.execute(
+            r#"{"kind":"decision","claim":"claim","why_useful":"useful","entry_refs":["E00000000","E00000001"]}"#,
+            agen::tool::ToolExecutionContext::direct(),
+        ).await.unwrap();
+        let requests = client.requests.lock().unwrap();
+        let request: server_api::SubjektivStageCandidateRequest =
+            serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+        for (index, segment, position) in [(0, "original-a", 80), (1, "original-b", 3)] {
+            assert_eq!(
+                request.operation.evidence[index].entry_range,
+                Some([position; 2])
+            );
+            assert_eq!(
+                request.operation.source_refs[index].segment_id.as_deref(),
+                Some(segment)
+            );
+            assert_eq!(
+                request.operation.source_refs[index].entry_range,
+                Some([position; 2])
+            );
+        }
     }
 }

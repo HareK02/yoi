@@ -26,6 +26,9 @@ use tokio::sync::broadcast;
 
 use worker::{Worker, WorkerController, WorkerError};
 
+#[path = "common/diagnostics.rs"]
+mod diagnostics;
+
 type TestStore = CombinedStore<FsStore, FsWorkerStore>;
 
 #[derive(Clone)]
@@ -2876,7 +2879,7 @@ const COMPACTION_HOST_WORKSPACE_ID: &str = "journal-transport-host-workspace";
 // Host authorization/selection or live-model semantic continuation quality.
 struct CompactionJournalHost {
     granted: bool,
-    unavailable: bool,
+    failure: Option<&'static str>,
     snapshot: Mutex<subjektiv::journal::startup::JournalStartupSnapshot>,
     reads: Mutex<Vec<worker::subjektiv::SubjektivHostContext>>,
     startup_reads: AtomicUsize,
@@ -2886,7 +2889,7 @@ impl CompactionJournalHost {
     fn new(snapshot: subjektiv::journal::startup::JournalStartupSnapshot) -> Self {
         Self {
             granted: true,
-            unavailable: false,
+            failure: None,
             snapshot: Mutex::new(snapshot),
             reads: Mutex::new(vec![]),
             startup_reads: AtomicUsize::new(0),
@@ -2917,10 +2920,18 @@ impl worker::subjektiv::SubjektivHost for CompactionJournalHost {
         worker::subjektiv::SubjektivHostError,
     > {
         self.reads.lock().unwrap().push(context.clone());
-        if self.unavailable {
-            return Err(worker::subjektiv::SubjektivHostError::Unavailable(
-                "injected Journal read failure".into(),
-            ));
+        if let Some(failure) = self.failure {
+            use worker::subjektiv::SubjektivHostError;
+            let secret = "PRIVATE_JOURNAL_BODY /private/host/path proof=PRIVATE_PROOF credential=PRIVATE_CREDENTIAL raw_error=PRIVATE_ERROR";
+            return Err(match failure {
+                "unavailable" => SubjektivHostError::Unavailable(secret.into()),
+                "invalid-argument" => SubjektivHostError::InvalidArgument(secret.into()),
+                "conflict" => SubjektivHostError::Conflict {
+                    code: secret.into(),
+                    message: secret.into(),
+                },
+                _ => panic!("unknown failure fixture"),
+            });
         }
         Ok(self.snapshot.lock().unwrap().clone())
     }
@@ -3466,26 +3477,37 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
 }
 
 #[tokio::test]
-async fn journal_absent_disabled_unavailable_and_over_byte_budget_keep_conversation_compaction() {
-    for case in [
-        "absent",
-        "disabled",
-        "unavailable",
-        "over-byte-budget",
-        "no-host",
-    ] {
+async fn journal_empty_disabled_and_available_compaction_preserve_inputs_without_failure_warnings()
+{
+    assert_journal_compaction_cases(&["absent", "available", "disabled", "no-host"]).await;
+}
+
+#[tokio::test]
+async fn journal_snapshot_failures_keep_safe_diagnostics_and_continue_compaction() {
+    assert_journal_compaction_cases(&["unavailable", "invalid-argument", "conflict"]).await;
+}
+
+#[tokio::test]
+async fn journal_over_byte_budget_keeps_safe_diagnostic_and_continues_compaction() {
+    assert_journal_compaction_cases(&["over-byte-budget"]).await;
+}
+
+async fn assert_journal_compaction_cases(cases: &[&'static str]) {
+    for &case in cases {
         let mut snapshot = compaction_snapshot(0);
         if case == "absent" {
             snapshot.journals.clear();
         }
         if case == "over-byte-budget" {
             snapshot.journals[0].current_position =
-                "x".repeat(subjektiv::journal::startup::STARTUP_MAX_BYTES);
+                "PRIVATE_JOURNAL_BODY".repeat(subjektiv::journal::startup::STARTUP_MAX_BYTES);
         }
-        let expected_json = (case == "absent").then(|| serde_json::to_string(&snapshot).unwrap());
+        let expected_json = matches!(case, "absent" | "available")
+            .then(|| serde_json::to_string(&snapshot).unwrap());
         let mut host = CompactionJournalHost::new(snapshot);
         host.granted = case != "disabled";
-        host.unavailable = case == "unavailable";
+        host.failure =
+            matches!(case, "unavailable" | "invalid-argument" | "conflict").then_some(case);
         let host = Arc::new(host);
         let client = MockClient::new(vec![
             single_text_events("seed"),
@@ -3517,7 +3539,51 @@ async fn journal_absent_disabled_unavailable_and_over_byte_budget_keep_conversat
                 true,
             )
             .await;
-        fixture.worker.compact(0).await.unwrap();
+        // Scope the subscriber to every poll, not a thread-local guard across await.
+        // This observes the real Feature warning while compacting into FsStore.
+        let logs = diagnostics::CapturedWarnings::default();
+        use tracing::instrument::WithSubscriber;
+        fixture
+            .worker
+            .compact(0)
+            .with_subscriber(logs.subscriber())
+            .await
+            .unwrap();
+        let log = logs.text();
+        let failure = match case {
+            "unavailable" => Some(("snapshot", "host_unavailable")),
+            "invalid-argument" => Some(("snapshot", "host_invalid_argument")),
+            "conflict" => Some(("snapshot", "host_conflict")),
+            "over-byte-budget" => Some(("byte_budget", "startup_max_bytes_exceeded")),
+            _ => None,
+        };
+        if let Some((stage, reason)) = failure {
+            assert!(log.contains(&format!("stage=\"{stage}\"")), "{case}: {log}");
+            assert!(
+                log.contains(&format!("reason=\"{reason}\"")),
+                "{case}: {log}"
+            );
+            assert_eq!(
+                log.matches("continuing without Journal").count(),
+                1,
+                "{case}"
+            );
+        } else {
+            assert!(
+                !log.contains("Journal compaction snapshot unavailable"),
+                "{case}: {log}"
+            );
+        }
+        for secret in [
+            "PRIVATE_",
+            "/private/host/path",
+            "JOURNAL_POSITION_0",
+            "JOURNAL_BODY_0",
+            "state-token-0",
+            "fixed-event-reference-0",
+        ] {
+            assert!(!log.contains(secret), "{case}: diagnostic leaked {secret}");
+        }
         let input = first_compactor_input(&observed.requests()[1]);
         let body = if matches!(case, "disabled" | "no-host") {
             assert_eq!(
@@ -3532,8 +3598,8 @@ async fn journal_absent_disabled_unavailable_and_over_byte_budget_keep_conversat
             String::new()
         } else {
             let body = journal_body(&fixture.worker);
-            let expected = if case == "absent" {
-                "absent"
+            let expected = if matches!(case, "absent" | "available") {
+                case
             } else {
                 "unavailable"
             };
@@ -3548,6 +3614,71 @@ async fn journal_absent_disabled_unavailable_and_over_byte_budget_keep_conversat
                 &fixture.worker.prompts().load_full(),
                 Some(COMPACTION_HOST_WORKSPACE_ID),
             );
+            let seed = replacement_seed(&fixture.worker);
+            let metadata = seed[1].metadata.input_metadata.as_ref().unwrap();
+            assert_eq!(
+                metadata.usage().recording_material,
+                session_store::InputEvidenceUse::Exclude
+            );
+            assert_eq!(
+                metadata.usage().memory_evidence,
+                session_store::InputEvidenceUse::Exclude
+            );
+            assert_eq!(
+                metadata.usage().observation,
+                session_store::InputObservationUse::Hidden
+            );
+            let payload: serde_json::Value = metadata
+                .feature_payload()
+                .unwrap()
+                .decode("journal:compaction", 1)
+                .unwrap();
+            assert_eq!(payload["status"], expected);
+            assert_eq!(
+                payload["prompt_provenance"]["workspace_id"],
+                COMPACTION_HOST_WORKSPACE_ID
+            );
+            let projection = fixture.worker.prompts().load_full().projection().clone();
+            assert_eq!(
+                payload["prompt_provenance"]["source_digest"],
+                projection.source_digest
+            );
+            assert_eq!(
+                payload["prompt_provenance"]["projection_digest"],
+                projection.catalog_digest
+            );
+            if let Some(json) = expected_json.as_deref() {
+                use sha2::{Digest, Sha256};
+                assert_eq!(
+                    payload["snapshot"],
+                    serde_json::from_str::<serde_json::Value>(json).unwrap()
+                );
+                assert_eq!(
+                    payload["snapshot_sha256"],
+                    Sha256::digest(json.as_bytes())
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                );
+            } else {
+                assert!(payload["snapshot"].is_null());
+                assert!(payload["snapshot_sha256"].is_null());
+            }
+            // Feature diagnostics do not become model input or a new metadata contract.
+            let saved = serde_json::to_string(&seed[1]).unwrap();
+            for forbidden in [
+                "PRIVATE_",
+                "/private/host/path",
+                "host_unavailable",
+                "host_conflict",
+                "host_invalid_argument",
+                "startup_max_bytes_exceeded",
+            ] {
+                assert!(
+                    !saved.contains(forbidden),
+                    "{case}: saved input leaked {forbidden}"
+                );
+            }
             body
         };
         assert_full_initial_summary(&input, &inherited);
@@ -3559,8 +3690,8 @@ async fn journal_absent_disabled_unavailable_and_over_byte_budget_keep_conversat
                 .is_some_and(|text| text.contains("PREVIOUS_JOURNAL_DELEGATED_CONTEXT"))),
             "fallback retains only the newly frozen reference, not an old snapshot as latest"
         );
-        assert!(!body.contains("JOURNAL_POSITION_0"));
-        assert!(!body.contains("journal-reference-0"));
+        assert_eq!(body.contains("JOURNAL_POSITION_0"), case == "available");
+        assert_eq!(body.contains("journal-reference-0"), case == "available");
         assert_eq!(
             host.reads.lock().unwrap().len(),
             usize::from(!matches!(case, "disabled" | "no-host")),

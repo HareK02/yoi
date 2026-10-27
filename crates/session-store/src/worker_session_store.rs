@@ -194,6 +194,21 @@ impl WorkerSessionStore {
         Ok(store)
     }
 
+    /// Open a current retained Session without creating or migrating anything.
+    /// The live constraint is checked here and again by every later publication;
+    /// attaching the control store itself does not acquire publication authority.
+    pub fn open_existing_with_retention(
+        root: impl Into<PathBuf>,
+        retention: crate::retention::SessionRetentionStore,
+    ) -> Result<Self, StoreError> {
+        let mut store = Self::open_read_only(root)?;
+        if let Some(session) = *store.session_id.lock().unwrap() {
+            retention.ensure_live(session)?;
+        }
+        store.retention = Some(retention);
+        Ok(store)
+    }
+
     fn lock_publication(
         &self,
         session: SessionId,

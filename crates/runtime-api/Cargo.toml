@@ -9,6 +9,7 @@ license.workspace = true
 api-macros = { workspace = true, features = ["reqwest", "axum"] }
 manifest.workspace = true
 protocol.workspace = true
+session-store.workspace = true
 serde = { workspace = true, features = ["derive"] }
 workdir.workspace = true
 

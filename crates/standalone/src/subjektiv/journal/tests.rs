@@ -1,6 +1,6 @@
 //! Integration of standalone attribution, original FsStore material, shared Journal storage
 //! and the local Job adapter. Only the outer model/execution lease is replaced in these cases.
-//! The generic Job runner is exercised separately by the standalone Jobs integration suite.
+//! The scripted model also exercises saved direct input through the actual generic Job runner.
 
 use super::*;
 use crate::store::{StaleLeasePolicy, StandaloneWorkerAllocation, StandaloneWorkerStore};
@@ -144,8 +144,8 @@ impl Fixture {
                 .unwrap()
                 .contains(sentinel)
         );
-        // Include SQLite/WAL/journal files: immutable request/grant storage must never hold
-        // original text, even in freed pages left behind by explicit source erasure.
+        // Include SQLite/WAL/journal files: erasure must scrub retired original bodies,
+        // including any freed pages or journal left by the immutable request store.
         for entry in fs::read_dir(self.connection.jobs_path.parent().unwrap()).unwrap() {
             let entry = entry.unwrap();
             if entry.file_type().unwrap().is_file() {
@@ -194,9 +194,9 @@ impl Fixture {
             context,
             job_context,
             generation,
+            input_digest: snapshot.input_digest.clone(),
             fence: fence.clone(),
         };
-        adapter.read_all_sources();
         (adapter, fence, snapshot)
     }
 }
@@ -220,37 +220,6 @@ fn message(id: &str, text: &str) -> session_store::LoggedHistoryEntry {
     }
 }
 impl LocalJournalHost {
-    fn read_all_sources(&self) {
-        for range in &self.generation.selected_ranges {
-            let mut offset = range.bytes.start as usize;
-            let mut content_token = None;
-            loop {
-                let response = self
-                    .execute(JournalJobRequest::ReadText {
-                        read: JournalTextRead {
-                            target: JournalTextTarget::Source {
-                                pointer: range.source.pointer.clone(),
-                            },
-                            offset,
-                            limit: MAX_JOURNAL_READ_BYTES,
-                            content_token: content_token.clone(),
-                        },
-                    })
-                    .unwrap();
-                let JournalJobResponse::Text(text) = response else {
-                    panic!()
-                };
-                match text.next_byte {
-                    Some(next) => {
-                        assert!(next > offset);
-                        offset = next;
-                        content_token = Some(text.content_token);
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
     fn state(&self) -> Result<JournalJobState, SubjektivHostError> {
         match self.execute(JournalJobRequest::ReadState)? {
             JournalJobResponse::State(state) => Ok(state),
@@ -362,8 +331,8 @@ fn duplicate_admission_reserves_one_job_and_excludes_private_prompt() {
     assert_eq!(jobs.pending().unwrap().len(), 1);
     let input = jobs.get(&id).unwrap().request.input.to_string();
     assert!(
-        !input.contains("short request"),
-        "Job storage retains descriptors, never a second copy of original text"
+        input.contains("short request"),
+        "Job storage supplies the canonical body directly"
     );
     assert!(!input.contains("PRIVATE PROMPT"));
     let foreign = SubjektivHostContext {
@@ -498,14 +467,16 @@ fn generation_input_stays_frozen_and_next_prefix_includes_last_input() {
             &adapter.generation.job,
         )
         .unwrap();
-    let materials = fixture
+    let next = fixture
         .host()
-        .select_journal_materials(&adapter.context, &adapter.grant.journal_id)
+        .build_journal_input(&adapter.context, &adapter.grant.journal_id, None)
         .unwrap();
-    assert_eq!(materials[0].range.source.pointer.entry_ref, "Elast");
+    assert_eq!(next.selected_ranges[0].source.pointer.entry_ref, "Elast");
     assert!(
-        materials[0]
-            .text
+        next.capture
+            .recording_text(next.selected_ranges[0].source.order)
+            .unwrap()
+            .2
             .contains("last input while generation runs")
     );
 }
@@ -547,7 +518,7 @@ fn large_original_is_chunked_without_claiming_unread_suffix() {
     let (adapter, _, _) = fixture.adapter();
     let range = &adapter.grant.ranges[0];
     assert!(range.bytes.end < range.source.total_bytes);
-    assert!(range.bytes.end - range.bytes.start < INPUT_BUDGET as u64);
+    assert!(range.bytes.end - range.bytes.start < job::MAX_JOB_INPUT_BYTES as u64);
     let snapshot = fixture
         .host()
         .jobs()
@@ -557,7 +528,7 @@ fn large_original_is_chunked_without_claiming_unread_suffix() {
         .pop()
         .unwrap();
     assert!(serde_json::to_vec(&snapshot.request.input).unwrap().len() < 128 * 1024);
-    assert!(!snapshot.request.input.to_string().contains("漢字"));
+    assert!(snapshot.request.input.to_string().contains("漢字"));
     assert!(adapter.finish().is_err());
 }
 
@@ -628,43 +599,35 @@ impl JournalScript {
             )
         } else if let Some(state) = result("state") {
             let state = &state["value"];
-            for (index, range) in state["selected_ranges"]
-                .as_array()
-                .unwrap()
+            let input: serde_json::Value = request
+                .items
                 .iter()
-                .enumerate()
-            {
-                let mut offset = range["bytes"]["start"].as_u64().unwrap();
-                let mut token = Value::Null;
-                loop {
-                    let id = format!("source-{index}-{offset}");
-                    if let Some(page) = result(&id) {
-                        let page = &page["value"];
-                        let key = format!("{}:{id}", state["generation_id"].as_str().unwrap());
-                        let text = page["text"].as_str().unwrap().to_owned();
-                        if let Some(previous) =
-                            self.source_reads.lock().unwrap().insert(key, text.clone())
-                        {
-                            assert_eq!(
-                                previous, text,
-                                "frozen source read changed within a generation"
-                            );
-                        }
-                        if let Some(next) = page["next_byte"].as_u64() {
-                            assert!(next > offset);
-                            offset = next;
-                            token = page["content_token"].clone();
-                        } else {
-                            break;
-                        }
-                    } else {
-                        let input = json!({"target":{"target":"source","pointer":range["source"]["pointer"]},"offset":offset,"limit":MAX_JOURNAL_READ_BYTES,"content_token":token});
-                        return vec![
-                            Event::tool_use_start(0, &id, "ReadJournalText"),
-                            Event::tool_input_delta(0, input.to_string()),
-                            Event::tool_use_stop(0),
-                        ];
-                    }
+                .filter_map(Item::as_text)
+                .find_map(|text| {
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("input_json: "))
+                })
+                .map(|json| serde_json::from_str(json).unwrap())
+                .expect("direct saved Journal input");
+            let input = JournalInput::decode(&input).unwrap();
+            assert_eq!(
+                serde_json::to_value(&input.selected_ranges).unwrap(),
+                state["selected_ranges"]
+            );
+            for entry in &input.capture.entries {
+                let (_, offset, text) = input.capture.recording_text(entry.order).unwrap();
+                let key = format!(
+                    "{}:{}:{offset}",
+                    state["generation_id"].as_str().unwrap(),
+                    entry.order
+                );
+                if let Some(previous) = self
+                    .source_reads
+                    .lock()
+                    .unwrap()
+                    .insert(key, text.to_owned())
+                {
+                    assert_eq!(previous, text, "saved source changed within generation");
                 }
             }
             let (name, action) = if state["current_open"].is_null() {
@@ -1166,6 +1129,11 @@ async fn shutdown_reopen_reconciles_partial_saved_operations_without_duplicate_c
         .items;
     assert_eq!(entries.len(), 1);
     let saved_entry = entries[0].id.clone();
+    let original_input = jobs.get(&id).unwrap().request.input;
+    fixture.append(
+        "newer-than-snapshot",
+        "NEW INPUT MUST NOT MIX INTO RESUMED SNAPSHOT",
+    );
     jobs.shutdown().await.unwrap();
     fixture.connection.close().unwrap();
     let mut reopened = StandaloneSubjects::open_existing(&state)
@@ -1176,8 +1144,29 @@ async fn shutdown_reopen_reconciles_partial_saved_operations_without_duplicate_c
         .unwrap();
     reopened.host.bind_jobs(jobs.clone()).unwrap();
     assert_eq!(jobs.get(&id).unwrap().state, JobState::Unknown);
-    // Domain reconciliation inspects the now-fenced prior attempt and preserves its receipts.
+    // Deny every original-source read while preparing and running the replacement.
+    let source_path = fixture
+        .sessions
+        .root_dir()
+        .join(&fixture.context.session_id);
+    let denied = fixture
+        ._temp
+        .path()
+        .join("temporarily-unavailable-original");
+    fs::rename(&source_path, &denied).unwrap();
     let (_, replacement) = reopened.host.next_journal_job().unwrap().unwrap();
+    let replacement_input = jobs.get(&replacement).unwrap().request.input;
+    assert_eq!(replacement_input["capture"], original_input["capture"]);
+    assert!(
+        !replacement_input
+            .to_string()
+            .contains("NEW INPUT MUST NOT MIX")
+    );
+    assert_eq!(jobs.get(&id).unwrap().request.input, original_input);
+    assert_eq!(
+        jobs.get(&id).unwrap().input_disposition,
+        JobInputDisposition::Available
+    );
     assert_ne!(
         replacement, id,
         "unknown external execution is not blindly replayed"
@@ -1205,8 +1194,26 @@ async fn shutdown_reopen_reconciles_partial_saved_operations_without_duplicate_c
         .items;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].id, saved_entry);
+    fs::rename(&denied, &source_path).unwrap();
+    let journal = reopened
+        .host
+        .catalog
+        .store
+        .read_journal(&context, &journal_id)
+        .unwrap();
+    let original = JournalInput::decode(&original_input).unwrap();
+    let end = original.selected_ranges.last().unwrap();
+    assert_eq!(
+        (journal.process_order, journal.process_byte),
+        if end.bytes.end == end.source.total_bytes {
+            (end.source.order + 1, 0)
+        } else {
+            (end.source.order, end.bytes.end)
+        }
+    );
+    assert!(reopened.host.admit_journal(&fixture.context).unwrap());
     assert!(
-        reopened
+        !reopened
             .host
             .session_fully_reflected(&fixture.context.session_id)
             .unwrap()
@@ -1302,9 +1309,9 @@ fn missing_original_material_blocks_worker_removal_without_erasing_state() {
 }
 
 #[test]
-fn frozen_original_remains_readable_after_worker_switches_its_active_session() {
+fn frozen_input_survives_active_session_change_and_source_tool_remains_refused() {
     let fixture = Fixture::new("old Session original");
-    let (adapter, _, _) = fixture.adapter();
+    let (adapter, _, snapshot) = fixture.adapter();
     let workers = StandaloneWorkerStore::open_existing(&fixture.host().catalog.state_root).unwrap();
     let worker = fixture._allocation.as_ref().unwrap().worker_id();
     let record = workers.load(worker).unwrap();
@@ -1318,22 +1325,30 @@ fn frozen_original_remains_readable_after_worker_switches_its_active_session() {
             )),
         ))
         .unwrap();
-    let response = adapter
-        .execute(JournalJobRequest::ReadText {
-            read: JournalTextRead {
-                target: JournalTextTarget::Source {
-                    pointer: adapter.generation.selected_ranges[0].source.pointer.clone(),
-                },
-                offset: 0,
-                limit: MAX_JOURNAL_READ_BYTES,
-                content_token: None,
-            },
-        })
-        .unwrap();
-    let JournalJobResponse::Text(page) = response else {
-        panic!()
-    };
-    assert!(page.text.contains("old Session original"));
+    assert!(
+        adapter
+            .execute(JournalJobRequest::ReadText {
+                read: JournalTextRead {
+                    target: JournalTextTarget::Source {
+                        pointer: adapter.generation.selected_ranges[0].source.pointer.clone()
+                    },
+                    offset: 0,
+                    limit: MAX_JOURNAL_READ_BYTES,
+                    content_token: None
+                }
+            })
+            .is_err(),
+        "original Source lookup is explicitly unavailable"
+    );
+    let input = JournalInput::decode(&snapshot.request.input).unwrap();
+    assert!(
+        input
+            .capture
+            .recording_text(0)
+            .unwrap()
+            .2
+            .contains("old Session original")
+    );
     assert!(
         fixture
             .host()
@@ -1512,14 +1527,18 @@ fn relocated_erasure_fences_old_and_retained_readers_publishers_and_late_pins() 
     const SENTINEL: &str = "original-plaintext-sentinel-must-never-enter-immutable-job-storage";
     let mut fixture = Fixture::new(SENTINEL);
     let (_, _, snapshot) = fixture.adapter();
-    fixture.assert_job_storage_excludes(&snapshot, SENTINEL);
+    assert!(snapshot.request.input.to_string().contains(SENTINEL));
     let state = fixture.host().catalog.state_root.clone();
     let binding = fixture.connection.binding.clone();
     let session: session_store::SessionId = fixture.context.session_id.parse().unwrap();
-    let old_reader = fixture
-        .host()
-        .material_reader(&fixture.context.session_id)
-        .unwrap();
+    let old_reader = SessionPublicMaterialReader::open_fs_with_retention(
+        fixture.sessions.root_dir(),
+        session,
+        fixture.segment,
+        PublicMaterialLimits::default(),
+        crate::store::session_retention(&state),
+    )
+    .unwrap();
     let descriptor = old_reader.descriptors().next().unwrap().clone();
     let (worker, workers) = fixture.stop_worker();
     assert!(workers.delete(worker).is_err());
@@ -1759,14 +1778,12 @@ async fn late_terminal_boundary_after_reflected_task_prefix_is_read_by_next_job(
     let snapshot = jobs.get(&next).unwrap();
     let grant = fixture.host().journal_grant(&snapshot).unwrap();
     assert_eq!(grant.ranges.len(), 1);
-    assert_eq!(
-        grant.origins[0].origin,
-        PublicMaterialOrigin::HostRunBoundary
-    );
-    let content = fixture
-        .host()
-        .journal_source_window(&grant.ranges[0].source, 0, 4096)
+    let input = JournalInput::decode(&snapshot.request.input).unwrap();
+    let (descriptor, _, content) = input
+        .capture
+        .recording_text(grant.ranges[0].source.order)
         .unwrap();
+    assert_eq!(descriptor.origin, PublicMaterialOrigin::HostRunBoundary);
     let value: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert_eq!(value["kind"], "run_boundary");
     assert_eq!(value["boundary"]["kind"], "errored");
@@ -1790,4 +1807,622 @@ async fn late_terminal_boundary_after_reflected_task_prefix_is_read_by_next_job(
     );
     assert!(fixture.host().next_journal_job().unwrap().is_none());
     jobs.shutdown().await.unwrap();
+}
+
+/// Original FsStore -> bounded common capture -> persisted Job -> actual generic runner ->
+/// sequential Journal tools. Only the LLM transport is scripted. Source files are deliberately
+/// unavailable after persistence, and input bodies are inspected in the provider request.
+#[tokio::test]
+async fn saved_body_jobs_process_over_a_hundred_entries_and_utf8_without_live_source_reads() {
+    let fixture = Fixture::new("oldest original");
+    for index in 0..115 {
+        fixture.append(
+            &format!("entry-{index}"),
+            &format!("public original {index}"),
+        );
+    }
+    fixture.append("long-utf8", &"漢字🙂\n\"".repeat(24_000));
+    fixture.host().admit_journal(&fixture.context).unwrap();
+    let expected = fixture
+        .host()
+        .recording_capture(&fixture.context.session_id)
+        .unwrap();
+    let source_path = fixture
+        .sessions
+        .root_dir()
+        .join(&fixture.context.session_id);
+    let denied = fixture._temp.path().join("denied-original-source");
+    let mut seen: std::collections::BTreeMap<u64, String> = Default::default();
+    let mut jobs_processed = 0;
+    loop {
+        let Some((jobs, id)) = fixture.host().next_journal_job().unwrap() else {
+            break;
+        };
+        let saved = jobs.get(&id).unwrap();
+        let input = JournalInput::decode(&saved.request.input).unwrap();
+        assert!(
+            serde_json::to_vec(&saved.request.input).unwrap().len() <= job::MAX_JOB_INPUT_BYTES
+        );
+        assert!(input.capture.entries.len() <= MAX_JOURNAL_RANGES);
+        for entry in &input.capture.entries {
+            let (_, offset, text) = input.capture.recording_text(entry.order).unwrap();
+            let previous = seen.entry(entry.order).or_default();
+            assert_eq!(
+                previous.len() as u64,
+                offset,
+                "no gap, preview or duplicate prefix"
+            );
+            previous.push_str(text);
+        }
+        // Deny all catalogs/reads, including grant preparation. The model still receives
+        // exactly the persisted body, and the Host must not follow the active pointer.
+        fs::rename(&source_path, &denied).unwrap();
+        let model = JournalScript::default();
+        jobs.start_with_model_client(&id, model.clone())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), jobs.wait(&id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.state, JobState::Completed);
+        assert!(
+            !model.source_reads.lock().unwrap().is_empty(),
+            "provider saw saved source bodies"
+        );
+        fixture.host().complete_journal_job(&jobs, &result).unwrap();
+        assert_eq!(
+            jobs.get(&id).unwrap().input_disposition,
+            JobInputDisposition::Reclaimed
+        );
+        fs::rename(&denied, &source_path).unwrap();
+        jobs_processed += 1;
+        assert!(jobs_processed < 20, "bounded prefix drain must progress");
+    }
+    assert!(
+        jobs_processed > 2,
+        "entry count and long text both require continuation"
+    );
+    assert_eq!(seen.len(), expected.entries.len());
+    for entry in &expected.entries {
+        assert_eq!(
+            seen[&entry.order],
+            expected.recording_text(entry.order).unwrap().2
+        );
+    }
+    fixture.host().jobs().unwrap().shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn descriptor_job_migrates_to_new_identity_preserving_input_and_successful_records() {
+    let fixture = Fixture::new("original descriptor-only input");
+    let (adapter, _, modern) = fixture.adapter();
+    let jobs = fixture.host().jobs().unwrap();
+    fixture
+        .host()
+        .catalog
+        .store
+        .close_journal_generation(
+            &adapter.context,
+            &adapter.generation.id,
+            &adapter.generation.job,
+        )
+        .unwrap();
+    jobs.cancel(&modern.request.job_id).unwrap();
+    let input = JournalInput::decode(&modern.request.input).unwrap();
+    let origins: Vec<_> = input
+        .capture
+        .entries
+        .iter()
+        .map(|entry| {
+            let (descriptor, _, _) = input.capture.recording_text(entry.order).unwrap();
+            SourceOrigin {
+                pointer: source_descriptor(&fixture.context.session_id, descriptor).pointer,
+                origin: descriptor.origin.clone(),
+            }
+        })
+        .collect();
+    let mut old_grant = adapter.grant.clone();
+    old_grant.origins = origins;
+    old_grant.writer_binding_id = None;
+    let mut request = modern.request.clone();
+    request.job_id = format!("legacy-descriptor:{}", uuid::Uuid::now_v7());
+    request.input =
+        serde_json::json!({"selected_ranges":old_grant.ranges,"origins":old_grant.origins});
+    let old = jobs
+        .request_granted(request, serde_json::to_value(&old_grant).unwrap())
+        .unwrap();
+    assert!(
+        fixture.host().journal_grant(&old).is_err(),
+        "descriptor jobs must not execute as snapshots"
+    );
+    let generation = fixture
+        .host()
+        .catalog
+        .store
+        .prepare_journal_generation(
+            &adapter.context,
+            &old_grant.journal_id,
+            JobAttemptBinding {
+                job_id: old.request.job_id.clone(),
+                attempt_id: old.attempt.attempt_id.clone(),
+            },
+            old_grant.ranges.clone(),
+        )
+        .unwrap();
+    let context = JournalJobContext::validated(
+        &fixture.host().catalog.store,
+        &adapter.context,
+        &generation.id,
+        generation.job.clone(),
+    )
+    .unwrap();
+    let saved = fixture
+        .host()
+        .catalog
+        .store
+        .execute_journal(
+            &context,
+            JournalOperation {
+                request_id: "legacy-record-success-response-lost".into(),
+                expected_state: generation.initial_journal.state_token.clone(),
+                action: JournalAction::Create {
+                    title: "already saved".into(),
+                    body: "legacy successful operation".into(),
+                    ongoing: "unfinished".into(),
+                    state: JournalEntryState::Open,
+                    source_end: None,
+                    correction_refs: vec![],
+                },
+                covered_ranges: generation.selected_ranges.clone(),
+            },
+        )
+        .unwrap();
+    fixture.append(
+        "new-not-selected",
+        "LATEST SOURCE MUST WAIT UNTIL OLD INPUT FINISHES",
+    );
+    fixture.host().admit_journal(&fixture.context).unwrap();
+    let (_, next) = fixture.host().next_journal_job().unwrap().unwrap();
+    assert_ne!(next, old.request.job_id);
+    let replacement = jobs.get(&next).unwrap();
+    let replacement_input = JournalInput::decode(&replacement.request.input).unwrap();
+    assert!(
+        !replacement
+            .request
+            .input
+            .to_string()
+            .contains("LATEST SOURCE MUST WAIT")
+    );
+    assert_eq!(replacement_input.selected_ranges, old_grant.ranges);
+    let retired = jobs.get(&old.request.job_id).unwrap();
+    assert_eq!(retired.input_disposition, JobInputDisposition::Invalidated);
+    assert_eq!(retired.input_digest, old.input_digest);
+    assert_eq!(retired.intent_fingerprint, old.intent_fingerprint);
+    assert!(retired.request.input.is_null());
+    assert!(
+        fixture
+            .host()
+            .catalog
+            .store
+            .execute_journal(
+                &context,
+                JournalOperation {
+                    request_id: "legacy-delayed".into(),
+                    expected_state: saved.state_token,
+                    action: JournalAction::ConfirmUnchanged,
+                    covered_ranges: old_grant.ranges,
+                }
+            )
+            .is_err()
+    );
+    jobs.start_with_model_client(&next, JournalScript::default())
+        .await
+        .unwrap();
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(20), jobs.wait(&next))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.state, JobState::Completed);
+    fixture
+        .host()
+        .complete_journal_job(&jobs, &completed)
+        .unwrap();
+    let entries = fixture
+        .host()
+        .catalog
+        .store
+        .list_journal_entries(&adapter.context, &adapter.grant.journal_id, None, 32)
+        .unwrap();
+    assert_eq!(entries.items.len(), 1);
+    assert_eq!(entries.items[0].id, saved.entry_id.unwrap());
+    jobs.shutdown().await.unwrap();
+}
+
+#[test]
+fn explicit_erase_retires_every_historical_body_across_job_history_pages() {
+    const SENTINEL: &str = "historical-input-erasure-sentinel-781";
+    let mut fixture = Fixture::new("ordinary original");
+    let (adapter, _, first) = fixture.adapter();
+    let jobs = fixture.host().jobs().unwrap();
+    for index in 0..105 {
+        let mut request = first.request.clone();
+        request.job_id = format!("historical-{index:03}");
+        request.purpose = "historical-other-domain-job".into();
+        request.serialization_key = None;
+        request.input = serde_json::json!({"body":SENTINEL, "index":index});
+        let saved = jobs
+            .request_granted(
+                request,
+                serde_json::json!({"session_id":fixture.context.session_id}),
+            )
+            .unwrap();
+        jobs.cancel(&saved.request.job_id).unwrap();
+    }
+    let state = fixture.host().catalog.state_root.clone();
+    let subject = fixture.connection.binding.subject_id.clone();
+    fixture.connection.close().unwrap();
+    StandaloneSubjects::open_existing(&state)
+        .unwrap()
+        .erase_session_completely(&subject, &fixture.context.session_id, "erase-all-history")
+        .unwrap();
+    let jobs = crate::jobs::StandaloneJobs::open(
+        &fixture.connection.jobs_path,
+        fixture._temp.path().into(),
+    )
+    .unwrap();
+    let mut after = None;
+    let mut count = 0;
+    loop {
+        let page = jobs
+            .list_session_snapshots(&fixture.context.session_id, after.as_deref(), 100)
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        for saved in &page {
+            assert_eq!(saved.input_disposition, JobInputDisposition::Erased);
+            assert!(saved.request.input.is_null());
+            assert!(saved.load_executable_request().is_err());
+        }
+        count += page.len();
+        after = page.last().map(|job| job.request.job_id.clone());
+    }
+    assert_eq!(count, 106);
+    assert!(
+        adapter.execute(JournalJobRequest::ReadState).is_err(),
+        "prepared local adapter is invalidated"
+    );
+    fixture.assert_job_storage_excludes(&jobs.get(&first.request.job_id).unwrap(), SENTINEL);
+}
+
+#[test]
+fn saved_snapshot_missing_tampered_foreign_or_changed_initial_state_is_not_recaptured() {
+    let fixture = Fixture::new("saved immutable original");
+    fixture.host().admit_journal(&fixture.context).unwrap();
+    let (jobs, id) = fixture.host().next_journal_job().unwrap().unwrap();
+    let saved = jobs.get(&id).unwrap();
+    for changed in [serde_json::Value::Null, serde_json::json!({"capture":{}})] {
+        let mut malformed = saved.clone();
+        malformed.request.input = changed;
+        assert!(fixture.host().journal_grant(&malformed).is_err());
+    }
+    let original = JournalInput::decode(&saved.request.input).unwrap();
+    for field in ["subject_id", "journal_id", "initial_state_token"] {
+        let mut changed = saved.request.clone();
+        changed.job_id = format!("changed-{field}");
+        changed.serialization_key = None;
+        changed.input[field] = serde_json::json!("foreign-or-altered");
+        // Even a separately reserved immutable Job may not adopt the original capability.
+        let changed = jobs
+            .request_granted(changed, saved.domain_grant.clone().unwrap())
+            .unwrap();
+        assert!(
+            grant(
+                fixture.host().clone(),
+                &changed,
+                Arc::new(TestFence(AtomicBool::new(true)))
+            )
+            .is_err()
+        );
+    }
+    let mut generation = fixture
+        .host()
+        .catalog
+        .store
+        .prepare_journal_generation(
+            &authority(fixture.host(), &fixture.context.session_id).unwrap(),
+            &original.journal_id,
+            JobAttemptBinding {
+                job_id: id,
+                attempt_id: saved.attempt.attempt_id.clone(),
+            },
+            original.selected_ranges.clone(),
+        )
+        .unwrap();
+    generation.initial_journal.state_token = "changed-after-snapshot".into();
+    assert!(original.validate_generation(&generation).is_err());
+    assert_eq!(
+        saved.request.input,
+        jobs.get(&saved.request.job_id).unwrap().request.input
+    );
+}
+
+#[tokio::test]
+async fn append_between_admission_and_body_capture_does_not_publish_unaccepted_input() {
+    let fixture = Fixture::new("accepted oldest prefix");
+    fixture.host().admit_journal(&fixture.context).unwrap();
+    fixture.append("not-yet-admitted", "newly saved but not accepted");
+    let (jobs, id) = fixture.host().next_journal_job().unwrap().unwrap();
+    let input = jobs.get(&id).unwrap().request.input;
+    assert!(input.to_string().contains("accepted oldest prefix"));
+    assert!(!input.to_string().contains("newly saved but not accepted"));
+    jobs.start_with_model_client(&id, JournalScript::default())
+        .await
+        .unwrap();
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(20), jobs.wait(&id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.state, JobState::Completed);
+    fixture
+        .host()
+        .complete_journal_job(&jobs, &completed)
+        .unwrap();
+    fixture.host().admit_journal(&fixture.context).unwrap();
+    let (_, next) = fixture.host().next_journal_job().unwrap().unwrap();
+    let remaining = jobs.get(&next).unwrap().request.input;
+    assert!(
+        remaining
+            .to_string()
+            .contains("newly saved but not accepted")
+    );
+    assert!(!remaining.to_string().contains("accepted oldest prefix"));
+    jobs.shutdown().await.unwrap();
+}
+
+/// Generic Job preparation must not attest delivery. The saved body is supplied by the
+/// runner before a bound Journal tool may execute; no model-provided digest is trusted.
+#[tokio::test]
+async fn actual_bound_tool_attests_delivery_but_prepared_blocked_job_does_not() {
+    let fixture = Fixture::new("body delivered through generic runner");
+    fixture.host().admit_journal(&fixture.context).unwrap();
+    let (jobs, id) = fixture.host().next_journal_job().unwrap().unwrap();
+    let saved = jobs.get(&id).unwrap();
+    let model = JournalScript {
+        gate_first: true,
+        pause_after_record: true,
+        ..Default::default()
+    };
+    jobs.start_with_model_client(&id, model.clone())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), model.entered.notified())
+        .await
+        .unwrap();
+    let host_context = authority(fixture.host(), &fixture.context.session_id).unwrap();
+    let journal_id = fixture
+        .host()
+        .catalog
+        .store
+        .journal_for_session(&host_context)
+        .unwrap()
+        .unwrap();
+    let generation = fixture
+        .host()
+        .catalog
+        .store
+        .active_journal_generation(&host_context, &journal_id)
+        .unwrap()
+        .unwrap();
+    let context = JournalJobContext::validated(
+        &fixture.host().catalog.store,
+        &host_context,
+        &generation.id,
+        generation.job.clone(),
+    )
+    .unwrap();
+    let undelivered = subjektiv::journal::service::execute_snapshot(
+        &fixture.host().catalog.store,
+        &context,
+        &saved.input_digest,
+        JournalJobRequest::ReadState,
+    )
+    .unwrap_err();
+    assert!(
+        undelivered.to_string().contains("delivery"),
+        "prepared grant must not satisfy delivery gate: {undelivered}"
+    );
+    let before = fixture
+        .host()
+        .catalog
+        .store
+        .read_journal(&host_context, &journal_id)
+        .unwrap();
+    assert_eq!((before.process_order, before.process_byte), (0, 0));
+    model.release.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        model.record_saved.notified(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        subjektiv::journal::service::execute_snapshot(
+            &fixture.host().catalog.store,
+            &context,
+            &saved.input_digest,
+            JournalJobRequest::ReadState
+        )
+        .is_ok(),
+        "actual bound tool execution attests exact saved input"
+    );
+    model.release.notify_one();
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(20), jobs.wait(&id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.state, JobState::Completed);
+    fixture
+        .host()
+        .complete_journal_job(&jobs, &completed)
+        .unwrap();
+    jobs.shutdown().await.unwrap();
+}
+
+#[derive(Clone, Default)]
+struct BlockedJournalRequest {
+    entered: Arc<tokio::sync::Notify>,
+    dropped: Arc<tokio::sync::Notify>,
+    request_dropped: Arc<AtomicBool>,
+}
+struct OwnedBlockedJournalRequest {
+    // A local request copy, including the saved input, must be dropped before erasure
+    // can acquire the lease. This does not claim remote/provider bytes are retractable.
+    _request: agen::llm_client::Request,
+    model: BlockedJournalRequest,
+}
+impl Drop for OwnedBlockedJournalRequest {
+    fn drop(&mut self) {
+        self.model.request_dropped.store(true, Ordering::Release);
+        self.model.dropped.notify_one();
+    }
+}
+#[async_trait::async_trait]
+impl agen::llm_client::LlmClient for BlockedJournalRequest {
+    async fn stream(
+        &self,
+        request: agen::llm_client::Request,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<
+                            agen::llm_client::event::Event,
+                            agen::llm_client::error::ClientError,
+                        >,
+                    > + Send,
+            >,
+        >,
+        agen::llm_client::error::ClientError,
+    > {
+        let owned = OwnedBlockedJournalRequest {
+            _request: request,
+            model: self.clone(),
+        };
+        assert!(
+            owned
+                ._request
+                .items
+                .iter()
+                .filter_map(agen::llm_client::types::Item::as_text)
+                .any(|text| text.contains("local blocked source body"))
+        );
+        self.entered.notify_one();
+        std::future::pending::<()>().await;
+        drop(owned);
+        unreachable!()
+    }
+    fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
+        Box::new(self.clone())
+    }
+}
+
+/// Real generic Jobs and a retained public handle, with only the provider transport blocked.
+/// Connection close must initiate cancellation and preserve the exclusive lease until local
+/// request/history ownership is gone (or return an explicit incomplete barrier).
+#[tokio::test]
+async fn close_cancels_retained_local_job_before_erase_can_acquire_exclusive_lease() {
+    let mut fixture = Fixture::new("local blocked source body");
+    fixture.host().admit_journal(&fixture.context).unwrap();
+    let (jobs, id) = fixture.host().next_journal_job().unwrap().unwrap();
+    let retained = jobs.clone();
+    let model = BlockedJournalRequest::default();
+    retained
+        .start_with_model_client(&id, model.clone())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), model.entered.notified())
+        .await
+        .unwrap();
+    let state = fixture.host().catalog.state_root.clone();
+    let subject = fixture.connection.binding.subject_id.clone();
+    let close_error = fixture.connection.close().unwrap_err();
+    assert!(matches!(
+        close_error,
+        SubjectError::JobShutdown(crate::jobs::JobServiceError::ShutdownIncomplete)
+    ));
+    assert!(fixture.connection.lease.is_some());
+    assert!(fixture.host().jobs.lock().unwrap().is_some());
+    assert!(matches!(
+        retained.start(&id).await,
+        Err(crate::jobs::JobServiceError::Closed)
+    ));
+    let locally_dropped_before_erase = model.request_dropped.load(Ordering::Acquire);
+    let early_erasure = StandaloneSubjects::open_existing(&state)
+        .unwrap()
+        .erase_session_completely(
+            &subject,
+            &fixture.context.session_id,
+            "erase-blocked-local-run",
+        );
+    let early_lease_was_retained = matches!(early_erasure, Err(SubjectError::Active(_)));
+    let teardown_from_close = model.request_dropped.load(Ordering::Acquire)
+        || tokio::time::timeout(std::time::Duration::from_secs(5), model.dropped.notified())
+            .await
+            .is_ok();
+    // Always tear down before asserting the observed violation, so a failed regression
+    // cannot leak the blocked model future into another test.
+    let _ = retained.shutdown().await;
+    assert!(model.request_dropped.load(Ordering::Acquire));
+    fixture.connection.close().unwrap();
+    assert!(fixture.connection.lease.is_none());
+    assert!(fixture.host().jobs.lock().unwrap().is_none());
+    // Cancellation is not completion/erasure. Reopening retains the same unknown
+    // attempt's immutable body until the explicit erasure transaction retires it.
+    let reopened = crate::jobs::StandaloneJobs::open(
+        &fixture.connection.jobs_path,
+        fixture._temp.path().into(),
+    )
+    .unwrap();
+    let unknown = reopened.get(&id).unwrap();
+    assert_eq!(unknown.attempt.state, crate::jobs::JobAttemptState::Unknown);
+    assert_eq!(unknown.input_disposition, JobInputDisposition::Available);
+    assert!(
+        unknown
+            .request
+            .input
+            .to_string()
+            .contains("local blocked source body")
+    );
+    reopened.shutdown().await.unwrap();
+    StandaloneSubjects::open_existing(&state)
+        .unwrap()
+        .erase_session_completely(
+            &subject,
+            &fixture.context.session_id,
+            "erase-blocked-local-run",
+        )
+        .unwrap();
+    let erased_store = crate::jobs::StandaloneJobs::open(
+        &fixture.connection.jobs_path,
+        fixture._temp.path().into(),
+    )
+    .unwrap();
+    let erased = erased_store.get(&id).unwrap();
+    assert_eq!(erased.input_disposition, JobInputDisposition::Erased);
+    fixture.assert_job_storage_excludes(&erased, "local blocked source body");
+    erased_store.shutdown().await.unwrap();
+    assert!(
+        locally_dropped_before_erase || early_lease_was_retained,
+        "close released exclusive lease while a retained generic Job still owned local input/history"
+    );
+    assert!(
+        teardown_from_close,
+        "connection close did not initiate cancellation of the externally retained local Job"
+    );
+    assert!(
+        retained.get(&id).is_err(),
+        "retained handles are closed after teardown"
+    );
 }

@@ -1340,6 +1340,52 @@ impl WorkdirSession for LocalWorkdirSession {
         self.inner.capabilities
     }
 
+    fn environment(&self) -> crate::WorkdirSessionEnvironment {
+        let scope = self.inner.scope.snapshot();
+        let project = |rule: manifest::ScopeRule| -> Option<crate::WorkdirToolScopeRule> {
+            let target = if self.inner.root.starts_with(&rule.target) && rule.recursive {
+                WorkdirPath::root()
+            } else {
+                let path = rule
+                    .target
+                    .strip_prefix(&self.inner.root)
+                    .unwrap_or(&rule.target);
+                WorkdirPath::new_scoped(path.to_str()?).ok()?
+            };
+            Some(crate::WorkdirToolScopeRule {
+                target,
+                permission: match rule.permission {
+                    Permission::Read => WorkdirToolScopePermission::Read,
+                    Permission::Write => WorkdirToolScopePermission::Write,
+                },
+                recursive: rule.recursive,
+                symlink_policy: rule.symlink_policy,
+            })
+        };
+        crate::WorkdirSessionEnvironment {
+            cwd: WorkdirPath::root(),
+            scope: Some(
+                scope
+                    .allow_rules()
+                    .into_iter()
+                    .filter_map(project)
+                    .collect(),
+            ),
+            capabilities: self.capabilities(),
+            restrictions: scope
+                .deny_rules()
+                .into_iter()
+                .map(|rule| {
+                    project(rule)
+                        .map(|rule| format!("Deny: {rule:?}"))
+                        .unwrap_or_else(|| {
+                            "Unrepresentable provider deny rule remains enforced".into()
+                        })
+                })
+                .collect(),
+        }
+    }
+
     async fn authorize_scope_path(
         &self,
         request: WorkdirScopeAuthorizationRequest,

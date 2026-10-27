@@ -36,9 +36,11 @@ use wip_protocol::{
 };
 
 use super::backend::{
-    MAX_DEPTH, MAX_NODES, MAX_PATH_BYTES, MAX_TEXT_BYTES, WorkspaceConfigBackend, failure, unknown,
+    MAX_DEPTH, MAX_NODES, MAX_PATH_BYTES, MAX_TEXT_BYTES, WorkspaceConfigBackend, diagnostic,
+    failure, unknown,
 };
 use super::{CONTENT_ROOT, WorkspaceConfigFeature};
+use crate::feature::builtin::backend_diagnostic::{Diagnostic, Reason, Stage};
 use crate::wip::{
     WipCallContext, WipOperationError, WipOperationHandler, WipOperationOutput, WipProjection,
     WipProjectionKind, WipSubtreeProvider, contextual_reference, json_to_wip,
@@ -139,6 +141,23 @@ async fn observe(
     paths: Vec<String>,
     depth: u32,
 ) -> Result<WorkspaceConfigObserveResponse, WipOperationError> {
+    observe_diagnosed(
+        backend,
+        connection,
+        paths,
+        depth,
+        diagnostic("observe", false),
+    )
+    .await
+}
+
+async fn observe_diagnosed(
+    backend: &WorkspaceConfigBackend,
+    connection: &str,
+    paths: Vec<String>,
+    depth: u32,
+    diagnostic: Diagnostic,
+) -> Result<WorkspaceConfigObserveResponse, WipOperationError> {
     if paths.len() > MAX_NODES || depth > MAX_DEPTH {
         return Err(invalid());
     }
@@ -148,7 +167,7 @@ async fn observe(
         }
     }
     let result: WorkspaceConfigObserveResponse = backend
-        .post(
+        .post_diagnosed(
             "/observe",
             &WorkspaceConfigObserveRequest {
                 connection_id: connection.into(),
@@ -156,6 +175,7 @@ async fn observe(
                 depth,
             },
             false,
+            diagnostic.clone(),
         )
         .await?;
     if result.connection_id != connection
@@ -164,24 +184,37 @@ async fn observe(
         || result.validator.len() > 4096
         || result.digest.is_empty()
     {
+        diagnostic.record(
+            Stage::Response,
+            if result.connection_id != connection {
+                Reason::Identity
+            } else {
+                Reason::InvalidMetadata
+            },
+            None,
+        );
         return Err(failure(
             ProtocolErrorCode::Internal,
             "Invalid Workspace config metadata",
         ));
     }
     if result.entrypoints.is_empty() || result.entrypoints.len() > MAX_NODES {
+        diagnostic.record(Stage::Response, Reason::InvalidMetadata, None);
         return Err(failure(
             ProtocolErrorCode::Internal,
             "Invalid Workspace config entrypoints",
         ));
     }
     for path in &result.entrypoints {
-        validate_source(path)?;
+        validate_source(path)
+            .inspect_err(|_| diagnostic.record(Stage::Response, Reason::InvalidMetadata, None))?;
     }
     let mut seen = BTreeSet::new();
     for node in &result.nodes {
         if !node.path.is_empty() {
-            validate_source(&node.path)?;
+            validate_source(&node.path).inspect_err(|_| {
+                diagnostic.record(Stage::Response, Reason::InvalidMetadata, None)
+            })?;
         }
         if !seen.insert(&node.path)
             || node.validator.is_empty()
@@ -198,6 +231,7 @@ async fn observe(
                 suffix.is_some_and(|s| s.split('/').count() <= depth as usize)
             })
         {
+            diagnostic.record(Stage::Response, Reason::InvalidMetadata, None);
             return Err(failure(
                 ProtocolErrorCode::Internal,
                 "Invalid Workspace config metadata scope",
@@ -490,9 +524,10 @@ fn content_type(value: Option<&Value>) -> Result<ConfigContentType, WipOperation
 
 impl ConfigHandler {
     async fn read(&self) -> Result<WorkspaceConfigReadResponse, WipOperationError> {
+        let diagnostic = diagnostic("read", false);
         let response: WorkspaceConfigReadResponse = self
             .backend
-            .post(
+            .post_diagnosed(
                 "/read",
                 &WorkspaceConfigReadRequest {
                     connection_id: self.attachment.connection_id.clone(),
@@ -500,6 +535,7 @@ impl ConfigHandler {
                     validator: self.node.validator.clone(),
                 },
                 false,
+                diagnostic.clone(),
             )
             .await?;
         if response.path != self.node.path
@@ -507,12 +543,14 @@ impl ConfigHandler {
             || Some(&response.digest) != self.node.digest.as_ref()
             || Some(&response.content_type) != self.node.content_type.as_ref()
         {
+            diagnostic.record(Stage::Response, Reason::Identity, None);
             return Err(failure(
                 ProtocolErrorCode::Internal,
                 "Invalid Workspace config read response",
             ));
         }
         if response.content.len() > MAX_TEXT_BYTES {
+            diagnostic.record(Stage::Response, Reason::ResponseSize, None);
             return Err(failure(
                 ProtocolErrorCode::ResourceLimitExceeded,
                 "Workspace config source exceeds text limit",
@@ -630,12 +668,17 @@ impl WipOperationHandler for ConfigHandler {
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
         let dispatched = std::sync::atomic::AtomicBool::new(false);
+        let diagnostic = diagnostic(
+            "operation",
+            !matches!(operation, "read" | "read_lines" | "search_text"),
+        );
         tokio::time::timeout(
             super::DEADLINE,
-            self.execute(operation, arguments, context, &dispatched),
+            self.execute(operation, arguments, context, &dispatched, &diagnostic),
         )
         .await
         .map_err(|_| {
+            diagnostic.record(Stage::Completion, Reason::Deadline, None);
             if dispatched.load(std::sync::atomic::Ordering::Acquire) {
                 unknown()
             } else {
@@ -655,6 +698,7 @@ impl ConfigHandler {
         arguments: &BTreeMap<String, Value>,
         context: WipCallContext,
         dispatched: &std::sync::atomic::AtomicBool,
+        operation_diagnostic: &Diagnostic,
     ) -> Result<WipOperationOutput, WipOperationError> {
         if !self.operations.iter().any(|name| name == operation) {
             return Err(failure(
@@ -798,9 +842,10 @@ impl ConfigHandler {
         };
         let changes = self.canonical_changes(changes).await?;
         dispatched.store(true, std::sync::atomic::Ordering::Release);
+        let diagnostic = operation_diagnostic.clone();
         let result: WorkspaceConfigCommitResponse = self
             .backend
-            .post(
+            .post_diagnosed(
                 "/commit",
                 &WorkspaceConfigCommitRequest {
                     connection_id: self.attachment.connection_id.clone(),
@@ -812,28 +857,37 @@ impl ConfigHandler {
                     },
                 },
                 true,
+                diagnostic.clone(),
             )
             .await?;
         // Commit response supplies ROOT state. Obtain the exact post-commit PATH
         // validator, never substitute the root validator for a file validator.
-        let updated = observe(
+        let updated = observe_diagnosed(
             &self.backend,
             &self.attachment.connection_id,
             vec![self.node.path.clone()],
             0,
+            diagnostic.at_stage(Stage::Reconcile),
         )
         .await
         .map_err(|_| unknown())?;
         if updated.digest != result.digest || updated.validator != result.validator {
+            diagnostic.record(Stage::Reconcile, Reason::Identity, None);
             return Err(unknown());
         }
         let node = updated
             .nodes
             .iter()
             .find(|n| n.path == self.node.path)
-            .ok_or_else(unknown)?;
+            .ok_or_else(|| {
+                diagnostic.record(Stage::Reconcile, Reason::InvalidMetadata, None);
+                unknown()
+            })?;
         let value = json_to_wip(&json!({"digest": result.digest,
-            "activation": "Saved to canonical Workspace configuration; existing Worker manifests are not rewritten"})).map_err(|_| unknown())?;
+            "activation": "Saved to canonical Workspace configuration; existing Worker manifests are not rewritten"})).map_err(|_| {
+                diagnostic.record(Stage::Completion, Reason::Decode, None);
+                unknown()
+            })?;
         Ok(WipOperationOutput::native_with_validator(
             value,
             object_validator(

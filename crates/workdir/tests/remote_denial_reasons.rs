@@ -14,6 +14,18 @@ use workdir::{
     },
 };
 
+fn opened(workdir_id: &str) -> String {
+    serde_json::to_string(&workdir::http::OpenWorkdirSessionResponse {
+        session_id: workdir::http::WorkdirSessionId::new("s").unwrap(),
+        workdir_id: Workdir::new(workdir_id).id().clone(),
+        capabilities: workdir::WorkdirSessionCapabilities::ALL,
+        environment: workdir::WorkdirSessionEnvironment::root(
+            workdir::WorkdirSessionCapabilities::ALL,
+        ),
+    })
+    .unwrap()
+}
+
 fn reply(listener: &TcpListener, status: &str, body: &str) {
     listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -73,11 +85,7 @@ async fn remote_http_denials_forward_only_typed_reasons_and_old_missing_reason()
             error["denial_reason"] = serde_json::to_value(reason).unwrap();
         }
         let server = thread::spawn(move || {
-            reply(
-                &listener,
-                "200 OK",
-                r#"{"session_id":"s","workdir_id":"w","capabilities":{"bits":63}}"#,
-            );
+            reply(&listener, "200 OK", &opened("w"));
             reply(&listener, "403 Forbidden", &error.to_string());
         });
         let remote = RemoteWorkdirSession::open(
@@ -163,11 +171,7 @@ async fn remote_checkout_diagnostics_preserve_mutation_outcome_and_read_failures
                 let address = listener.local_addr().unwrap();
                 let error = serde_json::json!({"code":code, "message":"/secret/host provider-secret", "denial_reason":reason});
                 let server = thread::spawn(move || {
-                    reply(
-                        &listener,
-                        "200 OK",
-                        r#"{"session_id":"s","workdir_id":"w","capabilities":{"bits":63}}"#,
-                    );
+                    reply(&listener, "200 OK", &opened("w"));
                     reply(
                         &listener,
                         &format!("{} Fixture failure", code.http_status()),
@@ -214,5 +218,108 @@ async fn remote_checkout_diagnostics_preserve_mutation_outcome_and_read_failures
                 );
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn mismatched_http_results_keep_cause_and_mutation_uncertainty() {
+    use workdir::{
+        CheckoutOperation, CheckoutRequest, CommandHandle, CommandOutputRequest,
+        WorkdirFailureReason as Failure,
+    };
+    for case in ["variant", "bytes", "mutation", "identity"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            reply(
+                &listener,
+                "200 OK",
+                &opened(if case == "identity" {
+                    "wrong-secret"
+                } else {
+                    "w"
+                }),
+            );
+            if case != "identity" {
+                let result = if case == "bytes" {
+                    serde_json::json!({"operation":"command_output","result":{
+                        "chunks": [], "next_cursor": 123, "terminal": null
+                    }})
+                } else {
+                    serde_json::to_value(
+                        workdir::http::WorkdirSessionOperationResult::CommandCancel,
+                    )
+                    .unwrap()
+                };
+                reply(&listener, "200 OK", &result.to_string());
+            }
+        });
+        let opened = RemoteWorkdirSession::open(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            format!("http://{address}").parse().unwrap(),
+            "request-secret",
+            Workdir::new("w").id().clone(),
+            OpenWorkdirSessionRequest::default(),
+        )
+        .await;
+        let error = if case == "identity" {
+            opened.unwrap_err()
+        } else {
+            let remote = opened.unwrap();
+            match case {
+                "variant" => remote
+                    .stat(StatRequest {
+                        path: WorkdirPath::new("file-secret").unwrap(),
+                    })
+                    .await
+                    .unwrap_err(),
+                "bytes" => remote
+                    .command_output(CommandOutputRequest {
+                        handle: CommandHandle("command-secret".into()),
+                        cursor: 0,
+                        limit: 16,
+                        wait: false,
+                    })
+                    .await
+                    .unwrap_err(),
+                "mutation" => remote
+                    .checkout_execute(CheckoutRequest {
+                        target: WorkdirPath::new("file-secret").unwrap(),
+                        validator: vec![1],
+                        operation: CheckoutOperation::Write {
+                            content: b"body-secret".to_vec(),
+                            expected_hash: [0; 32],
+                        },
+                    })
+                    .await
+                    .unwrap_err(),
+                _ => unreachable!(),
+            }
+        };
+        server.join().unwrap();
+        let expected = if case == "identity" {
+            Failure::SessionIdentityMismatch
+        } else {
+            Failure::OperationResultMismatch
+        };
+        assert_eq!(error.failure_reason(), Some(expected), "{case}: {error:?}");
+        let transport = WorkdirTransportError::from_workdir_error(&error);
+        assert_eq!(
+            transport.code,
+            if case == "mutation" {
+                Code::OutcomeUnknown
+            } else {
+                Code::Unavailable
+            }
+        );
+        let wire = serde_json::to_string(&transport).unwrap();
+        assert!(!wire.contains("secret"), "{wire}");
+        assert!(!format!("{error:?}").contains("secret"));
+        let forwarded = transport.into_workdir_error();
+        assert_eq!(forwarded.failure_reason(), Some(expected));
     }
 }

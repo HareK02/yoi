@@ -608,6 +608,239 @@ async fn standalone_metadata_fails_closed_on_incomplete_or_newer_records() -> Te
     Ok(())
 }
 
+#[tokio::test]
+async fn headless_unix_client_uses_production_history_lease_and_local_authority() -> TestResult {
+    use protocol::stream::{JsonLineReader, encode_method};
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::AsyncWriteExt;
+
+    let temp = tempfile::tempdir()?;
+    // Shorten only the owned endpoint's components, preserving the harness TMPDIR
+    // even when it is checkout-local. No process-global cwd or external /tmp fallback.
+    let socket_dir = tempfile::Builder::new()
+        .prefix("")
+        .rand_bytes(4)
+        .tempdir()?;
+    std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    let endpoint_path = socket_dir.path().join("s");
+    let endpoint = standalone::UnixEndpoint::bind(&endpoint_path)?;
+    let state_dir = temp.path().join("state");
+    let launch = StandaloneLaunchConfig::new(
+        temp.path(),
+        &state_dir,
+        manifest::ProfileSelector::Default,
+        "headless-operator",
+    )
+    .resolve()?;
+    let model = ScriptedClient::new(vec![vec![
+        LlmEvent::text_block_start(0),
+        LlmEvent::text_delta(0, "headless production response"),
+        LlmEvent::text_block_stop(0, Some(StopReason::EndTurn)),
+    ]]);
+    let inspection = model.clone();
+    let host = StandaloneHost::start_with_model_client(launch, model).await?;
+    let worker_id = host.worker_id();
+    let session_id = host.record().active_session_id;
+    let profile = host.record().manifest.clone();
+    let serve = tokio::spawn(host.serve_unix(endpoint));
+
+    // Exercise the real external client's stdin/stdout relay over the actual Unix adapter.
+    let (mut input, relay_input) = tokio::io::duplex(64 * 1024);
+    let (relay_output, output) = tokio::io::duplex(64 * 1024);
+    let relay = tokio::spawn(standalone::relay_unix_client(
+        endpoint_path.clone(),
+        relay_input,
+        relay_output,
+    ));
+    let mut events = JsonLineReader::new(output);
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), events.next::<Event>())
+        .await??
+        .expect("snapshot");
+    assert!(matches!(snapshot, Event::Snapshot { .. }));
+    let request = Method::SubmitTracked {
+        submission_request_id: protocol::new_submission_request_id(),
+        input: vec![protocol::Segment::text("headless production input")],
+        source: protocol::AuthenticatedInputSource::Backend {
+            operation_id: "forged-backend-source".into(),
+        },
+    };
+    let wire = encode_method(&request)?;
+    println!("headless input: {wire}");
+    input.write_all(wire.as_bytes()).await?;
+    input.write_all(b"\n").await?;
+    let mut saw_user = false;
+    let mut saw_response = false;
+    let mut saw_state = false;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let event = events.next::<Event>().await?.expect("live event");
+            match &event {
+                Event::UserMessage { segments, .. } => {
+                    saw_user |= format!("{segments:?}").contains("headless production input");
+                }
+                Event::TextDelta { text } => {
+                    saw_response |= text == "headless production response";
+                }
+                Event::WorkerState { .. } => saw_state = true,
+                Event::RunEnd { .. } => break,
+                _ => {}
+            }
+            println!(
+                "headless output: {}",
+                protocol::stream::encode_event(&event)?
+            );
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .await??;
+    assert!(saw_user && saw_response && saw_state);
+    assert_eq!(inspection.requests().len(), 1);
+    assert!(matches!(
+        StandaloneHost::restore_with_model_client(
+            state_dir.clone(),
+            worker_id,
+            ScriptedClient::new(vec![])
+        )
+        .await,
+        Err(StandaloneStartupError::WorkerActive)
+    ));
+
+    // EOF is a disconnect, not a shutdown; another view can reconnect to the same history.
+    drop(input);
+    tokio::time::timeout(Duration::from_secs(10), relay).await???;
+    assert!(!serve.is_finished());
+    let mut malformed = tokio::net::UnixStream::connect(&endpoint_path).await?;
+    malformed.write_all(b"not-json\n").await?;
+    let mut discarded = Vec::new();
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        malformed.read_to_end(&mut discarded),
+    )
+    .await??;
+    assert!(
+        !serve.is_finished(),
+        "invalid client input must not stop the Host"
+    );
+    let mut socket_client =
+        Client::new(client::transport::unix_socket::Socket::connect(&endpoint_path).await?);
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = socket_client.next_event().await?.expect("reconnect event");
+            if matches!(event, Event::Snapshot { .. }) {
+                break Ok::<_, Box<dyn std::error::Error>>(event);
+            }
+        }
+    })
+    .await??;
+    let snapshot_text = format!("{snapshot:?}");
+    assert!(
+        snapshot_text.contains("headless production input"),
+        "{snapshot_text}"
+    );
+    assert!(
+        snapshot_text.contains("headless production response"),
+        "{snapshot_text}"
+    );
+    socket_client
+        .send(&Method::Shutdown {
+            command: protocol::WorkerCommandEnvelope::new(0),
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(Event::CommandAcknowledged { acknowledgement }) =
+                socket_client.next_event().await?
+            {
+                assert_eq!(
+                    acknowledgement.disposition,
+                    protocol::WorkerCommandDisposition::StaleCommandId
+                );
+                break;
+            }
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .await??;
+    assert!(
+        !serve.is_finished(),
+        "stale Shutdown must not bypass Controller admission"
+    );
+    socket_client
+        .send(&Method::Shutdown {
+            command: protocol::WorkerCommandEnvelope::new(100),
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(15), serve).await???;
+    assert!(!endpoint_path.exists());
+    let store = StandaloneWorkerStore::open(&state_dir)?;
+    let saved = store.load(worker_id)?;
+    assert_eq!(saved.status, StandaloneWorkerStatus::Stopped);
+    use session_store::Store;
+    let history = session_store::FsStore::new(store.sessions_dir(worker_id))?.read_all(
+        saved.active_session_id,
+        saved.active_segment_id.expect("active segment"),
+    )?;
+    let origins = history
+        .iter()
+        .filter_map(|entry| match entry {
+            session_store::LogEntry::AnnotatedUserInput { history, .. } => Some(history),
+            _ => None,
+        })
+        .flatten()
+        .map(|entry| &entry.metadata.origin)
+        .collect::<Vec<_>>();
+    assert!(origins.contains(&&session_store::LoggedSessionHistoryOrigin::LocalHumanInput));
+    assert!(!format!("{origins:?}").contains("forged-backend-source"));
+
+    // This is the same restoration path called by the TUI, not a headless catalog/import.
+    let restored = StandaloneHost::restore_with_model_client(
+        state_dir.clone(),
+        worker_id,
+        ScriptedClient::new(vec![]),
+    )
+    .await?;
+    assert_eq!(restored.worker_id(), worker_id);
+    assert_eq!(restored.record().active_session_id, session_id);
+    assert_eq!(
+        serde_json::to_value(&restored.record().manifest)?,
+        serde_json::to_value(&profile)?
+    );
+    assert_eq!(
+        restored.record().cwd.canonical_path,
+        temp.path().canonicalize()?
+    );
+    let mut in_process = restored.connect();
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = in_process
+                .next_event()
+                .await?
+                .expect("in-process restored event");
+            if matches!(event, Event::Snapshot { .. }) {
+                break Ok::<_, Box<dyn std::error::Error>>(event);
+            }
+        }
+    })
+    .await??;
+    assert!(format!("{snapshot:?}").contains("headless production response"));
+    assert!(
+        !endpoint_path.exists(),
+        "in-process restore must not recreate the adapter"
+    );
+    let runtime = state_dir
+        .join(worker_id.to_string())
+        .join("runtime")
+        .join(format!("standalone-{worker_id}"));
+    assert!(!runtime.join("sock").exists());
+    assert!(!runtime.join("pid").exists());
+    restored.shutdown().await?;
+    println!(
+        "verdict: input/state/response/disconnect/explicit shutdown, shared production restore and concurrent lease exclusion passed for {worker_id}"
+    );
+    Ok(())
+}
+
 async fn wait_for_run_end(client: &mut Client<InProcessSocket>) -> TestResult {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {

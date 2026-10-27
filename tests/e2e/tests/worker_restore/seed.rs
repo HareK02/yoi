@@ -42,7 +42,20 @@ pub struct Installed {
 }
 
 pub fn start(fixture: &Fixture) -> Result<Installed> {
-    let mut environment = WorkerE2eEnvironment::new()?;
+    start_in(fixture, WorkerE2eEnvironment::new()?)
+}
+
+pub fn start_in(fixture: &Fixture, environment: WorkerE2eEnvironment) -> Result<Installed> {
+    start_in_with_source_setup(fixture, environment, |_| Ok(()))
+}
+
+// The callback runs only on the installed isolation copy, while Runtime is offline.
+// Restart never calls the seed or this setup again.
+pub fn start_in_with_source_setup(
+    fixture: &Fixture,
+    mut environment: WorkerE2eEnvironment,
+    setup: impl FnOnce(&Path) -> Result<()>,
+) -> Result<Installed> {
     super::phase(&environment, "fixture-copy-verify")?;
     let copy = environment.root.join("provided-fixture");
     fixture.source.copy_to(&copy)?;
@@ -111,6 +124,12 @@ pub fn start(fixture: &Fixture) -> Result<Installed> {
             backend_job: None,
         };
         support(template.install(&options, request, &bootstrap.manifest))?;
+        setup(
+            &options
+                .root
+                .join("workers")
+                .join(template.worker_id().to_string()),
+        )?;
         let sessions = support(session_store::WorkerSessionStore::open_read_only(
             options
                 .root

@@ -26,7 +26,7 @@ use flow::{
 use manifest::{Scope, WorkerManifest};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use session_store::{SegmentId, SessionId, Store, collect_state};
+use session_store::{SegmentId, SessionId, Store};
 use uuid::Uuid;
 
 use crate::feature::builtin::session_explore::{SessionExploreFeature, SessionExploreState};
@@ -469,10 +469,15 @@ where
             .store
             .read_all(self.session_id, self.segment_id)
             .map_err(|error| format!("read committed parent session: {error}"))?;
-        let restored = collect_state(&entries);
-        Ok(SessionCapture::new(
+        let history = crate::session_history::restore_history_entries(
+            self.session_id,
+            self.segment_id,
+            &entries,
+        )?;
+        Ok(SessionCapture::from_complete_history(
+            self.session_id.to_string(),
             self.segment_id.to_string(),
-            restored.history,
+            history,
         ))
     }
 }

@@ -384,7 +384,10 @@ async fn implementation_result_v97_to_v98_preserves_legacy_bytes_receipts_and_no
             DROP TRIGGER passkey_metadata_insert;
             DROP TABLE passkey_addition_receipts;
             DROP TABLE passkey_metadata;
-            UPDATE __yoi_schema_migrations SET version=102 WHERE version=103;
+            DROP TRIGGER backend_job_input_retirement;
+            DROP TRIGGER backend_job_identity_immutable;
+            ALTER TABLE backend_jobs DROP COLUMN input_disposition;
+            UPDATE __yoi_schema_migrations SET version=102 WHERE version=104;
             DROP TABLE subject_create_recoveries;
             UPDATE __yoi_schema_migrations SET version=101 WHERE version=102;
             DROP TABLE subject_worker_releases;
@@ -524,7 +527,10 @@ async fn mr_notification_upgrade_recovers_events_not_comments_and_retains_unknow
             DROP TRIGGER passkey_metadata_insert;
             DROP TABLE passkey_addition_receipts;
             DROP TABLE passkey_metadata;
-            UPDATE __yoi_schema_migrations SET version=102 WHERE version=103;
+            DROP TRIGGER backend_job_input_retirement;
+            DROP TRIGGER backend_job_identity_immutable;
+            ALTER TABLE backend_jobs DROP COLUMN input_disposition;
+            UPDATE __yoi_schema_migrations SET version=102 WHERE version=104;
             DROP TABLE subject_create_recoveries;
             UPDATE __yoi_schema_migrations SET version=101 WHERE version=102;
             DROP TABLE subject_worker_releases;
@@ -690,7 +696,10 @@ async fn mr_event_actors_preserve_self_suppression_in_capture_and_backfill() {
                     DROP TRIGGER passkey_metadata_insert;
             DROP TABLE passkey_addition_receipts;
             DROP TABLE passkey_metadata;
-            UPDATE __yoi_schema_migrations SET version=102 WHERE version=103;
+            DROP TRIGGER backend_job_input_retirement;
+            DROP TRIGGER backend_job_identity_immutable;
+            ALTER TABLE backend_jobs DROP COLUMN input_disposition;
+            UPDATE __yoi_schema_migrations SET version=102 WHERE version=104;
             DROP TABLE subject_create_recoveries;
             UPDATE __yoi_schema_migrations SET version=101 WHERE version=102;
             DROP TABLE subject_worker_releases;

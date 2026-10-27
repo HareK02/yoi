@@ -678,8 +678,8 @@ pub(crate) fn test_connection(client: Arc<dyn WorkspaceClient>) -> SubjektivHost
 mod tests {
     use super::*;
     use crate::{
-        Method, WorkerBootstrap, WorkerBootstrapLayout, WorkerControllerTransport,
-        WorkerFilesystemAuthority, WorkerManifest, WorkerWorkspaceContext,
+        Method, WorkerBootstrap, WorkerBootstrapLayout, WorkerFilesystemAuthority, WorkerManifest,
+        WorkerWorkspaceContext,
     };
     use agen::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
     use agen::llm_client::{ClientError, LlmClient, Request};
@@ -944,7 +944,6 @@ enabled = true
             WorkerBootstrapLayout::Direct {
                 runtime_base: temp.path().join("runtime"),
             },
-            WorkerControllerTransport::InProcess,
         )
         .with_model_client(TaskScriptClient::default())
         .with_subjektiv_host(host)
@@ -1137,7 +1136,6 @@ enabled = true
                 WorkerBootstrapLayout::Direct {
                     runtime_base: temp.path().join("runtime"),
                 },
-                WorkerControllerTransport::InProcess,
             )
             .with_model_client(ScriptedClient(tx))
             .with_subjektiv_host(host.clone())
@@ -1318,7 +1316,6 @@ enabled = true
             WorkerBootstrapLayout::Direct {
                 runtime_base: temp.path().join("runtime"),
             },
-            WorkerControllerTransport::InProcess,
         )
         .with_model_client(ScriptedClient(tx))
         .with_subjektiv_host(host.clone())
@@ -1377,7 +1374,6 @@ enabled = true
             WorkerBootstrapLayout::Direct {
                 runtime_base: temp.path().join("runtime"),
             },
-            WorkerControllerTransport::InProcess,
         )
         .with_model_client(ScriptedClient(tx));
         let bootstrap = if attach {

@@ -66,8 +66,8 @@ fn text_page(
     })
 }
 
-/// Adapter for Host captures bounded by their storage contract. Production source reads should
-/// use [`execute_bounded`] to avoid allocating an entire source for one small read.
+/// Legacy adapter for Host captures bounded by their storage contract.
+/// Production Hosts use [`attest_input_delivery`] and [`execute_snapshot`] instead.
 pub fn execute(
     store: &SubjektivStore,
     context: &JournalJobContext,
@@ -101,23 +101,149 @@ pub fn execute(
     })
 }
 
-/// Reads are delivered through this service before mutation authority is enabled. The durable
-/// delivery ledger stores byte ranges only: Jobs may retain immutable descriptors without
-/// accumulating a permanent second copy of the original Session in their request ledgers.
-/// The Host verifies original provenance/digest/length and returns a bounded UTF-8 fragment.
+pub(crate) fn migrate_input_delivery(
+    tx: &rusqlite::Transaction<'_>,
+) -> feature_storage::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE journal_generation_input_deliveries (
+            generation_id TEXT PRIMARY KEY NOT NULL REFERENCES journal_generations(id) ON DELETE CASCADE,
+            input_digest TEXT NOT NULL CHECK(length(input_digest)=71 AND substr(input_digest,1,7)='sha256:' AND substr(input_digest,8) NOT GLOB '*[^0-9a-f]*')
+        );
+        CREATE TRIGGER journal_generation_input_delivery_no_update
+        BEFORE UPDATE ON journal_generation_input_deliveries
+        BEGIN SELECT RAISE(ABORT, 'Journal input delivery bindings are immutable'); END;",
+    )?;
+    Ok(())
+}
+
+fn validate_input_digest(input_digest: &str) -> JournalResult<()> {
+    // Preserve JobRequest::input_digest() verbatim, including its algorithm prefix.
+    if input_digest.strip_prefix("sha256:").is_none_or(|hex| {
+        hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) {
+        return Err(JournalError::InvalidInput(
+            "immutable Job input digest must be sha256: followed by 64 lowercase hex digits".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Trusted Host-only delivery evidence, never a model tool or a claim of understanding.
+/// Before calling, the Host must validate the saved, immutable body-bearing input against the
+/// bound Job's input digest, its Session/provenance/ranges, and the actual dispatch plan that
+/// supplies that exact input. The service cannot verify bytes it does not own. This transaction
+/// stores only the digest bound to the generation's immutable selection; it neither copies the
+/// body nor changes records, position, reflection or checkpoint. Exact replay is allowed only
+/// while the same generation and writer binding remain active; changed digests/ranges conflict.
+pub fn attest_input_delivery(
+    store: &SubjektivStore,
+    context: &JournalJobContext,
+    input_digest: &str,
+    selected_ranges: &[JournalSourceRange],
+) -> JournalResult<()> {
+    validate_input_digest(input_digest)?;
+    store.database.try_transaction(|tx| {
+        super::lifecycle::reject_erased(tx, &context.host)?;
+        let generation = super::store::job(store, tx, context, true)?;
+        if generation.selected_ranges != selected_ranges {
+            return Err(JournalError::Conflict(
+                "immutable Job input selection differs from generation".into(),
+            ));
+        }
+        let saved: Option<String> = tx.query_row(
+            "SELECT input_digest FROM journal_generation_input_deliveries WHERE generation_id=?1",
+            [&generation.id], |row| row.get(0),
+        ).optional()?;
+        if let Some(saved) = saved {
+            if saved != input_digest {
+                return Err(JournalError::Conflict(
+                    "generation is bound to a different immutable Job input digest".into(),
+                ));
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO journal_generation_input_deliveries(generation_id,input_digest) VALUES(?1,?2)",
+                params![generation.id, input_digest],
+            )?;
+        }
+        Ok(())
+    })
+}
+
+fn require_input_delivery(
+    tx: &rusqlite::Connection,
+    context: &JournalJobContext,
+    input_digest: &str,
+) -> JournalResult<()> {
+    validate_input_digest(input_digest)?;
+    let saved: Option<String> = tx
+        .query_row(
+            "SELECT input_digest FROM journal_generation_input_deliveries WHERE generation_id=?1",
+            [&context.generation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if saved.as_deref() != Some(input_digest) {
+        return Err(JournalError::Conflict(
+            "trusted Host delivery of this immutable Job input is required".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Production sequential execution over Journal state and the Host-attested immutable input.
+/// The digest is taken from the bound saved Job by the Host, not from model arguments. Every
+/// request requires the matching delivery binding and an active generation/writer. Source text
+/// is already in immutable input: Source targets fail explicitly, with no Session reader or
+/// fallback. Receipt-backed record, position and checkpoint constraints remain unchanged.
+pub fn execute_snapshot(
+    store: &SubjektivStore,
+    context: &JournalJobContext,
+    input_digest: &str,
+    request: JournalJobRequest,
+) -> JournalResult<JournalJobResponse> {
+    execute_inner(store, context, request, Some(input_digest), |_, _, _| {
+        Err(JournalError::PermissionDenied(
+            "Source reads are unavailable for immutable Journal input".into(),
+        ))
+    })
+}
+
+/// Legacy/test source-read adapter. Production Hosts must use [`execute_snapshot`].
+/// This ledger attests bounded Source responses only and cannot satisfy the input-digest gate.
 pub fn execute_bounded(
     store: &SubjektivStore,
     context: &JournalJobContext,
     request: JournalJobRequest,
+    read_source: impl FnMut(&JournalSource, u64, usize) -> JournalResult<recording::JournalMaterial>,
+) -> JournalResult<JournalJobResponse> {
+    execute_inner(store, context, request, None, read_source)
+}
+
+fn execute_inner(
+    store: &SubjektivStore,
+    context: &JournalJobContext,
+    request: JournalJobRequest,
+    input_digest: Option<&str>,
     mut read_source: impl FnMut(&JournalSource, u64, usize) -> JournalResult<recording::JournalMaterial>,
 ) -> JournalResult<JournalJobResponse> {
-    let generation = store
-        .database
-        .try_with_connection(|tx| super::store::job(store, tx, context, true))?;
+    let generation = store.database.try_with_connection(|tx| {
+        super::lifecycle::reject_erased(tx, &context.host)?;
+        let generation = super::store::job(store, tx, context, true)?;
+        if let Some(input_digest) = input_digest {
+            require_input_delivery(tx, context, input_digest)?;
+        }
+        Ok::<_, JournalError>(generation)
+    })?;
     let mut delivered = None;
     let response = match request {
         JournalJobRequest::Execute { operation } => {
-            require_delivery(store, context, &generation.selected_ranges)?;
+            if input_digest.is_none() {
+                require_delivery(store, context, &generation.selected_ranges)?;
+            }
             let receipt = if matches!(operation.action, JournalAction::Checkpoint { .. }) {
                 crate::api::checkpoint_journal(store, context, operation)?
             } else {
@@ -197,6 +323,11 @@ pub fn execute_bounded(
         JournalJobRequest::ReadText { read } => {
             let text = match &read.target {
                 JournalTextTarget::Source { pointer } => {
+                    if input_digest.is_some() {
+                        return Err(JournalError::PermissionDenied(
+                            "Source target is unavailable: raw source bodies are in immutable Job input".into(),
+                        ));
+                    }
                     let range = generation
                         .selected_ranges
                         .iter()

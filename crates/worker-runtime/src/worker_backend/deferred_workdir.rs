@@ -66,13 +66,32 @@ impl DeferredWorkdirSession {
         let open = self.open.clone();
         let session = tokio::task::spawn_blocking(move || open())
             .await
-            .map_err(|_| WorkdirError::Unavailable("Workdir session opener failed".into()))?
-            .map_err(WorkdirError::Unavailable)?;
+            .map_err(|_| {
+                WorkdirError::Unavailable("Workdir session opener failed".into())
+                    .with_failure_reason(WorkdirFailureReason::SessionOpenTaskFailed)
+            })?
+            .map_err(|_| {
+                // The opener's string contract cannot prove a more specific cause.
+                WorkdirError::Unavailable("Workdir session could not be opened".into())
+                    .with_failure_reason(WorkdirFailureReason::SessionOpenFailed)
+            })?;
         if session.workdir().id() != self.workdir.id() {
-            session.close().await?;
-            return Err(WorkdirError::Unavailable(
-                "Workdir session identity mismatch".into(),
-            ));
+            if let Err(error) = session.close().await {
+                // Retain a failed-close owner for explicit close; never use it.
+                state.closed = true;
+                state.session = Some(session);
+                tracing::warn!(
+                    target: "worker_runtime::workdir",
+                    event = "workdir_session_identity_cleanup_failed",
+                    failure_reason = error.failure_reason().map(WorkdirFailureReason::as_str),
+                    denial_reason = error.denial_reason().map(WorkdirDenialReason::as_str),
+                    "Mismatched Workdir session cleanup failed"
+                );
+            }
+            return Err(
+                WorkdirError::Unavailable("Workdir session identity mismatch".into())
+                    .with_failure_reason(WorkdirFailureReason::SessionIdentityMismatch),
+            );
         }
         if let Some(mut source) = session.subscribe_command_events() {
             let events = self.events.clone();
@@ -103,6 +122,18 @@ macro_rules! impl_deferred_session {
 
             fn capabilities(&self) -> WorkdirSessionCapabilities {
                 self.capabilities
+            }
+
+            fn environment(&self) -> WorkdirSessionEnvironment {
+                let mut environment = self.state.try_lock().ok().and_then(|state| {
+                    state.session.as_ref().map(|session| session.environment())
+                }).unwrap_or_else(|| {
+                    let mut environment = WorkdirSessionEnvironment::root(self.capabilities);
+                    environment.restrictions.push("Deferred provider: scope is checked on connection and every operation".into());
+                    environment
+                });
+                environment.capabilities = self.capabilities;
+                environment
             }
 
             $(
@@ -162,6 +193,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn short_tempdir() -> tempfile::TempDir {
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        tempfile::Builder::new()
+            .prefix("d")
+            .rand_bytes(3)
+            .tempdir_in(target)
+            .unwrap()
+    }
+
     fn read_request() -> ReadRequest {
         ReadRequest {
             path: WorkdirPath::new("README.md").unwrap(),
@@ -195,8 +241,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_cleanup_of_unopened_session_never_connects_or_follows_reused_alias() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let session = DeferredWorkdirSession::handle(
+            "old",
+            WorkdirSessionCapabilities::READ_ONLY,
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err("offline".into())
+            },
+        );
+        let router = WorkdirSessionRouter::new();
+        let alias = WorkdirAttachmentAlias::new("w").unwrap();
+        let routed = router.attach(alias.clone(), session.clone()).unwrap();
+        assert!(routed.subscribe_command_events().is_some());
+        assert!(routed.command_snapshot().is_empty());
+        router.close_all().await.unwrap();
+        router.close_all().await.unwrap();
+        assert!(router.aliases().is_empty());
+        assert!(matches!(
+            session.read(read_request()).await,
+            Err(WorkdirError::SessionClosed)
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+
+        let new_attempts = Arc::new(AtomicUsize::new(0));
+        let new_observed = new_attempts.clone();
+        let replacement = DeferredWorkdirSession::handle(
+            "new",
+            WorkdirSessionCapabilities::READ_ONLY,
+            move || {
+                new_observed.fetch_add(1, Ordering::SeqCst);
+                Err("offline".into())
+            },
+        );
+        let new_routed = router.attach(alias, replacement).unwrap();
+        // A retained old connection cannot open the replacement provider.
+        assert!(routed.read(read_request()).await.is_err());
+        assert_eq!(new_attempts.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            new_routed.read(read_request()).await,
+            Err(ref error) if matches!(error.classification_source(), WorkdirError::Unavailable(_))
+        ));
+        assert_eq!(new_attempts.load(Ordering::SeqCst), 1);
+        // Even after a failed open, cleanup must not try connecting again.
+        router.close_all().await.unwrap();
+        assert_eq!(new_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn failed_open_retries_on_use_and_keeps_read_only_capabilities() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = short_tempdir();
         std::fs::write(temp.path().join("README.md"), "restored").unwrap();
         let root = temp.path().to_path_buf();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -224,10 +321,16 @@ mod tests {
             },
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        let failed = session.read(read_request()).await.unwrap_err();
         assert!(matches!(
-            session.read(read_request()).await,
-            Err(WorkdirError::Unavailable(_))
+            failed.classification_source(),
+            WorkdirError::Unavailable(_)
         ));
+        assert_eq!(
+            failed.failure_reason(),
+            Some(WorkdirFailureReason::SessionOpenFailed)
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert_eq!(
             session.read(read_request()).await.unwrap().bytes,
             b"restored"
@@ -252,5 +355,127 @@ mod tests {
             b"restored"
         );
         session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn opener_task_and_open_errors_keep_distinct_safe_causes() {
+        for panic in [false, true] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed = attempts.clone();
+            let session = DeferredWorkdirSession::handle(
+                "saved",
+                WorkdirSessionCapabilities::READ_ONLY,
+                move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    if panic {
+                        panic!(
+                            "/host/private bearer-secret command-secret proof-secret key-secret"
+                        );
+                    }
+                    Err("/host/private bearer-secret command-secret proof-secret key-secret".into())
+                },
+            );
+            let error = session.read(read_request()).await.unwrap_err();
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            let reason = if panic {
+                WorkdirFailureReason::SessionOpenTaskFailed
+            } else {
+                WorkdirFailureReason::SessionOpenFailed
+            };
+            assert_eq!(error.failure_reason(), Some(reason));
+            assert_eq!(reason.stage().as_str(), "session_open");
+            let transport = workdir::http::WorkdirTransportError::from_workdir_error(&error);
+            assert_eq!(transport.code.http_status(), 503);
+            assert!(
+                !serde_json::to_string(&transport)
+                    .unwrap()
+                    .contains("secret")
+            );
+            assert!(!format!("{error:?}").contains("secret"));
+            session.close().await.unwrap();
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[derive(Debug)]
+    struct MismatchedSession {
+        workdir: Workdir,
+        closes: Arc<AtomicUsize>,
+        fail_close: bool,
+    }
+
+    macro_rules! mismatched_session {
+        ($( $method:ident($request:ident: $request_type:ty) -> $result:ty; )*) => {
+            #[async_trait]
+            impl WorkdirSession for MismatchedSession {
+                fn workdir(&self) -> &Workdir { &self.workdir }
+                fn capabilities(&self) -> WorkdirSessionCapabilities { WorkdirSessionCapabilities::READ_ONLY }
+                $(async fn $method(&self, _: $request_type) -> Result<$result, WorkdirError> {
+                    panic!("mismatched session must never be used");
+                })*
+                async fn close(&self) -> Result<(), WorkdirError> {
+                    let attempt = self.closes.fetch_add(1, Ordering::SeqCst);
+                    if self.fail_close && attempt == 0 {
+                        Err(WorkdirError::Transport("/host/private key-secret".into())
+                            .with_failure_reason(WorkdirFailureReason::HttpTransfer))
+                    } else { Ok(()) }
+                }
+            }
+        };
+    }
+    mismatched_session! {
+        stat(request: StatRequest) -> StatResult;
+        read(request: ReadRequest) -> ReadResult;
+        write(request: WriteRequest) -> WriteResult;
+        edit(request: EditRequest) -> EditResult;
+        list(request: ListRequest) -> ListResult;
+        glob(request: GlobRequest) -> GlobResult;
+        grep(request: GrepRequest) -> GrepResult;
+        start_command(request: CommandRequest) -> CommandHandle;
+        command_status(handle: CommandHandle) -> CommandStatus;
+        command_output(request: CommandOutputRequest) -> CommandOutput;
+        cancel_command(handle: CommandHandle) -> ();
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_preserves_primary_cause_and_failed_close_owner() {
+        for fail_close in [false, true] {
+            let closes = Arc::new(AtomicUsize::new(0));
+            let raw: WorkdirSessionHandle = Arc::new(MismatchedSession {
+                workdir: Workdir::new("wrong-secret"),
+                closes: closes.clone(),
+                fail_close,
+            });
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed = attempts.clone();
+            let session = DeferredWorkdirSession::handle(
+                "saved",
+                WorkdirSessionCapabilities::READ_ONLY,
+                move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(raw.clone())
+                },
+            );
+            let error = session.read(read_request()).await.unwrap_err();
+            assert_eq!(
+                error.failure_reason(),
+                Some(WorkdirFailureReason::SessionIdentityMismatch)
+            );
+            assert!(!format!("{error:?}").contains("secret"));
+            assert_eq!(closes.load(Ordering::SeqCst), 1);
+            if fail_close {
+                assert!(matches!(
+                    session.read(read_request()).await,
+                    Err(WorkdirError::SessionClosed)
+                ));
+                assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            }
+            session.close().await.unwrap();
+            assert_eq!(
+                closes.load(Ordering::SeqCst),
+                if fail_close { 2 } else { 1 }
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
     }
 }

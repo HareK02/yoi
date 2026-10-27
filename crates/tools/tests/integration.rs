@@ -3,6 +3,11 @@
 //! `ToolServerHandle::register_tool` / `flush_pending` are `pub(crate)` in
 //! agen, so from here we exercise the factories directly — the same
 //! code path that `flush_pending()` runs at production time.
+//!
+//! Scoped routing cases connect real LocalWorkdirSession, WorkdirToolBroker::scope,
+//! attachment router and Tool factories without replacing their permission or path checks.
+//! They use RAII temporary roots and existing image fixtures; command cases require the
+//! same local shell as the Bash suite and run in the normal `tools --test integration` target.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -80,6 +85,101 @@ fn setup_routed() -> (TempDir, TempDir, Arc<WorkdirSessionRouter>, Registry) {
     (left, right, router, Registry::new(definitions))
 }
 
+const READ_SAME_FILE: &str = "IFS= read -r line < same.txt && printf '%s\\n' \"$line\"";
+
+struct ScopedRegistry {
+    roots: Vec<TempDir>,
+    directories: Vec<std::path::PathBuf>,
+    brokers: Vec<WorkdirToolBroker>,
+    leases: Vec<workdir::WorkdirScopeLease>,
+    router: Arc<WorkdirSessionRouter>,
+    reg: Registry,
+}
+
+impl ScopedRegistry {
+    // Cwd and scope targets here are delegation declarations in provider coordinates.
+    async fn new(attachments: &[(&str, &str, bool)]) -> Self {
+        let router = Arc::new(WorkdirSessionRouter::new());
+        let mut roots = Vec::new();
+        let mut directories = Vec::new();
+        let mut brokers = Vec::new();
+        let mut leases = Vec::new();
+        for &(alias, cwd, command) in attachments {
+            let root = TempDir::new().unwrap();
+            let directory = root.path().join(cwd);
+            std::fs::create_dir_all(directory.join("subdir")).unwrap();
+            std::fs::write(directory.join("same.txt"), format!("{alias} original\n")).unwrap();
+            std::fs::write(
+                directory.join("subdir/same.txt"),
+                format!("{alias} nested needle\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join("image.png"),
+                include_bytes!("fixtures/view-image/valid.png"),
+            )
+            .unwrap();
+            if cwd != "." {
+                // Decoys make accidental root-based resolution observable.
+                std::fs::write(root.path().join("same.txt"), "root decoy\n").unwrap();
+                std::fs::write(root.path().join("image.png"), "not an image").unwrap();
+            }
+            let source: WorkdirSessionHandle = Arc::new(LocalWorkdirSession::new(
+                Scope::writable(root.path()).unwrap(),
+                root.path().to_path_buf(),
+            ));
+            let broker = WorkdirToolBroker::new(source);
+            let lease = broker
+                .scope(WorkdirToolScope {
+                    rules: vec![WorkdirToolScopeRule {
+                        target: WorkdirPath::new(cwd).unwrap(),
+                        permission: WorkdirToolScopePermission::Write,
+                        recursive: true,
+                        symlink_policy: Default::default(),
+                    }],
+                    cwd: WorkdirPath::new(cwd).unwrap(),
+                    command,
+                })
+                .await
+                .unwrap();
+            router
+                .attach(
+                    WorkdirAttachmentAlias::new(alias).unwrap(),
+                    lease.tool_session(),
+                )
+                .unwrap();
+            roots.push(root);
+            directories.push(directory);
+            brokers.push(broker);
+            leases.push(lease);
+        }
+        let mut definitions = routed_builtin_tools(
+            router.clone(),
+            Tracker::new(),
+            tools::bash_output::BashOutputView::new(),
+        );
+        definitions.push(routed_view_image_tool(router.clone()));
+        Self {
+            roots,
+            directories,
+            brokers,
+            leases,
+            router,
+            reg: Registry::new(definitions),
+        }
+    }
+
+    async fn close(self) {
+        self.router.close_all().await.unwrap();
+        for lease in &self.leases {
+            lease.close().await.unwrap();
+        }
+        for broker in &self.brokers {
+            broker.close().await.unwrap();
+        }
+    }
+}
+
 fn valid_gif_with_len(target_len: usize) -> Vec<u8> {
     let fixture = include_bytes!("fixtures/view-image/valid.gif");
     assert_eq!(
@@ -153,6 +253,71 @@ fn routed_tool_schemas_share_optional_target_workdir() {
         let target = &meta.input_schema["properties"]["target_workdir"];
         assert!(target.is_object(), "{} lacks target_workdir", meta.name);
         assert_eq!(target["type"], json!(["string", "null"]));
+    }
+}
+
+#[test]
+fn routed_tool_help_does_not_override_session_path_coordinates() {
+    fn assert_no_root_coordinates(tool: &str, description: &str) {
+        let normalized = description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        for obsolete in ["workdir-relative", "workdir root", "root-relative"] {
+            assert!(
+                !normalized.contains(obsolete),
+                "{tool} help overrides session path coordinates: {description}"
+            );
+        }
+    }
+
+    fn check_schema_descriptions(tool: &str, schema: &serde_json::Value) {
+        match schema {
+            serde_json::Value::Object(object) => {
+                if let Some(description) = object.get("description").and_then(|v| v.as_str()) {
+                    assert_no_root_coordinates(tool, description);
+                }
+                for value in object.values() {
+                    check_schema_descriptions(tool, value);
+                }
+            }
+            serde_json::Value::Array(array) => {
+                for value in array {
+                    check_schema_descriptions(tool, value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let router = Arc::new(WorkdirSessionRouter::new());
+    let mut definitions = routed_builtin_tools(
+        router.clone(),
+        Tracker::new(),
+        tools::bash_output::BashOutputView::new(),
+    );
+    definitions.push(routed_view_image_tool(router));
+    for definition in definitions {
+        let (meta, _) = definition();
+        assert_no_root_coordinates(&meta.name, &meta.description);
+        // Referenced type definitions are model-visible too, not just properties.
+        check_schema_descriptions(&meta.name, &meta.input_schema);
+
+        let path_parameter = match meta.name.as_str() {
+            "Read" | "Write" | "Edit" => "file_path",
+            "Glob" | "Grep" | "ViewImage" => "path",
+            "Bash" => "cwd",
+            other => panic!("missing path parameter contract for {other}"),
+        };
+        let help = meta.input_schema["properties"][path_parameter]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !help.trim().is_empty(),
+            "{}.{path_parameter} must retain argument-specific help",
+            meta.name
+        );
     }
 }
 
@@ -282,6 +447,427 @@ async fn target_alias_routes_each_tool_and_isolates_read_before_edit() {
     assert_eq!(image.data(), png);
 
     router.close_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn scoped_cwd_file_search_and_image_tools_share_reusable_paths() {
+    for cwd in [".", "work"] {
+        let fixture = ScopedRegistry::new(&[("checkout", cwd, false)]).await;
+        let read = fixture.reg.get("Read");
+        let original = call(&read, json!({ "file_path": "same.txt" })).await;
+        assert!(original.content.unwrap().contains("checkout original"));
+        call(
+            &fixture.reg.get("Write"),
+            json!({ "file_path": "same.txt", "content": "written marker\n" }),
+        )
+        .await;
+        call(
+            &fixture.reg.get("Edit"),
+            json!({ "file_path": "same.txt", "old_string": "written", "new_string": "edited" }),
+        )
+        .await;
+        let edited = call(&read, json!({ "file_path": "same.txt" })).await;
+        assert!(edited.content.unwrap().contains("edited marker"));
+        assert_eq!(
+            std::fs::read_to_string(fixture.directories[0].join("same.txt")).unwrap(),
+            "edited marker\n"
+        );
+
+        // Omitted search paths start at cwd, not at the underlying provider root.
+        for (name, input) in [
+            ("Glob", json!({ "pattern": "same.txt" })),
+            (
+                "Grep",
+                json!({ "pattern": "edited marker", "output_mode": "files_with_matches" }),
+            ),
+        ] {
+            let result = call(&fixture.reg.get(name), input).await;
+            assert_eq!(
+                result.content.unwrap().trim(),
+                "same.txt",
+                "{name}, cwd={cwd}"
+            );
+        }
+
+        // A search rooted below cwd still returns cwd-relative reusable paths.
+        for (name, input) in [
+            ("Glob", json!({ "pattern": "*.txt", "path": "subdir" })),
+            (
+                "Grep",
+                json!({ "pattern": "needle", "path": "subdir", "output_mode": "files_with_matches" }),
+            ),
+        ] {
+            let result = call(&fixture.reg.get(name), input).await;
+            let body = result.content.unwrap();
+            let paths: Vec<_> = body.lines().collect();
+            assert_eq!(paths, ["subdir/same.txt"], "{name}, cwd={cwd}");
+            let path = paths[0];
+            let found = call(&read, json!({ "file_path": path })).await;
+            assert!(found.content.unwrap().contains("checkout nested needle"));
+            call(
+                &fixture.reg.get("Edit"),
+                json!({ "file_path": path, "old_string": "needle", "new_string": format!("needle-{name}") }),
+            )
+            .await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(fixture.directories[0].join("subdir/same.txt")).unwrap(),
+            "checkout nested needle-Grep-Glob\n"
+        );
+        let image = call(
+            &fixture.reg.get("ViewImage"),
+            json!({ "path": "image.png" }),
+        )
+        .await;
+        assert_eq!(image.attachments.len(), 1);
+        let agen::tool::Attachment::Image(image) = &image.attachments[0];
+        assert_eq!(image.mime_type(), "image/png");
+        assert_eq!(
+            image.data(),
+            include_bytes!("fixtures/view-image/valid.png")
+        );
+        if cwd != "." {
+            assert_eq!(
+                std::fs::read_to_string(fixture.roots[0].path().join("same.txt")).unwrap(),
+                "root decoy\n"
+            );
+        }
+        fixture.close().await;
+    }
+}
+
+#[tokio::test]
+async fn scoped_bash_relative_cwd_and_cd_do_not_change_later_tool_cwd() {
+    for cwd in [".", "work"] {
+        let fixture = ScopedRegistry::new(&[("checkout", cwd, true)]).await;
+        for (command_cwd, command, expected) in [
+            (".", READ_SAME_FILE, "checkout original\n"),
+            ("subdir", READ_SAME_FILE, "checkout nested needle\n"),
+            ("./subdir//.", READ_SAME_FILE, "checkout nested needle\n"),
+            (
+                ".",
+                "cd subdir && IFS= read -r line < same.txt && printf '%s\\n' \"$line\"",
+                "checkout nested needle\n",
+            ),
+            (".", READ_SAME_FILE, "checkout original\n"),
+        ] {
+            let output = call(
+                &fixture.reg.get("Bash"),
+                json!({ "cwd": command_cwd, "command": command, "timeout": 5 }),
+            )
+            .await;
+            let body: serde_json::Value = serde_json::from_str(&output.content.unwrap()).unwrap();
+            assert_eq!(body["output"]["terminal"]["exit_code"], 0, "{body}");
+            assert_eq!(body["stdout_preview"], expected, "cwd={cwd}, {command}");
+            let subsequent =
+                call(&fixture.reg.get("Read"), json!({ "file_path": "same.txt" })).await;
+            assert!(subsequent.content.unwrap().contains("checkout original"));
+        }
+        fixture.close().await;
+    }
+}
+
+#[tokio::test]
+async fn scoped_aliases_with_different_cwds_keep_paths_and_observations_separate() {
+    let fixture =
+        ScopedRegistry::new(&[("left", "work", true), ("right", "other/deep", true)]).await;
+    let read = fixture.reg.get("Read");
+    let edit = fixture.reg.get("Edit");
+    call(
+        &read,
+        json!({ "target_workdir": "left", "file_path": "same.txt" }),
+    )
+    .await;
+    let unread = call_err(
+        &edit,
+        json!({ "target_workdir": "right", "file_path": "same.txt", "old_string": "original", "new_string": "wrong" }),
+    )
+    .await;
+    assert!(unread.to_string().contains("has not been read"), "{unread}");
+    call(
+        &read,
+        json!({ "target_workdir": "right", "file_path": "same.txt" }),
+    )
+    .await;
+    call(
+        &fixture.reg.get("Write"),
+        json!({ "target_workdir": "right", "file_path": "same.txt", "content": "right written\n" }),
+    )
+    .await;
+    call(
+        &edit,
+        json!({ "target_workdir": "right", "file_path": "same.txt", "old_string": "written", "new_string": "edited" }),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(fixture.directories[0].join("same.txt")).unwrap(),
+        "left original\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.directories[1].join("same.txt")).unwrap(),
+        "right edited\n"
+    );
+
+    // Different valid bytes make cross-alias image reads observable too.
+    let png: &[u8] = include_bytes!("fixtures/view-image/valid.png");
+    let gif: &[u8] = include_bytes!("fixtures/view-image/valid.gif");
+    std::fs::write(fixture.directories[1].join("image.png"), gif).unwrap();
+    for (alias, expected, image_bytes, mime) in [
+        ("left", "left original", png, "image/png"),
+        ("right", "right edited", gif, "image/gif"),
+    ] {
+        let output = call(
+            &read,
+            json!({ "target_workdir": alias, "file_path": "same.txt" }),
+        )
+        .await;
+        assert!(output.content.unwrap().contains(expected));
+        for (name, input) in [
+            (
+                "Glob",
+                json!({ "target_workdir": alias, "pattern": "*.txt", "path": "subdir" }),
+            ),
+            (
+                "Grep",
+                json!({ "target_workdir": alias, "pattern": alias, "path": "subdir", "output_mode": "files_with_matches" }),
+            ),
+        ] {
+            let output = call(&fixture.reg.get(name), input).await;
+            let path = output.content.unwrap();
+            let path = path.trim();
+            assert_eq!(path, "subdir/same.txt", "{alias}: {name}");
+            let found = call(&read, json!({ "target_workdir": alias, "file_path": path })).await;
+            assert!(
+                found
+                    .content
+                    .unwrap()
+                    .contains(&format!("{alias} nested needle"))
+            );
+        }
+        let image = call(
+            &fixture.reg.get("ViewImage"),
+            json!({ "target_workdir": alias, "path": "image.png" }),
+        )
+        .await;
+        let agen::tool::Attachment::Image(image) = &image.attachments[0];
+        assert_eq!(image.mime_type(), mime);
+        assert_eq!(image.data(), image_bytes);
+        let output = call(
+            &fixture.reg.get("Bash"),
+            json!({ "target_workdir": alias, "cwd": ".", "command": READ_SAME_FILE, "timeout": 5 }),
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&output.content.unwrap()).unwrap();
+        assert_eq!(body["output"]["terminal"]["exit_code"], 0, "{body}");
+        assert_eq!(body["stdout_preview"], format!("{expected}\n"));
+    }
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn scoped_command_false_rejects_bash_without_fallback_to_another_alias() {
+    let fixture =
+        ScopedRegistry::new(&[("enabled", "work", true), ("disabled", "other", false)]).await;
+    for cwd in [".", "subdir"] {
+        let error = call_err(
+            &fixture.reg.get("Bash"),
+            json!({ "target_workdir": "disabled", "cwd": cwd, "command": "printf forbidden > blocked.txt", "timeout": 5 }),
+        )
+        .await;
+        assert!(
+            error.to_string().contains("does not support Command"),
+            "{error}"
+        );
+    }
+    // Write permission remains usable, but does not imply command permission.
+    call(
+        &fixture.reg.get("Write"),
+        json!({ "target_workdir": "disabled", "file_path": "created.txt", "content": "allowed write\n" }),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(fixture.directories[1].join("created.txt")).unwrap(),
+        "allowed write\n"
+    );
+    for (root, directory) in fixture.roots.iter().zip(&fixture.directories) {
+        for path in [
+            root.path().to_path_buf(),
+            directory.clone(),
+            directory.join("subdir"),
+        ] {
+            assert!(!path.join("blocked.txt").exists());
+        }
+    }
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn scoped_normalized_paths_share_read_before_mutation_history() {
+    let fixture = ScopedRegistry::new(&[("checkout", "work", false)]).await;
+    let read = call(
+        &fixture.reg.get("Read"),
+        json!({ "file_path": "./subdir//./same.txt" }),
+    )
+    .await;
+    assert!(read.content.unwrap().contains("checkout nested needle"));
+    call(
+        &fixture.reg.get("Write"),
+        json!({ "file_path": "subdir/same.txt", "content": "normalized write\n" }),
+    )
+    .await;
+    call(
+        &fixture.reg.get("Edit"),
+        json!({ "file_path": "./subdir/same.txt", "old_string": "write", "new_string": "edit" }),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(fixture.directories[0].join("subdir/same.txt")).unwrap(),
+        "normalized edit\n"
+    );
+    for (name, input) in [
+        ("Glob", json!({ "pattern": "*.txt", "path": "./subdir//." })),
+        (
+            "Grep",
+            json!({ "pattern": "normalized edit", "path": "./subdir//.", "output_mode": "files_with_matches" }),
+        ),
+    ] {
+        let result = call(&fixture.reg.get(name), input).await;
+        assert_eq!(result.content.unwrap().trim(), "subdir/same.txt", "{name}");
+    }
+    let image = call(
+        &fixture.reg.get("ViewImage"),
+        json!({ "path": "././image.png" }),
+    )
+    .await;
+    let agen::tool::Attachment::Image(image) = &image.attachments[0];
+    assert_eq!(
+        image.data(),
+        include_bytes!("fixtures/view-image/valid.png")
+    );
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn scoped_tools_reject_parent_traversal_and_paths_outside_the_grant() {
+    let fixture = ScopedRegistry::new(&[("checkout", "work", true)]).await;
+    let outside = fixture.roots[0].path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "private needle\n").unwrap();
+    for invalid in [
+        "../outside/secret.txt",
+        "subdir/../../outside/secret.txt",
+        "subdir\\same.txt",
+    ] {
+        for (name, input) in [
+            ("Read", json!({ "file_path": invalid })),
+            (
+                "Write",
+                json!({ "file_path": invalid, "content": "forbidden" }),
+            ),
+            (
+                "Edit",
+                json!({ "file_path": invalid, "old_string": "needle", "new_string": "forbidden" }),
+            ),
+            ("Glob", json!({ "path": invalid, "pattern": "*" })),
+            ("Grep", json!({ "path": invalid, "pattern": "needle" })),
+            ("ViewImage", json!({ "path": invalid })),
+            (
+                "Bash",
+                json!({ "cwd": invalid, "command": "printf forbidden > blocked.txt", "timeout": 5 }),
+            ),
+        ] {
+            let error = call_err(&fixture.reg.get(name), input).await;
+            assert!(
+                error.to_string().contains("path"),
+                "{name}: {invalid}: {error}"
+            );
+        }
+    }
+    // These paths are inside the provider's grant, but outside the child's grant.
+    // Absolute readable paths must not bypass the delegated scope after cwd rebasing.
+    for (name, input) in [
+        ("Read", json!({ "file_path": outside.join("secret.txt") })),
+        ("Grep", json!({ "path": outside, "pattern": "needle" })),
+        (
+            "Bash",
+            json!({ "cwd": outside, "command": "printf forbidden > blocked.txt", "timeout": 5 }),
+        ),
+    ] {
+        let error = call_err(&fixture.reg.get(name), input).await;
+        let message = error.to_string();
+        assert!(
+            matches!(error, ToolError::InvalidArgument(_)),
+            "{name}: {message}"
+        );
+        assert!(
+            message.contains("scope") || message.contains("path"),
+            "{name}: {message}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(outside.join("secret.txt")).unwrap(),
+        "private needle\n"
+    );
+    assert!(!outside.join("blocked.txt").exists());
+    assert!(!fixture.directories[0].join("blocked.txt").exists());
+    assert!(!fixture.roots[0].path().join("blocked.txt").exists());
+    fixture.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scoped_cwd_tools_reject_resolved_symlink_escape_after_a_read() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = ScopedRegistry::new(&[("checkout", "work", true)]).await;
+    let outside = fixture.roots[0].path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    // Equal bytes avoid disguising an authority failure as a stale-hash rejection.
+    std::fs::write(outside.join("secret.txt"), "checkout original\n").unwrap();
+    let png = include_bytes!("fixtures/view-image/valid.png");
+    std::fs::write(outside.join("image.png"), png).unwrap();
+    call(&fixture.reg.get("Read"), json!({ "file_path": "same.txt" })).await;
+    std::fs::remove_file(fixture.directories[0].join("same.txt")).unwrap();
+    symlink(
+        "../outside/secret.txt",
+        fixture.directories[0].join("same.txt"),
+    )
+    .unwrap();
+    symlink("../outside", fixture.directories[0].join("escape")).unwrap();
+
+    for (name, input) in [
+        ("Read", json!({ "file_path": "same.txt" })),
+        (
+            "Write",
+            json!({ "file_path": "escape/created.txt", "content": "forbidden" }),
+        ),
+        (
+            "Edit",
+            json!({ "file_path": "same.txt", "old_string": "original", "new_string": "forbidden" }),
+        ),
+        ("Glob", json!({ "path": "escape", "pattern": "*" })),
+        ("Grep", json!({ "path": "escape", "pattern": "original" })),
+        ("ViewImage", json!({ "path": "escape/image.png" })),
+        (
+            "Bash",
+            json!({ "cwd": "escape", "command": "printf forbidden > blocked.txt", "timeout": 5 }),
+        ),
+    ] {
+        let error = call_err(&fixture.reg.get(name), input).await;
+        let message = error.to_string();
+        assert!(
+            message.contains("scope") || message.contains("symlink"),
+            "{name}: {message}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(outside.join("secret.txt")).unwrap(),
+        "checkout original\n"
+    );
+    assert_eq!(std::fs::read(outside.join("image.png")).unwrap(), png);
+    assert!(!outside.join("created.txt").exists());
+    assert!(!outside.join("blocked.txt").exists());
+    fixture.close().await;
 }
 
 #[tokio::test]
@@ -416,6 +1002,7 @@ struct ExternalValidatingSession {
     truncate_first_binary_response: bool,
     command_response_losses: std::sync::atomic::AtomicUsize,
     lose_terminal_only: bool,
+    collection_override: Option<workdir::CommandOutputCollection>,
     mutate_after_first_binary_response: Option<std::path::PathBuf>,
 }
 
@@ -534,7 +1121,11 @@ impl workdir::WorkdirSession for ExternalValidatingSession {
         &self,
         request: workdir::CommandOutputRequest,
     ) -> Result<workdir::CommandOutput, workdir::WorkdirError> {
-        let output = self.inner.command_output(request).await?;
+        let mut output = self.inner.command_output(request).await?;
+        if let (Some(collection), Some(terminal)) = (self.collection_override, &mut output.terminal)
+        {
+            terminal.output_collection = collection;
+        }
         if (!self.lose_terminal_only || output.terminal.is_some())
             && self
                 .command_response_losses
@@ -575,6 +1166,7 @@ async fn external_view_image_uses_a_protocol_bounded_request() {
         truncate_first_binary_response: false,
         command_response_losses: std::sync::atomic::AtomicUsize::new(0),
         lose_terminal_only: false,
+        collection_override: None,
         mutate_after_first_binary_response: None,
     });
     let png = include_bytes!("fixtures/view-image/valid.png");
@@ -600,6 +1192,7 @@ async fn external_view_image_rejects_truncated_and_cross_version_chunks() {
         truncate_first_binary_response: true,
         command_response_losses: std::sync::atomic::AtomicUsize::new(0),
         lose_terminal_only: false,
+        collection_override: None,
         mutate_after_first_binary_response: None,
     });
     let (_meta, tool) = view_image_tool(truncated)();
@@ -618,6 +1211,7 @@ async fn external_view_image_rejects_truncated_and_cross_version_chunks() {
         truncate_first_binary_response: false,
         command_response_losses: std::sync::atomic::AtomicUsize::new(0),
         lose_terminal_only: false,
+        collection_override: None,
         mutate_after_first_binary_response: Some(image_path),
     });
     let (_meta, tool) = view_image_tool(changing)();
@@ -1104,7 +1698,20 @@ async fn bash_cancellation_returns_bounded_progress_as_terminal_output() {
     let execution = tokio::spawn(async move {
         executing.execute(r#"{"command":"printf 'before'; printf 'err-before' >&2; while :; do :; done","cwd":"."}"#, execution_context).await
     });
-    await_command_output(&mut events).await;
+    // Cancellation must follow both writes, not merely the first stdout chunk.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut ready = [false; 2];
+        while !ready.iter().all(|seen| *seen) {
+            if let workdir::CommandEvent::Output { stream, .. } = events.recv().await.unwrap() {
+                ready[match stream {
+                    workdir::CommandStream::Stdout => 0,
+                    workdir::CommandStream::Stderr => 1,
+                }] = true;
+            }
+        }
+    })
+    .await
+    .expect("both streams written before cancellation");
     bash.cancel_execution(&context).await.unwrap();
     let ToolError::Cancelled(output) =
         tokio::time::timeout(std::time::Duration::from_secs(5), execution)
@@ -1281,6 +1888,7 @@ async fn lost_page_and_terminal_responses_replay_without_restarting_or_double_ap
             mutate_after_first_binary_response: None,
             command_response_losses: std::sync::atomic::AtomicUsize::new(1),
             lose_terminal_only,
+            collection_override: None,
         });
         let view = tools::bash_output::BashOutputView::new();
         let definitions = core_builtin_tools(session.clone(), Tracker::new(), view.clone());
@@ -1312,6 +1920,83 @@ async fn lost_page_and_terminal_responses_replay_without_restarting_or_double_ap
             );
         }
         use workdir::WorkdirSession as _;
+        session.close().await.unwrap();
+    }
+}
+
+// Provider metadata is the fixture here; actual read/drain injection and HTTP
+// forwarding are tested by workdir's production-supervisor suite.
+#[tokio::test]
+async fn exit_zero_with_incomplete_output_keeps_partial_bytes_and_safe_failure_in_retained_evidence()
+ {
+    use workdir::{
+        CommandFailure, CommandFailureStage as Stage, CommandIoErrorKind, CommandOutputCollection,
+    };
+    for stage in [
+        Stage::StdoutRead,
+        Stage::StderrRead,
+        Stage::StdoutDrain,
+        Stage::StderrDrain,
+        Stage::OutputDelivery,
+    ] {
+        let root = TempDir::new().unwrap();
+        let failure = CommandFailure {
+            stage,
+            reason: CommandIoErrorKind::PermissionDenied,
+            os_code: None,
+        };
+        let collection = CommandOutputCollection::Incomplete { failure };
+        let session: WorkdirSessionHandle = Arc::new(ExternalValidatingSession {
+            inner: LocalWorkdirSession::new(
+                Scope::writable(root.path()).unwrap(),
+                root.path().into(),
+            ),
+            truncate_first_binary_response: false,
+            mutate_after_first_binary_response: None,
+            command_response_losses: std::sync::atomic::AtomicUsize::new(0),
+            lose_terminal_only: false,
+            collection_override: Some(collection),
+        });
+        let view = tools::bash_output::BashOutputView::new();
+        let (_, bash) = tools::bash_tool(session.clone(), view.clone())();
+        let out = call(
+            &bash,
+            json!({"cwd":".","command":"printf partial; printf err >&2"}),
+        )
+        .await;
+        assert!(out.summary.ends_with("(output incomplete)"));
+        let body: serde_json::Value = serde_json::from_str(&out.content.unwrap()).unwrap();
+        let metadata = &body["output"];
+        assert_eq!(body["stdout_preview"], "partial");
+        assert_eq!(body["stderr_preview"], "err");
+        assert_eq!(body["preview_omitted"], false);
+        assert_eq!(metadata["terminal"]["exit_code"], 0);
+        assert_eq!(metadata["terminal"]["status"], "completed");
+        assert_eq!(metadata["terminal"]["transport_complete"], false);
+        assert_eq!(
+            metadata["terminal"]["output_collection"],
+            serde_json::to_value(collection).unwrap()
+        );
+        assert_eq!(metadata["storage_truncated"], false);
+        assert_eq!(metadata["transport_truncation"], serde_json::Value::Null);
+        assert_eq!(metadata["stdout_seen"], 7);
+        assert_eq!(metadata["stdout_delivered"], 7);
+        let id = metadata["id"].as_str().unwrap();
+        assert_eq!(
+            serde_json::to_value(view.metadata(id).unwrap()).unwrap(),
+            *metadata
+        );
+        assert_eq!(
+            view.read(id, workdir::CommandStream::Stdout, 0, 100)
+                .unwrap(),
+            b"partial"
+        );
+        assert_eq!(
+            view.read(id, workdir::CommandStream::Stderr, 0, 100)
+                .unwrap(),
+            b"err"
+        );
+        assert!(!metadata.to_string().contains(root.path().to_str().unwrap()));
         session.close().await.unwrap();
     }
 }

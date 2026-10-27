@@ -100,21 +100,6 @@ pub fn worker_allocation_path() -> Option<PathBuf> {
     worker_allocation_path_from_runtime_dir(runtime_dir())
 }
 
-/// `<runtime_dir>/<worker_name>/` — per-Worker runtime directory.
-pub fn worker_runtime_dir(worker_name: &str) -> Option<PathBuf> {
-    worker_runtime_dir_from_runtime_dir(runtime_dir(), worker_name)
-}
-
-/// `<runtime_dir>/<worker_name>/sock` — Worker's Unix socket path.
-///
-/// The `worker` crate's `RuntimeDir::socket_path()` creates the socket inside the
-/// Worker process. This function **predicts** the path for external callers that
-/// know the Worker name, such as the TUI attach flow. Both should return the same
-/// path.
-pub fn worker_socket_path(worker_name: &str) -> Option<PathBuf> {
-    worker_socket_path_from_runtime_dir(runtime_dir(), worker_name)
-}
-
 // ---- internals --------------------------------------------------------------
 
 fn resolve_config_dir_from_parts(
@@ -202,20 +187,6 @@ fn sessions_dir_from_data_dir(data_dir: Option<PathBuf>) -> Option<PathBuf> {
 
 fn worker_allocation_path_from_runtime_dir(runtime_dir: Option<PathBuf>) -> Option<PathBuf> {
     Some(runtime_dir?.join("workers.json"))
-}
-
-fn worker_runtime_dir_from_runtime_dir(
-    runtime_dir: Option<PathBuf>,
-    worker_name: &str,
-) -> Option<PathBuf> {
-    Some(runtime_dir?.join(worker_name))
-}
-
-fn worker_socket_path_from_runtime_dir(
-    runtime_dir: Option<PathBuf>,
-    worker_name: &str,
-) -> Option<PathBuf> {
-    Some(worker_runtime_dir_from_runtime_dir(runtime_dir, worker_name)?.join("sock"))
 }
 
 /// Treats empty environment values as unset. `std::env::var` distinguishes
@@ -455,16 +426,8 @@ mod tests {
             PathBuf::from("/sand/sessions")
         );
         assert_eq!(
-            worker_allocation_path_from_runtime_dir(runtime_dir.clone()).unwrap(),
+            worker_allocation_path_from_runtime_dir(runtime_dir).unwrap(),
             PathBuf::from("/sand/run/workers.json")
-        );
-        assert_eq!(
-            worker_runtime_dir_from_runtime_dir(runtime_dir.clone(), "foo").unwrap(),
-            PathBuf::from("/sand/run/foo")
-        );
-        assert_eq!(
-            worker_socket_path_from_runtime_dir(runtime_dir, "foo").unwrap(),
-            PathBuf::from("/sand/run/foo/sock")
         );
     }
 }

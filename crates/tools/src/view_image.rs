@@ -20,7 +20,7 @@ pub const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const IMAGE_READ_CHUNK_BYTES: usize = 1024 * 1024;
 
 const DESCRIPTION: &str = "Attach an image from the selected Workdir attachment to the next model request. \
-The path must be logical and Workdir-relative. Supported formats: PNG, JPEG, GIF, and WebP. \
+Supported formats: PNG, JPEG, GIF, and WebP. \
 When exactly one Workdir is attached, target_workdir may be omitted.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -28,7 +28,7 @@ struct ViewImageParams {
     /// Worker-local alias of the Workdir attachment to use.
     #[serde(default)]
     target_workdir: Option<String>,
-    /// Logical path relative to the bound Workdir root.
+    /// Image file to attach to the next model request.
     path: String,
 }
 

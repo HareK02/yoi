@@ -789,6 +789,7 @@ CREATE TABLE "worker_registry" (
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );
 CREATE TABLE backend_jobs (
+            input_disposition TEXT NOT NULL DEFAULT 'available' CHECK (input_disposition IN ('available','reclaimed','erased','invalidated')),
             workspace_id TEXT NOT NULL,
             job_id TEXT NOT NULL,
             purpose TEXT NOT NULL,
@@ -1642,6 +1643,19 @@ CREATE TABLE IF NOT EXISTS ticket_assignment_work_releases (
     FOREIGN KEY (workspace_id, assignment_id)
         REFERENCES ticket_worker_assignments(workspace_id, assignment_id) ON DELETE CASCADE
 );
+
+CREATE TRIGGER backend_job_identity_immutable BEFORE UPDATE OF
+    workspace_id, job_id, purpose, input_digest, input_ref, resource_key, intent_fingerprint ON backend_jobs
+BEGIN SELECT RAISE(ABORT, 'immutable Backend Job identity'); END;
+CREATE TRIGGER backend_job_input_retirement BEFORE UPDATE OF request_json, input_disposition ON backend_jobs
+WHEN (
+    ((OLD.input_disposition = 'available' AND NEW.input_disposition IN ('reclaimed','erased','invalidated'))
+      OR (OLD.input_disposition IN ('reclaimed','invalidated') AND NEW.input_disposition = 'erased'))
+    AND json_remove(NEW.request_json,'$.input') = json_remove(OLD.request_json,'$.input')
+    AND json_type(NEW.request_json,'$.input') = 'null'
+) IS NOT TRUE
+BEGIN SELECT RAISE(ABORT, 'immutable Backend Job input retirement'); END;
+
 -- Ticket case assignment work constraints (schema 91).
 DROP VIEW IF EXISTS ticket_active_worker_assignments;
 CREATE VIEW ticket_active_worker_assignments AS

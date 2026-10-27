@@ -231,12 +231,10 @@ pub fn result_facts(
     current_ticket: &ticket::Ticket,
 ) -> Result<TicketItemCheckFacts> {
     let input = parse_input(&acceptance.job.request.input)?;
-    let result = validate_result(
-        &acceptance.job.request.input,
-        acceptance.job.result.as_ref().ok_or_else(|| {
-            Error::InvalidInput("completed Ticket item checker Job has no result".to_string())
-        })?,
-    )?;
+    let result_value = acceptance.job.result.as_ref().ok_or_else(|| {
+        Error::InvalidInput("completed Ticket item checker Job has no result".to_string())
+    })?;
+    let result = validate_result(&acceptance.job.request.input, result_value)?;
     if input.content_digest != content_digest(current_ticket)
         || input.ticket_id != current_ticket.meta.id
     {
@@ -246,21 +244,17 @@ pub fn result_facts(
         return Ok(TicketItemCheckFacts::NoFindings);
     }
 
-    Ok(TicketItemCheckFacts::Findings(render_result(acceptance)?))
+    Ok(TicketItemCheckFacts::Findings(render_result(
+        &acceptance.job.request.input,
+        result_value,
+    )?))
 }
 
 /// Stable rendering from the original checked snapshot. Used to pin pre-upgrade
 /// unacknowledged requests without reinterpreting them against newer Ticket text.
-pub(crate) fn render_result(acceptance: &BackendJobResultAcceptance) -> Result<String> {
-    let input = parse_input(&acceptance.job.request.input)?;
-    let result = validate_result(
-        &acceptance.job.request.input,
-        acceptance
-            .job
-            .result
-            .as_ref()
-            .ok_or_else(|| Error::InvalidInput("completed checker has no result".into()))?,
-    )?;
+pub(crate) fn render_result(input: &Value, result: &Value) -> Result<String> {
+    let checked = parse_input(input)?;
+    let result = validate_result(input, result)?;
     if result.findings.is_empty() {
         return Err(Error::InvalidInput(
             "clean checker result has no advisory body".into(),
@@ -268,7 +262,7 @@ pub(crate) fn render_result(acceptance: &BackendJobResultAcceptance) -> Result<S
     }
     let mut content = format!(
         "[Ticket item checker advisory]\nTicket: {}\nContent digest: {}\n\nThis is a post-save advisory based only on the inspected Ticket text. It is not a new user request, approval gate, workflow blocker, or implementation instruction.\n",
-        input.ticket_resource_key, input.content_digest
+        checked.ticket_resource_key, checked.content_digest
     );
     for (index, finding) in result.findings.iter().enumerate() {
         let quoted = serde_json::to_string(&finding.quote).map_err(|error| {
@@ -467,6 +461,8 @@ mod tests {
             job: BackendJobRecord {
                 workspace_id: "checker-unit".into(),
                 intent_fingerprint: request.fingerprint().unwrap(),
+                input_digest: request.input_digest().unwrap(),
+                input_disposition: crate::backend_job::JobInputDisposition::Available,
                 request,
                 state: BackendJobState::Completed,
                 current_attempt: 1,

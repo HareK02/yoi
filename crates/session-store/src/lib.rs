@@ -38,6 +38,8 @@ pub(crate) fn read_without_atime_bounded(path: &Path, max_bytes: u64) -> io::Res
     }
 }
 
+pub mod capture;
+mod committed_replay;
 pub mod event_trace;
 pub mod fs_store;
 pub mod history;

@@ -3990,6 +3990,7 @@ dependencies = [
  "protocol",
  "serde",
  "serde_json",
+ "session-store",
  "tokio",
  "workdir",
 ]
@@ -4783,12 +4784,14 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "feature-storage",
+ "job",
  "manifest",
  "memory",
  "rusqlite",
  "serde",
  "serde_json",
  "server-api",
+ "session-store",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
@@ -6497,6 +6500,7 @@ name = "workdir"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "fs-operation",
  "libc",
  "manifest",
@@ -6520,7 +6524,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "clap",
  "client",
  "config-source",
  "dotenv",
@@ -6558,6 +6561,7 @@ dependencies = [
  "toml",
  "tools",
  "tracing",
+ "tracing-subscriber",
  "tungstenite 0.28.0",
  "uuid",
  "wip-client",
@@ -6597,6 +6601,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.29.0",
  "toml",
+ "tools",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -6684,6 +6689,7 @@ dependencies = [
  "futures",
  "manifest",
  "project-record",
+ "protocol",
  "reqwest",
  "serde",
  "serde_json",
@@ -6699,7 +6705,6 @@ dependencies = [
  "tui",
  "uuid",
  "workdir",
- "worker",
 ]
 
 [[package]]

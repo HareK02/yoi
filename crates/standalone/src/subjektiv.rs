@@ -54,6 +54,8 @@ pub enum SubjectError {
     Journal(#[from] subjektiv::journal::JournalError),
     #[error(transparent)]
     Storage(#[from] feature_storage::FeatureStorageError),
+    #[error("local Subject Job shutdown: {0}")]
+    JobShutdown(#[from] crate::jobs::JobServiceError),
     #[error("local Subject storage metadata: {0}")]
     Json(#[from] serde_json::Error),
     #[error("local Subject storage permission or identity is invalid: {0}")]
@@ -338,8 +340,16 @@ impl SubjectConnection {
         }
     }
     pub fn close(&mut self) -> Result<(), SubjectError> {
-        self.host.jobs.lock().expect("Subject Jobs poisoned").take();
         self.host.live.store(false, Ordering::Release);
+        {
+            let mut jobs = self.host.jobs.lock().expect("Subject Jobs poisoned");
+            if let Some(service) = jobs.as_ref() {
+                // Signal cancellation, but retain the handle and exclusive lease until
+                // the generic owner confirms local request/history/resource teardown.
+                service.try_shutdown()?;
+            }
+            jobs.take();
+        }
         self.host.catalog.manager.shutdown()?;
         if let Some(file) = &self.lease {
             file.unlock()?;

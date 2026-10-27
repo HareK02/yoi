@@ -897,8 +897,28 @@ fn midturn_compaction_uses_exact_source_ids_and_preserves_discarded_originals() 
     store
         .create_segment(session, compact, &[start, output("new", "new")])
         .unwrap();
+    let retention = crate::retention::fs_retention(temp.path());
+    let guard = retention.lock_live(session).unwrap();
+    let captured = crate::capture::capture_recording_fs_guarded(
+        temp.path(),
+        session,
+        compact,
+        Default::default(),
+        Default::default(),
+        &guard,
+    )
+    .unwrap();
+    drop(guard);
+    let saved_bytes = captured.encode(Default::default()).unwrap();
     let reader = read(temp.path(), session, compact);
     assert_eq!(ids(&reader), ["Eu", "Ekept", "Enew"]);
+    for (entry, descriptor) in captured.entries.iter().zip(reader.descriptors()) {
+        assert_eq!(captured.recording_text(entry.order).unwrap().0, descriptor);
+    }
+    store
+        .append(session, compact, &output("after-snapshot", "next Job only"))
+        .unwrap();
+    assert_eq!(captured.encode(Default::default()).unwrap(), saved_bytes);
     let d: Vec<_> = reader.descriptors().collect();
     assert_eq!(d[0].identity.segment_id, root);
     assert_eq!(d[1].identity.segment_id, root);
@@ -913,6 +933,16 @@ fn midturn_compaction_uses_exact_source_ids_and_preserves_discarded_originals() 
             .is_err()
     );
     assert!(reader.read_content(d[0], 0, 4096).is_err());
+    assert_eq!(
+        captured
+            .recording_slice(Default::default(), 100, 8192)
+            .unwrap()
+            .capture
+            .entries
+            .len(),
+        3
+    );
+    assert_eq!(captured.encode(Default::default()).unwrap(), saved_bytes);
 }
 
 #[test]
@@ -1484,6 +1514,991 @@ fn generic_system_material_uses_explicit_evidence_purpose_not_producer_or_body()
             assert!(!body.contains("not-public"));
             assert!(!body.contains("private model text"));
             assert!(!body.contains("unknown:future"));
+            if purpose == PublicMaterialUse::Recording {
+                let retention = crate::retention::fs_retention(temp.path());
+                let guard = retention.lock_live(session).unwrap();
+                let capture = if worker_layout {
+                    crate::capture::capture_recording_worker_guarded(
+                        &root,
+                        session,
+                        fork,
+                        Default::default(),
+                        Default::default(),
+                        &guard,
+                    )
+                } else {
+                    crate::capture::capture_recording_fs_guarded(
+                        temp.path(),
+                        session,
+                        fork,
+                        Default::default(),
+                        Default::default(),
+                        &guard,
+                    )
+                }
+                .unwrap();
+                assert_eq!(capture.entries.len(), 1);
+                let (saved, _, text) = capture.recording_text(0).unwrap();
+                assert_eq!(saved, descriptor);
+                assert_eq!(text, body);
+                let view =
+                    crate::capture::SessionCapture::try_from_dto(capture, Default::default())
+                        .unwrap();
+                assert!(view.search(&Default::default()).is_empty());
+                assert!(view.overview().is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn recording_capture_slices_canonical_utf8_with_metadata_and_legacy_descriptors() {
+    use crate::capture::*;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("session");
+    let retention = crate::retention::SessionRetentionStore::new(temp.path().join("control"));
+    let session = crate::new_session_id();
+    let segment = crate::new_segment_id();
+    let store = WorkerSessionStore::new_with_retention(&root, retention.clone()).unwrap();
+    let mut records = vec![seed(session, vec![]), invoke(), input("u")];
+    for i in 0..150 {
+        records.push(output(&format!("a-{i}"), "saved text"));
+    }
+    records.push(LogEntry::AnnotatedToolResult {
+        ts: 5,
+        entry: entry(
+            "tool",
+            LoggedItem::ToolResult {
+                call_id: "call".into(),
+                summary: "summary".into(),
+                content: Some("漢字🍎\n\"".repeat(6000)),
+                disposition: agen::tool::ToolResultDisposition::default(),
+                is_error: false,
+                attachments: vec![],
+            },
+        ),
+    });
+    records.push(cancelled());
+    store.create_segment(session, segment, &records).unwrap();
+    let guard = retention.lock_live(session).unwrap();
+    let capture = capture_recording_worker_guarded(
+        &root,
+        session,
+        segment,
+        Default::default(),
+        Default::default(),
+        &guard,
+    )
+    .unwrap();
+    drop(guard);
+    assert_eq!(capture.entries.len(), 153);
+    let reader = SessionPublicMaterialReader::open_worker_with_retention(
+        &root,
+        segment,
+        Default::default(),
+        retention.clone(),
+    )
+    .unwrap();
+    let descriptors: Vec<_> = reader.descriptors().cloned().collect();
+    for (entry, descriptor) in capture.entries.iter().zip(&descriptors) {
+        let (saved, offset, text) = capture.recording_text(entry.order).unwrap();
+        assert_eq!(saved, descriptor);
+        assert_eq!(offset, 0);
+        assert_eq!(
+            reader
+                .read_content(descriptor, 0, text.len().max(4))
+                .unwrap()
+                .content,
+            text
+        );
+    }
+    let bytes = capture.encode(Default::default()).unwrap();
+    let restored = CaptureDto::decode(&bytes, Default::default()).unwrap();
+    let mut position = RecordingPosition::default();
+    let mut combined = vec![String::new(); descriptors.len()];
+    let mut slices = 0;
+    loop {
+        let slice = restored.recording_slice(position, 29, 4096).unwrap();
+        assert!(serde_json::to_vec(&slice).unwrap().len() <= 4096);
+        assert!(!slice.capture.entries.is_empty());
+        slice.capture.validate(Default::default()).unwrap();
+        for entry in &slice.capture.entries {
+            let (descriptor, offset, text) = slice.capture.recording_text(entry.order).unwrap();
+            let body = &mut combined[entry.order as usize];
+            assert_eq!(offset, body.len() as u64);
+            assert_eq!(descriptor, &descriptors[entry.order as usize]);
+            body.push_str(text);
+        }
+        slices += 1;
+        let Some(next) = slice.next else {
+            break;
+        };
+        assert_ne!(next, position);
+        position = next;
+    }
+    assert!(slices > 10);
+    for (order, text) in combined.iter().enumerate() {
+        assert_eq!(text, capture.recording_text(order as u64).unwrap().2);
+    }
+    assert!(matches!(
+        capture.entries.last().unwrap().body,
+        CaptureBody::CanonicalPublic {
+            boundary: Some(PublicRunBoundary::Cancelled),
+            ..
+        }
+    ));
+    let mut corrupt = restored.clone();
+    if let CaptureBody::CanonicalPublic { text, .. } = &mut corrupt.entries[0].body {
+        text.replace_range(0..1, "[");
+    }
+    assert!(corrupt.validate(Default::default()).is_err());
+    let mut unknown: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    unknown["entries"][0]["body"]["descriptor"]["unexpected"] = true.into();
+    assert!(
+        CaptureDto::decode(&serde_json::to_vec(&unknown).unwrap(), Default::default()).is_err()
+    );
+    let mut missing = restored.clone();
+    missing.entries.remove(1);
+    assert!(matches!(
+        missing.recording_slice(Default::default(), 3, 8192),
+        Err(CaptureError::InvalidRange)
+    ));
+    let tool_order = 151;
+    let tool_text = capture.recording_text(tool_order).unwrap().2;
+    let bad = tool_text.find('漢').unwrap() as u64 + 1;
+    assert!(matches!(
+        capture.recording_slice(
+            RecordingPosition {
+                canonical_order: tool_order,
+                byte_offset: bad
+            },
+            1,
+            4096
+        ),
+        Err(CaptureError::InvalidRange)
+    ));
+    assert!(matches!(
+        capture.recording_slice(Default::default(), 1, 10),
+        Err(CaptureError::BudgetTooSmall)
+    ));
+    // The full-value ceiling does not constrain bounded construction of a long Tool result.
+    let guard = retention.lock_live(session).unwrap();
+    assert!(matches!(
+        capture_recording_worker_guarded(
+            &root,
+            session,
+            segment,
+            Default::default(),
+            CaptureLimits {
+                max_bytes: 2048,
+                ..Default::default()
+            },
+            &guard
+        ),
+        Err(PublicMaterialError::ResourceLimit)
+    ));
+    let bounded = capture_recording_slice_worker_guarded(
+        &root,
+        session,
+        segment,
+        Default::default(),
+        RecordingPosition {
+            canonical_order: tool_order,
+            byte_offset: 0,
+        },
+        1,
+        4096,
+        &guard,
+    )
+    .unwrap();
+    assert!(serde_json::to_vec(&bounded).unwrap().len() <= 4096);
+    assert!(bounded.next.is_some());
+}
+
+#[test]
+fn recording_capture_fence_blocks_publication_and_value_survives_later_append_and_erasure() {
+    use crate::capture::*;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("session");
+    let retention = crate::retention::SessionRetentionStore::new(temp.path().join("control"));
+    let session = crate::new_session_id();
+    let segment = crate::new_segment_id();
+    let store = WorkerSessionStore::new_with_retention(&root, retention.clone()).unwrap();
+    store
+        .create_segment(
+            session,
+            segment,
+            &[
+                seed(session, vec![]),
+                invoke(),
+                input("u"),
+                output("a", "saved"),
+            ],
+        )
+        .unwrap();
+    let guard = retention.lock_live(session).unwrap();
+    let (started, receiver) = std::sync::mpsc::channel();
+    let (done, completed) = std::sync::mpsc::channel();
+    let writer = store.clone();
+    let thread = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        writer
+            .append(session, segment, &output("later", "not in snapshot"))
+            .unwrap();
+        done.send(()).unwrap();
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let capture = capture_recording_worker_guarded(
+        &root,
+        session,
+        segment,
+        Default::default(),
+        Default::default(),
+        &guard,
+    )
+    .unwrap();
+    assert!(completed.try_recv().is_err());
+    let bytes = capture.encode(Default::default()).unwrap();
+    drop(guard);
+    completed
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    thread.join().unwrap();
+    assert_eq!(capture.encode(Default::default()).unwrap(), bytes);
+    assert_eq!(capture.entries.len(), 2);
+    retention
+        .delete(
+            session,
+            crate::retention::SessionDeletionIntent::ErasePermanently,
+            || {
+                std::fs::remove_dir_all(&root)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        capture_recording_worker(
+            &root,
+            session,
+            segment,
+            &retention,
+            Default::default(),
+            Default::default()
+        ),
+        Err(PublicMaterialError::Erased)
+    ));
+    // Pure reads do not authorize adoption after erase; Host consumer revocation is separate.
+    assert_eq!(
+        capture
+            .recording_slice(Default::default(), 2, 8192)
+            .unwrap()
+            .capture
+            .entries
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn recording_capture_rejects_foreign_guard_and_storage_or_body_allocation_excess() {
+    use crate::capture::*;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("session");
+    let retention = crate::retention::SessionRetentionStore::new(temp.path().join("control"));
+    let session = crate::new_session_id();
+    let segment = crate::new_segment_id();
+    let store = WorkerSessionStore::new_with_retention(&root, retention.clone()).unwrap();
+    store
+        .create_segment(
+            session,
+            segment,
+            &[seed(
+                session,
+                vec![message("original", LoggedRole::User, "text")],
+            )],
+        )
+        .unwrap();
+    let wrong_guard = retention.lock_live(crate::new_session_id()).unwrap();
+    assert!(matches!(
+        capture_recording_worker_guarded(
+            &root,
+            session,
+            segment,
+            Default::default(),
+            Default::default(),
+            &wrong_guard
+        ),
+        Err(PublicMaterialError::Inconsistent)
+    ));
+    let guard = retention.lock_live(session).unwrap();
+    let limits = PublicMaterialLimits {
+        max_storage_bytes: 1,
+        ..Default::default()
+    };
+    assert!(matches!(
+        capture_recording_worker_guarded(
+            &root,
+            session,
+            segment,
+            limits,
+            Default::default(),
+            &guard
+        ),
+        Err(PublicMaterialError::ResourceLimit)
+    ));
+    let limits = CaptureLimits {
+        max_text_bytes: 1,
+        ..Default::default()
+    };
+    assert!(matches!(
+        capture_recording_worker_guarded(
+            &root,
+            session,
+            segment,
+            Default::default(),
+            limits,
+            &guard
+        ),
+        Err(PublicMaterialError::ResourceLimit)
+    ));
+}
+
+#[test]
+fn fixed_replay_ends_do_not_refresh_for_appends_between_replay_and_body_snapshot() {
+    use crate::capture::*;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("session");
+    let retention = crate::retention::SessionRetentionStore::new(temp.path().join("control"));
+    let session = crate::new_session_id();
+    let segment = crate::new_segment_id();
+    let store = WorkerSessionStore::new_with_retention(&root, retention.clone()).unwrap();
+    store
+        .create_segment(
+            session,
+            segment,
+            &[
+                seed(session, vec![]),
+                invoke(),
+                input("u"),
+                output("a", "saved"),
+            ],
+        )
+        .unwrap();
+    let guard = retention.lock_live(session).unwrap();
+    let replay = CommittedPublicReplay::open_worker_guarded(
+        &root,
+        segment,
+        Default::default(),
+        None,
+        PublicMaterialUse::Recording,
+    )
+    .unwrap();
+    let before = replay
+        .recording_slice(Default::default(), 100, 8192)
+        .unwrap();
+    drop(guard);
+    // Production keeps its fence through construction. Releasing it deliberately
+    // here also verifies that the lower-level replay never refreshes file ends.
+    store
+        .append(session, segment, &output("later", "not in fixed files"))
+        .unwrap();
+    let other = crate::new_segment_id();
+    store
+        .create_segment(
+            session,
+            other,
+            &[
+                seed(session, vec![]),
+                output("other", "different active segment"),
+            ],
+        )
+        .unwrap();
+    let after = replay
+        .recording_slice(RecordingPosition::default(), 100, 8192)
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(after.capture.entries.len(), 2);
+}
+
+#[test]
+fn recording_source_coordinates_count_hidden_rows_and_preserve_originals_across_compaction() {
+    use crate::capture::*;
+    let temp = tempfile::tempdir().unwrap();
+    let retention = crate::retention::fs_retention(temp.path());
+    let store = FsStore::new_with_retention(temp.path(), retention.clone()).unwrap();
+    let session = crate::new_session_id();
+    let root = crate::new_segment_id();
+    let compact = crate::new_segment_id();
+    let hidden =
+        |id: &str| system_context(id, "private omitted row", crate::InputCompactionUse::Retain);
+    let root_user = message("root-user", LoggedRole::User, "first public row");
+    let tool = entry(
+        "root-tool",
+        LoggedItem::ToolResult {
+            call_id: "call".into(),
+            summary: "original".into(),
+            content: Some("full original".into()),
+            disposition: Default::default(),
+            is_error: false,
+            attachments: vec![],
+        },
+    );
+    let mut corrected = tool.clone();
+    if let LoggedItem::ToolResult { content, .. } = &mut corrected.item {
+        *content = Some("corrected full original".into());
+    }
+    let source_ids = [
+        "hidden-0",
+        "root-user",
+        "hidden-2",
+        "hidden-3",
+        "batch-user",
+        "reasoning",
+        "root-tool",
+        "root-answer",
+    ];
+    store
+        .create_segment(
+            session,
+            root,
+            &[
+                seed(
+                    session,
+                    vec![hidden("hidden-0"), root_user.clone(), hidden("hidden-2")],
+                ),
+                invoke(),
+                LogEntry::AnnotatedUserInput {
+                    ts: 2,
+                    segments: vec![],
+                    extensions: vec![],
+                    history: vec![
+                        hidden("hidden-3"),
+                        message("batch-user", LoggedRole::User, "second public row"),
+                    ],
+                },
+                LogEntry::AnnotatedAssistantItem {
+                    ts: 3,
+                    entry: entry(
+                        "reasoning",
+                        LoggedItem::Reasoning {
+                            text: "private reasoning".into(),
+                            summary: vec![],
+                            encrypted_content: None,
+                            signature: None,
+                        },
+                    ),
+                },
+                LogEntry::AnnotatedToolResult {
+                    ts: 4,
+                    entry: tool.clone(),
+                },
+                LogEntry::RunYielded {
+                    ts: 6,
+                    entry_id: Some(LoggedSessionHistoryEntryId("yield-gap".into())),
+                    reason: protocol::RunYieldReason::Compaction,
+                    active_run_turn_count: 1,
+                },
+                LogEntry::RunResumed {
+                    ts: 7,
+                    entry_id: Some(LoggedSessionHistoryEntryId("resume-gap".into())),
+                    source: protocol::RunResumeSource::Compaction,
+                    active_run_turn_count: 1,
+                },
+                output("root-answer", "public answer"),
+                LogEntry::TurnEnd {
+                    ts: 8,
+                    turn_count: 1,
+                },
+            ],
+        )
+        .unwrap();
+    let mut summary = system_context(
+        "summary",
+        "not an original",
+        crate::InputCompactionUse::OpeningSummary,
+    );
+    summary.metadata.origin = LoggedSessionHistoryOrigin::CompactionSummary;
+    summary.metadata.derivation = Some(crate::LoggedHistoryDerivation {
+        sources: source_ids
+            .iter()
+            .map(|id| LoggedSessionHistoryEntryId((*id).into()))
+            .collect(),
+    });
+    let mut start = seed(
+        session,
+        vec![summary, root_user, tool, hidden("child-hidden-seed")],
+    );
+    if let LogEntry::AnnotatedSegmentStart { compacted_from, .. } = &mut start {
+        *compacted_from = Some(SegmentOrigin {
+            segment_id: root,
+            at_turn_index: 1,
+        });
+    }
+    store
+        .create_segment(
+            session,
+            compact,
+            &[
+                start,
+                LogEntry::ToolResultCorrected {
+                    ts: 9,
+                    entry: corrected,
+                },
+                output("child-answer", "new child original"),
+                LogEntry::AnnotatedUserInput {
+                    ts: 10,
+                    segments: vec![],
+                    extensions: vec![],
+                    history: vec![
+                        hidden("child-hidden-input"),
+                        message("child-user", LoggedRole::User, "new child user"),
+                    ],
+                },
+                cancelled(),
+            ],
+        )
+        .unwrap();
+    let guard = retention.lock_live(session).unwrap();
+    let capture = capture_recording_fs_guarded(
+        temp.path(),
+        session,
+        compact,
+        Default::default(),
+        Default::default(),
+        &guard,
+    )
+    .unwrap();
+    let catalog = recording_catalog_fs_guarded(
+        temp.path(),
+        session,
+        compact,
+        Default::default(),
+        &guard,
+        |descriptors| descriptors.to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        catalog,
+        capture
+            .entries
+            .iter()
+            .map(|entry| capture.recording_text(entry.order).unwrap().0.clone())
+            .collect::<Vec<_>>()
+    );
+    drop(guard);
+    let expected = [
+        ("Eroot-user", root, 1),
+        ("Ebatch-user", root, 4),
+        ("Eroot-tool", root, 6),
+        ("Eyield-gap", root, 7),
+        ("Eresume-gap", root, 7),
+        ("Eroot-answer", root, 7),
+        ("Echild-answer", compact, 4),
+        ("Echild-user", compact, 6),
+    ];
+    for ((reference, segment, index), entry) in expected.iter().zip(&capture.entries) {
+        assert_eq!(format!("E{}", entry.entry_id), *reference);
+        assert_eq!(entry.source.segment_id, segment.to_string());
+        assert_eq!(entry.source.entry_index, *index);
+    }
+    assert_eq!(capture.entries.len(), expected.len() + 1); // final cancelled boundary at child gap 7
+    assert_eq!(capture.entries.last().unwrap().source.entry_index, 7);
+    assert!(
+        capture
+            .recording_text(2)
+            .unwrap()
+            .2
+            .contains("corrected full original")
+    );
+    let reader = read(temp.path(), session, compact);
+    for (entry, descriptor) in capture.entries.iter().zip(reader.descriptors()) {
+        assert_eq!(capture.recording_text(entry.order).unwrap().0, descriptor);
+    }
+    let decoded = CaptureDto::decode(
+        &capture.encode(Default::default()).unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(decoded, capture);
+    let slice = decoded
+        .recording_slice(
+            RecordingPosition {
+                canonical_order: 2,
+                byte_offset: 0,
+            },
+            5,
+            16 * 1024,
+        )
+        .unwrap();
+    assert_eq!(
+        slice
+            .capture
+            .entries
+            .iter()
+            .map(|e| e.source.entry_index)
+            .collect::<Vec<_>>(),
+        vec![6, 7, 7, 7, 4]
+    );
+    slice.capture.validate(Default::default()).unwrap();
+    let mut alias = capture.clone();
+    alias.entries[1].source.entry_index = 1;
+    assert!(matches!(
+        alias.validate(Default::default()),
+        Err(CaptureError::Invalid("duplicate source position"))
+    ));
+    let mut reverse = capture.clone();
+    reverse.entries[2].source.entry_index = 2;
+    assert!(matches!(
+        reverse.validate(Default::default()),
+        Err(CaptureError::Invalid("recording source position order"))
+    ));
+    let mut reversed_gap = capture;
+    reversed_gap.entries[3].source.entry_index = 5;
+    assert!(matches!(
+        reversed_gap.validate(Default::default()),
+        Err(CaptureError::Invalid("recording source position order"))
+    ));
+}
+
+#[test]
+fn recording_catalog_guarded_is_descriptor_only_beyond_body_capture_budget_in_both_layouts() {
+    use crate::capture::*;
+    for worker_layout in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        let retention = crate::retention::SessionRetentionStore::new(temp.path().join("control"));
+        let session = crate::new_session_id();
+        let segment = crate::new_segment_id();
+        let mut records = vec![seed(
+            session,
+            vec![
+                system_context("hidden", "private", crate::InputCompactionUse::Retain),
+                message("u", LoggedRole::User, "request"),
+            ],
+        )];
+        records.push(invoke());
+        for i in 0..130 {
+            records.push(output(&format!("a-{i}"), &"漢字🍎\n\"".repeat(400)));
+        }
+        records.push(cancelled());
+        if worker_layout {
+            WorkerSessionStore::new_with_retention(&root, retention.clone())
+                .unwrap()
+                .create_segment(session, segment, &records)
+                .unwrap();
+        } else {
+            FsStore::new_with_retention(&root, retention.clone())
+                .unwrap()
+                .create_segment(session, segment, &records)
+                .unwrap();
+        }
+        let guard = retention.lock_live(session).unwrap();
+        let inspect = |descriptors: &[PublicMaterialDescriptor]| descriptors.to_vec();
+        let catalog = if worker_layout {
+            recording_catalog_worker_guarded(
+                &root,
+                session,
+                segment,
+                Default::default(),
+                &guard,
+                inspect,
+            )
+        } else {
+            recording_catalog_fs_guarded(
+                &root,
+                session,
+                segment,
+                Default::default(),
+                &guard,
+                inspect,
+            )
+        }
+        .unwrap();
+        assert_eq!(catalog.len(), 132); // user, 130 answers, typed Host boundary
+        assert_eq!(catalog[0].identity.entry_ref, "Eu");
+        assert_eq!(catalog[131].origin, PublicMaterialOrigin::HostRunBoundary);
+        assert!(catalog.iter().map(|d| d.total_bytes).sum::<u64>() > 128 * 1024);
+        assert!(
+            catalog
+                .iter()
+                .enumerate()
+                .all(|(i, d)| d.canonical_order == i as u64)
+        );
+        // This is an admission scan, not a full body DTO with a huge transient ceiling.
+        let small = CaptureLimits {
+            max_bytes: 8192,
+            ..Default::default()
+        };
+        let full = if worker_layout {
+            capture_recording_worker_guarded(
+                &root,
+                session,
+                segment,
+                Default::default(),
+                small,
+                &guard,
+            )
+        } else {
+            capture_recording_fs_guarded(&root, session, segment, Default::default(), small, &guard)
+        };
+        assert!(matches!(full, Err(PublicMaterialError::ResourceLimit)));
+        // Descriptor identities/order/digests are exactly those of the bounded body path.
+        for order in [0, 1, 130, 131] {
+            let start = RecordingPosition {
+                canonical_order: order,
+                byte_offset: 0,
+            };
+            let slice = if worker_layout {
+                capture_recording_slice_worker_guarded(
+                    &root,
+                    session,
+                    segment,
+                    Default::default(),
+                    start,
+                    1,
+                    4096,
+                    &guard,
+                )
+            } else {
+                capture_recording_slice_fs_guarded(
+                    &root,
+                    session,
+                    segment,
+                    Default::default(),
+                    start,
+                    1,
+                    4096,
+                    &guard,
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                slice.capture.recording_text(order).unwrap().0,
+                &catalog[order as usize]
+            );
+            assert!(serde_json::to_vec(&slice).unwrap().len() <= 4096);
+        }
+    }
+}
+
+#[test]
+fn recording_catalog_callback_keeps_same_external_guard_and_persisted_selector() {
+    use crate::capture::*;
+    use crate::{
+        WorkerActiveSegmentRef, WorkerAggregateStore, WorkerMetadata, WorkerMetadataStore,
+    };
+    for worker_layout in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        let control = temp.path().join("control");
+        let retention = crate::retention::SessionRetentionStore::new(&control);
+        let session = crate::new_session_id();
+        let selected = crate::new_segment_id();
+        let unrelated_newer = crate::new_segment_id();
+        for (segment, id) in [(selected, "selected"), (unrelated_newer, "not-active")] {
+            let records = [seed(session, vec![message(id, LoggedRole::User, id)])];
+            if worker_layout {
+                WorkerSessionStore::new_with_retention(&root, retention.clone())
+                    .unwrap()
+                    .create_segment(session, segment, &records)
+                    .unwrap();
+            } else {
+                FsStore::new_with_retention(&root, retention.clone())
+                    .unwrap()
+                    .create_segment(session, segment, &records)
+                    .unwrap();
+            }
+        }
+        let metadata_root = temp.path().join("worker-metadata");
+        let metadata = WorkerAggregateStore::new(&metadata_root, "test-worker").unwrap();
+        let guard = retention.lock_live(session).unwrap();
+        metadata
+            .write(&WorkerMetadata::new(
+                "test-worker",
+                Some(WorkerActiveSegmentRef::active_segment(session, selected)),
+            ))
+            .unwrap();
+        // Simulate with_recording_boundary: persisted pointer resolution and descriptor
+        // mapping share exactly the same guard. Neither call selects the newest file.
+        let active = WorkerAggregateStore::open_read_only(&metadata_root, "test-worker")
+            .unwrap()
+            .read_read_only()
+            .unwrap()
+            .unwrap()
+            .active
+            .unwrap();
+        assert_eq!(active.session_id, session);
+        let inspect = |descriptors: &[PublicMaterialDescriptor]| -> Result<Vec<_>, &'static str> {
+            // Direct non-blocking check of the exact external fence, during callback.
+            // Publishers, active-pointer changes and erasure all use this same lock.
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(control.join(format!("{session}.lock")))
+                .unwrap();
+            assert!(!fs4::fs_std::FileExt::try_lock_exclusive(&probe).unwrap());
+            assert_eq!(descriptors.len(), 1);
+            assert_eq!(descriptors[0].identity.segment_id, selected);
+            assert_eq!(descriptors[0].identity.entry_ref, "Eselected");
+            Ok(descriptors.to_vec())
+        };
+        let catalog = if worker_layout {
+            recording_catalog_worker_guarded(
+                &root,
+                session,
+                active.segment_id.unwrap(),
+                Default::default(),
+                &guard,
+                inspect,
+            )
+        } else {
+            recording_catalog_fs_guarded(
+                &root,
+                session,
+                active.segment_id.unwrap(),
+                Default::default(),
+                &guard,
+                inspect,
+            )
+        }
+        .unwrap()
+        .unwrap();
+        let callback_error = if worker_layout {
+            recording_catalog_worker_guarded(
+                &root,
+                session,
+                selected,
+                Default::default(),
+                &guard,
+                |_| Err::<(), _>("host-error"),
+            )
+        } else {
+            recording_catalog_fs_guarded(
+                &root,
+                session,
+                selected,
+                Default::default(),
+                &guard,
+                |_| Err::<(), _>("host-error"),
+            )
+        };
+        assert_eq!(callback_error.unwrap(), Err("host-error"));
+        // The API borrows, not replaces/drops, the caller's guard.
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(control.join(format!("{session}.lock")))
+            .unwrap();
+        assert!(!fs4::fs_std::FileExt::try_lock_exclusive(&probe).unwrap());
+        drop(guard);
+        assert!(fs4::fs_std::FileExt::try_lock_exclusive(&probe).unwrap());
+        fs4::fs_std::FileExt::unlock(&probe).unwrap();
+        retention
+            .delete(
+                session,
+                crate::retention::SessionDeletionIntent::ErasePermanently,
+                || {
+                    std::fs::remove_dir_all(&root)?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            retention.lock_live(session),
+            Err(crate::StoreError::SessionErased(_))
+        ));
+        // Descriptor results contain no source body and do not authorize post-erase reads/adoption.
+        assert_eq!(catalog[0].identity.entry_ref, "Eselected");
+    }
+}
+
+#[test]
+fn recording_catalog_errors_do_not_invoke_callback_or_relax_resource_and_identity_checks() {
+    use crate::capture::*;
+    for worker_layout in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        let retention = crate::retention::SessionRetentionStore::new(temp.path().join("control"));
+        let session = crate::new_session_id();
+        let segment = crate::new_segment_id();
+        let records = [seed(
+            session,
+            vec![message("u", LoggedRole::User, "request")],
+        )];
+        if worker_layout {
+            WorkerSessionStore::new_with_retention(&root, retention.clone())
+                .unwrap()
+                .create_segment(session, segment, &records)
+                .unwrap();
+        } else {
+            FsStore::new_with_retention(&root, retention.clone())
+                .unwrap()
+                .create_segment(session, segment, &records)
+                .unwrap();
+        }
+        let guard = retention.lock_live(session).unwrap();
+        let other_session = crate::new_session_id();
+        let other_guard = retention.lock_live(other_session).unwrap();
+        let open = |session, segment, limits, guard| {
+            if worker_layout {
+                recording_catalog_worker_guarded(&root, session, segment, limits, guard, |_| {
+                    panic!("callback must not run for rejected catalog")
+                })
+            } else {
+                recording_catalog_fs_guarded(&root, session, segment, limits, guard, |_| {
+                    panic!("callback must not run for rejected catalog")
+                })
+            }
+        };
+        assert!(matches!(
+            open(session, segment, Default::default(), &other_guard),
+            Err(PublicMaterialError::Inconsistent)
+        ));
+        for limits in [
+            PublicMaterialLimits {
+                max_storage_bytes: 1,
+                ..Default::default()
+            },
+            PublicMaterialLimits {
+                max_record_bytes: 1,
+                ..Default::default()
+            },
+            PublicMaterialLimits {
+                max_entries: 0,
+                ..Default::default()
+            },
+            PublicMaterialLimits {
+                max_segments: 0,
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                open(session, segment, limits, &guard),
+                Err(PublicMaterialError::ResourceLimit)
+            ));
+        }
+        assert!(open(session, crate::new_segment_id(), Default::default(), &guard).is_err());
+        // Even a guard matching a claimed Session cannot bless another stored Session.
+        if worker_layout {
+            assert!(matches!(
+                open(other_session, segment, Default::default(), &other_guard),
+                Err(PublicMaterialError::Inconsistent)
+            ));
+        } else {
+            let impostor = root.join(other_session.to_string());
+            std::fs::create_dir(&impostor).unwrap();
+            std::fs::copy(
+                root.join(session.to_string())
+                    .join(format!("{segment}.jsonl")),
+                impostor.join(format!("{segment}.jsonl")),
+            )
+            .unwrap();
+            assert!(matches!(
+                open(other_session, segment, Default::default(), &other_guard),
+                Err(PublicMaterialError::Inconsistent)
+            ));
         }
     }
 }

@@ -444,6 +444,31 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         material_pin(&self.state, request, true)
     }
 
+    async fn session_recording_capture(
+        &self,
+        request: runtime_api::SessionRecordingCaptureRequest,
+    ) -> Result<runtime_api::SessionRecordingCaptureAvailability, runtime_api::RuntimeApiError>
+    {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        #[cfg(feature = "fs-store")]
+        {
+            Ok(self
+                .state
+                .runtime
+                .session_recording_capture_scoped(&scope, &request))
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = scope;
+            Ok(
+                runtime_api::SessionRecordingCaptureAvailability::Unavailable {
+                    reason: runtime_api::SessionPublicUnavailableReason::StorageUnavailable,
+                    message: "Committed Session storage unavailable".into(),
+                },
+            )
+        }
+    }
+
     async fn session_material_catalog(
         &self,
         request: runtime_api::SessionMaterialCatalogRequest,
@@ -694,6 +719,9 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
                         server_api::WorkerRestoreState::RolledBack => {
                             runtime_api::WorkerRestoreState::RolledBack
                         }
+                        server_api::WorkerRestoreState::Superseded => {
+                            runtime_api::WorkerRestoreState::Superseded
+                        }
                         server_api::WorkerRestoreState::ReconciliationRequired => {
                             runtime_api::WorkerRestoreState::ReconciliationRequired
                         }
@@ -743,6 +771,9 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
                 }
                 server_api::WorkerRestoreState::RolledBack => {
                     runtime_api::WorkerRestoreState::RolledBack
+                }
+                server_api::WorkerRestoreState::Superseded => {
+                    runtime_api::WorkerRestoreState::Superseded
                 }
                 server_api::WorkerRestoreState::ReconciliationRequired => {
                     runtime_api::WorkerRestoreState::ReconciliationRequired
@@ -856,13 +887,25 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
                 )
             })?;
         let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
-        let inventory = self
-            .state
-            .runtime
-            .worker_retention_inventory(&scope.workspace_id, &worker_ref)
-            .map_err(RuntimeHttpRestError::runtime)
-            .map_err(api_error)?;
-        response(inventory)
+        #[cfg(feature = "fs-store")]
+        {
+            let inventory = self
+                .state
+                .runtime
+                .worker_retention_inventory(&scope.workspace_id, &worker_ref)
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)?;
+            response(inventory)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = (scope, worker_ref);
+            Err(runtime_api::RuntimeApiError::new(
+                503,
+                "worker_retention_unavailable",
+                "Worker retention requires filesystem storage",
+            ))
+        }
     }
 
     async fn execute_retention(
@@ -880,27 +923,36 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
                 )
             })?;
         let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
-        let request: WorkerRetentionExecutionRequest = request(value)?;
-        if request.workspace_id != scope.workspace_id {
+        if value.workspace_id != scope.workspace_id {
             return Err(runtime_api::RuntimeApiError::new(
                 StatusCode::NOT_FOUND.as_u16(),
                 "worker_not_found",
                 "worker does not belong to the authenticated Workspace",
             ));
         }
-        if request.worker_id != worker_ref.worker_id {
+        if value.worker_id != worker_ref.worker_id {
             return Err(runtime_api::RuntimeApiError::new(
                 StatusCode::BAD_REQUEST.as_u16(),
                 "worker_id_mismatch",
                 "Worker retention request worker_id does not match route worker_id",
             ));
         }
-        let result = self
-            .state
-            .runtime
-            .execute_worker_retention(&request)
-            .map_err(RuntimeHttpRestError::runtime)
-            .map_err(api_error)?;
-        response(result)
+        #[cfg(feature = "fs-store")]
+        {
+            let request: WorkerRetentionExecutionRequest = request(value)?;
+            let result = self
+                .state
+                .runtime
+                .execute_worker_retention(&request)
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)?;
+            response(result)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        Err(runtime_api::RuntimeApiError::new(
+            503,
+            "worker_retention_unavailable",
+            "Worker retention requires filesystem storage",
+        ))
     }
 }

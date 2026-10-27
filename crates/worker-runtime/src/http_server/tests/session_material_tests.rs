@@ -150,6 +150,27 @@ impl Fixture {
             limit: 1,
         }
     }
+    fn recording_request(&self) -> runtime_api::SessionRecordingCaptureRequest {
+        runtime_api::SessionRecordingCaptureRequest {
+            workspace_id: self.scope.workspace_id.clone(),
+            source: self.source(),
+            expected_session_id: self.session.to_string(),
+            start: Default::default(),
+            max_entries: 1000,
+            max_serialized_bytes: 128 * 1024,
+        }
+    }
+    fn capture(&self, source: Source) -> session_store::capture::RecordingCaptureSlice {
+        let mut request = self.recording_request();
+        request.source = source;
+        match self
+            .runtime
+            .session_recording_capture_scoped(&self.scope, &request)
+        {
+            runtime_api::SessionRecordingCaptureAvailability::Captured { slice } => slice,
+            other => panic!("{other:?}"),
+        }
+    }
     fn catalog(&self) -> runtime_api::SessionMaterialCatalogPage {
         match self
             .runtime
@@ -225,6 +246,9 @@ fn pending_session_proof_is_not_missing_material_and_pin_release_allows_empty_ar
             .pin_session_public_source_scoped(&f.scope, &f.source(), &f.session.to_string(), pin)
             .is_err(),
         "retention intent is not source availability"
+    );
+    assert!(
+        matches!(f.runtime.session_recording_capture_scoped(&f.scope, &f.recording_request()), runtime_api::SessionRecordingCaptureAvailability::NotMaterialized { session_id } if session_id == f.session.to_string())
     );
     // A missing committed source is never the same fact as a pending pointer.
     metadata
@@ -479,6 +503,7 @@ fn source_scope_session_and_active_pointer_mismatches_never_return_material() {
 #[test]
 fn pinned_stopped_worker_archives_before_removal_and_job_reads_archived_source() {
     let f = Fixture::new();
+    let frozen = f.capture(f.source());
     let original: Vec<_> = f.reader(&f.source()).descriptors().cloned().collect();
     let pin = SessionRetentionPin(uuid::Uuid::now_v7());
     f.runtime
@@ -516,6 +541,7 @@ fn pinned_stopped_worker_archives_before_removal_and_job_reads_archived_source()
     let archived = Source::Archived {
         archive_id: "canonical-archive".into(),
     };
+    assert_eq!(f.capture(archived.clone()), frozen);
     let reader = f.reader(&archived);
     assert_eq!(reader.descriptors().cloned().collect::<Vec<_>>(), original);
     let body = reader.read_content(&original[0], 0, 16384).unwrap();
@@ -951,11 +977,52 @@ async fn signed_generated_client_reads_canonical_pages_and_pins_with_real_router
             .authorizer(SignedAuthorizer { identity, trust })
             .build()
             .unwrap();
+        let frozen = match client
+            .session_recording_capture(f.recording_request())
+            .await
+            .unwrap()
+        {
+            runtime_api::SessionRecordingCaptureAvailability::Captured { slice } => slice,
+            other => panic!("{other:?}"),
+        };
+        frozen.capture.validate(Default::default()).unwrap();
+        assert!(frozen.next.is_none());
+        assert!(
+            serde_json::to_vec(&frozen).unwrap().len()
+                <= f.recording_request().max_serialized_bytes
+        );
+        let snapshot = serde_json::to_vec(&frozen).unwrap();
+        assert!(!String::from_utf8_lossy(&snapshot).contains("private-system-prompt"));
+        f.store
+            .append(
+                f.session,
+                f.segment,
+                &LogEntry::AnnotatedAssistantItem {
+                    ts: 6,
+                    entry: message("late-answer", LoggedRole::Assistant, "not in frozen input"),
+                },
+            )
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&frozen).unwrap(), snapshot);
         let page = match client.session_material_catalog(f.request()).await.unwrap() {
             Catalog::Page { page } => page,
             other => panic!("{other:?}"),
         };
         let descriptor = page.descriptors[0].clone();
+        assert_eq!(
+            frozen
+                .capture
+                .recording_text(0)
+                .unwrap()
+                .0
+                .identity
+                .entry_ref,
+            descriptor.entry_ref
+        );
+        assert_eq!(
+            frozen.capture.recording_text(0).unwrap().0.sha256,
+            descriptor.sha256
+        );
         let read = client
             .session_material_read(runtime_api::SessionMaterialReadRequest {
                 workspace_id: "workspace-a".into(),
@@ -1020,6 +1087,13 @@ async fn signed_generated_client_reads_canonical_pages_and_pins_with_real_router
         }
         assert!(!f.root().exists());
         assert!(matches!(
+            client
+                .session_recording_capture(f.recording_request())
+                .await
+                .unwrap(),
+            runtime_api::SessionRecordingCaptureAvailability::Unavailable { .. }
+        ));
+        assert!(matches!(
             client.session_material_catalog(f.request()).await.unwrap(),
             Catalog::Unavailable { .. }
         ));
@@ -1050,41 +1124,54 @@ async fn canonical_http_rejects_replay_tampered_body_and_workspace_mismatch() {
         None,
         workspace_test_auth(vec![trust.clone()]),
     );
-    let path = "/v1/session-public/material/catalog";
-    let body = serde_json::to_vec(&f.request()).unwrap();
-    let claims = signed_claims(&trust, "POST", path, &body);
-    let first = signed_request(app.clone(), &identity, &claims, body.clone(), "workspace-a").await;
-    assert_eq!(first.status(), StatusCode::OK);
-    let replay = signed_request(app.clone(), &identity, &claims, body.clone(), "workspace-a").await;
-    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
-    let claims = signed_claims(&trust, "POST", path, &body);
-    let changed = signed_request(
-        app.clone(),
-        &identity,
-        &claims,
-        b"{}".to_vec(),
-        "workspace-a",
-    )
-    .await;
-    assert_eq!(changed.status(), StatusCode::UNAUTHORIZED);
-    let mut wrong_scope = f.request();
-    wrong_scope.workspace_id = "other-workspace".into();
-    let wrong_body = serde_json::to_vec(&wrong_scope).unwrap();
-    let claims = signed_claims(&trust, "POST", path, &wrong_body);
-    let response = signed_request(app.clone(), &identity, &claims, wrong_body, "workspace-a").await;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let unsigned = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(path)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body))
-                .unwrap(),
+    for (path, body) in [
+        (
+            "/v1/session-public/material/catalog",
+            serde_json::to_vec(&f.request()).unwrap(),
+        ),
+        (
+            "/v1/session-public/recording-capture",
+            serde_json::to_vec(&f.recording_request()).unwrap(),
+        ),
+    ] {
+        let claims = signed_claims(&trust, "POST", path, &body);
+        let first =
+            signed_request(app.clone(), &identity, &claims, body.clone(), "workspace-a").await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let replay =
+            signed_request(app.clone(), &identity, &claims, body.clone(), "workspace-a").await;
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        let claims = signed_claims(&trust, "POST", path, &body);
+        let changed = signed_request(
+            app.clone(),
+            &identity,
+            &claims,
+            b"{}".to_vec(),
+            "workspace-a",
         )
-        .await
-        .unwrap();
-    assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+        .await;
+        assert_eq!(changed.status(), StatusCode::UNAUTHORIZED);
+        let mut wrong_scope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        wrong_scope["workspace_id"] = "other-workspace".into();
+        let wrong_body = serde_json::to_vec(&wrong_scope).unwrap();
+        let claims = signed_claims(&trust, "POST", path, &wrong_body);
+        let response =
+            signed_request(app.clone(), &identity, &claims, wrong_body, "workspace-a").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let unsigned = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 #[tokio::test]
@@ -1169,4 +1256,153 @@ async fn explicit_material_erasure_requires_delete_capability_and_matching_scope
             .is_ok()
     );
     assert!(f.root().exists());
+}
+
+#[test]
+fn recording_capture_rejects_scope_session_cursor_and_budget_without_returning_bodies() {
+    use runtime_api::SessionRecordingCaptureAvailability as Capture;
+    let f = Fixture::new();
+    let request = f.recording_request();
+    let frozen = f.capture(f.source());
+    assert_eq!(frozen.capture.entries.len(), 3);
+    let mut request = request;
+    for invalid in 0..5 {
+        let mut bad = request.clone();
+        match invalid {
+            0 => bad.workspace_id = "other".into(),
+            1 => bad.expected_session_id = session_store::new_session_id().to_string(),
+            2 => bad.start.canonical_order = 100,
+            3 => bad.max_entries = 0,
+            4 => bad.max_serialized_bytes = 4 * 1024 * 1024 + 1,
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            f.runtime.session_recording_capture_scoped(&f.scope, &bad),
+            Capture::Unavailable { .. }
+        ));
+    }
+    let text = frozen.capture.recording_text(1).unwrap().2;
+    request.start = session_store::capture::RecordingPosition {
+        canonical_order: 1,
+        byte_offset: text.find('🍎').unwrap() as u64 + 1,
+    };
+    assert!(matches!(
+        f.runtime
+            .session_recording_capture_scoped(&f.scope, &request),
+        Capture::Unavailable {
+            reason: Reason::InvalidCursor,
+            ..
+        }
+    ));
+    request.start = Default::default();
+    request.max_entries = 1;
+    let Capture::Captured { slice } = f
+        .runtime
+        .session_recording_capture_scoped(&f.scope, &request)
+    else {
+        panic!()
+    };
+    assert_eq!(slice.capture.entries.len(), 1);
+    assert_eq!(slice.next.unwrap().canonical_order, 1);
+}
+
+#[test]
+fn recording_capture_compaction_preserves_original_descriptors_and_excludes_summary_and_new_tail() {
+    let f = Fixture::new();
+    let old = f.capture(f.source());
+    let compact = session_store::new_segment_id();
+    let mut summary = message(
+        "summary",
+        LoggedRole::System,
+        "derived summary is not original",
+    );
+    summary.metadata.input_metadata = Some(
+        session_store::HistoryInputMetadata::new(
+            session_store::HistoryInputUsePolicy {
+                recording_material: session_store::InputEvidenceUse::Exclude,
+                memory_evidence: session_store::InputEvidenceUse::Exclude,
+                observation: session_store::InputObservationUse::Hidden,
+                compaction: session_store::InputCompactionUse::OpeningSummary,
+            },
+            None,
+            None,
+        )
+        .unwrap(),
+    );
+    summary.metadata.derivation = Some(session_store::LoggedHistoryDerivation {
+        sources: vec![
+            LoggedSessionHistoryEntryId("user-1".into()),
+            LoggedSessionHistoryEntryId("answer-1".into()),
+        ],
+    });
+    f.store
+        .create_segment(
+            f.session,
+            compact,
+            &[
+                LogEntry::AnnotatedSegmentStart {
+                    ts: 6,
+                    session_id: f.session,
+                    system_prompt: Some("private".into()),
+                    config: Default::default(),
+                    history: vec![summary],
+                    forked_from: None,
+                    compacted_from: Some(session_store::SegmentOrigin {
+                        segment_id: f.segment,
+                        at_turn_index: 0,
+                    }),
+                },
+                LogEntry::AnnotatedAssistantItem {
+                    ts: 7,
+                    entry: message(
+                        "new-answer",
+                        LoggedRole::Assistant,
+                        "new original after compaction",
+                    ),
+                },
+            ],
+        )
+        .unwrap();
+    WorkerAggregateStore::new(
+        f.root().parent().unwrap(),
+        format!("worker-runtime-{}", f.worker.worker_id),
+    )
+    .unwrap()
+    .set_active(
+        &format!("worker-runtime-{}", f.worker.worker_id),
+        Some(session_store::WorkerActiveSegmentRef::active_segment(
+            f.session, compact,
+        )),
+        None,
+    )
+    .unwrap();
+    let frozen = f.capture(f.source());
+    assert_eq!(frozen.capture.entries.len(), old.capture.entries.len() + 1);
+    for entry in &old.capture.entries {
+        assert_eq!(
+            frozen.capture.recording_text(entry.order).unwrap(),
+            old.capture.recording_text(entry.order).unwrap()
+        );
+    }
+    assert!(
+        !serde_json::to_string(&frozen)
+            .unwrap()
+            .contains("derived summary is not original")
+    );
+    let bytes = serde_json::to_vec(&frozen).unwrap();
+    f.store
+        .append(
+            f.session,
+            compact,
+            &LogEntry::AnnotatedAssistantItem {
+                ts: 8,
+                entry: message("tail", LoggedRole::Assistant, "next Job only"),
+            },
+        )
+        .unwrap();
+    assert_eq!(serde_json::to_vec(&frozen).unwrap(), bytes);
+    assert_eq!(
+        f.capture(f.source()).capture.entries.len(),
+        frozen.capture.entries.len() + 1
+    );
 }

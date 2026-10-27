@@ -65,7 +65,6 @@ async fn prepared(
         WorkerBootstrapLayout::Direct {
             runtime_base: temp.path().join("runtime"),
         },
-        WorkerControllerTransport::InProcess,
     )
     .with_model_client(client)
     .prepare()

@@ -206,24 +206,34 @@ impl AuthorizedWorkdirSession {
                         .map(CheckoutSearchResult::Grep),
                 };
             };
-            scoped
-                .authorize_scope_path(WorkdirScopeAuthorizationRequest {
-                    rules: vec![WorkdirToolScopeRule {
-                        target: WorkdirPath::root(),
-                        ..rule.clone()
-                    }],
-                    path: relative_path(&root, operation.path())?,
-                    permission: WorkdirToolScopePermission::Read,
-                })
-                .await?;
-            // Lease cwd rebases paths. Use the same provider scoped-traversal contract
-            // with attachment output_root instead, retaining typed paths, cursors and
-            // Grep's rendered filenames without parsing or post-filtering output.
-            let mut request = CheckoutSearchRequest::new(operation);
-            request.scope_layers.push(vec![rule]);
-            self.session.checkout_search(request).await
+            self.search_with_scope(scoped, root, rule, CheckoutSearchRequest::new(operation))
+                .await
         })
         .await
+    }
+
+    async fn search_with_scope(
+        &self,
+        scoped: WorkdirSessionHandle,
+        root: WorkdirPath,
+        rule: WorkdirToolScopeRule,
+        mut request: CheckoutSearchRequest,
+    ) -> Result<CheckoutSearchResult, WorkdirError> {
+        scoped
+            .authorize_scope_path(WorkdirScopeAuthorizationRequest {
+                rules: vec![WorkdirToolScopeRule {
+                    target: WorkdirPath::root(),
+                    ..rule.clone()
+                }],
+                path: relative_path(&root, request.operation.path())?,
+                permission: WorkdirToolScopePermission::Read,
+            })
+            .await?;
+        // Preserve the caller's coordinate root, cursors and all existing
+        // attenuation layers. The provider applies the Host ceiling during
+        // traversal, not by filtering already-rendered filenames afterward.
+        request.scope_layers.push(vec![rule]);
+        self.session.checkout_search(request).await
     }
 
     fn authorize_command(&self) -> Result<(), WorkdirError> {
@@ -261,6 +271,12 @@ impl WorkdirSession for AuthorizedWorkdirSession {
         self.session.capabilities()
     }
 
+    fn environment(&self) -> workdir::WorkdirSessionEnvironment {
+        let mut environment = self.session.environment();
+        environment.capabilities = environment.capabilities.intersection(self.capabilities());
+        environment
+    }
+
     async fn authorize_scope_path(
         &self,
         mut request: WorkdirScopeAuthorizationRequest,
@@ -296,8 +312,14 @@ impl WorkdirSession for AuthorizedWorkdirSession {
         &self,
         request: CheckoutSearchRequest,
     ) -> Result<CheckoutSearchResult, WorkdirError> {
-        self.require_legacy(READ)?;
-        self.session.checkout_search(request).await
+        let path = request.operation.path().clone();
+        self.with_authorized(READ, &path, true, |scoped, root, rule| async move {
+            match rule {
+                Some(rule) => self.search_with_scope(scoped, root, rule, request).await,
+                None => self.session.checkout_search(request).await,
+            }
+        })
+        .await
     }
 
     async fn checkout_observe(
@@ -489,6 +511,8 @@ impl WorkdirSession for AuthorizedWorkdirSession {
 mod tests {
     //! Component tests connect this adapter to the real LocalWorkdirSession.
     //! Only the Host authorization transport/policy is replaced; these are not E2E tests.
+
+    mod environment;
 
     use super::*;
     use crate::{WorkspaceClientError, WorkspaceRequest, WorkspaceResponse};
@@ -839,18 +863,6 @@ mod tests {
                         content: b"bad".to_vec()
                     },
                 })
-                .await,
-            Err(WorkdirError::Denied(_))
-        ));
-        assert!(matches!(
-            session
-                .checkout_search(CheckoutSearchRequest::new(CheckoutSearchOperation::List(
-                    ListRequest {
-                        path: WorkdirPath::root(),
-                        after: None,
-                        limit: 10,
-                    }
-                )))
                 .await,
             Err(WorkdirError::Denied(_))
         ));

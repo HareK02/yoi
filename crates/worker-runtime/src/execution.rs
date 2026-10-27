@@ -215,6 +215,38 @@ impl WorkerExecutionResult {
     }
 }
 
+// Private one-shot synchronization at real publication boundaries. Disconnect
+// releases the waiter during unwinding; timeout bounds a forgotten test owner.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct RestoreTestGate<T> {
+    pub(crate) entered: std::sync::mpsc::Sender<T>,
+    pub(crate) release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl<T> RestoreTestGate<T> {
+    pub(crate) fn wait(self, evidence: T) {
+        let _ = self.entered.send(evidence);
+        assert!(
+            !matches!(
+                self.release
+                    .recv_timeout(std::time::Duration::from_secs(30)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "publication test gate timed out"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "ws-server"))]
+#[derive(Debug)]
+pub(crate) struct RestoreFlushFault {
+    pub(crate) remaining_successes: usize,
+    pub(crate) gate: RestoreTestGate<protocol::Event>,
+    pub(crate) restored: std::sync::mpsc::Sender<Vec<protocol::Event>>,
+}
+
 /// Runtime hooks available to an execution backend for one Worker.
 #[cfg(feature = "ws-server")]
 type WorkerObservationPublisher = Arc<
@@ -242,10 +274,15 @@ enum WorkerExecutionPublicationState {
 #[derive(Clone)]
 pub struct WorkerExecutionContext {
     worker_ref: WorkerRef,
+    restore_progress: Option<Arc<dyn Fn(WorkerLifecycleOperationId) + Send + Sync>>,
+    restore_repair_authorizer:
+        Option<Arc<dyn Fn(WorkerLifecycleOperationId) -> Result<(), RuntimeError> + Send + Sync>>,
     #[cfg(feature = "ws-server")]
     observation_publisher: WorkerObservationPublisher,
     #[cfg(feature = "ws-server")]
     publication_state: Arc<Mutex<WorkerExecutionPublicationState>>,
+    #[cfg(all(test, feature = "ws-server"))]
+    flush_fault: Arc<Mutex<Option<RestoreFlushFault>>>,
 }
 
 impl WorkerExecutionContext {
@@ -256,7 +293,11 @@ impl WorkerExecutionContext {
     ) -> Self {
         Self {
             worker_ref,
+            restore_progress: None,
+            restore_repair_authorizer: None,
             observation_publisher,
+            #[cfg(test)]
+            flush_fault: Arc::default(),
             publication_state: Arc::new(Mutex::new(WorkerExecutionPublicationState::Active)),
         }
     }
@@ -268,7 +309,11 @@ impl WorkerExecutionContext {
     ) -> Self {
         Self {
             worker_ref,
+            restore_progress: None,
+            restore_repair_authorizer: None,
             observation_publisher,
+            #[cfg(test)]
+            flush_fault: Arc::default(),
             publication_state: Arc::new(Mutex::new(WorkerExecutionPublicationState::Pending(
                 VecDeque::new(),
             ))),
@@ -277,12 +322,56 @@ impl WorkerExecutionContext {
 
     #[cfg(not(feature = "ws-server"))]
     pub(crate) fn new(worker_ref: WorkerRef) -> Self {
-        Self { worker_ref }
+        Self {
+            worker_ref,
+            restore_progress: None,
+            restore_repair_authorizer: None,
+        }
     }
 
     #[cfg(not(feature = "ws-server"))]
     pub(crate) fn candidate(worker_ref: WorkerRef) -> Self {
-        Self { worker_ref }
+        Self {
+            worker_ref,
+            restore_progress: None,
+            restore_repair_authorizer: None,
+        }
+    }
+
+    pub(crate) fn with_restore_repair_authorizer(
+        mut self,
+        authorizer: Arc<
+            dyn Fn(WorkerLifecycleOperationId) -> Result<(), RuntimeError> + Send + Sync,
+        >,
+    ) -> Self {
+        self.restore_repair_authorizer = Some(authorizer);
+        self
+    }
+
+    pub(crate) fn authorize_restore_source_repair(
+        &self,
+        operation: WorkerLifecycleOperationId,
+    ) -> Result<(), RuntimeError> {
+        match &self.restore_repair_authorizer {
+            Some(authorizer) => authorizer(operation),
+            // Direct factory/component users own their source repair separately;
+            // only Runtime contexts carry a Runtime aggregate authority callback.
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn with_restore_progress(
+        mut self,
+        progress: Arc<dyn Fn(WorkerLifecycleOperationId) + Send + Sync>,
+    ) -> Self {
+        self.restore_progress = Some(progress);
+        self
+    }
+
+    pub(crate) fn restore_progressed(&self, operation_id: WorkerLifecycleOperationId) {
+        if let Some(progress) = &self.restore_progress {
+            progress(operation_id);
+        }
     }
 
     pub fn worker_ref(&self) -> &WorkerRef {
@@ -335,17 +424,62 @@ impl WorkerExecutionContext {
             let Some(event) = event else {
                 return Ok(());
             };
-            if let Err(error) = (self.observation_publisher)(self.worker_ref.clone(), event.clone())
-            {
+            #[cfg(test)]
+            let fault = {
+                let mut fault = self.flush_fault.lock().unwrap();
+                if fault.as_ref().is_some_and(|f| f.remaining_successes == 0) {
+                    fault.take()
+                } else {
+                    if let Some(fault) = fault.as_mut() {
+                        fault.remaining_successes -= 1;
+                    }
+                    None
+                }
+            };
+            #[cfg(test)]
+            let mut restored = None;
+            #[cfg(test)]
+            let publication = if let Some(fault) = fault {
+                restored = Some(fault.restored);
+                fault.gate.wait(event.clone());
+                Err(RuntimeError::InvalidRequest(
+                    "injected buffered publication failure".into(),
+                ))
+            } else {
+                (self.observation_publisher)(self.worker_ref.clone(), event.clone())
+            };
+            #[cfg(not(test))]
+            let publication = (self.observation_publisher)(self.worker_ref.clone(), event.clone());
+            if let Err(error) = publication {
                 let mut state = self
                     .publication_state
                     .lock()
                     .map_err(|_| RuntimeError::StatePoisoned)?;
                 if let WorkerExecutionPublicationState::Activating(events) = &mut *state {
                     events.push_front(event);
+                    #[cfg(test)]
+                    if let Some(restored) = restored {
+                        let _ = restored.send(events.iter().cloned().collect());
+                    }
                 }
                 return Err(error);
             }
+        }
+    }
+
+    #[cfg(all(test, feature = "ws-server"))]
+    pub(crate) fn test_fail_flush(&self, fault: RestoreFlushFault) {
+        assert!(self.flush_fault.lock().unwrap().replace(fault).is_none());
+    }
+
+    #[cfg(all(test, feature = "ws-server"))]
+    pub(crate) fn test_buffered_events(&self) -> Vec<protocol::Event> {
+        match &*self.publication_state.lock().unwrap() {
+            WorkerExecutionPublicationState::Pending(events)
+            | WorkerExecutionPublicationState::Activating(events) => {
+                events.iter().cloned().collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -424,6 +558,7 @@ pub struct WorkerExecutionSpawnRequest {
 /// Request passed to a [`WorkerExecutionBackend`] when restoring a persisted Worker.
 #[derive(Clone, Debug)]
 pub struct WorkerExecutionRestoreRequest {
+    pub source_repair_possible: bool,
     pub operation_id: WorkerLifecycleOperationId,
     pub worker_ref: WorkerRef,
     pub request: crate::catalog::CreateWorkerRequest,
@@ -565,6 +700,19 @@ impl fmt::Debug for WorkerProtocolTransport {
     }
 }
 
+/// Derived resource disposition for an existing restore owner. Not durable
+/// authority: Runtime must reread its decision before choosing any action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreRecoveryDisposition {
+    /// No live or pending owner for this exact operation. Not cleanup evidence.
+    Absent,
+    InFlight,
+    Continue,
+    Discard,
+    /// A retained cleanup-only owner; never reconstruct or activate it.
+    Reclaim,
+}
+
 /// The connection selects this backend; WorkerRef identifies an execution,
 /// never a capability or authorization token.
 pub trait WorkerExecutionBackend: Send + Sync + 'static {
@@ -633,11 +781,74 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Completed resource-owner evidence retained while Runtime settlement may
+    /// still need retry. This is not a new request or execution authorization.
+    fn completed_restore_failure(
+        &self,
+        _operation_id: WorkerLifecycleOperationId,
+        _worker_ref: &WorkerRef,
+    ) -> Option<WorkerExecutionSpawnResult> {
+        None
+    }
+
+    /// Opt in to Runtime-owned autonomous restore continuation. Pending tasks
+    /// signal completion through the original execution context; callbacks must
+    /// not wait for Runtime locks. Independent of resource disposition support.
+    fn supports_restore_continuation(&self) -> bool {
+        false
+    }
+
+    /// Describe exact operation resource ownership for warm/cold recovery
+    /// dispatch. This does not opt in to callbacks or autonomous continuation.
+    fn restore_recovery_disposition(
+        &self,
+        _operation_id: WorkerLifecycleOperationId,
+        _worker_ref: &WorkerRef,
+    ) -> Option<RestoreRecoveryDisposition> {
+        None
+    }
+
     fn reconcile_restore(
         &self,
         request: WorkerExecutionRestoreRequest,
     ) -> WorkerExecutionSpawnResult {
         self.restore_worker(request)
+    }
+
+    /// Reclaim an uncommitted operation after restart without preparing,
+    /// repairing, or activating a replacement candidate. Runtime must establish
+    /// the durable uncommitted decision before calling this seam. Unsupported
+    /// cleanup is uncertainty, never a successful rollback.
+    fn reclaim_uncommitted_restore(
+        &self,
+        _request: WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        WorkerExecutionSpawnResult::ReconciliationRequired {
+            result: WorkerExecutionResult::unsupported(
+                WorkerExecutionOperation::Restore,
+                "backend cannot reclaim an uncommitted restore after restart",
+            ),
+            worker_state: None,
+            workdir_attachments: Vec::new(),
+        }
+    }
+
+    /// Discard only the exact unpublished operation after Runtime has proved
+    /// its durable decision uncommitted. This is not Stop and must not affect a
+    /// connected execution. RolledBack requires confirmed cleanup and no repair.
+    fn discard_uncommitted_restore(
+        &self,
+        _operation_id: WorkerLifecycleOperationId,
+        _worker_ref: &WorkerRef,
+    ) -> WorkerExecutionSpawnResult {
+        WorkerExecutionSpawnResult::ReconciliationRequired {
+            result: WorkerExecutionResult::unsupported(
+                WorkerExecutionOperation::Restore,
+                "backend cannot confirm unpublished restore cleanup",
+            ),
+            worker_state: None,
+            workdir_attachments: Vec::new(),
+        }
     }
 
     fn activate_restored_worker(
@@ -901,11 +1112,49 @@ impl WorkerExecutionBackendRef {
         self.backend.preflight_restore(request)
     }
 
+    pub(crate) fn completed_restore_failure(
+        &self,
+        operation_id: WorkerLifecycleOperationId,
+        worker_ref: &WorkerRef,
+    ) -> Option<WorkerExecutionSpawnResult> {
+        self.backend
+            .completed_restore_failure(operation_id, worker_ref)
+    }
+
+    pub(crate) fn supports_restore_continuation(&self) -> bool {
+        self.backend.supports_restore_continuation()
+    }
+
+    pub(crate) fn restore_recovery_disposition(
+        &self,
+        operation_id: WorkerLifecycleOperationId,
+        worker_ref: &WorkerRef,
+    ) -> Option<RestoreRecoveryDisposition> {
+        self.backend
+            .restore_recovery_disposition(operation_id, worker_ref)
+    }
+
     pub(crate) fn reconcile_restore(
         &self,
         request: WorkerExecutionRestoreRequest,
     ) -> WorkerExecutionSpawnResult {
         self.backend.reconcile_restore(request)
+    }
+
+    pub(crate) fn reclaim_uncommitted_restore(
+        &self,
+        request: WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        self.backend.reclaim_uncommitted_restore(request)
+    }
+
+    pub(crate) fn discard_uncommitted_restore(
+        &self,
+        operation_id: WorkerLifecycleOperationId,
+        worker_ref: &WorkerRef,
+    ) -> WorkerExecutionSpawnResult {
+        self.backend
+            .discard_uncommitted_restore(operation_id, worker_ref)
     }
 
     pub(crate) fn activate_restored_worker(

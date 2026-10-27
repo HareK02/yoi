@@ -15,7 +15,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 client = { workspace = true }
 futures = { workspace = true }
 manifest = { workspace = true }
-worker = { workspace = true }
+protocol = { workspace = true }
 server-api = { workspace = true }
 workdir = { workspace = true }
 tokio-tungstenite = { workspace = true }

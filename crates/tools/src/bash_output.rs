@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use workdir::{CommandStatus, CommandStream};
 
-const COMMAND_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const COMMAND_BYTES: usize = 4 * 1024 * 1024;
 const STORE_BYTES: usize = 32 * 1024 * 1024;
 const STORE_COUNT: usize = 64;
 const ORDER_COUNT: usize = 4096;
@@ -55,6 +55,7 @@ struct Record {
     transport_counts: Option<(u64, u64)>,
     transport_truncation: Option<workdir::CommandOutputTruncation>,
     terminal: Option<OutputTerminal>,
+    cleanup: Option<CleanupDiagnostics>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -68,8 +69,10 @@ pub struct OutputRange {
 pub struct OutputTerminal {
     pub status: Option<CommandStatus>,
     pub exit_code: Option<i32>,
-    /// False on a forcibly dropped collector or failed transport: received bytes are retained,
-    /// but they are not a claim about the unobserved process tail.
+    pub process_failure: Option<workdir::CommandFailure>,
+    pub output_collection: Option<workdir::CommandOutputCollection>,
+    /// True only for confirmed EOF collection (quota is reported separately). A terminal
+    /// fence or exit zero alone does not confirm the unobserved process tail.
     pub transport_complete: bool,
 }
 
@@ -93,8 +96,70 @@ pub struct BashOutputMetadata {
     pub transport_truncation: Option<workdir::CommandOutputTruncation>,
     pub storage_truncated: bool,
     pub terminal: OutputTerminal,
+    pub cleanup: Option<CleanupDiagnostics>,
     pub text_encoding: &'static str,
     pub ordering: &'static str,
+}
+
+/// Drop cleanup observations, not assertions that cancellation stopped a process.
+/// Correlate with the enclosing output UUID and this host-assigned execution generation;
+/// caller identifiers, provider handles, commands and error text are deliberately excluded.
+#[derive(Clone, Debug, Serialize)]
+pub struct CleanupDiagnostics {
+    pub execution_nonce: u64,
+    pub cancel: CleanupCancel,
+    pub drain: CleanupDrain,
+    pub deadline_expired: bool,
+    pub registration: CleanupRegistration,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum CleanupCancel {
+    Acknowledged,
+    Failed { reason: CleanupProviderFailure },
+    DeadlineExceeded,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum CleanupDrain {
+    TerminalConfirmed,
+    Failed { reason: CleanupFailure },
+    DeadlineExceeded,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CleanupFailure {
+    Provider { reason: CleanupProviderFailure },
+    SequenceGap,
+    CursorGap,
+    DeliveryBudgetExceeded,
+    RetainedChunkInvalid,
+    TerminalMetadataInvalid,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CleanupProviderFailure {
+    pub failure_reason: Option<workdir::WorkdirFailureReason>,
+    pub denial_reason: Option<workdir::WorkdirDenialReason>,
+}
+
+impl From<&workdir::WorkdirError> for CleanupProviderFailure {
+    fn from(error: &workdir::WorkdirError) -> Self {
+        Self {
+            failure_reason: error.failure_reason(),
+            denial_reason: error.denial_reason(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupRegistration {
+    Released,
+    Superseded,
 }
 
 /// A bounded reservation acquired before command start. Drop terminalizes partial evidence.
@@ -212,6 +277,7 @@ impl BashOutputView {
             transport_counts: None,
             transport_truncation: None,
             terminal: None,
+            cleanup: None,
         }));
         store.records.push_back(record.clone());
         store.reserved += COMMAND_BYTES;
@@ -311,6 +377,7 @@ impl Record {
             transport_truncation: self.transport_truncation.clone(),
             storage_truncated: self.truncated || self.transport_truncation.is_some(),
             terminal: self.terminal.clone().expect("finalized record"),
+            cleanup: self.cleanup.clone(),
             text_encoding: "utf8_lossy",
             ordering: "provider_read_observation",
         }
@@ -340,6 +407,14 @@ async fn reap(weak: Weak<Mutex<Store>>, mut shutdown: tokio::sync::watch::Receiv
 }
 
 impl BashOutputWriter {
+    pub(crate) fn id(&self) -> String {
+        self.record.lock().unwrap().id.clone()
+    }
+
+    pub(crate) fn finish_cleanup(&mut self, diagnostics: CleanupDiagnostics) {
+        self.record.lock().unwrap().cleanup = Some(diagnostics);
+    }
+
     pub fn append_chunk(&mut self, chunk: &workdir::CommandByteChunk) -> Result<(), String> {
         let expected = {
             let r = self.record.lock().unwrap();
@@ -405,12 +480,9 @@ impl BashOutputWriter {
         terminal: &workdir::CommandTerminal,
     ) -> Result<BashOutputMetadata, String> {
         let mut r = self.record.lock().unwrap();
-        if terminal.stdout_delivered_bytes != r.stdout_seen
+        if !terminal.metadata_valid()
+            || terminal.stdout_delivered_bytes != r.stdout_seen
             || terminal.stderr_delivered_bytes != r.stderr_seen
-            || terminal.stdout_bytes < r.stdout_seen
-            || terminal.stderr_bytes < r.stderr_seen
-            || ((terminal.stdout_bytes != r.stdout_seen || terminal.stderr_bytes != r.stderr_seen)
-                != terminal.truncation_reason.is_some())
         {
             return Err("command terminal counts do not fence delivered bytes".into());
         }
@@ -419,7 +491,12 @@ impl BashOutputWriter {
         r.terminal = Some(OutputTerminal {
             status: Some(terminal.status),
             exit_code: terminal.exit_code,
-            transport_complete: true,
+            transport_complete: matches!(
+                terminal.output_collection,
+                workdir::CommandOutputCollection::Complete
+            ),
+            process_failure: terminal.process_failure,
+            output_collection: Some(terminal.output_collection),
         });
         Ok(r.metadata())
     }
@@ -439,6 +516,8 @@ impl Drop for BashOutputWriter {
                 status: None,
                 exit_code: None,
                 transport_complete: false,
+                process_failure: None,
+                output_collection: None,
             });
         }
     }
@@ -456,6 +535,8 @@ mod tests {
                 status: Some(CommandStatus::Completed),
                 exit_code: Some(0),
                 transport_complete: true,
+                process_failure: None,
+                output_collection: Some(workdir::CommandOutputCollection::Complete),
             })
             .id
     }
@@ -514,6 +595,8 @@ mod tests {
             status: Some(CommandStatus::Completed),
             exit_code: Some(0),
             transport_complete: true,
+            process_failure: None,
+            output_collection: Some(workdir::CommandOutputCollection::Complete),
         });
         assert!(root.metadata(&metadata.id).is_some());
         let _replacement = sibling.begin().unwrap();
@@ -582,7 +665,7 @@ mod tests {
         let root = BashOutputView::new();
         let mut writer = root.begin().unwrap();
         writer.append(CommandStream::Stdout, b"abc");
-        let mut terminal = serde_json::json!({"status":"completed","exit_code":0,"stdout_bytes":9,"stderr_bytes":0,"stdout_delivered_bytes":4,"stderr_delivered_bytes":0,"truncation_reason":"byte_budget"});
+        let mut terminal = serde_json::json!({"status":"completed","exit_code":0,"process_failure":null,"output_collection":{"state":"complete"},"stdout_bytes":9,"stderr_bytes":0,"stdout_delivered_bytes":4,"stderr_delivered_bytes":0,"truncation_reason":"byte_budget"});
         assert!(
             writer
                 .finish_transport(&serde_json::from_value(terminal.clone()).unwrap())
@@ -600,6 +683,43 @@ mod tests {
         assert_eq!(
             metadata.transport_truncation,
             Some(workdir::CommandOutputTruncation::ByteBudget)
+        );
+    }
+
+    #[test]
+    fn incomplete_collection_with_quota_retains_both_causes_without_claiming_complete_output() {
+        let root = BashOutputView::new();
+        let mut writer = root.begin().unwrap();
+        writer.append(CommandStream::Stdout, b"abc");
+        let terminal: workdir::CommandTerminal = serde_json::from_value(serde_json::json!({
+            "status":"completed", "exit_code":0, "process_failure":null,
+            "output_collection":{"state":"incomplete","failure":{"stage":"stdout_drain","reason":"other","os_code":null}},
+            "stdout_bytes":9, "stderr_bytes":0, "stdout_delivered_bytes":3, "stderr_delivered_bytes":0,
+            "truncation_reason":"byte_budget"
+        })).unwrap();
+        let metadata = writer.finish_transport(&terminal).unwrap();
+        assert!(!metadata.terminal.transport_complete);
+        assert_eq!(metadata.terminal.exit_code, Some(0));
+        assert_eq!(
+            metadata.terminal.output_collection,
+            Some(terminal.output_collection)
+        );
+        assert_eq!(
+            metadata.transport_truncation,
+            Some(workdir::CommandOutputTruncation::ByteBudget)
+        );
+        assert_eq!(metadata.stdout_seen, 9);
+        assert_eq!(metadata.stdout_saved, 3);
+        assert!(metadata.storage_truncated);
+        assert!(metadata.retention_limit.is_none());
+        assert_eq!(
+            root.read(&metadata.id, CommandStream::Stdout, 0, 100)
+                .unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            serde_json::to_value(root.metadata(&metadata.id).unwrap()).unwrap(),
+            serde_json::to_value(metadata).unwrap()
         );
     }
 }

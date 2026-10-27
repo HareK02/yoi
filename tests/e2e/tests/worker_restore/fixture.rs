@@ -15,13 +15,13 @@ const ASSETS: [&str; 3] = [
     "worker-template.json",
     "workspace-config.dcdl",
 ];
-const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub format_version: u32,
-    pub source_revision: String,
+    #[serde(rename = "source_revision")]
+    pub source_commit: String,
     pub runtime_schema_version: u32,
     pub session_schema_version: u32,
     pub workspace_id: String,
@@ -46,7 +46,8 @@ pub struct Asset {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Expected {
-    source_revision: String,
+    #[serde(rename = "source_revision")]
+    source_commit: String,
     model: String,
     worker_id: String,
     session_id: String,
@@ -88,6 +89,8 @@ impl Fixture {
             .unwrap_or_else(|| {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/worker-codex-v1")
             });
+        let file_names: Vec<_> = std::iter::once("manifest.json").chain(ASSETS).collect();
+        let source = FixtureSource::capture_flat(&root, &file_names)?;
         let manifest: Manifest =
             serde_json::from_slice(&bounded_read(&root.join("manifest.json"))?)?;
         if manifest.format_version != 1
@@ -96,9 +99,9 @@ impl Fixture {
             || manifest.session_schema_version == 0
             || manifest.acquisition.is_empty()
             || manifest.source_file_sha256.is_empty()
-            || manifest.source_revision.len() != 40
+            || manifest.source_commit.len() != 40
             || !manifest
-                .source_revision
+                .source_commit
                 .bytes()
                 .all(|c| c.is_ascii_hexdigit())
         {
@@ -107,13 +110,6 @@ impl Fixture {
         let names: BTreeSet<_> = manifest.files.keys().map(String::as_str).collect();
         if names != BTreeSet::from(ASSETS) {
             return Err(failure("unexpected fixture asset set"));
-        }
-        for name in ASSETS {
-            bounded_read(&root.join(name))?;
-        }
-        let source = FixtureSource::capture(&root)?;
-        if source.hashes().len() != 4 {
-            return Err(failure("fixture has unmanifested files"));
         }
         for (name, asset) in &manifest.files {
             if asset.bytes != fs::metadata(root.join(name))?.len()
@@ -124,7 +120,7 @@ impl Fixture {
         }
         let expected: Expected =
             serde_json::from_slice(&bounded_read(&root.join("expected.json"))?)?;
-        if expected.source_revision != manifest.source_revision
+        if expected.source_commit != manifest.source_commit
             || expected.model != manifest.model
             || expected.worker_id != manifest.worker_id
             || expected.session_id != manifest.session_id
@@ -134,7 +130,7 @@ impl Fixture {
                 "expected conversation identity differs from manifest",
             ));
         }
-        verify_builtin_revision(&manifest.source_revision)?;
+        verify_builtin_commit(&manifest.source_commit)?;
         let fixture = Self {
             root,
             source,
@@ -142,6 +138,7 @@ impl Fixture {
             expected,
         };
         fixture.template(&fixture.root)?;
+        fixture.source.assert_unchanged()?;
         Ok(fixture)
     }
 
@@ -220,40 +217,31 @@ impl Fixture {
 }
 
 fn bounded_read(path: &Path) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        failure(format!(
-            "required fixture asset {}: {error}",
-            path.display()
-        ))
-    })?;
-    if !metadata.is_file() || metadata.len() > MAX_ASSET_BYTES {
-        return Err(failure("fixture asset is not a bounded regular file"));
-    }
-    Ok(fs::read(path)?)
+    FixtureSource::read_bounded(path)
 }
 
-fn verify_builtin_revision(revision: &str) -> Result<()> {
+fn verify_builtin_commit(source_commit: &str) -> Result<()> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .parent()
         .unwrap();
-    // Resolve the immutable commit before diff; bad revisions must not be treated
+    // Resolve the immutable commit before diff; unavailable commits must not be treated
     // as an empty diff. All resources are checked, including transitive imports.
     let commit = Command::new("git")
-        .args(["cat-file", "-t", revision])
+        .args(["cat-file", "-t", source_commit])
         .current_dir(workspace)
         .output()?;
     if !commit.status.success() || commit.stdout != b"commit\n" {
         return Err(failure(
-            "fixture source revision is unavailable for builtin verification",
+            "fixture source commit is unavailable for builtin verification",
         ));
     }
     let status = Command::new("git")
         .args([
             "diff",
             "--quiet",
-            revision,
+            source_commit,
             "--",
             "resources",
             "crates/builtin-source",
@@ -262,7 +250,7 @@ fn verify_builtin_revision(revision: &str) -> Result<()> {
         .status()?;
     if !status.success() {
         return Err(failure(
-            "builtin/config resources differ from fixture source revision; provide a new version or frozen references",
+            "builtin/config resources differ from fixture source commit; provide a new version or frozen references",
         ));
     }
     Ok(())

@@ -1,8 +1,10 @@
 //! Bounded, Host-bound Journal recording and sequential Job transport.
 //!
 //! Subject, Journal and generation authority never come from these model inputs.
-//! Hosts validate live execution and public source bytes before selection; reading a
-//! preview must not select the enclosing entry. Operation retries retain the entire
+//! Hosts validate live execution and public source bytes before selection, save body-bearing
+//! immutable Job input, and attest its exact digest and dispatch plan through the service.
+//! Model requests cannot attest input delivery; Source targets are rejected by snapshot execution.
+//! Initial/current Journal reads remain separate from input delivery. Operation retries retain the entire
 //! JournalOperation, including its original expected_state and covered_ranges.
 
 use serde::{Deserialize, Serialize};
@@ -50,8 +52,8 @@ pub struct JournalJobState {
     pub current_journal: JournalMetadata,
     pub current_open: Option<JournalEntrySummary>,
     pub previous_fixed_end: Option<JournalSourcePointer>,
-    /// Frozen permission to fetch this prefix, not evidence of delivery or reflection.
-    /// The sequential service gates mutations on its durable Source-read delivery ledger.
+    /// Frozen source selection delivered in immutable Job input, not evidence of reflection.
+    /// Production execution requires the trusted Host's matching input-digest attestation.
     pub selected_ranges: Vec<JournalSourceRange>,
 }
 
@@ -83,7 +85,8 @@ pub enum JournalTextTarget {
     OpenOngoing {
         snapshot: JournalSnapshot,
     },
-    /// The Host restricts this pointer to this Job's frozen public source input.
+    /// Legacy source-read adapter only. Production snapshot execution rejects this target;
+    /// raw source bodies must already be present in the immutable Job input.
     Source {
         pointer: JournalSourcePointer,
     },

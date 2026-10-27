@@ -1,3 +1,8 @@
+//! Cleanup of legacy name-keyed Worker metadata, not Standalone execution state.
+//!
+//! Historical socket probes only refuse unsafe deletion; they never discover or
+//! attach Workers for execution. Session logs and shared history remain untouched.
+
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -484,7 +489,7 @@ fn to_error<E: fmt::Display>(error: E) -> WorkerCleanupCliError {
 }
 
 pub fn help_text() -> &'static str {
-    "yoi worker\n\nUsage:\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi worker [WORKER_OPTIONS]\n\nDescription:\n  delete/prune are safe Worker metadata cleanup commands. `worker delete` removes only name-keyed Worker metadata and never removes session logs/history. Live or uncertain Worker liveness is refused. Without --force the command reports only.\n\nDuration units: s, m, h, d, w\n\nOptions:\n      --force       Perform deletion after safety checks\n      --dry-run     Report only, even with --force\n      --older-than  Required explicit age threshold for prune\n  -h, --help        Print help\n"
+    "yoi worker\n\nUsage:\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n\nDescription:\n  delete/prune clean up legacy name-keyed Worker metadata only; they do not start or restore Workers. Use `yoi --local serve --socket <PATH>` for a headless Standalone Host. `worker delete` removes only name-keyed Worker metadata and never removes session logs/history. Live or uncertain Worker liveness is refused. Without --force the command reports only.\n\nDuration units: s, m, h, d, w\n\nOptions:\n      --force       Perform deletion after safety checks\n      --dry-run     Report only, even with --force\n      --older-than  Required explicit age threshold for prune\n  -h, --help        Print help\n"
 }
 
 fn delete_help_text() -> &'static str {

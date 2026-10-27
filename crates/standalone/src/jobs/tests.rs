@@ -468,3 +468,104 @@ async fn cleanup_cannot_reclassify_success_or_durable_cancellation_and_stale_han
         assert!(matches!(operation, Err(JobServiceError::Closed)));
     }
 }
+
+#[tokio::test]
+async fn cancelled_shutdown_future_keeps_execution_barrier_and_unknown_input() {
+    // Actual generic runner + SQLite; only the provider stream is scripted/blocked.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("jobs.sqlite3");
+    let jobs = StandaloneJobs::open(&path, temp.path().into()).unwrap();
+    let reserved = jobs.request(request("cancel-shutdown-wait")).unwrap();
+    let model = DomainTestClient {
+        stall: true,
+        ..Default::default()
+    };
+    jobs.start_with_model_client(&reserved.request.job_id, model.clone())
+        .await
+        .unwrap();
+    await_model(&model).await;
+    {
+        let shutdown = jobs.shutdown();
+        tokio::pin!(shutdown);
+        assert!(futures::poll!(shutdown.as_mut()).is_pending());
+        // Drop the caller's waiter while cancellation/cleanup is still pending.
+    }
+    assert!(matches!(
+        jobs.try_shutdown(),
+        Err(JobServiceError::ShutdownIncomplete)
+    ));
+    assert!(jobs.store.lock().unwrap().is_some());
+    assert!(matches!(
+        jobs.request(request("after-shutdown")),
+        Err(JobServiceError::Closed)
+    ));
+    tokio::time::timeout(Duration::from_secs(5), jobs.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(jobs.store.lock().unwrap().is_none());
+    let reopened = StandaloneJobs::open(&path, temp.path().into()).unwrap();
+    let unknown = reopened.get(&reserved.request.job_id).unwrap();
+    assert_eq!(unknown.attempt.state, JobAttemptState::Unknown);
+    assert_eq!(unknown.input_disposition, JobInputDisposition::Available);
+    assert_eq!(unknown.request, reserved.request);
+    assert_eq!(unknown.input_digest, reserved.input_digest);
+    assert!(reopened.retry(&unknown.request.job_id).is_err());
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn input_retirement_service_fences_live_attempt_and_preserves_session_receipts() {
+    // Production service + SQLite + attempt/result fences, without a model or Worker fixture.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("jobs.sqlite3");
+    let jobs = StandaloneJobs::open(&path, temp.path().to_path_buf()).unwrap();
+    let original = request("input-retirement");
+    let grant = json!({"session_id":"session-a"});
+    let reserved = jobs
+        .request_granted(original.clone(), grant.clone())
+        .unwrap();
+    jobs.with_store(|store| store.dispatch("input-retirement", &reserved.attempt.attempt_id, 8))
+        .unwrap();
+    let fence = BoundAttemptFence {
+        store: jobs.store.clone(),
+        job_id: "input-retirement".into(),
+        attempt_id: reserved.attempt.attempt_id.clone(),
+        input_digest: reserved.input_digest.clone(),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+    };
+    assert!(fence.ensure_live().is_ok());
+    assert!(
+        jobs.reclaim_input(
+            "input-retirement",
+            &reserved.input_digest,
+            JobInputRetirementReason::Completed
+        )
+        .is_err()
+    );
+    let erased = jobs
+        .reclaim_input(
+            "input-retirement",
+            &reserved.input_digest,
+            JobInputRetirementReason::ExplicitErasure,
+        )
+        .unwrap();
+    assert!(fence.ensure_live().is_err());
+    assert!(
+        sink(&jobs, "input-retirement", &reserved.attempt.attempt_id)
+            .submit(result("input-retirement", &reserved.attempt.attempt_id))
+            .is_err()
+    );
+    assert!(jobs.start("input-retirement").await.is_err());
+    assert_eq!(
+        jobs.list_session_snapshots("session-a", None, 100).unwrap(),
+        vec![erased.clone()]
+    );
+    assert!(
+        jobs.list_session_snapshots("session-b", None, 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(jobs.request_granted(original, grant).unwrap(), erased);
+    jobs.shutdown().await.unwrap();
+}

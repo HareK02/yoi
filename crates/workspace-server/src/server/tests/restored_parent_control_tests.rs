@@ -11,6 +11,20 @@ use worker_runtime::worker_backend::{
     WorkerRuntimeExecutionBackend,
 };
 
+pub(super) fn connected_restore_tempdir() -> tempfile::TempDir {
+    crate::restore_test_environment::require_restore_test_environment();
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    tempfile::Builder::new()
+        .prefix("c")
+        .rand_bytes(3)
+        .tempdir_in(checkout.join("target"))
+        .unwrap()
+}
+
 const WATCHDOG: Duration = Duration::from_secs(45);
 
 #[derive(Clone)]
@@ -82,23 +96,90 @@ impl RuntimeWorkerFactory for CapturingFactory {
     ) -> std::result::Result<(), String> {
         self.inner.preflight_restore(request).await
     }
-    async fn restore_controller(
+    async fn recover_restore_source(
+        &self,
+        request: &worker_runtime::execution::WorkerExecutionRestoreRequest,
+    ) -> std::result::Result<bool, worker_runtime::worker_backend::RuntimeRestoreFailure> {
+        self.inner.recover_restore_source(request).await
+    }
+
+    async fn prepare_restore(
         &self,
         request: worker_runtime::execution::WorkerExecutionRestoreRequest,
-    ) -> std::result::Result<RuntimeWorkerController, String> {
+    ) -> std::result::Result<
+        Box<dyn worker_runtime::worker_backend::RuntimeRestoreCandidate>,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
         let worker_ref = request.worker_ref.clone();
-        let controller = self.inner.restore_controller(request).await?;
+        let inner = self.inner.prepare_restore(request).await?;
+        Ok(Box::new(CapturingCandidate {
+            inner,
+            worker_ref,
+            captures: self.captures.clone(),
+        }))
+    }
+
+    async fn cleanup_failed_restore(
+        &self,
+        request: &worker_runtime::execution::WorkerExecutionRestoreRequest,
+    ) -> std::result::Result<(), worker_runtime::worker_backend::RuntimeRestoreCleanupFailure> {
+        self.inner.cleanup_failed_restore(request).await
+    }
+
+    async fn reconcile_stopped_worker(
+        &self,
+        worker_ref: &worker_runtime::identity::WorkerRef,
+    ) -> std::result::Result<(), String> {
+        self.inner.reconcile_stopped_worker(worker_ref).await
+    }
+
+    fn activate_restored_controller(
+        &self,
+        worker_ref: &worker_runtime::identity::WorkerRef,
+        workspace_id: Option<&str>,
+        handle: &worker::WorkerHandle,
+    ) -> std::result::Result<(), String> {
+        self.inner
+            .activate_restored_controller(worker_ref, workspace_id, handle)
+    }
+}
+
+struct CapturingCandidate {
+    inner: Box<dyn worker_runtime::worker_backend::RuntimeRestoreCandidate>,
+    worker_ref: worker_runtime::identity::WorkerRef,
+    captures: Arc<Captures>,
+}
+
+#[async_trait::async_trait]
+impl worker_runtime::worker_backend::RuntimeRestoreCandidate for CapturingCandidate {
+    fn initial_state(&self) -> protocol::WorkerStateSnapshot {
+        self.inner.initial_state()
+    }
+
+    async fn activate(
+        &mut self,
+    ) -> std::result::Result<
+        RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
+        let controller = self.inner.activate().await?;
         self.captures
             .handles
             .lock()
             .unwrap()
-            .push((worker_ref.clone(), controller.handle.clone()));
+            .push((self.worker_ref.clone(), controller.handle.clone()));
         self.captures
             .restored_clients
             .lock()
             .unwrap()
-            .push((worker_ref, controller.workspace_client.clone()));
+            .push((self.worker_ref.clone(), controller.workspace_client.clone()));
         Ok(controller)
+    }
+
+    async fn discard(
+        &mut self,
+    ) -> std::result::Result<(), worker_runtime::worker_backend::RuntimeRestoreCleanupFailure> {
+        self.inner.discard().await
     }
 }
 
@@ -259,7 +340,7 @@ async fn call(tools: &BTreeMap<String, Arc<dyn Tool>>, name: &str, args: Value) 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restored_runtime_parent_lists_and_inputs_existing_child() {
-    let root = tempfile::tempdir().unwrap();
+    let root = connected_restore_tempdir();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let mut config = test_server_config(root.path());

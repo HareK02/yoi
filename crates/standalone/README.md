@@ -4,7 +4,8 @@ A Host that starts existing Workers in the same process. Assembles interactive W
 
 ## Reference index
 
-- [`host`] — bootstrap and confirmed shutdown.
+- [`host`] — bootstrap and confirmed shutdown, with or without a TUI.
+- [`unix`] — optional operator transport; disconnect does not release execution ownership.
 - [`launch`] — Profile, cwd, and Subject validation before launch.
 - [`store`] — Worker records and leases.
 - [`jobs`] — Job execution and independent result and cleanup lifetimes.

@@ -3,7 +3,7 @@
 //! only the empty segment envelope is built with current APIs.
 use super::tests::{request, write_json};
 use super::*;
-use crate::fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};
+use crate::fs_store::{FsRuntimeStore, FsRuntimeStoreOptions, SCHEMA_VERSION};
 use serde_json::{Value, json};
 use session_store::{LogEntry, SegmentId, SessionId, Store, WorkerSessionStore};
 use std::collections::BTreeMap;
@@ -226,7 +226,7 @@ fn completed_v4_archive(
 
 #[test]
 fn runtime_v11_and_current_route_v4_stopped_orphan_archive_through_staging() {
-    for runtime_schema in [11, 12] {
+    for runtime_schema in [11, 12, SCHEMA_VERSION] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime");
         let (worker, session, segment) = runtime_fixture(&root, runtime_schema);
@@ -329,7 +329,7 @@ fn runtime_v11_and_current_route_v4_stopped_orphan_archive_through_staging() {
             (storage.checksum_sha256, storage.bytes, storage.file_count),
             (checksum, bytes, count)
         );
-        if runtime_schema == 12 {
+        if runtime_schema == SCHEMA_VERSION {
             for name in [
                 PathBuf::from("runtime.json"),
                 PathBuf::from(format!("workers/{worker}/worker.json")),
@@ -346,8 +346,8 @@ fn runtime_v11_and_current_route_v4_stopped_orphan_archive_through_staging() {
         );
         drop(FsRuntimeStore::open_or_create(root.clone(), "runtime-a").unwrap());
         assert_eq!(tree_bytes(&root), once, "retry rewrote migrated evidence");
-        assert!(!temp.path().join(".runtime.schema-v12-staging").exists());
-        assert!(!temp.path().join(".runtime.pre-schema-v12-backup").exists());
+        assert!(!temp.path().join(".runtime.schema-v13-staging").exists());
+        assert!(!temp.path().join(".runtime.pre-schema-v13-backup").exists());
         // session-storage, not the immutable receipt's old checksum, attests
         // current bytes. Tampering with those bytes must remain detectable.
         let path = archive_session
@@ -360,7 +360,7 @@ fn runtime_v11_and_current_route_v4_stopped_orphan_archive_through_staging() {
 
 #[test]
 fn corrupt_archive_does_not_block_startup_or_healthy_session_migration_and_repair_converges() {
-    for runtime_schema in [11, 12] {
+    for runtime_schema in [11, 12, SCHEMA_VERSION] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime");
         let (worker, session, segment) = runtime_fixture(&root, runtime_schema);
@@ -440,8 +440,8 @@ fn unmigratable_archive_preserves_evidence_across_startup_and_reopen() {
     ] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime");
-        let (live_worker, live_session, live_segment) = runtime_fixture(&root, 12);
-        let (worker, _, segment) = stopped_worker(&root, 12);
+        let (live_worker, live_session, live_segment) = runtime_fixture(&root, SCHEMA_VERSION);
+        let (worker, _, segment) = stopped_worker(&root, SCHEMA_VERSION);
         let provider = FsWorkerRetentionProvider::new(&root);
         let path = provider
             .worker_dir(worker)
@@ -542,8 +542,8 @@ fn unreadable_archive_metadata_does_not_block_archive_only_runtime_startup() {
     ] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime");
-        let (worker, _, _) = runtime_fixture(&root, 12);
-        completed_v4_archive(&root, 12);
+        let (worker, _, _) = runtime_fixture(&root, SCHEMA_VERSION);
+        completed_v4_archive(&root, SCHEMA_VERSION);
         let provider = FsWorkerRetentionProvider::new(&root);
         fs::remove_dir_all(provider.worker_dir(worker)).unwrap();
         let archive = provider.archive_dir("archive-a").unwrap();
@@ -575,8 +575,8 @@ fn unreadable_archive_metadata_does_not_block_archive_only_runtime_startup() {
 fn archive_isolation_does_not_bypass_corrupt_erasure_authority() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("runtime");
-    runtime_fixture(&root, 12);
-    let (session, _, _, _) = completed_v4_archive(&root, 12);
+    runtime_fixture(&root, SCHEMA_VERSION);
+    let (session, _, _, _) = completed_v4_archive(&root, SCHEMA_VERSION);
     let ledger = root.join("retention/session-sources");
     fs::create_dir_all(&ledger).unwrap();
     fs::write(ledger.join(format!("{session}.json")), b"{broken\n").unwrap();
@@ -591,7 +591,7 @@ fn archive_isolation_does_not_bypass_corrupt_erasure_authority() {
 fn runtime_v5_probe_and_staging_skip_erased_originals() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("runtime");
-    let (worker, live_session, live_segment) = runtime_fixture(&root, 12);
+    let (worker, live_session, live_segment) = runtime_fixture(&root, SCHEMA_VERSION);
     let erased = root
         .join("orphaned-workers")
         .join(WorkerId::now_v7().to_string());
@@ -643,7 +643,7 @@ fn runtime_v5_rejects_broken_or_future_source_without_rewriting_evidence() {
     for corruption in ["broken-json", "future-schema"] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime");
-        let (worker, session, segment) = runtime_fixture(&root, 12);
+        let (worker, session, segment) = runtime_fixture(&root, SCHEMA_VERSION);
         let session_root = root
             .join("workers")
             .join(worker.to_string())
@@ -674,17 +674,19 @@ fn runtime_v5_rejects_broken_or_future_source_without_rewriting_evidence() {
         assert_eq!(tree_bytes(&root), before);
         assert!(FsRuntimeStore::migrate(&options).is_err());
         assert_eq!(tree_bytes(&root), before);
-        assert!(!temp.path().join(".runtime.schema-v12-staging").exists());
-        assert!(!temp.path().join(".runtime.pre-schema-v12-backup").exists());
+        assert!(!temp.path().join(".runtime.schema-v13-staging").exists());
+        assert!(!temp.path().join(".runtime.pre-schema-v13-backup").exists());
     }
 }
 
 #[cfg(unix)]
 #[test]
 fn current_runtime_session_migration_still_rejects_live_worker_sockets() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("runtime");
-    let (worker, _, _) = runtime_fixture(&root, 12);
+    // The same TempDir owns the relative bind/connect reference. No cwd change
+    // or alias is needed, and the real live-socket migration refusal stays tested.
+    let temp = tempfile::tempdir_in(".").unwrap();
+    let root = Path::new(temp.path().file_name().unwrap()).join("runtime");
+    let (worker, _, _) = runtime_fixture(&root, SCHEMA_VERSION);
     let before = tree_bytes(&root);
     let runs = root.join("workers").join(worker.to_string()).join("runs");
     fs::create_dir_all(runs.join("1")).unwrap();
@@ -695,7 +697,7 @@ fn current_runtime_session_migration_still_rejects_live_worker_sockets() {
     drop(listener);
     fs::remove_dir_all(runs).unwrap();
     assert_eq!(tree_bytes(&root), before);
-    assert!(!temp.path().join(".runtime.schema-v12-staging").exists());
+    assert!(!temp.path().join(".runtime.schema-v13-staging").exists());
 }
 
 #[test]
@@ -703,7 +705,7 @@ fn current_runtime_upgrades_v5_role_metadata_through_staging_without_reserializi
 {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("runtime");
-    let (worker, session, segment) = runtime_fixture(&root, 12);
+    let (worker, session, segment) = runtime_fixture(&root, SCHEMA_VERSION);
     let aggregate = root.join("workers").join(worker.to_string());
     let path = aggregate
         .join("session/segments")

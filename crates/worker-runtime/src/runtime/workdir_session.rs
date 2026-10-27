@@ -55,6 +55,10 @@ impl WorkdirSession for RetainedWorkdirSession {
         self.inner.capabilities()
     }
 
+    fn environment(&self) -> workdir::WorkdirSessionEnvironment {
+        self.inner.environment()
+    }
+
     async fn authorize_scope_path(
         &self,
         request: WorkdirScopeAuthorizationRequest,

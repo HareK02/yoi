@@ -226,6 +226,7 @@ pub struct WorkspaceAttachedWorkdirSession {
     target_workdir: String,
     workdir: Workdir,
     capabilities: WorkdirSessionCapabilities,
+    environment: workdir::WorkdirSessionEnvironment,
 }
 
 impl WorkspaceAttachedWorkdirSession {
@@ -249,17 +250,38 @@ impl WorkspaceAttachedWorkdirSession {
         )
     }
 
+    /// Bind a known root-coordinate attachment. Opened provider sessions must
+    /// instead pass their metadata to [`Self::handle_for_workdir_with_environment`].
     pub fn handle_for_workdir_with_capabilities(
         client: Arc<dyn WorkspaceClient>,
         target_workdir: impl Into<String>,
         workdir_id: impl Into<String>,
         capabilities: WorkdirSessionCapabilities,
     ) -> WorkdirSessionHandle {
+        Self::handle_for_workdir_with_environment(
+            client,
+            target_workdir,
+            workdir_id,
+            capabilities,
+            workdir::WorkdirSessionEnvironment::root(capabilities),
+        )
+    }
+
+    /// Bind provider-authored coordinates without allowing metadata to expand
+    /// the Backend attachment capability ceiling.
+    pub fn handle_for_workdir_with_environment(
+        client: Arc<dyn WorkspaceClient>,
+        target_workdir: impl Into<String>,
+        workdir_id: impl Into<String>,
+        capabilities: WorkdirSessionCapabilities,
+        environment: workdir::WorkdirSessionEnvironment,
+    ) -> WorkdirSessionHandle {
         Arc::new(Self {
             client,
             target_workdir: target_workdir.into(),
             workdir: Workdir::new(workdir_id),
-            capabilities,
+            capabilities: capabilities.intersection(environment.capabilities),
+            environment,
         })
     }
 
@@ -291,6 +313,11 @@ impl WorkspaceAttachedWorkdirSession {
             .execute(request)
             .map_err(workspace_workdir_error)?;
         if !response.is_success() {
+            if let Ok(error) =
+                serde_json::from_str::<server_api::WorkdirOperationApiError>(&response.body)
+            {
+                notify_workdir_audit_failures(&error.audit_failures);
+            }
             return Err(
                 serde_json::from_str::<workdir::http::WorkdirTransportError>(&response.body)
                     .map(workdir::http::WorkdirTransportError::into_workdir_error)
@@ -302,17 +329,41 @@ impl WorkspaceAttachedWorkdirSession {
                     }),
             );
         }
-        serde_json::from_str(&response.body).map_err(|error| {
-            WorkdirError::Transport(format!(
-                "failed to decode Workspace Workdir operation result: {error}"
-            ))
-        })
+        let response: workdir::http::WorkdirSessionOperationResponse =
+            serde_json::from_str(&response.body).map_err(|_| {
+                WorkdirError::Transport(
+                    "failed to decode Workspace Workdir operation result".into(),
+                )
+            })?;
+        notify_workdir_audit_failures(&response.audit_failures);
+        Ok(response.result)
     }
 
     fn mismatch(expected: &str) -> WorkdirError {
         WorkdirError::Transport(format!(
             "Workspace Backend returned a mismatched Workdir operation result; expected {expected}"
         ))
+    }
+}
+
+// Notification is separate from the operation return: callers retain successful command
+// handles, checkout observations and original failures, and must not resend for audit loss.
+fn notify_workdir_audit_failures(failures: &[workdir::http::WorkdirAuditFailure]) {
+    use sha2::Digest;
+    for failure in failures {
+        // Response strings are untrusted. Never copy them into the receiving process log.
+        let operation_id_hash = sha2::Sha256::digest(failure.operation_id.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        tracing::error!(
+            event = "external_workdir_audit_failed",
+            operation_id_hash,
+            audit_stage = ?failure.stage,
+            audit_reason = ?failure.reason,
+            operation_outcome = ?failure.operation_outcome,
+            "External Workdir audit persistence failed; operation result is independent; do not resend"
+        );
     }
 }
 
@@ -331,6 +382,12 @@ impl WorkdirSession for WorkspaceAttachedWorkdirSession {
 
     fn capabilities(&self) -> WorkdirSessionCapabilities {
         self.capabilities
+    }
+
+    fn environment(&self) -> workdir::WorkdirSessionEnvironment {
+        let mut environment = self.environment.clone();
+        environment.capabilities = environment.capabilities.intersection(self.capabilities());
+        environment
     }
 
     async fn authorize_scope_path(
@@ -655,11 +712,12 @@ impl WorkspaceHttpWorkdirBackend {
         let response = self.attach_response(alias, working_directory_id)?;
         if let Err(error) = self.session_router.attach(
             alias_key.clone(),
-            WorkspaceAttachedWorkdirSession::handle_for_workdir_with_capabilities(
+            WorkspaceAttachedWorkdirSession::handle_for_workdir_with_environment(
                 self.client.clone(),
                 alias,
                 working_directory_id,
-                response.capabilities,
+                response.attachment.capabilities,
+                response.environment.clone(),
             ),
         ) {
             let _ = self.detach(alias);
@@ -677,9 +735,9 @@ impl WorkspaceHttpWorkdirBackend {
         &self,
         alias: &str,
         working_directory_id: &str,
-    ) -> Result<WorkdirAttachmentResponse, ToolError> {
+    ) -> Result<WorkdirSessionAttachmentResponse, ToolError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
-        self.execute_json::<WorkdirAttachmentResponse>(WorkspaceRequest::json(
+        self.execute_json::<WorkdirSessionAttachmentResponse>(WorkspaceRequest::json(
             WorkspaceRequestMethod::Post,
             format!("/api/w/{workspace_id}/workers/self/workdir-attachments"),
             serde_json::to_string(&WorkdirAttachRequest {
@@ -1163,6 +1221,13 @@ struct WorkdirAttachmentResponse {
     attached: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkdirSessionAttachmentResponse {
+    #[serde(flatten)]
+    attachment: WorkdirAttachmentResponse,
+    environment: workdir::WorkdirSessionEnvironment,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkdirDeleteInput {
@@ -1473,6 +1538,7 @@ mod tests {
                 "alias": "checkout",
                 "working_directory_id": "wd-created",
                 "capabilities": {"bits": 63},
+                "environment": workdir::WorkdirSessionEnvironment::root(WorkdirSessionCapabilities::ALL),
                 "attached": true
             })),
             response(json!({
@@ -1651,6 +1717,67 @@ mod tests {
             assert_eq!(body["operation"]["request"]["target"], "file.txt");
             assert!(body.get("runtime_id").is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn attached_session_keeps_operation_results_when_audit_persistence_failed() {
+        let failure = json!({
+            "operation_id":"op-safe-id", "stage":"response_received",
+            "reason":"audit_store_unavailable", "operation_outcome":{"kind":"succeeded"}
+        });
+        let mut responses = vec![response(json!({
+            "operation":"command_start", "result":"retained-command",
+            "audit_failures":[failure]
+        }))];
+        for (code, status, outcome) in [
+            ("denied", 403, json!({"kind":"failed","code":"denied"})),
+            ("outcome_unknown", 500, json!({"kind":"unknown"})),
+            ("not_dispatched", 503, json!({"kind":"not_dispatched"})),
+        ] {
+            let mut failure = failure.clone();
+            failure["operation_outcome"] = outcome;
+            responses.push(WorkspaceResponse { status, body: json!({
+                "code":code, "message":"safe provider classification", "audit_failures":[failure]
+            }).to_string() });
+        }
+        let client = Arc::new(RecordingWorkspaceClient::new(responses));
+        let session = WorkspaceAttachedWorkdirSession::handle(client.clone(), "checkout");
+        let handle = session
+            .start_command(CommandRequest {
+                command: "true".into(),
+                timeout_secs: 1,
+                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
+                cwd: workdir::WorkdirPath::root(),
+                tool_call_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(handle.0, "retained-command");
+        let request = workdir::CheckoutRequest {
+            target: workdir::WorkdirPath::new("file.txt").unwrap(),
+            validator: vec![1],
+            operation: workdir::CheckoutOperation::Write {
+                content: b"new".to_vec(),
+                expected_hash: [0; 32],
+            },
+        };
+        assert!(matches!(
+            session.checkout_execute(request.clone()).await,
+            Err(WorkdirError::Denied(_))
+        ));
+        assert!(matches!(
+            session.checkout_execute(request.clone()).await,
+            Err(WorkdirError::OutcomeUnknown(_))
+        ));
+        assert!(matches!(
+            session.checkout_execute(request).await,
+            Err(WorkdirError::NotDispatched)
+        ));
+        assert_eq!(
+            client.requests().len(),
+            4,
+            "audit loss must not trigger a resend"
+        );
     }
 
     #[tokio::test]
@@ -1914,6 +2041,7 @@ mod tests {
                 "alias": "checkout",
                 "working_directory_id": "wd-attached",
                 "capabilities": {"bits": 63},
+                "environment": workdir::WorkdirSessionEnvironment::root(WorkdirSessionCapabilities::ALL),
                 "attached": true
             })),
             response(json!({
@@ -1973,16 +2101,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn attach_propagates_provider_read_only_capabilities_to_the_alias_session() {
+    #[tokio::test]
+    async fn attach_projects_provider_environment_without_expanding_capability_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let provider = Arc::new(workdir::LocalWorkdirSession::materialized(
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            manifest::SharedScope::new(manifest::Scope::writable(dir.path()).unwrap()),
+            WorkdirSessionCapabilities::ALL,
+        ));
+        let broker =
+            workdir::WorkdirToolBroker::at_cwd(provider, workdir::WorkdirPath::new("src").unwrap())
+                .unwrap();
+        let mut environment = broker.tool_session().environment();
         let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
             "workspace_id": "workspace/test",
             "alias": "external",
             "working_directory_id": "external-workdir",
             "capabilities": {"bits": 25},
+            "environment": environment,
             "attached": true
         }))]));
-        let backend = WorkspaceHttpWorkdirBackend::new(client);
+        let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
         backend
             .attach(WorkdirAttachInput {
                 alias: "external".to_string(),
@@ -1994,10 +2135,33 @@ mod tests {
             .session_router
             .session(&workdir::WorkdirAttachmentAlias::new("external").unwrap())
             .unwrap();
+        environment.capabilities = WorkdirSessionCapabilities::READ_ONLY;
+        assert_eq!(session.environment(), environment);
         assert_eq!(
             session.capabilities(),
             WorkdirSessionCapabilities::READ_ONLY
         );
+        assert!(matches!(
+            session
+                .checkout_execute(workdir::CheckoutRequest {
+                    target: workdir::WorkdirPath::root(),
+                    validator: vec![1],
+                    operation: workdir::CheckoutOperation::Create {
+                        path: workdir::WorkdirPath::new("new.txt").unwrap(),
+                        content: b"denied".to_vec(),
+                    },
+                })
+                .await,
+            Err(WorkdirError::Unsupported(
+                workdir::WorkdirSessionCapability::Write
+            ))
+        ));
+        assert_eq!(
+            client.requests().len(),
+            1,
+            "denied mutation must not reach the Backend"
+        );
+        broker.tool_session().close().await.unwrap();
     }
 
     #[tokio::test]
@@ -2007,6 +2171,7 @@ mod tests {
             "alias": "checkout",
             "working_directory_id": "wd-attached",
             "capabilities": {"bits": 63},
+            "environment": workdir::WorkdirSessionEnvironment::root(WorkdirSessionCapabilities::ALL),
             "attached": true
         }))]));
         let reopen_calls = Arc::new(AtomicUsize::new(0));

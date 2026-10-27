@@ -1,40 +1,41 @@
 // Included in store::tests so both paths use the real retained migration chain.
+fn state_contract_schema_signature(conn: &Connection, table: &str) -> Vec<Vec<String>> {
+    let queries = [
+        "SELECT name, type, CAST(\"notnull\" AS TEXT), COALESCE(dflt_value, '<NULL>'), CAST(pk AS TEXT) FROM pragma_table_info(?1) ORDER BY name",
+        "SELECT \"table\", \"from\", \"to\", on_update, on_delete, match, CAST(seq AS TEXT) FROM pragma_foreign_key_list(?1) ORDER BY \"table\", \"from\", \"to\", seq",
+        "SELECT CAST(i.\"unique\" AS TEXT), CAST(i.partial AS TEXT), (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info(i.name) ORDER BY seqno)) FROM pragma_index_list(?1) AS i ORDER BY 1, 2, 3",
+        "SELECT name, sql FROM sqlite_schema WHERE type='trigger' AND tbl_name=?1 ORDER BY name",
+    ];
+    queries
+        .into_iter()
+        .flat_map(|sql| {
+            let mut statement = conn.prepare(sql).unwrap();
+            let count = statement.column_count();
+            statement
+                .query_map([table], |row| {
+                    (0..count)
+                        .map(|i| row.get::<_, String>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .map(|row| {
+                    row.unwrap()
+                        .into_iter()
+                        .map(|value| {
+                            value
+                                .chars()
+                                .filter(|c| !c.is_whitespace() && *c != '"')
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 #[test]
 fn fresh_and_upgraded_state_contract_schemas_enforce_the_same_constraints() {
-    fn signature(conn: &Connection, table: &str) -> Vec<Vec<String>> {
-        let queries = [
-            "SELECT name, type, CAST(\"notnull\" AS TEXT), COALESCE(dflt_value, '<NULL>'), CAST(pk AS TEXT) FROM pragma_table_info(?1) ORDER BY name",
-            "SELECT \"table\", \"from\", \"to\", on_update, on_delete, match, CAST(seq AS TEXT) FROM pragma_foreign_key_list(?1) ORDER BY \"table\", \"from\", \"to\", seq",
-            "SELECT CAST(i.\"unique\" AS TEXT), CAST(i.partial AS TEXT), (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info(i.name) ORDER BY seqno)) FROM pragma_index_list(?1) AS i ORDER BY 1, 2, 3",
-            "SELECT name, sql FROM sqlite_schema WHERE type='trigger' AND tbl_name=?1 ORDER BY name",
-        ];
-        queries
-            .into_iter()
-            .flat_map(|sql| {
-                let mut statement = conn.prepare(sql).unwrap();
-                let count = statement.column_count();
-                statement
-                    .query_map([table], |row| {
-                        (0..count)
-                            .map(|i| row.get::<_, String>(i))
-                            .collect::<rusqlite::Result<Vec<_>>>()
-                    })
-                    .unwrap()
-                    .map(|row| {
-                        row.unwrap()
-                            .into_iter()
-                            .map(|value| {
-                                value
-                                    .chars()
-                                    .filter(|c| !c.is_whitespace() && *c != '"')
-                                    .collect()
-                            })
-                            .collect()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("upgraded.db");
     prepare_retained_schema(&path, 85);
@@ -58,6 +59,9 @@ fn fresh_and_upgraded_state_contract_schemas_enforce_the_same_constraints() {
         "workspace_memory_settings",
         "worker_create_reservations",
         "subject_worker_releases",
+        "passkey_credentials",
+        "passkey_metadata",
+        "passkey_addition_receipts",
         "backend_jobs",
         "backend_job_attempts",
         "flow_sources",
@@ -92,9 +96,11 @@ fn fresh_and_upgraded_state_contract_schemas_enforce_the_same_constraints() {
         "workdir_create_legacy_ssh_archives",
         "repository_secret_legacy_receipts",
     ] {
-        let expected = fresh.with_conn(|conn| Ok(signature(conn, table))).unwrap();
+        let expected = fresh
+            .with_conn(|conn| Ok(state_contract_schema_signature(conn, table)))
+            .unwrap();
         let actual = upgraded
-            .with_conn(|conn| Ok(signature(conn, table)))
+            .with_conn(|conn| Ok(state_contract_schema_signature(conn, table)))
             .unwrap();
         assert!(!expected.is_empty(), "missing canonical table {table}");
         if actual != expected {

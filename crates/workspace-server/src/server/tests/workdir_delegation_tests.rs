@@ -200,6 +200,7 @@ async fn backend_delegation_reaches_remote_repository_resolution() {
                         session_id: WorkdirSessionId::new("delegation-session").unwrap(),
                         workdir_id,
                         capabilities: Caps::ALL,
+                        environment: workdir::WorkdirSessionEnvironment::root(Caps::ALL),
                     })
                 }
             }),

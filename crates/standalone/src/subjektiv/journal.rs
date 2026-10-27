@@ -5,9 +5,12 @@
 //! recovery authority; shutdown does not delete either original Sessions or pending requests.
 
 use super::*;
-use crate::jobs::{JobAttemptState, JobSnapshot, JobState};
+use crate::jobs::{
+    JobAttemptState, JobInputDisposition, JobInputRetirementReason, JobSnapshot, JobState,
+};
+use session_store::capture::{CaptureDto, CaptureLimits, RecordingPosition};
 use subjektiv::api::JobAttemptBinding;
-use subjektiv::journal::recording::JournalMaterial;
+use subjektiv::journal::recording::JournalInput;
 use subjektiv::journal::transport::*;
 use subjektiv::journal::*;
 use worker::subjektiv::{JournalJobFinalizer, JournalJobHost, JournalJobToolsFeature};
@@ -16,7 +19,6 @@ use worker::subjektiv::{JournalJobFinalizer, JournalJobHost, JournalJobToolsFeat
 mod tests;
 
 pub(super) const PURPOSE: &str = "subjektiv_journal";
-const INPUT_BUDGET: usize = 48 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +29,7 @@ struct LocalJournalGrant {
     session_id: String,
     journal_id: String,
     ranges: Vec<JournalSourceRange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     origins: Vec<SourceOrigin>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,11 +37,6 @@ struct LocalJournalGrant {
 struct SourceOrigin {
     pointer: JournalSourcePointer,
     origin: session_store::public_material::PublicMaterialOrigin,
-}
-impl LocalJournalGrant {
-    fn input(&self) -> serde_json::Value {
-        serde_json::json!({"selected_ranges": self.ranges, "origins": self.origins})
-    }
 }
 
 impl StandaloneSubjects {
@@ -84,32 +82,29 @@ impl StandaloneSubjects {
             self.state_root.clone(),
         )
         .map_err(|error| SubjectError::InvalidScope(error.to_string()))?;
-        for snapshot in jobs
-            .pending()
-            .map_err(|e| SubjectError::InvalidScope(e.to_string()))?
-            .into_iter()
-            .chain(
-                jobs.unknown_granted()
-                    .map_err(|e| SubjectError::InvalidScope(e.to_string()))?,
-            )
-        {
-            if snapshot.domain_grant.as_ref().is_some_and(|grant| {
-                grant.get("session_id").and_then(|v| v.as_str()) == Some(session_id)
-            }) {
+        let mut after = None;
+        loop {
+            let page = jobs
+                .list_session_snapshots(session_id, after.as_deref(), 100)
+                .map_err(|e| SubjectError::InvalidScope(e.to_string()))?;
+            if page.is_empty() {
+                break;
+            }
+            for snapshot in &page {
                 jobs.cancel(&snapshot.request.job_id)
                     .map_err(|e| SubjectError::InvalidScope(e.to_string()))?;
+                jobs.reclaim_input(
+                    &snapshot.request.job_id,
+                    &snapshot.input_digest,
+                    JobInputRetirementReason::ExplicitErasure,
+                )
+                .map_err(|e| SubjectError::InvalidScope(e.to_string()))?;
+                if snapshot.state == JobState::Completed && !snapshot.acknowledged {
+                    jobs.acknowledge(&snapshot.request.job_id)
+                        .map_err(|e| SubjectError::InvalidScope(e.to_string()))?;
+                }
             }
-        }
-        for snapshot in jobs
-            .unacknowledged_results()
-            .map_err(|e| SubjectError::InvalidScope(e.to_string()))?
-        {
-            if snapshot.domain_grant.as_ref().is_some_and(|grant| {
-                grant.get("session_id").and_then(|v| v.as_str()) == Some(session_id)
-            }) {
-                jobs.acknowledge(&snapshot.request.job_id)
-                    .map_err(|e| SubjectError::InvalidScope(e.to_string()))?;
-            }
+            after = page.last().map(|job| job.request.job_id.clone());
         }
         session_store::FsStore::new_with_retention(
             path,
@@ -590,17 +585,28 @@ impl LocalSubjectHost {
         self.ensure_live()?;
         let jobs = self.jobs()?;
         for saved in jobs.unacknowledged_results().map_err(service_error)? {
-            if self.journal_grant(&saved).is_ok() {
+            if self.journal_grant_scope(&saved).is_ok() {
                 self.complete_journal_job(&jobs, &saved)?;
             }
         }
         for pending in jobs.pending().map_err(service_error)? {
-            if self.journal_grant(&pending).is_ok() {
+            if pending.request.purpose != PURPOSE {
+                continue;
+            }
+            self.journal_grant_scope(&pending)?;
+            if pending.request.input.get("capture").is_some() {
+                self.journal_grant(&pending)?;
                 return Ok(Some((jobs, pending.request.job_id)));
+            }
+            // Old descriptor jobs never acquire new execution authority. Their immutable
+            // identity/input is retired, not upgraded in place; saved checkpoint wins.
+            let replacement = self.replace_legacy_journal_job(&jobs, &pending)?;
+            if let Some(id) = replacement {
+                return Ok(Some((jobs, id)));
             }
         }
         for unknown in jobs.unknown_granted().map_err(service_error)? {
-            let Ok(grant) = self.journal_grant(&unknown) else {
+            let Ok(grant) = self.journal_grant_scope(&unknown) else {
                 continue;
             };
             let context = authority(self, &grant.session_id)?;
@@ -685,32 +691,96 @@ impl LocalSubjectHost {
                         }
                     }
                 }
-                let materials = self.select_journal_materials(&context, &journal.id)?;
-                if materials.is_empty() {
+                let mut retained = None;
+                // Saved body snapshots always win over descriptor migration. In particular,
+                // a failed continuation must not recapture its original text even if an
+                // invalidated legacy grant still bounds a larger unprocessed suffix.
+                for legacy_pass in [false, true] {
+                    let mut after_job = None;
+                    loop {
+                        let page = jobs
+                            .list_session_snapshots(
+                                &journal.source_session_id,
+                                after_job.as_deref(),
+                                100,
+                            )
+                            .map_err(service_error)?;
+                        if page.is_empty() {
+                            break;
+                        }
+                        for saved in &page {
+                            if saved.request.purpose != PURPOSE {
+                                continue;
+                            }
+                            let legacy = saved.input_disposition
+                                == JobInputDisposition::Invalidated
+                                || (saved.input_disposition == JobInputDisposition::Available
+                                    && saved.request.input.get("capture").is_none());
+                            if legacy != legacy_pass
+                                || (!legacy
+                                    && saved.input_disposition != JobInputDisposition::Available)
+                            {
+                                continue;
+                            }
+                            let saved_grant = self.journal_grant_scope(saved)?;
+                            if saved_grant.journal_id != journal.id {
+                                continue;
+                            }
+                            if legacy {
+                                if let Some(id) = self.replace_legacy_journal_job(&jobs, saved)? {
+                                    return Ok(Some((jobs, id)));
+                                }
+                                continue;
+                            }
+                            self.journal_grant(saved)?;
+                            let original = JournalInput::decode(&saved.request.input)
+                                .map_err(journal_error)?;
+                            let continuation = self.build_journal_input(
+                                &context,
+                                &journal.id,
+                                Some(&original.capture),
+                            )?;
+                            if !continuation.selected_ranges.is_empty() {
+                                retained = Some(continuation);
+                                break;
+                            }
+                            if saved.state == JobState::Completed && saved.acknowledged {
+                                // Recover the acknowledgement-before-reclamation gap without
+                                // turning a retained receipt into an executable empty input.
+                                jobs.reclaim_input(
+                                    &saved.request.job_id,
+                                    &saved.input_digest,
+                                    JobInputRetirementReason::Completed,
+                                )
+                                .map_err(service_error)?;
+                            }
+                        }
+                        if retained.is_some() {
+                            break;
+                        }
+                        after_job = page.last().map(|job| job.request.job_id.clone());
+                    }
+                    if retained.is_some() {
+                        break;
+                    }
+                }
+                let input = match retained {
+                    Some(input) => input,
+                    None => self.build_journal_input(&context, &journal.id, None)?,
+                };
+
+                if input.selected_ranges.is_empty() {
                     continue;
                 }
-                let ranges = materials
-                    .into_iter()
-                    .map(|material| material.range)
-                    .collect::<Vec<_>>();
-                let origins = self.journal_origins(&ranges)?;
                 let grant = LocalJournalGrant {
                     writer_binding_id: Some(self.writer.binding_id.clone()),
                     binding: self.binding.clone(),
                     session_id: journal.source_session_id,
                     journal_id: journal.id.clone(),
-                    ranges,
-                    origins,
+                    ranges: input.selected_ranges.clone(),
+                    origins: vec![],
                 };
-                let request = job::JobRequest {
-                    job_id: format!("subjektiv-journal:{}", uuid::Uuid::now_v7()),
-                    purpose: PURPOSE.into(), input_ref: format!("subjektiv://{}/journal/{}", self.binding.subject_id, journal.id),
-                    input: grant.input(),
-                    instruction: "ReadJournalState first. Input descriptors are the frozen canonical public ranges authorized for this Job, not already read material. Read every selected source byte with bounded ReadJournalText before recording; then read initial/current position and open text in bounded pages. Reconcile saved operation receipts before new creates. Save sequential Create/Rewrite/Fix and UpdateJournalPosition operations, then CheckpointJournal backed by saved record/no-change receipts for all selected input. Do not fix an ongoing event just because this Job/turn ended. SubmitJobResult with result: {} only after the entire selected prefix is reflected. Never infer tool success or user intent not evidenced by public input.".into(),
-                    profile: "builtin:subjektiv-journal-recording".into(),
-                    serialization_key: Some(format!("subjektiv-journal:{}", journal.id)),
-                    limits: job::JobLimits { timeout_seconds: 600, ..Default::default() },
-                };
+                let request = self.journal_request(&journal.id, &input)?;
                 let saved = jobs
                     .request_granted(
                         request,
@@ -725,6 +795,138 @@ impl LocalSubjectHost {
                 return Ok(None);
             }
         }
+    }
+
+    fn replace_legacy_journal_job(
+        &self,
+        jobs: &crate::jobs::StandaloneJobs,
+        old: &JobSnapshot,
+    ) -> Result<Option<String>, SubjektivHostError> {
+        let grant = self.journal_grant_scope(old)?;
+        if old.input_disposition == JobInputDisposition::Available {
+            old.load_executable_request()
+                .map_err(|e| SubjektivHostError::InvalidArgument(e.to_string()))?;
+            if old.request.input
+                != serde_json::json!({"selected_ranges":grant.ranges,"origins":grant.origins})
+            {
+                return Err(SubjektivHostError::InvalidArgument(
+                    "invalid legacy Journal descriptor input".into(),
+                ));
+            }
+        } else if old.input_disposition != JobInputDisposition::Invalidated {
+            return Err(SubjektivHostError::InvalidArgument(
+                "legacy Journal input is unavailable".into(),
+            ));
+        }
+        let context = authority(self, &grant.session_id)?;
+        if let Some(active) = self
+            .catalog
+            .store
+            .active_journal_generation(&context, &grant.journal_id)
+            .map_err(journal_error)?
+        {
+            if active.job.job_id != old.request.job_id {
+                return Err(SubjektivHostError::InvalidArgument(
+                    "another generation owns legacy migration".into(),
+                ));
+            }
+            self.catalog
+                .store
+                .close_journal_generation(&context, &active.id, &active.job)
+                .map_err(journal_error)?;
+        }
+        jobs.cancel(&old.request.job_id).map_err(service_error)?;
+        let current = self
+            .catalog
+            .store
+            .read_journal(&context, &grant.journal_id)
+            .map_err(journal_error)?;
+        let end = grant
+            .ranges
+            .last()
+            .ok_or_else(|| SubjektivHostError::InvalidArgument("empty legacy selection".into()))?;
+        let end_position = if end.bytes.end == end.source.total_bytes {
+            (end.source.order + 1, 0)
+        } else {
+            (end.source.order, end.bytes.end)
+        };
+        let replacement = if (current.process_order, current.process_byte) >= end_position {
+            None
+        } else {
+            let mut capture = self.recording_capture(&grant.session_id)?;
+            capture
+                .entries
+                .retain(|entry| grant.ranges.iter().any(|r| r.source.order == entry.order));
+            for entry in &mut capture.entries {
+                let range = grant
+                    .ranges
+                    .iter()
+                    .find(|r| r.source.order == entry.order)
+                    .unwrap();
+                let session_store::capture::CaptureBody::CanonicalPublic {
+                    descriptor,
+                    byte_offset,
+                    text,
+                    ..
+                } = &mut entry.body
+                else {
+                    unreachable!()
+                };
+                if source_descriptor(&grant.session_id, descriptor) != range.source
+                    || !grant.origins.iter().any(|origin| {
+                        origin.pointer == range.source.pointer && origin.origin == descriptor.origin
+                    })
+                    || !text.is_char_boundary(range.bytes.start as usize)
+                    || !text.is_char_boundary(range.bytes.end as usize)
+                {
+                    return Err(SubjektivHostError::InvalidArgument(
+                        "legacy original source identity/range changed".into(),
+                    ));
+                }
+                *text = text[range.bytes.start as usize..range.bytes.end as usize].to_owned();
+                *byte_offset = range.bytes.start;
+            }
+            let input = self.build_journal_input(&context, &grant.journal_id, Some(&capture))?;
+            let request = self.journal_request(&grant.journal_id, &input)?;
+            let next_grant = LocalJournalGrant {
+                ranges: input.selected_ranges.clone(),
+                origins: vec![],
+                ..grant
+            };
+            Some(
+                jobs.request_granted(
+                    request,
+                    serde_json::to_value(next_grant)
+                        .map_err(|e| SubjektivHostError::Unavailable(e.to_string()))?,
+                )
+                .map_err(service_error)?
+                .request
+                .job_id,
+            )
+        };
+        jobs.reclaim_input(
+            &old.request.job_id,
+            &old.input_digest,
+            JobInputRetirementReason::LegacyInvalidation,
+        )
+        .map_err(service_error)?;
+        Ok(replacement)
+    }
+
+    fn journal_request(
+        &self,
+        journal_id: &str,
+        input: &JournalInput,
+    ) -> Result<job::JobRequest, SubjektivHostError> {
+        Ok(job::JobRequest {
+            job_id: format!("subjektiv-journal:{}", uuid::Uuid::now_v7()), purpose: PURPOSE.into(),
+            input_ref: format!("subjektiv://{}/journal/{journal_id}", self.binding.subject_id),
+            input: serde_json::to_value(input).map_err(|e| SubjektivHostError::Unavailable(e.to_string()))?,
+            instruction: "Input contains the frozen canonical public source bodies, provenance and byte ranges. Use only this saved input, never re-fetch Source. ReadJournalState first and read initial/current Journal position/open text in bounded pages if needed. Reconcile saved operation receipts before new creates. Save sequential Create/Rewrite/Fix and UpdateJournalPosition operations, then CheckpointJournal backed by saved record/no-change receipts for all selected input. Do not fix an ongoing event just because this Job/turn ended. SubmitJobResult with result: {} only after the entire selected prefix is reflected. Never infer tool success or user intent not evidenced by public input.".into(),
+            profile: "builtin:subjektiv-journal-recording".into(),
+            serialization_key: Some(format!("subjektiv-journal:{journal_id}")),
+            limits: job::JobLimits { timeout_seconds: 600, ..Default::default() },
+        })
     }
 
     fn pin_journal_session(&self, session: &str) -> Result<(), SubjektivHostError> {
@@ -869,11 +1071,16 @@ impl LocalSubjectHost {
         Ok(())
     }
 
-    fn material_reader(
+    fn with_recording_boundary<T>(
         &self,
         session: &str,
-    ) -> Result<session_store::public_material::SessionPublicMaterialReader, SubjektivHostError>
-    {
+        read: impl FnOnce(
+            &Path,
+            session_store::SessionId,
+            session_store::SegmentId,
+            &session_store::retention::SessionRetentionGuard,
+        ) -> Result<T, SubjektivHostError>,
+    ) -> Result<T, SubjektivHostError> {
         let sessions = crate::subjektiv_sessions::authorized_sessions_path(
             &self.catalog.state_root,
             &self.binding.scope_id,
@@ -906,6 +1113,11 @@ impl LocalSubjectHost {
             .ok_or_else(|| SubjektivHostError::InvalidArgument("invalid Session storage".into()))?
             .join("worker")
             .join(&record.storage_key);
+        let session_id = session
+            .parse()
+            .map_err(|_| SubjektivHostError::InvalidArgument("invalid Session".into()))?;
+        let retention = crate::store::session_retention(&self.catalog.state_root);
+        let guard = retention.lock_live(session_id).map_err(source_error)?;
         // This is the persisted active selector, not the newest filename/mtime or a model claim.
         let metadata =
             session_store::WorkerAggregateStore::open_read_only(metadata_root, &record.storage_key)
@@ -933,154 +1145,203 @@ impl LocalSubjectHost {
                     "no attested active lineage for the retained Session".into(),
                 )
             })?;
-        session_store::public_material::SessionPublicMaterialReader::open_fs_with_retention(
-            &sessions,
-            session
-                .parse()
-                .map_err(|_| SubjektivHostError::InvalidArgument("invalid Session".into()))?,
-            active,
-            session_store::public_material::PublicMaterialLimits {
-                max_segments: 256,
-                max_entries: 100_000,
-                max_record_bytes: 64 * 1024 * 1024,
-            },
-            crate::store::session_retention(&self.catalog.state_root),
-        )
-        .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))
+        read(&sessions, session_id, active, &guard)
+    }
+
+    fn recording_capture(&self, session: &str) -> Result<CaptureDto, SubjektivHostError> {
+        self.with_recording_boundary(session, |sessions, session_id, active, guard| {
+            session_store::capture::capture_recording_fs_guarded(
+                sessions,
+                session_id,
+                active,
+                session_store::public_material::PublicMaterialLimits::default(),
+                CaptureLimits {
+                    max_bytes: 128 * 1024 * 1024,
+                    max_entries: 100_000,
+                    max_text_bytes: 64 * 1024 * 1024,
+                    ..Default::default()
+                },
+                guard,
+            )
+            .map_err(|e| SubjektivHostError::Unavailable(e.to_string()))
+        })
     }
 
     fn journal_sources(
         &self,
         session: &str,
     ) -> Result<Vec<JournalSourceRange>, SubjektivHostError> {
-        let reader = self.material_reader(session)?;
-        Ok(reader
-            .descriptors()
-            .map(|descriptor| JournalSourceRange {
-                source: source_descriptor(session, descriptor),
-                bytes: JournalByteRange {
-                    start: 0,
-                    end: descriptor.total_bytes,
+        self.with_recording_boundary(session, |sessions, session_id, active, guard| {
+            session_store::capture::recording_catalog_fs_guarded(
+                sessions,
+                session_id,
+                active,
+                session_store::public_material::PublicMaterialLimits::default(),
+                guard,
+                |descriptors| {
+                    descriptors
+                        .iter()
+                        .map(|descriptor| JournalSourceRange {
+                            source: source_descriptor(session, descriptor),
+                            bytes: JournalByteRange {
+                                start: 0,
+                                end: descriptor.total_bytes,
+                            },
+                        })
+                        .collect()
                 },
-            })
-            .collect())
-    }
-
-    fn source_reader(
-        &self,
-        source: &JournalSource,
-    ) -> Result<session_store::public_material::SessionPublicMaterialReader, SubjektivHostError>
-    {
-        let sessions = crate::subjektiv_sessions::authorized_sessions_path(
-            &self.catalog.state_root,
-            &self.binding.scope_id,
-            &self.binding.subject_id,
-            &self.catalog.store,
-            &source.session_id,
-        )?;
-        // Frozen, already admitted original pointers do not follow the Worker's later active
-        // Session/Segment. This reads that original lineage and still checks descriptor identity,
-        // canonical order and digest below; the shared service enforces the frozen byte range.
-        session_store::public_material::SessionPublicMaterialReader::open_fs_with_retention(
-            &sessions,
-            source
-                .session_id
-                .parse()
-                .map_err(|_| SubjektivHostError::InvalidArgument("invalid Session".into()))?,
-            source.pointer.segment_id,
-            session_store::public_material::PublicMaterialLimits {
-                max_segments: 256,
-                max_entries: 100_000,
-                max_record_bytes: 64 * 1024 * 1024,
-            },
-            crate::store::session_retention(&self.catalog.state_root),
-        )
-        .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))
-    }
-
-    fn journal_origins(
-        &self,
-        ranges: &[JournalSourceRange],
-    ) -> Result<Vec<SourceOrigin>, SubjektivHostError> {
-        if ranges.is_empty() {
-            return Err(SubjektivHostError::InvalidArgument(
-                "empty material selection".into(),
-            ));
-        }
-        ranges
-            .iter()
-            .map(|range| {
-                let reader = self.source_reader(&range.source)?;
-                reader
-                    .descriptors()
-                    .find(|descriptor| {
-                        source_descriptor(&range.source.session_id, descriptor) == range.source
-                    })
-                    .map(|descriptor| SourceOrigin {
-                        pointer: range.source.pointer.clone(),
-                        origin: descriptor.origin.clone(),
-                    })
-                    .ok_or_else(|| {
-                        SubjektivHostError::InvalidArgument(
-                            "source provenance/identity changed".into(),
-                        )
-                    })
-            })
-            .collect()
-    }
-
-    fn journal_source_window(
-        &self,
-        source: &JournalSource,
-        offset: u64,
-        max_bytes: usize,
-    ) -> Result<String, SubjektivHostError> {
-        let reader = self.source_reader(source)?;
-        let descriptor = reader.descriptors().find(|descriptor| source_descriptor(&source.session_id, descriptor) == *source)
-            .ok_or_else(|| SubjektivHostError::InvalidArgument("canonical source identity/order/digest changed or is outside the authorized Session".into()))?;
-        reader
-            .read_content(descriptor, offset, max_bytes)
-            .map(|window| window.content)
-            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))
-    }
-
-    fn journal_source_material(
-        &self,
-        source: &JournalSource,
-        start: u64,
-        limit: usize,
-    ) -> JournalResult<JournalMaterial> {
-        let text = self
-            .journal_source_window(source, start, limit.max(4))
-            .map_err(|error| JournalError::Conflict(error.to_string()))?;
-        Ok(JournalMaterial {
-            range: JournalSourceRange {
-                source: source.clone(),
-                bytes: JournalByteRange {
-                    start,
-                    end: start + text.len() as u64,
-                },
-            },
-            text,
+            )
+            .map_err(|e| SubjektivHostError::Unavailable(e.to_string()))
         })
     }
 
-    fn select_journal_materials(
+    fn build_journal_input(
         &self,
         context: &JournalHostContext,
         id: &str,
-    ) -> Result<Vec<JournalMaterial>, SubjektivHostError> {
-        subjektiv::journal::recording::select_materials_bounded(
-            &self.catalog.store,
-            context,
-            id,
-            INPUT_BUDGET,
-            |source, start, limit| self.journal_source_material(source, start, limit),
-        )
+        saved: Option<&CaptureDto>,
+    ) -> Result<JournalInput, SubjektivHostError> {
+        let session = self
+            .catalog
+            .store
+            .read_journal(context, id)
+            .map_err(journal_error)?
+            .source_session_id;
+        JournalInput::build(&self.catalog.store, context, id, |order, offset, budget| {
+            let capture = match saved {
+                Some(capture) => capture.clone(),
+                None => {
+                    let capture = self
+                        .with_recording_boundary(&session, |sessions, session_id, active, guard| {
+                            session_store::capture::capture_recording_slice_fs_guarded(
+                                sessions,
+                                session_id,
+                                active,
+                                session_store::public_material::PublicMaterialLimits::default(),
+                                RecordingPosition {
+                                    canonical_order: order,
+                                    byte_offset: offset,
+                                },
+                                MAX_JOURNAL_RANGES,
+                                budget,
+                                guard,
+                            )
+                            .map(|slice| slice.capture)
+                            .map_err(|e| SubjektivHostError::Unavailable(e.to_string()))
+                        })
+                        .map_err(|e| JournalError::Conflict(e.to_string()))?;
+                    // Admission and capture are separate saves. An append between them
+                    // may be in replay but has not yet been accepted for this Journal.
+                    return self.accepted_capture_prefix(context, id, capture);
+                }
+            };
+            let end = capture
+                .entries
+                .last()
+                .map(|entry| {
+                    capture
+                        .recording_text(entry.order)
+                        .map(|(descriptor, start, text)| {
+                            if start + text.len() as u64 == descriptor.total_bytes {
+                                RecordingPosition {
+                                    canonical_order: entry.order + 1,
+                                    byte_offset: 0,
+                                }
+                            } else {
+                                RecordingPosition {
+                                    canonical_order: entry.order,
+                                    byte_offset: start + text.len() as u64,
+                                }
+                            }
+                        })
+                })
+                .transpose()
+                .map_err(|e| JournalError::Conflict(e.to_string()))?;
+            if end.is_none_or(|end| (order, offset) >= (end.canonical_order, end.byte_offset)) {
+                return Ok(CaptureDto {
+                    entries: vec![],
+                    ..capture
+                });
+            }
+            capture
+                .recording_slice(
+                    RecordingPosition {
+                        canonical_order: order,
+                        byte_offset: offset,
+                    },
+                    MAX_JOURNAL_RANGES,
+                    budget,
+                )
+                .map(|slice| slice.capture)
+                .map_err(|e| JournalError::Conflict(e.to_string()))
+        })
         .map_err(journal_error)
     }
 
-    fn journal_grant(
+    fn accepted_capture_prefix(
+        &self,
+        context: &JournalHostContext,
+        id: &str,
+        mut capture: CaptureDto,
+    ) -> JournalResult<CaptureDto> {
+        let mut selected = Vec::new();
+        for mut entry in capture.entries {
+            let status = match self
+                .catalog
+                .store
+                .read_journal_source(context, id, entry.order)
+            {
+                Ok(status) => status,
+                Err(JournalError::NotFound(_)) => break,
+                Err(error) => return Err(error),
+            };
+            let session_store::capture::CaptureBody::CanonicalPublic {
+                descriptor,
+                byte_offset,
+                text,
+                ..
+            } = &mut entry.body
+            else {
+                return Err(JournalError::InvalidInput("non-recording capture".into()));
+            };
+            if source_descriptor(&capture.session_id, descriptor) != status.source {
+                return Err(JournalError::Conflict(
+                    "captured source differs from admitted identity".into(),
+                ));
+            }
+            let Some(accepted) = status
+                .accepted
+                .iter()
+                .find(|range| range.start <= *byte_offset && *byte_offset < range.end)
+            else {
+                break;
+            };
+            let end = status
+                .unavailable
+                .iter()
+                .filter(|range| range.end > *byte_offset)
+                .fold(accepted.end, |end, range| {
+                    end.min(range.start.max(*byte_offset))
+                });
+            let mut length = text.len().min(end.saturating_sub(*byte_offset) as usize);
+            while !text.is_char_boundary(length) {
+                length -= 1;
+            }
+            if length == 0 {
+                break;
+            }
+            text.truncate(length);
+            let partial = *byte_offset + (text.len() as u64) < descriptor.total_bytes;
+            selected.push(entry);
+            if partial {
+                break;
+            }
+        }
+        capture.entries = selected;
+        Ok(capture)
+    }
+
+    fn journal_grant_scope(
         &self,
         snapshot: &JobSnapshot,
     ) -> Result<LocalJournalGrant, SubjektivHostError> {
@@ -1097,7 +1358,6 @@ impl LocalSubjectHost {
             || snapshot.request.purpose != PURPOSE
             || snapshot.request.serialization_key.as_deref()
                 != Some(&format!("subjektiv-journal:{}", grant.journal_id))
-            || snapshot.request.input != grant.input()
         {
             return Err(SubjektivHostError::InvalidArgument(
                 "Job input/grant does not match this Journal capability".into(),
@@ -1135,12 +1395,33 @@ impl LocalSubjectHost {
         Ok(grant)
     }
 
+    fn journal_grant(
+        &self,
+        snapshot: &JobSnapshot,
+    ) -> Result<LocalJournalGrant, SubjektivHostError> {
+        snapshot
+            .load_executable_request()
+            .map_err(|e| SubjektivHostError::InvalidArgument(e.to_string()))?;
+        let grant = self.journal_grant_scope(snapshot)?;
+        let input = JournalInput::decode(&snapshot.request.input).map_err(journal_error)?;
+        if input.subject_id != self.binding.subject_id
+            || input.journal_id != grant.journal_id
+            || input.capture.session_id != grant.session_id
+            || input.selected_ranges != grant.ranges
+        {
+            return Err(SubjektivHostError::InvalidArgument(
+                "saved Journal body identity/ranges differ from grant".into(),
+            ));
+        }
+        Ok(grant)
+    }
+
     fn complete_journal_job(
         &self,
         jobs: &crate::jobs::StandaloneJobs,
         snapshot: &JobSnapshot,
     ) -> Result<(), SubjektivHostError> {
-        let grant = self.journal_grant(snapshot)?;
+        let grant = self.journal_grant_scope(snapshot)?;
         let context = authority(self, &grant.session_id)?;
         let completion: JournalJobCompletion =
             serde_json::from_value(snapshot.result.clone().ok_or_else(|| {
@@ -1174,6 +1455,12 @@ impl LocalSubjectHost {
         }
         jobs.acknowledge(&snapshot.request.job_id)
             .map_err(service_error)?;
+        jobs.reclaim_input(
+            &snapshot.request.job_id,
+            &snapshot.input_digest,
+            JobInputRetirementReason::Completed,
+        )
+        .map_err(service_error)?;
         if let Err(error) = self.prune_retained_workers() {
             // Pruning is independent of a successful checkpoint/result. Keep the originals
             // and continue draining other saved prefixes; a retention error is not model failure.
@@ -1192,47 +1479,18 @@ pub(super) fn grant(
         .journal_grant(snapshot)
         .map_err(|error| error.to_string())?;
     let context = authority(&host, &grant.session_id).map_err(|error| error.to_string())?;
-    // Re-fetch selected identities before opening mutation authority. Only descriptors are
-    // retained in Job storage; the model must fetch actual source bytes with bounded tools.
-    for range in &grant.ranges {
-        let length = usize::try_from(
-            range
-                .bytes
-                .end
-                .checked_sub(range.bytes.start)
-                .ok_or("invalid source range")?,
-        )
-        .map_err(|_| "source range overflow")?;
-        if length > INPUT_BUDGET {
-            return Err("source range exceeds frozen input budget".into());
-        }
-        let text = host
-            .journal_source_window(&range.source, range.bytes.start, length.max(4))
-            .map_err(|error| error.to_string())?;
-        if text.len() != length {
-            return Err("frozen Journal source byte range changed".into());
-        }
-    }
-    if host
-        .journal_origins(&grant.ranges)
-        .map_err(|error| error.to_string())?
-        != grant.origins
-    {
-        return Err(
-            "frozen Journal provenance does not match the authorized original Session".into(),
-        );
-    }
+    let input = JournalInput::decode(&snapshot.request.input).map_err(|e| e.to_string())?;
+    let input_digest = snapshot.input_digest.clone();
     let generation = host
         .catalog
         .store
-        .prepare_journal_generation(
+        .prepare_journal_input(
             &context,
-            &grant.journal_id,
+            &input,
             JobAttemptBinding {
                 job_id: snapshot.request.job_id.clone(),
                 attempt_id: snapshot.attempt.attempt_id.clone(),
             },
-            grant.ranges.clone(),
         )
         .map_err(|error| error.to_string())?;
     let job_context = JournalJobContext::validated(
@@ -1242,12 +1500,17 @@ pub(super) fn grant(
         generation.job.clone(),
     )
     .map_err(|error| error.to_string())?;
+    input
+        .validate_generation(&generation)
+        .map_err(|e| e.to_string())?;
     let adapter = Arc::new(LocalJournalHost {
         host,
         grant,
         context,
         job_context,
+        #[cfg(test)]
         generation,
+        input_digest,
         fence,
     });
     Ok(worker::job::JobFeatureGrant {
@@ -1263,7 +1526,9 @@ struct LocalJournalHost {
     grant: LocalJournalGrant,
     context: JournalHostContext,
     job_context: JournalJobContext,
+    #[cfg(test)]
     generation: JournalGeneration,
+    input_digest: String,
     fence: Arc<dyn crate::jobs::JobAttemptFence>,
 }
 impl LocalJournalHost {
@@ -1296,18 +1561,20 @@ impl JournalJobHost for LocalJournalHost {
         request: JournalJobRequest,
     ) -> Result<JournalJobResponse, SubjektivHostError> {
         let context = self.live()?;
-        subjektiv::journal::service::execute_bounded(
+        // The generic runner has supplied this exact immutable input before it can
+        // invoke this bound tool. Preparation alone is not evidence of delivery.
+        subjektiv::journal::service::attest_input_delivery(
             &self.host.catalog.store,
             &context,
+            &self.input_digest,
+            &self.grant.ranges,
+        )
+        .map_err(journal_error)?;
+        subjektiv::journal::service::execute_snapshot(
+            &self.host.catalog.store,
+            &context,
+            &self.input_digest,
             request,
-            |source, start, limit| {
-                if source.session_id != self.generation.initial_journal.source_session_id {
-                    return Err(JournalError::PermissionDenied(
-                        "foreign original Session".into(),
-                    ));
-                }
-                self.host.journal_source_material(source, start, limit)
-            },
         )
         .map_err(journal_error)
     }

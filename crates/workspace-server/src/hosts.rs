@@ -1326,6 +1326,13 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         Err("Session source permanent erasure is unavailable on this Runtime".into())
     }
 
+    fn session_recording_capture(
+        &self,
+        _request: runtime_api::SessionRecordingCaptureRequest,
+    ) -> Result<runtime_api::SessionRecordingCaptureAvailability, String> {
+        Err("committed recording capture is unavailable on this Runtime".into())
+    }
+
     fn session_material_catalog(
         &self,
         _request: runtime_api::SessionMaterialCatalogRequest,
@@ -2332,6 +2339,21 @@ impl RuntimeRegistry {
             .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
                 runtime_id: runtime_id.into(),
                 code: "session_material_erase_failed".into(),
+                message,
+            })
+    }
+
+    pub fn session_recording_capture(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SessionRecordingCaptureRequest,
+    ) -> Result<runtime_api::SessionRecordingCaptureAvailability, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .session_recording_capture(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "session_recording_capture_failed".into(),
                 message,
             })
     }
@@ -3441,6 +3463,19 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         })
     }
 
+    fn session_recording_capture(
+        &self,
+        request: runtime_api::SessionRecordingCaptureRequest,
+    ) -> Result<runtime_api::SessionRecordingCaptureAvailability, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err("recording capture Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        Ok(self
+            .runtime
+            .session_recording_capture_scoped(&scope, &request))
+    }
+
     fn session_material_catalog(
         &self,
         request: runtime_api::SessionMaterialCatalogRequest,
@@ -3995,12 +4030,27 @@ impl WorkdirHttpAuthorization for RemoteWorkdirAuthorization {
                 return authorizer
                     .issue_async(method, path_and_query, operation, None, body)
                     .await
-                    .map_err(|error| WorkdirError::Unavailable(error.message));
+                    .map_err(|error| {
+                        use workdir::WorkdirFailureReason as Reason;
+                        let reason = match error.code.as_str() {
+                            "workspace_runtime_authorization_stale" => Reason::AuthorizationStale,
+                            "workspace_signing_identity_unavailable" => {
+                                Reason::SigningIdentityUnavailable
+                            }
+                            "workspace_runtime_authorization_sign_failed" => {
+                                Reason::AuthorizationSignFailed
+                            }
+                            _ => Reason::AuthorizationUnavailable,
+                        };
+                        WorkdirError::Unavailable("Workdir authorization is unavailable".into())
+                            .with_failure_reason(reason)
+                    });
             }
             authorization.fallback_bearer_token.ok_or_else(|| {
                 WorkdirError::Unavailable(
                     "remote Runtime does not have bearer authorization configured".to_string(),
                 )
+                .with_failure_reason(workdir::WorkdirFailureReason::AuthorizationMissing)
             })
         })
     }
@@ -5063,6 +5113,9 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                         runtime_api::WorkerRestoreState::RolledBack => {
                             server_api::WorkerRestoreState::RolledBack
                         }
+                        runtime_api::WorkerRestoreState::Superseded => {
+                            server_api::WorkerRestoreState::Superseded
+                        }
                         runtime_api::WorkerRestoreState::ReconciliationRequired => {
                             server_api::WorkerRestoreState::ReconciliationRequired
                         }
@@ -5658,6 +5711,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             self.request_timeout,
             MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
             move |client| async move { client.session_material_erase(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
+    fn session_recording_capture(
+        &self,
+        request: runtime_api::SessionRecordingCaptureRequest,
+    ) -> Result<runtime_api::SessionRecordingCaptureAvailability, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.session_recording_capture(request).await },
         )
         .map_err(|diagnostic| diagnostic.message)
     }
@@ -6839,9 +6904,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(
-            error,
-            WorkdirError::Unavailable(message) if message == Error::DbCapacityExceeded.to_string()
+            error.classification_source(),
+            WorkdirError::Unavailable(_)
         ));
+        assert_eq!(
+            error.failure_reason(),
+            Some(workdir::WorkdirFailureReason::AuthorizationUnavailable)
+        );
+        let transport = workdir::http::WorkdirTransportError::from_workdir_error(&error);
+        assert_eq!(transport.message, "Workdir session is unavailable");
+        assert!(!format!("{error:?}").contains(&Error::DbCapacityExceeded.to_string()));
         drop(release);
         executor.drain().await.unwrap();
     }
@@ -8805,6 +8877,9 @@ mod tests {
             session_id: workdir::http::WorkdirSessionId::new("session-1").unwrap(),
             workdir_id: Workdir::new("wd-1").id().clone(),
             capabilities: workdir::WorkdirSessionCapabilities::ALL,
+            environment: workdir::WorkdirSessionEnvironment::root(
+                workdir::WorkdirSessionCapabilities::ALL,
+            ),
         };
         let stat = workdir::http::WorkdirSessionOperationResult::Stat(StatResult {
             path: WorkdirPath::new("hello.txt").unwrap(),

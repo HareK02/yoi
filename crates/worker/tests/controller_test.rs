@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -150,6 +151,19 @@ impl LlmClient for MockClient {
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[path = "../../../tests/support/restore_environment.rs"]
+mod restore_test_environment;
+use restore_test_environment::require_restore_test_environment;
+
+fn owned_relative_runtime_base() -> (tempfile::TempDir, PathBuf) {
+    require_restore_test_environment();
+    let temp = tempfile::tempdir_in(".").unwrap();
+    // The relative reference and the TempDir name the same owned tree, without
+    // putting the checkout prefix into sockaddr_un or changing process cwd.
+    let runtime_base = Path::new(temp.path().file_name().unwrap()).join("runtime");
+    (temp, runtime_base)
+}
+
 fn simple_text_events() -> Vec<LlmEvent> {
     vec![
         LlmEvent::text_block_start(0),
@@ -295,6 +309,7 @@ async fn make_worker_with_manifest_and_workspace_context(
     manifest: WorkerManifest,
     workspace_context: WorkerWorkspaceContext,
 ) -> (Worker<MockClient, TestStore>, std::path::PathBuf) {
+    require_restore_test_environment();
     let store_tmp = tempfile::tempdir().unwrap();
     let store = CombinedStore::new(
         FsStore::new(store_tmp.path()).unwrap(),
@@ -320,18 +335,21 @@ async fn make_worker_with_manifest_and_workspace_context(
 }
 
 async fn spawn_controller(worker: Worker<MockClient, TestStore>) -> WorkerHandle {
-    let tmp = tempfile::tempdir().unwrap();
-    let runtime_base = tmp.path().to_owned();
-    std::mem::forget(tmp);
-    let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
+    let (tmp, runtime_base) = owned_relative_runtime_base();
+    let (handle, shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
         .await
         .unwrap();
+    // Retain ownership until controller shutdown (or test-runtime teardown).
+    tokio::spawn(async move {
+        let _ = shutdown_rx.await;
+        drop(tmp);
+    });
     handle
 }
 
 #[tokio::test]
 async fn canonical_worker_handle_uploads_and_submits_attachment() {
-    let root = tempfile::tempdir().unwrap();
+    let (root, runtime_base) = owned_relative_runtime_base();
     let manifest = WorkerManifest::from_toml(MANIFEST_TOML).unwrap();
     let session = session_store::WorkerSessionStore::new(root.path().join("session")).unwrap();
     let store = CombinedStore::new(
@@ -353,7 +371,7 @@ async fn canonical_worker_handle_uploads_and_submits_attachment() {
     )
     .await
     .unwrap();
-    let (handle, shutdown_rx) = WorkerController::spawn(worker, &root.path().join("runtime"))
+    let (handle, shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
         .await
         .unwrap();
     let mut rx = handle.subscribe();
@@ -760,6 +778,227 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
             .await,
         Err(ref error) if matches!(error.classification_source(), WorkdirError::Unavailable(_))
     ));
+}
+
+mod registry_startup_failure {
+    //! Connect real controller preparation, registry source fences and session cleanup.
+    //! The Workdir telemetry boundary substitutes a concurrent metadata change at subscription;
+    //! the real registry must reject drift before starting its prepared observer.
+    use super::*;
+    use session_store::WorkerMetadataStore;
+    use tokio::sync::broadcast;
+    use workdir::WorkdirSession;
+
+    struct ObservedSession {
+        local: LocalWorkdirSession,
+        metadata_store: TestStore,
+        worker_name: String,
+        events: broadcast::Sender<workdir::CommandEvent>,
+        subscriptions: AtomicUsize,
+        receivers_at_close: Mutex<Vec<usize>>,
+    }
+
+    impl std::fmt::Debug for ObservedSession {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ObservedSession")
+                .field("worker_name", &self.worker_name)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait]
+    impl WorkdirSession for ObservedSession {
+        fn workdir(&self) -> &Workdir {
+            self.local.workdir()
+        }
+
+        fn capabilities(&self) -> WorkdirSessionCapabilities {
+            self.local.capabilities()
+        }
+
+        async fn stat(
+            &self,
+            request: workdir::StatRequest,
+        ) -> Result<workdir::StatResult, WorkdirError> {
+            self.local.stat(request).await
+        }
+
+        async fn read(
+            &self,
+            request: workdir::ReadRequest,
+        ) -> Result<workdir::ReadResult, WorkdirError> {
+            self.local.read(request).await
+        }
+
+        async fn write(
+            &self,
+            request: workdir::WriteRequest,
+        ) -> Result<workdir::WriteResult, WorkdirError> {
+            self.local.write(request).await
+        }
+
+        async fn edit(
+            &self,
+            request: workdir::EditRequest,
+        ) -> Result<workdir::EditResult, WorkdirError> {
+            self.local.edit(request).await
+        }
+
+        async fn list(
+            &self,
+            request: workdir::ListRequest,
+        ) -> Result<workdir::ListResult, WorkdirError> {
+            self.local.list(request).await
+        }
+
+        async fn glob(
+            &self,
+            request: workdir::GlobRequest,
+        ) -> Result<workdir::GlobResult, WorkdirError> {
+            self.local.glob(request).await
+        }
+
+        async fn grep(
+            &self,
+            request: workdir::GrepRequest,
+        ) -> Result<workdir::GrepResult, WorkdirError> {
+            self.local.grep(request).await
+        }
+
+        async fn start_command(
+            &self,
+            request: CommandRequest,
+        ) -> Result<workdir::CommandHandle, WorkdirError> {
+            self.local.start_command(request).await
+        }
+
+        async fn command_status(
+            &self,
+            handle: workdir::CommandHandle,
+        ) -> Result<workdir::CommandStatus, WorkdirError> {
+            self.local.command_status(handle).await
+        }
+
+        async fn command_output(
+            &self,
+            request: CommandOutputRequest,
+        ) -> Result<workdir::CommandOutput, WorkdirError> {
+            self.local.command_output(request).await
+        }
+
+        async fn cancel_command(&self, handle: workdir::CommandHandle) -> Result<(), WorkdirError> {
+            self.local.cancel_command(handle).await
+        }
+
+        fn subscribe_command_events(&self) -> Option<broadcast::Receiver<workdir::CommandEvent>> {
+            // Interleave a canonical change after read-only registry preparation.
+            let mut metadata = self
+                .metadata_store
+                .read_by_name(&self.worker_name)
+                .unwrap()
+                .unwrap_or_else(|| session_store::WorkerMetadata::new(&self.worker_name, None));
+            metadata
+                .spawned_children
+                .push(session_store::WorkerSpawnedChild {
+                    worker_name: "legacy-drift".into(),
+                    socket_path: PathBuf::new(),
+                    callback_address: PathBuf::new(),
+                    scope_delegated: vec![],
+                });
+            self.metadata_store.write(&metadata).unwrap();
+            self.subscriptions.fetch_add(1, Ordering::SeqCst);
+            Some(self.events.subscribe())
+        }
+
+        async fn close(&self) -> Result<(), WorkdirError> {
+            // Record before any await: aborting without joining must not pass by getting a
+            // scheduler turn during the provider's asynchronous close. The sender stays alive
+            // even after close, so channel closure cannot accidentally dispose of the observer.
+            self.receivers_at_close
+                .lock()
+                .unwrap()
+                .push(self.events.receiver_count());
+            self.local.close().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn registry_drift_drops_prepared_observer_before_closing_session() {
+        let root = tempfile::tempdir().unwrap();
+        let run_dir = root.path().join("runs/1");
+        let client = MockClient::new(simple_text_events());
+        let manifest = WorkerManifest::from_toml(MANIFEST_TOML).unwrap();
+        let store = CombinedStore::new(
+            FsStore::new(root.path().join("sessions")).unwrap(),
+            FsWorkerStore::new(root.path().join("workers")).unwrap(),
+        );
+        let engine =
+            Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
+                client.clone(),
+            );
+        let mut worker = Worker::new(
+            manifest,
+            engine,
+            store.clone(),
+            WorkerWorkspaceContext::local_filesystem(None),
+            WorkerFilesystemAuthority::local(root.path().into(), root.path().into()),
+            manifest::Scope::writable(root.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (events, unused_receiver) = broadcast::channel(8);
+        drop(unused_receiver);
+        let session = Arc::new(ObservedSession {
+            local: LocalWorkdirSession::materialized_bound(
+                Workdir::new("registry-startup-failure"),
+                root.path().into(),
+                root.path().into(),
+                worker.scope().clone(),
+                WorkdirSessionCapabilities::ALL,
+            ),
+            metadata_store: store,
+            worker_name: worker.manifest().worker.name.clone(),
+            events,
+            subscriptions: AtomicUsize::new(0),
+            receivers_at_close: Mutex::new(Vec::new()),
+        });
+        worker.bind_single_workdir_session(Some(session.clone()));
+        let sessions = worker.workdir_sessions();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            WorkerController::spawn_runtime_managed_run(worker, &run_dir),
+        )
+        .await
+        .expect("registry rejection and cleanup must settle");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("registry source drift must reject controller startup"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(session.subscriptions.load(Ordering::SeqCst), 1);
+        assert_eq!(*session.receivers_at_close.lock().unwrap(), vec![0]);
+        assert_eq!(session.events.receiver_count(), 0);
+        assert!(sessions.aliases().is_empty());
+        // No controller retains the Worker/Engine after the failed startup.
+        assert_eq!(Arc::strong_count(&client.call_count), 1);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 0);
+        assert!(!run_dir.join("worker.sock").exists());
+        assert!(!run_dir.join("status.json").exists());
+        assert!(!run_dir.join("manifest.toml").exists());
+        assert!(matches!(
+            session
+                .start_command(CommandRequest {
+                    command: "printf unreachable".to_owned(),
+                    timeout_secs: 5,
+                    transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
+                    cwd: workdir::WorkdirPath::root(),
+                    tool_call_id: None,
+                })
+                .await,
+            Err(ref error) if matches!(error.classification_source(), WorkdirError::Unavailable(_))
+        ));
+    }
 }
 
 async fn wait_for_status(handle: &WorkerHandle, status: WorkerStatus) {
@@ -1561,11 +1800,12 @@ permission = "write"
 "#;
     let client = MockClient::new(simple_text_events());
     let worker = make_worker_with_pwd_and_manifest(client, manifest).await.0;
-    let tmp = tempfile::tempdir().unwrap();
-    let result = WorkerController::spawn(worker, tmp.path()).await;
+    let (_tmp, runtime_base) = owned_relative_runtime_base();
+    let result = WorkerController::spawn(worker, &runtime_base).await;
     assert!(
         result.is_ok(),
-        "feature exposure must not imply delegation authority"
+        "feature exposure must not imply delegation authority: {:?}",
+        result.as_ref().err()
     );
 }
 
@@ -1738,42 +1978,24 @@ async fn snapshot_includes_user_input_for_in_flight_turn() {
     // The Running event is the in-flight visibility fence: the committed
     // annotated input must already be available to an immediately attaching
     // subscriber rather than racing behind this status transition.
-    let stream = tokio::net::UnixStream::connect(handle.runtime_dir.socket_path())
-        .await
-        .unwrap();
-    let (reader, _writer) = stream.into_split();
-    let mut reader = protocol::stream::JsonLineReader::new(reader);
-
-    loop {
-        let event = reader.next::<Event>().await.unwrap().unwrap();
-        match event {
-            Event::Snapshot { session, .. } => {
-                let found = session.entries.iter().any(|entry| match &entry.data {
-                    protocol::SessionSnapshotEntryData::UserInput { segments } => {
-                        protocol::Segment::flatten_to_text(segments) == "hello in-flight"
-                    }
-                    protocol::SessionSnapshotEntryData::Message {
-                        role: protocol::SessionMessageRole::User,
-                        content,
-                    } => content.iter().any(|part| {
-                        matches!(
-                            part,
-                            protocol::SessionContentPart::Text { text }
-                                if text == "hello in-flight"
-                        )
-                    }),
-                    _ => false,
-                });
-                assert!(
-                    found,
-                    "snapshot must carry the in-flight UserInput entry: {session:?}"
-                );
-                return;
+    let Event::Snapshot { session, .. } = handle.snapshot_event() else {
+        panic!("expected snapshot");
+    };
+    assert!(
+        session.entries.iter().any(|entry| match &entry.data {
+            protocol::SessionSnapshotEntryData::UserInput { segments } => {
+                protocol::Segment::flatten_to_text(segments) == "hello in-flight"
             }
-            Event::Alert(_) => continue,
-            other => panic!("expected Snapshot first, got {other:?}"),
-        }
-    }
+            protocol::SessionSnapshotEntryData::Message {
+                role: protocol::SessionMessageRole::User,
+                content,
+            } => content.iter().any(|part| matches!(part,
+                protocol::SessionContentPart::Text { text } if text == "hello in-flight"
+            )),
+            _ => false,
+        }),
+        "snapshot must carry the in-flight UserInput entry: {session:?}"
+    );
 }
 
 #[tokio::test]
@@ -1855,24 +2077,10 @@ async fn attach_snapshot_includes_current_status() {
         .unwrap();
     wait_for_status(&handle, WorkerStatus::Running).await;
 
-    let stream = tokio::net::UnixStream::connect(handle.runtime_dir.socket_path())
-        .await
-        .unwrap();
-    let (reader, _writer) = stream.into_split();
-    let mut reader = protocol::stream::JsonLineReader::new(reader);
-
-    // First event after connect is the snapshot — it carries the current status.
-    loop {
-        let event = reader.next::<Event>().await.unwrap().unwrap();
-        match event {
-            Event::Snapshot { state, .. } => {
-                assert_eq!(state.catalog_status(), WorkerStatus::Running);
-                return;
-            }
-            Event::Alert(_) => continue,
-            other => panic!("expected Snapshot, got {other:?}"),
-        }
-    }
+    let Event::Snapshot { state, .. } = handle.snapshot_event() else {
+        panic!("expected snapshot");
+    };
+    assert_eq!(state.catalog_status(), WorkerStatus::Running);
 }
 
 #[tokio::test]
@@ -2928,7 +3136,7 @@ async fn status_json_reflects_worker_name() {
 }
 
 // ---------------------------------------------------------------------------
-// Socket transport tests
+// Controller lifecycle tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2966,283 +3174,148 @@ async fn shutdown_closes_method_admission_before_terminal_confirmation() {
     shutdown_rx.await.unwrap();
 }
 
+/// Uses the real Controller and metadata store; only the model client is replaced.
 #[tokio::test]
-async fn shutdown_joins_socket_server_with_active_connection() {
-    use tokio::net::UnixStream;
-
+async fn register_peer_returns_existing_response_and_persists_reciprocal_metadata() {
+    use session_store::{WorkerMetadata, WorkerMetadataStore};
     let worker = make_worker(MockClient::new(simple_text_events())).await;
-    let runtime_base = tempfile::tempdir().unwrap();
-    let (handle, shutdown_rx) = WorkerController::spawn(worker, runtime_base.path())
-        .await
+    let store = worker.store().clone();
+    store
+        .write(&WorkerMetadata::new("test-worker", None))
         .unwrap();
-    let socket_path = handle.runtime_dir.socket_path();
-    let _connection = UnixStream::connect(&socket_path).await.unwrap();
-
+    store
+        .write(&WorkerMetadata::new("peer-worker", None))
+        .unwrap();
+    let handle = spawn_controller(worker).await;
+    let mut events = handle.subscribe();
     handle
-        .send(Method::Shutdown {
-            command: worker_command(&handle),
+        .send(Method::RegisterPeer {
+            name: "peer-worker".into(),
         })
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_rx)
+    assert!(
+        drain_until(
+            &mut events,
+            std::time::Duration::from_secs(2),
+            |event| matches!(
+                event,
+                Event::PeerRegistered { result } if result == &serde_json::json!({
+                    "source": "test-worker", "peer": "peer-worker",
+                })
+            )
+        )
         .await
-        .expect("controller should join its socket tasks")
-        .expect("controller shutdown signal should remain open");
-    assert!(!socket_path.exists());
+    );
+    assert_eq!(
+        store.read_by_name("test-worker").unwrap().unwrap().peers[0].worker_name,
+        "peer-worker"
+    );
+    assert_eq!(
+        store.read_by_name("peer-worker").unwrap().unwrap().peers[0].worker_name,
+        "test-worker"
+    );
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
 }
 
 #[tokio::test]
-async fn socket_run_receives_events() {
-    use protocol::stream::{JsonLineReader, JsonLineWriter};
-    use tokio::net::UnixStream;
-
-    let client = MockClient::new(simple_text_events());
-    let worker = make_worker(client).await;
+async fn register_peer_missing_target_is_rejected_without_starting_a_worker() {
+    use session_store::{WorkerMetadata, WorkerMetadataStore};
+    let worker = make_worker(MockClient::new(simple_text_events())).await;
+    let store = worker.store().clone();
+    store
+        .write(&WorkerMetadata::new("test-worker", None))
+        .unwrap();
     let handle = spawn_controller(worker).await;
-
-    // Give the socket server a moment to bind
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let sock_path = handle.runtime_dir.socket_path();
-    let stream = UnixStream::connect(&sock_path).await.unwrap();
-    let (reader, writer) = stream.into_split();
-    let mut reader = JsonLineReader::new(reader);
-    let mut writer = JsonLineWriter::new(writer);
-
-    // Send run method via socket
-    writer
-        .write(&Method::submit_text(
-            protocol::new_submission_request_id(),
-            "Hello",
-        ))
+    let mut events = handle.subscribe();
+    handle
+        .send(Method::RegisterPeer {
+            name: "missing-peer".into(),
+        })
         .await
         .unwrap();
-
-    // Collect events
-    let mut saw_turn_start = false;
-    let mut saw_text_delta = false;
-    let mut saw_turn_end = false;
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        tokio::select! {
-            event = reader.next::<Event>() => {
-                match event {
-                    Ok(Some(Event::TurnStart { .. })) => saw_turn_start = true,
-                    Ok(Some(Event::TextDelta { .. })) => saw_text_delta = true,
-                    Ok(Some(Event::TurnEnd { .. })) => {
-                        saw_turn_end = true;
-                        break;
-                    }
-                    Ok(None) | Err(_) => break,
-                    _ => {}
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => break,
-        }
-    }
-
-    assert!(saw_turn_start, "should see turn_start via socket");
-    assert!(saw_text_delta, "should see text_delta via socket");
-    assert!(saw_turn_end, "should see turn_end via socket");
-}
-
-#[tokio::test]
-async fn socket_worker_event_turn_ended_while_idle_auto_starts_turn() {
-    use protocol::stream::{JsonLineReader, JsonLineWriter};
-    use tokio::net::UnixStream;
-
-    let client = MockClient::new(simple_text_events());
-    let worker = make_worker(client).await;
-    let handle = spawn_controller(worker).await;
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let sock_path = handle.runtime_dir.socket_path();
-    let stream = UnixStream::connect(&sock_path).await.unwrap();
-    let (reader, writer) = stream.into_split();
-    let mut reader = JsonLineReader::new(reader);
-    let mut writer = JsonLineWriter::new(writer);
-
-    writer
-        .write(&Method::WorkerEvent(protocol::WorkerEvent::TurnEnded {
-            worker_name: "child".into(),
-        }))
+    assert!(
+        drain_until(
+            &mut events,
+            std::time::Duration::from_secs(2),
+            |event| matches!(
+                event,
+                Event::Error { code: worker::ErrorCode::InvalidRequest, message }
+                    if message.contains("missing-peer") && message.contains("does not exist")
+            )
+        )
         .await
+    );
+    assert!(store.read_by_name("missing-peer").unwrap().is_none());
+    assert!(
+        store
+            .read_by_name("test-worker")
+            .unwrap()
+            .unwrap()
+            .peers
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn legacy_process_discovery_methods_require_host_or_runtime_authority() {
+    let worker = make_worker(MockClient::new(simple_text_events())).await;
+    let handle = spawn_controller(worker).await;
+    let mut events = handle.subscribe();
+    for method in [
+        Method::ListWorkers,
+        Method::RestoreWorker {
+            name: "old-worker".into(),
+        },
+    ] {
+        handle.send(method).await.unwrap();
+        assert!(
+            drain_until(
+                &mut events,
+                std::time::Duration::from_secs(2),
+                |event| matches!(
+                    event,
+                    Event::Error { code: worker::ErrorCode::InvalidRequest, message }
+                        if message.contains("Host or Runtime")
+                )
+            )
+            .await
+        );
+    }
+    assert_eq!(handle.shared_state.catalog_status(), WorkerStatus::Idle);
+}
+
+#[tokio::test]
+async fn all_controller_launch_modes_leave_external_transport_to_the_host() {
+    let root = tempfile::tempdir().unwrap();
+    for mode in ["direct", "runtime", "run"] {
+        let worker = make_worker(MockClient::new(simple_text_events())).await;
+        let base = root.path().join(mode);
+        let (handle, shutdown) = match mode {
+            "direct" => WorkerController::spawn(worker, &base).await,
+            "runtime" => WorkerController::spawn_runtime_managed(worker, &base).await,
+            "run" => {
+                WorkerController::spawn_runtime_managed_run(worker, &base.join("runs/1")).await
+            }
+            _ => unreachable!(),
+        }
         .unwrap();
-
-    let mut saw_worker_event_echo = false;
-    let mut saw_turn_start = false;
-    let mut saw_turn_end = false;
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    // The SystemItem and TurnEnd events arrive through independent
-    // broadcast lanes (sink fan-out vs `working_event_tx`), so their relative
-    // order on the wire is non-deterministic. Keep reading until both
-    // are observed (or the deadline trips), rather than breaking on
-    // the first TurnEnd.
-    loop {
-        if saw_worker_event_echo && saw_turn_end {
-            break;
+        for legacy in ["pid", "status.json", "manifest.toml", "sock", "worker.sock"] {
+            assert!(
+                !handle.runtime_dir.path().join(legacy).exists(),
+                "{mode} created {legacy}"
+            );
         }
-        tokio::select! {
-            event = reader.next::<Event>() => {
-                match event {
-                    Ok(Some(Event::SystemItem { ref item, .. }))
-                        if item.get("kind").and_then(|k| k.as_str()) == Some("worker_event")
-                            && item
-                                .pointer("/presentation/event/worker_name")
-                                .and_then(|v| v.as_str()) == Some("child") =>
-                    {
-                        saw_worker_event_echo = true;
-                    }
-                    Ok(Some(Event::TurnStart { .. })) => saw_turn_start = true,
-                    Ok(Some(Event::TurnEnd { .. })) => {
-                        saw_turn_end = true;
-                    }
-                    Ok(None) | Err(_) => break,
-                    _ => {}
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => break,
-        }
-    }
-
-    assert!(
-        saw_worker_event_echo,
-        "WorkerEvent::TurnEnded via socket should be echoed as Event::SystemItem(WorkerEvent)"
-    );
-    assert!(
-        saw_turn_start,
-        "WorkerEvent::TurnEnded via socket should auto-start a turn"
-    );
-    assert!(
-        saw_turn_end,
-        "auto-triggered turn should reach turn_end via socket"
-    );
-}
-
-async fn socket_error_after_method_line(
-    handle: &WorkerHandle,
-    line: &[u8],
-) -> (worker::ErrorCode, String) {
-    use protocol::stream::JsonLineReader;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::UnixStream;
-
-    let sock_path = handle.runtime_dir.socket_path();
-    let stream = UnixStream::connect(&sock_path).await.unwrap();
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = JsonLineReader::new(reader);
-
-    writer.write_all(line).await.unwrap();
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-    loop {
-        tokio::select! {
-            event = reader.next::<Event>() => {
-                match event {
-                    Ok(Some(Event::Error { code, message })) => return (code, message),
-                    Ok(Some(_)) => {}
-                    Ok(None) => panic!("socket closed before invalid-method error"),
-                    Err(e) => panic!("socket read failed before invalid-method error: {e}"),
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                panic!("timed out waiting for invalid-method error")
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn socket_schema_invalid_method_returns_error() {
-    let client = MockClient::new(simple_text_events());
-    let worker = make_worker(client).await;
-    let handle = spawn_controller(worker).await;
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let (code, message) = socket_error_after_method_line(&handle, b"{\"bad\":\"json\"}\n").await;
-
-    assert_eq!(code, worker::ErrorCode::InvalidRequest);
-    assert!(
-        message.contains("invalid method"),
-        "expected invalid-method diagnostic, got: {message}"
-    );
-}
-
-#[tokio::test]
-async fn socket_malformed_method_returns_error() {
-    let client = MockClient::new(simple_text_events());
-    let worker = make_worker(client).await;
-    let handle = spawn_controller(worker).await;
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let (code, message) = socket_error_after_method_line(&handle, b"{not-json}\n").await;
-
-    assert_eq!(code, worker::ErrorCode::InvalidRequest);
-    assert!(
-        message.contains("invalid method"),
-        "expected invalid-method diagnostic, got: {message}"
-    );
-}
-
-#[tokio::test]
-async fn socket_peer_close_without_method_does_not_broadcast_error() {
-    use protocol::stream::JsonLineReader;
-    use tokio::net::UnixStream;
-
-    let client = MockClient::new(simple_text_events());
-    let worker = make_worker(client).await;
-    let handle = spawn_controller(worker).await;
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let mut broadcast_rx = handle.subscribe();
-    let sock_path = handle.runtime_dir.socket_path();
-    let stream = UnixStream::connect(&sock_path).await.unwrap();
-    let (reader, writer) = stream.into_split();
-    let mut reader = JsonLineReader::new(reader);
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-    loop {
-        tokio::select! {
-            event = reader.next::<Event>() => {
-                match event {
-                    Ok(Some(Event::Snapshot { .. })) => break,
-                    Ok(Some(_)) => {}
-                    Ok(None) => panic!("socket closed before connect-time snapshot"),
-                    Err(e) => panic!("socket read failed before connect-time snapshot: {e}"),
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                panic!("timed out waiting for connect-time snapshot")
-            }
-        }
-    }
-
-    drop(writer);
-    drop(reader);
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
-    loop {
-        tokio::select! {
-            event = broadcast_rx.recv() => {
-                match event {
-                    Ok(Event::Error { code, message }) => {
-                        panic!("peer close without Method broadcast error {code:?}: {message}")
-                    }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        panic!("broadcast receiver lagged while checking peer close: {n}")
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => break,
-        }
+        handle
+            .send(Method::Shutdown {
+                command: worker_command(&handle),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
 
@@ -4006,27 +4079,15 @@ fn item_text_contains(item: &Item, needle: &str) -> bool {
 }
 
 async fn snapshot_contains_user_input(handle: &WorkerHandle, needle: &str) -> bool {
-    let stream = tokio::net::UnixStream::connect(handle.runtime_dir.socket_path())
-        .await
-        .unwrap();
-    let (reader, _writer) = stream.into_split();
-    let mut reader = protocol::stream::JsonLineReader::new(reader);
-
-    loop {
-        let event = reader.next::<Event>().await.unwrap().unwrap();
-        match event {
-            Event::Snapshot { session, .. } => {
-                return session.entries.into_iter().any(|entry| match entry.data {
-                    protocol::SessionSnapshotEntryData::UserInput { segments } => {
-                        protocol::Segment::flatten_to_text(&segments).contains(needle)
-                    }
-                    _ => false,
-                });
-            }
-            Event::Alert(_) => continue,
-            other => panic!("expected Snapshot first, got {other:?}"),
+    let Event::Snapshot { session, .. } = handle.snapshot_event() else {
+        panic!("expected snapshot");
+    };
+    session.entries.into_iter().any(|entry| match entry.data {
+        protocol::SessionSnapshotEntryData::UserInput { segments } => {
+            protocol::Segment::flatten_to_text(&segments).contains(needle)
         }
-    }
+        _ => false,
+    })
 }
 
 #[tokio::test]

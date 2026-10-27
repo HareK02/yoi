@@ -21,8 +21,9 @@ pub use error::ScopeLockError;
 #[cfg(test)]
 pub(crate) use lifecycle::install_top_level_at_for_test;
 pub use lifecycle::{
-    ScopeAllocationGuard, SegmentActivationCommitError, SegmentActivationGuard, SegmentLockInfo,
-    adopt_allocation, install_top_level, install_top_level_with_deny, lookup_segment,
+    ScopeAllocationCleanup, ScopeAllocationGuard, SegmentActivationCommitError,
+    SegmentActivationGuard, SegmentLockInfo, adopt_allocation, install_top_level,
+    install_top_level_with_deny, lookup_segment,
 };
 pub use mutate::{
     delegate_scope, reclaim_delegated_scope, reclaim_stale, reclaim_stale_with, register_worker,

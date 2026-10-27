@@ -924,6 +924,8 @@ mod tests {
                     chunks: vec![],
                     next_cursor: 0,
                     terminal: Some(crate::CommandTerminal {
+                        process_failure: None,
+                        output_collection: crate::CommandOutputCollection::Complete,
                         status: crate::CommandStatus::Completed,
                         exit_code: Some(0),
                         stdout_bytes: 0,
@@ -1082,6 +1084,8 @@ mod tests {
                 }],
                 next_cursor: 3,
                 terminal: Some(crate::CommandTerminal {
+                    process_failure: None,
+                    output_collection: crate::CommandOutputCollection::Complete,
                     status: crate::CommandStatus::Completed,
                     exit_code: Some(0),
                     stdout_bytes: 100 * 1024 * 1024,

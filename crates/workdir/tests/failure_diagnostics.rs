@@ -83,3 +83,34 @@ fn provider_cannot_inject_free_text_failure_reason() {
         .is_err()
     );
 }
+
+#[test]
+fn provider_authored_operational_messages_never_enter_error_display_or_debug() {
+    for code in [
+        Code::Conflict,
+        Code::OutcomeUnknown,
+        Code::Unsupported,
+        Code::InvalidRequest,
+        Code::Unavailable,
+        Code::Io,
+        Code::Transport,
+        Code::Internal,
+    ] {
+        let wire = serde_json::json!({
+            "code": code, "message":"/host/private command-secret body-secret proof-secret key-secret Authorization: Bearer bearer-secret",
+            "failure_reason": "session_open_task_failed"
+        });
+        let decoded: WorkdirTransportError = serde_json::from_value(wire).unwrap();
+        let error = decoded.into_workdir_error();
+        for text in [
+            format!("{error}"),
+            format!("{error:?}"),
+            serde_json::to_string(&WorkdirTransportError::from_workdir_error(&error)).unwrap(),
+        ] {
+            assert!(!text.contains("secret"), "{text}");
+            assert!(!text.contains("/host/private"), "{text}");
+        }
+        assert_eq!(error.failure_reason(), Some(Reason::SessionOpenTaskFailed));
+        assert_eq!(WorkdirTransportError::from_workdir_error(&error).code, code);
+    }
+}

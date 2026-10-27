@@ -376,6 +376,12 @@ impl StoppedWorkerTemplate {
             root: stage.clone(),
             _owner_lock: Some(lock),
             worker_write_fault: Arc::new(AtomicU8::new(AtomicWriteFault::None as u8)),
+            #[cfg(test)]
+            worker_reconcile_sync_fault: Default::default(),
+            #[cfg(test)]
+            worker_reconcile_read_fault: Default::default(),
+            #[cfg(test)]
+            worker_reconcile_counts: Default::default(),
         };
         let result = (|| {
             let worker = PersistedWorkerRecord {
@@ -463,8 +469,15 @@ impl StoppedWorkerTemplate {
     }
 
     fn validate_shape(&self) -> Result<(), RuntimeError> {
+        // Version 1 templates carry only settled Session material, never a
+        // lifecycle operation. Schema 12 -> 13 changes pending decision evidence,
+        // not that payload. Accept the fixed schema-12 artifact read-only and
+        // install through the current aggregate owner; never rewrite its bytes.
         if self.template_version != TEMPLATE_VERSION
-            || self.runtime_schema_version != SCHEMA_VERSION
+            || !matches!(
+                self.runtime_schema_version,
+                RESTORE_ADMISSION_SCHEMA_VERSION | SCHEMA_VERSION
+            )
         {
             return Err(reject("unsupported template schema"));
         }

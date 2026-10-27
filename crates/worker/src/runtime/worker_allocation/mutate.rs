@@ -58,6 +58,30 @@ pub fn register_worker_with_deny(
     scope_deny: Vec<ScopeRule>,
     segment_id: SegmentId,
 ) -> Result<(), ScopeLockError> {
+    prepare_worker_with_deny(
+        guard,
+        worker_name,
+        pid,
+        socket,
+        scope_allow,
+        scope_deny,
+        segment_id,
+    )?;
+    guard.save()?;
+    Ok(())
+}
+
+/// Admit and stage a registration without publishing it. Owned installation
+/// constructs its cleanup authority after admission and before committing.
+pub(super) fn prepare_worker_with_deny(
+    guard: &mut LockFileGuard,
+    worker_name: String,
+    pid: u32,
+    socket: PathBuf,
+    scope_allow: Vec<ScopeRule>,
+    scope_deny: Vec<ScopeRule>,
+    segment_id: SegmentId,
+) -> Result<(), ScopeLockError> {
     reclaim_stale(guard);
     if guard.data().find(&worker_name).is_some() {
         return Err(ScopeLockError::DuplicateWorkerName(worker_name));
@@ -101,7 +125,6 @@ pub fn register_worker_with_deny(
         delegated_from: None,
         segment_id: Some(segment_id),
     });
-    guard.save()?;
     Ok(())
 }
 

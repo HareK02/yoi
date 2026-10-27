@@ -25,7 +25,46 @@ use thiserror::Error;
 #[path = "job_store/legacy_migrations.rs"]
 mod legacy_migrations;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
+
+/// Availability of the immutable input body, independent of execution outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobInputDisposition {
+    Available,
+    Reclaimed,
+    Erased,
+    Invalidated,
+}
+
+impl JobInputDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Reclaimed => "reclaimed",
+            Self::Erased => "erased",
+            Self::Invalidated => "invalidated",
+        }
+    }
+}
+
+/// Host-authorized retirement; erasure and legacy invalidation do not change outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobInputRetirementReason {
+    Completed,
+    ExplicitErasure,
+    LegacyInvalidation,
+}
+
+impl JobInputRetirementReason {
+    pub fn disposition(self) -> JobInputDisposition {
+        match self {
+            Self::Completed => JobInputDisposition::Reclaimed,
+            Self::ExplicitErasure => JobInputDisposition::Erased,
+            Self::LegacyInvalidation => JobInputDisposition::Invalidated,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,7 +106,11 @@ impl JobAttemptState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobSnapshot {
+    /// Receipt metadata. After retirement `input` is null; use the verified loader to execute.
     pub request: JobRequest,
+    pub input_digest: String,
+    pub intent_fingerprint: String,
+    pub input_disposition: JobInputDisposition,
     /// Durable Host-issued domain delegation, not model input or Profile identity.
     pub domain_grant: Option<Value>,
     pub state: JobState,
@@ -77,14 +120,27 @@ pub struct JobSnapshot {
 }
 
 impl JobSnapshot {
+    /// Load only the original available body, checking both content and immutable intent.
+    pub fn load_executable_request(&self) -> Result<&JobRequest, JobStoreError> {
+        if self.input_disposition != JobInputDisposition::Available {
+            return Err(JobStoreError::InvalidTransition("Job input is retired"));
+        }
+        self.request.validate()?;
+        if self.request.input_digest()? != self.input_digest
+            || self.request.fingerprint()? != self.intent_fingerprint
+        {
+            return Err(JobStoreError::Corrupt(
+                "immutable input or intent fingerprint mismatch".into(),
+            ));
+        }
+        Ok(&self.request)
+    }
+
     /// Shared Feature-facing read contract; no Workspace or execution identity leaks.
     pub fn outcome(&self) -> job::JobOutcome {
         job::JobOutcome {
             job_id: self.request.job_id.clone(),
-            input_digest: self
-                .request
-                .input_digest()
-                .expect("validated immutable Job input"),
+            input_digest: self.input_digest.clone(),
             attempt_id: self.attempt.attempt_id.clone(),
             attempt: self.attempt.number,
             state: match self.state {
@@ -204,8 +260,22 @@ impl JobStore {
                 tx.execute_batch(RECONCILIATION_SCHEMA)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
-            SCHEMA_VERSION => {}
+            4 | SCHEMA_VERSION => {}
             other => return Err(JobStoreError::UnsupportedSchema(other)),
+        }
+        if version < 5 {
+            tx.execute_batch(INPUT_RETENTION_SCHEMA)?;
+            let has_legacy_archive: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='legacy_job_archive')", [], |r| r.get(0))?;
+            if has_legacy_archive {
+                tx.execute_batch("DROP TRIGGER legacy_job_archive_immutable;
+                    CREATE TRIGGER legacy_job_archive_immutable BEFORE UPDATE OF job_id,fingerprint,attempts_json ON legacy_job_archive
+                    BEGIN SELECT RAISE(ABORT, 'immutable legacy Job archive'); END;
+                    CREATE TRIGGER legacy_job_archive_input_retirement BEFORE UPDATE OF request_json ON legacy_job_archive
+                    WHEN NOT EXISTS (SELECT 1 FROM job_intents WHERE job_id=OLD.job_id AND input_disposition<>'available')
+                      OR (json_remove(NEW.request_json,'$.input') = json_remove(OLD.request_json,'$.input') AND json_type(NEW.request_json,'$.input')='null') IS NOT TRUE
+                    BEGIN SELECT RAISE(ABORT, 'immutable legacy Job input'); END;")?;
+            }
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         // An accepted result is the only evidence of success. Reserved attempts
         // were never started and remain pending; cancelled attempts never resume.
@@ -249,10 +319,7 @@ impl JobStore {
                 [&request.job_id],
                 |row| row.get(0),
             )?;
-            if stored != fingerprint
-                || snapshot.request != request
-                || snapshot.domain_grant != grant
-            {
+            if stored != fingerprint || snapshot.domain_grant != grant {
                 return Err(JobStoreError::IntentConflict(request.job_id));
             }
             tx.commit()?;
@@ -334,6 +401,7 @@ impl JobStore {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let previous = require_snapshot(&tx, job_id)?;
+        previous.load_executable_request()?;
         if previous.state != JobState::Failed || previous.attempt.state != JobAttemptState::Failed {
             return Err(JobStoreError::InvalidTransition(
                 "retry requires known failure",
@@ -351,6 +419,81 @@ impl JobStore {
         )?;
         let snapshot = require_snapshot(&tx, job_id)?;
         tx.commit()?;
+        Ok(snapshot)
+    }
+
+    /// Historical snapshots for one domain Session, including terminal and retired Jobs.
+    pub(crate) fn list_session_snapshots(
+        &self,
+        session_id: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JobSnapshot>, JobStoreError> {
+        let mut stmt = self.conn.prepare("SELECT i.job_id FROM job_intents i JOIN job_domain_grants g ON g.job_id=i.job_id WHERE json_extract(g.grant_json,'$.session_id')=?1 AND (?2 IS NULL OR i.job_id>?2) ORDER BY i.job_id LIMIT ?3")?;
+        let ids = stmt
+            .query_map(
+                params![session_id, after, limit.clamp(1, 100) as i64],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter()
+            .map(|id| require_snapshot(&self.conn, &id))
+            .collect()
+    }
+
+    /// The Host must fence domain mutation and delivery before erasure/invalidation.
+    /// This atomically prevents dispatch/retry/result acceptance, without rewriting outcome.
+    pub(crate) fn reclaim_input(
+        &mut self,
+        job_id: &str,
+        expected_input_digest: &str,
+        reason: JobInputRetirementReason,
+    ) -> Result<JobSnapshot, JobStoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let snapshot = require_snapshot(&tx, job_id)?;
+        if snapshot.input_digest != expected_input_digest {
+            return Err(JobStoreError::DigestMismatch);
+        }
+        let desired = reason.disposition();
+        if snapshot.input_disposition == desired {
+            tx.commit()?;
+            reclaim_retired_input_storage(&self.conn)?;
+            return Ok(snapshot);
+        }
+        if reason == JobInputRetirementReason::Completed
+            && (snapshot.state != JobState::Completed
+                || snapshot.attempt.state != JobAttemptState::Completed
+                || snapshot.result.is_none())
+        {
+            return Err(JobStoreError::InvalidTransition(
+                "reclaim requires known completed result",
+            ));
+        }
+        if snapshot.input_disposition != JobInputDisposition::Available
+            && reason != JobInputRetirementReason::ExplicitErasure
+        {
+            return Err(JobStoreError::InvalidTransition(
+                "retired input cannot be restored or reclassified",
+            ));
+        }
+        if reason == JobInputRetirementReason::Completed {
+            snapshot.load_executable_request()?;
+        }
+        let mut metadata = snapshot.request.clone();
+        metadata.input = Value::Null;
+        tx.execute(
+            "UPDATE job_intents SET request_json=?2, input_disposition=?3 WHERE job_id=?1",
+            params![job_id, serde_json::to_string(&metadata)?, desired.as_str()],
+        )?;
+        let has_legacy_archive: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='legacy_job_archive')", [], |r| r.get(0))?;
+        if has_legacy_archive {
+            tx.execute("UPDATE legacy_job_archive SET request_json=json_set(request_json,'$.input',json('null')) WHERE job_id=?1", [job_id])?;
+        }
+        let snapshot = require_snapshot(&tx, job_id)?;
+        tx.commit()?;
+        reclaim_retired_input_storage(&self.conn)?;
         Ok(snapshot)
     }
 
@@ -383,7 +526,7 @@ impl JobStore {
         let mut statement = self.conn.prepare(
             "SELECT i.job_id FROM job_intents i JOIN job_attempts a
              ON a.job_id = i.job_id AND a.number = i.current_attempt
-             WHERE i.state = 'pending' AND a.state = 'reserved' ORDER BY i.rowid",
+             WHERE i.state = 'pending' AND i.input_disposition='available' AND a.state = 'reserved' ORDER BY i.rowid",
         )?;
         let ids = statement
             .query_map([], |row| row.get::<_, String>(0))?
@@ -406,6 +549,7 @@ impl JobStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let snapshot = require_snapshot(&tx, job_id)?;
         check_attempt(&snapshot, attempt_id)?;
+        snapshot.load_executable_request()?;
         if snapshot.state != JobState::Pending
             || snapshot.attempt.state != JobAttemptState::Reserved
         {
@@ -447,7 +591,7 @@ impl JobStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let snapshot = require_snapshot(&tx, &bound.job_id)?;
         check_attempt(&snapshot, &bound.attempt_id)?;
-        if snapshot.request.input_digest()? != bound.input_digest {
+        if snapshot.input_digest != bound.input_digest {
             return Err(JobStoreError::DigestMismatch);
         }
         let (digest, encoded) =
@@ -466,6 +610,7 @@ impl JobStore {
             tx.commit()?;
             return Ok(snapshot);
         }
+        snapshot.load_executable_request()?;
         if snapshot.state != JobState::Pending
             || snapshot.attempt.state != JobAttemptState::Dispatched
         {
@@ -649,7 +794,7 @@ fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>,
     let row = conn
         .query_row(
             "SELECT i.request_json, i.state, i.acknowledged, a.attempt_id, a.number,
-         a.state, a.failure, a.result_json FROM job_intents i JOIN job_attempts a
+         a.state, a.failure, a.result_json, a.input_digest, i.fingerprint, i.input_disposition FROM job_intents i JOIN job_attempts a
          ON a.job_id = i.job_id AND a.number = i.current_attempt WHERE i.job_id = ?1",
             [job_id],
             |row| {
@@ -662,12 +807,27 @@ fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>,
                     row.get::<_, String>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             },
         )
         .optional()?;
     row.map(
-        |(request, state, acknowledged, attempt_id, number, attempt_state, failure, result)| {
+        |(
+            request,
+            state,
+            acknowledged,
+            attempt_id,
+            number,
+            attempt_state,
+            failure,
+            result,
+            input_digest,
+            intent_fingerprint,
+            disposition,
+        )| {
             let state = match state.as_str() {
                 "pending" => JobState::Pending,
                 "completed" => JobState::Completed,
@@ -693,8 +853,17 @@ fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>,
                     )));
                 }
             };
+            let request_value: Value = serde_json::from_str(&request)?;
+            if request_value.get("input").is_none() {
+                return Err(JobStoreError::Corrupt(
+                    "stored Job input field is missing".into(),
+                ));
+            }
             Ok(JobSnapshot {
-                request: serde_json::from_str(&request)?,
+                request: serde_json::from_value(request_value)?,
+                input_digest,
+                intent_fingerprint,
+                input_disposition: serde_json::from_value(Value::String(disposition))?,
                 domain_grant: conn
                     .query_row(
                         "SELECT grant_json FROM job_domain_grants WHERE job_id = ?1",
@@ -718,6 +887,37 @@ fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>,
     )
     .transpose()
 }
+
+// Retirement is already durable before this maintenance step. Failure must be
+// retried with the same Job/digest/reason; it must never restore input. VACUUM
+// removes historical free-page copies, including stores written before secure_delete.
+fn reclaim_retired_input_storage(conn: &Connection) -> Result<(), JobStoreError> {
+    conn.execute_batch("PRAGMA secure_delete=ON; VACUUM;")?;
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+    if busy != 0 {
+        return Err(JobStoreError::InvalidTransition(
+            "input retired; SQLite body cleanup blocked by a reader, retry retirement",
+        ));
+    }
+    Ok(())
+}
+
+const INPUT_RETENTION_SCHEMA: &str = "
+ALTER TABLE job_intents ADD COLUMN input_disposition TEXT NOT NULL DEFAULT 'available'
+    CHECK (input_disposition IN ('available','reclaimed','erased','invalidated'));
+DROP TRIGGER job_intent_immutable;
+CREATE TRIGGER job_intent_immutable BEFORE UPDATE OF
+    job_id, fingerprint, serialization_key, max_concurrent ON job_intents
+BEGIN SELECT RAISE(ABORT, 'immutable Job intent'); END;
+CREATE TRIGGER job_input_retirement BEFORE UPDATE OF request_json, input_disposition ON job_intents
+WHEN (
+    ((OLD.input_disposition = 'available' AND NEW.input_disposition IN ('reclaimed','erased','invalidated'))
+      OR (OLD.input_disposition IN ('reclaimed','invalidated') AND NEW.input_disposition = 'erased'))
+    AND json_remove(NEW.request_json,'$.input') = json_remove(OLD.request_json,'$.input')
+    AND json_type(NEW.request_json,'$.input') = 'null'
+) IS NOT TRUE
+BEGIN SELECT RAISE(ABORT, 'immutable Job input retirement'); END;
+";
 
 const RECONCILIATION_SCHEMA: &str = "
 DROP INDEX job_serialization_singleflight;
@@ -885,7 +1085,11 @@ mod tests {
                 Some("unconfirmed"),
             )
             .unwrap();
-        store.conn.execute_batch("DROP TRIGGER job_reconciliation_immutable; DROP TRIGGER job_reconciliation_retained; DROP TABLE job_domain_reconciliations; DROP INDEX job_serialization_singleflight; CREATE UNIQUE INDEX job_serialization_singleflight ON job_intents(serialization_key) WHERE serialization_key IS NOT NULL AND state IN ('pending','unknown'); PRAGMA user_version=3;").unwrap();
+        store.conn.execute_batch("DROP TRIGGER job_input_retirement; DROP TRIGGER job_intent_immutable;
+            ALTER TABLE job_intents DROP COLUMN input_disposition;
+            CREATE TRIGGER job_intent_immutable BEFORE UPDATE OF job_id,request_json,fingerprint,serialization_key,max_concurrent ON job_intents
+            BEGIN SELECT RAISE(ABORT, 'immutable Job intent'); END;
+            DROP TRIGGER job_reconciliation_immutable; DROP TRIGGER job_reconciliation_retained; DROP TABLE job_domain_reconciliations; DROP INDEX job_serialization_singleflight; CREATE UNIQUE INDEX job_serialization_singleflight ON job_intents(serialization_key) WHERE serialization_key IS NOT NULL AND state IN ('pending','unknown'); PRAGMA user_version=3;").unwrap();
         drop(store);
         let mut reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
         assert_eq!(reopened.get("first").unwrap(), unknown);
@@ -911,10 +1115,7 @@ mod tests {
         JobResultSubmission {
             job_id: snapshot.request.job_id.clone(),
             attempt_id: snapshot.attempt.attempt_id.clone(),
-            input_digest: snapshot
-                .request
-                .input_digest()
-                .expect("validated immutable Job input"),
+            input_digest: snapshot.input_digest.clone(),
             result,
         }
     }
@@ -924,6 +1125,314 @@ mod tests {
         store
             .dispatch(&reserved.request.job_id, &reserved.attempt.attempt_id, 8)
             .unwrap()
+    }
+
+    #[test]
+    fn input_reclaim_reopens_as_receipt_and_exact_replay_never_rehydrates() {
+        let (dir, mut store) = fixture();
+        let original = request("retained");
+        let grant = Some(json!({"session_id":"session-a", "consumer":"fixture"}));
+        let reserved = store
+            .reserve_granted(original.clone(), grant.clone())
+            .unwrap();
+        let running = store
+            .dispatch("retained", &reserved.attempt.attempt_id, 8)
+            .unwrap();
+        let result = submission(&running, json!({"saved":true}));
+        let completed = store.accept(&result).unwrap();
+        store.ack("retained").unwrap();
+        let retired = store
+            .reclaim_input(
+                "retained",
+                &completed.input_digest,
+                JobInputRetirementReason::Completed,
+            )
+            .unwrap();
+        assert_eq!(retired.input_disposition, JobInputDisposition::Reclaimed);
+        assert!(retired.request.input.is_null());
+        assert!(retired.load_executable_request().is_err());
+        assert_eq!(
+            retired.outcome().input_digest,
+            original.input_digest().unwrap()
+        );
+        assert_eq!(retired.result, completed.result);
+        drop(store);
+        let mut reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        assert_eq!(
+            reopened
+                .reserve_granted(original.clone(), grant.clone())
+                .unwrap(),
+            retired
+        );
+        assert_eq!(reopened.accept(&result).unwrap(), retired);
+        assert_eq!(
+            reopened
+                .list_session_snapshots("session-a", None, 1)
+                .unwrap(),
+            vec![retired.clone()]
+        );
+        assert!(
+            reopened
+                .list_session_snapshots("session-b", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .list_session_snapshots("session-a", Some("retained"), 100)
+                .unwrap()
+                .is_empty()
+        );
+        let mut changed = original.clone();
+        changed.input = json!({"changed":true});
+        assert!(matches!(
+            reopened.reserve_granted(changed, grant),
+            Err(JobStoreError::IntentConflict(_))
+        ));
+        assert!(reopened.retry("retained").is_err());
+        assert!(
+            reopened
+                .dispatch("retained", &retired.attempt.attempt_id, 8)
+                .is_err()
+        );
+        assert!(reopened.conn.execute("UPDATE job_intents SET request_json=?1,input_disposition='available' WHERE job_id='retained'", [serde_json::to_string(&original).unwrap()]).is_err());
+        let erased = reopened
+            .reclaim_input(
+                "retained",
+                &retired.input_digest,
+                JobInputRetirementReason::ExplicitErasure,
+            )
+            .unwrap();
+        assert_eq!(erased.input_disposition, JobInputDisposition::Erased);
+        assert_eq!(erased.state, JobState::Completed);
+        assert!(erased.acknowledged);
+        assert_eq!(
+            reopened
+                .reserve_granted(original, erased.domain_grant.clone())
+                .unwrap(),
+            erased
+        );
+    }
+
+    #[test]
+    fn unfinished_unknown_and_failed_inputs_are_kept_until_explicit_invalidation() {
+        let (_dir, mut store) = fixture();
+        for (id, state) in [
+            ("pending", None),
+            ("unknown", Some(JobAttemptState::Unknown)),
+            ("failed", Some(JobAttemptState::Failed)),
+        ] {
+            let original = request(id);
+            let snapshot = store.reserve(original.clone()).unwrap();
+            if let Some(state) = state {
+                store.dispatch(id, &snapshot.attempt.attempt_id, 8).unwrap();
+                store
+                    .finish(
+                        id,
+                        &snapshot.attempt.attempt_id,
+                        state,
+                        Some("not complete"),
+                    )
+                    .unwrap();
+            }
+            let before = store.get(id).unwrap();
+            assert!(
+                store
+                    .reclaim_input(
+                        id,
+                        &before.input_digest,
+                        JobInputRetirementReason::Completed
+                    )
+                    .is_err()
+            );
+            assert_eq!(store.get(id).unwrap(), before);
+            assert_eq!(before.load_executable_request().unwrap(), &original);
+            assert!(
+                store
+                    .reclaim_input(id, "wrong", JobInputRetirementReason::ExplicitErasure)
+                    .is_err()
+            );
+            let retired = store
+                .reclaim_input(
+                    id,
+                    &before.input_digest,
+                    JobInputRetirementReason::LegacyInvalidation,
+                )
+                .unwrap();
+            assert_eq!(retired.state, before.state);
+            assert_eq!(retired.attempt, before.attempt);
+            assert_eq!(retired.input_disposition, JobInputDisposition::Invalidated);
+            assert!(store.retry(id).is_err());
+            assert!(store.dispatch(id, &before.attempt.attempt_id, 8).is_err());
+            assert_eq!(store.reserve(original).unwrap(), retired);
+        }
+    }
+
+    #[test]
+    fn erased_dispatched_input_refuses_delayed_result_without_rewriting_unknown() {
+        let (dir, mut store) = fixture();
+        let running = dispatched(&mut store, request("erase-running"));
+        let result = submission(&running, json!({"late":true}));
+        let erased = store
+            .reclaim_input(
+                "erase-running",
+                &running.input_digest,
+                JobInputRetirementReason::ExplicitErasure,
+            )
+            .unwrap();
+        assert!(store.accept(&result).is_err());
+        assert_eq!(erased.state, JobState::Pending);
+        drop(store);
+        let mut reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        let recovered = reopened.get("erase-running").unwrap();
+        assert_eq!(recovered.state, JobState::Unknown);
+        assert_eq!(recovered.input_disposition, JobInputDisposition::Erased);
+        assert_eq!(recovered.input_digest, running.input_digest);
+        assert!(reopened.accept(&result).is_err());
+        assert!(reopened.retry("erase-running").is_err());
+    }
+
+    #[test]
+    fn available_input_loader_refuses_tamper_missing_body_and_envelope_changes() {
+        for mutation in [
+            "json_set(request_json,'$.input',json('{\"tampered\":true}'))",
+            "json_remove(request_json,'$.input')",
+            "json_set(request_json,'$.instruction','changed')",
+        ] {
+            let (_dir, mut store) = fixture();
+            store.reserve(request("tamper")).unwrap();
+            // Simulate external corruption bypassing SQLite's normal write guard.
+            store
+                .conn
+                .execute_batch("DROP TRIGGER job_input_retirement")
+                .unwrap();
+            store
+                .conn
+                .execute_batch(&format!("UPDATE job_intents SET request_json={mutation}"))
+                .unwrap();
+            match store.get("tamper") {
+                Ok(snapshot) => {
+                    assert!(snapshot.load_executable_request().is_err());
+                    assert!(
+                        store
+                            .dispatch("tamper", &snapshot.attempt.attempt_id, 8)
+                            .is_err()
+                    );
+                }
+                Err(JobStoreError::Json(_) | JobStoreError::Corrupt(_)) => {}
+                other => panic!("unexpected corrupt input read: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn input_retirement_cleanup_failure_is_durable_and_exact_retry_finishes_without_rehydration() {
+        let (dir, mut store) = fixture();
+        let mut original = request("physical-erasure");
+        let private_body = "private-input-retirement-original-bytes".repeat(1000);
+        original.input = json!({"body":private_body});
+        let reserved = store.reserve(original.clone()).unwrap();
+        // A reader retaining the old SQLite snapshot prevents truncation of the old WAL.
+        let reader = Connection::open(dir.path().join("jobs.sqlite3")).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT request_json FROM job_intents;")
+            .unwrap();
+        store.conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        assert!(
+            store
+                .reclaim_input(
+                    "physical-erasure",
+                    &reserved.input_digest,
+                    JobInputRetirementReason::ExplicitErasure
+                )
+                .is_err()
+        );
+        let retired = store.get("physical-erasure").unwrap();
+        assert_eq!(retired.input_disposition, JobInputDisposition::Erased);
+        assert!(retired.load_executable_request().is_err());
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        let replay = store
+            .reclaim_input(
+                "physical-erasure",
+                &reserved.input_digest,
+                JobInputRetirementReason::ExplicitErasure,
+            )
+            .unwrap();
+        assert_eq!(replay, retired);
+        assert_eq!(store.reserve(original).unwrap(), retired);
+        let needle = b"private-input-retirement-original-bytes";
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                let bytes = std::fs::read(&path).unwrap();
+                assert!(
+                    !bytes.windows(needle.len()).any(|bytes| bytes == needle),
+                    "retired body remained in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_original_null_input_is_not_treated_as_available_null() {
+        let (_dir, mut store) = fixture();
+        let mut original = request("null-original");
+        original.input = Value::Null;
+        let reserved = store.reserve(original).unwrap();
+        assert!(reserved.load_executable_request().is_ok());
+        store.conn.execute_batch("DROP TRIGGER job_input_retirement; UPDATE job_intents SET request_json=json_remove(request_json,'$.input')").unwrap();
+        assert!(store.get("null-original").is_err());
+    }
+
+    #[test]
+    fn input_retirement_migration_preserves_receipts_and_rolls_back_failed_ddl() {
+        let (dir, mut store) = fixture();
+        let original = store.reserve(request("upgrade")).unwrap();
+        store.conn.execute_batch("DROP TRIGGER job_input_retirement; DROP TRIGGER job_intent_immutable;
+            ALTER TABLE job_intents DROP COLUMN input_disposition;
+            CREATE TRIGGER job_intent_immutable BEFORE UPDATE OF job_id,request_json,fingerprint,serialization_key,max_concurrent ON job_intents
+            BEGIN SELECT RAISE(ABORT, 'immutable Job intent'); END;
+            PRAGMA user_version=4;
+            CREATE TRIGGER job_input_retirement BEFORE UPDATE ON job_attempts BEGIN SELECT RAISE(ABORT,'collision'); END;").unwrap();
+        drop(store);
+        let path = dir.path().join("jobs.sqlite3");
+        assert!(JobStore::open(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('job_intents') WHERE name='input_disposition')",[],|r|r.get(0)).unwrap();
+        assert!(!present);
+        conn.execute_batch("DROP TRIGGER job_input_retirement")
+            .unwrap();
+        drop(conn);
+        let mut reopened = JobStore::open(&path).unwrap();
+        assert_eq!(reopened.get("upgrade").unwrap(), original);
+        assert_eq!(
+            reopened
+                .get("upgrade")
+                .unwrap()
+                .load_executable_request()
+                .unwrap(),
+            &request("upgrade")
+        );
+        let retired = reopened
+            .reclaim_input(
+                "upgrade",
+                &original.input_digest,
+                JobInputRetirementReason::ExplicitErasure,
+            )
+            .unwrap();
+        assert_eq!(retired.state, JobState::Pending);
+        assert!(
+            reopened
+                .conn
+                .execute_batch("UPDATE job_intents SET input_disposition='available'")
+                .is_err()
+        );
     }
 
     #[test]

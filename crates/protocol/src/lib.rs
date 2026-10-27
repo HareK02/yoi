@@ -52,7 +52,7 @@ pub enum AuthenticatedInputSource {
     /// Assigned whenever a serialized tracked method crosses an untrusted
     /// protocol boundary. Receivers must handle it exactly like public input.
     UntrustedWire,
-    /// Stamped only by the operator-owned standalone in-process transport.
+    /// Stamped only by the operator-owned Standalone Host after local admission.
     /// This is not a Backend Account or authority accepted from wire fields.
     LocalOperator,
     Account {
@@ -399,15 +399,12 @@ pub enum Method {
 
 /// Typed lifecycle events sent from a child Worker to its parent.
 ///
-/// Delivered as `Method::WorkerEvent` over the parent's Unix socket. The
-/// parent Controller always applies variant-specific side effects
-/// (registry / worker-allocation updates). Agent-visible variants are also
-/// queued into the notification buffer; control-plane-only variants are
-/// not injected into the parent's LLM context.
+/// Delivered in-process to the parent Controller's protocol intake. Agent-visible variants
+/// are queued into the notification buffer. Reports are advisory: receivers must check the
+/// actual child session before treating its work as complete.
 ///
-/// Transport is fire-and-forget; receivers must tolerate out-of-order
-/// delivery (e.g. `TurnEnded` arriving after `ShutDown` for the same
-/// child Worker).
+/// Retained legacy control-only variants can be decoded from saved history, but do not
+/// register live children, delegate scope, or establish a socket callback.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -429,16 +426,8 @@ pub enum WorkerEvent {
     /// Child has stopped (controller loop is exiting).
     ShutDown { worker_name: String },
 
-    /// Child SubWorker sub-delegated scope to a grandchild SubWorker via `SubWorkerSpawn`.
-    ///
-    /// Control-plane only: receivers apply registry side effects and
-    /// propagate upward, but do not expose this as an agent notification.
-    ///
-    /// The parent uses this to add the grandchild to its own
-    /// `spawned_workers.json` so it can manage the grandchild directly
-    /// even if the intermediate child dies. The parent then re-fires
-    /// this event upward (if it has a parent of its own) to maintain
-    /// the chain to root.
+    /// Legacy process-child scope report retained for saved Session decoding only.
+    /// Live Controllers ignore it; only the Host-owned Internal registry grants child scope.
     ScopeSubDelegated {
         /// Sub-delegating Worker (= the sender itself).
         parent_worker: String,

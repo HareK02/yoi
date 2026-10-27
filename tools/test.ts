@@ -1,9 +1,10 @@
-// Bound top-level suites/shards, not total processes; large shards use two test threads.
+// Bound top-level suites/shards, not total processes; large shards normally use two threads.
 // Cargo selects targets/features. Retain all listed names; never skip cached successes.
 import { spawn } from "node:child_process";
 import process from "node:process";
 import { availableParallelism } from "node:os";
 import { fileURLToPath } from "node:url";
+import { posix } from "node:path";
 
 // Safety limits, NOT the separate 60s performance goal.
 export const SUITE_TIMEOUT_MS = 180_000;
@@ -65,7 +66,19 @@ export function shardRustCommand(
   if (new Set(names).size !== names.length) {
     throw new Error("cannot shard duplicate test names");
   }
-  if (names.length <= 72) return [{ task, selectedNames: [...names] }];
+  // RuntimeDirSandbox changes process-global paths. Do not overlap its writes
+  // with restore guards in the same process, including small integration targets.
+  const serial = ["worker", "worker-runtime", "yoi-workspace-server"].includes(
+    task.name.split("/")[0],
+  );
+  if (names.length <= 72) {
+    return [{
+      task: serial
+        ? { ...task, args: [...task.args, "--test-threads", "1"] }
+        : task,
+      selectedNames: [...names],
+    }];
+  }
   const count = Math.min(32, Math.ceil(names.length / 36));
   const shards: string[][] = Array.from({ length: count }, () => []);
   names.forEach((name, index) => shards[index % count].push(name));
@@ -75,7 +88,13 @@ export function shardRustCommand(
       name: `${task.name}/shard-${
         String(index + 1).padStart(2, "0")
       }-of-${count}`,
-      args: [...task.args, "--exact", "--test-threads", "2", ...selectedNames],
+      args: [
+        ...task.args,
+        "--exact",
+        "--test-threads",
+        serial ? "1" : "2",
+        ...selectedNames,
+      ],
     },
     selectedNames,
   }));
@@ -84,18 +103,27 @@ export function shardRustCommand(
 export async function discoverRustCommands(
   commands: TestCommand[],
   jobs: number,
-  options: { output: string; signal?: AbortSignal },
+  options: {
+    output: string;
+    signal?: AbortSignal;
+    run?: (task: TestCommand, label: string) => Promise<ExecutionResult>;
+  },
 ) {
   const binaries = await mapConcurrent(commands, jobs, async (task, index) => {
-    const listing = await execute({
+    const listingTask = {
       ...task,
       name: `${task.name}/list`,
       args: [...task.args, "--list", "--format", "terse"],
-    }, {
-      ...options,
-      label: `list-${String(index).padStart(3, "0")}`,
-      timeoutMs: SUITE_TIMEOUT_MS,
-    });
+    };
+    const label = `list-${String(index).padStart(3, "0")}`;
+    const listing = await (options.run
+      ? options.run(listingTask, label)
+      : execute(listingTask, {
+        output: options.output,
+        signal: options.signal,
+        label,
+        timeoutMs: SUITE_TIMEOUT_MS,
+      }));
     let shards: RustShard[] = [];
     let error: string | undefined;
     try {
@@ -124,7 +152,8 @@ export async function discoverRustCommands(
       error,
       selectedCases: error
         ? null
-        : shards.reduce((sum, shard) => sum + shard.selectedNames.length, 0),
+        : shards.reduce((sum, shard) =>
+          sum + shard.selectedNames.length, 0),
       shards,
     };
   });
@@ -426,10 +455,147 @@ export interface TestCommand {
   command: string;
   args: string[];
   cwd: string;
-  env?: Record<string, string>;
+  env?: Record<string, string | undefined>;
   // Exact link from each execution result into inventory.json, even when two
   // Cargo targets happen to share the same package/target display name.
   inventoryRef?: { binaryIndex: number; shardIndex: number };
+}
+
+// Walk with lstat before creating any child: recursive mkdir/realPath alone
+// would follow an existing symlink first. Reject aliases rather than silently
+// canonicalizing a caller's checkout. As with the Rust guard, this assumes the
+// owned checkout is not concurrently replaced by an adversarial filesystem actor.
+async function ownedTestDirectory(checkout: string, relative: string) {
+  if (
+    !posix.isAbsolute(checkout) || checkout === "/" ||
+    posix.normalize(checkout) !== checkout
+  ) throw new Error("test checkout must be an absolute normal-only path");
+
+  async function checkDirectory(path: string, owned: boolean) {
+    const stat = await Deno.lstat(path);
+    if (!stat.isDirectory || stat.isSymlink) {
+      throw new Error(
+        `test isolation refuses non-directory or symlink: ${path}`,
+      );
+    }
+    if (owned && process.getuid && stat.uid !== process.getuid()) {
+      throw new Error(
+        `test isolation directory is not owned by this user: ${path}`,
+      );
+    }
+    if (await Deno.realPath(path) !== path) {
+      throw new Error(
+        `test isolation refuses non-canonical directory: ${path}`,
+      );
+    }
+  }
+  let checkoutPath = "";
+  for (const part of checkout.slice(1).split("/")) {
+    checkoutPath += `/${part}`;
+    await checkDirectory(checkoutPath, false);
+  }
+  let path = checkout;
+  for (const part of relative.split("/")) {
+    if (!part || part === "." || part === "..") {
+      throw new Error("invalid owned test directory component");
+    }
+    path += `/${part}`;
+    try {
+      await Deno.mkdir(path, { mode: 0o700 });
+    } catch (error) {
+      if (!(error instanceof Deno.errors.AlreadyExists)) throw error;
+    }
+    await checkDirectory(path, true);
+  }
+  return path;
+}
+
+/** Prepare child-only isolation for the maintained normal-test entrypoint.
+ * Each wrap gets a fresh allocation table, even for repeated/sanitized labels or
+ * concurrent runners using the same output id. Resources stay under target for
+ * diagnosis; callers with temporary checkouts own their recursive cleanup.
+ */
+export async function prepareTestIsolation(checkout: string, runId: string) {
+  const ownedDirectory = (relative: string) =>
+    ownedTestDirectory(checkout, relative);
+  const prefix = "target/restore-test-environment";
+  await ownedDirectory(prefix);
+  // Keep tempfile Unix-socket references short. tempfile owns unique resources
+  // here; neither runners nor suites remove/replace this shared directory.
+  const tmp = await ownedDirectory("target/t");
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(runId)),
+  );
+  const id = Array.from(
+    digest.slice(0, 6),
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+  const relativeRoot = `${prefix}/runner-${id}-${crypto.randomUUID()}`;
+  const root = await ownedDirectory(relativeRoot);
+  let next = 0;
+  return {
+    root,
+    async wrapCommand(task: TestCommand, label: string): Promise<TestCommand> {
+      const safeLabel = label.replaceAll(/[^a-zA-Z0-9_-]/g, "-").slice(0, 40) ||
+        "command";
+      const relative = `${relativeRoot}/${safeLabel}-${next++}`;
+      // Recheck shared ancestors as well as the command namespace on every wrap.
+      await ownedDirectory("target/t");
+      const namespace = await ownedDirectory(relative);
+      for (
+        const dir of [
+          "config",
+          "data",
+          "run",
+          "home",
+          "git-template/info",
+          "git-template/hooks",
+        ]
+      ) {
+        await ownedDirectory(`${relative}/${dir}`);
+      }
+      const inherited = { ...process.env, ...task.env };
+      const env: NonNullable<TestCommand["env"]> = { ...task.env };
+      // Undefined shadows inherited entries in execute's merge; node spawn omits
+      // them. Strip indexed Git config and less common Git path overrides too.
+      for (const key of Object.keys(inherited)) {
+        if (/^GIT_/i.test(key) || /(^|_)proxy$/i.test(key)) {
+          env[key] = undefined;
+        }
+      }
+      Object.assign(env, {
+        HOME: `${namespace}/home`,
+        YOI_HOME: `${namespace}/data`,
+        YOI_CONFIG_DIR: `${namespace}/config`,
+        YOI_DATA_DIR: `${namespace}/data`,
+        YOI_RUNTIME_DIR: `${namespace}/run`,
+        TMPDIR: tmp,
+        TMP: tmp,
+        TEMP: tmp,
+        GIT_TEMPLATE_DIR: `${namespace}/git-template`,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_SYSTEM: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_ATTR_NOSYSTEM: "1",
+        GIT_CEILING_DIRECTORIES: checkout,
+        GIT_AUTHOR_NAME: "Normal test runner",
+        GIT_AUTHOR_EMAIL: "normal-tests@example.invalid",
+        GIT_COMMITTER_NAME: "Normal test runner",
+        GIT_COMMITTER_EMAIL: "normal-tests@example.invalid",
+        RUSTC_WRAPPER: "",
+        RUSTC_WORKSPACE_WRAPPER: "",
+        SCCACHE_DISABLE: "1",
+      });
+      // HOME is isolated, but toolchain/cache discovery must keep its ordinary
+      // host locations (these are compiler settings, not live product state).
+      for (const key of ["CARGO_HOME", "RUSTUP_HOME"] as const) {
+        const fallback = key === "CARGO_HOME" ? ".cargo" : ".rustup";
+        env[key] = inherited[key] ||
+          (process.env.HOME ? `${process.env.HOME}/${fallback}` : undefined);
+      }
+      return { ...task, env };
+    },
+  };
 }
 
 export function rustTestCommands(
@@ -497,16 +663,26 @@ async function main() {
     "",
   );
   const jobs = parseJobs(Deno.args);
-  const output = `${root}/target/normal-tests/${
+  const outputId = `${
     new Date().toISOString().replaceAll(":", "-")
-  }`;
-  await Deno.mkdir(output, { recursive: true });
+  }-${crypto.randomUUID()}`;
+  const isolation = await prepareTestIsolation(root, outputId);
+  const output = await ownedTestDirectory(
+    root,
+    `target/normal-tests/${outputId}`,
+  );
   const cancellation = installCancellationHandlers();
-  const run = (
+  const run = async (
     task: TestCommand,
     label: string,
     timeoutMs = SUITE_TIMEOUT_MS,
-  ) => execute(task, { output, label, timeoutMs, signal: cancellation.signal });
+  ) =>
+    execute(await isolation.wrapCommand(task, label), {
+      output,
+      label,
+      timeoutMs,
+      signal: cancellation.signal,
+    });
   const summary: Record<string, unknown> = { phase: "metadata", failed: false };
   let executionStart: number | undefined;
   const writeSummary = () =>
@@ -516,7 +692,7 @@ async function main() {
         {
           jobs,
           concurrency:
-            "top-level suites/shards; large Rust shards use 2 test threads, other suites retain internal parallelism",
+            "top-level suites/shards; worker, worker-runtime and yoi-workspace-server use 1 test thread; other large Rust shards use 2, other suites retain internal parallelism",
           platform: "linux",
           suiteTimeoutMs: SUITE_TIMEOUT_MS,
           buildTimeoutMs: BUILD_TIMEOUT_MS,
@@ -600,6 +776,7 @@ async function main() {
     const discovery = await discoverRustCommands(rust, jobs, {
       output,
       signal: cancellation.signal,
+      run,
     });
     summary.discoverySeconds = (performance.now() - discoveryStart) / 1000;
     summary.inventory = "inventory.json";
@@ -655,6 +832,7 @@ async function main() {
           "--allow-write",
           "--allow-run",
           "--allow-env",
+          "--allow-sys=uid",
           "tools/test.test.ts",
           "tools/check-state-contract-names.test.ts",
         ],
@@ -663,7 +841,7 @@ async function main() {
       ...discovery.tasks,
     ];
     console.log(
-      `Running ${rust.length} Rust binaries (${discovery.inventory.selectedCases} selected names, including ignored; ${discovery.tasks.length} suites/shards), doctests, Web and runner suites; at most ${jobs} top-level suites/shards (large Rust shards: 2 test threads; other internal parallelism unchanged; NOT a total process limit). Logs: ${output}`,
+      `Running ${rust.length} Rust binaries (${discovery.inventory.selectedCases} selected names, including ignored; ${discovery.tasks.length} suites/shards), doctests, Web and runner suites; at most ${jobs} top-level suites/shards (worker/worker-runtime/yoi-workspace-server: 1 test thread; other large Rust shards: 2; other internal parallelism unchanged; NOT a total process limit). Logs: ${output}`,
     );
     const results: ReturnType<typeof resultSummary>[] = [];
     summary.results = results;

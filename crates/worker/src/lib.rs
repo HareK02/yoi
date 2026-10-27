@@ -7,8 +7,6 @@ pub mod bootstrap;
 pub mod checkout;
 pub mod compact;
 pub mod controller;
-pub mod discovery;
-pub mod entrypoint;
 pub mod feature;
 mod file_operation;
 pub mod fs_view;
@@ -19,9 +17,12 @@ pub mod job;
 mod metadata_lifecycle;
 pub mod model_client;
 mod paste_artifact_tool;
+pub mod profile_manifest;
 pub mod prompt;
+#[cfg(test)]
+#[path = "../../../tests/support/restore_environment.rs"]
+mod restore_test_environment;
 pub mod runtime;
-pub mod runtime_command;
 pub mod segment_log_sink;
 mod session_capture;
 mod session_history;
@@ -37,6 +38,7 @@ pub mod wip;
 
 mod internal_worker;
 mod interrupt_prep;
+mod peer;
 mod permission;
 mod worker;
 
@@ -45,10 +47,9 @@ pub use bootstrap::{
     WorkerBootstrapLayout, start_worker_controller,
 };
 pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};
-pub use controller::{ShutdownReceiver, WorkerController, WorkerControllerTransport, WorkerHandle};
+pub use controller::{ShutdownReceiver, WorkerController, WorkerHandle};
 pub use hook::{Hook, HookEventKind, HookRegistryBuilder};
 pub use ipc::alerter::Alerter;
-pub use ipc::server::SocketServer;
 pub use manifest::{
     AuthRef, ModelManifest, SchemeKind, Scope, WorkerManifest, WorkerManifestConfig,
     WorkerMetaConfig,
@@ -73,8 +74,8 @@ pub use shared_state::WorkerSharedState;
 pub use worker::{
     LocalWorkingDirectory, ReviewerChildWorkspaceClient, ReviewerContext,
     SubjektivSessionAttributionLifecycle, Worker, WorkerError, WorkerFilesystemAuthority,
-    WorkerRunResult, WorkerWorkspaceContext, WorkspaceBinaryRequest, WorkspaceBinaryResponse,
-    WorkspaceClient, WorkspaceClientError, WorkspaceId, WorkspaceIdError,
+    WorkerRunResult, WorkerStartupFeatureCleanup, WorkerWorkspaceContext, WorkspaceBinaryRequest,
+    WorkspaceBinaryResponse, WorkspaceClient, WorkspaceClientError, WorkspaceId, WorkspaceIdError,
     WorkspacePromptCatalogResolution, WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse,
     WorkspaceServerOperation, WorkspaceWorkerDiscoveryRequest, apply_worker_manifest,
     marker_workspace_client, unavailable_workspace_client,

@@ -46,6 +46,13 @@ pub struct SessionRetentionStore {
 /// Do not recursively acquire the same Session lock inside a guarded callback.
 pub struct SessionRetentionGuard {
     _file: File,
+    session_id: SessionId,
+}
+
+impl SessionRetentionGuard {
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
 }
 
 impl SessionRetentionStore {
@@ -71,7 +78,10 @@ impl SessionRetentionStore {
         }
         let file = options.open(self.root.join(format!("{session}.lock")))?;
         FileExt::lock_exclusive(&file)?;
-        Ok(SessionRetentionGuard { _file: file })
+        Ok(SessionRetentionGuard {
+            _file: file,
+            session_id: session,
+        })
     }
 
     fn read(&self, session: SessionId) -> Result<RetentionState, StoreError> {

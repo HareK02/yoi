@@ -10,6 +10,7 @@ autotests = false
 default = []
 e2e = []
 fixture-support = ["yoi-workspace-server/test-support", "worker-runtime/test-support"]
+restore-checkpoints = ["fixture-support", "worker-runtime/restore-checkpoints"]
 
 [dependencies]
 libc.workspace = true

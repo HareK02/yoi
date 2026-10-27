@@ -202,7 +202,7 @@ pub(super) fn open(tx: &Connection, journal_id: &str) -> JournalResult<Option<Jo
         .optional()?;
     id.map(|id| entry(tx, journal_id, &id)).transpose()
 }
-fn previous_fixed(
+pub(super) fn previous_fixed(
     tx: &Connection,
     journal_id: &str,
 ) -> JournalResult<Option<(JournalSourcePointer, u64)>> {
@@ -569,6 +569,60 @@ impl SubjektivStore {
             Ok(snapshot)
         })
     }
+    /// Rebind a saved body input to a new attempt without resampling its initial state.
+    /// The first binding freezes the full initial Journal snapshot; retries reuse it and
+    /// retain operation receipts. Different Jobs cannot borrow that snapshot as authority.
+    pub fn prepare_journal_input(
+        &self,
+        host: &JournalHostContext,
+        input: &super::recording::JournalInput,
+        binding: JobAttemptBinding,
+    ) -> JournalResult<JournalGeneration> {
+        label(&binding.job_id)?;
+        label(&binding.attempt_id)?;
+        self.database.try_transaction(|tx| {
+            check_host(self, tx, host, false)?;
+            check_session_host(self, tx, host)?;
+            let current = journal(tx, host, &input.journal_id, true)?;
+            let existing: Option<String> = tx.query_row(
+                "SELECT snapshot_json FROM journal_generations WHERE journal_id=?1 AND job_id=?2 AND attempt_id=?3",
+                params![input.journal_id, binding.job_id, binding.attempt_id], |r| r.get(0)).optional()?;
+            if let Some(raw) = existing {
+                let g = serde_json::from_str(&raw)?;
+                input.validate_generation(&g)?;
+                return Ok(g);
+            }
+            // Retained receipt lookup does not reacquire writer authority. Only a new
+            // generation requires the current active Subject/Session writer lifetime.
+            check_host(self, tx, host, true)?;
+            if tx.query_row("SELECT EXISTS(SELECT 1 FROM journal_generations WHERE journal_id=?1 AND active=1)", [&input.journal_id], |r| r.get::<_, bool>(0))? {
+                return Err(conflict("another active generation owns this Journal"));
+            }
+            let prior: Option<String> = tx.query_row(
+                "SELECT snapshot_json FROM journal_generations WHERE journal_id=?1 AND job_id=?2 ORDER BY rowid LIMIT 1",
+                params![input.journal_id, binding.job_id], |r| r.get(0)).optional()?;
+            let mut g = if let Some(raw) = prior {
+                serde_json::from_str::<JournalGeneration>(&raw)?
+            } else {
+                JournalGeneration { id: String::new(), journal_id: input.journal_id.clone(), job: binding.clone(),
+                    selected_ranges: input.selected_ranges.clone(), initial_journal: current.clone(),
+                    initial_open: open(tx, &input.journal_id)?, previous_fixed_end: previous_fixed(tx, &input.journal_id)?.map(|p| p.0) }
+            };
+            input.validate_generation(&g)?;
+            check_ranges(tx, &current, &input.selected_ranges, true)?;
+            let end = prefix(&g.initial_journal, &input.selected_ranges)?;
+            let cursor = (current.process_order, current.process_byte);
+            if cursor < (g.initial_journal.process_order, g.initial_journal.process_byte) || cursor > end {
+                return Err(conflict("saved input no longer owns the current processing cursor"));
+            }
+            g.id = issued_id("journal-generation");
+            g.job = binding;
+            tx.execute("INSERT INTO journal_generations(id,journal_id,job_id,attempt_id,request_json,snapshot_json,active) VALUES(?1,?2,?3,?4,?5,?6,1)",
+                params![g.id,g.journal_id,g.job.job_id,g.job.attempt_id,serde_json::to_string(&g.selected_ranges)?,serde_json::to_string(&g)?])?;
+            Ok(g)
+        })
+    }
+
     pub(super) fn validate_journal_job(&self, ctx: &JournalJobContext) -> JournalResult<()> {
         self.database.try_with_connection(|tx| {
             job(self, tx, ctx, true)?;

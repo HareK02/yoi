@@ -467,7 +467,6 @@ impl AttentionWorkerFactory {
             worker::WorkerBootstrapLayout::RuntimeManagedRun {
                 run_dir: root.join(uuid::Uuid::now_v7().to_string()),
             },
-            worker::WorkerControllerTransport::InProcess,
         )
         .start()
         .await
@@ -477,6 +476,7 @@ impl AttentionWorkerFactory {
             shutdown: Arc::new(tokio::sync::Mutex::new(Some(started.shutdown))),
             controller_task: started.controller_task,
             workspace_client,
+            restore_streams: None,
         })
     }
 }
@@ -490,12 +490,61 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for AttentionWorkerFac
         self.controller(request.worker_ref.worker_id.to_string(), false)
             .await
     }
-    async fn restore_controller(
+    async fn prepare_restore(
         &self,
         request: worker_runtime::execution::WorkerExecutionRestoreRequest,
-    ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
-        self.controller(request.worker_ref.worker_id.to_string(), true)
-            .await
+    ) -> std::result::Result<
+        Box<dyn worker_runtime::worker_backend::RuntimeRestoreCandidate>,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
+        Ok(Box::new(AttentionRestoreCandidate {
+            inputs: Some((
+                AttentionWorkerFactory {
+                    root: self.root.clone(),
+                },
+                request.worker_ref.worker_id.to_string(),
+            )),
+        }))
+    }
+}
+
+// Preparation owns only fixture inputs; reconstruction and Controller startup
+// remain lazy so discard never needs to shut down a started Worker.
+struct AttentionRestoreCandidate {
+    inputs: Option<(AttentionWorkerFactory, String)>,
+}
+
+#[async_trait::async_trait]
+impl worker_runtime::worker_backend::RuntimeRestoreCandidate for AttentionRestoreCandidate {
+    fn initial_state(&self) -> protocol::WorkerStateSnapshot {
+        protocol::WorkerStateSnapshot::initial()
+    }
+
+    async fn activate(
+        &mut self,
+    ) -> std::result::Result<
+        worker_runtime::worker_backend::RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
+        let (factory, worker_id) = self.inputs.take().ok_or_else(|| {
+            worker_runtime::worker_backend::RuntimeRestoreFailure::refused(
+                worker_runtime::worker_backend::RuntimeRestoreStage::Controller,
+                "attention fixture candidate already consumed",
+            )
+        })?;
+        factory.controller(worker_id, true).await.map_err(|_| {
+            worker_runtime::worker_backend::RuntimeRestoreFailure::unproven(
+                worker_runtime::worker_backend::RuntimeRestoreStage::Reconstruction,
+                "attention fixture reconstruction failed",
+            )
+        })
+    }
+
+    async fn discard(
+        &mut self,
+    ) -> std::result::Result<(), worker_runtime::worker_backend::RuntimeRestoreCleanupFailure> {
+        self.inputs.take();
+        Ok(())
     }
 }
 
@@ -602,7 +651,7 @@ async fn orchestrator_attention_real_worker_lost_response_retry_commits_once() {
 
 async fn real_attention_worker_start_restore(lose_response: bool) {
     use session_store::{LogEntry, Store, WorkerSessionStore};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = restored_parent_control_tests::connected_restore_tempdir();
     init_clean_git_workspace(dir.path());
     let config = test_server_config(dir.path());
     let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());

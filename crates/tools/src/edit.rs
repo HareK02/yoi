@@ -21,7 +21,7 @@ pub(crate) struct EditParams {
     /// Worker-local alias of the Workdir attachment to use.
     #[serde(default)]
     pub target_workdir: Option<String>,
-    /// Logical path relative to the bound Workdir root.
+    /// Existing file in which to replace text.
     pub file_path: String,
     #[serde(flatten)]
     pub edit: fs_operation::text::EditArgs,

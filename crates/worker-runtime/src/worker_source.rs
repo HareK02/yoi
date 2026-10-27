@@ -1,23 +1,32 @@
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "http-server")]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "http-server")]
 use crate::workspace_request::{
     RuntimeWorkspaceRequest, RuntimeWorkspaceRequestClient, RuntimeWorkspaceRequestError,
 };
+use worker::WorkspaceResponse;
+#[cfg(feature = "http-server")]
 use worker::{
     WorkspaceBinaryRequest, WorkspaceBinaryResponse, WorkspaceClient, WorkspaceClientError,
     WorkspacePromptCatalogResolution, WorkspacePromptProjection, WorkspaceRequest,
-    WorkspaceRequestMethod, WorkspaceResponse, WorkspaceServerOperation,
+    WorkspaceRequestMethod, WorkspaceServerOperation,
 };
 
 use crate::auth::{
     RuntimeAuthError, RuntimeIdentityMaterial, RuntimeWorkerMutationSourceSigner,
-    WORKER_REMOVE_PERMISSION, WORKSPACE_REQUEST_PERMISSION, WORKSPACE_WORKER_DISCOVERY_PERMISSION,
-    WorkerMutationActorKind, WorkerMutationOperation, WorkerMutationSourceClaims, new_token_id,
+    WORKER_REMOVE_PERMISSION, WorkerMutationActorKind, WorkerMutationOperation,
+    WorkerMutationSourceClaims, new_token_id,
 };
+#[cfg(feature = "http-server")]
+use crate::auth::{WORKSPACE_REQUEST_PERMISSION, WORKSPACE_WORKER_DISCOVERY_PERMISSION};
 use crate::runtime::RuntimeWorkspaceScope;
+#[cfg(feature = "http-server")]
 use crate::worker_backend::WorkspacePromptProjectionCache;
 
+#[cfg(feature = "http-server")]
 fn ticket_assignment_role_segment(role: server_api::TicketAssignmentRole) -> &'static str {
     match role {
         server_api::TicketAssignmentRole::Orchestrator => "orchestrator",
@@ -144,6 +153,7 @@ pub trait EmbeddedWorkerMutationDispatcher: Send + Sync {
 
 #[derive(Clone)]
 enum RuntimeWorkerMutationTransport {
+    #[cfg(feature = "http-server")]
     Remote {
         request_client: RuntimeWorkspaceRequestClient,
     },
@@ -161,6 +171,7 @@ pub struct RuntimeWorkerMutationForwarder {
 }
 
 impl RuntimeWorkerMutationForwarder {
+    #[cfg(feature = "http-server")]
     pub fn remote(
         identity: &RuntimeIdentityMaterial,
         scope: RuntimeWorkspaceScope,
@@ -206,6 +217,7 @@ impl RuntimeWorkerMutationForwarder {
             target_worker_id,
         )?;
         match (&self.transport, proof) {
+            #[cfg(feature = "http-server")]
             (
                 RuntimeWorkerMutationTransport::Remote { request_client },
                 RuntimeOwnedWorkerMutationProof::Remote(token),
@@ -231,6 +243,7 @@ impl RuntimeWorkerMutationForwarder {
     }
 }
 
+#[cfg(feature = "http-server")]
 struct RemoteWorkerRemoveHttpRequest {
     request_client: RuntimeWorkspaceRequestClient,
     source_worker_id: String,
@@ -240,6 +253,7 @@ struct RemoteWorkerRemoveHttpRequest {
     reason: String,
 }
 
+#[cfg(feature = "http-server")]
 fn execute_remote_worker_remove_http(
     request: RemoteWorkerRemoveHttpRequest,
 ) -> Result<WorkspaceResponse, RuntimeWorkerMutationForwardError> {
@@ -263,6 +277,7 @@ fn execute_remote_worker_remove_http(
     execute_remote_worker_remove_http_blocking(request)
 }
 
+#[cfg(feature = "http-server")]
 fn execute_remote_worker_remove_http_blocking(
     request: RemoteWorkerRemoveHttpRequest,
 ) -> Result<WorkspaceResponse, RuntimeWorkerMutationForwardError> {
@@ -315,6 +330,7 @@ fn execute_remote_worker_remove_http_blocking(
     }
 }
 
+#[cfg(feature = "http-server")]
 #[derive(Clone)]
 pub struct RuntimeOwnedWorkspaceClient {
     workspace_id: String,
@@ -325,6 +341,7 @@ pub struct RuntimeOwnedWorkspaceClient {
     prompt_projection_cache: Option<Arc<WorkspacePromptProjectionCache>>,
 }
 
+#[cfg(feature = "http-server")]
 impl RuntimeOwnedWorkspaceClient {
     pub fn new(
         workspace_id: impl Into<String>,
@@ -495,6 +512,7 @@ impl RuntimeOwnedWorkspaceClient {
     }
 }
 
+#[cfg(feature = "http-server")]
 impl std::fmt::Debug for RuntimeOwnedWorkspaceClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -510,6 +528,7 @@ impl std::fmt::Debug for RuntimeOwnedWorkspaceClient {
     }
 }
 
+#[cfg(feature = "http-server")]
 fn generated_workspace_response<T: serde::Serialize>(
     response: Result<T, server_api::client_support::ClientError<server_api::RepositoryApiError>>,
 ) -> Result<WorkspaceResponse, WorkspaceClientError> {
@@ -530,6 +549,7 @@ fn generated_workspace_response<T: serde::Serialize>(
     }
 }
 
+#[cfg(feature = "http-server")]
 impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
     fn workspace_id(&self) -> Option<&str> {
         Some(self.request_client.workspace_id())
@@ -929,12 +949,17 @@ fn unix_now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "http-server")]
     use crate::auth::{
-        RUNTIME_REQUEST_SOURCE_PROOF_HEADER, WorkerMutationSourceExpectation,
-        decode_runtime_request_source_claims, decode_worker_mutation_source_claims,
-        request_body_digest, verify_worker_mutation_source_proof,
+        RUNTIME_REQUEST_SOURCE_PROOF_HEADER, decode_runtime_request_source_claims,
+        request_body_digest,
+    };
+    use crate::auth::{
+        WorkerMutationSourceExpectation, decode_worker_mutation_source_claims,
+        verify_worker_mutation_source_proof,
     };
 
+    #[cfg(feature = "http-server")]
     fn binary_loopback(response: Vec<u8>) -> (String, std::thread::JoinHandle<(String, Vec<u8>)>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -972,6 +997,7 @@ mod tests {
         (base_url, server)
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn generated_ticket_assignment_transport_signs_exact_authoring_and_bounded_read_subjects() {
         use crate::auth::{RuntimeRequestSourceExpectation, verify_runtime_request_source};
@@ -1104,6 +1130,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn binary_roundtrip_signs_exact_query_method_worker_and_raw_body() {
         use crate::auth::{RuntimeRequestSourceExpectation, verify_runtime_request_source};
@@ -1194,6 +1221,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn binary_responses_enforce_declared_and_streamed_limits_with_fixed_errors() {
         for response in [
@@ -1213,6 +1241,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn binary_redirect_returns_status_without_forwarding_authentication() {
         let (base_url, server) = binary_loopback(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec());
@@ -1231,6 +1260,7 @@ mod tests {
         assert!(result.body.is_empty());
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn binary_invalid_or_normalized_targets_fail_with_fixed_errors_before_http() {
         let client = RuntimeOwnedWorkspaceClient::new(
@@ -1277,6 +1307,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn current_prompt_projection_uses_the_shared_runtime_cache_without_http() {
         let cache = Arc::new(WorkspacePromptProjectionCache::default());
@@ -1312,6 +1343,7 @@ mod tests {
         assert!(Arc::ptr_eq(&projection.catalog, &second.catalog));
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn prompt_projection_cache_miss_fetches_content_identity() {
         use std::io::{Read, Write};
@@ -1356,6 +1388,7 @@ mod tests {
         assert_eq!(fetched.projection.source_digest, "source-3");
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn concurrent_prompt_projection_miss_fetches_once_and_shares_catalog() {
         use std::io::{Read, Write};
@@ -1427,6 +1460,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn current_prompt_projection_rejects_cross_workspace_response() {
         use std::io::{Read, Write};
@@ -1473,6 +1507,7 @@ mod tests {
         assert!(error.to_string().contains("scope mismatch"));
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn ordinary_workspace_forwarding_stamps_runtime_identity_and_signs_path_and_query() {
         use std::io::{Read, Write};
@@ -1531,6 +1566,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn workspace_worker_discovery_signs_dedicated_permission_and_encoded_query() {
         use std::io::{Read, Write};
@@ -1652,6 +1688,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "http-server")]
     #[tokio::test(flavor = "multi_thread")]
     async fn remote_forwarder_is_safe_in_async_runtime_and_stamps_signed_proof() {
         use std::io::{Read, Write};
@@ -1815,6 +1852,7 @@ mod tests {
         assert_eq!(reason, "retire obsolete Worker");
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn runtime_owned_workspace_client_returns_successful_response_without_request_timeout() {
         // Effective deadline clearing is exercised with a short inherited deadline in
@@ -1838,6 +1876,7 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn runtime_owned_workspace_client_honors_per_request_timeouts() {
         let (base_url, server) = delayed_workspace_response(Duration::from_millis(75));
@@ -1857,6 +1896,7 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[cfg(feature = "http-server")]
     #[test]
     fn runtime_owned_workspace_client_reports_request_timeouts() {
         let (base_url, server) = delayed_workspace_response(Duration::from_millis(75));
@@ -1878,6 +1918,7 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[cfg(feature = "http-server")]
     fn delayed_workspace_response(delay: Duration) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;

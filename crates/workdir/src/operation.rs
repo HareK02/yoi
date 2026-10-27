@@ -132,17 +132,204 @@ pub enum CommandOutputTruncation {
     ByteBudget,
 }
 
-/// Raw totals include discarded pipe bytes. Delivered totals count only prefixes
-/// admitted to the transport queue, not page reads or retries by a consumer.
+/// Closed diagnostic vocabulary: never serialize OS messages, paths, or errno text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandIoErrorKind {
+    NotFound,
+    PermissionDenied,
+    ConnectionRefused,
+    ConnectionReset,
+    ConnectionAborted,
+    NotConnected,
+    BrokenPipe,
+    AlreadyExists,
+    WouldBlock,
+    InvalidInput,
+    InvalidData,
+    TimedOut,
+    WriteZero,
+    Interrupted,
+    UnexpectedEof,
+    OutOfMemory,
+    HostUnreachable,
+    NetworkUnreachable,
+    AddrInUse,
+    AddrNotAvailable,
+    NetworkDown,
+    NotADirectory,
+    IsADirectory,
+    DirectoryNotEmpty,
+    ReadOnlyFilesystem,
+    StaleNetworkFileHandle,
+    StorageFull,
+    NotSeekable,
+    QuotaExceeded,
+    FileTooLarge,
+    ResourceBusy,
+    ExecutableFileBusy,
+    Deadlock,
+    CrossesDevices,
+    TooManyLinks,
+    InvalidFilename,
+    ArgumentListTooLong,
+    Unsupported,
+    Other,
+    Unknown,
+}
+
+impl From<std::io::ErrorKind> for CommandIoErrorKind {
+    fn from(kind: std::io::ErrorKind) -> Self {
+        use std::io::ErrorKind as Io;
+        match kind {
+            Io::NotFound => Self::NotFound,
+            Io::PermissionDenied => Self::PermissionDenied,
+            Io::ConnectionRefused => Self::ConnectionRefused,
+            Io::ConnectionReset => Self::ConnectionReset,
+            Io::ConnectionAborted => Self::ConnectionAborted,
+            Io::NotConnected => Self::NotConnected,
+            Io::BrokenPipe => Self::BrokenPipe,
+            Io::AlreadyExists => Self::AlreadyExists,
+            Io::WouldBlock => Self::WouldBlock,
+            Io::InvalidInput => Self::InvalidInput,
+            Io::InvalidData => Self::InvalidData,
+            Io::TimedOut => Self::TimedOut,
+            Io::WriteZero => Self::WriteZero,
+            Io::Interrupted => Self::Interrupted,
+            Io::UnexpectedEof => Self::UnexpectedEof,
+            Io::OutOfMemory => Self::OutOfMemory,
+            Io::HostUnreachable => Self::HostUnreachable,
+            Io::NetworkUnreachable => Self::NetworkUnreachable,
+            Io::AddrInUse => Self::AddrInUse,
+            Io::AddrNotAvailable => Self::AddrNotAvailable,
+            Io::NetworkDown => Self::NetworkDown,
+            Io::NotADirectory => Self::NotADirectory,
+            Io::IsADirectory => Self::IsADirectory,
+            Io::DirectoryNotEmpty => Self::DirectoryNotEmpty,
+            Io::ReadOnlyFilesystem => Self::ReadOnlyFilesystem,
+            Io::StaleNetworkFileHandle => Self::StaleNetworkFileHandle,
+            Io::StorageFull => Self::StorageFull,
+            Io::NotSeekable => Self::NotSeekable,
+            Io::QuotaExceeded => Self::QuotaExceeded,
+            Io::FileTooLarge => Self::FileTooLarge,
+            Io::ResourceBusy => Self::ResourceBusy,
+            Io::ExecutableFileBusy => Self::ExecutableFileBusy,
+            Io::Deadlock => Self::Deadlock,
+            Io::CrossesDevices => Self::CrossesDevices,
+            Io::TooManyLinks => Self::TooManyLinks,
+            Io::InvalidFilename => Self::InvalidFilename,
+            Io::ArgumentListTooLong => Self::ArgumentListTooLong,
+            Io::Unsupported => Self::Unsupported,
+            Io::Other => Self::Other,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandFailureStage {
+    Spawn,
+    Wait,
+    StdoutRead,
+    StderrRead,
+    StdoutDrain,
+    StderrDrain,
+    OutputDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CommandFailure {
+    pub stage: CommandFailureStage,
+    pub reason: CommandIoErrorKind,
+    /// Observed numeric OS code, if supplied by the source. Never inferred from text.
+    pub os_code: Option<i32>,
+}
+
+impl CommandFailure {
+    pub(crate) fn io(stage: CommandFailureStage, error: &std::io::Error) -> Self {
+        Self {
+            stage,
+            reason: error.kind().into(),
+            os_code: error.raw_os_error(),
+        }
+    }
+}
+
+/// EOF collection is independent of exit status and the explicit byte budget.
+/// Incomplete counts are lower bounds on bytes actually produced by the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CommandOutputCollection {
+    NotStarted,
+    Complete,
+    Incomplete { failure: CommandFailure },
+}
+
+/// Raw totals include discarded *observed* pipe bytes, not an unknown failed tail.
+/// Delivered totals count only prefixes admitted to the transport queue, not page
+/// reads or retries. Neither terminal arrival nor exit zero implies EOF collection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CommandTerminal {
     pub status: CommandStatus,
     pub exit_code: Option<i32>,
+    pub process_failure: Option<CommandFailure>,
+    pub output_collection: CommandOutputCollection,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
     pub stdout_delivered_bytes: u64,
     pub stderr_delivered_bytes: u64,
     pub truncation_reason: Option<CommandOutputTruncation>,
+}
+
+impl CommandTerminal {
+    /// Validate provider-authored metadata before publishing it as collected evidence.
+    pub fn metadata_valid(&self) -> bool {
+        let truncated = self.stdout_bytes > self.stdout_delivered_bytes
+            || self.stderr_bytes > self.stderr_delivered_bytes;
+        if self.status == CommandStatus::Running
+            || self.stdout_delivered_bytes > self.stdout_bytes
+            || self.stderr_delivered_bytes > self.stderr_bytes
+            || self.truncation_reason != truncated.then_some(CommandOutputTruncation::ByteBudget)
+        {
+            return false;
+        }
+        match self.process_failure {
+            Some(CommandFailure {
+                stage: CommandFailureStage::Spawn,
+                ..
+            }) => {
+                self.status == CommandStatus::Failed
+                    && self.exit_code.is_none()
+                    && self.output_collection == CommandOutputCollection::NotStarted
+                    && self.stdout_bytes == 0
+                    && self.stderr_bytes == 0
+            }
+            Some(CommandFailure {
+                stage: CommandFailureStage::Wait,
+                ..
+            }) => {
+                self.status != CommandStatus::Completed
+                    && self.exit_code.is_none()
+                    && self.collection_started()
+            }
+            Some(_) => false,
+            None => self.collection_started(),
+        }
+    }
+
+    fn collection_started(&self) -> bool {
+        match self.output_collection {
+            CommandOutputCollection::NotStarted => false,
+            CommandOutputCollection::Complete => true,
+            CommandOutputCollection::Incomplete { failure } => !matches!(
+                failure.stage,
+                CommandFailureStage::Spawn | CommandFailureStage::Wait
+            ),
+        }
+    }
 }
 
 /// Sending next_cursor acknowledges this page. Only the current page may be
@@ -186,19 +373,13 @@ impl CommandOutput {
         self.next_cursor <= MAX_COMMAND_TRANSPORT_BYTES
             && end.is_none_or(|end| end == self.next_cursor)
             && self.terminal.as_ref().is_none_or(|terminal| {
-                let truncated = terminal.stdout_bytes > terminal.stdout_delivered_bytes
-                    || terminal.stderr_bytes > terminal.stderr_delivered_bytes;
-                stream_ends[0].is_none_or(|end| end == terminal.stdout_delivered_bytes)
+                terminal.metadata_valid()
+                    && stream_ends[0].is_none_or(|end| end == terminal.stdout_delivered_bytes)
                     && stream_ends[1].is_none_or(|end| end == terminal.stderr_delivered_bytes)
-                    && terminal.status != CommandStatus::Running
-                    && terminal.stdout_delivered_bytes <= terminal.stdout_bytes
-                    && terminal.stderr_delivered_bytes <= terminal.stderr_bytes
                     && terminal
                         .stdout_delivered_bytes
                         .checked_add(terminal.stderr_delivered_bytes)
                         == Some(self.next_cursor)
-                    && terminal.truncation_reason
-                        == truncated.then_some(CommandOutputTruncation::ByteBudget)
             })
     }
 }
@@ -261,5 +442,71 @@ mod tests {
                 .unwrap()
                 .contains(&serde_json::json!("transport_byte_budget"))
         );
+    }
+
+    #[test]
+    fn failure_wire_is_closed_and_does_not_infer_os_codes_from_custom_messages() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "/host/private TOKEN=secret EACCES command",
+        );
+        let failure = CommandFailure::io(CommandFailureStage::Wait, &error);
+        assert_eq!(
+            serde_json::to_value(failure).unwrap(),
+            serde_json::json!({"stage":"wait","reason":"other","os_code":null})
+        );
+        let os_error = std::io::Error::from_raw_os_error(libc::EIO);
+        let actual = CommandFailure::io(CommandFailureStage::StdoutDrain, &os_error);
+        assert_eq!(actual.os_code, Some(libc::EIO));
+        for invalid in [
+            serde_json::json!({"stage":"wait","reason":"/host/private TOKEN=secret"}),
+            serde_json::json!({"stage":"/host/private","reason":"other"}),
+            serde_json::json!({"stage":"wait","reason":"other","message":"secret"}),
+        ] {
+            assert!(serde_json::from_value::<CommandFailure>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_terminal_rejects_inconsistent_failure_domains_and_unstarted_byte_claims() {
+        let wire = serde_json::json!({"status":"completed","exit_code":0,"process_failure":null,"output_collection":{"state":"incomplete","failure":{"stage":"stdout_drain","reason":"other","os_code":null}},"stdout_bytes":3,"stderr_bytes":0,"stdout_delivered_bytes":3,"stderr_delivered_bytes":0,"truncation_reason":null});
+        let terminal: CommandTerminal = serde_json::from_value(wire.clone()).unwrap();
+        assert!(terminal.metadata_valid());
+        for (field, value) in [
+            (
+                "output_collection",
+                serde_json::json!({"state":"not_started"}),
+            ),
+            (
+                "output_collection",
+                serde_json::json!({"state":"incomplete","failure":{"stage":"wait","reason":"other"}}),
+            ),
+            (
+                "process_failure",
+                serde_json::json!({"stage":"stdout_read","reason":"other"}),
+            ),
+            (
+                "process_failure",
+                serde_json::json!({"stage":"spawn","reason":"not_found"}),
+            ),
+            ("truncation_reason", serde_json::json!("byte_budget")),
+        ] {
+            let mut invalid = wire.clone();
+            invalid[field] = value;
+            assert!(
+                !serde_json::from_value::<CommandTerminal>(invalid)
+                    .unwrap()
+                    .metadata_valid()
+            );
+        }
+        let mut unclassified = wire.clone();
+        unclassified
+            .as_object_mut()
+            .unwrap()
+            .remove("output_collection");
+        assert!(serde_json::from_value::<CommandTerminal>(unclassified).is_err());
+        let mut raw = wire;
+        raw["message"] = serde_json::json!("/private TOKEN=secret");
+        assert!(serde_json::from_value::<CommandTerminal>(raw).is_err());
     }
 }

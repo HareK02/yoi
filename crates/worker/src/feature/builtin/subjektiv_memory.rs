@@ -39,12 +39,65 @@ use crate::hook::{
     HookErrorCategory, HookExecutionPolicy, HookFailurePolicy, HookPreRequestAction, PreLlmRequest,
     PreRequestContext, RunCommitted, RunCommittedContext,
 };
-use crate::session_capture::{SessionCapture, SessionEntryEvidence};
+use crate::session_capture::{CaptureBody, SessionCapture, SessionEntryEvidence};
 use crate::subjektiv::SubjektivHostConnection;
 #[cfg(test)]
 use crate::worker::WorkspaceClient;
 #[cfg(test)]
 use server_api::SubjektivMemoryBackendRequest;
+
+// Pending-commit receipt interpretation belongs to Memory, not the shared capture.
+struct CommittedMemoryCall {
+    call_id: String,
+    name: String,
+    arguments: String,
+    evidence: SessionEntryEvidence,
+}
+
+fn committed_pending_tool_calls(view: &SessionCapture, names: &[&str]) -> Vec<CommittedMemoryCall> {
+    let pending: HashSet<_> = view
+        .entries()
+        .filter_map(|entry| {
+            let CaptureBody::ToolResult {
+                call_id,
+                content: Some(content),
+                is_error: false,
+                ..
+            } = &entry.body
+            else {
+                return None;
+            };
+            (serde_json::from_str::<serde_json::Value>(content)
+                .ok()
+                .and_then(|value| value.get("status").cloned())
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                == Some("pending_commit"))
+            .then_some(call_id.as_str())
+        })
+        .collect();
+    view.entries()
+        .filter_map(|entry| {
+            let CaptureBody::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } = &entry.body
+            else {
+                return None;
+            };
+            if !names.contains(&name.as_str()) || !pending.contains(call_id.as_str()) {
+                return None;
+            }
+            Some(CommittedMemoryCall {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+                evidence: view.evidence_for_tool_call(call_id)?,
+            })
+        })
+        .collect()
+}
 
 const QUERY_TOOL: &str = "SubjektivMemoryQuery";
 const READ_TOOL: &str = "SubjektivMemoryRead";
@@ -518,14 +571,18 @@ impl SubjektivMemoryState {
                 .capture()
                 .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
             let session_id = capture.session_id.clone();
-            let view = SessionCapture::from_history_entries(capture.segment_id, capture.history);
-            let committed = view
-                .committed_pending_tool_calls(&[REMEMBER_TOOL, PROPOSE_CHANGE_TOOL])
-                .into_iter()
-                .any(|call| {
-                    receipt_id(&session_id, &call.call_id)
-                        .is_ok_and(|committed_receipt| committed_receipt == expected_receipt_id)
-                });
+            let view = SessionCapture::from_complete_history(
+                capture.session_id.clone(),
+                capture.segment_id,
+                capture.history,
+            );
+            let committed =
+                committed_pending_tool_calls(&view, &[REMEMBER_TOOL, PROPOSE_CHANGE_TOOL])
+                    .into_iter()
+                    .any(|call| {
+                        receipt_id(&session_id, &call.call_id)
+                            .is_ok_and(|committed_receipt| committed_receipt == expected_receipt_id)
+                    });
             if committed {
                 status.status = SubjektivMemoryReceiptStatus::PendingCommit;
             }
@@ -623,10 +680,13 @@ fn replay_pending_committed_memory_with_policy(
         .capture
         .capture()
         .map_err(|error| HookError::new(HookErrorCategory::Dependency, error.to_string()))?;
-    let view =
-        SessionCapture::from_history_entries(capture.segment_id.clone(), capture.history.clone());
+    let view = SessionCapture::from_complete_history(
+        capture.session_id.clone(),
+        capture.segment_id.clone(),
+        capture.history.clone(),
+    );
     let mut failures = Vec::new();
-    for call in view.committed_pending_tool_calls(&[REMEMBER_TOOL, PROPOSE_CHANGE_TOOL]) {
+    for call in committed_pending_tool_calls(&view, &[REMEMBER_TOOL, PROPOSE_CHANGE_TOOL]) {
         let receipt_id = match receipt_id(&capture.session_id, &call.call_id) {
             Ok(value) => value,
             Err(error) => {
@@ -755,8 +815,11 @@ fn resolve_entry_refs(
     capture: &crate::feature::session::CommittedSessionCapture,
     entry_refs: &[String],
 ) -> Result<Vec<SessionEntryEvidence>, ToolError> {
-    let view =
-        SessionCapture::from_history_entries(capture.segment_id.clone(), capture.history.clone());
+    let view = SessionCapture::from_complete_history(
+        capture.session_id.clone(),
+        capture.segment_id.clone(),
+        capture.history.clone(),
+    );
     let mut seen = HashSet::new();
     entry_refs
         .iter()

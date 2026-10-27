@@ -1,17 +1,12 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use manifest::{ScopeRule, paths};
+use manifest::ScopeRule;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
-use crate::shared_state::WorkerSharedState;
-
-/// One spawned-child record mirrored to `spawned_workers.json`.
-///
-/// Written by the spawner after registry changes so runtime-local tools
-/// have a materialised snapshot. Durable restore uses Worker state metadata;
-/// this file is not the authoritative source.
+/// Legacy process-child projection used only by persisted scope reclamation.
+/// Socket fields retain the stored format; they are never connected to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnedWorkerRecord {
     /// Spawned Worker's identity.
@@ -25,56 +20,33 @@ pub struct SpawnedWorkerRecord {
     pub callback_address: PathBuf,
 }
 
-/// Manages the Worker's runtime directory on tmpfs.
+/// Artifact directory retained by an in-process Controller.
 ///
-/// ```text
-/// <runtime_dir>/{worker_name}/
-/// ├── pid
-/// ├── status.json
-/// ├── manifest.toml
-/// ├── history.json
-/// └── sock             (created by socket listener, not by RuntimeDir)
-/// ```
-///
-/// `<runtime_dir>` is resolved via [`manifest::paths::runtime_dir`].
-/// Files are written atomically (write tmp → rename).
-/// The directory is removed on drop.
+/// Worker liveness and configuration belong to the Host, not filesystem projections.
+/// Persistent run directories and pre-existing data are never removed on drop.
 pub struct RuntimeDir {
     path: PathBuf,
-    write_legacy_snapshots: bool,
     preserve_on_drop: bool,
-    socket_file_name: &'static str,
 }
 
 impl RuntimeDir {
-    /// Create the runtime directory and write the PID file.
+    /// Create an ephemeral directory without PID, status, manifest or socket files.
     pub async fn create(base: &Path, worker_name: &str) -> Result<Self, io::Error> {
-        let path = base.join(worker_name);
-        fs::create_dir_all(&path).await?;
-
-        let pid = std::process::id().to_string();
-        fs::write(path.join("pid"), pid.as_bytes()).await?;
-
-        Ok(Self {
-            path,
-            write_legacy_snapshots: true,
-            preserve_on_drop: false,
-            socket_file_name: "sock",
-        })
+        Self::create_transient(base, worker_name).await
     }
 
-    /// Create an ephemeral Runtime-owned artifact directory.
-    ///
-    /// Runtime-managed Workers keep their status in the owning Runtime and do
-    /// not materialize legacy pid/status/manifest projections.
+    /// Preserve pre-existing directories rather than claiming their contents for cleanup.
     pub async fn create_transient(base: &Path, worker_name: &str) -> Result<Self, io::Error> {
+        fs::create_dir_all(base).await?;
         let path = base.join(worker_name);
-        fs::create_dir_all(&path).await?;
+        let preserve_on_drop = match fs::create_dir(&path).await {
+            Ok(()) => false,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => true,
+            Err(error) => return Err(error),
+        };
         Ok(Self {
             path,
-            write_legacy_snapshots: false,
-            preserve_on_drop: false,
-            socket_file_name: "sock",
+            preserve_on_drop,
         })
     }
 
@@ -100,39 +72,11 @@ impl RuntimeDir {
         std::fs::File::open(parent)?.sync_all()?;
         Ok(Self {
             path: path.to_path_buf(),
-            write_legacy_snapshots: false,
             preserve_on_drop: true,
-            socket_file_name: "worker.sock",
         })
     }
 
-    /// Create in the default base directory resolved via
-    /// [`manifest::paths::runtime_dir`].
-    pub async fn create_default(worker_name: &str) -> Result<Self, io::Error> {
-        let base = default_base()?;
-        Self::create(&base, worker_name).await
-    }
-
-    /// Write status.json atomically.
-    pub async fn write_status(&self, state: &WorkerSharedState) -> Result<(), io::Error> {
-        if !self.write_legacy_snapshots {
-            return Ok(());
-        }
-        let content = state.status_json();
-        atomic_write(&self.path.join("status.json"), content.as_bytes()).await
-    }
-
-    /// Write manifest.toml (typically once at startup).
-    pub async fn write_manifest(&self, toml: &str) -> Result<(), io::Error> {
-        if !self.write_legacy_snapshots {
-            return Ok(());
-        }
-        atomic_write(&self.path.join("manifest.toml"), toml.as_bytes()).await
-    }
-
-    /// Write `spawned_workers.json` atomically. The entries are the full
-    /// set of spawned children known to this Worker — callers pass the
-    /// replacement list, no incremental merge.
+    /// Rewrite the legacy projection during persisted process-child reclamation.
     pub async fn write_spawned_workers(
         &self,
         records: &[SpawnedWorkerRecord],
@@ -145,26 +89,10 @@ impl RuntimeDir {
     pub fn path(&self) -> &Path {
         &self.path
     }
-
-    /// Path where the Unix socket should be created. External callers
-    /// that only know the worker name (e.g. the TUI's attach flow)
-    /// predict the same path via [`manifest::paths::worker_socket_path`].
-    pub fn socket_path(&self) -> PathBuf {
-        self.path.join(self.socket_file_name)
-    }
-
-    pub async fn close_socket(&self) -> Result<(), io::Error> {
-        match fs::remove_file(self.socket_path()).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
 }
 
 impl Drop for RuntimeDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.socket_path());
         if !self.preserve_on_drop {
             let _ = std::fs::remove_dir_all(&self.path);
         }
@@ -179,156 +107,72 @@ async fn atomic_write(target: &Path, content: &[u8]) -> Result<(), io::Error> {
     Ok(())
 }
 
-/// Resolve the default base directory for runtime data.
-///
-/// Thin wrapper over [`manifest::paths::runtime_dir`] that converts a
-/// missing-env situation into an `io::Error`.
-pub fn default_base() -> Result<PathBuf, io::Error> {
-    paths::runtime_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "could not resolve runtime directory (no YOI_HOME / \
-             YOI_RUNTIME_DIR / XDG_RUNTIME_DIR / HOME)",
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared_state::WorkerSharedState;
-
-    fn test_state() -> WorkerSharedState {
-        WorkerSharedState::new(
-            "test-worker".into(),
-            session_store::new_segment_id(),
-            "[engine]\nname = \"test-worker\"".into(),
-            protocol::Greeting {
-                worker_name: "test-worker".into(),
-                cwd: "/tmp".into(),
-                provider: "anthropic".into(),
-                model: "claude".into(),
-                scope_summary: String::new(),
-                tools: Vec::new(),
-                context_window: 200_000,
-                context_tokens: 0,
-                reasoning: None,
-                context_usage: None,
-            },
-        )
-    }
 
     #[tokio::test]
-    async fn creates_directory_and_pid() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rt = RuntimeDir::create(tmp.path(), "my-worker").await.unwrap();
-
-        assert!(rt.path().join("pid").exists());
-        let pid = std::fs::read_to_string(rt.path().join("pid")).unwrap();
-        assert_eq!(pid, std::process::id().to_string());
-    }
-
-    #[tokio::test]
-    async fn write_status_creates_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rt = RuntimeDir::create(tmp.path(), "my-worker").await.unwrap();
-        let state = test_state();
-
-        rt.write_status(&state).await.unwrap();
-
-        let content = std::fs::read_to_string(rt.path().join("status.json")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed["state"], "idle");
-        assert_eq!(parsed["worker_name"], "test-worker");
-    }
-
-    #[tokio::test]
-    async fn write_status_reflects_changes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rt = RuntimeDir::create(tmp.path(), "my-worker").await.unwrap();
-        let state = test_state();
-
-        state.transition(protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
-            protocol::WorkerRunState::Running,
-        )));
-        rt.write_status(&state).await.unwrap();
-
-        let content = std::fs::read_to_string(rt.path().join("status.json")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed["state"], "running");
-    }
-
-    #[tokio::test]
-    async fn write_manifest_creates_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rt = RuntimeDir::create(tmp.path(), "my-worker").await.unwrap();
-
-        rt.write_manifest("[engine]\nname = \"test\"")
-            .await
-            .unwrap();
-
-        let content = std::fs::read_to_string(rt.path().join("manifest.toml")).unwrap();
-        assert_eq!(content, "[engine]\nname = \"test\"");
-    }
-
-    #[tokio::test]
-    async fn transient_directory_does_not_write_liveness_snapshots() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rt = RuntimeDir::create_transient(tmp.path(), "runtime-worker")
-            .await
-            .unwrap();
-
-        rt.write_status(&test_state()).await.unwrap();
-        rt.write_manifest("[worker]\nname = \"runtime-worker\"")
-            .await
-            .unwrap();
-
-        assert!(!rt.path().join("pid").exists());
-        assert!(!rt.path().join("status.json").exists());
-        assert!(!rt.path().join("manifest.toml").exists());
-    }
-
-    #[tokio::test]
-    async fn write_spawned_workers_creates_file() {
-        use manifest::{Permission, ScopeRule};
-        let tmp = tempfile::tempdir().unwrap();
-        let rt = RuntimeDir::create(tmp.path(), "my-worker").await.unwrap();
-
-        let records = vec![SpawnedWorkerRecord {
-            worker_name: "child".into(),
-            socket_path: "/run/yoi/child/sock".into(),
-            scope_delegated: vec![ScopeRule {
-                target: "/tmp/work".into(),
-                permission: Permission::Write,
-                recursive: true,
-                symlink_policy: Default::default(),
-            }],
-            callback_address: "/run/yoi/my-worker/sock".into(),
-        }];
-        rt.write_spawned_workers(&records).await.unwrap();
-
-        let content = std::fs::read_to_string(rt.path().join("spawned_workers.json")).unwrap();
-        let parsed: Vec<SpawnedWorkerRecord> = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].worker_name, "child");
-    }
-
-    #[tokio::test]
-    async fn socket_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rt = RuntimeDir::create(tmp.path(), "my-worker").await.unwrap();
-        assert_eq!(rt.socket_path(), rt.path().join("sock"));
-    }
-
-    #[tokio::test]
-    async fn drop_removes_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir_path;
+    async fn transient_controller_directory_has_no_liveness_projections_and_is_released() {
+        let root = tempfile::tempdir().unwrap();
+        let path;
         {
-            let rt = RuntimeDir::create(tmp.path(), "my-worker").await.unwrap();
-            dir_path = rt.path().to_owned();
-            assert!(dir_path.exists());
+            let runtime = RuntimeDir::create(root.path(), "worker").await.unwrap();
+            path = runtime.path().to_owned();
+            assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
         }
-        assert!(!dir_path.exists());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn preexisting_data_is_not_overwritten_or_removed_on_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("worker");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("pid"), "retained legacy data").unwrap();
+        {
+            let _runtime = RuntimeDir::create(root.path(), "worker").await.unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(path.join("pid")).unwrap(),
+            "retained legacy data"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_run_preserves_logs_and_rejects_directory_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("runs/1");
+        {
+            let _runtime = RuntimeDir::create_worker_run(&path).await.unwrap();
+            for name in ["artifacts", "spawned", "worker.out.log", "worker.err.log"] {
+                assert!(path.join(name).exists(), "missing {name}");
+            }
+        }
+        assert!(path.exists());
+        let error = RuntimeDir::create_worker_run(&path).await.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn legacy_reclamation_projection_retains_its_stored_format() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = RuntimeDir::create(root.path(), "worker").await.unwrap();
+        let record: SpawnedWorkerRecord = serde_json::from_value(serde_json::json!({
+            "worker_name": "legacy-child", "socket_path": "/old/child/sock",
+            "scope_delegated": [], "callback_address": "/old/parent/sock",
+        }))
+        .unwrap();
+        runtime.write_spawned_workers(&[record]).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(runtime.path().join("spawned_workers.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value[0]["socket_path"], "/old/child/sock");
+        assert_eq!(value[0]["callback_address"], "/old/parent/sock");
+        runtime.write_spawned_workers(&[]).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(runtime.path().join("spawned_workers.json")).unwrap(),
+            "[]"
+        );
     }
 }

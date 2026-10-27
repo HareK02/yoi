@@ -125,6 +125,8 @@ pub struct WorkdirOperationApiError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<Vec<Diagnostic>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_failures: Vec<workdir::http::WorkdirAuditFailure>,
     #[serde(skip, default = "default_repository_error_status")]
     status: u16,
     /// Server-local metadata retained by generated error response extensions, never the wire body.
@@ -156,6 +158,7 @@ impl WorkdirOperationApiError {
             code: None,
             message: error.message,
             diagnostics: Some(error.diagnostics),
+            audit_failures: Vec::new(),
             status: error.status,
             workdir_log: None,
             denial_reason: None,
@@ -170,6 +173,7 @@ impl WorkdirOperationApiError {
             code: Some(error.code),
             message: error.message,
             diagnostics: None,
+            audit_failures: Vec::new(),
             status,
             workdir_log: None,
             denial_reason: error.denial_reason,
@@ -552,8 +556,9 @@ pub struct WorkspaceWorkerSessionHistoryResponse {
 /// comparisons do not replace admission checks under the Runtime operation lock; conflicts do
 /// not trigger automatic token replacement.
 /// [`WorkerRestoreState`] Accepted means Restore committed, not that the subsequent run succeeded.
-/// Distinguish read-only preflight Rejected, confirmed RolledBack after side effects, and
-/// ReconciliationRequired needing settled-state checks. Response loss does not imply rollback.
+/// Distinguish read-only preflight Rejected, confirmed RolledBack after side effects,
+/// Superseded by a later Stop, and ReconciliationRequired needing settled-state checks.
+/// Response loss does not imply rollback.
 #[api(reqwest, axum, openapi)]
 pub trait ServerApi {
     #[get("/health", status = 200, error_status = 400)]
@@ -7593,6 +7598,9 @@ pub struct CurrentWorkerWorkdirAttachmentResponse {
     pub alias: String,
     pub working_directory_id: String,
     pub capabilities: workdir::WorkdirSessionCapabilities,
+    /// Present for attachment responses, absent after detach.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<workdir::WorkdirSessionEnvironment>,
     pub attached: bool,
 }
 
@@ -7605,7 +7613,9 @@ pub struct CurrentWorkerWorkdirOperationRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(transparent)]
-pub struct CurrentWorkerWorkdirOperationResponse(pub workdir::http::WorkdirSessionOperationResult);
+pub struct CurrentWorkerWorkdirOperationResponse(
+    pub workdir::http::WorkdirSessionOperationResponse,
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -10653,8 +10663,8 @@ pub enum WorkerOperationState {
 /// Cross-layer outcome of an explicit Worker restore operation.
 ///
 /// `Rejected` is reserved for read-only preflight failures. Once live restore
-/// work starts, failure is either a confirmed `RolledBack` operation or a
-/// `ReconciliationRequired` result whose commit state must be reread/retried.
+/// work starts, distinguish confirmed `RolledBack`, unresolved
+/// `ReconciliationRequired`, and a later Stop's `Superseded` outcome.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -10662,6 +10672,8 @@ pub enum WorkerRestoreState {
     Accepted,
     Rejected,
     RolledBack,
+    /// A later Stop superseded this restore; neither rollback nor prior Accepted is asserted.
+    Superseded,
     ReconciliationRequired,
 }
 
@@ -12759,6 +12771,7 @@ mod tests {
             (WorkerRestoreState::Accepted, "accepted"),
             (WorkerRestoreState::Rejected, "rejected"),
             (WorkerRestoreState::RolledBack, "rolled_back"),
+            (WorkerRestoreState::Superseded, "superseded"),
             (
                 WorkerRestoreState::ReconciliationRequired,
                 "reconciliation_required",
@@ -13367,6 +13380,7 @@ mod tests {
             alias: "checkout".to_string(),
             working_directory_id: "workdir".to_string(),
             capabilities: workdir::WorkdirSessionCapabilities::EMPTY,
+            environment: None,
             attached: false,
         };
         let value = serde_json::to_value(&response).unwrap();

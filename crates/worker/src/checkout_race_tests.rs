@@ -78,6 +78,12 @@ impl WorkdirSession for HookedSession {
         self.local.capabilities()
     }
 
+    fn environment(&self) -> workdir::WorkdirSessionEnvironment {
+        let mut environment = self.local.environment();
+        environment.capabilities = environment.capabilities.intersection(self.capabilities());
+        environment
+    }
+
     async fn authorize_scope_path(
         &self,
         request: WorkdirScopeAuthorizationRequest,
@@ -201,11 +207,10 @@ async fn checkout_wip_file_operations_share_core_and_keep_prior_read_boundary() 
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("text.txt"), "旧 旧\n").unwrap();
     let router = Arc::new(WorkdirSessionRouter::new());
+    let hooked = HookedSession::new(&dir);
+    assert_eq!(hooked.environment(), hooked.local.environment());
     router
-        .attach(
-            WorkdirAttachmentAlias::new("main").unwrap(),
-            HookedSession::new(&dir),
-        )
+        .attach(WorkdirAttachmentAlias::new("main").unwrap(), hooked)
         .unwrap();
     let provider = provider(router);
     let route = format!("{}/text.txt", checkout_root("main"));

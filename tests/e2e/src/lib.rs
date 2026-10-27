@@ -137,7 +137,9 @@ fn tested_yoi_env_policy_overview() -> TestedYoiEnvPolicy {
 #[derive(Debug)]
 pub enum HarnessError {
     Io(io::Error),
-    Json(serde_json::Error),
+    // Never retain decode errors: serde messages can contain rejected field names
+    // or values from private fixture/protocol payloads, including through Debug.
+    Json,
     CommandFailed {
         program: PathBuf,
         args: Vec<String>,
@@ -163,7 +165,7 @@ impl std::fmt::Display for HarnessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(err) => write!(f, "io error: {err}"),
-            Self::Json(err) => write!(f, "json error: {err}"),
+            Self::Json => write!(f, "invalid JSON document"),
             Self::CommandFailed {
                 program,
                 args,
@@ -209,8 +211,8 @@ impl From<io::Error> for HarnessError {
 }
 
 impl From<serde_json::Error> for HarnessError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
+    fn from(_: serde_json::Error) -> Self {
+        Self::Json
     }
 }
 

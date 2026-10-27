@@ -1253,7 +1253,7 @@ pub(crate) mod tests {
                     state.generation += 1;
                     let raw = json!({"alias":body["alias"], "working_directory_id":body["working_directory_id"], "connection_id":format!("connection-{}", state.generation), "capabilities":{"bits":63}});
                     state.attachments.push(raw);
-                    json!({"workspace_id":"test-workspace", "alias":body["alias"], "working_directory_id":body["working_directory_id"], "capabilities":{"bits":63}, "attached":true})
+                    json!({"workspace_id":"test-workspace", "alias":body["alias"], "working_directory_id":body["working_directory_id"], "capabilities":{"bits":63}, "environment":workdir::WorkdirSessionEnvironment::root(workdir::WorkdirSessionCapabilities::ALL), "attached":true})
                 }
                 (WorkspaceRequestMethod::Delete, p)
                     if p.starts_with("workers/self/workdir-attachments/") =>

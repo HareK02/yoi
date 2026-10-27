@@ -187,7 +187,14 @@ async fn config_call(
     runtime
         .invoke(
             path.into(),
-            if matches!(operation,"edit"|"write") {wip_protocol::InterfaceReference {scope:"/".into(),name:format!("yoi.file/{operation}-text/v1")}} else {config_interface(path)},
+            if matches!(operation, "edit" | "write") {
+                wip_protocol::InterfaceReference {
+                    scope: "/".into(),
+                    name: format!("yoi.file/{operation}-text/v1"),
+                }
+            } else {
+                config_interface(path)
+            },
             operation.into(),
             args,
             agen::tool::ToolExecutionContext::direct(),
@@ -581,11 +588,88 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for ConfigCaptureFacto
         *self.controller_abort.lock().unwrap() = Some(controller.controller_task.abort_handle());
         Ok(controller)
     }
-    async fn restore_controller(
+    async fn preflight_restore(
+        &self,
+        request: &worker_runtime::execution::WorkerExecutionRestoreRequest,
+    ) -> std::result::Result<(), String> {
+        self.inner.preflight_restore(request).await
+    }
+
+    async fn recover_restore_source(
+        &self,
+        request: &worker_runtime::execution::WorkerExecutionRestoreRequest,
+    ) -> std::result::Result<bool, worker_runtime::worker_backend::RuntimeRestoreFailure> {
+        self.inner.recover_restore_source(request).await
+    }
+
+    async fn prepare_restore(
         &self,
         request: worker_runtime::execution::WorkerExecutionRestoreRequest,
-    ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
-        self.inner.restore_controller(request).await
+    ) -> std::result::Result<
+        Box<dyn worker_runtime::worker_backend::RuntimeRestoreCandidate>,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
+        let inner = self.inner.prepare_restore(request).await?;
+        Ok(Box::new(ConfigCaptureCandidate {
+            inner,
+            client: self.client.clone(),
+            controller_abort: self.controller_abort.clone(),
+        }))
+    }
+
+    async fn cleanup_failed_restore(
+        &self,
+        request: &worker_runtime::execution::WorkerExecutionRestoreRequest,
+    ) -> std::result::Result<(), worker_runtime::worker_backend::RuntimeRestoreCleanupFailure> {
+        self.inner.cleanup_failed_restore(request).await
+    }
+
+    async fn reconcile_stopped_worker(
+        &self,
+        worker_ref: &worker_runtime::identity::WorkerRef,
+    ) -> std::result::Result<(), String> {
+        self.inner.reconcile_stopped_worker(worker_ref).await
+    }
+
+    fn activate_restored_controller(
+        &self,
+        worker_ref: &worker_runtime::identity::WorkerRef,
+        workspace_id: Option<&str>,
+        handle: &worker::WorkerHandle,
+    ) -> std::result::Result<(), String> {
+        self.inner
+            .activate_restored_controller(worker_ref, workspace_id, handle)
+    }
+}
+
+struct ConfigCaptureCandidate {
+    inner: Box<dyn worker_runtime::worker_backend::RuntimeRestoreCandidate>,
+    client: Arc<Mutex<Option<Arc<dyn worker::WorkspaceClient>>>>,
+    controller_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+}
+
+#[async_trait]
+impl worker_runtime::worker_backend::RuntimeRestoreCandidate for ConfigCaptureCandidate {
+    fn initial_state(&self) -> protocol::WorkerStateSnapshot {
+        self.inner.initial_state()
+    }
+
+    async fn activate(
+        &mut self,
+    ) -> std::result::Result<
+        worker_runtime::worker_backend::RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
+        let controller = self.inner.activate().await?;
+        *self.client.lock().unwrap() = Some(controller.workspace_client.clone());
+        *self.controller_abort.lock().unwrap() = Some(controller.controller_task.abort_handle());
+        Ok(controller)
+    }
+
+    async fn discard(
+        &mut self,
+    ) -> std::result::Result<(), worker_runtime::worker_backend::RuntimeRestoreCleanupFailure> {
+        self.inner.discard().await
     }
 }
 
@@ -714,6 +798,7 @@ async fn workspace_config_actual_remote_and_embedded_clients_use_authenticated_w
         RUNTIME_REQUEST_SOURCE_PROOF_HEADER, WORKSPACE_REQUEST_PERMISSION,
         decode_runtime_request_source_claims,
     };
+    let root = restored_parent_control_tests::connected_restore_tempdir();
     // Remote Runtime-owned HTTP adapter, including its real request signer.
     let mut fixture = manual_worker_assignment_fixture().await;
     let identity = RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id).unwrap();
@@ -793,7 +878,6 @@ async fn workspace_config_actual_remote_and_embedded_clients_use_authenticated_w
 
     // Actual embedded Runtime factory -> real Worker controller -> captured
     // production WorkspaceClient -> signed HTTP -> production Backend middleware.
-    let root = tempfile::tempdir().unwrap();
     init_clean_git_workspace(root.path());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

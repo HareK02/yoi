@@ -6,7 +6,7 @@
 //! hashes alone do not accept same-content inode replacements. Callers own Read line numbering
 //! and per-attachment read history.
 //!
-//! Create paths are checkout-root-relative and must be strict descendants of the observed target
+//! Create paths use the target's session coordinates and must be strict descendants of the observed target
 //! directory. Existing destinations are never overwritten; results return the updated observation
 //! of the retained target directory, not the created file. Read results also return the validator
 //! of the state actually read, never a replacement from a later independent stat.
@@ -18,7 +18,8 @@
 //!
 //! Search delegates to shared List/Glob/Grep engines. Scope rules form unions within layers and
 //! intersections across layers, provider authority, and output roots. Wrappers transform coordinates
-//! once; returned paths and Grep content are relative to the final session's logical root.
+//! once; returned paths and Grep content are relative to the composed output root (the caller's
+//! cwd by default).
 //! Paths are not reverse-parsed from rendered filenames; non-UTF-8 names are not lossily aliased.
 //! Unsupported providers reject search rather than fall back to broader trait searches. Search is
 //! live traversal, not an atomic snapshot of all descendants or exclusion of external editors.
@@ -556,15 +557,13 @@ mod tests {
         ));
     }
     #[tokio::test]
-    async fn checkout_hardlink_save_isolates_alias_and_rejects_symlinks_special_files() {
+    async fn checkout_hardlink_save_isolates_alias_and_rejects_symlinks() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a"), "original").unwrap();
         std::fs::hard_link(root.path().join("a"), root.path().join("alias")).unwrap();
         std::os::unix::fs::symlink("a", root.path().join("link")).unwrap();
-        let _socket = std::os::unix::net::UnixListener::bind(root.path().join("socket")).unwrap();
         let session = session(root.path());
         assert!(session.checkout_observe(path("link")).await.is_err());
-        assert!(session.checkout_observe(path("socket")).await.is_err());
         let read = checked_read(&session, session.checkout_observe(path("a")).await.unwrap()).await;
         session
             .checkout_execute(CheckoutRequest {

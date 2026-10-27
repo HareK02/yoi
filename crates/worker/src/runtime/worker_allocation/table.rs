@@ -72,7 +72,8 @@ pub struct Allocation {
     pub worker_name: String,
     /// Owning process. Checked with `kill(pid, 0)` for stale detection.
     pub pid: u32,
-    /// Worker's Unix socket path.
+    /// Legacy stored endpoint hint. Empty means the Host owns connectivity.
+    /// Allocation admission and stale reclamation use identity/PID, never this path.
     pub socket: PathBuf,
     /// Allow rules granted to this Worker (write + read).
     pub scope_allow: Vec<ScopeRule>,
@@ -245,6 +246,14 @@ impl LockFileGuard {
     /// Persist with atomic replacement while the separate allocation lock stays
     /// held. A crash exposes either the old complete table or the new one.
     pub fn save(&mut self) -> io::Result<()> {
+        let mut published = false;
+        self.save_with_publication(&mut published)
+    }
+
+    /// Report this save's rename while the caller still holds the table lock.
+    /// In-memory mutation alone is not evidence that an acquisition took place.
+    pub(super) fn save_with_publication(&mut self, published: &mut bool) -> io::Result<()> {
+        *published = false;
         let json = serde_json::to_vec_pretty(&self.data).map_err(io::Error::other)?;
         let mut temp_os = self.data_path.as_os_str().to_owned();
         temp_os.push(".tmp");
@@ -264,6 +273,7 @@ impl LockFileGuard {
             ));
         }
         fs::rename(&temp_path, &self.data_path)?;
+        *published = true;
         #[cfg(test)]
         if take_save_fault(&self.data_path, SaveFaultPoint::AfterRename) {
             return Err(io::Error::other(
@@ -336,6 +346,51 @@ mod tests {
         let guard = LockFileGuard::open(&path).unwrap();
         assert_eq!(guard.data().allocations.len(), 1);
         assert_eq!(guard.data().allocations[0].worker_name, "a");
+    }
+
+    #[test]
+    fn empty_legacy_socket_roundtrips_without_path_resolution_or_cleanup() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("workers.json");
+        let retained = root.path().join("retained-data");
+        fs::write(&retained, "do not touch").unwrap();
+        let segment = sid();
+        {
+            let mut guard = open_empty(&path);
+            register_worker(
+                &mut guard,
+                "in-process".into(),
+                std::process::id(),
+                PathBuf::new(),
+                Vec::new(),
+                segment,
+            )
+            .unwrap();
+        }
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["allocations"][0]["socket"], "");
+        let mut guard = LockFileGuard::open(&path).unwrap();
+        assert!(guard.data().allocations[0].socket.as_os_str().is_empty());
+        super::super::reclaim_stale_with(&mut guard, |pid| {
+            assert_eq!(pid, std::process::id());
+            true
+        });
+        assert_eq!(
+            guard.data().allocations.len(),
+            1,
+            "missing endpoint is not stale ownership"
+        );
+        assert!(guard.data().find_by_segment(segment).is_some());
+        super::super::reclaim_stale_with(&mut guard, |_| false);
+        drop(guard);
+        assert!(
+            LockFileGuard::open(&path)
+                .unwrap()
+                .data()
+                .allocations
+                .is_empty()
+        );
+        assert_eq!(fs::read_to_string(retained).unwrap(), "do not touch");
     }
 
     #[test]

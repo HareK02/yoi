@@ -86,6 +86,8 @@ pub enum WorkerRestoreState {
     Accepted,
     Rejected,
     RolledBack,
+    /// A later Stop superseded this restore; neither rollback nor prior Accepted is asserted.
+    Superseded,
     ReconciliationRequired,
 }
 
@@ -836,6 +838,34 @@ pub struct SessionMaterialPinResponse {
     pub pin_id: String,
 }
 
+/// One body-bearing immutable slice. The byte budget includes slice metadata,
+/// but not the enclosing availability enum or the caller's durable Job envelope.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRecordingCaptureRequest {
+    pub workspace_id: String,
+    pub source: SessionPublicSource,
+    pub expected_session_id: String,
+    pub start: session_store::capture::RecordingPosition,
+    pub max_entries: usize,
+    pub max_serialized_bytes: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum SessionRecordingCaptureAvailability {
+    NotMaterialized {
+        session_id: String,
+    },
+    Captured {
+        slice: session_store::capture::RecordingCaptureSlice,
+    },
+    Unavailable {
+        reason: SessionPublicUnavailableReason,
+        message: String,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionMaterialCatalogRequest {
@@ -1247,6 +1277,16 @@ pub trait RuntimeApi {
     ) -> Result<SessionMaterialPinResponse, RuntimeApiError>;
 
     #[post(
+        "/v1/session-public/recording-capture",
+        status = 200,
+        error_status = 400
+    )]
+    async fn session_recording_capture(
+        &self,
+        #[body] request: SessionRecordingCaptureRequest,
+    ) -> Result<SessionRecordingCaptureAvailability, RuntimeApiError>;
+
+    #[post(
         "/v1/session-public/material/catalog",
         status = 200,
         error_status = 400
@@ -1540,13 +1580,24 @@ mod tests {
         )
         .unwrap();
         assert!(request.preparation.is_none());
-        for state in [
-            "accepted",
-            "rejected",
-            "rolled_back",
-            "reconciliation_required",
+        for (state, wire) in [
+            (WorkerRestoreState::Accepted, "accepted"),
+            (WorkerRestoreState::Rejected, "rejected"),
+            (WorkerRestoreState::RolledBack, "rolled_back"),
+            (WorkerRestoreState::Superseded, "superseded"),
+            (
+                WorkerRestoreState::ReconciliationRequired,
+                "reconciliation_required",
+            ),
         ] {
-            assert!(serde_json::from_value::<WorkerRestoreState>(serde_json::json!(state)).is_ok());
+            assert_eq!(
+                serde_json::from_value::<WorkerRestoreState>(serde_json::json!(wire)).unwrap(),
+                state
+            );
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::json!(wire)
+            );
         }
         assert!(
             serde_json::from_value::<WorkerRestoreState>(serde_json::json!(
@@ -1727,6 +1778,13 @@ mod tests {
             &self,
             _request: SessionMaterialPinRequest,
         ) -> Result<SessionMaterialPinResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+
+        async fn session_recording_capture(
+            &self,
+            _request: SessionRecordingCaptureRequest,
+        ) -> Result<SessionRecordingCaptureAvailability, RuntimeApiError> {
             Err(test_error(501))
         }
 
