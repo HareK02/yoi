@@ -48742,6 +48742,12 @@ mod tests {
             std::sync::Mutex<Vec<worker_runtime::execution::WorkerLifecycleOperationId>>,
         reconcile_operations:
             std::sync::Mutex<Vec<worker_runtime::execution::WorkerLifecycleOperationId>>,
+        restore_owners: std::sync::Mutex<
+            std::collections::HashMap<
+                worker_runtime::execution::WorkerLifecycleOperationId,
+                worker_runtime::identity::WorkerRef,
+            >,
+        >,
         inputs: std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, String)>>,
         protocol_methods:
             Arc<std::sync::Mutex<Vec<(worker_runtime::identity::WorkerRef, protocol::Method)>>>,
@@ -48775,6 +48781,7 @@ mod tests {
                 restore_failure: std::sync::Mutex::new(None),
                 restore_operations: std::sync::Mutex::new(Vec::new()),
                 reconcile_operations: std::sync::Mutex::new(Vec::new()),
+                restore_owners: Default::default(),
                 inputs: std::sync::Mutex::new(Vec::new()),
                 protocol_methods: Arc::new(std::sync::Mutex::new(Vec::new())),
                 stops: std::sync::Mutex::new(Vec::new()),
@@ -48979,6 +48986,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request.operation_id);
+            self.restore_owners
+                .lock()
+                .unwrap()
+                .insert(request.operation_id, request.worker_ref.clone());
             if let Some(result) = self.restore_failure.lock().unwrap().take() {
                 return result;
             }
@@ -49012,6 +49023,21 @@ mod tests {
                 worker_state: protocol::WorkerStateSnapshot::initial(),
                 workdir_attachments,
             }
+        }
+
+        fn restore_recovery_disposition(
+            &self,
+            operation_id: worker_runtime::execution::WorkerLifecycleOperationId,
+            worker_ref: &worker_runtime::identity::WorkerRef,
+        ) -> Option<worker_runtime::execution::RestoreRecoveryDisposition> {
+            use worker_runtime::execution::RestoreRecoveryDisposition as D;
+            Some(
+                if self.restore_owners.lock().unwrap().get(&operation_id) == Some(worker_ref) {
+                    D::Continue
+                } else {
+                    D::Absent
+                },
+            )
         }
 
         fn reconcile_restore(

@@ -1,8 +1,8 @@
 {
   "tasks": {
-    "test": "deno run --allow-read --allow-write=target --allow-run --allow-env tools/test.ts",
+    "test": "deno run --allow-read --allow-write=target --allow-run --allow-env --allow-sys=uid tools/test.ts",
     "test:ticket:real-api": "cargo test -p yoi-workspace-server --lib ticket_web_roundtrip_tests -- --ignored",
-    "test:runner": "deno test --allow-read --allow-write --allow-run --allow-env tools/test.test.ts"
+    "test:runner": "deno test --allow-read --allow-write --allow-run --allow-env --allow-sys=uid tools/test.test.ts"
   },
   "fmt": {
     "proseWrap": "never"

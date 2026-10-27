@@ -617,7 +617,8 @@ impl fmt::Display for McpRequestStage {
     }
 }
 
-/// A running initialized stdio MCP client.
+/// An owned stdio MCP process, initialized by `connect` or explicitly after
+/// `spawn_uninitialized` when startup cleanup must retain it before any await.
 pub struct McpStdioClient {
     server_name: String,
     limits: McpStdioLimits,
@@ -636,6 +637,9 @@ pub struct McpStdioClient {
 
 impl McpStdioClient {
     /// Spawn, initialize, negotiate capabilities, and send notifications/initialized.
+    /// Initialization errors attempt shutdown, but this convenience API cannot
+    /// return an unreaped client on failure/cancellation. Its error is not proof
+    /// of cleanup; use `spawn_uninitialized` with retained ownership when needed.
     pub async fn connect(
         spec: McpStdioServerSpec,
         limits: McpStdioLimits,
@@ -668,6 +672,21 @@ impl McpStdioClient {
         spec: McpStdioServerSpec,
         limits: McpStdioLimits,
     ) -> Result<Self, McpClientError> {
+        Self::spawn_uninitialized(spec, limits)
+    }
+
+    /// Spawn without awaiting the handshake, so a cleanup owner can retain the
+    /// client before initialization can fail or be cancelled. Call
+    /// `initialize_with_timeout` before discovery; on error/cancellation, shut
+    /// down this same client rather than spawning a replacement.
+    ///
+    /// Once the process spawns, this returns its owner even if an expected pipe
+    /// is missing. Initialization then fails, but cleanup can still reap the
+    /// actual child rather than relying on kill-on-drop for a post-spawn error.
+    pub fn spawn_uninitialized(
+        spec: McpStdioServerSpec,
+        limits: McpStdioLimits,
+    ) -> Result<Self, McpClientError> {
         let redactor = spec.redactor();
         let mut command = Command::new(&spec.command);
         command.args(&spec.args);
@@ -688,29 +707,23 @@ impl McpStdioClient {
                 McpErrorKind::Io(redactor.redact(&err.to_string())),
             )
         })?;
-        let stdin = child.stdin.take().ok_or_else(|| {
-            McpClientError::new(
-                &spec.name,
-                McpPhase::Spawn,
-                McpErrorKind::Protocol("child stdin was not piped".into()),
-            )
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            McpClientError::new(
-                &spec.name,
-                McpPhase::Spawn,
-                McpErrorKind::Protocol("child stdout was not piped".into()),
-            )
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            McpClientError::new(
-                &spec.name,
-                McpPhase::Spawn,
-                McpErrorKind::Protocol("child stderr was not piped".into()),
-            )
-        })?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let missing_pipe = if stdin.is_none() {
+            Some("stdin")
+        } else if stdout.is_none() {
+            Some("stdout")
+        } else if stderr.is_none() {
+            Some("stderr")
+        } else {
+            None
+        };
 
-        let stdin: SharedStdin = Arc::new(Mutex::new(Some(Box::new(stdin))));
+        let stdin: SharedStdin =
+            Arc::new(Mutex::new(stdin.map(|stdin| {
+                Box::new(stdin) as Box<dyn AsyncWrite + Send + Unpin>
+            })));
         let diagnostics = Arc::new(Mutex::new(BoundedDiagnostics::new(
             spec.name.clone(),
             limits.max_diagnostic_lines,
@@ -718,16 +731,32 @@ impl McpStdioClient {
         )));
         let list_changes = Arc::new(Mutex::new(BoundedListChanged::new(spec.name.clone())));
         let (tx, rx) = mpsc::channel(16);
-        let reader_task = spawn_stdout_reader(
-            spec.name.clone(),
-            stdout,
-            stdin.clone(),
-            tx,
-            limits.clone(),
-            redactor.clone(),
-            list_changes.clone(),
-        );
-        let stderr_task = spawn_stderr_reader(stderr, diagnostics.clone(), limits.clone());
+        // Do not return an error that discards an already spawned child. Queue
+        // setup failure before reader events so initialization cannot succeed.
+        if let Some(pipe) = missing_pipe {
+            tx.try_send(ReaderEvent::Error(McpClientError::new(
+                &spec.name,
+                McpPhase::Spawn,
+                McpErrorKind::Protocol(format!("child {pipe} was not piped")),
+            )))
+            .expect("new response channel has capacity");
+        }
+        let reader_task = match stdout {
+            Some(stdout) => spawn_stdout_reader(
+                spec.name.clone(),
+                stdout,
+                stdin.clone(),
+                tx,
+                limits.clone(),
+                redactor.clone(),
+                list_changes.clone(),
+            ),
+            None => tokio::spawn(async {}),
+        };
+        let stderr_task = match stderr {
+            Some(stderr) => spawn_stderr_reader(stderr, diagnostics.clone(), limits.clone()),
+            None => tokio::spawn(async {}),
+        };
 
         Ok(Self {
             server_name: spec.name,
@@ -744,6 +773,25 @@ impl McpStdioClient {
             initialized: None,
             shutdown_started: false,
         })
+    }
+
+    /// Perform the bounded handshake on an already retained client. Failure or
+    /// cancellation does not drop or shut down the client: its owner must do so.
+    /// Do not retry initialization on a partially initialized connection.
+    pub async fn initialize_with_timeout(&mut self) -> Result<(), McpClientError> {
+        let started = Instant::now();
+        match timeout(self.limits.startup_timeout, self.initialize()).await {
+            Ok(result) => result,
+            Err(_) => Err(McpClientError::new(
+                &self.server_name,
+                McpPhase::Initialize,
+                McpErrorKind::Timeout {
+                    operation: "startup".to_string(),
+                    elapsed: started.elapsed(),
+                },
+            )
+            .with_diagnostics(self.snapshot_diagnostics().await)),
+        }
     }
 
     async fn initialize(&mut self) -> Result<(), McpClientError> {
@@ -1080,6 +1128,8 @@ impl McpStdioClient {
     }
 
     /// Close stdin and wait for process exit, falling back to terminate and kill.
+    /// Errors and cancellation retain the child for another attempt on this
+    /// client. Only confirmed reaping releases the process handle.
     pub async fn shutdown(&mut self) -> Result<ShutdownReport, McpClientError> {
         self.shutdown_started = true;
         let deadline = Instant::now() + self.limits.shutdown_timeout;
@@ -1091,64 +1141,55 @@ impl McpStdioClient {
         .await
         .is_ok();
 
-        let mut child = match self.child.take() {
-            Some(child) => child,
-            None => return Ok(ShutdownReport::already_finished()),
-        };
+        // Keep the actual process handle in the client across every await and
+        // error. Taking it before wait loses retry/reaping authority on cancel.
+        if self.child.is_none() {
+            return Ok(ShutdownReport::already_finished());
+        }
         if !closed {
             self.reader_task.abort();
-            return self.terminate_then_kill(child).await;
+            return self.terminate_then_kill().await;
         }
 
+        let child = self.child.as_mut().expect("checked child");
         if let Ok(Some(status)) = child.try_wait() {
-            self.reader_task.abort();
-            self.stderr_task.abort();
-            return Ok(ShutdownReport {
-                exit_status: Some(status),
-                terminated: false,
-                killed: false,
-            });
+            return Ok(self.finish_shutdown(status, false, false));
         }
 
         match timeout_at(deadline, child.wait()).await {
-            Ok(Ok(status)) => {
-                self.reader_task.abort();
-                self.stderr_task.abort();
-                Ok(ShutdownReport {
-                    exit_status: Some(status),
-                    terminated: false,
-                    killed: false,
-                })
-            }
+            Ok(Ok(status)) => Ok(self.finish_shutdown(status, false, false)),
             Ok(Err(err)) => Err(McpClientError::new(
                 &self.server_name,
                 McpPhase::Shutdown,
                 McpErrorKind::Io(self.redactor.redact(&err.to_string())),
             )
             .with_diagnostics(self.snapshot_diagnostics().await)),
-            Err(_) => self.terminate_then_kill(child).await,
+            Err(_) => self.terminate_then_kill().await,
         }
     }
 
-    async fn terminate_then_kill(
+    fn finish_shutdown(
         &mut self,
-        mut child: Child,
-    ) -> Result<ShutdownReport, McpClientError> {
-        let mut terminated = false;
-        let mut killed = false;
-        if send_terminate(&mut child).is_ok() {
-            terminated = true;
+        status: ExitStatus,
+        terminated: bool,
+        killed: bool,
+    ) -> ShutdownReport {
+        // No await separates confirmed reaping from releasing the handle.
+        drop(self.child.take());
+        self.reader_task.abort();
+        self.stderr_task.abort();
+        ShutdownReport {
+            exit_status: Some(status),
+            terminated,
+            killed,
         }
+    }
+
+    async fn terminate_then_kill(&mut self) -> Result<ShutdownReport, McpClientError> {
+        let child = self.child.as_mut().expect("shutdown retains child");
+        let terminated = send_terminate(child).is_ok();
         match timeout(self.limits.kill_timeout, child.wait()).await {
-            Ok(Ok(status)) => {
-                self.reader_task.abort();
-                self.stderr_task.abort();
-                Ok(ShutdownReport {
-                    exit_status: Some(status),
-                    terminated,
-                    killed,
-                })
-            }
+            Ok(Ok(status)) => Ok(self.finish_shutdown(status, terminated, false)),
             Ok(Err(err)) => Err(McpClientError::new(
                 &self.server_name,
                 McpPhase::Shutdown,
@@ -1163,7 +1204,6 @@ impl McpStdioClient {
                         McpErrorKind::Io(self.redactor.redact(&err.to_string())),
                     )
                 })?;
-                killed = true;
                 let status = timeout(self.limits.kill_timeout, child.wait())
                     .await
                     .map_err(|_| {
@@ -1183,13 +1223,7 @@ impl McpStdioClient {
                             McpErrorKind::Io(self.redactor.redact(&err.to_string())),
                         )
                     })?;
-                self.reader_task.abort();
-                self.stderr_task.abort();
-                Ok(ShutdownReport {
-                    exit_status: Some(status),
-                    terminated,
-                    killed,
-                })
+                Ok(self.finish_shutdown(status, terminated, true))
             }
         }
     }
@@ -1197,10 +1231,10 @@ impl McpStdioClient {
 
 impl Drop for McpStdioClient {
     fn drop(&mut self) {
-        if !self.shutdown_started {
-            if let Some(child) = &mut self.child {
-                let _ = child.start_kill();
-            }
+        // An attempted shutdown is not proof of exit. Errors and cancellation
+        // leave the child here so Drop must still make a best-effort kill.
+        if let Some(child) = &mut self.child {
+            let _ = child.start_kill();
         }
         self.reader_task.abort();
         self.stderr_task.abort();
@@ -1784,3 +1818,70 @@ fn send_terminate(child: &mut Child) -> Result<(), ()> {
 
 #[cfg(test)]
 mod deadline_tests;
+
+#[cfg(all(test, unix))]
+mod shutdown_retention_tests {
+    //! The real client and OS process are used; only the external server is a
+    //! local shell that acknowledges initialization and ignores TERM/EOF.
+    use super::*;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn cancelled_graceful_or_terminate_wait_retries_reaping_the_same_child() {
+        for cancel_in_fallback in [false, true] {
+            let script = r#"trap '' TERM
+read init || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"retained","version":"1"}}}'
+while :; do :; done
+"#;
+            let mut client = McpStdioClient::connect(
+                McpStdioServerSpec::new("retained", "/bin/sh").args(["-c", script]),
+                McpStdioLimits {
+                    shutdown_timeout: if cancel_in_fallback {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(30)
+                    },
+                    kill_timeout: Duration::from_secs(30),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("initialize after installing TERM handler");
+            let pid = client.child.as_ref().unwrap().id();
+            let mut shutdown = Box::pin(client.shutdown());
+            poll_fn(|cx| {
+                assert!(shutdown.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(shutdown);
+            assert_eq!(client.child.as_ref().and_then(Child::id), pid);
+            assert!(client.shutdown_started);
+
+            client.limits.shutdown_timeout = Duration::from_millis(20);
+            client.limits.kill_timeout = Duration::from_millis(50);
+            let report = timeout(Duration::from_secs(2), client.shutdown())
+                .await
+                .expect("retry bounded")
+                .expect("retry reaps original child");
+            assert!(
+                report.exit_status.is_some(),
+                "not an already-finished receipt"
+            );
+            assert!(report.killed, "TERM was ignored");
+            assert!(client.child.is_none());
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid.unwrap() as libc::pid_t, &mut status, libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD),
+                "shutdown, not a later observer, reaped the original process"
+            );
+        }
+    }
+}

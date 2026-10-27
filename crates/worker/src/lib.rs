@@ -19,6 +19,9 @@ pub mod model_client;
 mod paste_artifact_tool;
 pub mod profile_manifest;
 pub mod prompt;
+#[cfg(test)]
+#[path = "../../../tests/support/restore_environment.rs"]
+mod restore_test_environment;
 pub mod runtime;
 pub mod segment_log_sink;
 mod session_capture;
@@ -70,9 +73,10 @@ pub use session_history::{
 pub use shared_state::WorkerSharedState;
 pub use worker::{
     LocalWorkingDirectory, SubjektivSessionAttributionLifecycle, Worker, WorkerError,
-    WorkerFilesystemAuthority, WorkerRunResult, WorkerWorkspaceContext, WorkspaceBinaryRequest,
-    WorkspaceBinaryResponse, WorkspaceClient, WorkspaceClientError, WorkspaceId, WorkspaceIdError,
-    WorkspacePromptCatalogResolution, WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse,
-    WorkspaceServerOperation, WorkspaceWorkerDiscoveryRequest, apply_worker_manifest,
-    marker_workspace_client, unavailable_workspace_client,
+    WorkerFilesystemAuthority, WorkerRunResult, WorkerStartupFeatureCleanup,
+    WorkerWorkspaceContext, WorkspaceBinaryRequest, WorkspaceBinaryResponse, WorkspaceClient,
+    WorkspaceClientError, WorkspaceId, WorkspaceIdError, WorkspacePromptCatalogResolution,
+    WorkspaceRequest, WorkspaceRequestMethod, WorkspaceResponse, WorkspaceServerOperation,
+    WorkspaceWorkerDiscoveryRequest, apply_worker_manifest, marker_workspace_client,
+    unavailable_workspace_client,
 };

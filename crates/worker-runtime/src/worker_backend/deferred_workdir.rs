@@ -193,6 +193,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn short_tempdir() -> tempfile::TempDir {
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        tempfile::Builder::new()
+            .prefix("d")
+            .rand_bytes(3)
+            .tempdir_in(target)
+            .unwrap()
+    }
+
     fn read_request() -> ReadRequest {
         ReadRequest {
             path: WorkdirPath::new("README.md").unwrap(),
@@ -226,8 +241,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_cleanup_of_unopened_session_never_connects_or_follows_reused_alias() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let session = DeferredWorkdirSession::handle(
+            "old",
+            WorkdirSessionCapabilities::READ_ONLY,
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err("offline".into())
+            },
+        );
+        let router = WorkdirSessionRouter::new();
+        let alias = WorkdirAttachmentAlias::new("w").unwrap();
+        let routed = router.attach(alias.clone(), session.clone()).unwrap();
+        assert!(routed.subscribe_command_events().is_some());
+        assert!(routed.command_snapshot().is_empty());
+        router.close_all().await.unwrap();
+        router.close_all().await.unwrap();
+        assert!(router.aliases().is_empty());
+        assert!(matches!(
+            session.read(read_request()).await,
+            Err(WorkdirError::SessionClosed)
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+
+        let new_attempts = Arc::new(AtomicUsize::new(0));
+        let new_observed = new_attempts.clone();
+        let replacement = DeferredWorkdirSession::handle(
+            "new",
+            WorkdirSessionCapabilities::READ_ONLY,
+            move || {
+                new_observed.fetch_add(1, Ordering::SeqCst);
+                Err("offline".into())
+            },
+        );
+        let new_routed = router.attach(alias, replacement).unwrap();
+        // A retained old connection cannot open the replacement provider.
+        assert!(routed.read(read_request()).await.is_err());
+        assert_eq!(new_attempts.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            new_routed.read(read_request()).await,
+            Err(ref error) if matches!(error.classification_source(), WorkdirError::Unavailable(_))
+        ));
+        assert_eq!(new_attempts.load(Ordering::SeqCst), 1);
+        // Even after a failed open, cleanup must not try connecting again.
+        router.close_all().await.unwrap();
+        assert_eq!(new_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn failed_open_retries_on_use_and_keeps_read_only_capabilities() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = short_tempdir();
         std::fs::write(temp.path().join("README.md"), "restored").unwrap();
         let root = temp.path().to_path_buf();
         let attempts = Arc::new(AtomicUsize::new(0));

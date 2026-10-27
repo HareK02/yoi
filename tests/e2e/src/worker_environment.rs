@@ -1,3 +1,6 @@
+#[path = "worker_environment/response_loss.rs"]
+mod response_loss;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -13,12 +16,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    FixtureAllocation, HarnessError, Result, allocate_fixture, command_display,
-    current_target_profile_dir, now_ms, test_profile, workspace_root, yoi_binary_info,
+    FixtureAllocation, HarnessError, Result, allocate_fixture, command_display, now_ms,
+    product_target_dir, test_profile, workspace_root,
 };
 
 const STARTUP_WAIT: Duration = Duration::from_secs(15);
 const EXIT_WAIT: Duration = Duration::from_secs(5);
+const SETUP_WAIT: Duration = Duration::from_secs(15);
 const HTTP_WAIT_STEP: Duration = Duration::from_millis(50);
 const MAX_PROCESS_LOG_BYTES: usize = 256 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
@@ -61,21 +65,19 @@ pub fn worker_binary_provider_info() -> Result<WorkerBinaryProviderInfo> {
 fn resolve_worker_binaries() -> Result<WorkerBinaryProviderInfo> {
     let workspace_root = workspace_root()?;
     let profile = test_profile();
-    let yoi = yoi_binary_info()?;
-    let mut records = vec![binary_record(
-        "yoi",
-        yoi.binary,
-        yoi.provider,
-        yoi.build_command,
-    )?];
-
+    let mut records = Vec::new();
+    let yoi_override = resolve_override("YOI_E2E_BIN", &workspace_root)?;
     let server_override = resolve_override("YOI_E2E_SERVER_BIN", &workspace_root)?;
     let runtime_override = resolve_override("YOI_E2E_RUNTIME_BIN", &workspace_root)?;
     let mut build_command = None;
-    if server_override.is_none() || runtime_override.is_none() {
+    if yoi_override.is_none() || server_override.is_none() || runtime_override.is_none() {
         let cargo = PathBuf::from(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
         let mut args = vec![
             "build".to_string(),
+            "-p".to_string(),
+            "yoi".to_string(),
+            "--bin".to_string(),
+            "yoi".to_string(),
             "-p".to_string(),
             "yoi-workspace-server".to_string(),
             "--bin".to_string(),
@@ -84,6 +86,8 @@ fn resolve_worker_binaries() -> Result<WorkerBinaryProviderInfo> {
             "worker-runtime".to_string(),
             "--bin".to_string(),
             "yoi-runtime".to_string(),
+            "--target-dir".to_string(),
+            product_target_dir()?.to_string_lossy().into_owned(),
         ];
         if profile == "release" {
             args.push("--release".to_string());
@@ -106,7 +110,16 @@ fn resolve_worker_binaries() -> Result<WorkerBinaryProviderInfo> {
         build_command = Some(rendered);
     }
 
-    let profile_dir = current_target_profile_dir()?;
+    let profile_dir = product_target_dir()?.join(&profile);
+    let (yoi_path, yoi_provider, yoi_build) = match yoi_override {
+        Some(path) => (path, "YOI_E2E_BIN".to_string(), None),
+        None => (
+            profile_dir.join(executable_name("yoi")),
+            "cargo-build".to_string(),
+            build_command.clone(),
+        ),
+    };
+    records.push(binary_record("yoi", yoi_path, yoi_provider, yoi_build)?);
     let (server_path, server_provider, server_build) = match server_override {
         Some(path) => (path, "YOI_E2E_SERVER_BIN".to_string(), None),
         None => (
@@ -196,6 +209,17 @@ fn executable_name(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum WorkerProcessShutdownOutcome {
+    #[default]
+    NotStarted,
+    Succeeded,
+    Failed {
+        error: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerEnvironmentCleanupReport {
     pub fixture_root: PathBuf,
@@ -204,6 +228,10 @@ pub struct WorkerEnvironmentCleanupReport {
     pub cleanup_success: bool,
     pub fixture_root_exists_after: bool,
     pub cleanup_error: Option<String>,
+    pub runtime_shutdown: WorkerProcessShutdownOutcome,
+    pub server_shutdown: WorkerProcessShutdownOutcome,
+    pub root_cleanup_success: bool,
+    pub root_cleanup_error: Option<String>,
     pub report_path: PathBuf,
 }
 
@@ -231,9 +259,15 @@ pub struct WorkerE2eEnvironment {
     pub runtime_url: Option<String>,
     server: Option<ManagedProcess>,
     runtime: Option<ManagedProcess>,
+    runtime_shutdown: WorkerProcessShutdownOutcome,
+    server_shutdown: WorkerProcessShutdownOutcome,
+    shutdown_error: Option<String>,
+    runtime_public_identity: Option<Value>,
     access_token: Option<String>,
     client: Client,
     binaries: WorkerBinaryProviderInfo,
+    #[cfg(feature = "restore-checkpoints")]
+    restore_checkpoint_config: Option<PathBuf>,
 }
 
 impl WorkerE2eEnvironment {
@@ -292,12 +326,54 @@ impl WorkerE2eEnvironment {
             runtime_url: None,
             server: None,
             runtime: None,
+            runtime_shutdown: WorkerProcessShutdownOutcome::NotStarted,
+            server_shutdown: WorkerProcessShutdownOutcome::NotStarted,
+            shutdown_error: None,
+            runtime_public_identity: None,
             access_token: None,
             client,
             binaries,
+            #[cfg(feature = "restore-checkpoints")]
+            restore_checkpoint_config: None,
         };
         environment.write_metadata("created")?;
         Ok(environment)
+    }
+
+    /// Select the separately built test-enabled Runtime for this environment
+    /// only. The checkpoint file must already belong to its isolated root.
+    #[cfg(feature = "restore-checkpoints")]
+    pub fn use_checkpoint_runtime(&mut self, binary: PathBuf, config: &Path) -> Result<()> {
+        if self.runtime.is_some() || self.server.is_some() {
+            return Err(HarnessError::Protocol(
+                "checkpoint selection requires an unstarted environment".into(),
+            ));
+        }
+        let config = config.canonicalize()?;
+        if !config.starts_with(self.root.canonicalize()?) || !config.is_file() {
+            return Err(HarnessError::Protocol(
+                "checkpoint config is outside the owned environment".into(),
+            ));
+        }
+        let record = binary_record(
+            "yoi-runtime",
+            binary.canonicalize()?,
+            "restore-checkpoints-opt-in".into(),
+            None,
+        )?;
+        let runtime = self
+            .binaries
+            .binaries
+            .iter_mut()
+            .find(|record| record.name == "yoi-runtime")
+            .ok_or_else(|| HarnessError::Protocol("missing Runtime binary record".into()))?;
+        *runtime = record;
+        self.restore_checkpoint_config = Some(config);
+        fs::write(
+            self.artifacts_dir.join("binary-provider.json"),
+            serde_json::to_vec_pretty(&self.binaries)?,
+        )?;
+        Ok(())
     }
 
     pub fn start(&mut self) -> Result<()> {
@@ -319,8 +395,9 @@ impl WorkerE2eEnvironment {
                 "Backend-only restart requires a running Server and no Runtime".to_string(),
             ));
         }
-        if let Some(mut server) = self.server.take() {
-            server.shutdown(EXIT_WAIT)?;
+        shutdown_process(&mut self.server, &mut self.server_shutdown);
+        if let WorkerProcessShutdownOutcome::Failed { error } = &self.server_shutdown {
+            return Err(HarnessError::Protocol(error.clone()));
         }
         self.server_url = None;
         self.start_server_process()
@@ -374,6 +451,47 @@ impl WorkerE2eEnvironment {
         Ok(())
     }
 
+    /// Start a store populated by the Backend's typed test-support API. The seed
+    /// supplies fixed catalog IDs, but the bearer must be freshly issued for this
+    /// environment. No database mutation or fixture credential import occurs here.
+    pub fn start_seeded_backend(
+        &mut self,
+        workspace_id: String,
+        runtime_id: String,
+        access_token: String,
+    ) -> Result<()> {
+        if self.server.is_some() || self.runtime.is_some() || self.workspace_id.is_some() {
+            return Err(HarnessError::Protocol(
+                "fixture seed requires an unstarted environment".into(),
+            ));
+        }
+        if workspace_id.is_empty() || runtime_id.is_empty() || access_token.is_empty() {
+            return Err(HarnessError::Protocol(
+                "fixture seed omitted an identity or fresh bearer".into(),
+            ));
+        }
+        if !self.server_data_dir.join("server.db").is_file() {
+            return Err(HarnessError::Protocol(
+                "typed Backend seed has not created server.db".into(),
+            ));
+        }
+        if self.runtime_public_identity.is_some() {
+            if self.runtime_id != runtime_id {
+                return Err(HarnessError::Protocol(
+                    "seeded Runtime ID differs from initialized identity".into(),
+                ));
+            }
+        } else {
+            assert_absent_or_empty(&self.runtime_data_dir, "Runtime data directory")?;
+        }
+        self.workspace_id = Some(workspace_id);
+        self.runtime_id = runtime_id;
+        self.access_token = Some(access_token);
+        self.start_server_process()?;
+        self.export_workspace_public_identity()?;
+        self.write_metadata("seeded-backend-running")
+    }
+
     pub fn start_backend(&mut self) -> Result<()> {
         self.start_empty_backend()?;
         let server_binary = self.binaries.binary("yoi-server")?;
@@ -417,7 +535,15 @@ impl WorkerE2eEnvironment {
             "create Workspace",
         )?;
         let workspace_id = json_string(&created, "/workspace/workspace_id")?;
-        self.workspace_id = Some(workspace_id.clone());
+        self.workspace_id = Some(workspace_id);
+        self.export_workspace_public_identity()?;
+        self.write_metadata("backend-running")?;
+        Ok(())
+    }
+
+    fn export_workspace_public_identity(&self) -> Result<()> {
+        let server_url = self.required_server_url()?;
+        let workspace_id = self.required_workspace_id()?;
         let identity = self.request_json(
             self.client.get(format!(
                 "{server_url}/api/w/{workspace_id}/settings/signing-identity"
@@ -429,17 +555,27 @@ impl WorkerE2eEnvironment {
         })?;
         let bundle_path = self.root.join("workspace-public-identity.json");
         fs::write(&bundle_path, serde_json::to_vec_pretty(&public_bundle)?)?;
-        self.write_metadata("backend-running")?;
         Ok(())
     }
 
     fn start_runtime(&mut self) -> Result<()> {
-        let bundle_path = self.root.join("workspace-public-identity.json");
-        let server_url = self.required_server_url()?.to_string();
-        let workspace_id = self.required_workspace_id()?.to_string();
-        let runtime_binary = self.binaries.binary("yoi-runtime")?;
+        self.start_runtime_with_seed(|_| Ok(()))?;
+        self.assert_connected_and_empty()
+    }
+
+    /// Generate fresh keys before offline Backend registration when fixed IDs are
+    /// required. Returns only the public bundle; no fixture keys are accepted.
+    pub fn initialize_runtime_identity(&mut self, runtime_id: String) -> Result<Value> {
+        if self.runtime_public_identity.is_some() || self.runtime.is_some() {
+            return Err(HarnessError::Protocol(
+                "Runtime identity is already initialized".into(),
+            ));
+        }
+        assert_absent_or_empty(&self.runtime_data_dir, "Runtime data directory")?;
+        self.runtime_id = runtime_id;
+        let binary = self.binaries.binary("yoi-runtime")?;
         self.run_command(
-            &runtime_binary,
+            &binary,
             &[
                 "identity",
                 "init",
@@ -450,8 +586,8 @@ impl WorkerE2eEnvironment {
             ],
             false,
         )?;
-        let runtime_identity = self.run_command(
-            &runtime_binary,
+        let identity = self.run_command(
+            &binary,
             &[
                 "identity",
                 "show",
@@ -461,7 +597,26 @@ impl WorkerE2eEnvironment {
             ],
             false,
         )?;
-        let runtime_identity: Value = serde_json::from_slice(&runtime_identity.stdout)?;
+        let identity: Value = serde_json::from_slice(&identity.stdout)?;
+        self.runtime_public_identity = Some(identity.clone());
+        Ok(identity)
+    }
+
+    /// Initialize fresh Runtime keys/trust, then invoke the typed Runtime seed
+    /// before starting its process. The actual Backend URL is now available.
+    pub fn start_runtime_with_seed(
+        &mut self,
+        seed: impl FnOnce(&Self) -> Result<()>,
+    ) -> Result<()> {
+        if self.runtime.is_some() {
+            return Err(HarnessError::Protocol("Runtime is already running".into()));
+        }
+        if self.runtime_public_identity.is_none() {
+            self.initialize_runtime_identity(self.runtime_id.clone())?;
+        }
+        let bundle_path = self.root.join("workspace-public-identity.json");
+        let workspace_id = self.required_workspace_id()?.to_string();
+        let runtime_binary = self.binaries.binary("yoi-runtime")?;
         self.run_command(
             &runtime_binary,
             &[
@@ -497,6 +652,22 @@ impl WorkerE2eEnvironment {
             ));
         }
 
+        seed(self)?;
+        self.write_metadata("runtime-seeded")?;
+        self.start_runtime_process()
+    }
+
+    fn start_runtime_process(&mut self) -> Result<()> {
+        if self.runtime.is_some() {
+            return Err(HarnessError::Protocol("Runtime is already running".into()));
+        }
+        let runtime_binary = self.binaries.binary("yoi-runtime")?;
+        let runtime_identity = self
+            .runtime_public_identity
+            .clone()
+            .ok_or_else(|| HarnessError::Protocol("Runtime identity is not initialized".into()))?;
+        let server_url = self.required_server_url()?.to_string();
+        let workspace_id = self.required_workspace_id()?.to_string();
         let mut command = self.isolated_command(&runtime_binary);
         command.args([
             "--bind",
@@ -508,6 +679,10 @@ impl WorkerE2eEnvironment {
             "--fs-root",
             self.runtime_data_dir.to_string_lossy().as_ref(),
         ]);
+        #[cfg(feature = "restore-checkpoints")]
+        if let Some(config) = self.restore_checkpoint_config.take() {
+            command.arg("--test-restore-checkpoint").arg(config);
+        }
         let runtime = ManagedProcess::spawn(
             "runtime",
             command,
@@ -519,22 +694,86 @@ impl WorkerE2eEnvironment {
         self.runtime = Some(runtime);
         self.runtime_url = Some(runtime_url.clone());
 
+        let registered = self.request_json(
+            self.client
+                .get(format!("{server_url}/api/w/{workspace_id}/runtimes")),
+            "observe Runtime registration before endpoint update",
+        )?;
+        let expected_binding_id = registered
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("runtime_id").and_then(Value::as_str) == Some(self.runtime_id.as_str())
+                })
+            })
+            .and_then(|item| item.pointer("/management/binding/binding_id"))
+            .cloned();
         self.request_json(
             self.client
                 .post(format!("{server_url}/api/w/{workspace_id}/runtimes"))
                 .json(&serde_json::json!({
                     "public_bundle": runtime_identity,
                     "display_name": format!("E2E {}", self.runtime_id),
-                    "endpoint": runtime_url
+                    "endpoint": runtime_url,
+                    "expected_binding_id": expected_binding_id,
                 })),
             "register Runtime",
         )?;
-        self.assert_connected_and_empty()?;
+        self.assert_connected()?;
         self.write_metadata("running")?;
         Ok(())
     }
 
-    pub fn assert_connected_and_empty(&self) -> Result<()> {
+    /// Kill/reap only the Runtime child owned by this environment, retaining roots
+    /// and identities. Restart neither seeds storage nor rotates restore requests.
+    pub fn crash_and_restart_runtime(&mut self) -> Result<()> {
+        self.crash_runtime()?;
+        self.start_runtime_process()
+    }
+
+    /// Leave the owned Runtime reaped and offline for read-only canonical crash
+    /// inspection before restart. No root, identity or request is recreated.
+    pub fn crash_runtime(&mut self) -> Result<()> {
+        let runtime = self
+            .runtime
+            .as_mut()
+            .ok_or_else(|| HarnessError::Protocol("Runtime is not running".into()))?;
+        let pid = runtime.id();
+        let status = runtime.kill_and_reap(EXIT_WAIT)?;
+        runtime.join_readers_until(Instant::now() + EXIT_WAIT)?;
+        fs::write(
+            self.artifacts_dir.join("runtime-crash.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "owned_pid": pid, "reaped": true, "exit_status": status.to_string(),
+                "same_runtime_id": self.runtime_id,
+            }))?,
+        )?;
+        self.runtime.take();
+        for stream in ["stdout", "stderr"] {
+            fs::rename(
+                self.artifacts_dir.join(format!("runtime.{stream}.log")),
+                self.artifacts_dir
+                    .join(format!("runtime-before-crash.{stream}.log")),
+            )?;
+        }
+        self.runtime_url = None;
+        self.runtime_shutdown = WorkerProcessShutdownOutcome::NotStarted;
+        Ok(())
+    }
+
+    /// Restart the previously initialized identity without seed or checkpoint flags.
+    #[cfg(feature = "restore-checkpoints")]
+    pub fn restart_runtime_after_crash(&mut self) -> Result<()> {
+        if self.runtime.is_some() || self.runtime_public_identity.is_none() {
+            return Err(HarnessError::Protocol(
+                "Runtime is not an offline initialized child".into(),
+            ));
+        }
+        self.start_runtime_process()
+    }
+
+    pub fn assert_connected(&self) -> Result<()> {
         let server_url = self.required_server_url()?;
         let workspace_id = self.required_workspace_id()?;
         // connection testは実署名要求。保存済みの接続flagを認証成功の代わりにしない。
@@ -545,47 +784,188 @@ impl WorkerE2eEnvironment {
             )),
             "verify Runtime connection",
         )?;
-        if connection.get("status").and_then(Value::as_str) != Some("compatible") {
-            return Err(HarnessError::Protocol(format!(
-                "Runtime connection was not compatible: {connection}"
-            )));
-        }
+        require_compatible_connection(&connection)?;
         let binding_id = json_string(&connection, "/binding_id")?;
         let runtimes = self.request_json(
             self.client
                 .get(format!("{server_url}/api/w/{workspace_id}/runtimes")),
             "list Runtimes",
         )?;
-        let connected = runtimes
-            .get("items")
-            .and_then(Value::as_array)
-            .is_some_and(|items| {
-                items.iter().any(|item| {
-                    item.get("runtime_id").and_then(Value::as_str) == Some(self.runtime_id.as_str())
-                        && item
-                            .pointer("/management/binding/binding_id")
-                            .and_then(Value::as_str)
-                            == Some(binding_id.as_str())
-                })
-            });
-        if !connected {
-            return Err(HarnessError::Protocol(format!(
-                "Runtime {} is not verified in {runtimes}",
-                self.runtime_id
-            )));
-        }
-        let workers = self.request_json(
+        require_registered_runtime(&runtimes, &self.runtime_id, &binding_id)
+    }
+
+    pub fn list_workers(&self) -> Result<Value> {
+        let server_url = self.required_server_url()?;
+        let workspace_id = self.required_workspace_id()?;
+        self.request_json(
             self.client
                 .get(format!("{server_url}/api/w/{workspace_id}/workers")),
             "list Workers",
+        )
+    }
+
+    pub fn assert_connected_and_empty(&self) -> Result<()> {
+        self.assert_connected()?;
+        let workers = self.list_workers()?;
+        require_empty_worker_list(&workers)
+    }
+
+    fn worker_url(&self, worker_id: &str, suffix: &str) -> Result<String> {
+        let mut url = reqwest::Url::parse(self.required_server_url()?)
+            .map_err(|error| HarnessError::Protocol(format!("invalid Server URL: {error}")))?;
+        url.path_segments_mut()
+            .map_err(|_| HarnessError::Protocol("Server URL has no path segments".into()))?
+            .extend([
+                "api",
+                "w",
+                self.required_workspace_id()?,
+                "runtimes",
+                &self.runtime_id,
+                "workers",
+                worker_id,
+            ]);
+        if !suffix.is_empty() {
+            url.path_segments_mut().unwrap().extend(suffix.split('/'));
+        }
+        Ok(url.into())
+    }
+
+    pub fn worker_detail(&self, worker_id: &str) -> Result<Value> {
+        self.request_json(
+            self.client.get(self.worker_url(worker_id, "")?),
+            "read Worker detail",
+        )
+    }
+
+    /// Exactly one restore submission. No retries, replacement token or new intent.
+    pub fn restore_worker(
+        &self,
+        worker_id: &str,
+        request_id: &str,
+        expected_observation_token: &str,
+    ) -> Result<Value> {
+        self.request_json(
+            self.client
+                .post(self.worker_url(worker_id, "restore")?)
+                .timeout(STARTUP_WAIT)
+                .json(&serde_json::json!({
+                    "request_id": request_id,
+                    "expected_observation_token": expected_observation_token,
+                })),
+            "restore Worker",
+        )
+    }
+
+    /// Build one authenticated call that may run in a scoped test thread while
+    /// the owner observes a checkpoint. The HTTP request deadline bounds joining
+    /// that thread even on test failure; credentials never enter artifacts.
+    #[cfg(feature = "restore-checkpoints")]
+    pub fn pending_restore_call(
+        &self,
+        worker_id: &str,
+        request_id: &str,
+        expected_observation_token: &str,
+    ) -> Result<impl FnOnce() -> Result<Value> + Send + 'static + use<>> {
+        let token = self.access_token.as_deref().ok_or_else(|| {
+            HarnessError::Protocol("Backend access token is not initialized".into())
+        })?;
+        let request = self
+            .client
+            .post(self.worker_url(worker_id, "restore")?)
+            .bearer_auth(token)
+            .timeout(STARTUP_WAIT)
+            .json(&serde_json::json!({"request_id": request_id,
+                "expected_observation_token": expected_observation_token}))
+            .build()
+            .map_err(|_| HarnessError::Protocol("build pending restore request".into()))?;
+        let client = self.client.clone();
+        Ok(move || {
+            let response = client
+                .execute(request)
+                .map_err(|_| HarnessError::Protocol("pending restore transport failed".into()))?;
+            decode_api_response(response, "pending restore")
+        })
+    }
+
+    /// Forward one unchanged public restore request through an owned loopback
+    /// relay, consume its complete upstream response, and close without delivering
+    /// any response bytes. The returned JSON is relay evidence, not caller success.
+    pub fn restore_worker_losing_response(
+        &self,
+        worker_id: &str,
+        request_id: &str,
+        expected_observation_token: &str,
+    ) -> Result<Value> {
+        let token = self.access_token.as_deref().ok_or_else(|| {
+            HarnessError::Protocol("Backend access token is not initialized".into())
+        })?;
+        let request = self
+            .client
+            .post(self.worker_url(worker_id, "restore")?)
+            .bearer_auth(token)
+            .header(reqwest::header::CONNECTION, "close")
+            .timeout(STARTUP_WAIT + EXIT_WAIT)
+            .json(&serde_json::json!({
+                "request_id": request_id,
+                "expected_observation_token": expected_observation_token,
+            }))
+            .build()
+            .map_err(|_| HarnessError::Protocol("build response-loss request".into()))?;
+        let evidence = response_loss::drop_response(&self.client, request)?;
+        self.append_operation(
+            "restore response consumed by relay, caller transport failed",
+            0,
         )?;
-        if workers
-            .get("items")
-            .and_then(Value::as_array)
-            .is_none_or(|items| !items.is_empty())
-        {
+        Ok(evidence)
+    }
+
+    pub fn stop_worker(&self, worker_id: &str) -> Result<Value> {
+        self.request_json(
+            self.client
+                .post(self.worker_url(worker_id, "stop")?)
+                .json(&serde_json::json!({})),
+            "stop Worker",
+        )
+    }
+
+    /// Authorization stays in memory; callers must not persist or debug this request.
+    pub fn worker_protocol_request(&self, worker_id: &str) -> Result<reqwest::blocking::Request> {
+        let token = self.access_token.as_deref().ok_or_else(|| {
+            HarnessError::Protocol("Backend access token is not initialized".into())
+        })?;
+        self.client
+            .get(self.worker_url(worker_id, "protocol/ws")?)
+            .bearer_auth(token)
+            .build()
+            .map_err(|_| HarnessError::Protocol("build Worker protocol request".into()))
+    }
+
+    /// The other environment must reject this environment's fresh bearer even
+    /// when both contain identical Workspace/Runtime/Worker IDs. Never logs tokens.
+    pub fn assert_authentication_isolated_from(&self, other: &Self) -> Result<()> {
+        let token = self
+            .access_token
+            .as_deref()
+            .ok_or_else(|| HarnessError::Protocol("missing source bearer".into()))?;
+        if other.access_token.as_deref() == Some(token) {
+            return Err(HarnessError::Protocol(
+                "environments share authentication material".into(),
+            ));
+        }
+        let (server, workspace) = other.backend_target()?;
+        let response = self
+            .client
+            .get(format!("{server}/api/w/{workspace}/workers"))
+            .bearer_auth(token)
+            .send()
+            .map_err(|_| {
+                HarnessError::Protocol("cross-environment authorization request failed".into())
+            })?;
+        let status = response.status().as_u16();
+        other.append_operation("reject other environment bearer", status)?;
+        if status != 401 {
             return Err(HarnessError::Protocol(format!(
-                "fresh Worker list is not empty: {workers}"
+                "cross-environment bearer was not rejected with 401: {status}"
             )));
         }
         Ok(())
@@ -636,7 +1016,7 @@ impl WorkerE2eEnvironment {
                     "assignee": null,
                     "readiness": null,
                     "risk_flags": [],
-                    "workflow_state": "planning",
+                    "workflow_state": "open",
                     "queued_by": null,
                     "queued_at": null,
                     "repository_key": null,
@@ -697,30 +1077,53 @@ impl WorkerE2eEnvironment {
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
-        if let Some(mut runtime) = self.runtime.take() {
-            runtime.shutdown(EXIT_WAIT)?;
+        // 一方の異常でも他方を回収し、再呼出しやroot削除で失敗を消さない。
+        shutdown_process(&mut self.runtime, &mut self.runtime_shutdown);
+        shutdown_process(&mut self.server, &mut self.server_shutdown);
+        let mut errors = Vec::new();
+        for (name, outcome) in [
+            ("Runtime", &self.runtime_shutdown),
+            ("Server", &self.server_shutdown),
+        ] {
+            if let WorkerProcessShutdownOutcome::Failed { error } = outcome {
+                errors.push(format!("{name}: {error}"));
+            }
         }
-        if let Some(mut server) = self.server.take() {
-            server.shutdown(EXIT_WAIT)?;
+        if self.write_metadata("stopped").is_err() {
+            errors.push("write stopped metadata failed".to_string());
         }
-        self.write_metadata("stopped")?;
-        Ok(())
+        if self.shutdown_error.is_none() && !errors.is_empty() {
+            self.shutdown_error = Some(errors.join("; "));
+        }
+        match &self.shutdown_error {
+            Some(error) => Err(HarnessError::Protocol(error.clone())),
+            None => Ok(()),
+        }
     }
 
     pub fn cleanup(mut self) -> Result<WorkerEnvironmentCleanupReport> {
-        self.shutdown()?;
         self.cleanup_inner(true)
     }
 
     fn cleanup_inner(&mut self, strict: bool) -> Result<WorkerEnvironmentCleanupReport> {
-        let mut cleanup_error = None;
+        let _ = self.shutdown();
+        let mut root_cleanup_error = None;
         if let Some(temp_root) = self.temp_root.take()
-            && let Err(error) = temp_root.close()
+            && temp_root.close().is_err()
         {
-            cleanup_error = Some(error.to_string());
+            root_cleanup_error = Some("remove fixture root failed".to_string());
         }
         let fixture_root_exists_after = self.root.exists();
-        let cleanup_success = cleanup_error.is_none() && !fixture_root_exists_after;
+        if fixture_root_exists_after && root_cleanup_error.is_none() {
+            root_cleanup_error = Some("fixture root still exists".to_string());
+        }
+        let root_cleanup_success = root_cleanup_error.is_none() && !fixture_root_exists_after;
+        let cleanup_error = match (&self.shutdown_error, &root_cleanup_error) {
+            (Some(shutdown), Some(root)) => Some(format!("{shutdown}; {root}")),
+            (Some(error), _) | (_, Some(error)) => Some(error.clone()),
+            (None, None) => None,
+        };
+        let cleanup_success = self.shutdown_error.is_none() && root_cleanup_success;
         let report = WorkerEnvironmentCleanupReport {
             fixture_root: self.root.clone(),
             artifacts_dir: self.artifacts_dir.clone(),
@@ -728,6 +1131,10 @@ impl WorkerE2eEnvironment {
             cleanup_success,
             fixture_root_exists_after,
             cleanup_error,
+            runtime_shutdown: self.runtime_shutdown.clone(),
+            server_shutdown: self.server_shutdown.clone(),
+            root_cleanup_success,
+            root_cleanup_error,
             report_path: self.artifacts_dir.join("cleanup.json"),
         };
         fs::write(&report.report_path, serde_json::to_vec_pretty(&report)?)?;
@@ -773,18 +1180,8 @@ impl WorkerE2eEnvironment {
         let response = request
             .send()
             .map_err(|error| HarnessError::Protocol(format!("{operation}: {error}")))?;
-        let status = response.status();
-        let body = response
-            .bytes()
-            .map_err(|error| HarnessError::Protocol(format!("{operation}: {error}")))?;
-        self.append_operation(operation, status.as_u16())?;
-        if !status.is_success() {
-            return Err(HarnessError::Protocol(format!(
-                "{operation} returned {status}: {}",
-                bounded_text(&body, MAX_COMMAND_OUTPUT_BYTES)
-            )));
-        }
-        serde_json::from_slice(&body).map_err(HarnessError::from)
+        self.append_operation(operation, response.status().as_u16())?;
+        decode_api_response(response, operation)
     }
 
     fn append_operation(&self, operation: &str, status: u16) -> Result<()> {
@@ -810,12 +1207,32 @@ impl WorkerE2eEnvironment {
         args: &[&str],
         redact_stdout: bool,
     ) -> Result<std::process::Output> {
+        self.run_command_with_timeout(binary, args, redact_stdout, SETUP_WAIT)
+    }
+
+    fn run_command_with_timeout(
+        &self,
+        binary: &Path,
+        args: &[&str],
+        redact_stdout: bool,
+        timeout: Duration,
+    ) -> Result<std::process::Output> {
         let args_owned = args
             .iter()
             .map(|arg| (*arg).to_string())
             .collect::<Vec<_>>();
         let mut command = self.isolated_command(binary);
-        let output = command.args(args).output()?;
+        command.args(args).stdin(Stdio::null());
+        // credentialを含むstdoutは呼出元へだけ返す。raw fileは作らない。
+        let mut process = ManagedProcess::spawn_captured(
+            "setup command",
+            command,
+            None,
+            None,
+            MAX_COMMAND_OUTPUT_BYTES + 1,
+        )?;
+        let result = process.collect_output(timeout);
+        let output = result.as_ref().ok();
         let mut log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -826,17 +1243,21 @@ impl WorkerE2eEnvironment {
                 "ts_ms": now_ms(),
                 "binary": binary,
                 "args": args,
-                "status": output.status.code(),
+                "status": output.and_then(|output| output.status.code()),
                 "stdout": if redact_stdout {
                     "<redacted>".to_string()
                 } else {
-                    bounded_text(&output.stdout, MAX_COMMAND_OUTPUT_BYTES)
+                    output.map(|output| bounded_text(&output.stdout, MAX_COMMAND_OUTPUT_BYTES))
+                        .unwrap_or_default()
                 },
-                "stderr": bounded_text(&output.stderr, MAX_COMMAND_OUTPUT_BYTES),
+                "stderr": output.map(|output| bounded_text(&output.stderr, MAX_COMMAND_OUTPUT_BYTES))
+                    .unwrap_or_default(),
+                "error": result.as_ref().err().map(ToString::to_string),
                 "env_clear": true,
             }),
         )?;
         writeln!(log)?;
+        let output = result?;
         if !output.status.success() {
             return Err(HarnessError::CommandFailed {
                 program: binary.to_path_buf(),
@@ -908,16 +1329,52 @@ impl WorkerE2eEnvironment {
     }
 }
 
+// The operation is a caller-owned static label, never a response field. Refused
+// response bodies may contain secrets; do not even collect them for diagnostics.
+fn decode_api_response(response: reqwest::blocking::Response, operation: &str) -> Result<Value> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(HarnessError::Protocol(format!(
+            "{operation} returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+    let mut body = std::io::Read::take(response, MAX_COMMAND_OUTPUT_BYTES as u64 + 1);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut body, &mut bytes)
+        .map_err(|_| HarnessError::Protocol(format!("{operation}: response read failed")))?;
+    if bytes.len() > MAX_COMMAND_OUTPUT_BYTES {
+        return Err(HarnessError::Protocol(format!(
+            "{operation}: response byte budget exceeded"
+        )));
+    }
+    serde_json::from_slice(&bytes).map_err(HarnessError::from)
+}
+
 impl Drop for WorkerE2eEnvironment {
     fn drop(&mut self) {
-        if let Some(mut runtime) = self.runtime.take() {
-            let _ = runtime.shutdown(EXIT_WAIT);
-        }
-        if let Some(mut server) = self.server.take() {
-            let _ = server.shutdown(EXIT_WAIT);
-        }
         if self.temp_root.is_some() {
             let _ = self.cleanup_inner(false);
+        } else if self.runtime.is_some() || self.server.is_some() {
+            let _ = self.shutdown();
+        }
+    }
+}
+
+fn shutdown_process(
+    process: &mut Option<ManagedProcess>,
+    outcome: &mut WorkerProcessShutdownOutcome,
+) {
+    if let Some(mut process) = process.take() {
+        let next = match process.shutdown(EXIT_WAIT) {
+            Ok(_) => WorkerProcessShutdownOutcome::Succeeded,
+            // shutdownはstatus／OSエラーだけを返し、captureしたstdout/stderrは含めない。
+            Err(error) => WorkerProcessShutdownOutcome::Failed {
+                error: error.to_string(),
+            },
+        };
+        if !matches!(outcome, WorkerProcessShutdownOutcome::Failed { .. }) {
+            *outcome = next;
         }
     }
 }
@@ -928,15 +1385,26 @@ struct ManagedProcess {
     child: Child,
     stdout: Arc<Mutex<Vec<u8>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
-    readers: Vec<JoinHandle<()>>,
+    readers: Vec<JoinHandle<std::io::Result<()>>>,
 }
 
 impl ManagedProcess {
-    fn spawn(
+    fn spawn(name: &str, command: Command, stdout_path: &Path, stderr_path: &Path) -> Result<Self> {
+        Self::spawn_captured(
+            name,
+            command,
+            Some(stdout_path.to_path_buf()),
+            Some(stderr_path.to_path_buf()),
+            MAX_PROCESS_LOG_BYTES,
+        )
+    }
+
+    fn spawn_captured(
         name: &str,
         mut command: Command,
-        stdout_path: &Path,
-        stderr_path: &Path,
+        stdout_path: Option<PathBuf>,
+        stderr_path: Option<PathBuf>,
+        capture_limit: usize,
     ) -> Result<Self> {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn()?;
@@ -951,8 +1419,8 @@ impl ManagedProcess {
         let stdout = Arc::new(Mutex::new(Vec::new()));
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let readers = vec![
-            capture_stream(stdout_pipe, stdout_path.to_path_buf(), Arc::clone(&stdout)),
-            capture_stream(stderr_pipe, stderr_path.to_path_buf(), Arc::clone(&stderr)),
+            capture_stream(stdout_pipe, stdout_path, Arc::clone(&stdout), capture_limit),
+            capture_stream(stderr_pipe, stderr_path, Arc::clone(&stderr), capture_limit),
         ];
         Ok(Self {
             name: name.to_string(),
@@ -1023,64 +1491,161 @@ impl ManagedProcess {
         )
     }
 
-    fn shutdown(&mut self, timeout: Duration) -> Result<ExitStatus> {
-        if let Some(status) = self.child.try_wait()? {
-            self.join_readers();
-            return Ok(status);
+    fn collect_output(&mut self, timeout: Duration) -> Result<std::process::Output> {
+        let deadline = Instant::now() + timeout;
+        let result = self.wait_until(deadline);
+        let status = match result {
+            Ok(Some(status)) => status,
+            other => {
+                // timeoutでも所有childをkillしてreapする。出力は診断へコピーしない。
+                let _ = self.kill_and_reap(EXIT_WAIT);
+                let _ = self.join_readers_until(Instant::now() + EXIT_WAIT);
+                return match other {
+                    Err(error) => Err(error),
+                    _ => Err(HarnessError::Protocol(
+                        "setup command deadline exceeded".into(),
+                    )),
+                };
+            }
+        };
+        // child終了後もpipeが保持される場合を、同じsetup deadlineで失敗にする。
+        self.join_readers_until(deadline)?;
+        let stdout = self
+            .stdout
+            .lock()
+            .map_err(|_| HarnessError::Protocol("setup stdout capture poisoned".into()))?
+            .clone();
+        let stderr = self
+            .stderr
+            .lock()
+            .map_err(|_| HarnessError::Protocol("setup stderr capture poisoned".into()))?
+            .clone();
+        if stdout.len() > MAX_COMMAND_OUTPUT_BYTES || stderr.len() > MAX_COMMAND_OUTPUT_BYTES {
+            return Err(HarnessError::Protocol(
+                "setup command output byte budget exceeded".into(),
+            ));
         }
-        let signal_result = unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
-        if signal_result != 0 {
-            return Err(io_error("send SIGTERM", std::io::Error::last_os_error()));
-        }
-        let start = Instant::now();
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn wait_until(&mut self, deadline: Instant) -> Result<Option<ExitStatus>> {
         loop {
             if let Some(status) = self.child.try_wait()? {
-                self.join_readers();
-                if status.success() {
-                    return Ok(status);
-                }
-                return Err(HarnessError::Protocol(format!(
-                    "{} did not complete graceful shutdown: {status}",
-                    self.name
-                )));
+                return Ok(Some(status));
             }
-            if start.elapsed() >= timeout {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                self.join_readers();
-                return Err(HarnessError::Protocol(format!(
-                    "{} did not exit within {timeout:?}",
-                    self.name
-                )));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
             }
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(remaining.min(Duration::from_millis(20)));
         }
     }
 
-    fn join_readers(&mut self) {
-        for reader in self.readers.drain(..) {
-            let _ = reader.join();
+    fn kill_and_reap(&mut self, timeout: Duration) -> Result<ExitStatus> {
+        if let Ok(Some(status)) = self.child.try_wait() {
+            return Ok(status);
         }
+        // killと自然終了の競合ではtry_waitで回収を確認する。
+        let _ = self.child.kill();
+        self.wait_until(Instant::now() + timeout)?.ok_or_else(|| {
+            HarnessError::Protocol(format!(
+                "{} could not be reaped within {timeout:?}",
+                self.name
+            ))
+        })
+    }
+
+    fn shutdown(&mut self, timeout: Duration) -> Result<ExitStatus> {
+        let result = (|| {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            let signal_result = unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+            if signal_result != 0 {
+                return Err(io_error("send SIGTERM", std::io::Error::last_os_error()));
+            }
+            self.wait_until(Instant::now() + timeout)?.ok_or_else(|| {
+                HarnessError::Protocol(format!("{} did not exit within {timeout:?}", self.name))
+            })
+        })();
+        if result.is_err() {
+            let _ = self.kill_and_reap(EXIT_WAIT);
+        }
+        let readers = self.join_readers_until(Instant::now() + EXIT_WAIT);
+        let status = result?;
+        readers?;
+        self.require_successful_exit(status)
+    }
+
+    fn require_successful_exit(&self, status: ExitStatus) -> Result<ExitStatus> {
+        if status.success() {
+            Ok(status)
+        } else {
+            Err(HarnessError::Protocol(format!(
+                "{} did not complete graceful shutdown: {status}",
+                self.name
+            )))
+        }
+    }
+
+    fn join_readers_until(&mut self, deadline: Instant) -> Result<()> {
+        let mut failed = false;
+        while !self.readers.is_empty() {
+            let mut index = 0;
+            while index < self.readers.len() {
+                if self.readers[index].is_finished() {
+                    let reader = self.readers.swap_remove(index);
+                    if !matches!(reader.join(), Ok(Ok(()))) {
+                        failed = true;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            if self.readers.is_empty() {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // stdのblocking Readは取消せない。異常なpipe保持時はthreadをdetachし、
+                // 呼出元の待機だけをboundedにする。子孫processの回収までは保証しない。
+                self.readers.clear();
+                return Err(HarnessError::Protocol(format!(
+                    "{} output readers did not finish before deadline",
+                    self.name
+                )));
+            }
+            thread::sleep(remaining.min(Duration::from_millis(20)));
+        }
+        if failed {
+            return Err(HarnessError::Protocol(format!(
+                "{} output reader failed",
+                self.name
+            )));
+        }
+        Ok(())
     }
 }
 
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-        self.join_readers();
+        let _ = self.kill_and_reap(EXIT_WAIT);
+        let _ = self.join_readers_until(Instant::now() + EXIT_WAIT);
     }
 }
 
 fn capture_stream(
     mut stream: impl Read + Send + 'static,
-    path: PathBuf,
+    path: Option<PathBuf>,
     shared: Arc<Mutex<Vec<u8>>>,
-) -> JoinHandle<()> {
+    capture_limit: usize,
+) -> JoinHandle<std::io::Result<()>> {
     thread::spawn(move || {
-        let mut file = File::create(path).ok();
+        let mut file = path.and_then(|path| File::create(path).ok());
         let mut written = 0usize;
         let mut truncated = false;
         let mut buffer = [0u8; 4096];
@@ -1089,12 +1654,12 @@ fn capture_stream(
                 Ok(0) => break,
                 Ok(count) => count,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(error) => return Err(error),
             };
             if let Ok(mut captured) = shared.lock()
-                && captured.len() < MAX_PROCESS_LOG_BYTES
+                && captured.len() < capture_limit
             {
-                let remaining = MAX_PROCESS_LOG_BYTES - captured.len();
+                let remaining = capture_limit - captured.len();
                 captured.extend_from_slice(&buffer[..count.min(remaining)]);
             }
             if let Some(file) = file.as_mut() {
@@ -1110,6 +1675,7 @@ fn capture_stream(
                 }
             }
         }
+        Ok(())
     })
 }
 
@@ -1145,12 +1711,55 @@ fn assert_absent_or_empty(path: &Path, label: &str) -> Result<()> {
     )))
 }
 
-fn json_string(value: &Value, pointer: &str) -> Result<String> {
+fn require_compatible_connection(connection: &Value) -> Result<()> {
+    if connection.get("status").and_then(Value::as_str) != Some("compatible") {
+        return Err(HarnessError::Protocol(
+            "Runtime connection was not compatible".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_registered_runtime(runtimes: &Value, runtime_id: &str, binding_id: &str) -> Result<()> {
+    let connected = runtimes
+        .get("items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("runtime_id").and_then(Value::as_str) == Some(runtime_id)
+                    && item
+                        .pointer("/management/binding/binding_id")
+                        .and_then(Value::as_str)
+                        == Some(binding_id)
+            })
+        });
+    if !connected {
+        return Err(HarnessError::Protocol(
+            "Runtime registration did not match the verified binding".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_empty_worker_list(workers: &Value) -> Result<()> {
+    if workers
+        .get("items")
+        .and_then(Value::as_array)
+        .is_none_or(|items| !items.is_empty())
+    {
+        return Err(HarnessError::Protocol(
+            "fresh Worker list is not empty or has invalid shape".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn json_string(value: &Value, pointer: &'static str) -> Result<String> {
     value
         .pointer(pointer)
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| HarnessError::Protocol(format!("JSON response omitted {pointer}: {value}")))
+        .ok_or_else(|| HarnessError::Protocol(format!("JSON response omitted string at {pointer}")))
 }
 
 fn url_port(url: &str) -> Result<u16> {
@@ -1175,7 +1784,357 @@ fn io_error(operation: &str, error: std::io::Error) -> HarnessError {
 
 #[cfg(test)]
 mod startup_address_tests {
-    use super::parse_address_after;
+    use super::*;
+
+    // 製品binary providerを呼ばず、同じ所有・収集・cleanup経路へ合成childだけを接続する。
+    fn synthetic_environment(artifacts_dir: &Path) -> Result<WorkerE2eEnvironment> {
+        let temp_root = tempfile::tempdir()?;
+        let root = temp_root.path().to_path_buf();
+        fs::create_dir_all(artifacts_dir)?;
+        Ok(WorkerE2eEnvironment {
+            temp_root: Some(temp_root),
+            home: root.clone(),
+            xdg_data_home: root.clone(),
+            xdg_state_home: root.clone(),
+            xdg_config_home: root.clone(),
+            xdg_runtime_dir: root.clone(),
+            server_data_dir: root.join("server"),
+            runtime_data_dir: root.join("runtime"),
+            server_config: root.join("server.toml"),
+            artifacts_dir: artifacts_dir.to_path_buf(),
+            workspace_id: None,
+            runtime_id: "synthetic-runtime".into(),
+            account_handle: "synthetic-account".into(),
+            server_url: None,
+            runtime_url: None,
+            server: None,
+            runtime: None,
+            runtime_shutdown: WorkerProcessShutdownOutcome::NotStarted,
+            server_shutdown: WorkerProcessShutdownOutcome::NotStarted,
+            shutdown_error: None,
+            runtime_public_identity: None,
+            access_token: None,
+            client: Client::builder().no_proxy().build().unwrap(),
+            binaries: WorkerBinaryProviderInfo {
+                workspace_root: root.clone(),
+                profile: "synthetic".into(),
+                binaries: Vec::new(),
+            },
+            root,
+        })
+    }
+
+    fn synthetic_process(root: &Path, name: &str, script: &str) -> Result<ManagedProcess> {
+        let mut command = Command::new("/bin/sh");
+        command
+            .env_clear()
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .args(["-c", script]);
+        ManagedProcess::spawn_captured(name, command, None, None, MAX_COMMAND_OUTPUT_BYTES + 1)
+    }
+
+    fn assert_secret_free(diagnostic: impl std::fmt::Debug) {
+        assert!(!format!("{diagnostic:?}").contains("private-test-marker"));
+    }
+
+    #[test]
+    fn setup_stdout_is_returned_but_redacted_in_logs_and_nonzero_errors() -> Result<()> {
+        let artifacts = tempfile::tempdir()?;
+        let environment = synthetic_environment(artifacts.path())?;
+        // script自体はsecretの完全値を含めず、stdoutの漏洩だけを検出する。
+        let script = "printf 'private-%s' test-marker";
+        let output = environment.run_command(Path::new("/bin/sh"), &["-c", script], true)?;
+        assert_eq!(output.stdout, b"private-test-marker");
+        let error = environment
+            .run_command(
+                Path::new("/bin/sh"),
+                &["-c", "printf 'private-%s' test-marker; exit 7"],
+                true,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::CommandFailed { status, stdout, .. }
+            if status.code() == Some(7) && stdout == "<redacted>")
+        );
+        assert_secret_free(&error);
+        assert_secret_free(error.to_string());
+        let log = fs::read_to_string(artifacts.path().join("setup-commands.jsonl"))?;
+        assert_secret_free(&log);
+        for line in log.lines() {
+            let record: Value = serde_json::from_str(line)?;
+            assert_eq!(record["stdout"], "<redacted>");
+        }
+        // setup経路はraw stdout/stderr fileを作らない。
+        assert_eq!(fs::read_dir(artifacts.path())?.count(), 1);
+        let report = environment.cleanup()?;
+        assert!(report.cleanup_success && report.root_cleanup_success);
+        Ok(())
+    }
+
+    #[test]
+    fn setup_deadline_kills_and_reaps_owned_child_without_logging_stdout() -> Result<()> {
+        let artifacts = tempfile::tempdir()?;
+        let environment = synthetic_environment(artifacts.path())?;
+        let script = "trap '' TERM; printf 'private-%s' test-marker; while :; do :; done";
+        let timeout = Duration::from_millis(100);
+        let mut process = synthetic_process(&environment.root, "setup command", script)?;
+        let started = Instant::now();
+        let error = process.collect_output(timeout).unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert_secret_free(&error);
+        assert!(started.elapsed() < timeout + EXIT_WAIT + EXIT_WAIT);
+        assert!(process.child.try_wait()?.is_some());
+        assert!(process.readers.is_empty());
+        let error = environment
+            .run_command_with_timeout(Path::new("/bin/sh"), &["-c", script], true, timeout)
+            .unwrap_err();
+        assert_secret_free(&error);
+        let log = fs::read_to_string(artifacts.path().join("setup-commands.jsonl"))?;
+        assert_secret_free(&log);
+        let record: Value = serde_json::from_str(log.trim())?;
+        assert_eq!(record["stdout"], "<redacted>");
+        assert!(
+            record["error"]
+                .as_str()
+                .unwrap()
+                .contains("deadline exceeded")
+        );
+        assert_eq!(fs::read_dir(artifacts.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn setup_output_overflow_is_bounded_drained_and_rejected() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut process = synthetic_process(
+            root.path(),
+            "setup command",
+            "i=0; while [ \"$i\" -lt 20000 ]; do printf 0123456789abcdef; printf fedcba9876543210 >&2; i=$((i + 1)); done",
+        )?;
+        let error = process.collect_output(SETUP_WAIT).unwrap_err();
+        assert!(error.to_string().contains("output byte budget exceeded"));
+        // 両pipeを上限後もdrainしなければこの成功exitまで到達しない。
+        assert!(process.child.try_wait()?.unwrap().success());
+        assert!(process.readers.is_empty());
+        assert_eq!(
+            process.stdout.lock().unwrap().len(),
+            MAX_COMMAND_OUTPUT_BYTES + 1
+        );
+        assert_eq!(
+            process.stderr.lock().unwrap().len(),
+            MAX_COMMAND_OUTPUT_BYTES + 1
+        );
+        assert_eq!(fs::read_dir(root.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn setup_output_at_byte_limit_is_returned_without_truncation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut process = synthetic_process(
+            root.path(),
+            "setup command",
+            "i=0; while [ \"$i\" -lt 4096 ]; do printf 0123456789abcdef; i=$((i + 1)); done",
+        )?;
+        let output = process.collect_output(SETUP_WAIT)?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), MAX_COMMAND_OUTPUT_BYTES);
+        assert!(
+            output
+                .stdout
+                .chunks_exact(16)
+                .all(|chunk| chunk == b"0123456789abcdef")
+        );
+        assert!(output.stderr.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_output_reader_rejects_successful_child_without_raw_error() -> Result<()> {
+        struct FailedReader;
+        impl Read for FailedReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("private-test-marker"))
+            }
+        }
+        let root = tempfile::tempdir()?;
+        let mut process = synthetic_process(root.path(), "setup command", "exit 0")?;
+        process.readers.push(capture_stream(
+            FailedReader,
+            None,
+            Arc::new(Mutex::new(Vec::new())),
+            MAX_COMMAND_OUTPUT_BYTES + 1,
+        ));
+        let error = process.collect_output(SETUP_WAIT).unwrap_err();
+        assert!(error.to_string().contains("output reader failed"));
+        assert_secret_free(&error);
+        assert_secret_free(error.to_string());
+        assert!(process.child.try_wait()?.unwrap().success());
+        Ok(())
+    }
+
+    #[test]
+    fn unfinished_output_reader_has_bounded_join_and_is_not_success() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut process = synthetic_process(root.path(), "setup command", "exit 0")?;
+        assert!(
+            process
+                .wait_until(Instant::now() + EXIT_WAIT)?
+                .unwrap()
+                .success()
+        );
+        // 子孫を残さず、pipe保持と同じ未完readerをchannelで決定的に再現する。
+        let (release, pending) = std::sync::mpsc::channel::<()>();
+        let (finished, completion) = std::sync::mpsc::channel();
+        process.readers.push(thread::spawn(move || {
+            let _ = pending.recv();
+            let _ = finished.send(());
+            Ok(())
+        }));
+        let timeout = Duration::from_millis(50);
+        let started = Instant::now();
+        let error = process.collect_output(timeout).unwrap_err();
+        drop(release);
+        completion.recv_timeout(EXIT_WAIT).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("readers did not finish before deadline")
+        );
+        assert!(started.elapsed() < timeout + EXIT_WAIT);
+        assert!(process.readers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_failure_still_reaps_live_server_and_survives_repeated_shutdown() -> Result<()> {
+        let artifacts = tempfile::tempdir()?;
+        let mut environment = synthetic_environment(artifacts.path())?;
+        let mut runtime = synthetic_process(&environment.root, "runtime", "exit 7")?;
+        assert_eq!(
+            runtime
+                .wait_until(Instant::now() + EXIT_WAIT)?
+                .unwrap()
+                .code(),
+            Some(7)
+        );
+        environment.runtime = Some(runtime);
+        let server = synthetic_process(
+            &environment.root,
+            "server",
+            "trap 'exit 0' TERM; printf 'ready 127.0.0.1:12345\\n'; while :; do :; done",
+        )?;
+        server.wait_for_address("ready ", EXIT_WAIT)?;
+        environment.server = Some(server);
+        for _ in 0..2 {
+            assert!(environment.shutdown().is_err());
+            assert!(environment.runtime.is_none() && environment.server.is_none());
+            assert!(matches!(
+                environment.runtime_shutdown,
+                WorkerProcessShutdownOutcome::Failed { .. }
+            ));
+            assert_eq!(
+                environment.server_shutdown,
+                WorkerProcessShutdownOutcome::Succeeded
+            );
+        }
+        let root = environment.root.clone();
+        assert!(environment.cleanup().is_err());
+        assert!(!root.exists());
+        let report: WorkerEnvironmentCleanupReport =
+            serde_json::from_slice(&fs::read(artifacts.path().join("cleanup.json"))?)?;
+        assert!(!report.cleanup_success);
+        assert!(report.root_cleanup_success);
+        assert!(report.cleanup_error.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_and_drop_keep_process_failures_separate_from_root_cleanup() -> Result<()> {
+        for explicit_cleanup in [false, true] {
+            for (runtime_code, server_code) in [(0, 0), (7, 0), (0, 9), (7, 9)] {
+                let artifacts = tempfile::tempdir()?;
+                let mut environment = synthetic_environment(artifacts.path())?;
+                for (name, code) in [("runtime", runtime_code), ("server", server_code)] {
+                    let mut process = synthetic_process(
+                        &environment.root,
+                        name,
+                        &format!("printf 'private-%s' test-marker; exit {code}"),
+                    )?;
+                    assert_eq!(
+                        process
+                            .wait_until(Instant::now() + EXIT_WAIT)?
+                            .unwrap()
+                            .code(),
+                        Some(code)
+                    );
+                    if name == "runtime" {
+                        environment.runtime = Some(process);
+                    } else {
+                        environment.server = Some(process);
+                    }
+                }
+                let root = environment.root.clone();
+                let expected_success = runtime_code == 0 && server_code == 0;
+                if explicit_cleanup {
+                    assert_eq!(environment.cleanup().is_ok(), expected_success);
+                } else {
+                    drop(environment);
+                }
+                let raw_report = fs::read_to_string(artifacts.path().join("cleanup.json"))?;
+                assert_secret_free(&raw_report);
+                let report: WorkerEnvironmentCleanupReport = serde_json::from_str(&raw_report)?;
+                assert_eq!(report.cleanup_success, expected_success);
+                assert_eq!(report.cleanup_error.is_none(), expected_success);
+                assert!(report.root_cleanup_success);
+                assert!(report.root_cleanup_error.is_none());
+                assert!(!report.fixture_root_exists_after && !root.exists());
+                for (outcome, code) in [
+                    (report.runtime_shutdown, runtime_code),
+                    (report.server_shutdown, server_code),
+                ] {
+                    if code == 0 {
+                        assert_eq!(outcome, WorkerProcessShutdownOutcome::Succeeded);
+                    } else {
+                        assert!(matches!(
+                            outcome,
+                            WorkerProcessShutdownOutcome::Failed { .. }
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_rejects_nonzero_exit_even_when_process_already_exited() -> super::Result<()> {
+        let root = tempfile::tempdir()?;
+        for code in [0, 7] {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .env_clear()
+                .current_dir(root.path())
+                .args(["-c", &format!("exit {code}")]);
+            let mut process = super::ManagedProcess::spawn(
+                "already-exited",
+                command,
+                &root.path().join(format!("{code}.stdout")),
+                &root.path().join(format!("{code}.stderr")),
+            )?;
+            // Reap first to deterministically exercise the initial try_wait branch.
+            assert_eq!(process.child.wait()?.code(), Some(code));
+            let result = process.shutdown(std::time::Duration::from_secs(1));
+            if code == 0 {
+                assert!(result?.success());
+            } else {
+                assert!(matches!(result, Err(super::HarnessError::Protocol(message))
+                    if message.contains("did not complete graceful shutdown")));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn startup_address_waits_for_complete_valid_socket_record() {
@@ -1203,5 +2162,109 @@ mod startup_address_tests {
                 None
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod response_diagnostic_tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn assert_secret_free(error: &HarnessError) {
+        for diagnostic in [error.to_string(), format!("{error:?}")] {
+            assert!(!diagnostic.contains("private-test-marker"), "{diagnostic}");
+        }
+        assert!(std::error::Error::source(error).is_none());
+    }
+
+    #[test]
+    fn json_decode_errors_do_not_retain_rejected_fields_values_or_enum_names() {
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Document {
+            #[allow(dead_code)]
+            count: u64,
+        }
+        for raw in [
+            r#"{"count":"private-test-marker"}"#,
+            r#"{"count":1,"private-test-marker":true}"#,
+        ] {
+            let error: HarnessError = serde_json::from_str::<Document>(raw).unwrap_err().into();
+            assert_secret_free(&error);
+        }
+        let raw = serde_json::json!({"kind":"private-test-marker"});
+        let error: HarnessError = serde_json::from_value::<protocol::Event>(raw)
+            .unwrap_err()
+            .into();
+        assert_secret_free(&error);
+    }
+
+    #[test]
+    fn valid_json_contract_failures_do_not_retain_response_fields_or_values() -> Result<()> {
+        let response: Value = serde_json::from_str(
+            r#"{"status":"private-test-marker","items":[{"private-test-marker":"private-test-marker"}],"binding_id":{ "private-test-marker":true }}"#,
+        )?;
+        for error in [
+            require_compatible_connection(&response).unwrap_err(),
+            require_registered_runtime(&response, "runtime-test", "binding-test").unwrap_err(),
+            require_empty_worker_list(&response).unwrap_err(),
+            json_string(&response, "/binding_id").unwrap_err(),
+            json_string(&response, "/workspace/workspace_id").unwrap_err(),
+        ] {
+            assert_secret_free(&error);
+        }
+        require_compatible_connection(&json!({"status":"compatible"}))?;
+        require_registered_runtime(
+            &json!({"items":[{"runtime_id":"runtime-test","management":{"binding":{"binding_id":"binding-test"}}}]}),
+            "runtime-test",
+            "binding-test",
+        )?;
+        require_empty_worker_list(&json!({"items":[]}))?;
+        assert_eq!(
+            json_string(&json!({"id":"worker-test"}), "/id")?,
+            "worker-test"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn http_failure_bodies_and_malformed_success_bodies_are_not_diagnostics() -> Result<()> {
+        for (status, body) in [
+            ("400 Bad Request", "private-test-marker"),
+            ("200 OK", "private-test-marker"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let server = thread::spawn(move || -> std::io::Result<()> {
+                let (mut connection, _) = listener.accept()?;
+                connection.set_read_timeout(Some(Duration::from_secs(3)))?;
+                let mut request = [0; 4096];
+                connection.read(&mut request)?;
+                write!(
+                    connection,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )?;
+                Ok(())
+            });
+            let response = Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap()
+                .get(format!("http://{address}"))
+                .send()
+                .unwrap();
+            let error = decode_api_response(response, "test response").unwrap_err();
+            server.join().unwrap()?;
+            assert_secret_free(&error);
+            if status.starts_with("400") {
+                assert!(error.to_string().contains("HTTP 400"));
+            }
+        }
+        Ok(())
     }
 }

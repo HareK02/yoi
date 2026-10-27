@@ -5113,6 +5113,9 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                         runtime_api::WorkerRestoreState::RolledBack => {
                             server_api::WorkerRestoreState::RolledBack
                         }
+                        runtime_api::WorkerRestoreState::Superseded => {
+                            server_api::WorkerRestoreState::Superseded
+                        }
                         runtime_api::WorkerRestoreState::ReconciliationRequired => {
                             server_api::WorkerRestoreState::ReconciliationRequired
                         }

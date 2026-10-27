@@ -305,6 +305,7 @@ Deno.test("Restore classification never promotes nonaccepted results and preserv
       "accepted",
       "rejected",
       "rolled_back",
+      "superseded",
       "reconciliation_required",
     ] as const
   ) {

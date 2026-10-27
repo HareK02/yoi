@@ -21,7 +21,7 @@ use crate::shutdown_after_idle::{
     ShutdownAfterIdleRequest, TicketIntakeReadyShutdownHook, is_ticket_intake_role,
     take_shutdown_request_after_status,
 };
-use crate::spawn::registry::SpawnedWorkerRegistry;
+use crate::spawn::registry::{PreparedSpawnedWorkerRegistryLoad, SpawnedWorkerRegistry};
 use crate::spawn::tool::sub_worker_spawn_tool;
 use crate::worker::{
     PendingSubmissionHandle, SystemItemCommitter, Worker, WorkerError, WorkerRunResult,
@@ -654,7 +654,56 @@ pub type ShutdownReceiver = oneshot::Receiver<()>;
 
 pub struct WorkerController;
 
+// Own the real command receiver and all snapshot sources before starting any
+// protocol listener or controller loop. Fresh startup may materialize the head;
+// Runtime restore requires an already materialized source and defers canonical
+// restore effects until its durable decision. Tool discovery can own external
+// resources, so private initialization is not synonymous with side-effect-free.
+pub(crate) struct InitializedWorkerController<C: LlmClient, St: Store> {
+    pub(crate) worker: Worker<C, St>,
+    pub(crate) handle: WorkerHandle,
+    method_rx: mpsc::Receiver<Method>,
+    shutdown_tx: oneshot::Sender<()>,
+    shutdown_rx: ShutdownReceiver,
+    registry_reclaim: PreparedSpawnedWorkerRegistryLoad<St>,
+    shutdown_after_idle: ShutdownAfterIdleRequest,
+    command_events: Option<PreparedWorkdirCommandEvents>,
+}
+
+pub(crate) struct PreparedControllerPublication {
+    command_observer: Option<tokio::task::JoinHandle<()>>,
+}
+
 impl WorkerController {
+    /// Explicit recovery of an unmaterialized Session head. This installs the
+    /// saved Feature composition needed to produce the seed, but creates no
+    /// Controller, input channel, socket, observer, or queue consumer. The caller
+    /// owns the same operation's Feature/session/allocation cleanup on every exit.
+    pub async fn recover_pending_head<C, St>(
+        worker: &mut Worker<C, St>,
+        runtime_base: &Path,
+    ) -> std::io::Result<()>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        if worker.needs_initial_session_head_materialization() {
+            worker
+                .validate_subjektiv_body_publication()
+                .map_err(std::io::Error::other)?;
+            let registry = SpawnedWorkerRegistry::new_internal(
+                worker.manifest().worker.name.clone(),
+                worker.scope().clone(),
+            );
+            register_worker_tools(worker, runtime_base.to_path_buf(), registry, None, None).await?;
+            worker
+                .materialize_durable_session_head()
+                .await
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+
     pub async fn spawn<C, St>(
         worker: Worker<C, St>,
         runtime_base: &Path,
@@ -734,8 +783,12 @@ impl WorkerController {
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
         let sessions = worker.workdir_sessions();
+        let factory_owned_cleanup = worker.startup_feature_cleanup_handle().is_some();
         let result = Self::spawn_initialized(worker, runtime_base, runtime_run).await;
+        // An opted-in factory must quiesce its captured Feature tasks before
+        // closing their Workdir sessions; this wrapper cannot confirm that order.
         if result.is_err()
+            && !factory_owned_cleanup
             && let Err(error) = sessions.close_all().await
         {
             tracing::warn!(%error, "Workdir sessions close after controller startup failure failed");
@@ -744,7 +797,7 @@ impl WorkerController {
     }
 
     async fn spawn_initialized<C, St>(
-        mut worker: Worker<C, St>,
+        worker: Worker<C, St>,
         runtime_base: &Path,
         runtime_run: Option<&Path>,
     ) -> Result<(WorkerHandle, ShutdownReceiver, tokio::task::JoinHandle<()>), std::io::Error>
@@ -752,6 +805,52 @@ impl WorkerController {
         C: LlmClient + Clone + 'static,
         St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
     {
+        Self::initialize(worker, runtime_base, runtime_run)
+            .await?
+            .publish()
+            .await
+    }
+
+    async fn initialize<C, St>(
+        worker: Worker<C, St>,
+        runtime_base: &Path,
+        runtime_run: Option<&Path>,
+    ) -> Result<InitializedWorkerController<C, St>, std::io::Error>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        Self::initialize_inner(worker, runtime_base, runtime_run, true).await
+    }
+
+    pub(crate) async fn initialize_restored<St>(
+        worker: Worker<Box<dyn LlmClient>, St>,
+        run_dir: &Path,
+    ) -> std::io::Result<InitializedWorkerController<Box<dyn LlmClient>, St>>
+    where
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        let parent = run_dir
+            .parent()
+            .ok_or_else(|| std::io::Error::other("run path has no parent"))?;
+        Self::initialize_inner(worker, parent, Some(run_dir), false).await
+    }
+
+    async fn initialize_inner<C, St>(
+        mut worker: Worker<C, St>,
+        runtime_base: &Path,
+        runtime_run: Option<&Path>,
+        canonical_startup: bool,
+    ) -> Result<InitializedWorkerController<C, St>, std::io::Error>
+    where
+        C: LlmClient + Clone + 'static,
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        if !canonical_startup && worker.needs_initial_session_head_materialization() {
+            return Err(std::io::Error::other(
+                "restore source requires operation-owned head recovery",
+            ));
+        }
         worker
             .validate_subjektiv_body_publication()
             .map_err(std::io::Error::other)?;
@@ -773,21 +872,13 @@ impl WorkerController {
         });
 
         let spawner_name = worker.manifest().worker.name.clone();
-        let loaded_registry = SpawnedWorkerRegistry::load_from_worker_state_with_reclaim(
+        let registry_reclaim = SpawnedWorkerRegistry::prepare_from_worker_state_with_reclaim(
             runtime_dir.clone(),
             worker.store().clone(),
             spawner_name.clone(),
             Some(worker.scope().clone()),
-        )
-        .await?;
-        let reclaimed_unreachable = loaded_registry.reclaimed_unreachable;
-        let spawned_registry = loaded_registry.registry;
-        if reclaimed_unreachable {
-            worker.push_notify(
-                "Restored Worker state contained unreachable delegated child Workers; their delegated write scopes were reclaimed before resume."
-                    .to_string(),
-            );
-        }
+        )?;
+        let spawned_registry = registry_reclaim.registry.clone();
 
         // Hand the alerter to the Worker so internal operations (compaction,
         // AGENTS.md ingestion during the first turn) can emit user-facing
@@ -878,7 +969,6 @@ impl WorkerController {
         if let Some(fs_for_view) = fs_for_view.as_ref() {
             shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view.clone()));
         }
-
         let artifact_store: Arc<dyn Store> = Arc::new(worker.store().clone());
         let session_id = worker.session_id();
         let pending_activations = worker.pending_activation_state();
@@ -903,10 +993,71 @@ impl WorkerController {
             pending_activations,
         };
 
-        // Start the observer only after fallible head/recovery initialization.
-        let command_observer = fs_for_view
+        let command_events = fs_for_view
             .as_ref()
-            .and_then(|session| wire_workdir_command_events(session, &in_flight));
+            .map(|session| PreparedWorkdirCommandEvents::new(session, &handle.in_flight));
+        Ok(InitializedWorkerController {
+            worker,
+            handle,
+            method_rx,
+            shutdown_tx,
+            shutdown_rx,
+            registry_reclaim,
+            shutdown_after_idle,
+            command_events,
+        })
+    }
+}
+
+impl<C, St> InitializedWorkerController<C, St>
+where
+    C: LlmClient + Clone + 'static,
+    St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+{
+    async fn publish(
+        mut self,
+    ) -> Result<(WorkerHandle, ShutdownReceiver, tokio::task::JoinHandle<()>), std::io::Error> {
+        let publication = self.prepare_publication().await?;
+        Ok(self.start(publication))
+    }
+
+    pub(crate) async fn prepare_publication(
+        &mut self,
+    ) -> std::io::Result<PreparedControllerPublication> {
+        let loaded_registry = self.registry_reclaim.apply().await?;
+        debug_assert!(Arc::ptr_eq(
+            &loaded_registry.registry,
+            &self.handle.spawned_registry
+        ));
+        if loaded_registry.reclaimed_unreachable {
+            self.worker.push_notify("Restored Worker state contained unreachable delegated child Workers; their delegated write scopes were reclaimed before resume.".to_string());
+        }
+        let command_observer = self
+            .command_events
+            .take()
+            .and_then(PreparedWorkdirCommandEvents::start);
+        Ok(PreparedControllerPublication { command_observer })
+    }
+
+    pub(crate) fn start(
+        self,
+        publication: PreparedControllerPublication,
+    ) -> (WorkerHandle, ShutdownReceiver, tokio::task::JoinHandle<()>) {
+        let Self {
+            mut worker,
+            handle,
+            method_rx,
+            shutdown_tx,
+            shutdown_rx,
+            shutdown_after_idle,
+            ..
+        } = self;
+        let PreparedControllerPublication { command_observer } = publication;
+        let runtime_dir = handle.runtime_dir.clone();
+        let shared_state = handle.shared_state.clone();
+        let working_event_tx = handle.working_event_tx.clone();
+        let spawned_registry = handle.spawned_registry.clone();
+
         // === 5. controller_loop ===
         // Clone cancel sender and notification buffer before moving worker
         // into the controller task so the in-flight turn can be reached
@@ -915,6 +1066,7 @@ impl WorkerController {
         let pause_tx = worker.engine_mut().pause_sender();
         let notify_buffer = worker.notify_buffer_handle();
 
+        worker.finish_startup_feature_cleanup_capture();
         let controller_task = tokio::spawn(controller_loop(
             worker,
             method_rx,
@@ -930,7 +1082,7 @@ impl WorkerController {
             command_observer,
         ));
 
-        Ok((handle, shutdown_rx, controller_task))
+        (handle, shutdown_rx, controller_task)
     }
 }
 
@@ -938,30 +1090,51 @@ pub(crate) fn wire_workdir_command_events(
     session: &Arc<dyn WorkdirSession>,
     in_flight: &InFlightEvents,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    in_flight.replace_command_snapshot(protocol_command_snapshots(session.as_ref()));
-    let Some(mut events) = session.subscribe_command_events() else {
-        return None;
-    };
-    // Keep only a weak reference in the observer task. Holding the session
-    // strongly here would keep its broadcast sender alive forever and prevent
-    // the receiver from observing closure during Worker teardown.
-    let session = Arc::downgrade(session);
-    let in_flight = in_flight.clone();
-    Some(tokio::spawn(async move {
-        loop {
-            match events.recv().await {
-                Ok(event) => in_flight.publish_command_event(protocol_command_event(event)),
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let Some(session) = session.upgrade() else {
-                        break;
-                    };
-                    in_flight
-                        .replace_command_snapshot(protocol_command_snapshots(session.as_ref()));
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
+    PreparedWorkdirCommandEvents::new(session, in_flight).start()
+}
+
+struct PreparedWorkdirCommandEvents {
+    session: std::sync::Weak<dyn WorkdirSession>,
+    in_flight: InFlightEvents,
+    events: Option<broadcast::Receiver<WorkdirCommandEvent>>,
+}
+
+impl PreparedWorkdirCommandEvents {
+    fn new(session: &Arc<dyn WorkdirSession>, in_flight: &InFlightEvents) -> Self {
+        // Subscribe before reading command state; hold the receiver privately
+        // across the durable decision instead of creating a publication gap.
+        let events = session.subscribe_command_events();
+        in_flight.replace_command_snapshot(protocol_command_snapshots(session.as_ref()));
+        Self {
+            session: Arc::downgrade(session),
+            in_flight: in_flight.clone(),
+            events,
         }
-    }))
+    }
+
+    fn start(self) -> Option<tokio::task::JoinHandle<()>> {
+        let Self {
+            session,
+            in_flight,
+            events,
+        } = self;
+        let mut events = events?;
+        Some(tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => in_flight.publish_command_event(protocol_command_event(event)),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(session) = session.upgrade() else {
+                            break;
+                        };
+                        in_flight
+                            .replace_command_snapshot(protocol_command_snapshots(session.as_ref()));
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }))
+    }
 }
 
 fn protocol_command_snapshots(session: &dyn WorkdirSession) -> Vec<ProtocolCommandSnapshot> {
@@ -1687,9 +1860,17 @@ where
             .add_module(crate::feature::builtin::orchestration::orchestration_feature());
     }
     if let Some(workspace_root) = local_workspace_root.as_ref() {
-        if let Some(module) =
+        let module = if let Some(cleanup) = worker.startup_feature_cleanup_handle() {
+            crate::feature::mcp::discover_stdio_tool_feature_with_cleanup(
+                &mcp_config,
+                workspace_root,
+                &cleanup.mcp_discovery(),
+            )
+            .await?
+        } else {
             crate::feature::mcp::discover_stdio_tool_feature(&mcp_config, workspace_root).await
-        {
+        };
+        if let Some(module) = module {
             feature_registry = feature_registry.with_module(module);
         }
     }
@@ -3750,6 +3931,159 @@ mod tests {
             }
         }
 
+        // Component connection: real Worker/Store, initialized endpoint, paired
+        // protocol subscription and Controller loop. The model boundary is an
+        // empty non-network script; this test must not request any generation.
+        #[tokio::test]
+        async fn initialized_controller_publishes_the_same_endpoint_and_subscription() {
+            let root = TempDir::new().unwrap();
+            let manifest = manifest::WorkerManifest::from_toml(
+                "[worker]\nname = 'p'\n[model]\nscheme = 'anthropic'\nmodel_id = 'test'\n[engine]\n[scope]\n",
+            )
+            .unwrap();
+            let client = ScriptedClient::new(vec![]);
+            let requests = client.requests.clone();
+            let engine =
+                Engine::<_, agen::state::Mutable, crate::SessionHistoryMetadata>::new_annotated(
+                    client,
+                );
+            let store = session_store::CombinedStore::new(
+                session_store::FsStore::new(root.path().join("sessions")).unwrap(),
+                session_store::FsWorkerStore::new(root.path().join("workers")).unwrap(),
+            );
+            let mut worker = Worker::new(
+                manifest,
+                engine,
+                store,
+                crate::worker::WorkerWorkspaceContext::local_filesystem(None),
+                crate::worker::WorkerFilesystemAuthority::None,
+                manifest::Scope::empty(),
+            )
+            .await
+            .unwrap();
+            worker.set_system_prompt_template(
+                crate::SystemPromptTemplate::parse(
+                    "default",
+                    crate::PromptCatalogSource::builtins_only(),
+                )
+                .unwrap(),
+            );
+            let prepared = WorkerController::initialize(worker, root.path(), None)
+                .await
+                .unwrap();
+            let endpoint = prepared.handle.clone();
+            let mut streams =
+                crate::ipc::protocol_session::subscribe_worker_protocol_session(&endpoint);
+            let entries = endpoint.committed_entries();
+            assert!(matches!(
+                &streams.snapshot_event,
+                Event::Snapshot { greeting, state, session, .. }
+                    if !greeting.tools.is_empty()
+                        && state.state == WorkerState::Idle
+                        && session == &session_store::public_snapshot::project_current_session_snapshot(&entries)
+            ));
+            assert!(!endpoint.protocol_is_closed());
+            assert!(!endpoint.runtime_dir.path().join("sock").exists());
+            assert!(!endpoint.runtime_dir.path().join("status.json").exists());
+            assert!(!endpoint.runtime_dir.path().join("manifest.toml").exists());
+            assert!(matches!(
+                streams.events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+            assert!(requests.lock().unwrap().is_empty());
+
+            let (handle, shutdown, task) = prepared.publish().await.unwrap();
+            assert!(handle.same_controller(&endpoint));
+            assert!(!handle.runtime_dir.path().join("sock").exists());
+            assert!(!handle.runtime_dir.path().join("status.json").exists());
+            assert!(!handle.runtime_dir.path().join("manifest.toml").exists());
+            handle.send(Method::ListPendingSubmissions).await.unwrap();
+            let pending = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Event::PendingSubmissionsChanged { pending } =
+                        streams.events.recv().await.unwrap()
+                    {
+                        break pending;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(pending, protocol::PendingSubmissionsSnapshot::default());
+            assert_eq!(
+                serde_json::to_value(handle.committed_entries()).unwrap(),
+                serde_json::to_value(entries).unwrap(),
+            );
+            handle
+                .send(Method::Shutdown {
+                    command: WorkerCommandEnvelope { command_id: 1 },
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), shutdown)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(endpoint.protocol_is_closed());
+            assert!(!endpoint.runtime_dir.path().join("sock").exists());
+            assert!(requests.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn tool_initialization_failure_does_not_reclaim_saved_children() {
+            let root = TempDir::new().unwrap();
+            let mut manifest = manifest::WorkerManifest::from_toml(
+                "[worker]\nname = 'p'\n[model]\nscheme = 'anthropic'\nmodel_id = 'test'\n[engine]\n[scope]\n",
+            ).unwrap();
+            manifest.feature.ticket.enabled = true;
+            let client = ScriptedClient::new(vec![]);
+            let requests = client.requests.clone();
+            let store = session_store::CombinedStore::new(
+                session_store::FsStore::new(root.path().join("sessions")).unwrap(),
+                session_store::FsWorkerStore::new(root.path().join("workers")).unwrap(),
+            );
+            // New feature activation is refused by the real unavailable host;
+            // legacy child metadata must not be consumed before that refusal.
+            let worker = Worker::new(
+                manifest,
+                Engine::<_, agen::state::Mutable, crate::SessionHistoryMetadata>::new_annotated(
+                    client,
+                ),
+                store.clone(),
+                crate::worker::WorkerWorkspaceContext::no_workspace(),
+                crate::worker::WorkerFilesystemAuthority::None,
+                manifest::Scope::empty(),
+            )
+            .await
+            .unwrap();
+            let mut metadata = session_store::WorkerMetadata::new(
+                "p",
+                Some(session_store::WorkerActiveSegmentRef {
+                    session_id: worker.session_id(),
+                    segment_id: Some(worker.segment_id()),
+                }),
+            );
+            metadata
+                .spawned_children
+                .push(session_store::WorkerSpawnedChild {
+                    worker_name: "legacy".into(),
+                    socket_path: root.path().join("legacy.sock"),
+                    callback_address: root.path().join("p/sock"),
+                    scope_delegated: Vec::new(),
+                });
+            store.write(&metadata).unwrap();
+            let before = store.read_by_name("p").unwrap();
+            let result = WorkerController::initialize(worker, root.path(), None).await;
+            assert!(result.is_err());
+            assert_eq!(store.read_by_name("p").unwrap(), before);
+            assert!(!root.path().join("p/spawned_workers.json").exists());
+            assert!(requests.lock().unwrap().is_empty());
+        }
+
         #[derive(Debug)]
         struct DriveWorkspaceHost {
             available: bool,
@@ -4077,10 +4411,19 @@ mod tests {
         assert!(feature_install < materialize_gate);
         assert!(materialize_gate < materialize);
         assert!(materialize < exposure);
-        let observer = startup.find("let command_observer = fs_for_view").unwrap();
+        let observer_preparation = startup
+            .find("PreparedWorkdirCommandEvents::new(session")
+            .unwrap();
         let recover = startup.find(".recover_unfinished_compaction()").unwrap();
+        let reclaim = startup
+            .find("self.registry_reclaim.apply().await?")
+            .unwrap();
+        let observer_start = startup
+            .find(".and_then(PreparedWorkdirCommandEvents::start)")
+            .unwrap();
         let loop_start = startup.find("tokio::spawn(controller_loop(").unwrap();
-        assert!(recover < observer && observer < loop_start);
+        assert!(recover < observer_preparation && observer_preparation < reclaim);
+        assert!(reclaim < observer_start && observer_start < loop_start);
         assert!(
             startup[materialize_gate..materialize]
                 .contains("needs_initial_session_head_materialization")

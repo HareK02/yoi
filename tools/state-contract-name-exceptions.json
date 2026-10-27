@@ -1,5 +1,38 @@
 [
   {
+    "path": "tests/e2e/fixtures/worker-codex-v1/manifest.json",
+    "kind": "saved_data",
+    "reason": "ユーザー提供済v1固定資産の生成元Git commitの保存key。原本の取得証拠とSHA-256を保持するため変更しない。Worker実行状態や競合制御の番号ではなく、生成元resources照合のみに使う。",
+    "lines": [
+      {
+        "sha256": "fbf8f92576eb6afbb03502d2f95144651373ce8cd7b4401bc06f801fdb4db28d",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "tests/e2e/fixtures/worker-codex-v1/expected.json",
+    "kind": "saved_data",
+    "reason": "ユーザー提供済v1固定資産の生成元Git commitの保存key。原本の取得証拠とSHA-256を保持するため変更しない。Worker実行状態や競合制御の番号ではなく、生成元resources照合のみに使う。",
+    "lines": [
+      {
+        "sha256": "fbf8f92576eb6afbb03502d2f95144651373ce8cd7b4401bc06f801fdb4db28d",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "tests/e2e/tests/worker_restore/fixture.rs",
+    "kind": "saved_data",
+    "reason": "提供済v1原本の生成元Git commitを読むための固定保存key対応。原本bytesとhashを変更しない。実行状態の観測tokenや更新番号に利用せず、現行Rust内ではsource_commitとして扱う。",
+    "lines": [
+      {
+        "sha256": "4dd4810d1a31b812596b9d6cc8a8b27f398476174dfa6f0c3c1881aeadb5ade4",
+        "count": 2
+      }
+    ]
+  },
+  {
     "path": "crates/subjektiv/src/journal/memory_links/tests.rs",
     "kind": "saved_data",
     "reason": "最古対応v1 schemaの保存済Subject JSONとSQLをそのまま作成し、最新migrationが元出典を保持する検証に必要な固定綴り。現行writerや状態判断には使わない。",

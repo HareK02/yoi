@@ -19,15 +19,19 @@ required-features = ["ws-server", "fs-store"]
 [features]
 default = ["ws-server", "fs-store"]
 fs-store = ["dep:fs4"]
+# Offline fixture tooling only; never enabled by the product defaults.
+test-support = ["fs-store", "ws-server"]
+# Explicit process-test synchronization; independent of offline fixture tooling.
+restore-checkpoints = ["fs-store"]
 http-server = ["dep:axum", "dep:tower", "dep:reqwest"]
-ws-server = ["http-server", "axum/ws", "dep:futures", "tokio/sync"]
+ws-server = ["http-server", "axum/ws", "tokio/sync"]
 
 [dependencies]
 agen.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 axum = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
+futures.workspace = true
 decodal.workspace = true
 flow = { path = "../flow" }
 fs4 = { workspace = true, optional = true }

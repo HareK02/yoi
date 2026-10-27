@@ -6712,15 +6712,21 @@ name = "yoi-e2e"
 version = "0.0.0"
 dependencies = [
  "chrono",
+ "config-source",
  "libc",
+ "manifest",
+ "protocol",
  "reqwest",
  "serde",
  "serde_json",
  "server-api",
+ "session-store",
  "sha2 0.11.0",
  "tempfile",
+ "tungstenite 0.29.0",
  "webauthn-authenticator-rs",
  "webauthn-rs-proto",
+ "worker-runtime",
  "yoi-workspace-server",
 ]
 

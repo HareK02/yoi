@@ -8,6 +8,7 @@
 //! the regular registry decides Tool-name collisions.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -25,6 +26,7 @@ use mcp::stdio::{
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
+use tokio::sync::Mutex;
 
 use super::{
     FeatureDescriptor, FeatureDiagnostic, FeatureInstallContext, FeatureInstallError,
@@ -52,8 +54,88 @@ const MAX_LIST_ITEMS: usize = 128;
 const MAX_RESOURCE_CONTENTS: usize = 16;
 const MAX_PROMPT_MESSAGES: usize = 32;
 
+/// Owns discovery clients until process reaping is confirmed. Retain a clone in
+/// startup cleanup *before* awaiting discovery. Stop/cancel discovery before
+/// calling `shutdown`; the shared lock serializes discovery and cleanup, not
+/// cancellation of an in-flight discovery task.
+///
+/// Error or cancellation leaves the actual clients here for another shutdown
+/// attempt. Dropping the final owner only provides best-effort process killing.
+#[derive(Clone, Default)]
+pub struct McpDiscoveryCleanup {
+    clients: Arc<Mutex<Vec<McpStdioClient>>>,
+}
+
+impl McpDiscoveryCleanup {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Try every retained client once, removing only confirmed shutdowns. An
+    /// error is not a cleanup receipt; retry this same owner, not discovery.
+    pub async fn shutdown(&self) -> io::Result<()> {
+        let mut clients = self.clients.lock().await;
+        let mut first_error = None;
+        let mut index = 0;
+        while index < clients.len() {
+            match clients[index].shutdown().await {
+                Ok(_) => {
+                    clients.remove(index);
+                }
+                Err(err) => {
+                    first_error.get_or_insert_with(|| discovery_shutdown_error(&err));
+                    index += 1;
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+fn discovery_shutdown_error(err: &McpClientError) -> io::Error {
+    io::Error::other(bounded_diagnostic(format!(
+        "MCP discovery shutdown unconfirmed; client retained for cleanup retry: {err}"
+    )))
+}
+
+/// Restore preparation must fail if discovery cannot confirm process shutdown.
+/// The caller retains `cleanup` before this future is polled, including during
+/// initialization. Ordinary discovery failures remain isolated contributions
+/// only after their client has been reaped.
+pub async fn discover_stdio_tool_feature_with_cleanup(
+    config: &McpConfig,
+    workspace_root: &Path,
+    cleanup: &McpDiscoveryCleanup,
+) -> Result<Option<McpStdioToolFeature>, io::Error> {
+    if config.stdio_servers.is_empty() {
+        return Ok(None);
+    }
+    let mut feature = McpStdioToolFeature::new();
+    for server in &config.stdio_servers {
+        match resolve_stdio_server(server, workspace_root, None) {
+            Ok(spec) => {
+                feature.add_contribution(
+                    discover_server_tools_with_cleanup(spec, cleanup, McpStdioLimits::default())
+                        .await?,
+                );
+            }
+            Err(err) => {
+                feature.add_diagnostic(FeatureDiagnostic::error(bounded_diagnostic(format!(
+                    "failed to resolve MCP stdio server `{}`: {err}",
+                    server.name
+                ))))
+            }
+        }
+    }
+    Ok(Some(feature))
+}
+
 /// Discover enabled MCP stdio server tools and return a single feature module
 /// containing startup contributions for normal ToolRegistry installation.
+/// Callers needing retryable startup cleanup must use the cleanup-aware API.
 pub async fn discover_stdio_tool_feature(
     config: &McpConfig,
     workspace_root: &Path,
@@ -82,19 +164,64 @@ pub async fn discover_stdio_tool_feature(
 
 async fn discover_server_tools(spec: McpStdioServerSpec) -> ProtocolProviderContribution {
     let declaration = provider_declaration(&spec.name, None);
+    let cleanup = McpDiscoveryCleanup::new();
+    match discover_server_tools_with_cleanup(spec, &cleanup, McpStdioLimits::default()).await {
+        Ok(contribution) => contribution,
+        Err(err) => {
+            ProtocolProviderContribution::failed(declaration, bounded_diagnostic(err.to_string()))
+        }
+    }
+}
+
+async fn discover_server_tools_with_cleanup(
+    spec: McpStdioServerSpec,
+    cleanup: &McpDiscoveryCleanup,
+    limits: McpStdioLimits,
+) -> io::Result<ProtocolProviderContribution> {
+    let declaration = provider_declaration(&spec.name, None);
+    let mut clients = cleanup.clients.lock().await;
+    if !clients.is_empty() {
+        return Err(io::Error::other(
+            "MCP discovery cleanup is pending; shut down the retained owner before retrying discovery",
+        ));
+    }
+    let client = match McpStdioClient::spawn_uninitialized(spec.clone(), limits) {
+        Ok(client) => client,
+        Err(err) => {
+            // The synchronous spawn API only errors before a process exists;
+            // pipe/handshake failures retain a client and use the shutdown path.
+            return Ok(ProtocolProviderContribution::failed(
+                declaration,
+                bounded_diagnostic(err.to_string()),
+            ));
+        }
+    };
+    // Spawn is synchronous: the owner holds the client before the first await
+    // that can leave a running process on initialization failure/cancellation.
+    clients.push(client);
+    let client = clients.last_mut().expect("retained discovery client");
+    let contribution = match client.initialize_with_timeout().await {
+        Ok(()) => discover_connected_server_tools(spec, client).await,
+        Err(err) => {
+            ProtocolProviderContribution::failed(declaration, bounded_diagnostic(err.to_string()))
+        }
+    };
+    client
+        .shutdown()
+        .await
+        .map_err(|err| discovery_shutdown_error(&err))?;
+    drop(clients.pop());
+    Ok(contribution)
+}
+
+async fn discover_connected_server_tools(
+    spec: McpStdioServerSpec,
+    client: &mut McpStdioClient,
+) -> ProtocolProviderContribution {
+    let declaration = provider_declaration(&spec.name, None);
     let mut contribution = ProtocolProviderContribution::ready(declaration.clone());
     let server_namespace = sanitize_segment(&spec.name);
     let execution_spec = spec.clone();
-
-    let mut client = match McpStdioClient::connect(spec, McpStdioLimits::default()).await {
-        Ok(client) => client,
-        Err(err) => {
-            return ProtocolProviderContribution::failed(
-                declaration,
-                bounded_diagnostic(err.to_string()),
-            );
-        }
-    };
 
     let (server_version, has_tools, has_resources, has_prompts) = client
         .initialize_result()
@@ -133,18 +260,10 @@ async fn discover_server_tools(spec: McpStdioServerSpec) -> ProtocolProviderCont
         {
             Ok(list) => list,
             Err(err) => {
-                let mut failed = ProtocolProviderContribution::failed(
+                return ProtocolProviderContribution::failed(
                     declaration,
                     bounded_diagnostic(err.to_string()),
                 );
-                if let Err(shutdown_err) = client.shutdown().await {
-                    failed = failed.with_diagnostic(FeatureDiagnostic::warning(
-                        bounded_diagnostic(format!(
-                            "MCP server shutdown after discovery failure failed: {shutdown_err}"
-                        )),
-                    ));
-                }
-                return failed;
             }
         };
         let list_changes = client.snapshot_list_changes().await;
@@ -166,20 +285,12 @@ async fn discover_server_tools(spec: McpStdioServerSpec) -> ProtocolProviderCont
             {
                 Ok(list) => list,
                 Err(err) => {
-                    let mut failed = ProtocolProviderContribution::failed(
+                    return ProtocolProviderContribution::failed(
                         declaration,
                         bounded_diagnostic(format!(
                             "MCP server sent notifications/tools/list_changed during tool discovery and refresh failed: {err}"
                         )),
                     );
-                    if let Err(shutdown_err) = client.shutdown().await {
-                        failed = failed.with_diagnostic(FeatureDiagnostic::warning(
-                            bounded_diagnostic(format!(
-                                "MCP server shutdown after discovery refresh failure failed: {shutdown_err}"
-                            )),
-                        ));
-                    }
-                    return failed;
                 }
             };
             let refresh_changes = client.snapshot_list_changes().await;
@@ -197,13 +308,6 @@ async fn discover_server_tools(spec: McpStdioServerSpec) -> ProtocolProviderCont
     } else {
         None
     };
-    let shutdown_result = client.shutdown().await;
-    if let Err(err) = shutdown_result {
-        contribution =
-            contribution.with_diagnostic(FeatureDiagnostic::warning(bounded_diagnostic(format!(
-                "MCP server shutdown after capability discovery failed: {err}"
-            ))));
-    }
 
     if let Some(list) = list {
         contribution = normalize_listed_tools(
@@ -1817,6 +1921,140 @@ read exit_notification || true
             capabilities
         );
         McpStdioServerSpec::new("shell-mock", "/bin/sh").args(["-c".to_string(), script])
+    }
+
+    #[cfg(unix)]
+    fn discovery_config(spec: McpStdioServerSpec) -> McpConfig {
+        McpConfig {
+            stdio_servers: vec![manifest::McpStdioServerConfig {
+                name: spec.name,
+                command: spec.command,
+                args: spec.args,
+                cwd: None,
+                env: Default::default(),
+            }],
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_discovery_retains_initializing_client_in_cleanup_clone() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let config = discovery_config(
+            McpStdioServerSpec::new("initializing", "/bin/sh")
+                .args(["-c", "while read line; do :; done"]),
+        );
+        let cleanup = McpDiscoveryCleanup::new();
+        let retained = cleanup.clone();
+        let mut discovery = Box::pin(discover_stdio_tool_feature_with_cleanup(
+            &config,
+            Path::new("."),
+            &cleanup,
+        ));
+        poll_fn(|cx| {
+            assert!(discovery.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(discovery);
+        drop(cleanup);
+        assert_eq!(retained.clients.lock().await.len(), 1);
+        let retry_error =
+            discover_stdio_tool_feature_with_cleanup(&config, Path::new("."), &retained)
+                .await
+                .err()
+                .expect("discovery must not replace an unreaped client");
+        assert!(retry_error.to_string().contains("cleanup is pending"));
+        assert_eq!(retained.clients.lock().await.len(), 1);
+        tokio::time::timeout(Duration::from_secs(3), retained.shutdown())
+            .await
+            .expect("cleanup bounded")
+            .expect("initializing process reaped");
+        assert!(retained.clients.lock().await.is_empty());
+        retained
+            .shutdown()
+            .await
+            .expect("confirmed cleanup repeatable");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_owner_shutdown_keeps_client_for_retry() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let cleanup = McpDiscoveryCleanup::new();
+        cleanup.clients.lock().await.push(
+            McpStdioClient::spawn_uninitialized(
+                McpStdioServerSpec::new("shutdown-pending", "/bin/sh")
+                    .args(["-c", "while :; do :; done"]),
+                McpStdioLimits {
+                    shutdown_timeout: Duration::from_millis(50),
+                    kill_timeout: Duration::from_millis(100),
+                    ..Default::default()
+                },
+            )
+            .expect("local process spawned"),
+        );
+        let mut shutdown = Box::pin(cleanup.shutdown());
+        poll_fn(|cx| {
+            assert!(shutdown.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(shutdown);
+        assert_eq!(cleanup.clients.lock().await.len(), 1);
+        tokio::time::timeout(Duration::from_secs(2), cleanup.shutdown())
+            .await
+            .expect("retry bounded")
+            .expect("retained client shutdown");
+        assert!(cleanup.clients.lock().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_aware_discovery_reaps_success_and_initialize_failure() {
+        let cleanup = McpDiscoveryCleanup::new();
+        let config = discovery_config(shell_capability_server(r#"{"resources":{}}"#));
+        let feature = discover_stdio_tool_feature_with_cleanup(&config, Path::new("."), &cleanup)
+            .await
+            .expect("discovery cleanup confirmed")
+            .expect("configured feature");
+        assert!(
+            feature.contributions[0]
+                .tools
+                .iter()
+                .any(|tool| { tool.name() == "Mcp_shell_mock_resources_read" })
+        );
+        assert!(cleanup.clients.lock().await.is_empty());
+
+        let spec = McpStdioServerSpec::new("init-rejected", "/bin/sh").args([
+            "-c",
+            r#"read init || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"initialization rejected"}}'
+while read line; do :; done
+"#,
+        ]);
+        let config = discovery_config(spec);
+        let feature = discover_stdio_tool_feature_with_cleanup(&config, Path::new("."), &cleanup)
+            .await
+            .expect("failure isolated only after cleanup")
+            .expect("failed contribution preserved");
+        assert!(feature.contributions[0].tools.is_empty());
+        assert!(
+            feature.contributions[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.severity == FeatureDiagnosticSeverity::Error
+                        && diagnostic.message.contains("initialization rejected")
+                })
+        );
+        assert!(cleanup.clients.lock().await.is_empty());
     }
 
     #[test]

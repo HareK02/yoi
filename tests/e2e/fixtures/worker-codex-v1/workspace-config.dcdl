@@ -1,0 +1,22 @@
+{
+  profile = {
+    default_profile = "project:fixture-chat";
+    entries = [{
+      selector = "project:fixture-chat";
+      label = "Isolated Codex fixture conversation";
+      description = "Artificial conversation only; no Workdir, Tools, Subject or background work.";
+      profile = (import "$builtin/profiles/job.dcdl") // {
+        slug = "fixture-chat";
+        worker = { mode = "tools"; };
+        model = { ref = "codex-oauth/gpt-6.1-sol"; };
+        scope = "workspace_read";
+        delegation_scope = "workspace_read";
+        permissions = { default_action = "deny"; rule = []; };
+        engine = { instruction = "default"; reasoning = "low"; max_tokens = 2048; max_turns = 4; language = "Japanese"; };
+        session = { record_event_trace = false; };
+        feature = { workdir_catalog = { enabled = false; }; };
+      };
+    }];
+  };
+  prompts = { default_prompt = "これは隔離環境の人工的な会話テストです。日本語で簡潔に応答してください。Toolや外部操作は行わず、ユーザーが会話中に提示した情報だけを使ってください。"; };
+} as WorkspaceConfigSchema

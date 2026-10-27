@@ -9,6 +9,8 @@ autotests = false
 [features]
 default = []
 e2e = []
+fixture-support = ["yoi-workspace-server/test-support", "worker-runtime/test-support"]
+restore-checkpoints = ["fixture-support", "worker-runtime/restore-checkpoints"]
 
 [dependencies]
 libc.workspace = true
@@ -17,11 +19,17 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+protocol.workspace = true
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 yoi-workspace-server.workspace = true
 server-api.workspace = true
+worker-runtime.workspace = true
+session-store.workspace = true
+config-source.workspace = true
+manifest.workspace = true
 webauthn-rs-proto = "0.5.5"
 webauthn-authenticator-rs = { version = "0.5.5", default-features = false, features = ["softpasskey"] }
 
@@ -44,3 +52,8 @@ required-features = ["e2e"]
 name = "worker_environment"
 path = "tests/worker_environment.rs"
 required-features = ["e2e"]
+
+[[test]]
+name = "worker_restore"
+path = "tests/worker_restore.rs"
+required-features = ["e2e", "fixture-support"]

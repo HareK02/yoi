@@ -25,6 +25,7 @@ use crate::interaction::{WorkerInput, WorkerInteractionAck};
 use crate::management::{RuntimeSummary, WorkerDeleteResult};
 #[cfg(feature = "ws-server")]
 use crate::observation::WorkerObservationCursor;
+#[cfg(feature = "fs-store")]
 use crate::retention::{
     WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult, WorkerRetentionInventory,
 };
@@ -1568,6 +1569,7 @@ fn protocol_error_event(message: impl Into<String>) -> protocol::Event {
     }
 }
 
+#[cfg(feature = "fs-store")]
 #[allow(dead_code)]
 async fn worker_retention_inventory(
     State(state): State<RuntimeHttpState>,
@@ -1589,6 +1591,7 @@ async fn worker_retention_inventory(
         .map_err(RuntimeHttpRestError::runtime)
 }
 
+#[cfg(feature = "fs-store")]
 #[allow(dead_code)]
 async fn execute_worker_retention(
     State(state): State<RuntimeHttpState>,
@@ -2652,6 +2655,87 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    // Generated management routes and real Workspace capability middleware stay
+    // connected even when this process has no filesystem retention provider.
+    #[cfg(not(feature = "fs-store"))]
+    #[tokio::test]
+    async fn memory_retention_routes_preserve_auth_and_return_typed_unavailable() {
+        let identity = RuntimeIdentityMaterial::generate("workspace-key").unwrap();
+        let trust = workspace_trust(&identity);
+        let runtime = Runtime::new_memory();
+        let app = runtime_http_router_with_workspace_auth(
+            runtime,
+            None,
+            workspace_test_auth(vec![trust.clone()]),
+        );
+        let worker_id = WorkerId::now_v7();
+        let body = runtime_api::WorkerRetentionExecutionRequest {
+            operation_id: "memory-retention".into(),
+            input_fingerprint: "input".into(),
+            archive_id: None,
+            workspace_id: "workspace-a".into(),
+            source_runtime_id: "runtime-test".into(),
+            worker_id,
+            source_created_at: "2026-01-01T00:00:00Z".into(),
+            removed_at: "2026-01-02T00:00:00Z".into(),
+            effective_profile: None,
+            retention_class: None,
+            policy_id: "policy".into(),
+            session_disposition: runtime_api::SessionDisposition::Purge,
+            diagnostics_disposition: runtime_api::DiagnosticsDisposition::Purge,
+        };
+        for (method, path, body) in [
+            (
+                "GET",
+                format!("/v1/workers/{worker_id}/retention/inventory"),
+                vec![],
+            ),
+            (
+                "POST",
+                format!("/v1/workers/{worker_id}/retention/execute"),
+                serde_json::to_vec(&body).unwrap(),
+            ),
+        ] {
+            let unsigned = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(&path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+            let claims = signed_claims(&trust, method, &path, &body);
+            let response =
+                signed_request(app.clone(), &identity, &claims, body, "workspace-a").await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let error: RuntimeHttpErrorResponse = read_json(response).await;
+            assert_eq!(error.error.code, "worker_retention_unavailable");
+        }
+        for (mut value, expected_status, expected_code) in [
+            (body.clone(), StatusCode::NOT_FOUND, "worker_not_found"),
+            (body.clone(), StatusCode::BAD_REQUEST, "worker_id_mismatch"),
+        ] {
+            if expected_status == StatusCode::NOT_FOUND {
+                value.workspace_id = "workspace-b".into();
+            } else {
+                value.worker_id = WorkerId::now_v7();
+            }
+            let path = format!("/v1/workers/{worker_id}/retention/execute");
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let claims = signed_claims(&trust, "POST", &path, &bytes);
+            let response =
+                signed_request(app.clone(), &identity, &claims, bytes, "workspace-a").await;
+            assert_eq!(response.status(), expected_status);
+            let error: RuntimeHttpErrorResponse = read_json(response).await;
+            assert_eq!(error.error.code, expected_code);
+        }
     }
 
     #[tokio::test]

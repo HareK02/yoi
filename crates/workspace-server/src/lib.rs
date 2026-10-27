@@ -19,12 +19,17 @@ pub mod repositories;
 pub mod repository_access;
 pub mod repository_source;
 pub mod resource_broker;
+#[cfg(test)]
+#[path = "../../../tests/support/restore_environment.rs"]
+mod restore_test_environment;
 pub mod retention;
 pub mod runtime_settings;
 pub mod runtime_subscription;
 pub mod server;
 pub mod skills;
 pub mod store;
+#[cfg(feature = "test-support")]
+pub use store::fixture_support as test_support;
 pub mod subjektiv;
 #[cfg(test)]
 mod ticket_browse_performance_tests;

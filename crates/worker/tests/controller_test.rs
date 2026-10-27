@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -150,6 +151,19 @@ impl LlmClient for MockClient {
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[path = "../../../tests/support/restore_environment.rs"]
+mod restore_test_environment;
+use restore_test_environment::require_restore_test_environment;
+
+fn owned_relative_runtime_base() -> (tempfile::TempDir, PathBuf) {
+    require_restore_test_environment();
+    let temp = tempfile::tempdir_in(".").unwrap();
+    // The relative reference and the TempDir name the same owned tree, without
+    // putting the checkout prefix into sockaddr_un or changing process cwd.
+    let runtime_base = Path::new(temp.path().file_name().unwrap()).join("runtime");
+    (temp, runtime_base)
+}
+
 fn simple_text_events() -> Vec<LlmEvent> {
     vec![
         LlmEvent::text_block_start(0),
@@ -295,6 +309,7 @@ async fn make_worker_with_manifest_and_workspace_context(
     manifest: WorkerManifest,
     workspace_context: WorkerWorkspaceContext,
 ) -> (Worker<MockClient, TestStore>, std::path::PathBuf) {
+    require_restore_test_environment();
     let store_tmp = tempfile::tempdir().unwrap();
     let store = CombinedStore::new(
         FsStore::new(store_tmp.path()).unwrap(),
@@ -320,18 +335,21 @@ async fn make_worker_with_manifest_and_workspace_context(
 }
 
 async fn spawn_controller(worker: Worker<MockClient, TestStore>) -> WorkerHandle {
-    let tmp = tempfile::tempdir().unwrap();
-    let runtime_base = tmp.path().to_owned();
-    std::mem::forget(tmp);
-    let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
+    let (tmp, runtime_base) = owned_relative_runtime_base();
+    let (handle, shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
         .await
         .unwrap();
+    // Retain ownership until controller shutdown (or test-runtime teardown).
+    tokio::spawn(async move {
+        let _ = shutdown_rx.await;
+        drop(tmp);
+    });
     handle
 }
 
 #[tokio::test]
 async fn canonical_worker_handle_uploads_and_submits_attachment() {
-    let root = tempfile::tempdir().unwrap();
+    let (root, runtime_base) = owned_relative_runtime_base();
     let manifest = WorkerManifest::from_toml(MANIFEST_TOML).unwrap();
     let session = session_store::WorkerSessionStore::new(root.path().join("session")).unwrap();
     let store = CombinedStore::new(
@@ -353,7 +371,7 @@ async fn canonical_worker_handle_uploads_and_submits_attachment() {
     )
     .await
     .unwrap();
-    let (handle, shutdown_rx) = WorkerController::spawn(worker, &root.path().join("runtime"))
+    let (handle, shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
         .await
         .unwrap();
     let mut rx = handle.subscribe();
@@ -760,6 +778,227 @@ async fn controller_startup_failure_closes_bound_workdir_session() {
             .await,
         Err(ref error) if matches!(error.classification_source(), WorkdirError::Unavailable(_))
     ));
+}
+
+mod registry_startup_failure {
+    //! Connect real controller preparation, registry source fences and session cleanup.
+    //! The Workdir telemetry boundary substitutes a concurrent metadata change at subscription;
+    //! the real registry must reject drift before starting its prepared observer.
+    use super::*;
+    use session_store::WorkerMetadataStore;
+    use tokio::sync::broadcast;
+    use workdir::WorkdirSession;
+
+    struct ObservedSession {
+        local: LocalWorkdirSession,
+        metadata_store: TestStore,
+        worker_name: String,
+        events: broadcast::Sender<workdir::CommandEvent>,
+        subscriptions: AtomicUsize,
+        receivers_at_close: Mutex<Vec<usize>>,
+    }
+
+    impl std::fmt::Debug for ObservedSession {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ObservedSession")
+                .field("worker_name", &self.worker_name)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait]
+    impl WorkdirSession for ObservedSession {
+        fn workdir(&self) -> &Workdir {
+            self.local.workdir()
+        }
+
+        fn capabilities(&self) -> WorkdirSessionCapabilities {
+            self.local.capabilities()
+        }
+
+        async fn stat(
+            &self,
+            request: workdir::StatRequest,
+        ) -> Result<workdir::StatResult, WorkdirError> {
+            self.local.stat(request).await
+        }
+
+        async fn read(
+            &self,
+            request: workdir::ReadRequest,
+        ) -> Result<workdir::ReadResult, WorkdirError> {
+            self.local.read(request).await
+        }
+
+        async fn write(
+            &self,
+            request: workdir::WriteRequest,
+        ) -> Result<workdir::WriteResult, WorkdirError> {
+            self.local.write(request).await
+        }
+
+        async fn edit(
+            &self,
+            request: workdir::EditRequest,
+        ) -> Result<workdir::EditResult, WorkdirError> {
+            self.local.edit(request).await
+        }
+
+        async fn list(
+            &self,
+            request: workdir::ListRequest,
+        ) -> Result<workdir::ListResult, WorkdirError> {
+            self.local.list(request).await
+        }
+
+        async fn glob(
+            &self,
+            request: workdir::GlobRequest,
+        ) -> Result<workdir::GlobResult, WorkdirError> {
+            self.local.glob(request).await
+        }
+
+        async fn grep(
+            &self,
+            request: workdir::GrepRequest,
+        ) -> Result<workdir::GrepResult, WorkdirError> {
+            self.local.grep(request).await
+        }
+
+        async fn start_command(
+            &self,
+            request: CommandRequest,
+        ) -> Result<workdir::CommandHandle, WorkdirError> {
+            self.local.start_command(request).await
+        }
+
+        async fn command_status(
+            &self,
+            handle: workdir::CommandHandle,
+        ) -> Result<workdir::CommandStatus, WorkdirError> {
+            self.local.command_status(handle).await
+        }
+
+        async fn command_output(
+            &self,
+            request: CommandOutputRequest,
+        ) -> Result<workdir::CommandOutput, WorkdirError> {
+            self.local.command_output(request).await
+        }
+
+        async fn cancel_command(&self, handle: workdir::CommandHandle) -> Result<(), WorkdirError> {
+            self.local.cancel_command(handle).await
+        }
+
+        fn subscribe_command_events(&self) -> Option<broadcast::Receiver<workdir::CommandEvent>> {
+            // Interleave a canonical change after read-only registry preparation.
+            let mut metadata = self
+                .metadata_store
+                .read_by_name(&self.worker_name)
+                .unwrap()
+                .unwrap_or_else(|| session_store::WorkerMetadata::new(&self.worker_name, None));
+            metadata
+                .spawned_children
+                .push(session_store::WorkerSpawnedChild {
+                    worker_name: "legacy-drift".into(),
+                    socket_path: PathBuf::new(),
+                    callback_address: PathBuf::new(),
+                    scope_delegated: vec![],
+                });
+            self.metadata_store.write(&metadata).unwrap();
+            self.subscriptions.fetch_add(1, Ordering::SeqCst);
+            Some(self.events.subscribe())
+        }
+
+        async fn close(&self) -> Result<(), WorkdirError> {
+            // Record before any await: aborting without joining must not pass by getting a
+            // scheduler turn during the provider's asynchronous close. The sender stays alive
+            // even after close, so channel closure cannot accidentally dispose of the observer.
+            self.receivers_at_close
+                .lock()
+                .unwrap()
+                .push(self.events.receiver_count());
+            self.local.close().await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn registry_drift_drops_prepared_observer_before_closing_session() {
+        let root = tempfile::tempdir().unwrap();
+        let run_dir = root.path().join("runs/1");
+        let client = MockClient::new(simple_text_events());
+        let manifest = WorkerManifest::from_toml(MANIFEST_TOML).unwrap();
+        let store = CombinedStore::new(
+            FsStore::new(root.path().join("sessions")).unwrap(),
+            FsWorkerStore::new(root.path().join("workers")).unwrap(),
+        );
+        let engine =
+            Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
+                client.clone(),
+            );
+        let mut worker = Worker::new(
+            manifest,
+            engine,
+            store.clone(),
+            WorkerWorkspaceContext::local_filesystem(None),
+            WorkerFilesystemAuthority::local(root.path().into(), root.path().into()),
+            manifest::Scope::writable(root.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let (events, unused_receiver) = broadcast::channel(8);
+        drop(unused_receiver);
+        let session = Arc::new(ObservedSession {
+            local: LocalWorkdirSession::materialized_bound(
+                Workdir::new("registry-startup-failure"),
+                root.path().into(),
+                root.path().into(),
+                worker.scope().clone(),
+                WorkdirSessionCapabilities::ALL,
+            ),
+            metadata_store: store,
+            worker_name: worker.manifest().worker.name.clone(),
+            events,
+            subscriptions: AtomicUsize::new(0),
+            receivers_at_close: Mutex::new(Vec::new()),
+        });
+        worker.bind_single_workdir_session(Some(session.clone()));
+        let sessions = worker.workdir_sessions();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            WorkerController::spawn_runtime_managed_run(worker, &run_dir),
+        )
+        .await
+        .expect("registry rejection and cleanup must settle");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("registry source drift must reject controller startup"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(session.subscriptions.load(Ordering::SeqCst), 1);
+        assert_eq!(*session.receivers_at_close.lock().unwrap(), vec![0]);
+        assert_eq!(session.events.receiver_count(), 0);
+        assert!(sessions.aliases().is_empty());
+        // No controller retains the Worker/Engine after the failed startup.
+        assert_eq!(Arc::strong_count(&client.call_count), 1);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 0);
+        assert!(!run_dir.join("worker.sock").exists());
+        assert!(!run_dir.join("status.json").exists());
+        assert!(!run_dir.join("manifest.toml").exists());
+        assert!(matches!(
+            session
+                .start_command(CommandRequest {
+                    command: "printf unreachable".to_owned(),
+                    timeout_secs: 5,
+                    transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
+                    cwd: workdir::WorkdirPath::root(),
+                    tool_call_id: None,
+                })
+                .await,
+            Err(ref error) if matches!(error.classification_source(), WorkdirError::Unavailable(_))
+        ));
+    }
 }
 
 async fn wait_for_status(handle: &WorkerHandle, status: WorkerStatus) {
@@ -1561,11 +1800,12 @@ permission = "write"
 "#;
     let client = MockClient::new(simple_text_events());
     let worker = make_worker_with_pwd_and_manifest(client, manifest).await.0;
-    let tmp = tempfile::tempdir().unwrap();
-    let result = WorkerController::spawn(worker, tmp.path()).await;
+    let (_tmp, runtime_base) = owned_relative_runtime_base();
+    let result = WorkerController::spawn(worker, &runtime_base).await;
     assert!(
         result.is_ok(),
-        "feature exposure must not imply delegation authority"
+        "feature exposure must not imply delegation authority: {:?}",
+        result.as_ref().err()
     );
 }
 

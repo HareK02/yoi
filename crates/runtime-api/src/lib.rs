@@ -86,6 +86,8 @@ pub enum WorkerRestoreState {
     Accepted,
     Rejected,
     RolledBack,
+    /// A later Stop superseded this restore; neither rollback nor prior Accepted is asserted.
+    Superseded,
     ReconciliationRequired,
 }
 
@@ -1578,13 +1580,24 @@ mod tests {
         )
         .unwrap();
         assert!(request.preparation.is_none());
-        for state in [
-            "accepted",
-            "rejected",
-            "rolled_back",
-            "reconciliation_required",
+        for (state, wire) in [
+            (WorkerRestoreState::Accepted, "accepted"),
+            (WorkerRestoreState::Rejected, "rejected"),
+            (WorkerRestoreState::RolledBack, "rolled_back"),
+            (WorkerRestoreState::Superseded, "superseded"),
+            (
+                WorkerRestoreState::ReconciliationRequired,
+                "reconciliation_required",
+            ),
         ] {
-            assert!(serde_json::from_value::<WorkerRestoreState>(serde_json::json!(state)).is_ok());
+            assert_eq!(
+                serde_json::from_value::<WorkerRestoreState>(serde_json::json!(wire)).unwrap(),
+                state
+            );
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::json!(wire)
+            );
         }
         assert!(
             serde_json::from_value::<WorkerRestoreState>(serde_json::json!(

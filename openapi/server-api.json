@@ -15697,14 +15697,23 @@
         "type": "object"
       },
       "WorkerRestoreState": {
-        "description": "Cross-layer outcome of an explicit Worker restore operation.\n\n`Rejected` is reserved for read-only preflight failures. Once live restore\nwork starts, failure is either a confirmed `RolledBack` operation or a\n`ReconciliationRequired` result whose commit state must be reread/retried.",
-        "enum": [
-          "accepted",
-          "rejected",
-          "rolled_back",
-          "reconciliation_required"
-        ],
-        "type": "string"
+        "description": "Cross-layer outcome of an explicit Worker restore operation.\n\n`Rejected` is reserved for read-only preflight failures. Once live restore\nwork starts, distinguish confirmed `RolledBack`, unresolved\n`ReconciliationRequired`, and a later Stop's `Superseded` outcome.",
+        "oneOf": [
+          {
+            "enum": [
+              "accepted",
+              "rejected",
+              "rolled_back",
+              "reconciliation_required"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "superseded",
+            "description": "A later Stop superseded this restore; neither rollback nor prior Accepted is asserted.",
+            "type": "string"
+          }
+        ]
       },
       "WorkerRetentionResponse": {
         "additionalProperties": false,
@@ -18155,7 +18164,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:5de3f3b716555717d3274b8c6a385fb66624585941628a53b8b3050cb58f8ab7"
+    "x-yoi-source-digest": "sha256:4159d6baa918c9d7d3cb6ae02207aad877a69ad1dd4207beb63b271deb24176e"
   },
   "openapi": "3.1.0",
   "paths": {

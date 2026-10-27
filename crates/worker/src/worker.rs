@@ -532,7 +532,7 @@ use crate::prompt::catalog::{CatalogError, PromptCatalog, WorkspacePromptProject
 use crate::prompt::source::PromptCatalogSource;
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::runtime::worker_allocation::{
-    self, ScopeAllocationGuard, ScopeLockError, SegmentActivationGuard,
+    self, ScopeAllocationCleanup, ScopeAllocationGuard, ScopeLockError, SegmentActivationGuard,
 };
 use crate::skill::{SkillActivationResponse, SkillClientError};
 #[cfg(test)]
@@ -3322,6 +3322,360 @@ struct PendingCompactionCleanup {
     compaction_id: String,
 }
 
+/// Retains startup task scopes after a consuming controller startup fails.
+///
+/// Call `shutdown` only after startup has failed with no live Controller. Keep
+/// this handle on errors or timeout and retry; it owns any in-flight settlement
+/// future, including join handles drained from the registries. On successful
+/// controller transfer, drop the factory's handle without shutting it down.
+#[derive(Clone)]
+pub struct WorkerStartupFeatureCleanup {
+    inner: Arc<StartupFeatureCleanupInner>,
+}
+
+struct StartupFeatureCleanupInner {
+    mcp_discovery: crate::feature::mcp::McpDiscoveryCleanup,
+    registries: Mutex<Vec<FeatureBackgroundTaskRegistry>>,
+    settlement: tokio::sync::Mutex<
+        Option<futures_util::future::BoxFuture<'static, Result<(), crate::hook::HookError>>>,
+    >,
+}
+
+impl WorkerStartupFeatureCleanup {
+    fn new(registry: FeatureBackgroundTaskRegistry) -> Self {
+        Self {
+            inner: Arc::new(StartupFeatureCleanupInner {
+                mcp_discovery: crate::feature::mcp::McpDiscoveryCleanup::new(),
+                registries: Mutex::new(vec![registry]),
+                settlement: tokio::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    pub(crate) fn mcp_discovery(&self) -> crate::feature::mcp::McpDiscoveryCleanup {
+        self.inner.mcp_discovery.clone()
+    }
+
+    fn retain(&self, registry: FeatureBackgroundTaskRegistry) {
+        self.inner
+            .registries
+            .lock()
+            .expect("startup Feature cleanup poisoned")
+            .push(registry);
+    }
+
+    /// Stops and joins every captured registry. Cancelling this call preserves
+    /// its settlement future for the next call, rather than dropping task joins.
+    pub async fn shutdown(&self) -> Result<(), crate::hook::HookError> {
+        let mut settlement = self.inner.settlement.lock().await;
+        let pending = settlement.get_or_insert_with(|| {
+            let registries = self
+                .inner
+                .registries
+                .lock()
+                .expect("startup Feature cleanup poisoned")
+                .clone();
+            let mcp_discovery = self.inner.mcp_discovery.clone();
+            Box::pin(async move {
+                let mut failure = None;
+                for registry in registries {
+                    if let Err(error) = registry.shutdown().await {
+                        failure.get_or_insert(error);
+                    }
+                }
+                if let Err(error) = mcp_discovery.shutdown().await {
+                    failure.get_or_insert_with(|| {
+                        crate::hook::HookError::new(
+                            crate::hook::HookErrorCategory::Dependency,
+                            error.to_string(),
+                        )
+                    });
+                }
+                failure.map_or(Ok(()), Err)
+            })
+        });
+        let result = pending.as_mut().await;
+        *settlement = None;
+        result
+    }
+}
+
+/// A close-only candidate resource owner, not filesystem execution authority.
+#[derive(Clone)]
+pub struct RestoreCandidateWorkdirCleanup {
+    sessions: Arc<WorkdirSessionRouter>,
+}
+
+impl RestoreCandidateWorkdirCleanup {
+    pub async fn close(&self) -> Result<(), WorkerError> {
+        self.sessions
+            .close_all()
+            .await
+            .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))
+    }
+}
+
+/// An unpublished, read-only reconstruction of an existing materialized Worker.
+///
+/// The host must hold its per-Worker operation lock through activation. Snapshot
+/// checks reject drift; they do not replace that lock or current host authorization.
+/// No controller, allocation, Feature installation, or repair runs during prepare.
+/// The public candidate exposes no Worker execution or mutation handles. Binding
+/// inside this crate is limited to the open candidate; once discard begins, only
+/// cleanup retry remains valid, even if its previous attempt failed or was cancelled.
+/// Use `discard` for confirmed cleanup; Drop only schedules best-effort cleanup on
+/// the current Tokio runtime and cannot attest that asynchronous cleanup completed.
+pub struct PreparedRestoredWorker<St: Store> {
+    worker: Option<Worker<Box<dyn LlmClient>, St>>,
+    closing: bool,
+    activation: Option<RestoredWorkerActivation>,
+}
+
+/// Exact existing restore source retained while a Controller is initialized.
+///
+/// This carries no new Worker identity or execution authority. The host must keep
+/// the per-Worker operation lock and invoke activation only after durable commit.
+/// Controller initialization must not change the captured source before then.
+pub(crate) struct RestoredWorkerActivation {
+    metadata: Option<WorkerMetadata>,
+    entries: serde_json::Value,
+    manifest: serde_json::Value,
+}
+
+impl RestoredWorkerActivation {
+    fn revalidate<St>(&self, worker: &Worker<Box<dyn LlmClient>, St>) -> Result<(), WorkerError>
+    where
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        let changed = |component| WorkerError::RestoreCandidateChanged {
+            worker_name: worker.manifest.worker.name.clone(),
+            component,
+        };
+        if worker.store.read_by_name(&worker.manifest.worker.name)? != self.metadata {
+            return Err(changed("metadata"));
+        }
+        if restore_snapshot_value(&worker.manifest)? != self.manifest {
+            return Err(changed("manifest"));
+        }
+        let entries = worker
+            .store
+            .read_all(worker.session_id(), worker.segment_id())?;
+        if restore_snapshot_value(&entries)? != self.entries {
+            return Err(changed("segment"));
+        }
+        Ok(())
+    }
+
+    /// Acquire the existing top-level writer allocation after commit, checking
+    /// exact source both before and after acquisition, then apply restore effects.
+    /// On failure the Controller still owns the Worker; cleanup handles do not
+    /// establish rollback and allocation release must wait until it is dropped.
+    pub(crate) async fn activate<St>(
+        &self,
+        worker: &mut Worker<Box<dyn LlmClient>, St>,
+    ) -> Result<(), WorkerError>
+    where
+        St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+    {
+        self.revalidate(worker)
+            .map_err(|error| worker.construction_failure(error))?;
+        let allocate = || -> Result<ScopeAllocationGuard, WorkerError> {
+            Ok(worker_allocation::install_top_level_with_deny(
+                worker.manifest.worker.name.clone(),
+                std::process::id(),
+                PathBuf::new(), // Reserved legacy field; no Worker endpoint exists.
+                worker.scope.snapshot().allow_rules(),
+                worker.scope.snapshot().deny_rules(),
+                worker.segment_id(),
+            )?)
+        };
+        worker.scope_allocation =
+            Some(allocate().map_err(|error| worker.construction_failure(error))?);
+        self.revalidate(worker)
+            .map_err(|error| worker.construction_failure(error))?;
+        worker
+            .finish_restored_construction_in_place(false)
+            .await
+            .map_err(|source| WorkerError::RestoreActivationEffects {
+                source: Box::new(source),
+            })
+    }
+}
+
+impl<St> PreparedRestoredWorker<St>
+where
+    St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+{
+    pub fn manifest(&self) -> &WorkerManifest {
+        &self.worker().manifest
+    }
+
+    /// Retain the same Workdir resource owner for explicit cleanup, including
+    /// after discard fails. This does not grant Worker input or execution access.
+    pub fn workdir_cleanup(&self) -> RestoreCandidateWorkdirCleanup {
+        RestoreCandidateWorkdirCleanup {
+            sessions: self.worker().workdir_sessions.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn workdir_sessions(&self) -> Arc<WorkdirSessionRouter> {
+        self.worker().workdir_sessions.clone()
+    }
+
+    fn worker(&self) -> &Worker<Box<dyn LlmClient>, St> {
+        self.worker
+            .as_ref()
+            .expect("restore candidate already discarded")
+    }
+
+    /// Bootstrap may bind host services before returning an open candidate.
+    /// Never reopen a candidate whose cleanup has begun.
+    pub(crate) fn worker_mut(
+        &mut self,
+    ) -> Result<&mut Worker<Box<dyn LlmClient>, St>, WorkerError> {
+        if self.closing {
+            return Err(WorkerError::RestoreCandidateClosing);
+        }
+        self.worker
+            .as_mut()
+            .ok_or(WorkerError::RestoreCandidateClosing)
+    }
+
+    fn revalidate(&self, worker: &Worker<Box<dyn LlmClient>, St>) -> Result<(), WorkerError> {
+        self.activation
+            .as_ref()
+            .expect("restore candidate activation already transferred")
+            .revalidate(worker)
+    }
+
+    /// Transfer the read-only reconstruction for Controller initialization, not
+    /// execution. Validate once without allocation or canonical restore effects;
+    /// the Controller must retain activation until its durable commit succeeds.
+    pub(crate) fn into_controller_parts(
+        mut self,
+    ) -> Result<(Worker<Box<dyn LlmClient>, St>, RestoredWorkerActivation), WorkerError> {
+        let worker = self
+            .worker
+            .take()
+            .ok_or(WorkerError::RestoreCandidateClosing)?;
+        if self.closing {
+            return Err(worker.construction_failure(WorkerError::RestoreCandidateClosing));
+        }
+        self.revalidate(&worker)
+            .map_err(|error| worker.construction_failure(error))?;
+        let activation = self
+            .activation
+            .take()
+            .expect("restore candidate activation already transferred");
+        Ok((worker, activation))
+    }
+
+    /// Acquire writer allocation only after exact source validation, validate
+    /// again under that allocation, then apply the existing restore mutations.
+    /// An error may retain partial durable effects; ConstructionCleanup carries
+    /// resource ownership and is not evidence of rollback.
+    pub async fn activate(self) -> Result<Worker<Box<dyn LlmClient>, St>, WorkerError> {
+        self.activate_with_allocation(|worker| {
+            Ok(worker_allocation::install_top_level_with_deny(
+                worker.manifest.worker.name.clone(),
+                std::process::id(),
+                PathBuf::new(), // Reserved legacy field; no Worker endpoint exists.
+                worker.scope.snapshot().allow_rules(),
+                worker.scope.snapshot().deny_rules(),
+                worker.segment_id(),
+            )?)
+        })
+        .await
+    }
+
+    async fn activate_with_allocation(
+        mut self,
+        allocate: impl FnOnce(
+            &Worker<Box<dyn LlmClient>, St>,
+        ) -> Result<ScopeAllocationGuard, WorkerError>,
+    ) -> Result<Worker<Box<dyn LlmClient>, St>, WorkerError> {
+        let mut worker = self
+            .worker
+            .take()
+            .ok_or(WorkerError::RestoreCandidateClosing)?;
+        if self.closing {
+            // Preserve the same cleanup owner without validating or acquiring
+            // allocation for a partially closed candidate.
+            return Err(worker.construction_failure(WorkerError::RestoreCandidateClosing));
+        }
+        self.revalidate(&worker)
+            .map_err(|error| worker.construction_failure(error))?;
+        worker.scope_allocation =
+            Some(allocate(&worker).map_err(|error| worker.construction_failure(error))?);
+        self.revalidate(&worker)
+            .map_err(|error| worker.construction_failure(error))?;
+        worker
+            .finish_restored_construction()
+            .await
+            .map_err(|source| WorkerError::RestoreActivationEffects {
+                source: Box::new(source),
+            })
+    }
+
+    /// Directly settle candidate resources, without Controller Shutdown. Failed
+    /// cleanup retains the candidate so the same owner can retry it.
+    pub async fn discard(&mut self) -> Result<(), WorkerError> {
+        self.closing = true;
+        if let Some(worker) = self.worker.as_mut() {
+            worker
+                .retain_startup_feature_cleanup()
+                .shutdown()
+                .await
+                .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?;
+            worker
+                .workdir_sessions
+                .close_all()
+                .await
+                .map_err(|error| WorkerError::FeatureLifecycle(error.to_string()))?;
+            // An unpublished candidate has no allocation guard. Activation moves
+            // the Worker out and uses ConstructionCleanup on failure; never try
+            // releasing a cleanup handle while its guard is still attached.
+            debug_assert!(worker.scope_allocation.is_none());
+        }
+        self.worker = None;
+        Ok(())
+    }
+}
+
+impl<St: Store> Drop for PreparedRestoredWorker<St> {
+    fn drop(&mut self) {
+        let Some(worker) = self.worker.as_mut() else {
+            return;
+        };
+        let sessions = worker.workdir_sessions.clone();
+        let features = worker.retain_startup_feature_cleanup();
+        // Candidates do not acquire allocation until consuming activation.
+        debug_assert!(worker.scope_allocation.is_none());
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = features.shutdown().await {
+                        tracing::warn!(%error, "restore candidate Feature cleanup unconfirmed");
+                        return;
+                    }
+                    if let Err(error) = sessions.close_all().await {
+                        tracing::warn!(%error, "restore candidate Workdir cleanup unconfirmed");
+                    }
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "restore candidate dropped without async cleanup runtime")
+            }
+        }
+    }
+}
+
+fn restore_snapshot_value(value: &impl serde::Serialize) -> Result<serde_json::Value, WorkerError> {
+    serde_json::to_value(value)
+        .map_err(|error| WorkerError::InvalidState(format!("encode restore snapshot: {error}")))
+}
+
 /// An independent agent execution unit.
 ///
 /// Holds a [`Engine`] directly and persists session state via
@@ -3341,6 +3695,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// constructors install this from the same FsStore that owns the session
     /// logs; low-level `Worker::new` tests leave it absent.
     worker_metadata_writer: Option<WorkerMetadataWriter>,
+    persist_restored_manifest: bool,
     worker_metadata_segment_cas: Option<WorkerMetadataSegmentCas>,
     /// Shared session pointer. Source of truth for the Worker's current
     /// `segment_id` and append tally. `self.segment_id()` is a thin
@@ -3368,6 +3723,8 @@ pub struct Worker<C: LlmClient, St: Store> {
     hook_registry: Option<Arc<HookRegistry>>,
     /// Executable background tasks registered by successfully installed features.
     feature_background_tasks: FeatureBackgroundTaskRegistry,
+    /// Present only while an opted-in factory is capturing startup task scopes.
+    startup_feature_cleanup: Option<WorkerStartupFeatureCleanup>,
     /// Enabled chat invocation metadata and executable handlers.
     feature_invocations: FeatureInvocationRegistry,
     /// Internal Workers install an explicit Feature composition and disable
@@ -3458,9 +3815,8 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// Workers built via `from_manifest` /
     /// `restore_from_manifest` (production paths); `None` for the
     /// low-level `Worker::new` constructor used in tests, which bypasses
-    /// the registry. Kept purely for its `Drop` impl, which releases
-    /// the allocation when the Worker is dropped.
-    #[allow(dead_code)]
+    /// the registry. Cleanup handles can retain the allocation beyond Worker
+    /// drop; only the final shared owner attempts best-effort release.
     scope_allocation: Option<ScopeAllocationGuard>,
     /// Transient launch role for Ticket role sessions. This is process-local
     /// runtime identity used by controller policy; it is not model-visible and
@@ -3523,13 +3879,54 @@ pub struct Worker<C: LlmClient, St: Store> {
 impl<C: LlmClient, St: Store> Drop for Worker<C, St> {
     fn drop(&mut self) {
         // A failed activation authority nests the same machine-wide lock used by
-        // `ScopeAllocationGuard::drop`. Release the nested guard first so Worker
+        // allocation owner's final Drop. Release the nested guard first so Worker
         // teardown cannot self-deadlock while removing its outer allocation.
         let authority = match self.failed_activation_authority.get_mut() {
             Ok(authority) => authority.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         };
         drop(authority);
+    }
+}
+
+impl<C: LlmClient, St: Store> Worker<C, St> {
+    /// Opt in before a consuming startup call. The handle captures the current
+    /// task registry and each subsequently installed registry until successful
+    /// controller transfer ends capture. Repeated calls share the same capture.
+    pub fn retain_startup_feature_cleanup(&mut self) -> WorkerStartupFeatureCleanup {
+        self.startup_feature_cleanup
+            .get_or_insert_with(|| {
+                WorkerStartupFeatureCleanup::new(self.feature_background_tasks.clone())
+            })
+            .clone()
+    }
+
+    /// Observes explicit factory cleanup ownership without enabling capture.
+    pub fn startup_feature_cleanup_handle(&self) -> Option<WorkerStartupFeatureCleanup> {
+        self.startup_feature_cleanup.clone()
+    }
+
+    /// End factory capture immediately before transferring to a live Controller.
+    /// The factory must also drop its handle after startup returns success.
+    pub fn finish_startup_feature_cleanup_capture(&mut self) {
+        self.startup_feature_cleanup = None;
+    }
+
+    /// Retain cleanup authority before passing the reconstructed Worker into a
+    /// consuming factory. Explicit release is only valid after factory failure
+    /// with no live Controller; drop the handle on successful controller transfer.
+    pub fn restore_allocation_cleanup_handle(&self) -> Option<ScopeAllocationCleanup> {
+        self.scope_allocation
+            .as_ref()
+            .map(ScopeAllocationGuard::cleanup_handle)
+    }
+
+    fn construction_failure(&self, error: WorkerError) -> WorkerError {
+        WorkerError::ConstructionCleanup {
+            source: Box::new(error),
+            allocation: self.restore_allocation_cleanup_handle(),
+            sessions: self.workdir_sessions.clone(),
+        }
     }
 }
 
@@ -3709,6 +4106,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             last_run_interrupted: false,
             store,
             worker_metadata_writer: None,
+            persist_restored_manifest: false,
             worker_metadata_segment_cas: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority,
@@ -3720,6 +4118,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            startup_feature_cleanup: None,
             feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
@@ -4229,6 +4628,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             return report;
         }
         self.feature_background_tasks = report.background_tasks.clone();
+        if let Some(cleanup) = &self.startup_feature_cleanup {
+            cleanup.retain(self.feature_background_tasks.clone());
+        }
         self.feature_invocations = report.chat_invocations.clone();
         for instruction in report.installed_instruction_contributions() {
             self.register_feature_instruction(instruction);
@@ -4418,14 +4820,21 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
     }
 
     fn worker_metadata(&self, active: Option<WorkerActiveSegmentRef>) -> WorkerMetadata {
-        worker_metadata_for_manifest(
+        let mut metadata = worker_metadata_for_manifest(
             &self.manifest,
             self.workspace_id(),
             self.filesystem_authority
                 .as_local()
                 .map(|local| local.root.as_path()),
             active,
-        )
+        );
+        // A repaired/restored Session must not lose the saved execution policy
+        // merely because its current composition also permits legacy local use.
+        if self.persist_restored_manifest {
+            metadata.resolved_manifest_snapshot =
+                manifest::write_persisted_worker_manifest_snapshot(&self.manifest).ok();
+        }
+        metadata
     }
 
     fn write_worker_metadata_pending(&self) -> Result<(), WorkerError> {
@@ -8318,7 +8727,7 @@ where
         let workdir_sessions =
             workdir_sessions_from_authority(&common.filesystem_authority, &scope)?;
 
-        let mut worker = Self {
+        let worker = Self {
             backend_job: std::sync::OnceLock::new(),
             manifest,
             engine: Some(worker),
@@ -8326,6 +8735,7 @@ where
             last_run_interrupted: false,
             store,
             worker_metadata_writer,
+            persist_restored_manifest: existing_session_id.is_some(),
             worker_metadata_segment_cas,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority: common.filesystem_authority,
@@ -8337,6 +8747,7 @@ where
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            startup_feature_cleanup: None,
             feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
@@ -8379,10 +8790,15 @@ where
             log_writer: None,
             notification_committer: None,
         };
-        worker.apply_permissions_from_manifest();
-        worker.apply_prune_from_manifest();
-        worker.write_worker_metadata_pending()?;
-        Ok(worker)
+        worker.finish_pending_construction()
+    }
+
+    fn finish_pending_construction(mut self) -> Result<Self, WorkerError> {
+        self.apply_permissions_from_manifest();
+        self.apply_prune_from_manifest();
+        self.write_worker_metadata_pending()
+            .map_err(|error| self.construction_failure(error))?;
+        Ok(self)
     }
 
     /// Complete the Host-owned Session-to-Subject attribution boundary before a
@@ -8726,6 +9142,7 @@ where
             last_run_interrupted: false,
             store,
             worker_metadata_writer: None,
+            persist_restored_manifest: false,
             worker_metadata_segment_cas: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             filesystem_authority: common.filesystem_authority,
@@ -8737,6 +9154,7 @@ where
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            startup_feature_cleanup: None,
             feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: false,
             interceptor_installed: false,
@@ -8816,6 +9234,33 @@ where
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
+        Self::prepare_restored_from_worker_metadata_with_context_and_model_client(
+            worker_name,
+            manifest,
+            store,
+            loader,
+            workspace_context,
+            filesystem_authority,
+            None,
+        )
+        .await?
+        .activate()
+        .await
+    }
+
+    /// Prepare only a materialized saved Worker. Pending Session creation and
+    /// Subject attribution repair must be performed explicitly by the host
+    /// before entering this read-only path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_restored_from_worker_metadata_with_context_and_model_client(
+        worker_name: &str,
+        fallback: WorkerManifest,
+        store: St,
+        loader: PromptCatalogSource,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
+        model_client: Option<Box<dyn LlmClient>>,
+    ) -> Result<PreparedRestoredWorker<St>, WorkerError> {
         let metadata =
             store
                 .read_by_name(worker_name)?
@@ -8829,11 +9274,13 @@ where
                 worker_name: worker_name.to_string(),
             });
         }
-        let active = metadata
-            .active
-            .ok_or_else(|| WorkerError::WorkerMetadataInactive {
-                worker_name: worker_name.to_string(),
-            })?;
+        let active =
+            metadata
+                .active
+                .as_ref()
+                .ok_or_else(|| WorkerError::WorkerMetadataInactive {
+                    worker_name: worker_name.to_string(),
+                })?;
         let segment_id = active
             .segment_id
             .ok_or_else(|| WorkerError::WorkerMetadataPending {
@@ -8842,10 +9289,15 @@ where
             })?;
         let manifest = restore_manifest_from_worker_metadata_snapshot(
             worker_name,
-            metadata.resolved_manifest_snapshot,
-            manifest,
+            metadata.resolved_manifest_snapshot.clone(),
+            fallback,
         )?;
-        Self::restore_from_manifest_with_context(
+        if manifest.worker.name != worker_name {
+            return Err(WorkerError::InvalidState(
+                "restore manifest Worker name mismatch".into(),
+            ));
+        }
+        Self::prepare_restored_from_manifest_snapshot(
             active.session_id,
             segment_id,
             manifest,
@@ -8853,6 +9305,8 @@ where
             loader,
             workspace_context,
             filesystem_authority,
+            model_client,
+            Some(metadata),
         )
         .await
     }
@@ -9039,10 +9493,41 @@ where
         filesystem_authority: WorkerFilesystemAuthority,
         model_client: Option<Box<dyn LlmClient>>,
     ) -> Result<Self, WorkerError> {
+        let metadata = store.read_by_name(&manifest.worker.name)?;
+        Self::prepare_restored_from_manifest_snapshot(
+            session_id,
+            segment_id,
+            manifest,
+            store,
+            loader,
+            workspace_context,
+            filesystem_authority,
+            model_client,
+            metadata,
+        )
+        .await?
+        .activate()
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_restored_from_manifest_snapshot(
+        session_id: SessionId,
+        segment_id: SegmentId,
+        manifest: WorkerManifest,
+        store: St,
+        loader: PromptCatalogSource,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
+        model_client: Option<Box<dyn LlmClient>>,
+        metadata: Option<WorkerMetadata>,
+    ) -> Result<PreparedRestoredWorker<St>, WorkerError> {
         // Read raw entries once so we can both reconstruct state and
         // seed the broadcast sink's mirror with the same prefix that
         // sits on disk.
         let raw_entries = store.read_all(session_id, segment_id)?;
+        let entries_snapshot = restore_snapshot_value(&raw_entries)?;
+        let manifest_snapshot = restore_snapshot_value(&manifest)?;
         let state = session_store::collect_state(&raw_entries);
         if state.entries_count == 0 {
             return Err(WorkerError::SegmentEmpty { segment_id });
@@ -9050,6 +9535,11 @@ where
         if state.system_prompt.is_none() {
             return Err(WorkerError::SegmentSystemPromptMissing { segment_id });
         }
+        let restored_history_entries =
+            restore_history_entries(session_id, segment_id, &raw_entries).map_err(|error| {
+                WorkerError::InvalidState(format!("restore typed Worker session history: {error}"))
+            })?;
+        let flow_runtime_state = restored_flow_runtime_state(&state.extensions)?;
         let mirror_entries: Vec<LogEntry> = raw_entries.clone();
         let scope_config = effective_restore_scope_config(&store, &manifest)?;
 
@@ -9061,20 +9551,6 @@ where
             filesystem_authority,
             scope_config,
             model_client,
-        )?;
-
-        // Atomic: register_worker inside install_top_level rejects when
-        // another live allocation already holds `segment_id`. Wrapping
-        // the lookup + install inside a single `LockFileGuard` is what
-        // makes "no two live Workers write to the same session log"
-        // actually structural rather than a hopeful pre-check.
-        let scope_allocation = worker_allocation::install_top_level_with_deny(
-            manifest.worker.name.clone(),
-            std::process::id(),
-            PathBuf::new(), // Reserved legacy allocation field; no Worker endpoint exists.
-            common.scope.allow_rules(),
-            common.scope.deny_rules(),
-            segment_id,
         )?;
 
         // Build the worker and apply the manifest defaults first, then
@@ -9092,10 +9568,6 @@ where
         // (the Worker's one and only write path that prepends a summary at
         // history[0]). Restoring the anchor lets Anthropic re-use a
         // stable cache prefix for long-lived restored sessions.
-        let restored_history_entries =
-            restore_history_entries(session_id, segment_id, &raw_entries).map_err(|error| {
-                WorkerError::InvalidState(format!("restore typed Worker session history: {error}"))
-            })?;
         let restored_history = restored_history_entries
             .iter()
             .map(|entry| entry.item.clone())
@@ -9129,19 +9601,19 @@ where
             last_run_interrupted: state.last_run_interrupted,
             store,
             worker_metadata_writer,
+            persist_restored_manifest: true,
             worker_metadata_segment_cas,
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
             filesystem_authority: common.filesystem_authority,
             workdir_sessions,
             workspace_context: common.workspace_context,
-            flow_runtime_state: Arc::new(Mutex::new(restored_flow_runtime_state(
-                &state.extensions,
-            )?)),
+            flow_runtime_state: Arc::new(Mutex::new(flow_runtime_state)),
             flow_feature_enabled: false,
             scope,
             hook_builder: HookRegistryBuilder::new(),
             hook_registry: None,
             feature_background_tasks: FeatureBackgroundTaskRegistry::default(),
+            startup_feature_cleanup: None,
             feature_invocations: FeatureInvocationRegistry::default(),
             manifest_lifecycle_features_enabled: true,
             interceptor_installed: false,
@@ -9168,7 +9640,7 @@ where
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             pending_committed_history: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             failed_activation_authority: Mutex::new(None),
-            scope_allocation: Some(scope_allocation),
+            scope_allocation: None,
             runtime_ticket_role: None,
             prompts: common.prompts,
             inject_resident_summary: true,
@@ -9192,17 +9664,51 @@ where
         worker
             .session
             .restore_pending_activations(&state.extensions);
-        worker
-            .pending_submission_handle()
-            .reconcile_uploaded_file_pins()?;
         worker.apply_permissions_from_manifest();
         worker.apply_prune_from_manifest();
-        worker.write_worker_metadata_active(SegmentLocation {
-            session_id,
-            segment_id,
-        })?;
-        worker.reconcile_restored_delegations().await?;
-        Ok(worker)
+        let mut candidate = PreparedRestoredWorker {
+            worker: Some(worker),
+            closing: false,
+            activation: Some(RestoredWorkerActivation {
+                metadata,
+                entries: entries_snapshot,
+                manifest: manifest_snapshot,
+            }),
+        };
+        if let Err(error) = candidate.revalidate(candidate.worker()) {
+            let worker = candidate.worker.take().expect("candidate just constructed");
+            return Err(worker.construction_failure(error));
+        }
+        Ok(candidate)
+    }
+
+    async fn finish_restored_construction(mut self) -> Result<Self, WorkerError> {
+        self.finish_restored_construction_in_place(true).await?;
+        Ok(self)
+    }
+
+    /// Apply the same restore effects while an initialized Controller retains
+    /// ownership. Errors retain cleanup handles, but do not drop this Worker.
+    async fn finish_restored_construction_in_place(
+        &mut self,
+        reclaim_delegations: bool,
+    ) -> Result<(), WorkerError> {
+        self.pending_submission_handle()
+            .reconcile_uploaded_file_pins()
+            .map_err(|error| self.construction_failure(error.into()))?;
+        self.apply_permissions_from_manifest();
+        self.apply_prune_from_manifest();
+        self.write_worker_metadata_active(SegmentLocation {
+            session_id: self.session_id(),
+            segment_id: self.segment_id(),
+        })
+        .map_err(|error| self.construction_failure(error))?;
+        if reclaim_delegations {
+            self.reconcile_restored_delegations()
+                .await
+                .map_err(|error| self.construction_failure(error))?;
+        }
+        Ok(())
     }
 
     async fn reconcile_restored_delegations(&mut self) -> Result<(), WorkerError> {
@@ -10043,6 +10549,35 @@ fn compact_failure_category(error: &WorkerError) -> CompactFailureCategory {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
+    /// A construction or activation step failed after acquiring resources. Retain
+    /// these handles until explicit cleanup succeeds. Consuming constructors drop
+    /// the Worker before returning; in-place activation leaves its owner responsible
+    /// for dropping it before allocation release.
+    #[error("{source}")]
+    ConstructionCleanup {
+        #[source]
+        source: Box<WorkerError>,
+        allocation: Option<ScopeAllocationCleanup>,
+        sessions: Arc<WorkdirSessionRouter>,
+    },
+
+    /// Activation entered canonical pin/metadata/delegation updates. Cleanup
+    /// ownership in the source does not establish rollback of those effects.
+    #[error("{source}")]
+    RestoreActivationEffects {
+        #[source]
+        source: Box<WorkerError>,
+    },
+
+    #[error("restore candidate is closing; only cleanup retry is allowed")]
+    RestoreCandidateClosing,
+
+    #[error("restore candidate source changed for Worker {worker_name}: {component}")]
+    RestoreCandidateChanged {
+        worker_name: String,
+        component: &'static str,
+    },
+
     #[error("invalid durable Worker state: {0}")]
     InvalidState(String),
 
@@ -12690,6 +13225,1283 @@ mod build_summary_prompt_tests {
         let restored = session_store::collect_state(&replacement_entries);
         assert!(!restored.last_run_interrupted);
         assert_eq!(restored.active_run_turn_count, None);
+    }
+
+    #[tokio::test]
+    async fn restore_cleanup_handle_retains_allocation_after_worker_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store,
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        assert!(worker.restore_allocation_cleanup_handle().is_none());
+        let lock_path = dir.path().join("workers.json");
+        worker.scope_allocation = Some(
+            worker_allocation::install_top_level_at_for_test(
+                lock_path.clone(),
+                "test-worker".into(),
+                std::process::id(),
+                dir.path().join("worker.sock"),
+                Vec::new(),
+                worker.segment_id(),
+            )
+            .unwrap(),
+        );
+        let cleanup = worker.restore_allocation_cleanup_handle().unwrap();
+
+        drop(worker);
+        {
+            let table = worker_allocation::LockFileGuard::open(&lock_path).unwrap();
+            assert!(table.data().find("test-worker").is_some());
+        }
+        cleanup.release().unwrap();
+        let table = worker_allocation::LockFileGuard::open(&lock_path).unwrap();
+        assert!(table.data().find("test-worker").is_none());
+    }
+
+    // Real Session/metadata stores, allocation and Workdir providers; only the
+    // model transport is substituted. Profile/Runtime publication belongs to the
+    // factory integration suite, not this reconstruction component suite.
+    mod restored_candidate_tests {
+        use super::*;
+
+        type CandidateStore =
+            session_store::CombinedStore<session_store::FsStore, session_store::FsWorkerStore>;
+
+        #[derive(Clone)]
+        struct CountedClient(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl LlmClient for CountedClient {
+            async fn stream(
+                &self,
+                request: agen::llm_client::Request,
+            ) -> Result<
+                std::pin::Pin<
+                    Box<
+                        dyn futures::Stream<
+                                Item = Result<
+                                    agen::llm_client::event::Event,
+                                    agen::llm_client::ClientError,
+                                >,
+                            > + Send,
+                    >,
+                >,
+                agen::llm_client::ClientError,
+            > {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                NoopClient.stream(request).await
+            }
+
+            fn clone_boxed(&self) -> Box<dyn LlmClient> {
+                Box::new(self.clone())
+            }
+        }
+
+        #[derive(Debug)]
+        struct FailCloseOnce {
+            inner: workdir::WorkdirSessionHandle,
+            attempts: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl workdir::WorkdirSession for FailCloseOnce {
+            fn workdir(&self) -> &workdir::Workdir {
+                self.inner.workdir()
+            }
+            fn capabilities(&self) -> workdir::WorkdirSessionCapabilities {
+                self.inner.capabilities()
+            }
+            async fn stat(
+                &self,
+                request: workdir::StatRequest,
+            ) -> Result<workdir::StatResult, workdir::WorkdirError> {
+                self.inner.stat(request).await
+            }
+            async fn read(
+                &self,
+                request: workdir::ReadRequest,
+            ) -> Result<workdir::ReadResult, workdir::WorkdirError> {
+                self.inner.read(request).await
+            }
+            async fn write(
+                &self,
+                request: workdir::WriteRequest,
+            ) -> Result<workdir::WriteResult, workdir::WorkdirError> {
+                self.inner.write(request).await
+            }
+            async fn edit(
+                &self,
+                request: workdir::EditRequest,
+            ) -> Result<workdir::EditResult, workdir::WorkdirError> {
+                self.inner.edit(request).await
+            }
+            async fn list(
+                &self,
+                request: workdir::ListRequest,
+            ) -> Result<workdir::ListResult, workdir::WorkdirError> {
+                self.inner.list(request).await
+            }
+            async fn glob(
+                &self,
+                request: workdir::GlobRequest,
+            ) -> Result<workdir::GlobResult, workdir::WorkdirError> {
+                self.inner.glob(request).await
+            }
+            async fn grep(
+                &self,
+                request: workdir::GrepRequest,
+            ) -> Result<workdir::GrepResult, workdir::WorkdirError> {
+                self.inner.grep(request).await
+            }
+            async fn start_command(
+                &self,
+                request: workdir::CommandRequest,
+            ) -> Result<workdir::CommandHandle, workdir::WorkdirError> {
+                self.inner.start_command(request).await
+            }
+            async fn command_status(
+                &self,
+                handle: workdir::CommandHandle,
+            ) -> Result<workdir::CommandStatus, workdir::WorkdirError> {
+                self.inner.command_status(handle).await
+            }
+            async fn command_output(
+                &self,
+                request: workdir::CommandOutputRequest,
+            ) -> Result<workdir::CommandOutput, workdir::WorkdirError> {
+                self.inner.command_output(request).await
+            }
+            async fn cancel_command(
+                &self,
+                handle: workdir::CommandHandle,
+            ) -> Result<(), workdir::WorkdirError> {
+                self.inner.cancel_command(handle).await
+            }
+            async fn close(&self) -> Result<(), workdir::WorkdirError> {
+                self.inner.close().await?;
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // The real provider has closed, but its first response is
+                    // uncertain: the candidate must not become activatable again.
+                    Err(workdir::WorkdirError::Unavailable(
+                        "close response lost".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        struct Fixture {
+            temp: tempfile::TempDir,
+            store: CandidateStore,
+            manifest: WorkerManifest,
+            session_id: SessionId,
+            segment_id: SegmentId,
+            orphan: protocol::UploadedFileRef,
+            model_calls: Arc<AtomicUsize>,
+        }
+
+        impl Fixture {
+            async fn new() -> Self {
+                let temp = tempfile::tempdir().unwrap();
+                let store = session_store::CombinedStore::new(
+                    session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+                    session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+                );
+                let mut manifest = minimal_manifest();
+                manifest.scope = ScopeConfig {
+                    allow: vec![ScopeRule {
+                        target: temp.path().canonicalize().unwrap(),
+                        permission: Permission::Write,
+                        recursive: true,
+                        symlink_policy: Default::default(),
+                    }],
+                    deny: Vec::new(),
+                };
+                let model_calls = Arc::new(AtomicUsize::new(0));
+                let mut worker = Worker::new(
+                    manifest.clone(),
+                    Engine::<Box<dyn LlmClient>, Mutable, SessionHistoryMetadata>::new_annotated(
+                        Box::new(CountedClient(model_calls.clone())),
+                    ),
+                    store.clone(),
+                    WorkerWorkspaceContext::no_workspace(),
+                    WorkerFilesystemAuthority::None,
+                    Scope::empty(),
+                )
+                .await
+                .unwrap();
+                worker
+                    .engine_mut()
+                    .set_system_prompt("saved candidate prompt");
+                worker.ensure_segment_head().await.unwrap();
+                let session_id = worker.session_id();
+                let segment_id = worker.segment_id();
+                let queue = worker.pending_submission_handle();
+                queue
+                    .accept(
+                        "saved-submit".into(),
+                        vec![Segment::Text {
+                            content: "saved input".into(),
+                        }],
+                        false,
+                    )
+                    .unwrap();
+                queue
+                    .accept_notification("saved-notification".into(), "saved notice".into())
+                    .unwrap();
+                let orphan = store
+                    .write_uploaded_file(
+                        session_id,
+                        "orphan.txt",
+                        "text/plain",
+                        b"orphan",
+                        session_store::UploadedFileLimits::default(),
+                    )
+                    .unwrap();
+                store
+                    .pin_uploaded_file(session_id, &orphan, "acceptance-without-checkpoint")
+                    .unwrap();
+                let mut metadata = WorkerMetadata::new(
+                    &manifest.worker.name,
+                    Some(WorkerActiveSegmentRef {
+                        session_id,
+                        segment_id: Some(segment_id),
+                    }),
+                );
+                // Activation replaces this stale derived path; preparation must not.
+                metadata.workspace_root = Some(temp.path().join("old-root"));
+                metadata.spawned_children.push(WorkerSpawnedChild {
+                    worker_name: "missing-child".into(),
+                    socket_path: temp.path().join("missing-child.sock"),
+                    scope_delegated: Vec::new(),
+                    callback_address: temp.path().join("unused-parent.sock"),
+                });
+                metadata.resolved_manifest_snapshot =
+                    Some(manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap());
+                store.write(&metadata).unwrap();
+                drop(worker);
+                Self {
+                    temp,
+                    store,
+                    manifest,
+                    session_id,
+                    segment_id,
+                    orphan,
+                    model_calls,
+                }
+            }
+
+            async fn prepare(&self) -> PreparedRestoredWorker<CandidateStore> {
+                Worker::prepare_restored_from_worker_metadata_with_context_and_model_client(
+                    &self.manifest.worker.name,
+                    self.manifest.clone(),
+                    self.store.clone(),
+                    PromptCatalogSource::builtins_only(),
+                    WorkerWorkspaceContext::no_workspace(),
+                    WorkerFilesystemAuthority::local(
+                        self.temp.path().to_path_buf(),
+                        self.temp.path().to_path_buf(),
+                    ),
+                    Some(Box::new(CountedClient(self.model_calls.clone()))),
+                )
+                .await
+                .unwrap()
+            }
+
+            fn allocate(
+                &self,
+                worker: &Worker<Box<dyn LlmClient>, CandidateStore>,
+            ) -> Result<ScopeAllocationGuard, WorkerError> {
+                Ok(worker_allocation::install_top_level_at_for_test(
+                    self.temp.path().join("allocation.json"),
+                    worker.manifest.worker.name.clone(),
+                    std::process::id(),
+                    self.temp.path().join("worker.sock"),
+                    worker.scope.snapshot().allow_rules(),
+                    worker.segment_id(),
+                )?)
+            }
+
+            fn snapshot(&self) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+                fn visit(
+                    root: &Path,
+                    path: &Path,
+                    files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+                ) {
+                    for entry in std::fs::read_dir(path).unwrap() {
+                        let path = entry.unwrap().path();
+                        if path.is_dir() {
+                            visit(root, &path, files);
+                        } else {
+                            files.insert(
+                                path.strip_prefix(root).unwrap().to_path_buf(),
+                                std::fs::read(path).unwrap(),
+                            );
+                        }
+                    }
+                }
+                let mut files = std::collections::BTreeMap::new();
+                for name in ["sessions", "workers"] {
+                    visit(self.temp.path(), &self.temp.path().join(name), &mut files);
+                }
+                files
+            }
+        }
+
+        #[tokio::test]
+        async fn prepare_and_discard_preserve_session_queue_pins_and_metadata() {
+            let fixture = Fixture::new().await;
+            let before = fixture.snapshot();
+            let mut candidate = fixture.prepare().await;
+            assert!(
+                candidate
+                    .worker()
+                    .restore_allocation_cleanup_handle()
+                    .is_none()
+            );
+            assert!(!fixture.temp.path().join("worker.sock").exists());
+            assert_eq!(
+                candidate.worker().pending_submissions().submissions.len(),
+                1
+            );
+            assert_eq!(
+                candidate
+                    .worker()
+                    .session
+                    .pending_activations
+                    .lock()
+                    .unwrap()
+                    .pending_notifications
+                    .len(),
+                1
+            );
+            assert_eq!(fixture.snapshot(), before);
+            assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 0);
+            let session = candidate
+                .worker()
+                .workdir_sessions()
+                .resolve(None)
+                .unwrap()
+                .session;
+            assert!(
+                session
+                    .stat(workdir::StatRequest {
+                        path: workdir::WorkdirPath::root()
+                    })
+                    .await
+                    .is_ok()
+            );
+            candidate.discard().await.unwrap();
+            candidate.discard().await.unwrap();
+            assert!(
+                session
+                    .stat(workdir::StatRequest {
+                        path: workdir::WorkdirPath::root()
+                    })
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fixture.snapshot(), before);
+        }
+
+        #[tokio::test]
+        async fn failed_discard_allows_only_cleanup_retry_not_binding_or_activation() {
+            for retry_discard in [true, false] {
+                let fixture = Fixture::new().await;
+                let before = fixture.snapshot();
+                let mut candidate = fixture.prepare().await;
+                let provider = Arc::new(FailCloseOnce {
+                    inner: candidate.workdir_sessions().resolve(None).unwrap().session,
+                    attempts: AtomicUsize::new(0),
+                });
+                candidate
+                    .worker_mut()
+                    .unwrap()
+                    .bind_single_workdir_session(Some(provider.clone()));
+                let cleanup = candidate.workdir_sessions();
+                assert!(matches!(
+                    candidate.discard().await,
+                    Err(WorkerError::FeatureLifecycle(_))
+                ));
+                assert_eq!(provider.attempts.load(Ordering::SeqCst), 1);
+                assert!(!cleanup.is_empty());
+                assert_eq!(fixture.snapshot(), before);
+                assert!(matches!(
+                    candidate.worker_mut(),
+                    Err(WorkerError::RestoreCandidateClosing)
+                ));
+                assert_eq!(
+                    candidate.manifest().worker.name,
+                    fixture.manifest.worker.name
+                );
+                assert!(Arc::ptr_eq(&candidate.workdir_sessions(), &cleanup));
+                if retry_discard {
+                    candidate.discard().await.unwrap();
+                    assert!(cleanup.is_empty());
+                    assert_eq!(provider.attempts.load(Ordering::SeqCst), 2);
+                    assert!(matches!(
+                        candidate.worker_mut(),
+                        Err(WorkerError::RestoreCandidateClosing)
+                    ));
+                    candidate.discard().await.unwrap();
+                } else {
+                    let allocations = AtomicUsize::new(0);
+                    let error = match candidate
+                        .activate_with_allocation(|worker| {
+                            allocations.fetch_add(1, Ordering::SeqCst);
+                            fixture.allocate(worker)
+                        })
+                        .await
+                    {
+                        Err(error) => error,
+                        Ok(_) => panic!("partially closed candidate was activated"),
+                    };
+                    let WorkerError::ConstructionCleanup {
+                        source,
+                        allocation,
+                        sessions,
+                    } = error
+                    else {
+                        panic!("cleanup ownership lost");
+                    };
+                    assert!(matches!(*source, WorkerError::RestoreCandidateClosing));
+                    assert!(allocation.is_none());
+                    assert_eq!(allocations.load(Ordering::SeqCst), 0);
+                    assert_eq!(provider.attempts.load(Ordering::SeqCst), 1);
+                    assert!(Arc::ptr_eq(&sessions, &cleanup));
+                    sessions.close_all().await.unwrap();
+                    assert!(cleanup.is_empty());
+                    assert_eq!(provider.attempts.load(Ordering::SeqCst), 2);
+                }
+                assert_eq!(fixture.snapshot(), before);
+                assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn dropping_candidate_closes_workdir_without_consuming_saved_inputs() {
+            let fixture = Fixture::new().await;
+            let before = fixture.snapshot();
+            let candidate = fixture.prepare().await;
+            let sessions = candidate.worker().workdir_sessions();
+            let session = sessions.resolve(None).unwrap().session;
+            drop(candidate);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !sessions.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("candidate Drop must finish direct close");
+            assert!(
+                session
+                    .stat(workdir::StatRequest {
+                        path: workdir::WorkdirPath::root()
+                    })
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fixture.snapshot(), before);
+            assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn activation_alone_reconciles_orphan_pins_and_updates_active_metadata() {
+            let fixture = Fixture::new().await;
+            let before_metadata = fixture
+                .store
+                .read_by_name(&fixture.manifest.worker.name)
+                .unwrap()
+                .unwrap();
+            let before_entries = restore_snapshot_value(
+                &fixture
+                    .store
+                    .read_all(fixture.session_id, fixture.segment_id)
+                    .unwrap(),
+            )
+            .unwrap();
+            let candidate = fixture.prepare().await;
+            assert!(matches!(
+                fixture
+                    .store
+                    .delete_uploaded_file(fixture.session_id, &fixture.orphan.artifact_id),
+                Err(StoreError::ArtifactAlreadyCommitted)
+            ));
+            let worker = candidate
+                .activate_with_allocation(|worker| fixture.allocate(worker))
+                .await
+                .unwrap();
+            assert!(worker.restore_allocation_cleanup_handle().is_some());
+            let metadata = fixture
+                .store
+                .read_by_name(&fixture.manifest.worker.name)
+                .unwrap()
+                .unwrap();
+            assert_ne!(metadata.workspace_root, before_metadata.workspace_root);
+            assert_eq!(metadata.active, before_metadata.active);
+            assert_eq!(before_metadata.spawned_children.len(), 1);
+            assert!(metadata.spawned_children.is_empty());
+            assert_eq!(metadata.reclaimed_children.len(), 1);
+            assert!(
+                fixture
+                    .store
+                    .delete_uploaded_file(fixture.session_id, &fixture.orphan.artifact_id)
+                    .unwrap()
+            );
+            assert_eq!(worker.pending_submissions().submissions.len(), 1);
+            assert_eq!(
+                worker
+                    .session
+                    .pending_activations
+                    .lock()
+                    .unwrap()
+                    .pending_notifications
+                    .len(),
+                1
+            );
+            assert_eq!(
+                restore_snapshot_value(
+                    &fixture
+                        .store
+                        .read_all(fixture.session_id, fixture.segment_id)
+                        .unwrap()
+                )
+                .unwrap(),
+                before_entries
+            );
+            assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 0);
+            worker.workdir_sessions().close_all().await.unwrap();
+            let allocation = worker.restore_allocation_cleanup_handle().unwrap();
+            assert!(matches!(
+                allocation.release(),
+                Err(ScopeLockError::AllocationGuardAttached { .. })
+            ));
+            drop(worker);
+            allocation.release().unwrap();
+        }
+
+        #[tokio::test]
+        async fn metadata_or_same_entry_count_history_drift_rejects_before_allocation() {
+            for component in ["metadata", "segment", "manifest"] {
+                let fixture = Fixture::new().await;
+                let mut candidate = fixture.prepare().await;
+                match component {
+                    "metadata" => {
+                        fixture
+                            .store
+                            .update_by_name(&fixture.manifest.worker.name, |metadata| {
+                                metadata.workspace_id = Some("changed-workspace".into());
+                            })
+                            .unwrap();
+                    }
+                    "segment" => {
+                        let mut entries = fixture
+                            .store
+                            .read_all(fixture.session_id, fixture.segment_id)
+                            .unwrap();
+                        let LogEntry::AnnotatedSegmentStart { system_prompt, .. } = &mut entries[0]
+                        else {
+                            panic!("fixture seed");
+                        };
+                        *system_prompt = Some("different same-length history".into());
+                        fixture
+                            .store
+                            .create_segment(fixture.session_id, fixture.segment_id, &entries)
+                            .unwrap();
+                    }
+                    "manifest" => {
+                        candidate.worker_mut().unwrap().manifest.model.model_id =
+                            Some("changed-model".into());
+                    }
+                    _ => unreachable!(),
+                }
+                let before = fixture.snapshot();
+                let allocations = AtomicUsize::new(0);
+                let error = match candidate
+                    .activate_with_allocation(|worker| {
+                        allocations.fetch_add(1, Ordering::SeqCst);
+                        fixture.allocate(worker)
+                    })
+                    .await
+                {
+                    Err(error) => error,
+                    Ok(_) => panic!("stale candidate accepted"),
+                };
+                let WorkerError::ConstructionCleanup {
+                    source,
+                    allocation,
+                    sessions,
+                } = error
+                else {
+                    panic!("cleanup ownership lost");
+                };
+                assert!(
+                    matches!(*source, WorkerError::RestoreCandidateChanged { component: changed, .. } if changed == component)
+                );
+                assert!(allocation.is_none());
+                assert_eq!(allocations.load(Ordering::SeqCst), 0);
+                sessions.close_all().await.unwrap();
+                assert_eq!(fixture.snapshot(), before);
+                assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn post_allocation_metadata_drift_retains_cleanup_without_mutating_pins() {
+            let fixture = Fixture::new().await;
+            let candidate = fixture.prepare().await;
+            let error = match candidate
+                .activate_with_allocation(|worker| {
+                    let guard = fixture.allocate(worker)?;
+                    fixture
+                        .store
+                        .update_by_name(&fixture.manifest.worker.name, |metadata| {
+                            metadata.workspace_id = Some("changed-under-allocation".into());
+                        })?;
+                    Ok(guard)
+                })
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("stale candidate accepted"),
+            };
+            let before = fixture.snapshot();
+            let WorkerError::ConstructionCleanup {
+                source,
+                allocation,
+                sessions,
+            } = error
+            else {
+                panic!("cleanup ownership lost");
+            };
+            assert!(matches!(
+                *source,
+                WorkerError::RestoreCandidateChanged {
+                    component: "metadata",
+                    ..
+                }
+            ));
+            let allocation =
+                allocation.expect("allocation retained after second validation failure");
+            assert!(
+                worker_allocation::LockFileGuard::open(
+                    &fixture.temp.path().join("allocation.json")
+                )
+                .unwrap()
+                .data()
+                .find(&fixture.manifest.worker.name)
+                .is_some()
+            );
+            assert!(matches!(
+                fixture
+                    .store
+                    .delete_uploaded_file(fixture.session_id, &fixture.orphan.artifact_id),
+                Err(StoreError::ArtifactAlreadyCommitted)
+            ));
+            sessions.close_all().await.unwrap();
+            worker_allocation::fail_next_save_for_test(
+                &fixture.temp.path().join("allocation.json"),
+            );
+            assert!(allocation.release().is_err());
+            allocation.release().unwrap();
+            assert_eq!(fixture.snapshot(), before);
+        }
+
+        #[tokio::test]
+        async fn pending_session_is_rejected_without_repair_or_session_creation() {
+            let fixture = Fixture::new().await;
+            fixture
+                .store
+                .update_by_name(&fixture.manifest.worker.name, |metadata| {
+                    metadata.active.as_mut().unwrap().segment_id = None;
+                })
+                .unwrap();
+            let before = fixture.snapshot();
+            let result =
+                Worker::prepare_restored_from_worker_metadata_with_context_and_model_client(
+                    &fixture.manifest.worker.name,
+                    fixture.manifest.clone(),
+                    fixture.store.clone(),
+                    PromptCatalogSource::builtins_only(),
+                    WorkerWorkspaceContext::no_workspace(),
+                    WorkerFilesystemAuthority::None,
+                    Some(Box::new(CountedClient(fixture.model_calls.clone()))),
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(WorkerError::WorkerMetadataPending { .. })
+            ));
+            assert_eq!(fixture.snapshot(), before);
+            assert_eq!(fixture.model_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    // Constructor finalization uses real Worker, allocation, Workdir, and storage
+    // implementations. Only the model and metadata-write failure boundary are substituted.
+    mod construction_cleanup_tests {
+        use super::*;
+
+        type ConstructionStore =
+            session_store::CombinedStore<session_store::FsStore, session_store::FsWorkerStore>;
+
+        async fn constructed_worker(
+            temp: &tempfile::TempDir,
+        ) -> Worker<Box<dyn LlmClient>, ConstructionStore> {
+            let store = session_store::CombinedStore::new(
+                session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+                session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+            );
+            let mut worker = Worker::new(
+                minimal_manifest(),
+                Engine::<Box<dyn LlmClient>, Mutable, SessionHistoryMetadata>::new_annotated(
+                    Box::new(NoopClient),
+                ),
+                store,
+                WorkerWorkspaceContext::no_workspace(),
+                WorkerFilesystemAuthority::local(
+                    temp.path().to_path_buf(),
+                    temp.path().to_path_buf(),
+                ),
+                Scope::writable(temp.path()).unwrap(),
+            )
+            .await
+            .unwrap();
+            worker.scope_allocation = Some(
+                worker_allocation::install_top_level_at_for_test(
+                    temp.path().join("workers.json"),
+                    worker.manifest.worker.name.clone(),
+                    std::process::id(),
+                    temp.path().join("worker.sock"),
+                    Vec::new(),
+                    worker.segment_id(),
+                )
+                .unwrap(),
+            );
+            worker
+        }
+
+        #[tokio::test]
+        async fn post_construction_failures_retain_resources_through_failed_release_retry() {
+            for stage in [
+                "pending_metadata",
+                "restore_pins",
+                "restore_metadata",
+                "restore_delegations",
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut worker = constructed_worker(&temp).await;
+                if stage != "pending_metadata" {
+                    worker.ensure_segment_head().await.unwrap();
+                }
+                let name = worker.manifest.worker.name.clone();
+                let lock_path = temp.path().join("workers.json");
+                let sessions = Arc::downgrade(&worker.workdir_sessions());
+                let session = worker.workdir_sessions().resolve(None).unwrap().session;
+                let writes = Arc::new(AtomicUsize::new(0));
+                let writer_calls = writes.clone();
+                let metadata_path = temp
+                    .path()
+                    .join("workers")
+                    .join(&name)
+                    .join("metadata.json");
+                worker.worker_metadata_writer = Some(Arc::new(move |_| {
+                    writer_calls.fetch_add(1, Ordering::SeqCst);
+                    if stage == "restore_delegations" {
+                        // A successful publication followed by an unreadable retained
+                        // record forces the subsequent delegation reconciliation to fail.
+                        std::fs::create_dir_all(&metadata_path)?;
+                        Ok(())
+                    } else {
+                        Err(WorkerStoreError::Io(std::io::Error::other(
+                            "metadata write refused",
+                        )))
+                    }
+                }));
+                if stage == "restore_pins" {
+                    let pins_dir = temp
+                        .path()
+                        .join("sessions")
+                        .join(worker.session_id().to_string())
+                        .join("artifacts")
+                        .join("paste");
+                    std::fs::create_dir_all(pins_dir.join(".aggregate.lock")).unwrap();
+                }
+                let result = if stage == "pending_metadata" {
+                    worker.finish_pending_construction()
+                } else {
+                    worker.finish_restored_construction().await
+                };
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("{stage} must fail after Worker construction"),
+                };
+                let WorkerError::ConstructionCleanup {
+                    source,
+                    allocation,
+                    sessions: retained,
+                } = &error
+                else {
+                    panic!("{stage} lost construction cleanup authority: {error:?}");
+                };
+                if stage == "restore_pins" {
+                    assert!(matches!(
+                        source.as_ref(),
+                        WorkerError::Store(StoreError::Io(_))
+                    ));
+                    assert_eq!(writes.load(Ordering::SeqCst), 0);
+                } else {
+                    assert!(matches!(
+                        source.as_ref(),
+                        WorkerError::WorkerStore(WorkerStoreError::Io(_))
+                    ));
+                    assert_eq!(writes.load(Ordering::SeqCst), 1);
+                }
+                assert_eq!(error.to_string(), source.to_string());
+                assert_eq!(
+                    std::error::Error::source(&error).unwrap().to_string(),
+                    source.to_string()
+                );
+                assert!(Arc::ptr_eq(&sessions.upgrade().unwrap(), retained));
+                let allocation = allocation.clone().expect("constructed Worker's allocation");
+                let retained = retained.clone();
+                drop(error);
+                {
+                    let table = worker_allocation::LockFileGuard::open(&lock_path).unwrap();
+                    assert!(
+                        table.data().find(&name).is_some(),
+                        "{stage} released during Worker Drop"
+                    );
+                }
+                assert!(
+                    session
+                        .stat(workdir::StatRequest {
+                            path: workdir::WorkdirPath::root()
+                        })
+                        .await
+                        .is_ok()
+                );
+                retained.close_all().await.unwrap();
+                assert!(retained.is_empty());
+                assert!(
+                    session
+                        .stat(workdir::StatRequest {
+                            path: workdir::WorkdirPath::root()
+                        })
+                        .await
+                        .is_err()
+                );
+
+                worker_allocation::fail_next_save_for_test(&lock_path);
+                assert!(matches!(allocation.release(), Err(ScopeLockError::Io(_))));
+                {
+                    let table = worker_allocation::LockFileGuard::open(&lock_path).unwrap();
+                    assert!(
+                        table.data().find(&name).is_some(),
+                        "{stage} lost failed release"
+                    );
+                }
+                allocation.release().unwrap();
+                allocation.clone().release().unwrap();
+                let table = worker_allocation::LockFileGuard::open(&lock_path).unwrap();
+                assert!(table.data().find(&name).is_none());
+            }
+        }
+
+        #[tokio::test]
+        async fn malformed_restore_state_is_rejected_before_filesystem_preparation() {
+            for corrupt_flow in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let store = session_store::CombinedStore::new(
+                    session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+                    session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+                );
+                let session_id = session_store::new_session_id();
+                let segment_id = session_store::new_segment_id();
+                let mut entries = vec![LogEntry::AnnotatedSegmentStart {
+                    ts: 0,
+                    session_id,
+                    system_prompt: Some("saved prompt".into()),
+                    config: RequestConfig::default(),
+                    history: Vec::new(),
+                    forked_from: None,
+                    compacted_from: None,
+                }];
+                if corrupt_flow {
+                    entries.push(LogEntry::Extension {
+                        ts: 1,
+                        domain: FLOW_RUNTIME_EXTENSION_DOMAIN.into(),
+                        payload: serde_json::Value::Null,
+                    });
+                } else {
+                    entries.push(LogEntry::ToolResultCorrected {
+                        ts: 1,
+                        entry: to_logged_history_entry(&history_entry(
+                            Item::user_message("correction without a target"),
+                            WorkerHistoryProvenance::LegacyUnknown,
+                        )),
+                    });
+                }
+                store
+                    .create_segment(session_id, segment_id, &entries)
+                    .unwrap();
+                let result = Worker::<Box<dyn LlmClient>, _>::restore_from_manifest_with_context_and_model_client(
+                    session_id,
+                    segment_id,
+                    minimal_manifest(),
+                    store,
+                    PromptCatalogSource::builtins_only(),
+                    WorkerWorkspaceContext::no_workspace(),
+                    // If preparation runs first, it must reject this missing root,
+                    // without touching the process-global allocation table.
+                    WorkerFilesystemAuthority::local(temp.path().join("missing"), temp.path().join("missing")),
+                    Some(Box::new(NoopClient)),
+                ).await;
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("corrupt restore state must be rejected"),
+                };
+                let WorkerError::InvalidState(message) = error else {
+                    panic!("restore parsed state too late: {error:?}");
+                };
+                assert!(message.contains(if corrupt_flow {
+                    "Flow runtime state"
+                } else {
+                    "typed Worker session history"
+                }));
+            }
+        }
+    }
+
+    // Real Feature installation, task registries, Workdir provider/router, and
+    // PreparedWorker startup; only the model and task completion barrier are test implementations.
+    mod startup_feature_cleanup_tests {
+        use super::*;
+        use crate::feature::background::{
+            BackgroundTaskCancellation, BackgroundTaskContext, BackgroundTaskSpec,
+            FeatureBackgroundTask,
+        };
+        use crate::feature::{
+            BackgroundTaskDeclaration, FeatureDescriptor, FeatureId, FeatureInstallContext,
+            FeatureInstallError, FeatureModule,
+        };
+        use crate::hook::{HookError, HookErrorCategory};
+        use tokio::sync::Notify;
+
+        type StartupStore =
+            session_store::CombinedStore<session_store::FsStore, session_store::FsWorkerStore>;
+
+        #[derive(Default)]
+        struct TaskSignals {
+            entered: Notify,
+            cancelled: AtomicBool,
+            release: Notify,
+            exited: AtomicBool,
+            session: Mutex<Option<workdir::WorkdirSessionHandle>>,
+        }
+
+        #[derive(Clone)]
+        struct BarrierTask {
+            signals: Arc<TaskSignals>,
+            _lifetime: Arc<()>,
+            panic_on_release: bool,
+        }
+
+        #[async_trait]
+        impl FeatureBackgroundTask for BarrierTask {
+            async fn run(
+                &self,
+                _context: BackgroundTaskContext,
+                cancellation: BackgroundTaskCancellation,
+            ) -> Result<(), HookError> {
+                self.signals.entered.notify_one();
+                cancellation.cancelled().await;
+                self.signals.cancelled.store(true, Ordering::Release);
+                self.signals.release.notified().await;
+                assert!(!self.panic_on_release, "injected startup task join failure");
+                let session = self.signals.session.lock().unwrap().clone();
+                if let Some(session) = session {
+                    assert!(
+                        session_open(&session).await,
+                        "Feature task must retain Workdir access until it is quiescent"
+                    );
+                }
+                self.signals.exited.store(true, Ordering::Release);
+                Ok(())
+            }
+        }
+
+        struct BarrierFeature(BarrierTask);
+
+        impl FeatureModule for BarrierFeature {
+            fn descriptor(&self) -> FeatureDescriptor {
+                FeatureDescriptor::builtin("startup-barrier", "Startup barrier")
+                    .with_background_task(BackgroundTaskDeclaration::worker_managed(
+                        "barrier",
+                        "Startup task completion barrier",
+                    ))
+            }
+
+            fn install(
+                &self,
+                context: &mut FeatureInstallContext<'_>,
+            ) -> Result<(), FeatureInstallError> {
+                context.background_tasks().register(
+                    BackgroundTaskSpec::single_flight(
+                        BackgroundTaskDeclaration::worker_managed(
+                            "barrier",
+                            "Startup task completion barrier",
+                        ),
+                        Duration::from_secs(60),
+                    ),
+                    self.0.clone(),
+                )
+            }
+        }
+
+        async fn worker(temp: &tempfile::TempDir) -> Worker<NoopClient, StartupStore> {
+            let store = session_store::CombinedStore::new(
+                session_store::FsStore::new(temp.path().join("sessions")).unwrap(),
+                session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+            );
+            Worker::new(
+                minimal_manifest(),
+                Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+                store,
+                WorkerWorkspaceContext::no_workspace(),
+                WorkerFilesystemAuthority::None,
+                Scope::empty(),
+            )
+            .await
+            .unwrap()
+        }
+
+        fn install(
+            worker: &mut Worker<NoopClient, StartupStore>,
+            panic_on_release: bool,
+        ) -> (Arc<TaskSignals>, std::sync::Weak<()>) {
+            let signals = Arc::new(TaskSignals::default());
+            let lifetime = Arc::new(());
+            let weak = Arc::downgrade(&lifetime);
+            let report = worker.install_features(FeatureRegistryBuilder::new().with_module(
+                BarrierFeature(BarrierTask {
+                    signals: signals.clone(),
+                    _lifetime: lifetime,
+                    panic_on_release,
+                }),
+            ));
+            assert!(!report.has_errors());
+            (signals, weak)
+        }
+
+        async fn start(worker: &Worker<NoopClient, StartupStore>, signals: &TaskSignals) {
+            let registry = worker.feature_background_tasks.clone();
+            registry
+                .start(
+                    &FeatureId::builtin("startup-barrier"),
+                    "barrier",
+                    HookInvocationContext {
+                        workspace_id: None,
+                        worker_id: "startup-owner".into(),
+                        session_id: worker.session_id().to_string(),
+                        run_id: None,
+                        turn_index: None,
+                        call_id: None,
+                    },
+                )
+                .unwrap();
+            // A transient registry clone must not cancel or abort the task:
+            // the Worker and startup capture still own the shared registry.
+            drop(registry);
+            tokio::time::timeout(Duration::from_secs(5), signals.entered.notified())
+                .await
+                .unwrap();
+        }
+
+        fn bind_session(
+            worker: &mut Worker<NoopClient, StartupStore>,
+            temp: &tempfile::TempDir,
+        ) -> workdir::WorkdirSessionHandle {
+            let session: workdir::WorkdirSessionHandle =
+                Arc::new(workdir::LocalWorkdirSession::materialized_bound(
+                    workdir::Workdir::new("startup-task-cleanup"),
+                    temp.path().to_path_buf(),
+                    temp.path().to_path_buf(),
+                    SharedScope::new(Scope::writable(temp.path()).unwrap()),
+                    workdir::WorkdirSessionCapabilities::ALL,
+                ));
+            worker.bind_single_workdir_session(Some(session.clone()));
+            session
+        }
+
+        async fn session_open(session: &workdir::WorkdirSessionHandle) -> bool {
+            session
+                .stat(workdir::StatRequest {
+                    path: workdir::WorkdirPath::root(),
+                })
+                .await
+                .is_ok()
+        }
+
+        async fn fail_consuming_start(
+            worker: Worker<NoopClient, StartupStore>,
+            temp: &tempfile::TempDir,
+        ) {
+            let factory_owned_cleanup = worker.startup_feature_cleanup_handle().is_some();
+            let blocked_parent = temp.path().join("blocked-runtime");
+            std::fs::write(&blocked_parent, "not a directory").unwrap();
+            let result = crate::PreparedWorker::new(
+                worker,
+                crate::WorkerBootstrapLayout::RuntimeManagedRun {
+                    run_dir: blocked_parent.join("1"),
+                },
+            )
+            .start()
+            .await;
+            let Err(crate::WorkerBootstrapError::Controller {
+                source,
+                cleanup_failed,
+            }) = result
+            else {
+                panic!("runtime parent file must reject controller startup");
+            };
+            assert!(matches!(
+                source.kind(),
+                std::io::ErrorKind::NotADirectory | std::io::ErrorKind::AlreadyExists
+            ));
+            assert_eq!(cleanup_failed, factory_owned_cleanup);
+        }
+
+        #[tokio::test]
+        async fn consumed_worker_failure_retains_all_task_joins_across_cleanup_timeout() {
+            let temp = tempfile::tempdir().unwrap();
+            let mut worker = worker(&temp).await;
+            let session = bind_session(&mut worker, &temp);
+            let sessions = worker.workdir_sessions();
+            let (first, first_lifetime) = install(&mut worker, false);
+            *first.session.lock().unwrap() = Some(session.clone());
+            start(&worker, &first).await;
+            let cleanup = worker.retain_startup_feature_cleanup();
+            let retry_owner = cleanup.clone();
+            let (second, second_lifetime) = install(&mut worker, false);
+            *second.session.lock().unwrap() = Some(session.clone());
+            start(&worker, &second).await;
+            fail_consuming_start(worker, &temp).await;
+
+            assert!(!sessions.aliases().is_empty());
+            assert!(session_open(&session).await);
+            assert!(first_lifetime.upgrade().is_some());
+            assert!(second_lifetime.upgrade().is_some());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), cleanup.shutdown())
+                    .await
+                    .is_err()
+            );
+            assert!(first.cancelled.load(Ordering::Acquire));
+            drop(cleanup);
+
+            // A fresh shutdown of the drained registry would falsely succeed
+            // once the second task finishes, abandoning the first task's join.
+            second.release.notify_one();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), retry_owner.shutdown())
+                    .await
+                    .is_err()
+            );
+            assert!(!first.exited.load(Ordering::Acquire));
+            assert!(session_open(&session).await);
+            first.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), retry_owner.shutdown())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(first.exited.load(Ordering::Acquire));
+            assert!(second.exited.load(Ordering::Acquire));
+            assert!(session_open(&session).await);
+            sessions.close_all().await.unwrap();
+            assert!(sessions.aliases().is_empty());
+            assert!(!session_open(&session).await);
+            drop(retry_owner);
+            assert!(first_lifetime.upgrade().is_none());
+            assert!(second_lifetime.upgrade().is_none());
+        }
+
+        #[tokio::test]
+        async fn startup_without_factory_cleanup_owner_still_closes_sessions_on_error() {
+            let temp = tempfile::tempdir().unwrap();
+            let mut worker = worker(&temp).await;
+            let session = bind_session(&mut worker, &temp);
+            let sessions = worker.workdir_sessions();
+            assert!(session_open(&session).await);
+            fail_consuming_start(worker, &temp).await;
+            assert!(sessions.aliases().is_empty());
+            assert!(!session_open(&session).await);
+        }
+
+        #[tokio::test]
+        async fn cleanup_error_settles_other_registries_and_keeps_owner_for_retry() {
+            let temp = tempfile::tempdir().unwrap();
+            let mut worker = worker(&temp).await;
+            let (first, first_lifetime) = install(&mut worker, true);
+            start(&worker, &first).await;
+            let cleanup = worker.retain_startup_feature_cleanup();
+            let (second, second_lifetime) = install(&mut worker, false);
+            start(&worker, &second).await;
+            fail_consuming_start(worker, &temp).await;
+            first.release.notify_one();
+            second.release.notify_one();
+
+            let error = tokio::time::timeout(Duration::from_secs(5), cleanup.shutdown())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.category, HookErrorCategory::Internal);
+            assert!(second.exited.load(Ordering::Acquire));
+            assert!(first_lifetime.upgrade().is_some());
+            assert!(second_lifetime.upgrade().is_some());
+            tokio::time::timeout(Duration::from_secs(5), cleanup.shutdown())
+                .await
+                .unwrap()
+                .unwrap();
+            drop(cleanup);
+            assert!(first_lifetime.upgrade().is_none());
+            assert!(second_lifetime.upgrade().is_none());
+        }
+
+        #[tokio::test]
+        async fn successful_controller_transfer_releases_old_startup_task_scopes() {
+            let temp = tempfile::tempdir().unwrap();
+            let mut worker = worker(&temp).await;
+            let (_signals, old_scope) = install(&mut worker, false);
+            let cleanup = worker.retain_startup_feature_cleanup();
+            let started = crate::PreparedWorker::new(
+                worker,
+                crate::WorkerBootstrapLayout::RuntimeManagedRun {
+                    run_dir: temp.path().join("runs/1"),
+                },
+            )
+            .start()
+            .await
+            .unwrap();
+
+            assert!(old_scope.upgrade().is_some());
+            drop(cleanup);
+            let released = old_scope.upgrade().is_none();
+            stop_body_publication_controller(started).await;
+            assert!(
+                released,
+                "live Controller must not retain factory startup capture"
+            );
+        }
     }
 
     #[tokio::test]

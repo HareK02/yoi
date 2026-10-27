@@ -2603,6 +2603,10 @@ pub struct SqliteWorkspaceStore {
     db_executor: crate::db_executor::DbExecutor,
 }
 
+#[cfg(feature = "test-support")]
+#[path = "test_support.rs"]
+pub mod fixture_support;
+
 impl SqliteWorkspaceStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -2915,6 +2919,33 @@ impl SqliteWorkspaceStore {
         singleton_key: Option<&str>,
         current_memory_settings: &WorkspaceMemorySettingsRecord,
     ) -> Result<WorkerCreateReservation> {
+        self.reserve_worker_create_with(
+            workspace_id,
+            runtime_id,
+            allocation_key,
+            request_fingerprint,
+            singleton_key,
+            current_memory_settings,
+            |_| Ok(None),
+            |_, _| Ok(()),
+        )
+    }
+
+    // Keep reservation validation, Memory binding and writes in one transaction. The
+    // nondefault test-support module supplies fixed identity / offline catalog hooks;
+    // ordinary creation always supplies a newly generated ID and no completion hook.
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_worker_create_with(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        allocation_key: &str,
+        request_fingerprint: &str,
+        singleton_key: Option<&str>,
+        current_memory_settings: &WorkspaceMemorySettingsRecord,
+        prepare: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<Option<WorkerId>>,
+        complete: impl FnOnce(&rusqlite::Transaction<'_>, &WorkerCreateReservation) -> Result<()>,
+    ) -> Result<WorkerCreateReservation> {
         if allocation_key.trim().is_empty() || request_fingerprint.trim().is_empty() {
             return Err(Error::InvalidInput(
                 "Worker create allocation key and fingerprint must be non-empty".to_string(),
@@ -2926,6 +2957,7 @@ impl SqliteWorkspaceStore {
         validate_workspace_memory_settings_record(current_memory_settings, workspace_id)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let fixed_worker_id = prepare(&tx)?;
             let existing = tx
                 .query_row(
                     "SELECT worker_id, runtime_id, request_fingerprint, create_fingerprint, \
@@ -3108,7 +3140,7 @@ impl SqliteWorkspaceStore {
             validate_workspace_memory_settings_snapshot(&snapshot, workspace_id)?;
             let create_fingerprint =
                 bound_worker_create_fingerprint(request_fingerprint, &snapshot);
-            let worker_id = WorkerId::now_v7();
+            let worker_id = fixed_worker_id.unwrap_or_else(WorkerId::now_v7);
             let worker_id_text = worker_id.to_string();
             let now = chrono::Utc::now().to_rfc3339();
             let singleton_generation = match singleton_owner.as_ref() {
@@ -3197,13 +3229,15 @@ impl SqliteWorkspaceStore {
                     ));
                 }
             }
-            tx.commit()?;
-            Ok(WorkerCreateReservation {
+            let reservation = WorkerCreateReservation {
                 worker_id,
                 create_fingerprint,
                 memory_settings: snapshot,
                 singleton,
-            })
+            };
+            complete(&tx, &reservation)?;
+            tx.commit()?;
+            Ok(reservation)
         })
     }
 

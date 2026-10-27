@@ -3676,6 +3676,7 @@ mod tests {
 
     #[test]
     fn bound_ssh_workdir_uses_attachment_scoped_agent_and_cleans_it_up() {
+        crate::restore_test_environment::require_restore_test_environment();
         let repo = create_clean_repo();
         // ssh-agent and the broker receive relative socket paths in this owned
         // fixture tree, so the test does not depend on checkout/TMPDIR length.

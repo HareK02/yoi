@@ -14,17 +14,37 @@ async fn notification_diagnostics_http_auth_scope_and_readonly_evidence() {
     seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
     let ticket = delivery_ticket(&api, "Notification diagnostics auth fixture");
     delivery_assign(&api, ticket.id.as_str(), "diagnostics-assignment").await;
-    let path = format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?ticket={}&limit=1",ticket.id.as_str());
-    let page = delivery_http(&api,"GET",&path,None,StatusCode::OK).await;
-    assert_eq!(page["items"].as_array().unwrap().len(),1);
-    assert_eq!(page["items"][0]["model_processing_confirmed"],false);
+    let path = format!(
+        "/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?ticket={}&limit=1",
+        ticket.id.as_str()
+    );
+    let page = delivery_http(&api, "GET", &path, None, StatusCode::OK).await;
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["items"][0]["model_processing_confirmed"], false);
     assert!(page["items"][0].get("content").is_none());
-    let again=delivery_http(&api,"GET",&path,None,StatusCode::OK).await;
-    assert_eq!(again,page);
-    let response=build_router(api.clone()).oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap()).await.unwrap();
-    assert_eq!(response.status(),StatusCode::UNAUTHORIZED);
-    delivery_http(&api,"GET","/api/w/other-workspace/notification-diagnostics",None,StatusCode::NOT_FOUND).await;
-    delivery_http(&api,"GET",&format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?limit=101"),None,StatusCode::BAD_REQUEST).await;
+    let again = delivery_http(&api, "GET", &path, None, StatusCode::OK).await;
+    assert_eq!(again, page);
+    let response = build_router(api.clone())
+        .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    delivery_http(
+        &api,
+        "GET",
+        "/api/w/other-workspace/notification-diagnostics",
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    delivery_http(
+        &api,
+        "GET",
+        &format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?limit=101"),
+        None,
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
 }
 
 fn delivery_assignment_path(ticket: &str) -> String {
@@ -814,6 +834,7 @@ impl DeliveryWorkerFactory {
             shutdown: Arc::new(tokio::sync::Mutex::new(Some(started.shutdown))),
             controller_task: started.controller_task,
             workspace_client,
+            restore_streams: None,
         })
     }
 }
@@ -827,12 +848,62 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for DeliveryWorkerFact
         self.controller(request.worker_ref.worker_id.to_string(), false)
             .await
     }
-    async fn restore_controller(
+    async fn prepare_restore(
         &self,
         request: delivery_execution::WorkerExecutionRestoreRequest,
-    ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
-        self.controller(request.worker_ref.worker_id.to_string(), true)
-            .await
+    ) -> std::result::Result<
+        Box<dyn worker_runtime::worker_backend::RuntimeRestoreCandidate>,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
+        Ok(Box::new(DeliveryRestoreCandidate {
+            inputs: Some((
+                DeliveryWorkerFactory {
+                    root: self.root.clone(),
+                    client: self.client.clone(),
+                },
+                request.worker_ref.worker_id.to_string(),
+            )),
+        }))
+    }
+}
+
+// Retain the same scripted client/receipt store without opening either store or
+// starting a Controller until activation. Discard drops only these owned inputs.
+struct DeliveryRestoreCandidate {
+    inputs: Option<(DeliveryWorkerFactory, String)>,
+}
+
+#[async_trait::async_trait]
+impl worker_runtime::worker_backend::RuntimeRestoreCandidate for DeliveryRestoreCandidate {
+    fn initial_state(&self) -> protocol::WorkerStateSnapshot {
+        protocol::WorkerStateSnapshot::initial()
+    }
+
+    async fn activate(
+        &mut self,
+    ) -> std::result::Result<
+        worker_runtime::worker_backend::RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
+        let (factory, worker_id) = self.inputs.take().ok_or_else(|| {
+            worker_runtime::worker_backend::RuntimeRestoreFailure::refused(
+                worker_runtime::worker_backend::RuntimeRestoreStage::Controller,
+                "delivery fixture candidate already consumed",
+            )
+        })?;
+        factory.controller(worker_id, true).await.map_err(|_| {
+            worker_runtime::worker_backend::RuntimeRestoreFailure::unproven(
+                worker_runtime::worker_backend::RuntimeRestoreStage::Reconstruction,
+                "delivery fixture reconstruction failed",
+            )
+        })
+    }
+
+    async fn discard(
+        &mut self,
+    ) -> std::result::Result<(), worker_runtime::worker_backend::RuntimeRestoreCleanupFailure> {
+        self.inputs.take();
+        Ok(())
     }
 }
 
@@ -931,6 +1002,7 @@ async fn delivery_real_fixture(
     Arc<DeliveryResponseLossBackend>,
     DeliveryScriptedClient,
 ) {
+    let _environment = restored_parent_control_tests::connected_restore_tempdir();
     let config = test_server_config(root);
     let store = Arc::new(SqliteWorkspaceStore::open_for_test(&config.database_path).unwrap());
     seed_test_registered_workspace(store.as_ref(), &config)
@@ -1136,9 +1208,22 @@ async fn assignment_real_worker_response_loss_restore_and_concurrent_scans_commi
         "uncertain delivery changed request id or payload: {attempts:?}"
     );
     assert_eq!(delivery_receipts(&api, &worker).len(), 1);
-    let unknown = api.store.notification_diagnostics(TEST_WORKSPACE_ID, &server_api::NotificationDiagnosticsQuery {
-        assignment_id: Some(assignment.into()), ..Default::default()
-    }).unwrap().items.into_iter().find(|item| item.stage == server_api::NotificationDiagnosticStage::AcceptanceUnknown).expect("saved unknown acceptance must remain visible while Runtime already has its receipt");
+    let unknown = api
+        .store
+        .notification_diagnostics(
+            TEST_WORKSPACE_ID,
+            &server_api::NotificationDiagnosticsQuery {
+                assignment_id: Some(assignment.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| item.stage == server_api::NotificationDiagnosticStage::AcceptanceUnknown)
+        .expect(
+            "saved unknown acceptance must remain visible while Runtime already has its receipt",
+        );
     assert!(!unknown.model_processing_confirmed);
     // Change mutable rendering context while the acknowledgement is unknown.
     // A new self-report is not a new input and cannot change the frozen retry.
@@ -1199,11 +1284,24 @@ async fn assignment_real_worker_response_loss_restore_and_concurrent_scans_commi
     }
     delivery_wait_idle(&reopened, &worker, 2).await;
     assert_eq!(delivery_receipts(&reopened, &worker).len(), 2);
-    let evidence = delivery_http(&reopened,"GET",&format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?source_id={}",unknown.source_id),None,StatusCode::OK).await;
-    assert_eq!(evidence["items"][0]["stage"],"runtime_accepted");
-    assert_eq!(evidence["items"][0]["delivery_id"],json!(unknown.delivery_id));
-    assert_eq!(evidence["items"][0]["model_processing_confirmed"],false);
-    assert_eq!(evidence["items"][0]["retry_candidate"],false);
+    let evidence = delivery_http(
+        &reopened,
+        "GET",
+        &format!(
+            "/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?source_id={}",
+            unknown.source_id
+        ),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(evidence["items"][0]["stage"], "runtime_accepted");
+    assert_eq!(
+        evidence["items"][0]["delivery_id"],
+        json!(unknown.delivery_id)
+    );
+    assert_eq!(evidence["items"][0]["model_processing_confirmed"], false);
+    assert_eq!(evidence["items"][0]["retry_candidate"], false);
     assert_eq!(
         delivery_commits(&reopened, &worker)
             .iter()
