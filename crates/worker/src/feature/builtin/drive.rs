@@ -31,6 +31,8 @@ pub(crate) mod delegation;
 #[cfg(test)]
 mod tests;
 pub mod wip;
+#[cfg(test)]
+mod wip_tests;
 
 use crate::{
     feature::{
