@@ -407,7 +407,8 @@ fn reconstruct_implementation_schema96(conn: &Connection) -> Result<()> {
     }
     // Children before parents; dropping the tables also drops snapshot guards.
     conn.execute_batch(
-        "DROP TABLE subject_deletion_allocations;
+        "DROP TABLE subject_deletion_removals;
+        DROP TABLE subject_deletion_allocations;
         DROP TABLE subject_deletion_jobs;
         DROP TABLE subject_deletion_workers;
         DROP TABLE subject_deletions;

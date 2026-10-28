@@ -727,3 +727,473 @@ async fn unmaterialized_body_and_job_reservations_finish_only_with_runtime_stora
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_retry_and_restart() {
+    use worker_runtime::retention::{DiagnosticsDisposition, SessionDisposition};
+    for phase in [
+        "planned",
+        "executing",
+        "failed",
+        "response_lost",
+        "catalog_failure",
+        "purge_ack_commit_failure",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+        let store = open_subjektiv_store(&api).unwrap();
+        let subject = store
+            .create_subject(
+                crate::subjektiv::SubjectRole::new(format!("old plan {phase}")).unwrap(),
+            )
+            .unwrap();
+        let other = store
+            .create_subject_with_behavior(
+                crate::subjektiv::SubjectRole::new("keep other").unwrap(),
+                "untouched".into(),
+            )
+            .unwrap();
+        let candidate = serde_json::from_value(json!({
+            "schema_version": 2, "id": "old-job-candidate", "extract_run_id": "extract",
+            "source": {"segment_id":"segment", "range":[1,2]}, "kind":"constraint",
+            "claim":"private candidate", "why_useful":"erase after explicit deletion",
+            "evidence": [], "source_refs": []
+        }))
+        .unwrap();
+        store
+            .stage_candidate(crate::subjektiv::SubjectStagingRecord::attach(
+                &subject.id,
+                candidate,
+            ))
+            .unwrap();
+        start_subjektiv_staging_consolidation(
+            api.clone(),
+            &subject.id,
+            MemoryConsolidateStagingOperation { force: true },
+        )
+        .await
+        .unwrap();
+        let job = api
+            .store
+            .find_active_backend_job_for_resource(
+                TEST_WORKSPACE_ID,
+                &crate::backend_job::subjektiv_serialization_key(&subject.id),
+            )
+            .unwrap()
+            .unwrap();
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &job.request.job_id,
+                &crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt),
+            )
+            .unwrap()
+            .unwrap();
+        let worker = attempt.worker.clone().unwrap();
+        seed_worker_session_for_cleanup(dir.path(), &worker);
+        api.runtime
+            .stop_worker(
+                &worker,
+                WorkerLifecycleRequest {
+                    reason: Some("Prior independent removal".into()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        let diagnostic = dir
+            .path()
+            .join(".test-embedded-runtime-store/workers")
+            .join(&worker.worker_id)
+            .join("runs/old/worker.out.log");
+        std::fs::create_dir_all(diagnostic.parent().unwrap()).unwrap();
+        std::fs::write(&diagnostic, "private old Job diagnostic").unwrap();
+        let policy = api
+            .config_store
+            .worker_retention_policy(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap();
+        api.config_store
+            .update_worker_retention_policy(
+                TEST_WORKSPACE_ID,
+                &policy.policy_digest,
+                &crate::retention::WorkerRetentionPolicyUpdate {
+                    policy_id: "prior-job-archive-policy".into(),
+                    session_disposition: SessionDisposition::Archive,
+                    metadata_disposition: crate::retention::MetadataDisposition::Tombstone,
+                    archive_retention: crate::retention::ArchiveRetention::ForSeconds {
+                        seconds: 600,
+                    },
+                    diagnostics_disposition: DiagnosticsDisposition::Retain,
+                    diagnostics_retention_seconds: Some(600),
+                },
+            )
+            .unwrap();
+        let inventory = api.runtime.worker_retention_inventory(&worker).unwrap();
+        assert!(inventory.diagnostics_bytes > 0);
+        let old = api
+            .config_store
+            .plan_worker_removal(
+                &crate::retention::WorkerRemovalPlanRequest {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    worker: worker.clone(),
+                    reason: "Previously requested retention".into(),
+                    journal_erasure: None,
+                },
+                &inventory,
+            )
+            .unwrap();
+        assert_eq!(old.session_disposition, SessionDisposition::Archive);
+        let saved = if phase == "planned" {
+            api.config_store
+                .recover_worker_removal_execution(TEST_WORKSPACE_ID, &worker)
+                .unwrap()
+                .unwrap()
+        } else {
+            api.config_store
+                .prepare_worker_removal_execution(
+                    TEST_WORKSPACE_ID,
+                    &old.plan_id,
+                    &old.input_fingerprint,
+                )
+                .unwrap()
+        };
+        if phase == "failed" {
+            api.config_store
+                .fail_worker_removal(
+                    TEST_WORKSPACE_ID,
+                    &old.operation_id,
+                    &old.input_fingerprint,
+                    "old_unknown_outcome",
+                )
+                .unwrap();
+        }
+        if phase == "catalog_failure" {
+            api.config_store.with_conn(|c| { c.execute_batch("CREATE TRIGGER injected_old_catalog_failure BEFORE DELETE ON worker_registry BEGIN SELECT RAISE(ABORT,'catalog failure'); END;")?; Ok(()) }).unwrap();
+        }
+        let old_result = if matches!(phase, "response_lost" | "catalog_failure") {
+            let result = api
+                .runtime
+                .execute_worker_retention(&worker, saved.runtime_request.clone())
+                .unwrap();
+            if phase == "catalog_failure" {
+                assert!(
+                    api.config_store
+                        .commit_worker_removal(
+                            TEST_WORKSPACE_ID,
+                            &old.operation_id,
+                            &old.input_fingerprint,
+                            &result
+                        )
+                        .is_err()
+                );
+            }
+            Some(result)
+        } else {
+            None
+        };
+        if phase == "purge_ack_commit_failure" {
+            api.config_store.with_conn(|c| { c.execute_batch("CREATE TRIGGER injected_purge_ack_commit_failure BEFORE UPDATE OF completed ON subject_deletion_removals WHEN NEW.completed=1 BEGIN SELECT RAISE(ABORT,'purge receipt commit failure'); END;")?; Ok(()) }).unwrap();
+        }
+        // Force a midpoint AFTER domain/snapshot commit but BEFORE any deletion-owned
+        // Runtime effect. It must retain exactly the original canonical input.
+        *execution.subject_delete_failure.lock().unwrap() = Some("shutdown outcome unknown".into());
+        let owner =
+            seed_test_workspace_owner_token(api.store.as_ref(), &format!("old-removal-{phase}"))
+                .await;
+        let (status, pending) = delete_request(
+            &api,
+            &subject.id,
+            "same-delete",
+            Some(&owner),
+            TEST_WORKSPACE_ID,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{phase}: {pending}");
+        assert_eq!(pending["completed"], false, "{phase}");
+        let pinned = api
+            .config_store
+            .subject_deletion_removal(TEST_WORKSPACE_ID, &worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.request, saved.runtime_request, "{phase}");
+        assert!(!pinned.completed);
+        assert!(pinned.is_job);
+        assert!(
+            api.config_store
+                .erase_subject_deleted_jobs(TEST_WORKSPACE_ID, &subject.id, "same-delete")
+                .is_err()
+        );
+        *execution.subject_delete_failure.lock().unwrap() = None;
+        let mut reopened = api.clone();
+        let reopened_store =
+            Arc::new(SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap());
+        reopened.config_store = reopened_store.clone();
+        reopened.store = reopened_store;
+        if matches!(phase, "catalog_failure" | "purge_ack_commit_failure") {
+            let (status, pending) = delete_request(
+                &reopened,
+                &subject.id,
+                "same-delete",
+                Some(&owner),
+                TEST_WORKSPACE_ID,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{phase}: {pending}");
+            assert_eq!(pending["completed"], false, "{phase}");
+            assert!(
+                !store
+                    .subject_deletion(&subject.id)
+                    .unwrap()
+                    .unwrap()
+                    .completed
+            );
+            assert!(
+                reopened
+                    .store
+                    .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
+                    .unwrap()
+                    .is_some()
+            );
+            reopened
+                .config_store
+                .with_conn(|c| {
+                    c.execute_batch(if phase == "catalog_failure" {
+                        "DROP TRIGGER injected_old_catalog_failure;"
+                    } else {
+                        "DROP TRIGGER injected_purge_ack_commit_failure;"
+                    })?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        // Exercise the same production restart recovery that starts from the saved
+        // domain operation, then HTTP replay of the same full request.
+        let recovery = reopened.clone();
+        let handle = tokio::runtime::Handle::current();
+        reopened
+            .host_executors
+            .host()
+            .unwrap()
+            .run(move || handle.block_on(subjektiv_deletion::recover(&recovery)))
+            .await
+            .unwrap();
+        let (status, done) = delete_request(
+            &reopened,
+            &subject.id,
+            "same-delete",
+            Some(&owner),
+            TEST_WORKSPACE_ID,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{phase}: {done}");
+        assert_eq!(done["completed"], true, "{phase}: {done}");
+        let reconciled = reopened
+            .config_store
+            .subject_deletion_removal(TEST_WORKSPACE_ID, &worker)
+            .unwrap()
+            .unwrap();
+        assert!(reconciled.completed);
+        assert_eq!(reconciled.request, saved.runtime_request);
+        let canonical = reopened
+            .config_store
+            .recover_worker_removal_execution(TEST_WORKSPACE_ID, &worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            canonical.plan.state,
+            crate::retention::WorkerRemovalPlanState::Succeeded
+        );
+        assert_eq!(canonical.runtime_request, saved.runtime_request);
+        assert_eq!(
+            canonical.plan.session_disposition,
+            SessionDisposition::Archive,
+            "old result was not relabeled Purge"
+        );
+        let result = reopened
+            .runtime
+            .execute_worker_retention(&worker, saved.runtime_request.clone())
+            .unwrap();
+        if let Some(old_result) = old_result {
+            assert_eq!(result, old_result);
+        }
+        assert_eq!(result.session_disposition, SessionDisposition::Archive);
+        assert!(result.source_removed);
+        let archive = result.archive.as_ref().unwrap();
+        let root = dir.path().join(".test-embedded-runtime-store");
+        assert!(
+            !root
+                .join("archives/workers")
+                .join(&archive.archive_id)
+                .join("session")
+                .exists(),
+            "new Job archive copy survives {phase}"
+        );
+        if result.diagnostics_disposition == DiagnosticsDisposition::Retain {
+            assert!(
+                !root
+                    .join("archives/diagnostics")
+                    .join(&old.operation_id)
+                    .exists(),
+                "Job diagnostics survive {phase}"
+            );
+        }
+        assert!(
+            reopened
+                .store
+                .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .store
+                .current_worker_singleton_owner(
+                    TEST_WORKSPACE_ID,
+                    &crate::backend_job::subjektiv_serialization_key(&subject.id)
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.subject(&subject.id).unwrap().is_none());
+        assert_eq!(
+            store.subject(&other.id).unwrap().unwrap().behavior_md,
+            "untouched"
+        );
+        let (status, replay) = delete_request(
+            &reopened,
+            &subject.id,
+            "same-delete",
+            Some(&owner),
+            TEST_WORKSPACE_ID,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(done, replay);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subject_deletion() {
+    let dir = tempfile::tempdir().unwrap();
+    init_clean_git_workspace(dir.path());
+    let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(crate::subjektiv::SubjectRole::new("old body archive").unwrap())
+        .unwrap();
+    let Json(created) = create_workspace_worker(
+        State(api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
+            display_name: "Existing body removal".into(),
+            singleton_key: None,
+            profile: Some("builtin:companion".into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachments: vec![],
+            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
+                    subject_id: subject.id.clone(),
+                }),
+            },
+            control_operation_id: None,
+            execution_grant: None,
+        }),
+    )
+    .await
+    .unwrap();
+    let worker = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
+    seed_worker_session_for_cleanup(dir.path(), &worker);
+    api.runtime
+        .stop_worker(
+            &worker,
+            WorkerLifecycleRequest {
+                reason: Some("Earlier removal".into()),
+                ticket_assignment: None,
+            },
+        )
+        .unwrap();
+    let inventory = api.runtime.worker_retention_inventory(&worker).unwrap();
+    let old = api
+        .config_store
+        .plan_worker_removal(
+            &crate::retention::WorkerRemovalPlanRequest {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                worker: worker.clone(),
+                reason: "Earlier authorized archive".into(),
+                journal_erasure: None,
+            },
+            &inventory,
+        )
+        .unwrap();
+    let saved = api
+        .config_store
+        .prepare_worker_removal_execution(TEST_WORKSPACE_ID, &old.plan_id, &old.input_fingerprint)
+        .unwrap();
+    let result = api
+        .runtime
+        .execute_worker_retention(&worker, saved.runtime_request.clone())
+        .unwrap();
+    // Simulate a lost result before canonical Backend commit. Deletion must pin an
+    // unfinished request, not retrospectively classify its archive as a prior success.
+    *execution.subject_delete_failure.lock().unwrap() = Some("unknown shutdown".into());
+    let owner = seed_test_workspace_owner_token(api.store.as_ref(), "old-body-removal").await;
+    let (status, pending) = delete_request(
+        &api,
+        &subject.id,
+        "same-body-delete",
+        Some(&owner),
+        TEST_WORKSPACE_ID,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pending}");
+    assert_eq!(pending["completed"], false);
+    let snapshot = api
+        .config_store
+        .subject_deletion_removal(TEST_WORKSPACE_ID, &worker)
+        .unwrap()
+        .unwrap();
+    assert!(!snapshot.is_job && !snapshot.completed);
+    assert_eq!(snapshot.request, saved.runtime_request);
+    *execution.subject_delete_failure.lock().unwrap() = None;
+    let (status, done) = delete_request(
+        &api,
+        &subject.id,
+        "same-body-delete",
+        Some(&owner),
+        TEST_WORKSPACE_ID,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(done["completed"], true, "{done}");
+    let completed = api
+        .config_store
+        .subject_deletion_removal(TEST_WORKSPACE_ID, &worker)
+        .unwrap()
+        .unwrap();
+    assert!(completed.completed);
+    assert_eq!(completed.request, saved.runtime_request);
+    let replay = api
+        .runtime
+        .execute_worker_retention(&worker, saved.runtime_request)
+        .unwrap();
+    assert_eq!(replay, result);
+    let archive = result.archive.unwrap();
+    assert!(
+        dir.path()
+            .join(".test-embedded-runtime-store/archives/workers")
+            .join(&archive.archive_id)
+            .join("session")
+            .is_dir()
+    );
+    assert!(api.config_store.with_conn(|c| Ok(c.query_row("SELECT prior_removal_operation_id IS NULL FROM subject_deletion_workers WHERE workspace_id=?1 AND subject_id=?2 AND runtime_id=?3 AND worker_id=?4", rusqlite::params![TEST_WORKSPACE_ID,subject.id,worker.runtime_id,worker.worker_id], |r|r.get::<_,bool>(0))?)).unwrap());
+    assert!(
+        store
+            .subject_deletion(&subject.id)
+            .unwrap()
+            .unwrap()
+            .completed
+    );
+}

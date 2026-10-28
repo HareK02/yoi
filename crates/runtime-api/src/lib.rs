@@ -1219,8 +1219,34 @@ pub struct SubjectDeleteWorkerResponse {
     pub originals_absent: bool,
 }
 
+/// Additional erasure of a Subject Job's newly reconciled removal copies.
+/// Both identities are exact saved requests; this never changes the old receipt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectJobRemovalPurgeRequest {
+    pub deletion: SubjectDeleteWorkerRequest,
+    pub removal: WorkerRetentionExecutionRequest,
+}
+
+/// Confirms current physical erasure under the permanent deletion fence.
+/// Operation identity belongs to `removal`, not the Subject deletion operation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectJobRemovalPurgeResponse {
+    pub workspace_id: String,
+    pub worker_id: WorkerId,
+    pub operation_id: String,
+    pub input_fingerprint: String,
+}
+
 #[api(reqwest, axum)]
 pub trait RuntimeApi {
+    #[post("/v1/subject-job-removal-purge", status = 200, error_status = 400)]
+    async fn purge_subject_job_removal(
+        &self,
+        #[body] request: SubjectJobRemovalPurgeRequest,
+    ) -> Result<SubjectJobRemovalPurgeResponse, RuntimeApiError>;
+
     #[post("/v1/subject-delete-worker", status = 200, error_status = 400)]
     async fn subject_delete_worker(
         &self,
@@ -1787,6 +1813,18 @@ mod tests {
         ) -> Result<SessionMaterialPinResponse, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn purge_subject_job_removal(
+            &self,
+            request: SubjectJobRemovalPurgeRequest,
+        ) -> Result<SubjectJobRemovalPurgeResponse, RuntimeApiError> {
+            Ok(SubjectJobRemovalPurgeResponse {
+                workspace_id: request.removal.workspace_id,
+                worker_id: request.removal.worker_id,
+                operation_id: request.removal.operation_id,
+                input_fingerprint: request.removal.input_fingerprint,
+            })
+        }
+
         async fn subject_delete_worker(
             &self,
             request: SubjectDeleteWorkerRequest,
@@ -1989,9 +2027,35 @@ mod tests {
             .subject_delete_worker(deletion.clone())
             .await
             .unwrap();
-        let mut expected = serde_json::to_value(deletion).unwrap();
+        let mut expected = serde_json::to_value(&deletion).unwrap();
         expected["originals_absent"] = true.into();
         assert_eq!(serde_json::to_value(receipt).unwrap(), expected);
+        let purge = SubjectJobRemovalPurgeRequest {
+            removal: WorkerRetentionExecutionRequest {
+                operation_id: "old-removal".into(),
+                input_fingerprint: "old-removal-fingerprint".into(),
+                archive_id: Some("old-archive".into()),
+                workspace_id: deletion.workspace_id.clone(),
+                source_runtime_id: "runtime-a".into(),
+                worker_id: deletion.worker_id,
+                source_created_at: "2026-01-01T00:00:00Z".into(),
+                removed_at: "2026-01-02T00:00:00Z".into(),
+                effective_profile: None,
+                retention_class: None,
+                policy_id: "old-policy".into(),
+                session_disposition: SessionDisposition::Archive,
+                diagnostics_disposition: DiagnosticsDisposition::Retain,
+            },
+            deletion,
+        };
+        let receipt = client
+            .purge_subject_job_removal(purge.clone())
+            .await
+            .unwrap();
+        assert_eq!(receipt.workspace_id, purge.removal.workspace_id);
+        assert_eq!(receipt.worker_id, purge.removal.worker_id);
+        assert_eq!(receipt.operation_id, purge.removal.operation_id);
+        assert_eq!(receipt.input_fingerprint, purge.removal.input_fingerprint);
         let summary = client.runtime_summary().await.unwrap();
         assert_eq!(summary.runtime.display_name.as_deref(), Some("round-trip"));
         let workers = client

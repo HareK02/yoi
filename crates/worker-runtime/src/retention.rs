@@ -359,28 +359,91 @@ fn erase_archived_diagnostics(
             return Err(invalid());
         }
     }
+    erase_operation_diagnostics(
+        runtime_root,
+        &archive.workspace_id,
+        &archive.source_runtime_id,
+        archive.source_worker_id,
+        &archive.operation_id,
+        &archive.input_fingerprint,
+    )
+}
+
+fn erase_removal_session_copies(
+    runtime_root: &Path,
+    archive: &WorkerSessionArchiveManifest,
+) -> Result<(), session_store::StoreError> {
+    let parent = runtime_root.join("archives/workers");
+    let prefix = format!(".{}.tmp-", archive.archive_id);
+    for entry in fs::read_dir(&parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name != archive.archive_id && !is_operation_staging(name, &prefix) {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            return Err(std::io::Error::other("Removal archive source is not a directory").into());
+        }
+        let mut saved: WorkerSessionArchiveManifest =
+            serde_json::from_slice(&fs::read(entry.path().join("manifest.json"))?)?;
+        // Each interrupted attempt attests the same input, with its own time.
+        saved.archived_at_unix_seconds = archive.archived_at_unix_seconds;
+        if saved != *archive {
+            return Err(std::io::Error::other("Removal archive copy identity mismatch").into());
+        }
+        match fs::remove_dir_all(entry.path().join("session")) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.into()),
+        }
+        sync_directory(&entry.path(), "erase removal Session")
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn is_operation_staging(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix).is_some_and(|suffix| {
+        suffix.split_once('-').is_some_and(|(pid, sequence)| {
+            !pid.is_empty()
+                && !sequence.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && sequence.bytes().all(|b| b.is_ascii_digit())
+        })
+    })
+}
+
+fn erase_operation_diagnostics(
+    runtime_root: &Path,
+    workspace_id: &str,
+    source_runtime_id: &str,
+    worker_id: WorkerId,
+    operation_id: &str,
+    input_fingerprint: &str,
+) -> Result<(), session_store::StoreError> {
+    let invalid = || {
+        session_store::StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Archived diagnostics erasure identity mismatch",
+        ))
+    };
+    validate_id("operation_id", operation_id).map_err(|_| invalid())?;
     let parent = runtime_root.join("archives/diagnostics");
     let entries = match fs::read_dir(&parent) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    let staging_prefix = format!(".{}.tmp-", archive.operation_id);
+    let staging_prefix = format!(".{operation_id}.tmp-");
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
-        let staged = name.strip_prefix(&staging_prefix).is_some_and(|suffix| {
-            suffix.split_once('-').is_some_and(|(pid, sequence)| {
-                !pid.is_empty()
-                    && !sequence.is_empty()
-                    && pid.bytes().all(|b| b.is_ascii_digit())
-                    && sequence.bytes().all(|b| b.is_ascii_digit())
-            })
-        });
-        if name != archive.operation_id && !staged {
+        let staged = is_operation_staging(name, &staging_prefix);
+        if name != operation_id && !staged {
             continue;
         }
         if !entry.file_type()?.is_dir() {
@@ -395,11 +458,11 @@ fn erase_archived_diagnostics(
         };
         if let Some(manifest) = manifest {
             if manifest.schema_version != ARCHIVE_SCHEMA_VERSION
-                || manifest.workspace_id != archive.workspace_id
-                || manifest.source_runtime_id != archive.source_runtime_id
-                || manifest.source_worker_id != archive.source_worker_id
-                || manifest.operation_id != archive.operation_id
-                || manifest.input_fingerprint != archive.input_fingerprint
+                || manifest.workspace_id != workspace_id
+                || manifest.source_runtime_id != source_runtime_id
+                || manifest.source_worker_id != worker_id
+                || manifest.operation_id != operation_id
+                || manifest.input_fingerprint != input_fingerprint
             {
                 return Err(invalid());
             }
@@ -478,6 +541,109 @@ impl FsWorkerRetentionProvider {
         };
         validate_receipt_request(&receipt, request)?;
         Ok(receipt.result.source_removed.then_some(receipt.result))
+    }
+
+    /// Caller holds the Worker operation lock and has verified the durable
+    /// Subject deletion fence. Never execute/recover a missing or pending receipt
+    /// here: the original canonical operation must have completed first.
+    pub(crate) fn purge_subject_job_removal(
+        &self,
+        request: &WorkerRetentionExecutionRequest,
+    ) -> Result<(), RuntimeError> {
+        validate_request(request)?;
+        let lock_path = self.runtime_root.join(RETENTION_LOCK);
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| RuntimeError::StoreIo {
+                operation: "lock Subject Job removal purge",
+                path: lock_path.clone(),
+                source,
+            })?;
+        lock.lock().map_err(|source| RuntimeError::StoreIo {
+            operation: "lock Subject Job removal purge",
+            path: lock_path,
+            source,
+        })?;
+        let receipt = read_operation_receipt(&self.operation_path(&request.operation_id)?)?
+            .ok_or_else(|| {
+                RuntimeError::InvalidRequest("Canonical removal receipt missing".into())
+            })?;
+        validate_receipt_request(&receipt, request)?;
+        let result = &receipt.result;
+        if !result.source_removed
+            || result.worker_id != request.worker_id
+            || result.session_disposition != request.session_disposition
+            || result.diagnostics_disposition != request.diagnostics_disposition
+            || result.diagnostics_retained
+                != (request.diagnostics_disposition == DiagnosticsDisposition::Retain)
+            || result.archive.is_some()
+                != (request.session_disposition == SessionDisposition::Archive)
+            || self.worker_dir(request.worker_id).exists()
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "Canonical removal is not an exact successful receipt".into(),
+            ));
+        }
+        let archive = if let Some(manifest) = &result.archive {
+            if request.archive_id.as_ref() != Some(&manifest.archive_id)
+                || manifest.workspace_id != request.workspace_id
+                || manifest.source_runtime_id != request.source_runtime_id
+                || manifest.source_worker_id != request.worker_id
+                || manifest.operation_id != request.operation_id
+                || manifest.input_fingerprint != request.input_fingerprint
+            {
+                return Err(RuntimeError::InvalidRequest(
+                    "Removal archive identity mismatch".into(),
+                ));
+            }
+            let (saved, _) = self.session_archive_identity(&manifest.archive_id)?;
+            if saved != *manifest {
+                return Err(RuntimeError::InvalidRequest(
+                    "Removal archive receipt mismatch".into(),
+                ));
+            }
+            let session = manifest
+                .source_session_id
+                .parse::<session_store::SessionId>()
+                .map_err(|_| {
+                    RuntimeError::InvalidRequest("Invalid removal Session identity".into())
+                })?;
+            Some(session)
+        } else {
+            None
+        };
+        let erase = || -> Result<(), session_store::StoreError> {
+            erase_operation_diagnostics(
+                &self.runtime_root,
+                &request.workspace_id,
+                &request.source_runtime_id,
+                request.worker_id,
+                &request.operation_id,
+                &request.input_fingerprint,
+            )?;
+            if let Some(manifest) = &result.archive {
+                erase_removal_session_copies(&self.runtime_root, manifest)?;
+            }
+            Ok(())
+        };
+        if let Some(session) = &archive {
+            runtime_session_retention(&self.runtime_root)
+                .delete(
+                    *session,
+                    session_store::retention::SessionDeletionIntent::ErasePermanently,
+                    erase,
+                )
+                .map_err(retention_error)?;
+        } else {
+            // Diagnostics-only old Purge operations have no archive Session ID.
+            // The existing permanent Worker fence plus immutable completed receipt
+            // prevents execution and re-publication; hold the retention lock here.
+            erase().map_err(retention_error)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn snapshot(

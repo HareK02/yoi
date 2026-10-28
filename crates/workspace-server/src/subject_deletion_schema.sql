@@ -35,6 +35,41 @@ BEGIN SELECT RAISE(ABORT,'Subject deletion Worker snapshot identity is immutable
 CREATE TRIGGER subject_deletion_original_absence_monotonic BEFORE UPDATE OF originals_absent ON subject_deletion_workers
 WHEN OLD.originals_absent=1 AND NEW.originals_absent=0
 BEGIN SELECT RAISE(ABORT,'Subject deletion original absence proof is permanent'); END;
+-- In-flight removals are distinct from successful prior receipts. Pin the exact
+-- old Runtime request once; Subject deletion never rewrites its retention policy.
+CREATE TABLE subject_deletion_removals (
+    workspace_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL REFERENCES worker_removal_operations(operation_id),
+    input_fingerprint TEXT NOT NULL,
+    request_json TEXT NOT NULL CHECK(json_valid(request_json)),
+    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0,1)),
+    job_purge_receipt_json TEXT CHECK(job_purge_receipt_json IS NULL OR json_valid(job_purge_receipt_json)),
+    PRIMARY KEY(workspace_id,subject_id,runtime_id,worker_id),
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    FOREIGN KEY(workspace_id,subject_id,runtime_id,worker_id)
+      REFERENCES subject_deletion_workers(workspace_id,subject_id,runtime_id,worker_id) ON DELETE CASCADE
+);
+CREATE TRIGGER subject_deletion_removal_insert BEFORE INSERT ON subject_deletion_removals
+WHEN NEW.completed!=0 OR NEW.job_purge_receipt_json IS NOT NULL OR NOT EXISTS(
+ SELECT 1 FROM subject_deletion_workers w JOIN worker_removal_operations r
+ ON r.workspace_id=w.workspace_id AND r.runtime_id=w.runtime_id AND r.worker_id=w.worker_id
+ WHERE w.workspace_id=NEW.workspace_id AND w.subject_id=NEW.subject_id
+ AND w.runtime_id=NEW.runtime_id AND w.worker_id=NEW.worker_id AND w.prior_removal_operation_id IS NULL
+ AND r.operation_id=NEW.operation_id AND r.input_fingerprint=NEW.input_fingerprint
+ AND r.state IN ('planned','executing','failed')
+ AND json_extract(NEW.request_json,'$.operation_id')=r.operation_id
+ AND json_extract(NEW.request_json,'$.input_fingerprint')=r.input_fingerprint)
+BEGIN SELECT RAISE(ABORT,'Subject deletion reconciliation must pin an unfinished canonical removal'); END;
+CREATE TRIGGER subject_deletion_removal_identity_immutable BEFORE UPDATE OF
+ workspace_id,subject_id,runtime_id,worker_id,operation_id,input_fingerprint,request_json ON subject_deletion_removals
+BEGIN SELECT RAISE(ABORT,'Subject deletion removal request is immutable'); END;
+CREATE TRIGGER subject_deletion_removal_completion_monotonic BEFORE UPDATE ON subject_deletion_removals
+WHEN (OLD.completed=1 AND NEW.completed!=1)
+ OR (OLD.job_purge_receipt_json IS NOT NULL AND NEW.job_purge_receipt_json IS NOT OLD.job_purge_receipt_json)
+BEGIN SELECT RAISE(ABORT,'Subject deletion removal receipt is permanent'); END;
 -- Job/attempt identities remain after payload erasure, preventing stale allocation
 -- or caller-selected Job-id reuse from recreating the deleted Subject's inputs.
 CREATE TABLE subject_deletion_jobs (

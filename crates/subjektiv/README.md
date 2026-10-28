@@ -35,6 +35,14 @@ originals and pre-existing archives have independent retention lifecycles: the W
 Host archives source originals rather than erasing them. Those archives may contain
 previously injected Memory; Workdirs, Tickets, exports and external provider copies are
 also outside Subject content erasure. These boundaries must be explained to the user.
+An unfinished, previously authorized Worker retention operation is snapshotted separately
+from prior successful removals. Its exact original request is reconciled under the permanent
+fence; its disposition, fingerprint and canonical result are never rewritten. Body originals
+follow that earlier independent request. For a Subject Job, any archive/diagnostic copies
+produced by the unfinished operation require a distinct Runtime physical-erasure acknowledgement
+before deletion can complete. Lost responses or failed receipt commits retain the same request
+and incomplete state across restart. Successes that already existed at deletion start remain
+under their independent archive lifecycle; a later success is not inserted into that snapshot.
 The domain rechecks after out-of-DB capture callbacks and before returning Job read
 responses; already returned DTOs cannot be revoked by SQLite. Host lifecycle locking
 must cover delivery/reinjection of previously fetched content as well as finish.

@@ -1292,6 +1292,13 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         })
     }
 
+    fn purge_subject_job_removal(
+        &self,
+        _request: runtime_api::SubjectJobRemovalPurgeRequest,
+    ) -> Result<runtime_api::SubjectJobRemovalPurgeResponse, String> {
+        Err("Subject Job removal source erasure is unavailable on this Runtime".into())
+    }
+
     fn subject_delete_worker(
         &self,
         _request: runtime_api::SubjectDeleteWorkerRequest,
@@ -2274,6 +2281,32 @@ impl RuntimeRegistry {
                 },
             )?);
         runtime.worker_session_attachment(workspace_id, &worker_ref, session_id, attachment_id)
+    }
+
+    pub fn purge_subject_job_removal(
+        &self,
+        runtime_id: &str,
+        deletion: runtime_api::SubjectDeleteWorkerRequest,
+        removal: WorkerRetentionExecutionRequest,
+    ) -> Result<runtime_api::SubjectJobRemovalPurgeResponse, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let removal = runtime_contract_convert(removal).map_err(|diagnostic| {
+            RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "subject_job_removal_request_invalid".into(),
+                message: diagnostic.message,
+            }
+        })?;
+        self.runtime(runtime_id)?
+            .purge_subject_job_removal(runtime_api::SubjectJobRemovalPurgeRequest {
+                deletion,
+                removal,
+            })
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "subject_job_removal_purge_unconfirmed".into(),
+                message,
+            })
     }
 
     pub fn subject_delete_worker(
@@ -3399,6 +3432,19 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
         self.runtime
             .subject_delete_worker_scoped(&scope, request)
+            .map_err(|e| e.to_string())
+    }
+
+    fn purge_subject_job_removal(
+        &self,
+        request: runtime_api::SubjectJobRemovalPurgeRequest,
+    ) -> Result<runtime_api::SubjectJobRemovalPurgeResponse, String> {
+        if request.deletion.workspace_id != self.workspace_id {
+            return Err("Subject Job removal erasure Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.deletion.workspace_id, "embedded-backend");
+        self.runtime
+            .purge_subject_job_removal_scoped(&scope, request)
             .map_err(|e| e.to_string())
     }
 
@@ -5692,6 +5738,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 message: diagnostic.message,
             }
         })
+    }
+
+    fn purge_subject_job_removal(
+        &self,
+        request: runtime_api::SubjectJobRemovalPurgeRequest,
+    ) -> Result<runtime_api::SubjectJobRemovalPurgeResponse, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.purge_subject_job_removal(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
     }
 
     fn subject_delete_worker(

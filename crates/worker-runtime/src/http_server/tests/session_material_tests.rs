@@ -3,6 +3,8 @@
 //! verifier are connected. Only controller execution is replaced by AcceptingBackend;
 //! no model, external server, user credentials or running Runtime is used.
 use super::*;
+#[path = "subject_job_removal_purge_tests.rs"]
+mod subject_job_removal_purge_tests;
 use crate::retention::{DiagnosticsDisposition, SessionDisposition, runtime_session_retention};
 use runtime_api::{
     SessionMaterialCatalogAvailability as Catalog, SessionMaterialReadAvailability as Read,

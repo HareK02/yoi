@@ -91,7 +91,7 @@
     {#if phase === 'confirming'}
       <form onsubmit={(event) => { event.preventDefault(); void submit(); }}>
         <p><strong>This is irreversible.</strong> This Subject, its behavior, Memory, change history, staging, Surface, Journal, permissions, delegations, Writer/Session associations, and Subject Job inputs/results will be deleted. Connected and delegated Workers and Jobs must stop before completion can be confirmed.</p>
-        <p>Original Worker/Session text, existing archives and Workdirs, Tickets, and other separately retained resources are <strong>not deleted</strong>. Minimal deletion retry/audit metadata is retained. Other Subjects and Workspaces are not affected.</p>
+        <p>Original Worker/Session text, existing archives and Workdirs, Tickets, and other separately retained resources are <strong>not deleted</strong>. Minimal deletion retry/audit metadata is retained. Any earlier Worker retention request still follows its original disposition. Other Subjects and Workspaces are not affected.</p>
         <label class="delete-confirm"><input type="checkbox" bind:checked={confirmed} /> I have checked the target, deletion scope, retained data, and irreversible effect.</label>
         <div class="delete-actions">
           <button type="submit" class="workspace-danger-button" disabled={!confirmed}>Permanently delete Subject</button>

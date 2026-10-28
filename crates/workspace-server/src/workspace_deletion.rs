@@ -96,6 +96,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_control_grants",
     // Snapshot children precede their fence parent and canonical Worker removal
     // receipts (subject_deletion_workers.prior_removal_operation_id).
+    "subject_deletion_removals",
     "subject_deletion_allocations",
     "subject_deletion_jobs",
     "subject_deletion_workers",
@@ -1286,6 +1287,7 @@ mod tests {
     fn workspace_purge_removes_subject_deletion_snapshots_and_preserves_other_workspace() {
         let (store, owner, workspace_id) = setup();
         let tables = [
+            "subject_deletion_removals",
             "subject_deletion_allocations",
             "subject_deletion_jobs",
             "subject_deletion_workers",
@@ -1299,9 +1301,11 @@ mod tests {
                 .position(|name| *name == table)
                 .unwrap()
         };
-        for child in &tables[..3] {
+        for child in &tables[..4] {
             assert!(position(*child) < position("subject_deletions"));
         }
+        assert!(position("subject_deletion_removals") < position("subject_deletion_workers"));
+        assert!(position("subject_deletion_removals") < position("worker_removal_operations"));
         assert!(position("subject_deletion_workers") < position("worker_removal_operations"));
         for workspace in ["workspace-a", "workspace-b"] {
             store.with_conn(|conn| {
@@ -1310,11 +1314,16 @@ mod tests {
                     worker_updated_at,policy_id,policy_digest,session_disposition,metadata_disposition,
                     archive_retention_kind,diagnostics_disposition,blockers_json,state,reason,created_at,updated_at)
                     VALUES(?1,?1,'fingerprint',?1,'runtime','worker','1','policy','digest',
-                        'purge','purge','forever','purge','[]','succeeded','removed','1','1')", [workspace])?;
+                        'purge','purge','forever','purge','[]','executing','removed','1','1')", [workspace])?;
                 conn.execute("INSERT INTO subject_deletions(workspace_id,subject_id,operation_id,completed,jobs_erased)
                     VALUES(?1,'subject','subject-delete',1,1)", [workspace])?;
                 conn.execute("INSERT INTO subject_deletion_workers(workspace_id,subject_id,runtime_id,worker_id,is_job,prior_removal_operation_id,originals_absent)
-                    VALUES(?1,'subject','runtime','worker',1,?1,1)", [workspace])?;
+                    VALUES(?1,'subject','runtime','worker',1,NULL,0)", [workspace])?;
+                conn.execute("INSERT INTO subject_deletion_removals(workspace_id,subject_id,runtime_id,worker_id,operation_id,input_fingerprint,request_json)
+                    VALUES(?1,'subject','runtime','worker',?1,'fingerprint',json_object('operation_id',?1,'input_fingerprint','fingerprint'))", [workspace])?;
+                // Settle canonical removal so Workspace deletion's independent
+                // preflight is unblocked; the reconciliation row still needs purge.
+                conn.execute("UPDATE worker_removal_operations SET state='succeeded' WHERE operation_id=?1", [workspace])?;
                 conn.execute("INSERT INTO subject_deletion_jobs VALUES(?1,'subject','job')", [workspace])?;
                 conn.execute("INSERT INTO subject_deletion_allocations VALUES(?1,'subject','allocation')", [workspace])?;
                 Ok(())

@@ -406,6 +406,18 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         }
     }
 
+    async fn purge_subject_job_removal(
+        &self,
+        request: runtime_api::SubjectJobRemovalPurgeRequest,
+    ) -> Result<runtime_api::SubjectJobRemovalPurgeResponse, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.deletion.workspace_id)?;
+        self.state
+            .runtime
+            .purge_subject_job_removal_scoped(&scope, request)
+            .map_err(RuntimeHttpRestError::runtime)
+            .map_err(api_error)
+    }
+
     async fn subject_delete_worker(
         &self,
         request: runtime_api::SubjectDeleteWorkerRequest,

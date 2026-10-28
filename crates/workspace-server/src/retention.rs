@@ -333,6 +333,8 @@ impl SqliteWorkspaceStore {
                     return Err(StoreError::InvalidInput(if other{"cross-workspace".into()}else{"worker-missing".into()}));
                 }
             };
+            let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM subject_deletion_removals WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND completed=0)",params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id],|row|row.get(0))?;
+            if pending {return Err(StoreError::InvalidInput("Pinned pre-deletion removal must reconcile before another retention plan".into()));}
             if crate::store::subject_deletion_worker_kind(&tx, &req.workspace_id, &req.worker)?.is_some() {
                 let prior = tx.prepare("SELECT plan_id FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state IN ('executing','failed')")?
                     .query_map(params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id],|r|r.get::<_,String>(0))?
@@ -381,23 +383,26 @@ impl SqliteWorkspaceStore {
                 return Err(StoreError::InvalidInput(format!("stale:{plan_id}:plan state {} is not executable", state_s(plan.state))));
             }
             if !plan.blockers.is_empty(){return Err(StoreError::InvalidInput(format!("blocked:{}",serde_json::to_string(&plan.blockers).unwrap())));}
-            let policy=load_removal_policy(&tx,workspace_id,&plan.worker,plan.policy_id==ERASED_JOURNAL_POLICY_ID)?.ok_or_else(||StoreError::InvalidInput(format!("policy-missing:{workspace_id}")))?;
-            if policy.policy_id!=plan.policy_id||policy.policy_digest!=plan.policy_digest{
-                mark_stale(&tx,&plan,"policy content changed")?;tx.commit()?;
-                return Err(stale_error(&plan,"policy content changed"));
+            let reconciliation=crate::store::subject_deletion_removal_matches(&tx,workspace_id,&plan.worker,&plan.operation_id,&plan.input_fingerprint)?;
+            if !reconciliation {
+                let policy=load_removal_policy(&tx,workspace_id,&plan.worker,plan.policy_id==ERASED_JOURNAL_POLICY_ID)?.ok_or_else(||StoreError::InvalidInput(format!("policy-missing:{workspace_id}")))?;
+                if policy.policy_id!=plan.policy_id||policy.policy_digest!=plan.policy_digest{
+                    mark_stale(&tx,&plan,"policy content changed")?;tx.commit()?;
+                    return Err(stale_error(&plan,"policy content changed"));
+                }
             }
             let worker=load_worker(&tx,workspace_id,&plan.worker)?.ok_or_else(||StoreError::InvalidInput(format!("stale:{plan_id}:Worker missing")))?;
-            if worker.updated_at!=plan.worker_updated_at{
+            if !reconciliation && worker.updated_at!=plan.worker_updated_at{
                 mark_stale(&tx,&plan,"Worker updated_at changed")?;tx.commit()?;
                 return Err(stale_error(&plan,"Worker updated_at changed"));
             }
             if worker.retention_state=="pinned"{
-                mark_stale(&tx,&plan,"hold added")?;tx.commit()?;
+                if !reconciliation {mark_stale(&tx,&plan,"hold added")?;}tx.commit()?;
                 return Err(stale_error(&plan,"hold added"));
             }
             let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3 UNION ALL SELECT 1 FROM ticket_assignment_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND claim_state='pending' AND action IN ('assign','reassign'))",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|r|r.get(0))?;
             if assigned{
-                mark_stale(&tx,&plan,"unfinished work added")?;tx.commit()?;
+                if !reconciliation {mark_stale(&tx,&plan,"unfinished work added")?;}tx.commit()?;
                 return Err(stale_error(&plan,"unfinished work added"));
             }
             let now=Utc::now().to_rfc3339();
@@ -416,6 +421,15 @@ impl SqliteWorkspaceStore {
         input_fingerprint: &str,
     ) -> Result<PreparedWorkerRemoval, WorkerRetentionError> {
         let plan = self.begin_worker_removal(workspace_id, plan_id, input_fingerprint)?;
+        if let Some(reconciliation) = self.subject_deletion_removal(workspace_id, &plan.worker)?
+            && reconciliation.request.operation_id == plan.operation_id
+        {
+            return Ok(PreparedWorkerRemoval {
+                runtime_request: reconciliation.request,
+                prior_failure_category: plan.failure_category.clone(),
+                plan,
+            });
+        }
         let worker = self
             .with_conn(|conn| load_worker(conn, workspace_id, &plan.worker))?
             .ok_or_else(|| WorkerRetentionError::StalePlan {
@@ -466,12 +480,18 @@ impl SqliteWorkspaceStore {
                  WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3
                    AND state IN ('planned','executing','failed','succeeded')
                    AND (
-                     state='succeeded' OR worker_updated_at=(
+                     state='succeeded' OR EXISTS(
+                       SELECT 1 FROM subject_deletion_removals d
+                       WHERE d.workspace_id=worker_removal_operations.workspace_id
+                         AND d.runtime_id=worker_removal_operations.runtime_id
+                         AND d.worker_id=worker_removal_operations.worker_id
+                         AND d.operation_id=worker_removal_operations.operation_id
+                     ) OR worker_updated_at=(
                        SELECT updated_at FROM worker_registry
                        WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3
                      )
                    )
-                 ORDER BY CASE WHEN EXISTS(SELECT 1 FROM subject_deletion_workers d WHERE d.workspace_id=worker_removal_operations.workspace_id AND d.runtime_id=worker_removal_operations.runtime_id AND d.worker_id=worker_removal_operations.worker_id AND d.prior_removal_operation_id=worker_removal_operations.operation_id) THEN 0 WHEN state='succeeded' THEN 1 ELSE 2 END,
+                 ORDER BY CASE WHEN EXISTS(SELECT 1 FROM subject_deletion_workers d WHERE d.workspace_id=worker_removal_operations.workspace_id AND d.runtime_id=worker_removal_operations.runtime_id AND d.worker_id=worker_removal_operations.worker_id AND d.prior_removal_operation_id=worker_removal_operations.operation_id) THEN 0 WHEN EXISTS(SELECT 1 FROM subject_deletion_removals d WHERE d.workspace_id=worker_removal_operations.workspace_id AND d.runtime_id=worker_removal_operations.runtime_id AND d.worker_id=worker_removal_operations.worker_id AND d.operation_id=worker_removal_operations.operation_id) THEN 1 WHEN state='succeeded' THEN 2 ELSE 3 END,
                           created_at DESC,operation_id DESC LIMIT 1",
                 params![workspace_id, worker.runtime_id, worker.worker_id],
                 |row| row.get::<_, String>(0),
@@ -489,6 +509,15 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| require_current_subject_deletion_plan(conn, &plan))
             .map_err(map_error)?;
         let prior_failure_category = plan.failure_category.clone();
+        if let Some(reconciliation) = self.subject_deletion_removal(workspace_id, &plan.worker)?
+            && reconciliation.request.operation_id == plan.operation_id
+        {
+            return Ok(Some(PreparedWorkerRemoval {
+                runtime_request: reconciliation.request,
+                prior_failure_category,
+                plan,
+            }));
+        }
         let worker_id = plan
             .worker
             .worker_id
@@ -698,8 +727,12 @@ impl SqliteWorkspaceStore {
                     return Err(StoreError::InvalidInput("Erased removal receipt requires matching source and physical Runtime erasure acknowledgement".into()));
                 }
             }
+            let reconciliation=crate::store::subject_deletion_removal_matches(&tx,workspace_id,&plan.worker,&plan.operation_id,&plan.input_fingerprint)?;
             let worker=load_worker(&tx,workspace_id,&plan.worker)?.ok_or_else(||StoreError::InvalidInput("Worker missing before commit".into()))?;
-            if worker.updated_at!=plan.worker_updated_at{return Err(StoreError::InvalidInput(format!("stale:{}:Worker updated_at changed",plan.plan_id)));}
+            // A pinned pre-deletion request is reconciled unchanged under the permanent
+            // Subject/Runtime exclusion. Its Worker identity cannot be reused. Metadata
+            // version movement must not discard an already-applied canonical result.
+            if !reconciliation && worker.updated_at!=plan.worker_updated_at{return Err(StoreError::InvalidInput(format!("stale:{}:Worker updated_at changed",plan.plan_id)));}
             if worker.retention_state=="pinned" { return Err(StoreError::InvalidInput(format!("stale:{}:hold added",plan.plan_id))); }
             let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3 UNION ALL SELECT 1 FROM ticket_assignment_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND claim_state='pending' AND action IN ('assign','reassign'))",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|row|row.get(0))?;
             if assigned { return Err(StoreError::InvalidInput(format!("stale:{}:unfinished work added",plan.plan_id))); }
@@ -771,7 +804,7 @@ impl SqliteWorkspaceStore {
                 tx.execute("INSERT OR IGNORE INTO worker_tombstones(workspace_id,runtime_id,worker_id,display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_digest,operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,worker.display_name,worker.profile,worker.created_at,now,if erasure.is_some() { None } else { plan.archive_id.clone() },plan.policy_id,plan.policy_digest,operation_id])?;
             }
             tx.execute("UPDATE worker_workdir_links SET unlinked_at=?4 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND unlinked_at IS NULL",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,now])?;
-            let deleted=tx.execute("DELETE FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND updated_at=?4",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.worker_updated_at])?;
+            let deleted=tx.execute("DELETE FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND (updated_at=?4 OR ?5)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.worker_updated_at,reconciliation])?;
             tx.execute("UPDATE worker_create_reservations SET state='removed',updated_at=?4 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state IN ('reserved','created')",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,now])?;
             if deleted!=1{return Err(StoreError::InvalidInput(format!("stale:{}:removal fence changed",plan.plan_id)));}
             let catalog=commit_worker_catalog_removal(&tx,workspace_id,&plan.worker)?;
@@ -1109,6 +1142,18 @@ fn require_current_subject_deletion_plan(
     c: &Connection,
     plan: &WorkerRemovalPlan,
 ) -> crate::Result<()> {
+    if crate::store::subject_deletion_removal_matches(
+        c,
+        &plan.workspace_id,
+        &plan.worker,
+        &plan.operation_id,
+        &plan.input_fingerprint,
+    )? {
+        // An unfinished canonical request is pinned separately from successes. Only
+        // its exact original input may reconcile; any required Job copy erasure is
+        // a subsequent physical operation and never changes this historical result.
+        return Ok(());
+    }
     if plan.state == WorkerRemovalPlanState::Succeeded
         && crate::store::subject_deletion_prior_removal_matches(
             c,
@@ -2831,7 +2876,7 @@ mod tests {
     #[test]
     fn subject_deletion_snapshot_overrides_policy_without_changing_normal_removal() {
         let store = setup();
-        let ordinary = store.plan_worker_removal(&req(), &inv()).unwrap();
+        let ordinary = setup().plan_worker_removal(&req(), &inv()).unwrap();
         store
             .prepare_subject_deletion("w", "subject", "delete", &[req().worker.clone()])
             .unwrap();
@@ -2842,12 +2887,8 @@ mod tests {
         assert_eq!(body.diagnostics_disposition, DiagnosticsDisposition::Retain);
         assert!(body.diagnostics_retention_seconds.is_some());
         assert_ne!(body.policy_id, ordinary.policy_id);
-        // A saved plan that would discard diagnostics cannot silently stand in
-        // for the Subject conversation archive plan.
-        assert!(matches!(
-            store.begin_worker_removal("w", &ordinary.plan_id, &ordinary.input_fingerprint),
-            Err(WorkerRetentionError::StalePlan { .. })
-        ));
+        // A new deletion-owned plan uses the archival policy; independently saved
+        // old requests are reconciled separately, without borrowing this policy.
         let ordinary_store = setup();
         assert_eq!(
             ordinary_store
@@ -2859,10 +2900,10 @@ mod tests {
     }
 
     #[test]
-    fn subject_deletion_job_purge_rejects_recovery_of_old_executing_archive() {
+    fn subject_deletion_pins_old_archive_input_without_counting_it_as_job_purge() {
         let store = setup();
         let old = store.plan_worker_removal(&req(), &inv()).unwrap();
-        store
+        let original = store
             .prepare_worker_removal_execution("w", &old.plan_id, &old.input_fingerprint)
             .unwrap();
         store
@@ -2877,14 +2918,21 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(matches!(
-            store.recover_worker_removal_execution("w", &req().worker),
-            Err(WorkerRetentionError::StalePlan { .. })
-        ));
-        assert!(matches!(
-            store.plan_worker_removal(&req(), &inv()),
-            Err(WorkerRetentionError::StalePlan { .. })
-        ));
+        let recovered = store
+            .recover_worker_removal_execution("w", &req().worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.runtime_request, original.runtime_request);
+        let prepared = store
+            .prepare_worker_removal_execution("w", &old.plan_id, &old.input_fingerprint)
+            .unwrap();
+        assert_eq!(prepared.runtime_request, original.runtime_request);
+        assert!(store.plan_worker_removal(&req(), &inv()).is_err());
+        assert!(
+            store
+                .erase_subject_deleted_jobs("w", "subject", "delete")
+                .is_err()
+        );
         let fresh = store
             .with_conn(|c| load_removal_policy(c, "w", &req().worker, false))
             .unwrap()

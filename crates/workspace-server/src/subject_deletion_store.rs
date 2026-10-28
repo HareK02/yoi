@@ -5,14 +5,184 @@
 //! All historical Job attempts and dispatch allocations are snapshotted, not just
 //! the current attempt. Pending/unknown work becomes failed/subject_deleted (not a
 //! successful Job). Originals in body/delegated Sessions are archived forever;
-//! Existing canonical Worker removals and archives are outside this deletion:
+//! Successful canonical Worker removals and archives are outside this deletion:
 //! prepare pins their exact successful receipt, regardless of its disposition.
+//! Unfinished removals instead pin their immutable old execution request; exact
+//! reconciliation and (for Jobs) additional physical erasure must complete first.
 //! Newly removed Job Sessions/diagnostics need canonical Purge before input,
 //! result, notification payloads and live Job/cache references can be erased.
 //! This DB has no separate Job content cache. Runtime caches are the canonical
 //! Worker removal's responsibility. Notification text already delivered into an
 //! ordinary conversation follows that conversation's archive lifecycle.
 use super::*;
+use worker_runtime::retention::{
+    DiagnosticsDisposition, WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult,
+};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SubjectDeletionRemoval {
+    pub request: WorkerRetentionExecutionRequest,
+    pub completed: bool,
+    pub is_job: bool,
+}
+
+fn decode_request(json: &str) -> Result<WorkerRetentionExecutionRequest> {
+    serde_json::from_str(json).map_err(|e| Error::Store(e.to_string()))
+}
+
+// Only source metadata comes from the saved Worker snapshot. Everything owned by
+// the canonical plan is rechecked, even after its success/catalog removal.
+fn canonical_request(
+    conn: &Connection,
+    operation: &str,
+    source_created_at: &str,
+    profile: Option<&str>,
+) -> Result<Option<(WorkerRetentionExecutionRequest, String)>> {
+    let row: Option<(String, String)> = conn.query_row(
+        "SELECT json_object('operation_id',operation_id,'input_fingerprint',input_fingerprint,
+          'archive_id',archive_id,'workspace_id',workspace_id,'source_runtime_id',runtime_id,
+          'worker_id',worker_id,'source_created_at',?2,'removed_at',created_at,
+          'effective_profile',?3,'retention_class',NULL,'policy_id',policy_id,
+          'session_disposition',session_disposition,'diagnostics_disposition',diagnostics_disposition),state
+         FROM worker_removal_operations WHERE operation_id=?1",
+        params![operation,source_created_at,profile], |r| Ok((r.get(0)?,r.get(1)?)),
+    ).optional()?;
+    row.map(|(json, state)| Ok((decode_request(&json)?, state)))
+        .transpose()
+}
+
+fn saved_removal(
+    conn: &Connection,
+    workspace: &str,
+    subject: Option<&str>,
+    worker: &RuntimeWorkerRef,
+) -> Result<Option<SubjectDeletionRemoval>> {
+    let rows = conn.prepare("SELECT d.request_json,d.completed,w.is_job FROM subject_deletion_removals d
+        JOIN subject_deletion_workers w USING(workspace_id,subject_id,runtime_id,worker_id)
+        WHERE d.workspace_id=?1 AND d.runtime_id=?2 AND d.worker_id=?3 AND (?4 IS NULL OR d.subject_id=?4)
+        ORDER BY d.subject_id")?
+        .query_map(params![workspace,worker.runtime_id,worker.worker_id,subject], |r| Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?,r.get::<_,bool>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut saved: Option<SubjectDeletionRemoval> = None;
+    for (json, completed, is_job) in rows {
+        let request = decode_request(&json)?;
+        if let Some(saved) = saved.as_mut() {
+            if saved.request != request {
+                return Err(Error::RepositoryConflict(
+                    "Conflicting Subject deletion removal snapshots".into(),
+                ));
+            }
+            saved.completed &= completed;
+            saved.is_job |= is_job;
+        } else {
+            saved = Some(SubjectDeletionRemoval {
+                request,
+                completed,
+                is_job,
+            });
+        }
+    }
+    Ok(saved)
+}
+
+pub(crate) fn removal_reconciliation_matches(
+    conn: &Connection,
+    workspace: &str,
+    worker: &RuntimeWorkerRef,
+    operation: &str,
+    fp: &str,
+) -> Result<bool> {
+    let Some(saved) = saved_removal(conn, workspace, None, worker)? else {
+        return Ok(false);
+    };
+    let request = &saved.request;
+    if request.workspace_id != workspace
+        || request.source_runtime_id != worker.runtime_id
+        || request.worker_id.to_string() != worker.worker_id
+        || request.operation_id != operation
+        || request.input_fingerprint != fp
+    {
+        return Ok(false);
+    }
+    Ok(canonical_request(
+        conn,
+        operation,
+        &request.source_created_at,
+        request.effective_profile.as_deref(),
+    )?
+    .is_some_and(|(canonical, state)| {
+        canonical == *request
+            && matches!(
+                state.as_str(),
+                "planned" | "executing" | "failed" | "succeeded"
+            )
+    }))
+}
+
+pub(super) fn completed_removal_matches(
+    conn: &Connection,
+    workspace: &str,
+    subject: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<bool> {
+    let Some(saved) = saved_removal(conn, workspace, Some(subject), worker)? else {
+        return Ok(false);
+    };
+    if !saved.completed
+        || !removal_reconciliation_matches(
+            conn,
+            workspace,
+            worker,
+            &saved.request.operation_id,
+            &saved.request.input_fingerprint,
+        )?
+    {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM subject_deletion_removals d
+         JOIN worker_removal_operations r ON r.operation_id=d.operation_id AND r.input_fingerprint=d.input_fingerprint
+         WHERE d.workspace_id=?1 AND d.subject_id=?2 AND d.runtime_id=?3 AND d.worker_id=?4
+         AND r.state='succeeded' AND d.completed=1 AND (?5=0 OR (
+           json_extract(d.job_purge_receipt_json,'$.workspace_id')=d.workspace_id
+           AND json_extract(d.job_purge_receipt_json,'$.worker_id')=d.worker_id
+           AND json_extract(d.job_purge_receipt_json,'$.operation_id')=d.operation_id
+           AND json_extract(d.job_purge_receipt_json,'$.input_fingerprint')=d.input_fingerprint)))",
+        params![workspace,subject,worker.runtime_id,worker.worker_id,saved.is_job],
+        |r| r.get(0),
+    )?)
+}
+
+fn pin_removal(
+    conn: &Connection,
+    workspace: &str,
+    subject: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<()> {
+    let operation: Option<String> = conn.query_row("SELECT operation_id FROM worker_removal_operations
+        WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state IN ('planned','executing','failed')
+        AND (state IN ('executing','failed') OR worker_updated_at=(SELECT updated_at FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3))
+        ORDER BY created_at DESC,operation_id DESC LIMIT 1",
+        params![workspace,worker.runtime_id,worker.worker_id],|r|r.get(0)).optional()?;
+    let Some(operation) = operation else {
+        return Ok(());
+    };
+    let source: Option<(String,Option<String>)> = conn.query_row("SELECT created_at,profile FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+        params![workspace,worker.runtime_id,worker.worker_id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let (created_at, profile) = source.ok_or_else(|| {
+        Error::RepositoryConflict(
+            "Unfinished Worker removal has no source identity to snapshot".into(),
+        )
+    })?;
+    let (request, _) = canonical_request(conn, &operation, &created_at, profile.as_deref())?
+        .ok_or_else(|| {
+            Error::RepositoryConflict("Canonical removal disappeared while snapshotting".into())
+        })?;
+    let json = serde_json::to_string(&request).map_err(|e| Error::Store(e.to_string()))?;
+    conn.execute("INSERT INTO subject_deletion_removals(workspace_id,subject_id,runtime_id,worker_id,operation_id,input_fingerprint,request_json)
+        VALUES(?1,?2,?3,?4,?5,?6,?7)",params![workspace,subject,worker.runtime_id,worker.worker_id,operation,request.input_fingerprint,json])?;
+    Ok(())
+}
 
 const MIGRATION_NAME: &str = "Durable Subject deletion snapshots and Job admission fences";
 
@@ -103,6 +273,10 @@ pub(super) fn verify(conn: &Connection) -> Result<()> {
     for name in [
         "subject_deletions",
         "subject_deletion_workers",
+        "subject_deletion_removals",
+        "subject_deletion_removal_insert",
+        "subject_deletion_removal_identity_immutable",
+        "subject_deletion_removal_completion_monotonic",
         "subject_deletion_jobs",
         "subject_deletion_allocations",
         "subject_deleted_job_insert",
@@ -251,6 +425,72 @@ fn worker_fence_request(
 }
 
 impl SqliteWorkspaceStore {
+    pub(crate) fn subject_deletion_removal(
+        &self,
+        workspace: &str,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<super::SubjectDeletionRemoval>> {
+        self.with_conn(|conn| saved_removal(conn, workspace, None, worker))
+    }
+
+    /// A canonical success alone is not proof of additional Job erasure. Keep the
+    /// old receipt/dispositions intact and only complete this separate snapshot
+    /// after the exact Runtime result and (for Jobs) physical purge response.
+    pub(crate) fn confirm_subject_deletion_removal(
+        &self,
+        workspace: &str,
+        worker: &RuntimeWorkerRef,
+        request: &WorkerRetentionExecutionRequest,
+        result: &WorkerRetentionExecutionResult,
+        purge: Option<&runtime_api::SubjectJobRemovalPurgeResponse>,
+    ) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let saved = saved_removal(&tx,workspace,None,worker)?
+                .ok_or_else(|| Error::RepositoryConflict("No saved Subject deletion removal".into()))?;
+            if saved.request != *request
+                || !removal_reconciliation_matches(&tx,workspace,worker,&request.operation_id,&request.input_fingerprint)?
+                || !tx.query_row("SELECT state='succeeded' FROM worker_removal_operations WHERE operation_id=?1",[&request.operation_id],|r|r.get::<_,bool>(0))?
+                || result.operation_id != request.operation_id || result.input_fingerprint != request.input_fingerprint
+                || result.worker_id != request.worker_id || result.session_disposition != request.session_disposition
+                || result.diagnostics_disposition != request.diagnostics_disposition || !result.source_removed
+                || result.diagnostics_retained != (request.diagnostics_disposition == DiagnosticsDisposition::Retain) {
+                return Err(Error::RepositoryConflict("Subject deletion removal requires exact saved request and canonical Runtime success".into()));
+            }
+            let archive_matches = match (&result.archive, request.session_disposition) {
+                (Some(archive), worker_runtime::retention::SessionDisposition::Archive) => {
+                    request.archive_id.as_deref() == Some(archive.archive_id.as_str())
+                        && archive.workspace_id == workspace
+                        && archive.source_runtime_id == worker.runtime_id
+                        && archive.source_worker_id == request.worker_id
+                        && archive.operation_id == request.operation_id
+                        && archive.input_fingerprint == request.input_fingerprint
+                        && archive.policy_id == request.policy_id
+                        && archive.source_created_at == request.source_created_at
+                }
+                (None, worker_runtime::retention::SessionDisposition::Purge) => true,
+                _ => false,
+            };
+            if !archive_matches {
+                return Err(Error::RepositoryConflict("Subject deletion removal archive identity mismatch".into()));
+            }
+            if saved.is_job && purge.is_none() {
+                return Err(Error::RepositoryConflict("Subject Job removal requires an additional physical purge receipt".into()));
+            }
+            if let Some(purge) = purge {
+                if purge.workspace_id != workspace || purge.worker_id != request.worker_id
+                    || purge.operation_id != request.operation_id || purge.input_fingerprint != request.input_fingerprint {
+                    return Err(Error::RepositoryConflict("Subject Job physical purge receipt identity mismatch".into()));
+                }
+            }
+            let purge_json = purge.map(serde_json::to_string).transpose().map_err(|e| Error::Store(e.to_string()))?;
+            tx.execute("UPDATE subject_deletion_removals SET completed=1,job_purge_receipt_json=coalesce(job_purge_receipt_json,?4)
+                WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![workspace,worker.runtime_id,worker.worker_id,purge_json])?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub(crate) fn subject_deletion_worker_request(
         &self,
         workspace: &str,
@@ -316,6 +556,12 @@ impl SqliteWorkspaceStore {
                 tx.execute("INSERT INTO subject_deletion_workers(workspace_id,subject_id,runtime_id,worker_id,is_job,prior_removal_operation_id) VALUES(?1,?2,?3,?4,?5,?6)
                     ON CONFLICT(workspace_id,subject_id,runtime_id,worker_id) DO UPDATE SET is_job=max(is_job,excluded.is_job)",params![workspace,subject,worker.runtime_id,worker.worker_id,is_job,prior])?;
             }
+            // Deduplicate workers before pinning: an identity can be both a
+            // delegated Worker and a Job attempt; the final is_job wins.
+            let pending = tx.prepare("SELECT runtime_id,worker_id FROM subject_deletion_workers WHERE workspace_id=?1 AND subject_id=?2 AND prior_removal_operation_id IS NULL")?
+                .query_map(params![workspace,subject],|r|Ok(RuntimeWorkerRef::new(r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for worker in pending { pin_removal(&tx,workspace,subject,&worker)?; }
             let now = chrono::Utc::now().to_rfc3339();
             tx.execute("UPDATE backend_job_attempts SET state='failed',failure_category='subject_deleted',failure_detail=NULL,completed_at=?3,updated_at=?3,
                 worker_cleanup_state=CASE WHEN worker_id IS NULL THEN 'completed' ELSE 'pending' END,
@@ -361,6 +607,12 @@ impl SqliteWorkspaceStore {
             if fence.workspace_id != request.workspace_id || fence.worker_id != request.worker_id
                 || fence.create_fingerprint != request.create_fingerprint || fence.operation_id != request.operation_id {
                 return Err(Error::RepositoryConflict("Subject deletion absence fence identity mismatch".into()));
+            }
+            // An in-flight pin cannot be bypassed by UnknownWorker/absence or
+            // a different later canonical success, even if that success is Purge.
+            if saved_removal(conn,workspace,Some(subject),worker)?.is_some() {
+                if completed_removal_matches(conn,workspace,subject,worker)? { return Ok(()); }
+                return Err(Error::RepositoryConflict("Subject deletion removal reconciliation is incomplete".into()));
             }
             if fence.originals_absent {
                 let registered: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3)", params![workspace,worker.runtime_id,worker.worker_id], |r|r.get(0))?;
@@ -474,7 +726,19 @@ fn require_worker_receipts(
     subject: &str,
     jobs_only: bool,
 ) -> Result<()> {
+    let pinned = conn.prepare("SELECT d.runtime_id,d.worker_id FROM subject_deletion_removals d JOIN subject_deletion_workers w USING(workspace_id,subject_id,runtime_id,worker_id)
+        WHERE d.workspace_id=?1 AND d.subject_id=?2 AND (?3=0 OR w.is_job=1)")?
+        .query_map(params![workspace,subject,jobs_only],|r|Ok(RuntimeWorkerRef::new(r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for worker in pinned {
+        if !completed_removal_matches(conn, workspace, subject, &worker)? {
+            return Err(Error::RepositoryConflict(
+                "Subject deletion removal reconciliation receipt is incomplete".into(),
+            ));
+        }
+    }
     let missing: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM subject_deletion_workers w WHERE w.workspace_id=?1 AND w.subject_id=?2 AND (?3=0 OR w.is_job=1) AND w.originals_absent=0
+        AND NOT EXISTS(SELECT 1 FROM subject_deletion_removals d WHERE d.workspace_id=w.workspace_id AND d.subject_id=w.subject_id AND d.runtime_id=w.runtime_id AND d.worker_id=w.worker_id)
         AND NOT (
           (w.prior_removal_operation_id IS NOT NULL AND EXISTS(SELECT 1 FROM worker_removal_operations r WHERE r.operation_id=w.prior_removal_operation_id AND r.workspace_id=w.workspace_id AND r.runtime_id=w.runtime_id AND r.worker_id=w.worker_id AND r.state='succeeded'))
           OR (w.prior_removal_operation_id IS NULL AND (
@@ -1108,6 +1372,8 @@ mod tests {
             "job-owner",
             Some("subjektiv-consolidation:subject"),
         );
+        registry(&s, &job_worker);
+        registry(&s, &body);
         receipt(&s, &job_worker, "executing", "archive", "retain");
         receipt(&s, &body, "failed", "purge", "purge");
         s.prepare_subject_deletion("w", "subject", "delete", std::slice::from_ref(&body))
@@ -1134,13 +1400,399 @@ mod tests {
             c.execute("UPDATE worker_create_reservations SET state='removed' WHERE workspace_id='w'",[])?;
             Ok(())
         }).unwrap();
-        s.erase_subject_deleted_jobs("w", "subject", "delete")
-            .unwrap();
+        assert!(
+            s.erase_subject_deleted_jobs("w", "subject", "delete")
+                .is_err(),
+            "replacement canonical Purge cannot bypass the pinned unfinished removal"
+        );
         assert!(
             s.finish_subject_deletion_record("w", "subject", "delete")
                 .is_err(),
             "new body Purge is not Archive Forever"
         );
+    }
+
+    fn in_flight(s: &SqliteWorkspaceStore, w: &RuntimeWorkerRef, state: &str, is_job: bool) {
+        registry(s, w);
+        reservation(
+            s,
+            w,
+            "pending",
+            Some(if is_job {
+                "subjektiv-consolidation:subject"
+            } else {
+                "subjektiv:subject"
+            }),
+        );
+        receipt(s, w, state, "archive", "retain");
+        s.with_conn(|c| {
+            c.execute("UPDATE worker_registry SET profile='builtin:old-profile' WHERE worker_id=?1",[&w.worker_id])?;
+            c.execute("UPDATE worker_removal_operations SET archive_id='old-archive',metadata_disposition='purge',archive_retention_kind='for_seconds',archive_retention_seconds=60 WHERE worker_id=?1",[&w.worker_id])?;
+            Ok(())
+        }).unwrap();
+    }
+
+    fn execution_result(
+        request: &WorkerRetentionExecutionRequest,
+    ) -> WorkerRetentionExecutionResult {
+        WorkerRetentionExecutionResult {
+            operation_id: request.operation_id.clone(),
+            input_fingerprint: request.input_fingerprint.clone(),
+            worker_id: request.worker_id,
+            session_disposition: request.session_disposition,
+            diagnostics_disposition: request.diagnostics_disposition,
+            archive: request.archive_id.as_ref().map(|archive_id| {
+                worker_runtime::retention::WorkerSessionArchiveManifest {
+                    schema_version: 1,
+                    archive_id: archive_id.clone(),
+                    workspace_id: request.workspace_id.clone(),
+                    source_runtime_id: request.source_runtime_id.clone(),
+                    source_worker_id: request.worker_id,
+                    source_session_id: "old-session".into(),
+                    source_active_segment_id: None,
+                    segment_ids: vec![],
+                    source_created_at: request.source_created_at.clone(),
+                    removed_at: request.removed_at.clone(),
+                    archived_at_unix_seconds: 0,
+                    effective_profile: request.effective_profile.clone(),
+                    retention_class: request.retention_class.clone(),
+                    content_checksum_sha256: "fixture-checksum".into(),
+                    content_bytes: 0,
+                    content_file_count: 0,
+                    policy_id: request.policy_id.clone(),
+                    operation_id: request.operation_id.clone(),
+                    input_fingerprint: request.input_fingerprint.clone(),
+                }
+            }),
+            source_removed: true,
+            diagnostics_retained: request.diagnostics_disposition == DiagnosticsDisposition::Retain,
+        }
+    }
+
+    fn succeed(s: &SqliteWorkspaceStore, request: &WorkerRetentionExecutionRequest) {
+        // Isolated store proof fixture. HTTP/Runtime tests exercise canonical
+        // commit; here success alone must still leave reconciliation incomplete.
+        s.with_conn(|c| {
+            c.execute("UPDATE worker_removal_operations SET state='succeeded' WHERE operation_id=?1",[&request.operation_id])?;
+            c.execute("DELETE FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![request.workspace_id,request.source_runtime_id,request.worker_id.to_string()])?;
+            c.execute("UPDATE worker_create_reservations SET state='removed' WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",params![request.workspace_id,request.source_runtime_id,request.worker_id.to_string()])?;
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn unfinished_removal_pins_full_identity_and_requires_exact_success_before_release() {
+        let s = setup();
+        let w = worker(71);
+        in_flight(&s, &w, "executing", false);
+        // An executing plan may have an older registry epoch. Its exact Runtime
+        // request is still authoritative; do not turn this into permanent stale.
+        s.with_conn(|c| {
+            c.execute(
+                "UPDATE worker_registry SET updated_at='later' WHERE worker_id=?1",
+                [&w.worker_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        s.prepare_subject_deletion("w", "subject", "delete", &[])
+            .unwrap();
+        let saved = s.subject_deletion_removal("w", &w).unwrap().unwrap();
+        let req = &saved.request;
+        assert!(!saved.completed);
+        assert!(!saved.is_job);
+        assert_eq!(req.source_created_at, NOW);
+        assert_eq!(req.removed_at, NOW);
+        assert_eq!(
+            req.effective_profile.as_deref(),
+            Some("builtin:old-profile")
+        );
+        assert_eq!(req.retention_class, None);
+        assert_eq!(req.archive_id.as_deref(), Some("old-archive"));
+        assert_eq!(req.policy_id, "test");
+        assert_eq!(saved_prior(&s, "subject", &w), None);
+        s.with_conn(|c| {
+            assert!(removal_reconciliation_matches(c,"w",&w,&req.operation_id,&req.input_fingerprint)?);
+            assert!(!removal_reconciliation_matches(c,"w",&w,&req.operation_id,"changed")?);
+            assert!(!removal_reconciliation_matches(c,"other",&w,&req.operation_id,&req.input_fingerprint)?);
+            assert!(c.execute("UPDATE subject_deletion_removals SET request_json=request_json WHERE workspace_id='w'",[]).is_err());
+            Ok(())
+        }).unwrap();
+        let result = execution_result(req);
+        assert!(
+            s.confirm_subject_deletion_removal("w", &w, req, &result, None)
+                .is_err()
+        );
+        succeed(&s, req);
+        assert!(
+            s.current_worker_singleton_owner("w", "subjektiv:subject")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            s.finish_subject_deletion_record("w", "subject", "delete")
+                .is_err()
+        );
+        let fence_request = s
+            .subject_deletion_worker_request("w", "subject", "delete", &w)
+            .unwrap();
+        let fence = runtime_api::SubjectDeleteWorkerResponse {
+            workspace_id: fence_request.workspace_id,
+            worker_id: fence_request.worker_id,
+            create_fingerprint: fence_request.create_fingerprint,
+            operation_id: fence_request.operation_id,
+            originals_absent: true,
+        };
+        assert!(
+            s.confirm_subject_deletion_absence("w", "subject", "delete", &w, &fence)
+                .is_err()
+        );
+        for (field, value) in [
+            ("operation_id", serde_json::json!("changed")),
+            ("input_fingerprint", serde_json::json!("changed")),
+            ("archive_id", serde_json::json!("changed")),
+            ("workspace_id", serde_json::json!("other")),
+            ("source_runtime_id", serde_json::json!("other-runtime")),
+            ("worker_id", serde_json::json!(worker(72).worker_id)),
+            ("source_created_at", serde_json::json!("changed")),
+            ("removed_at", serde_json::json!("changed")),
+            ("effective_profile", serde_json::json!("changed")),
+            ("retention_class", serde_json::json!("changed")),
+            ("policy_id", serde_json::json!("changed")),
+            ("session_disposition", serde_json::json!("purge")),
+            ("diagnostics_disposition", serde_json::json!("purge")),
+        ] {
+            let mut changed = serde_json::to_value(req).unwrap();
+            changed[field] = value;
+            let changed: WorkerRetentionExecutionRequest = serde_json::from_value(changed).unwrap();
+            assert!(
+                s.confirm_subject_deletion_removal("w", &w, &changed, &result, None)
+                    .is_err(),
+                "{field}"
+            );
+            assert!(
+                !s.subject_deletion_removal("w", &w)
+                    .unwrap()
+                    .unwrap()
+                    .completed
+            );
+        }
+        for (field, value) in [
+            ("operation_id", serde_json::json!("changed")),
+            ("input_fingerprint", serde_json::json!("changed")),
+            ("worker_id", serde_json::json!(worker(72).worker_id)),
+            ("session_disposition", serde_json::json!("purge")),
+            ("diagnostics_disposition", serde_json::json!("purge")),
+            ("source_removed", serde_json::json!(false)),
+            ("diagnostics_retained", serde_json::json!(false)),
+            ("archive", serde_json::Value::Null),
+        ] {
+            let mut changed = serde_json::to_value(&result).unwrap();
+            changed[field] = value;
+            let changed = serde_json::from_value(changed).unwrap();
+            assert!(
+                s.confirm_subject_deletion_removal("w", &w, req, &changed, None)
+                    .is_err(),
+                "{field}"
+            );
+        }
+        s.confirm_subject_deletion_removal("w", &w, req, &result, None)
+            .unwrap();
+        assert_eq!(
+            saved_prior(&s, "subject", &w),
+            None,
+            "not a late prior success"
+        );
+        assert!(
+            s.current_worker_singleton_owner("w", "subjektiv:subject")
+                .unwrap()
+                .is_none()
+        );
+        s.confirm_subject_deletion_absence("w", "subject", "delete", &w, &fence)
+            .unwrap();
+        s.erase_subject_deleted_jobs("w", "subject", "delete")
+            .unwrap();
+        s.finish_subject_deletion_record("w", "subject", "delete")
+            .unwrap();
+        s.with_conn(|c| {
+            assert!(removal_reconciliation_matches(
+                c,
+                "w",
+                &w,
+                &req.operation_id,
+                &req.input_fingerprint
+            )?);
+            c.execute(
+                "UPDATE worker_removal_operations SET policy_id='changed' WHERE operation_id=?1",
+                [&req.operation_id],
+            )?;
+            assert!(!completed_removal_matches(c, "w", "subject", &w)?);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            s.finish_subject_deletion_record("w", "subject", "delete")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn job_reconciliation_requires_additional_purge_and_survives_reopen_and_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.db");
+        let s = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        seed(&s);
+        let w = worker(81);
+        in_flight(&s, &w, "failed", true);
+        let other = worker(82);
+        registry(&s, &other);
+        reservation(&s, &other, "other-allocation", Some("subjektiv:another"));
+        receipt(&s, &other, "executing", "archive", "retain");
+        s.prepare_subject_deletion("w", "another", "other-delete", &[])
+            .unwrap();
+        let other_before = s.subject_deletion_removal("w", &other).unwrap();
+        s.prepare_subject_deletion("w", "subject", "delete", &[])
+            .unwrap();
+        let req = s
+            .subject_deletion_removal("w", &w)
+            .unwrap()
+            .unwrap()
+            .request;
+        drop(s);
+        let s = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        s.prepare_subject_deletion("w", "subject", "delete", &[])
+            .unwrap();
+        assert_eq!(
+            s.subject_deletion_removal("w", &w)
+                .unwrap()
+                .unwrap()
+                .request,
+            req
+        );
+        assert!(s.subject_deletion_removal("other", &w).unwrap().is_none());
+        let result = execution_result(&req);
+        let purge = runtime_api::SubjectJobRemovalPurgeResponse {
+            workspace_id: "w".into(),
+            worker_id: req.worker_id,
+            operation_id: req.operation_id.clone(),
+            input_fingerprint: req.input_fingerprint.clone(),
+        };
+        assert!(
+            s.confirm_subject_deletion_removal("w", &w, &req, &result, Some(&purge))
+                .is_err(),
+            "failed is not success"
+        );
+        succeed(&s, &req);
+        assert!(
+            s.current_worker_singleton_owner("w", "subjektiv-consolidation:subject")
+                .unwrap()
+                .is_some(),
+            "canonical success cannot release Job occupancy before physical purge"
+        );
+        assert!(
+            s.confirm_subject_deletion_removal("w", &w, &req, &result, None)
+                .is_err()
+        );
+        assert!(
+            s.erase_subject_deleted_jobs("w", "subject", "delete")
+                .is_err()
+        );
+        for (field, value) in [
+            ("workspace_id", serde_json::json!("other")),
+            ("worker_id", serde_json::json!(worker(82).worker_id)),
+            ("operation_id", serde_json::json!("changed")),
+            ("input_fingerprint", serde_json::json!("changed")),
+        ] {
+            let mut changed = serde_json::to_value(&purge).unwrap();
+            changed[field] = value;
+            let changed = serde_json::from_value(changed).unwrap();
+            assert!(
+                s.confirm_subject_deletion_removal("w", &w, &req, &result, Some(&changed))
+                    .is_err(),
+                "{field}"
+            );
+        }
+        assert!(
+            !s.subject_deletion_removal("w", &w)
+                .unwrap()
+                .unwrap()
+                .completed
+        );
+        s.confirm_subject_deletion_removal("w", &w, &req, &result, Some(&purge))
+            .unwrap();
+        drop(s);
+        let s = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        s.confirm_subject_deletion_removal("w", &w, &req, &result, Some(&purge))
+            .unwrap();
+        assert!(
+            s.subject_deletion_removal("w", &w)
+                .unwrap()
+                .unwrap()
+                .completed
+        );
+        assert_eq!(saved_prior(&s, "subject", &w), None);
+        assert!(
+            s.current_worker_singleton_owner("w", "subjektiv-consolidation:subject")
+                .unwrap()
+                .is_none()
+        );
+        s.with_conn(|c| {
+            let old:(String,String,String) = c.query_row("SELECT state,session_disposition,metadata_disposition FROM worker_removal_operations WHERE operation_id=?1",[&req.operation_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            assert_eq!(old,("succeeded".into(),"archive".into(),"purge".into()));
+            assert!(c.execute("UPDATE subject_deletion_removals SET completed=0",[]).is_err());
+            assert_eq!(c.query_row("SELECT count(*) FROM pragma_foreign_key_check",[],|r|r.get::<_,i64>(0))?,0);
+            Ok(())
+        }).unwrap();
+        assert_eq!(
+            s.subject_deletion_removal("w", &other).unwrap(),
+            other_before
+        );
+        assert!(
+            s.current_worker_singleton_owner("w", "subjektiv:another")
+                .unwrap()
+                .is_some()
+        );
+        s.erase_subject_deleted_jobs("w", "subject", "delete")
+            .unwrap();
+        s.finish_subject_deletion_record("w", "subject", "delete")
+            .unwrap();
+    }
+
+    #[test]
+    fn planned_pin_uses_current_epoch_and_never_replaces_prior_success() {
+        for (state, current, expected) in [
+            ("planned", true, true),
+            ("planned", false, false),
+            ("failed", false, true),
+        ] {
+            let s = setup();
+            let w = worker(91);
+            in_flight(&s, &w, state, false);
+            if !current {
+                s.with_conn(|c| {
+                    c.execute("UPDATE worker_registry SET updated_at='later'", [])?;
+                    Ok(())
+                })
+                .unwrap();
+            }
+            s.prepare_subject_deletion("w", "subject", "delete", &[])
+                .unwrap();
+            assert_eq!(
+                s.subject_deletion_removal("w", &w).unwrap().is_some(),
+                expected,
+                "{state}/{current}"
+            );
+        }
+        let s = setup();
+        let w = worker(92);
+        in_flight(&s, &w, "executing", true);
+        receipt(&s, &w, "succeeded", "archive", "retain");
+        s.prepare_subject_deletion("w", "subject", "delete", &[])
+            .unwrap();
+        assert!(saved_prior(&s, "subject", &w).is_some());
+        assert!(s.subject_deletion_removal("w", &w).unwrap().is_none());
+        s.erase_subject_deleted_jobs("w", "subject", "delete")
+            .unwrap();
     }
 
     #[test]

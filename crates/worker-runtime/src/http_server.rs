@@ -2104,7 +2104,9 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     }
     if matches!(
         path,
-        "/v1/subject-create-recovery" | "/v1/subject-delete-worker"
+        "/v1/subject-create-recovery"
+            | "/v1/subject-delete-worker"
+            | "/v1/subject-job-removal-purge"
     ) && *method == Method::POST
     {
         return Some("workers:delete");

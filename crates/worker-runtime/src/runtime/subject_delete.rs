@@ -10,6 +10,79 @@ pub(crate) struct SubjectDeleteWorkerFence {
 }
 
 impl Runtime {
+    /// Erase only copies bound to an exact, completed canonical removal. The
+    /// Subject fence already excludes execution; this does not mint erase authority
+    /// for an arbitrary Worker or reinterpret the historical retention result.
+    pub fn purge_subject_job_removal_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        request: runtime_api::SubjectJobRemovalPurgeRequest,
+    ) -> Result<runtime_api::SubjectJobRemovalPurgeResponse, RuntimeError> {
+        let deletion = &request.deletion;
+        let removal = &request.removal;
+        if deletion.workspace_id != scope.workspace_id
+            || removal.workspace_id != deletion.workspace_id
+            || removal.worker_id != deletion.worker_id
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "Subject Job removal scope mismatch".into(),
+            ));
+        }
+        let lease = self.worker_operation_lock(deletion.worker_id)?;
+        let _operation = lease.lock().map_err(|_| RuntimeError::StatePoisoned)?;
+        let mut state = self.lock()?;
+        state.ensure_running()?;
+        state.ensure_workspace_owner(scope, false)?;
+        if state.runtime_identity.as_deref() != Some(removal.source_runtime_id.as_str()) {
+            return Err(RuntimeError::InvalidRequest(
+                "Subject Job removal Runtime identity mismatch".into(),
+            ));
+        }
+        state
+            .subject_delete_worker_fences
+            .get(&deletion.worker_id)
+            .filter(|fence| fence.request == *deletion && fence.response.is_some())
+            .ok_or_else(|| {
+                RuntimeError::InvalidRequest(
+                    "Exact confirmed Subject deletion fence required".into(),
+                )
+            })?;
+        if state.workers.contains_key(&deletion.worker_id)
+            || state
+                .unreconciled_worker_writes
+                .contains(&deletion.worker_id)
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "Subject Job canonical removal must be reconciled first".into(),
+            ));
+        }
+        #[cfg(feature = "fs-store")]
+        {
+            let store = state.fs_store().ok_or_else(|| {
+                RuntimeError::InvalidRequest("Subject Job purge requires filesystem storage".into())
+            })?;
+            let removal: WorkerRetentionExecutionRequest = serde_json::from_value(
+                serde_json::to_value(removal)
+                    .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?,
+            )
+            .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?;
+            // Worker -> Runtime -> retention -> Session is the canonical removal
+            // lock order. The provider validates the receipt under its disk lock.
+            FsWorkerRetentionProvider::new(store.runtime_dir())
+                .purge_subject_job_removal(&removal)?;
+            Ok(runtime_api::SubjectJobRemovalPurgeResponse {
+                workspace_id: removal.workspace_id,
+                worker_id: removal.worker_id,
+                operation_id: removal.operation_id,
+                input_fingerprint: removal.input_fingerprint,
+            })
+        }
+        #[cfg(not(feature = "fs-store"))]
+        Err(RuntimeError::InvalidRequest(
+            "Subject Job purge requires filesystem storage".into(),
+        ))
+    }
+
     pub fn subject_delete_worker_scoped(
         &self,
         scope: &RuntimeWorkspaceScope,

@@ -95,7 +95,8 @@ use crate::{Error, Result};
 #[path = "subject_deletion_store.rs"]
 mod subject_deletion_store;
 pub(crate) use subject_deletion_store::{
-    prior_removal_matches as subject_deletion_prior_removal_matches,
+    SubjectDeletionRemoval, prior_removal_matches as subject_deletion_prior_removal_matches,
+    removal_reconciliation_matches as subject_deletion_removal_matches,
     worker_kind as subject_deletion_worker_kind,
 };
 
@@ -16255,7 +16256,8 @@ fn current_worker_singleton_owner(
     let owner = conn
         .query_row(
             "SELECT owner.runtime_id, owner.worker_id, owner.generation, \
-                    CASE WHEN substr(owner.singleton_key,1,10)='subjektiv:' AND reservation.state='removed' \
+                    CASE WHEN reservation.state='removed' AND EXISTS(SELECT 1 FROM subject_deletion_removals d WHERE d.workspace_id=owner.workspace_id AND d.runtime_id=owner.runtime_id AND d.worker_id=owner.worker_id AND owner.singleton_key IN ('subjektiv:'||d.subject_id,'subjektiv-consolidation:'||d.subject_id)) THEN 'created' \
+                    WHEN substr(owner.singleton_key,1,10)='subjektiv:' AND reservation.state='removed' \
                       AND NOT EXISTS(SELECT 1 FROM subject_worker_releases r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.completed=1) \
                       AND NOT EXISTS(SELECT 1 FROM subject_create_recoveries r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.create_fingerprint=reservation.create_fingerprint AND r.completed=1) \
                       AND NOT EXISTS(SELECT 1 FROM worker_removal_operations r JOIN subject_deletion_workers d ON d.workspace_id=r.workspace_id AND d.runtime_id=r.runtime_id AND d.worker_id=r.worker_id WHERE r.workspace_id=owner.workspace_id AND r.runtime_id=owner.runtime_id AND r.worker_id=owner.worker_id AND r.state='succeeded' AND owner.singleton_key='subjektiv:'||d.subject_id AND (d.prior_removal_operation_id=r.operation_id OR (d.prior_removal_operation_id IS NULL AND d.is_job=0 AND r.session_disposition='archive' AND r.archive_retention_kind='forever' AND r.metadata_disposition='tombstone'))) \
@@ -16278,7 +16280,15 @@ fn current_worker_singleton_owner(
         )
         .optional()?;
     owner
-        .map(|(runtime_id, worker_id, generation, state)| {
+        .map(|(runtime_id, worker_id, generation, mut state)| {
+            let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
+            if let Some(subject) = singleton_key.strip_prefix("subjektiv:").or_else(|| singleton_key.strip_prefix("subjektiv-consolidation:"))
+                && state.as_deref() == Some("created")
+                && subject_deletion_store::completed_removal_matches(conn, workspace_id, subject, &worker)?
+            {
+                let removed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='removed')",params![workspace_id,worker.runtime_id,worker.worker_id],|r|r.get(0))?;
+                if removed { state = Some("removed".into()); }
+            }
             let generation = generation.try_into().map_err(|_| {
                 Error::Store(format!(
                     "Worker singleton key {singleton_key:?} has an invalid generation"
@@ -16288,7 +16298,7 @@ fn current_worker_singleton_owner(
                 WorkerSingletonLease {
                     key: singleton_key.to_string(),
                     generation,
-                    worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+                    worker,
                 },
                 state,
             ))
@@ -26903,7 +26913,7 @@ INSERT INTO worker_registry (
                 .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             for (name,table) in triggers {conn.execute_batch(&format!("DROP TRIGGER {name}; CREATE TRIGGER {name} BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'Notification evidence is immutable'); END;"))?;}
             for name in ["subject_deleted_job_insert","subject_deleted_job_result","subject_deleted_attempt_insert","subject_deleted_attempt_result","subject_deleted_worker_reservation","subject_deleted_notification_source","subject_deleted_notification_payload","subject_deleted_notification_send","subject_deletion_worker_prior_insert","subject_deletion_worker_identity_immutable"] {conn.execute_batch(&format!("DROP TRIGGER {name}"))?;}
-            conn.execute_batch("DROP TABLE subject_deletion_allocations; DROP TABLE subject_deletion_jobs; DROP TABLE subject_deletion_workers; DROP TABLE subject_deletions;")?;
+            conn.execute_batch("DROP TABLE subject_deletion_removals; DROP TABLE subject_deletion_allocations; DROP TABLE subject_deletion_jobs; DROP TABLE subject_deletion_workers; DROP TABLE subject_deletions;")?;
             conn.execute_batch("DROP TRIGGER backend_job_input_retirement; DROP TRIGGER backend_job_identity_immutable;
                 ALTER TABLE backend_jobs DROP COLUMN input_disposition;
                 DROP TRIGGER passkey_metadata_insert;
