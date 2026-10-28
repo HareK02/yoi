@@ -54,6 +54,8 @@ impl Default for Limits {
 pub enum ExecutionError {
     #[error("invalid artifact: {0}")]
     Artifact(String),
+    #[error("unsupported Component execution policy: {0}")]
+    UnsupportedComponent(String),
     #[error("invalid invocation: {0}")]
     InvalidInput(String),
     #[error("invalid output: {0}")]
@@ -165,7 +167,10 @@ impl Executor {
         )
         .map_err(|e| ExecutionError::Artifact(e.message))?;
         let manifest = verified.package.manifest;
-        let component = Component::new(&self.engine, &verified.files[&manifest.runtime.component])
+        let component_bytes = &verified.files[&manifest.runtime.component];
+        crate::sandbox::check_component_resources(component_bytes)
+            .map_err(|e| ExecutionError::UnsupportedComponent(e.to_string()))?;
+        let component = Component::new(&self.engine, component_bytes)
             .map_err(|e| ExecutionError::Artifact(e.to_string()))?;
         Ok(CompiledTool {
             component,

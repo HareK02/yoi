@@ -4,6 +4,39 @@
 use crate::Limits;
 use wasmtime::{ResourceLimiter, StoreLimits, StoreLimitsBuilder};
 
+/// Additional execution-policy check, not a replacement ABI/package validator.
+/// Wasmtime's Store limiter does not meter Component-internal resource tables.
+/// The Tool ABI needs only imported Host resources, whose creation is metered
+/// by our adapter; guest-defined resources and allocators therefore fail closed.
+/// `parse_all` visits concrete nested Components as well as the outer one.
+pub(crate) fn check_component_resources(bytes: &[u8]) -> wasmtime::Result<()> {
+    use wasmparser::{CanonicalFunction, ComponentType, Parser, Payload};
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload? {
+            Payload::ComponentTypeSection(types) => {
+                for ty in types {
+                    if matches!(ty?, ComponentType::Resource { .. }) {
+                        return Err(wasmtime::Error::msg(
+                            "guest-defined Component resources are unsupported by the Tool sandbox",
+                        ));
+                    }
+                }
+            }
+            Payload::ComponentCanonicalSection(functions) => {
+                for function in functions {
+                    if matches!(function?, CanonicalFunction::ResourceNew { .. }) {
+                        return Err(wasmtime::Error::msg(
+                            "guest Component resource.new is unsupported by the Tool sandbox",
+                        ));
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct SandboxLimits {
     inner: StoreLimits,
     memory: Budget,

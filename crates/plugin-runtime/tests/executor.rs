@@ -950,3 +950,81 @@ fn operational_limits_cannot_raise_the_supported_ceiling() {
         .is_err()
     );
 }
+
+fn private_resource_component(nested_depth: usize, allocate: bool) -> Vec<u8> {
+    let mut payload = "(type $private (resource (rep i32)))".to_string();
+    if allocate {
+        // The i32 drop discards a representation, not the live resource handle.
+        // A core start creates handles during Component instantiation without
+        // changing the T-791 fixture's public imports or exports.
+        payload.push_str(&format!(
+            r#"
+            (core func $new (canon resource.new $private))
+            (core module $allocate
+                (import "r" "new" (func $new (param i32) (result i32)))
+                (func $start {})
+                (start $start)
+            )
+            (core instance $resource-funcs (export "new" (func $new)))
+            (core instance $allocated (instantiate $allocate (with "r" (instance $resource-funcs))))
+        "#,
+            "i32.const 7 call $new drop ".repeat(64)
+        ));
+    }
+    for _ in 0..nested_depth {
+        payload = format!("(component $nested {payload}) (instance (instantiate $nested))");
+    }
+    let wat = wasmprinter::print_bytes(PURE_COMPONENT).unwrap();
+    let end = wat.rfind(')').unwrap();
+    wat::parse_str(format!("{}{}{}", &wat[..end], payload, &wat[end..])).unwrap()
+}
+
+#[tokio::test]
+async fn private_and_nested_component_resources_fail_closed_before_instantiation() {
+    for resources in [0, Limits::default().resources] {
+        let ex = executor(Limits {
+            resources,
+            ..Limits::default()
+        });
+        let fresh = compile(&ex, &artifact(PURE, PURE_COMPONENT).unwrap());
+        let host = TestHost::new(Behavior::Respond);
+        for nested_depth in 0..=2 {
+            for allocate in [false, true] {
+                let bytes = private_resource_component(nested_depth, allocate);
+                // The canonical package/ABI is valid. Reject only the unsupported
+                // execution policy, after verification and before a Store exists.
+                let package = artifact(PURE, &bytes).unwrap();
+                let error = ex
+                    .compile(
+                        &package.bytes,
+                        &package.package_digest,
+                        &package.artifact_digest,
+                        package.artifact_size,
+                    )
+                    .err()
+                    .expect("private resources must be rejected");
+                assert!(
+                    matches!(&error, ExecutionError::UnsupportedComponent(message) if message.contains("guest-defined Component resources")),
+                    "depth={nested_depth}, resources={resources}, allocate={allocate}: {error:?}"
+                );
+                host.released();
+            }
+        }
+        assert_eq!(host.admissions.load(Ordering::SeqCst), 0);
+        let result = ex
+            .invoke(
+                &fresh,
+                echo_context(&fresh, "fresh-after-rejection"),
+                host.clone(),
+                "example_echo",
+                r#"{"text":"fresh"}"#,
+                "{}",
+            )
+            .await
+            .unwrap();
+        let structured: serde_json::Value =
+            serde_json::from_str(result.output.structured_json.as_deref().unwrap()).unwrap();
+        assert_eq!(structured["text"], "fresh");
+        host.released();
+    }
+}
