@@ -4434,7 +4434,8 @@ impl WorkspaceApi {
             .with_provider(Arc::new(crate::prompt_settings::PromptConfigSchemaProvider))
             .with_provider(Arc::new(RuntimeConfigSchemaProvider))
             .with_provider(Arc::new(RepositoryAccessConfigSchemaProvider))
-            .with_provider(Arc::new(skills::SkillConfigSchemaProvider));
+            .with_provider(Arc::new(skills::SkillConfigSchemaProvider))
+            .with_provider(Arc::new(crate::plugin_settings::PluginConfigSchemaProvider));
         let materialization_store = config_store.clone();
         let workspace_id = config.workspace_id.clone();
         let schema = config_schema_registry.compose()?;
@@ -7479,6 +7480,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::workspace_prompt_projection(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::workspace_config_tree_preview(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::workspace_config_tree_commit(
             service.clone(),
         ))
@@ -9322,6 +9326,34 @@ impl server_api::ServerApi for ServerApiContractService {
         .await
         .map(|Json(response)| prompt_projection_to_api(response))
         .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn workspace_config_tree_preview(
+        &self,
+        workspace_id: String,
+        request: server_api::ConfigCommitRequest,
+    ) -> std::result::Result<server_api::WorkspaceConfigTreeResponse, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?.clone();
+        api.store
+            .db_executor()
+            .run(move || {
+                validate_workspace_scope(&api, &workspace_id)?;
+                let candidate = prepare_workspace_config_tree(
+                    &api,
+                    &workspace_id,
+                    &config_commit_request_from_api(request)?,
+                )?;
+                Ok(workspace_config_state_to_api(
+                    crate::config_source::WorkspaceConfigState {
+                        snapshot: candidate.snapshot,
+                        contract: candidate.contract,
+                        projection_digest: candidate.evaluation.projection_digest,
+                    },
+                ))
+            })
+            .await
+            .map_err(|error: ApiError| error.into_repository_api_error())
     }
 
     async fn workspace_config_tree_commit(

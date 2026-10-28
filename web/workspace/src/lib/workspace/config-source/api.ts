@@ -316,6 +316,21 @@ export async function fetchConfigHistory(
   );
 }
 
+export async function previewConfigTree(
+  workspaceId: string,
+  request: ConfigCommitRequest,
+  fetcher: typeof fetch = fetch,
+): Promise<WorkspaceConfigTreeResponse> {
+  return await readJson(
+    await fetcher(`${sourceTreeUrl(workspaceId)}/preview`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(request),
+    }),
+    parseWorkspaceConfigTreeResponse,
+  );
+}
+
 export async function commitConfigTree(
   workspaceId: string,
   request: ConfigCommitRequest,

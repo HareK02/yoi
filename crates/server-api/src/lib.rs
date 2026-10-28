@@ -1214,6 +1214,20 @@ pub trait ServerApi {
     ) -> Result<WorkspacePromptProjection, RepositoryApiError>;
 
     #[post(
+        "/api/w/{workspace_id}/config/source-tree/preview",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_config_tree_preview(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: ConfigCommitRequest,
+    ) -> Result<WorkspaceConfigTreeResponse, RepositoryApiError>;
+
+    #[post(
         "/api/w/{workspace_id}/config/source-tree/commit",
         status = 201,
         error_status = 400,
@@ -12805,6 +12819,11 @@ mod tests {
                 "workspace_prompt_projection",
                 HttpMethod::Get,
                 "/api/w/{workspace_id}/config/projections/prompts",
+            ),
+            (
+                "workspace_config_tree_preview",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/config/source-tree/preview",
             ),
             (
                 "workspace_config_tree_commit",

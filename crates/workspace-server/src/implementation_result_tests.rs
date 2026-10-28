@@ -372,9 +372,9 @@ async fn implementation_result_rejects_forged_evidence_and_rolls_back_without_no
 // and erasure guards in an otherwise legacy fixture.
 fn reconstruct_implementation_schema96(conn: &Connection) -> Result<()> {
     assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
-    conn.execute_batch("DROP TABLE plugin_references; DROP TABLE plugin_operations;
+    conn.execute_batch("DROP TABLE plugin_execution_plans; DROP TABLE plugin_references; DROP TABLE plugin_operations;
         DROP TABLE plugin_uploads; DROP TABLE plugin_artifacts; DROP TABLE plugin_installations;
-        UPDATE __yoi_schema_migrations SET version=105 WHERE version=106;")?;
+        UPDATE __yoi_schema_migrations SET version=105 WHERE version=107;")?;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("retained96.db");
     prepare_retained_schema(&path, 96);

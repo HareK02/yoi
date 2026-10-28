@@ -13,6 +13,7 @@ import {
   fetchConfigHistory,
   fetchConfigTree,
   parseWorkspaceConfigTreeResponse,
+  previewConfigTree,
 } from "../../src/lib/workspace/config-source/api.ts";
 
 function response(body: unknown, status = 200): Response {
@@ -334,4 +335,25 @@ Deno.test("config source API carries bounded optional authoring schemas without 
         },
       }), ConfigSourceApiError);
   }
+});
+
+Deno.test("config source API previews a candidate without calling commit", async () => {
+  const request = {
+    base_digest: "sha256:base",
+    changes: [],
+    entrypoints: ["main.dcdl"],
+  };
+  const calls: string[] = [];
+  const result = await previewConfigTree(
+    "w/one",
+    request,
+    ((input: string | URL | Request, init?: RequestInit) => {
+      calls.push(String(input));
+      assertEquals(init?.method, "POST");
+      assertEquals(JSON.parse(String(init?.body)), request);
+      return Promise.resolve(response(tree));
+    }) as typeof fetch,
+  );
+  assertEquals(calls, ["/api/w/w%2Fone/config/source-tree/preview"]);
+  assertEquals<unknown>(result, tree);
 });

@@ -104,6 +104,7 @@ mod schema_convergence {
                             version: 106,
                             name: crate::plugin_catalog::MIGRATION_NAME.into(),
                         },
+                        WorkspaceSchemaMigrationStep { version:107, name:"Immutable Worker Plugin plans and retained pins".into() },
                     ]
                 );
                 assert_eq!(
@@ -121,6 +122,7 @@ mod schema_convergence {
                     expected.push((104, "Converge Passkey results and Job input retention".into()));
                     expected.push((105, "Durable Subject deletion snapshots and Job admission fences".into()));
                     expected.push((106, crate::plugin_catalog::MIGRATION_NAME.into()));
+                    expected.push((107,"Immutable Worker Plugin plans and retained pins".into()));
                     assert_eq!(workspace_schema_migration_history(conn)?, expected);
                     for table in ["passkey_credentials", "passkey_metadata", "passkey_addition_receipts", "backend_jobs", "backend_job_attempts"] {
                         assert_eq!(state_contract_schema_signature(conn, table), fresh.with_conn(|c| Ok(state_contract_schema_signature(c, table)))?, "{table}");

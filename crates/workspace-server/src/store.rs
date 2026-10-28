@@ -127,7 +127,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 106;
+const LATEST_SCHEMA_VERSION: i64 = 107;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -464,6 +464,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 106,
         name: crate::plugin_catalog::MIGRATION_NAME,
         apply: crate::plugin_catalog::migrate,
+    },
+    Migration {
+        version: 107,
+        name: "Immutable Worker Plugin plans and retained pins",
+        apply: migrate_plugin_plans_v106_to_v107,
     },
 ];
 
@@ -15755,10 +15760,24 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
 
 // Fresh composition uses the posts contract. Retained fixtures pass frozen host
 // and component DDL to the shared cross-domain constraint composition below.
+fn migrate_plugin_plans_v106_to_v107(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 106 {
+        return Err(Error::Store(
+            "Plugin plan migration requires schema 106".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
+    tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES(107,'Immutable Worker Plugin plans and retained pins')", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure_from_sql(conn, include_str!("latest_schema.sql"), true)?;
     conn.execute_batch(include_str!("activation_schema.sql"))?;
     conn.execute_batch(include_str!("passkey_results_schema.sql"))?;
+    conn.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
     Ok(())
 }
 
@@ -16800,6 +16819,7 @@ fn apply_migrations_with_secret_source(
 
     verify_schema_history(conn, LATEST_SCHEMA_VERSION)?;
     crate::plugin_catalog::verify(conn)?;
+    crate::plugin_plan::verify_plan_schema(conn)?;
     verify_workspace_runtime_binding_schema(conn)?;
     verify_workspace_runtime_verification_schema(conn)?;
     verify_workspace_deletion_schema(conn)?;
@@ -19494,6 +19514,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:104, name:"Converge Passkey results and Job input retention".into()},
                 WorkspaceSchemaMigrationStep {version:105, name:"Durable Subject deletion snapshots and Job admission fences".into()},
                 WorkspaceSchemaMigrationStep {version:106, name:crate::plugin_catalog::MIGRATION_NAME.into()},
+                WorkspaceSchemaMigrationStep {version:107, name:"Immutable Worker Plugin plans and retained pins".into()},
             ]
         );
 
@@ -19610,6 +19631,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (104, "Converge Passkey results and Job input retention".to_string()),
 (105, "Durable Subject deletion snapshots and Job admission fences".to_string()),
 (106, crate::plugin_catalog::MIGRATION_NAME.to_string()),
+(107, "Immutable Worker Plugin plans and retained pins".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -22897,7 +22919,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (103, "Passkey metadata and atomic addition results".into()),
                          (104, "Converge Passkey results and Job input retention".into()),
                          (105, "Durable Subject deletion snapshots and Job admission fences".into()),
-                         (106, crate::plugin_catalog::MIGRATION_NAME.into())]);
+                         (106, crate::plugin_catalog::MIGRATION_NAME.into()),
+                         (107, "Immutable Worker Plugin plans and retained pins".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
@@ -27091,7 +27114,7 @@ INSERT INTO worker_registry (
             .unwrap();
         store.with_conn(|conn| {
             // This fixture deliberately reconstructs schema 102 from fresh.
-            conn.execute_batch("DROP TABLE plugin_references; DROP TABLE plugin_artifacts; DROP TABLE plugin_installations; DROP TABLE plugin_uploads; DROP TABLE plugin_operations;")?;
+            conn.execute_batch("DROP TABLE plugin_execution_plans; DROP TABLE plugin_references; DROP TABLE plugin_artifacts; DROP TABLE plugin_installations; DROP TABLE plugin_uploads; DROP TABLE plugin_operations;")?;
             // Remove the newer Subject fence composition, not just its receipt.
             let triggers=conn.prepare("SELECT name,tbl_name FROM sqlite_schema WHERE type='trigger' AND tbl_name LIKE 'notification_%' AND name NOT LIKE 'subject_deleted_%' AND sql LIKE '%subject_deletion_jobs%'")?
                 .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -27103,7 +27126,7 @@ INSERT INTO worker_registry (
                 DROP TRIGGER passkey_metadata_insert;
                 DROP TABLE passkey_addition_receipts;
                 DROP TABLE passkey_metadata;
-                UPDATE __yoi_schema_migrations SET version=102 WHERE version=106;
+                UPDATE __yoi_schema_migrations SET version=102 WHERE version=107;
                 CREATE TRIGGER backend_job_input_retirement BEFORE UPDATE ON backend_job_attempts BEGIN SELECT RAISE(ABORT,'collision'); END;")?; Ok(())
         }).unwrap();
         drop(store);
@@ -28419,3 +28442,7 @@ mod frozen_runtime_binding_tests;
 #[cfg(test)]
 #[path = "plugin_catalog/migration_tests.rs"]
 mod plugin_catalog_migration_tests;
+
+#[cfg(test)]
+#[path = "plugin_plan/migration_tests.rs"]
+mod plugin_plan_migration_tests;

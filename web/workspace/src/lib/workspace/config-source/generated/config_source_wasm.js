@@ -44,6 +44,10 @@ export function changes_between(base, candidate) {
 }
 
 /**
+ * Complete after converting the editor's UTF-16 offset to the shared analyzer's UTF-8 byte offset.
+ *
+ * Convert the returned start position back to UTF-16 so non-ASCII characters do not
+ * misalign editor and analyzer positions. Reject offsets that cannot map to a character boundary.
  * @param {string} entrypoint
  * @param {string} source
  * @param {number} utf16_offset
@@ -154,6 +158,10 @@ export function set_schema_bundle(schema_bundle) {
 }
 
 /**
+ * Retain the browser's edit candidate as a snapshot.
+ *
+ * Deserialization uses shared digest validation but neither saves to nor authorizes the Backend.
+ * Keep the schema bundle in separate state to distinguish sources from evaluation conditions.
  * @param {any} snapshot
  */
 export function set_snapshot(snapshot) {

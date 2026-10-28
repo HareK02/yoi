@@ -58,6 +58,10 @@ pub struct WorkerManifestConfig {
     /// never starts a local MCP subprocess.
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Omission retains the lower layer; an explicit section replaces the entire
+    /// selection list, including an empty list. Never unions Plugin grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<crate::PluginProfileConfig>,
     #[serde(default)]
     pub compaction: Option<CompactionConfigPartial>,
     /// First-class web tool opt-in. See [`WebConfig`].
@@ -795,11 +799,6 @@ pub(crate) fn reject_removed_manifest_fields(s: &str) -> Result<(), toml::de::Er
             "unknown field in manifest: memory (removed; configure feature.memory)",
         ));
     }
-    if value.get("plugins").is_some() {
-        return Err(toml::de::Error::custom(
-            "unknown field in manifest: plugins (dynamic Plugins are not supported)",
-        ));
-    }
     if value
         .get("feature")
         .and_then(toml::Value::as_table)
@@ -930,6 +929,7 @@ impl WorkerManifestConfig {
             ),
             feature: self.feature.merge(upper.feature),
             mcp: merge_mcp_config(self.mcp, upper.mcp),
+            plugins: upper.plugins.or(self.plugins),
             compaction: merge_option(
                 self.compaction,
                 upper.compaction,
@@ -1445,6 +1445,7 @@ impl TryFrom<WorkerManifestConfig> for WorkerManifest {
             permissions,
             feature: FeatureConfig::from(cfg.feature),
             mcp: cfg.mcp,
+            plugins: cfg.plugins.unwrap_or_default(),
             compaction,
             web: cfg.web,
             skills: cfg.skills,
@@ -1492,6 +1493,7 @@ mod tests {
             permissions: None,
             feature: FeatureConfigPartial::default(),
             mcp: McpConfig::default(),
+            plugins: None,
             session: None,
             compaction: None,
             web: None,
