@@ -196,6 +196,26 @@ impl TicketSurface {
         let reference_field = if name == "ShowTicket" { "id" } else { "ticket" };
         let path = format!("/tickets/{}", input[reference_field].as_str().unwrap());
         input.as_object_mut().unwrap().remove(reference_field);
+        match name {
+            "ShowTicket" => {
+                let mut page = serde_json::Map::new();
+                for (legacy, native) in [("event_limit", "limit"), ("event_cursor", "cursor")] {
+                    if let Some(value) = input.as_object_mut().unwrap().remove(legacy) {
+                        page.insert(native.into(), value);
+                    }
+                }
+                if !page.is_empty() {
+                    input["page"] = page.into();
+                }
+            }
+            "TicketAssignmentAnswer" => {
+                let fields = input.as_object_mut().unwrap();
+                let assignment_id = fields.remove("assignment_id").unwrap();
+                let expected_last_event_id = fields.remove("expected_last_event_id").unwrap();
+                input["observed"] = serde_json::json!({"assignment_id":assignment_id,"expected_last_event_id":expected_last_event_id});
+            }
+            _ => {}
+        }
         // Observe the real item representation before invoking a mutation. Tracking
         // reads alone do not establish the Ticket WIP object validator. Explicit
         // refresh also reconciles stale observations after an unknown result;
