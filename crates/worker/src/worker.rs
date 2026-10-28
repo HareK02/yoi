@@ -61,8 +61,8 @@ use crate::feature::session::{
     SessionExtensionHandle,
 };
 use crate::feature::{
-    FeatureInstructionDeclaration, FeatureInstructionId, FeatureInvocationRegistry,
-    FeatureRegistryBuilder, FeatureRegistryInstallReport, dedupe_instruction_contributions,
+    FeatureInstructionDeclaration, FeatureInvocationRegistry, FeatureRegistryBuilder,
+    FeatureRegistryInstallReport, dedupe_instruction_contributions,
 };
 use crate::hook::{
     BeforeSessionRewriteAction, BeforeSessionRewriteContext, Hook, HookHistoryRange,
@@ -78,8 +78,6 @@ use crate::internal_worker::{
 };
 
 const LARGE_PASTE_INLINE_MAX_BYTES: usize = 32 * 1024;
-const WORKER_ORCHESTRATION_INSTRUCTION_ID: &str = "worker.orchestration";
-const WORKER_ORCHESTRATION_PROMPT_REF: &str = "common.worker_orchestration";
 const FEATURE_HOOK_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN: &str = "worker.pending_activations.v1";
 const MAX_PENDING_SUBMISSIONS: usize = 32;
@@ -517,14 +515,6 @@ fn hook_run_exit(exit: &EngineRunExit) -> RunCommittedExit {
     }
 }
 
-fn worker_orchestration_instruction() -> FeatureInstructionDeclaration {
-    FeatureInstructionDeclaration::new(
-        FeatureInstructionId::builtin(WORKER_ORCHESTRATION_INSTRUCTION_ID),
-        WORKER_ORCHESTRATION_PROMPT_REF,
-        "Worker orchestration guidance",
-    )
-    .expect("static Worker orchestration instruction declaration is valid")
-}
 use crate::ipc::alerter::Alerter;
 use crate::ipc::interceptor::WorkerInterceptor;
 use crate::ipc::notify_buffer::NotifyBuffer;
@@ -4899,10 +4889,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         self.feature_instructions = dedupe_instruction_contributions(instructions);
     }
 
-    pub fn register_worker_orchestration_instruction(&mut self) {
-        self.register_feature_instruction(worker_orchestration_instruction());
-    }
-
     /// Toggle all resident sections in the system prompt.
     ///
     /// Default `true`: normal Workers may expose each resident section according
@@ -5371,6 +5357,14 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         &mut self,
         registry: FeatureRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
+        self.install_features_with_wip(registry, None)
+    }
+
+    pub(crate) fn install_features_with_wip(
+        &mut self,
+        registry: FeatureRegistryBuilder,
+        wip_mounts: Option<&mut crate::wip::WipMountRegistry>,
+    ) -> FeatureRegistryInstallReport {
         self.backend_job.get_or_init(|| None);
         let client = self.workspace_client_handle();
         let manifest = self.manifest().clone();
@@ -5381,7 +5375,8 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     .map_err(|error| error.to_string())
             });
         let worker = self.engine.as_mut().expect("worker taken during run");
-        let report = registry.install_into_engine(worker, &mut self.hook_builder);
+        let report =
+            registry.install_into_engine_with_wip(worker, &mut self.hook_builder, wip_mounts);
         if report.has_errors() {
             return report;
         }
@@ -21003,6 +20998,10 @@ target = "/abs/scope"
 permission = "write"
 "#;
         WorkerManifest::from_toml(toml_str).unwrap()
+    }
+
+    mod composition_tests {
+        include!("worker_composition_tests.rs");
     }
 
     // Real initial-seed/replay/fork/compaction and Memory source wiring. Only the

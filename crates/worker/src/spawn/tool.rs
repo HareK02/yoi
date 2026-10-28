@@ -571,13 +571,15 @@ impl Tool for SubWorkerSpawnTool {
         })?;
         let child_change_tracker = child.tracker().cloned();
         #[cfg(test)]
-        let installed_tools = child
-            .engine()
-            .tool_server_handle()
-            .tool_definitions_sorted()
-            .into_iter()
-            .map(|definition| definition.name)
-            .collect();
+        let installed_tools = {
+            let server = child.engine().tool_server_handle();
+            server.flush_pending();
+            server
+                .tool_definitions_sorted()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect()
+        };
         let child_name = input.name.clone();
         let registry = Arc::downgrade(&self.registry);
         let parent_notifications = self.parent_notifications.clone();
