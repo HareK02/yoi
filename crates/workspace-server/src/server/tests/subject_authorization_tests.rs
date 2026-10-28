@@ -1997,10 +1997,10 @@ async fn native_wip_ticket_create_uses_same_signed_authorization_before_real_bac
         .as_array()
         .unwrap()
         .iter()
-        .find(|interface| interface["reference"]["name"] == "yoi.ticket/collection/v1")
+        .find(|interface| interface["reference"]["name"] == "yoi.ticket/collection/v2")
         .expect("native Ticket collection interface")["reference"]
         .clone();
-    let args = json!({"path":"/tickets","interface":reference,"operation":"create","arguments":{"title":"Native authorized Ticket"}}).to_string();
+    let args = json!({"path":"/tickets","interface":reference,"operation":"create","arguments":{"content":{"title":"Native authorized Ticket"}}}).to_string();
     assert!(
         invoke
             .execute(&args, ToolExecutionContext::direct())

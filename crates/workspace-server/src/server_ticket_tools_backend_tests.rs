@@ -207,6 +207,14 @@ impl TicketSurface {
         )
         .await?;
         if name == "ShowTicket" {
+            let mut page = serde_json::Map::new();
+            for (tool_field, native_field) in [("event_cursor", "cursor"), ("event_limit", "limit")] {
+                if let Some(value) = input.as_object_mut().unwrap().remove(tool_field) {
+                    page.insert(native_field.into(), value);
+                }
+            }
+            assert!(input.as_object().unwrap().is_empty());
+            input = serde_json::json!({"page": page});
             return execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":"read","arguments":input}), context).await;
         }
         execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":"read","arguments":{}}), ToolExecutionContext::direct()).await?;
@@ -216,6 +224,16 @@ impl TicketSurface {
             ToolExecutionContext::direct(),
         )
         .await?;
+        // The fixture accepts Tool commands for shared scenarios, but invokes the real v2
+        // native coordinates. Do not weaken the production descriptor to accept flat v1 input.
+        if name == "TicketAssignmentAnswer" {
+            let fields = input.as_object_mut().unwrap();
+            let observed = serde_json::json!({
+                "assignment_id": fields.remove("assignment_id").unwrap(),
+                "expected_last_event_id": fields.remove("expected_last_event_id").unwrap(),
+            });
+            fields.insert("observed".into(), observed);
+        }
         let operation = match name {
             "TicketAssignmentTrackingQuery" => "assignment_tracking_query",
             "TicketAssignmentAnswer" => "assignment_answer",
