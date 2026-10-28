@@ -19,18 +19,31 @@ impl Tool for DiagnosticsTool {
     }
 }
 
-/// Convert an adapter-owned internal command without Tool execution or schema validation.
+/// Preserve the regular Tool presentation for internal callers.
+#[cfg(test)]
 pub(super) async fn execute_native(
     client: Arc<dyn WorkspaceClient>,
     tool_name: &str,
     command: Value,
-    _ctx: ToolExecutionContext,
+    ctx: ToolExecutionContext,
 ) -> Option<Result<ToolOutput, ToolError>> {
+    execute_native_value(client, tool_name, command, ctx)
+        .await
+        .map(|result| result.map(|content| tool_output(tool_name, content)))
+}
+
+/// Return the shared domain projection before Tool presentation serialization.
+pub(super) async fn execute_native_value(
+    client: Arc<dyn WorkspaceClient>,
+    tool_name: &str,
+    command: Value,
+    _ctx: ToolExecutionContext,
+) -> Option<Result<Value, ToolError>> {
     if tool_name != NAME {
         return None;
     }
     Some(match serde_json::from_value(command) {
-        Ok(query) => execute_domain(client, query).await,
+        Ok(query) => execute_value(client, query).await,
         Err(error) => Err(ToolError::InvalidArgument(error.to_string())),
     })
 }
@@ -39,6 +52,23 @@ async fn execute_domain(
     client: Arc<dyn WorkspaceClient>,
     query: server_api::NotificationDiagnosticsQuery,
 ) -> Result<ToolOutput, ToolError> {
+    execute_value(client, query)
+        .await
+        .map(|content| tool_output(NAME, content))
+}
+
+fn tool_output(name: &str, content: Value) -> ToolOutput {
+    ToolOutput {
+        summary: name.into(),
+        content: Some(content.to_string()),
+        attachments: vec![],
+    }
+}
+
+async fn execute_value(
+    client: Arc<dyn WorkspaceClient>,
+    query: server_api::NotificationDiagnosticsQuery,
+) -> Result<Value, ToolError> {
     let workspace_id = client
         .workspace_id()
         .filter(|s| !s.trim().is_empty())
@@ -147,13 +177,7 @@ async fn execute_domain(
             "Notification response exceeds 100 items".into(),
         ));
     }
-    Ok(ToolOutput {
-        summary: NAME.into(),
-        content: Some(
-            serde_json::to_string(&page).map_err(|e| ToolError::Internal(e.to_string()))?,
-        ),
-        attachments: vec![],
-    })
+    serde_json::to_value(page).map_err(|e| ToolError::Internal(e.to_string()))
 }
 #[cfg(test)]
 mod authorization_tests {
@@ -284,6 +308,7 @@ mod authorization_tests {
                 "notification_diagnostics",
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker".into(),
                 },
@@ -297,6 +322,7 @@ mod authorization_tests {
                     "notification_diagnostics",
                     &args,
                     WipCallContext {
+                        result_namespaces: Default::default(),
                         execution: ToolExecutionContext::direct(),
                         security_context: "worker".into()
                     }
@@ -355,6 +381,7 @@ mod authorization_tests {
                 "notification_diagnostics",
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker".into(),
                 },
@@ -376,6 +403,7 @@ mod authorization_tests {
                     "notification_diagnostics",
                     &args,
                     WipCallContext {
+                        result_namespaces: Default::default(),
                         execution: ToolExecutionContext::direct(),
                         security_context: "worker".into()
                     }
@@ -492,8 +520,9 @@ mod native_command_tests {
 
     #[tokio::test]
     async fn internal_notification_command_requires_all_origins_and_shares_tool_request() {
-        let client =
-            AuthorizedClient::new(json!({"items":[],"next_cursor":null,"source_checks":[]}));
+        let client = AuthorizedClient::new(json!({
+            "items":[], "next_cursor":"source/8?", "source_checks":[]
+        }));
         let input = json!({"ticket":"T-A","job_id":"Job-A","cursor":"source/7?","limit":2});
         client.grant("notification.diagnostics.read", ticket("T-A"));
         assert!(
@@ -529,21 +558,40 @@ mod native_command_tests {
         .await
         .unwrap()
         .unwrap();
+        let value = execute_native_value(
+            client.clone(),
+            NAME,
+            input.clone(),
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::from_str::<Value>(ordinary.content.as_deref().unwrap()).unwrap()
+        );
+        assert_eq!(value["next_cursor"], "source/8?");
         assert_eq!(native.content, ordinary.content);
+        assert_eq!(native.summary, ordinary.summary);
+        assert_eq!(ordinary.summary, NAME);
+        assert!(native.attachments.is_empty());
+        assert_eq!(client.requests.lock().unwrap().len(), 3);
         {
             let requests = client.requests.lock().unwrap();
             assert_eq!(requests[0], requests[1]);
+            assert_eq!(requests[1], requests[2]);
         }
         client.grants.lock().unwrap().clear();
         assert!(
-            execute_native(client.clone(), NAME, input, ToolExecutionContext::direct())
+            execute_native_value(client.clone(), NAME, input, ToolExecutionContext::direct())
                 .await
                 .unwrap()
                 .is_err()
         );
-        assert_eq!(client.requests.lock().unwrap().len(), 2);
+        assert_eq!(client.requests.lock().unwrap().len(), 3);
         assert!(
-            execute_native(
+            execute_native_value(
                 client.clone(),
                 "Unknown",
                 Value::Null,

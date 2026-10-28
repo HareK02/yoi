@@ -63,6 +63,9 @@ async fn ticket_inspect_contract_drives_query_read_and_comment_without_tool_sche
     let signature = declaration["interface_signature"].as_str().unwrap();
     assert!(signature.contains("query("));
     assert!(signature.contains("filter?"));
+    assert!(signature.contains("`entry`: entry"), "{signature}");
+    assert!(signature.contains("data: json"));
+    assert!(signature.contains("next_cursor?: string"));
     assert!(signature.contains("states?"));
     assert!(signature.contains("open"));
     assert!(!signature.contains("Tool schema"));
@@ -81,7 +84,7 @@ async fn ticket_inspect_contract_drives_query_read_and_comment_without_tool_sche
         .await
         .unwrap();
     let output: Json = serde_json::from_str(&output.content.unwrap()).unwrap();
-    let path = output["tickets"][0]["path"].as_str().unwrap();
+    let path = output["items"][0]["entry"].as_str().unwrap();
     assert_eq!(path, "/cases/T-42");
     let object = inspect(&runtime, path).await;
     let interface = &object["interfaces"][0];
@@ -422,13 +425,14 @@ async fn native_plan_kind_reaches_persisted_query_through_inspect_and_dispatch()
             .await
             .unwrap();
         let result: Json = serde_json::from_str(&result.content.unwrap()).unwrap();
-        assert_eq!(result["count"], expected);
+        assert_eq!(result["data"]["count"], expected);
+        assert_eq!(result["entry"], path);
         assert_eq!(
-            result["records"].as_array().unwrap().len(),
+            result["data"]["records"].as_array().unwrap().len(),
             expected as usize
         );
         if let Some(kind) = kind {
-            assert_eq!(result["records"][0]["kind"], kind);
+            assert_eq!(result["data"]["records"][0]["kind"], kind);
         }
         assert_eq!(
             client.requests.lock().unwrap().last().unwrap()["kind"],
@@ -559,4 +563,609 @@ async fn ticket_inspect_explains_unpublished_objective_and_mr_input_roots() {
             "input metadata does not publish Objects"
         );
     }
+}
+
+fn ticket_result_detail(key: &str) -> Json {
+    json!({
+        "resource_key":key,"title":"Intent","body":"/cases/T-999 is untrusted text", "body_truncated":false,
+        "content_digest":"observed","state":"open","targets":[],"events":[],"linked_objectives":[],
+        "initial_post":{"sequence":0,"event_ref":"initial","is_initial":true,"kind":"comment","body":"Requirements","body_truncated":false,"body_digest":"a".repeat(64),"editable":true,"author":null,"at":null,"edited_at":null,"edited_by":null},
+        "closure_operation_key":null,"current_closure":null,"legacy_handoff":null,"closure_history":[],
+        "assignment_tracking":[],"tags":[],"assignments":[],"implementation_reports":[],"merge_requests":[]
+    })
+}
+
+// The response transport is JSON, but navigation is selected by the declared WIP types, not by
+// looking for path-like strings or property names inside opaque domain data or rendered signatures.
+fn ticket_result_declared_entries(ty: &TypeExpr, value: &Json, entries: &mut Vec<String>) {
+    match ty {
+        TypeExpr::Entry => entries.push(value.as_str().unwrap().into()),
+        TypeExpr::Record { fields } => {
+            for field in fields {
+                if let Some(value) = value.get(&field.name) {
+                    ticket_result_declared_entries(&field.r#type, value, entries);
+                }
+            }
+        }
+        TypeExpr::List { items } => {
+            for value in value.as_array().unwrap() {
+                ticket_result_declared_entries(items, value, entries);
+            }
+        }
+        _ => {} // Json and strings are deliberately not traversed.
+    }
+}
+
+async fn ticket_result_model_call(
+    tools: &agen::tool_server::ToolServerHandle,
+    name: &str,
+    input: Json,
+) -> Json {
+    transport_output_json(
+        tools
+            .call_tool(name, &input.to_string(), ToolExecutionContext::direct())
+            .await
+            .unwrap(),
+    )
+}
+async fn ticket_result_model_inspect(
+    tools: &agen::tool_server::ToolServerHandle,
+    entry: &Json,
+) -> Json {
+    ticket_result_model_call(tools, "Inspect", json!({"path":entry})).await
+}
+async fn ticket_result_model_invoke(
+    tools: &agen::tool_server::ToolServerHandle,
+    object: &Json,
+    operation: &str,
+    arguments: Json,
+) -> Json {
+    ticket_result_model_call(tools, "Invoke", json!({"path":object["path"],"interface":object["interfaces"][0]["reference"],"operation":operation,"arguments":arguments})).await
+}
+
+#[tokio::test]
+async fn ticket_typed_results_drive_model_query_create_read_and_all_related_domain_transitions() {
+    for order in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
+        let mut detail = ticket_result_detail("T-42");
+        detail["linked_objectives"] =
+            json!([{"resource_key":"O-3","title":"Objective","state":"active"}]);
+        detail["relations"] = json!({"outgoing":[{"target_resource_key":"T-7","kind":"related","note":null,"at":null}],"incoming":[],"blockers":[],"notices":[]});
+        detail["merge_requests"] = json!([{"merge_request_id":"MR-1","repository_key":"main","state":"open","selector_from":"work/source","selector_to":"develop","review_status":"pending","subject_ref":null,"source_ref_observation":{"status":"not_required"}}]);
+        let query_item = json!({"resource_key":"T-42","title":"Intent","state":"open","closure_operation_key":null,"current_closure":null,"legacy_handoff":null,"assignment_tracking":[],"tags":[],"matched_fields":[],"linked_objective_keys":["O-3"],"relation_count":1,"blocker_count":0,"unresolved_blocker_count":0,"unresolved_review_count":0,"merge_requests":detail["merge_requests"], "snippet":"/cases/T-999"});
+        let mut second_item = query_item.clone();
+        second_item["resource_key"] = json!("T-43");
+        let response = |value: Json| crate::worker::WorkspaceResponse {
+            status: 200,
+            body: value.to_string(),
+        };
+        let client = Arc::new(ScriptedWorkspaceClient::new([
+        response(json!({"items":[query_item, second_item],"page":{"next_cursor":"opaque-next","has_more":true}})),
+        response(json!({"items":[],"page":{"next_cursor":null,"has_more":false}})),
+        response(detail),
+        response(ticket_result_detail("T-7")),
+        objective_detail_response("objective-observed"),
+        response(json!({"workspace_id":"workspace","merge_request_id":"MR-1","repository_key":"main","state":"open","selector_from":"work/source","selector_to":"develop","ticket_ids":[],"thread":[]})),
+        response(json!({"id":"internal123","resource_key":"T-9","slug":"new","status":"Open"})),
+    ]).with_authorizations([
+        expected_authorization("ticket.query","workspace",None),
+        expected_authorization("ticket.query","workspace",None),
+        expected_authorization("ticket.read","ticket",Some(("ticket_id","T-42"))),
+        expected_authorization("ticket.read","ticket",Some(("ticket_id","T-7"))),
+        expected_authorization("objective.read","objective",Some(("objective_id","O-3"))),
+        expected_authorization("merge_request.read","merge_request",Some(("merge_request_id","MR-1"))),
+        expected_authorization("ticket.create","workspace",None),
+    ]));
+        let mut registry = WipMountRegistry::new();
+        let tickets = registry.allocate_namespace("ticket", "cases").unwrap();
+        let objectives = registry.allocate_namespace("objective", "goals").unwrap();
+        let mrs = registry
+            .allocate_namespace("merge-request", "changes")
+            .unwrap();
+        for domain in order {
+            match domain {
+                0 => crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
+                    &mut registry,
+                    client.clone(),
+                    crate::feature::builtin::ticket::TicketFeatureAccess::workspace_authoring(),
+                    None,
+                    &tickets,
+                )
+                .unwrap(),
+                1 => crate::feature::builtin::objective::mount_workspace_http_objective_wip(
+                    &mut registry,
+                    client.clone(),
+                    None,
+                    &objectives,
+                )
+                .unwrap(),
+                2 => {
+                    crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
+                        &mut registry,
+                        client.clone(),
+                        manifest::MergeRequestFeatureConfig {
+                            show: true,
+                            ..Default::default()
+                        },
+                        None,
+                        &mrs,
+                    )
+                    .unwrap()
+                }
+                _ => unreachable!(),
+            }
+        }
+        let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        let runtime = install_wip_mode_with_mounts(
+            &mut engine,
+            None,
+            "ticket-model-results".into(),
+            registry,
+        )
+        .unwrap();
+        let tools = engine.tool_server_handle();
+        tools.flush_pending();
+        let collection = ticket_result_model_inspect(&tools, &json!("/cases")).await;
+        let interface =
+            ticket_result_model_inspect(&tools, &collection["interfaces"][0]["path"]).await;
+        let signature = interface["interface_signature"].as_str().unwrap();
+        assert!(signature.contains("`entry`: entry"), "{signature}");
+        assert!(signature.contains("`entry`?: entry"));
+        assert!(signature.contains("data: json"));
+        let query =
+            ticket_result_model_invoke(&tools, &collection, "query", json!({"page":{"limit":2}}))
+                .await;
+        assert_eq!(query["next_cursor"], "opaque-next");
+        assert_eq!(query["has_more"], true);
+        assert_eq!(
+            client.requests().len(),
+            1,
+            "query does not prefetch any returned entry"
+        );
+        let declaration = runtime
+            .host
+            .projection("/cases")
+            .unwrap()
+            .descriptor
+            .operations
+            .into_iter()
+            .find(|op| op.name == "query")
+            .unwrap();
+        let mut paths = vec![];
+        ticket_result_declared_entries(&declaration.returns.r#type, &query, &mut paths);
+        assert!(paths.contains(&"/cases/T-42".into()));
+        assert!(!paths.contains(&"/cases/T-999".into()));
+        let page = ticket_result_model_invoke(
+            &tools,
+            &collection,
+            "query",
+            json!({"page":{"cursor":query["next_cursor"],"limit":2}}),
+        )
+        .await;
+        assert_eq!(page, json!({"items":[],"has_more":false}));
+        let selected = ticket_result_model_inspect(&tools, &query["items"][0]["entry"]).await;
+        assert_eq!(
+            client.requests().len(),
+            2,
+            "Inspect resolves only route metadata, not related reads"
+        );
+        let read =
+            ticket_result_model_invoke(&tools, &selected, "read", json!({"page":{"limit":1}}))
+                .await;
+        assert_eq!(read["entry"], query["items"][0]["entry"]);
+        for domain in ["tickets", "objectives", "merge_requests"] {
+            let related =
+                ticket_result_model_inspect(&tools, &read["links"][domain][0]["entry"]).await;
+            let interface =
+                ticket_result_model_inspect(&tools, &related["interfaces"][0]["path"]).await;
+            assert!(
+                interface["interface_signature"]
+                    .as_str()
+                    .unwrap()
+                    .contains("read(")
+            );
+            ticket_result_model_invoke(&tools, &related, "read", json!({})).await;
+        }
+        let created = ticket_result_model_invoke(
+            &tools,
+            &collection,
+            "create",
+            json!({"content":{"title":"New"}}),
+        )
+        .await;
+        let created_object = ticket_result_model_inspect(&tools, &created["entry"]).await;
+        assert_eq!(created_object["path"], created["entry"]);
+        assert_eq!(client.requests().len(), 7);
+        client.assert_authorizations_consumed();
+        let tree = ticket_result_model_call(&tools, "Tree", json!({"path":"/","depth":3})).await;
+        assert!(!tree.to_string().contains("/cases/T-42"));
+        assert!(!tree.to_string().contains("/goals/O-3"));
+        assert!(!tree.to_string().contains("/changes/MR-1"));
+        assert!(!tree.to_string().contains("/cases/T-43"));
+        assert_eq!(client.requests().len(), 7);
+    }
+}
+
+#[tokio::test]
+async fn ticket_successful_create_is_never_replayed_after_selected_deleted_or_denied_read() {
+    let client = Arc::new(
+        ScriptedWorkspaceClient::new([
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({"id":"internal123","resource_key":"T-9","slug":"new","status":"Open"})
+                    .to_string(),
+            },
+            crate::worker::WorkspaceResponse {
+                status: 404,
+                body: json!({"error":"not_found","message":"deleted"}).to_string(),
+            },
+            crate::worker::WorkspaceResponse {
+                status: 403,
+                body: json!({"error":"permission_denied","message":"denied"}).to_string(),
+            },
+        ])
+        .with_authorizations([
+            expected_authorization("ticket.create", "workspace", None),
+            expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-9"))),
+            expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-9"))),
+        ]),
+    );
+    let mut registry = WipMountRegistry::new();
+    let route = registry.allocate_namespace("ticket", "cases").unwrap();
+    crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
+        &mut registry,
+        client.clone(),
+        crate::feature::builtin::ticket::TicketFeatureAccess::workspace_authoring(),
+        None,
+        &route,
+    )
+    .unwrap();
+    let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+    install_wip_mode_with_mounts(
+        &mut engine,
+        None,
+        "ticket-negative-results".into(),
+        registry,
+    )
+    .unwrap();
+    let tools = engine.tool_server_handle();
+    tools.flush_pending();
+    let collection = ticket_result_model_inspect(&tools, &json!("/cases")).await;
+    let created = ticket_result_model_invoke(
+        &tools,
+        &collection,
+        "create",
+        json!({"content":{"title":"Created once"}}),
+    )
+    .await;
+    assert_eq!(client.requests().len(), 1);
+    let object = ticket_result_model_inspect(&tools, &created["entry"]).await;
+    for expected in ["NotFound", "PermissionDenied"] {
+        let error=tools.call_tool("Invoke",&json!({"path":created["entry"],"interface":object["interfaces"][0]["reference"],"operation":"read","arguments":{}}).to_string(),ToolExecutionContext::direct()).await.unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    let requests = client.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/api/w/workspace/tickets")
+            .count(),
+        1
+    );
+    client.assert_authorizations_consumed();
+}
+
+#[test]
+fn result_namespaces_follow_committed_registry_rollback_and_independent_host_builds() {
+    let client = Arc::new(ScriptedWorkspaceClient::new([]));
+    let mut registry = WipMountRegistry::new();
+    let ticket = registry.allocate_namespace("ticket", "cases").unwrap();
+    let objective = registry.allocate_namespace("objective", "goals").unwrap();
+    let checkpoint = registry.clone();
+    assert!(registry.publish_result_namespace(&ticket).is_err());
+    assert!(
+        registry
+            .result_namespace_snapshot()
+            .root("ticket")
+            .is_none()
+    );
+    crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
+        &mut registry,
+        client.clone(),
+        crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
+        None,
+        &ticket,
+    )
+    .unwrap();
+    let ticket_host = WipHost::new(registry.clone());
+    assert_eq!(ticket_host.result_namespaces.root("ticket"), Some("/cases"));
+    assert_eq!(ticket_host.result_namespaces.root("objective"), None);
+    crate::feature::builtin::objective::mount_workspace_http_objective_wip(
+        &mut registry,
+        client,
+        None,
+        &objective,
+    )
+    .unwrap();
+    let both = WipHost::new(registry.clone());
+    assert_eq!(both.result_namespaces.root("objective"), Some("/goals"));
+    assert_eq!(
+        ticket_host.result_namespaces.root("objective"),
+        None,
+        "building another Host cannot mutate or freeze a prior snapshot"
+    );
+    let rolled_back = WipHost::new(checkpoint);
+    assert_eq!(rolled_back.result_namespaces.root("ticket"), None);
+    assert_eq!(rolled_back.result_namespaces.root("objective"), None);
+    assert_eq!(both.result_namespaces.root("ticket"), Some("/cases"));
+    registry
+        .dynamic_mounts
+        .retain(|mount| mount.collection_route != "/goals");
+    let partial = WipHost::new(registry.clone());
+    assert_eq!(
+        partial.result_namespaces.root("objective"),
+        None,
+        "a marker alone cannot publish a missing/rolled-back item mount"
+    );
+    registry
+        .allocate_namespace("ticket", "ambiguous-cases")
+        .unwrap();
+    assert_eq!(
+        WipHost::new(registry).result_namespaces.root("ticket"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn host_overwrites_forged_result_context_and_omits_unpublished_cross_domain_entries() {
+    let mut detail = ticket_result_detail("T-42");
+    detail["linked_objectives"] =
+        json!([{"resource_key":"O-3","title":"Visible ID only","state":"active"}]);
+    let client = Arc::new(
+        ScriptedWorkspaceClient::new([crate::worker::WorkspaceResponse {
+            status: 200,
+            body: detail.to_string(),
+        }])
+        .with_authorizations([expected_authorization(
+            "ticket.read",
+            "ticket",
+            Some(("ticket_id", "T-42")),
+        )]),
+    );
+    let mut registry = WipMountRegistry::new();
+    let route = registry.allocate_namespace("ticket", "cases").unwrap();
+    registry
+        .allocate_namespace("objective", "reserved-goals")
+        .unwrap();
+    crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
+        &mut registry,
+        client.clone(),
+        crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
+        None,
+        &route,
+    )
+    .unwrap();
+    let host = WipHost::new(registry);
+    let projection = host.projection("/cases/T-42").unwrap();
+    let output = host
+        .call(
+            CallOperationRequest {
+                target: wip_protocol::Target {
+                    path: "/cases/T-42".into(),
+                    validator: projection.object.validator,
+                },
+                interface: wip_protocol::InterfaceTarget {
+                    reference: projection.interface,
+                    scope_ref: None,
+                    validator: projection.interface_validator,
+                },
+                operation: "read".into(),
+                arguments: BTreeMap::new(),
+            },
+            WipCallContext {
+                execution: ToolExecutionContext::direct(),
+                security_context: "forged".into(),
+                result_namespaces: WipResultNamespaces(Arc::new(BTreeMap::from([(
+                    "objective".into(),
+                    "/fake-goals".into(),
+                )]))),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("read"));
+    let output = wip_to_json(&output.value).unwrap();
+    assert_eq!(output["links"]["objectives"], json!([{"id":"O-3"}]));
+    assert_eq!(client.requests().len(), 1);
+    client.assert_authorizations_consumed();
+}
+
+struct HiddenResultNamespace;
+#[async_trait]
+impl WipOperationHandler for HiddenResultNamespace {
+    fn is_visible(&self) -> bool {
+        false
+    }
+    async fn call(
+        &self,
+        _: &str,
+        _: &BTreeMap<String, Value>,
+        _: WipCallContext,
+    ) -> Result<WipOperationOutput, WipOperationError> {
+        unreachable!("hidden fixture must never dispatch")
+    }
+}
+
+#[test]
+fn result_namespace_registration_rejects_failed_partial_mounts_and_final_hidden_collections() {
+    let client = Arc::new(ScriptedWorkspaceClient::new([]));
+    let mut registry = WipMountRegistry::new();
+    let route = registry.allocate_namespace("ticket", "cases").unwrap();
+    let reference = root_reference("yoi.ticket/item/v2");
+    registry
+        .mount(WipProjection {
+            route: "/tools/conflicting-item-interface".into(),
+            capability: "fixture:conflict".into(),
+            kind: WipProjectionKind::Native,
+            object: Object {
+                name: "conflicting-item-interface".into(),
+                description: None,
+                interfaces: vec![reference.clone()],
+                r#ref: None,
+                validator: None,
+            },
+            interface: reference,
+            interface_validator: None,
+            descriptor: InterfaceDescriptor {
+                format: INTERFACE_FORMAT_V1.into(),
+                documentation: None,
+                types: vec![],
+                operations: vec![],
+            },
+            handler: Arc::new(HiddenResultNamespace),
+        })
+        .unwrap();
+    let result = crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
+        &mut registry,
+        client.clone(),
+        crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
+        None,
+        &route,
+    );
+    assert!(matches!(
+        result,
+        Err(WipMountError::InterfaceCollision { .. })
+    ));
+    assert!(
+        registry.mounts.contains_key("/cases"),
+        "the failure happened after collection staging"
+    );
+    assert_eq!(
+        WipHost::new(registry).result_namespaces.root("ticket"),
+        None
+    );
+    let mut registry = WipMountRegistry::new();
+    let route = registry.allocate_namespace("ticket", "cases").unwrap();
+    crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
+        &mut registry,
+        client,
+        crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
+        None,
+        &route,
+    )
+    .unwrap();
+    registry
+        .mounts
+        .get_mut("/cases")
+        .unwrap()
+        .projection
+        .handler = Arc::new(HiddenResultNamespace);
+    assert_eq!(
+        WipHost::new(registry).result_namespaces.root("ticket"),
+        None,
+        "final visibility overrides a stale success marker"
+    );
+}
+
+#[tokio::test]
+async fn retained_ticket_result_mr_reference_is_model_navigation_not_body_or_snapshot_authority() {
+    let receipt = json!({"result_id":"saved","ticket_id":"T-42","created_at":"now",
+        "request":{"operation_key":"saved-operation","kind":"result","body":"/changes/MR-999 is prose",
+            "merge_request":{"merge_request_id":"MR-1","subject_ref":"historical-source"}}});
+    let client = Arc::new(
+        ScriptedWorkspaceClient::new([
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: receipt.to_string(),
+            },
+            crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({"merge_request_id":"MR-1","ticket_ids":[],"thread":[]}).to_string(),
+            },
+        ])
+        .with_authorizations([
+            expected_authorization(
+                "ticket.implementation_result.read",
+                "ticket",
+                Some(("ticket_id", "T-42")),
+            ),
+            expected_authorization(
+                "merge_request.read",
+                "merge_request",
+                Some(("merge_request_id", "MR-1")),
+            ),
+        ]),
+    );
+    let mut registry = WipMountRegistry::new();
+    let tickets = registry.allocate_namespace("ticket", "cases").unwrap();
+    let changes = registry
+        .allocate_namespace("merge-request", "changes")
+        .unwrap();
+    crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
+        &mut registry,
+        client.clone(),
+        crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
+        None,
+        &tickets,
+    )
+    .unwrap();
+    crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
+        &mut registry,
+        client.clone(),
+        manifest::MergeRequestFeatureConfig {
+            show: true,
+            ..Default::default()
+        },
+        None,
+        &changes,
+    )
+    .unwrap();
+    let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+    let runtime = install_wip_mode_with_mounts(
+        &mut engine,
+        None,
+        "retained-result-entries".into(),
+        registry,
+    )
+    .unwrap();
+    let tools = engine.tool_server_handle();
+    tools.flush_pending();
+    let selected = ticket_result_model_inspect(&tools, &json!("/cases/T-42")).await;
+    let result = ticket_result_model_invoke(
+        &tools,
+        &selected,
+        "implementation_result_query",
+        json!({"result_id":"saved"}),
+    )
+    .await;
+    assert_eq!(result["data"], receipt);
+    assert_eq!(
+        client.requests().len(),
+        1,
+        "saved references do not prefetch current state"
+    );
+    let declaration = runtime
+        .host
+        .projection("/cases/T-42")
+        .unwrap()
+        .descriptor
+        .operations
+        .into_iter()
+        .find(|op| op.name == "implementation_result_query")
+        .unwrap();
+    let mut entries = vec![];
+    ticket_result_declared_entries(&declaration.returns.r#type, &result, &mut entries);
+    assert!(entries.contains(&"/changes/MR-1".into()));
+    assert!(!entries.contains(&"/changes/MR-999".into()));
+    let related =
+        ticket_result_model_inspect(&tools, &result["links"]["merge_requests"][0]["entry"]).await;
+    let interface = ticket_result_model_inspect(&tools, &related["interfaces"][0]["path"]).await;
+    assert!(
+        interface["interface_signature"]
+            .as_str()
+            .unwrap()
+            .contains("read(")
+    );
+    ticket_result_model_invoke(&tools, &related, "read", json!({})).await;
+    assert_eq!(client.requests().len(), 2);
+    client.assert_authorizations_consumed();
 }

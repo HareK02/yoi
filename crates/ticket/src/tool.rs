@@ -925,6 +925,7 @@ impl Tool for TicketCreateTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketCreateParams = parse_input("TicketCreate", input_json)?;
         execute_ticket_create(&self.backend, params, _ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -932,7 +933,21 @@ fn execute_ticket_create(
     backend: &TicketToolBackend,
     params: TicketCreateParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
+    let created = create_ticket(backend, params)?;
+    Ok(command_result(
+        format!("Created ticket {}", created.id),
+        json!(TicketRefOutput {
+            id: created.id,
+            state: "open".to_string(),
+        }),
+    ))
+}
+
+fn create_ticket(
+    backend: &TicketToolBackend,
+    params: TicketCreateParams,
+) -> Result<TicketRef, ToolError> {
     if params
         .state
         .is_some_and(|state| !matches!(state.into_state(), TicketState::Open))
@@ -963,16 +978,9 @@ fn execute_ticket_create(
     input.queued_at = params.queued_at;
     input.targets = params.targets;
 
-    let created = backend
+    backend
         .create(input)
-        .map_err(|error| backend_error("TicketCreate", error))?;
-    Ok(json_output(
-        format!("Created ticket {}", created.id),
-        json!(TicketRefOutput {
-            id: created.id,
-            state: "open".to_string(),
-        }),
-    ))
+        .map_err(|error| backend_error("TicketCreate", error))
 }
 
 #[async_trait]
@@ -984,6 +992,7 @@ impl Tool for TicketEditItemTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketEditItemParams = parse_input("TicketEditItem", input_json)?;
         execute_ticket_edit_item(&self.backend, params, _ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -991,7 +1000,7 @@ fn execute_ticket_edit_item(
     backend: &TicketToolBackend,
     params: TicketEditItemParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let body_replacement = match (params.old_string, params.new_string) {
         (Some(old_string), Some(new_string)) => Some(TicketBodyReplacement {
             old_string,
@@ -1018,7 +1027,7 @@ fn execute_ticket_edit_item(
     let ticket = backend
         .edit_item(TicketIdOrSlug::from(params.ticket), edit)
         .map_err(|error| backend_error("TicketEditItem", error))?;
-    Ok(json_output(
+    Ok(command_result(
         format!("Edited ticket {}", ticket.meta.id),
         ticket_json(
             &ticket,
@@ -1038,6 +1047,7 @@ impl Tool for TicketEditPostTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketEditPostParams = parse_input("TicketEditPost", input_json)?;
         execute_ticket_edit_post(&self.backend, params, _ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1045,7 +1055,7 @@ fn execute_ticket_edit_post(
     backend: &TicketToolBackend,
     params: TicketEditPostParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let ticket = backend
         .edit_post(
             TicketIdOrSlug::from(params.ticket),
@@ -1057,7 +1067,7 @@ fn execute_ticket_edit_post(
             },
         )
         .map_err(|error| backend_error("TicketEditPost", error))?;
-    Ok(json_output(
+    Ok(command_result(
         format!("Edited Ticket post in {}", ticket.meta.id),
         ticket_json(
             &ticket,
@@ -1076,7 +1086,7 @@ impl Tool for QueryTicketTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: QueryTicketParams = parse_input("QueryTicket", input_json)?;
-        execute_query_ticket(&self.backend, params, _ctx)
+        execute_query_ticket(&self.backend, params, _ctx).map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1084,7 +1094,7 @@ fn execute_query_ticket(
     backend: &TicketToolBackend,
     params: QueryTicketParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let (filter, state_filter, params_limit) = params
         .into_query()
         .map_err(|error| backend_error("QueryTicket", error))?;
@@ -1106,7 +1116,7 @@ fn execute_query_ticket(
         limit,
         tickets: returned_tickets,
     };
-    Ok(json_output(
+    Ok(command_result(
         format!(
             "Listed {} ticket(s) for state {state_filter}{}",
             output.returned,
@@ -1124,7 +1134,7 @@ impl Tool for ShowTicketTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: ShowTicketParams = parse_input("ShowTicket", input_json)?;
-        execute_show_ticket(&self.backend, params, _ctx)
+        execute_show_ticket(&self.backend, params, _ctx).map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1132,7 +1142,7 @@ fn execute_show_ticket(
     backend: &TicketToolBackend,
     params: ShowTicketParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let query = id_or_query(params.id, params.query)?;
     let event_limit = bounded(params.event_limit, DEFAULT_EVENT_LIMIT, MAX_EVENT_LIMIT);
     let artifact_limit = bounded(
@@ -1153,7 +1163,7 @@ fn execute_show_ticket(
         ticket.meta.id,
         ticket.meta.workflow_state.as_str()
     );
-    Ok(json_output(
+    Ok(command_result(
         summary,
         ticket_json(&ticket, event_limit, artifact_limit, body_max_bytes),
     ))
@@ -1164,7 +1174,7 @@ fn execute_ticket_thread_event(
     tool_name: &str,
     kind: TicketEventKind,
     params: TicketThreadEventParams,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let role = kind.as_str().to_string();
     backend
         .add_event(
@@ -1172,7 +1182,7 @@ fn execute_ticket_thread_event(
             NewTicketEvent::new(kind, params.body),
         )
         .map_err(|error| backend_error(tool_name, error))?;
-    Ok(json_output(
+    Ok(command_result(
         format!("Appended {role} event to ticket {}", params.ticket),
         json!({ "ticket": params.ticket, "event": role, "ok": true }),
     ))
@@ -1191,6 +1201,7 @@ impl Tool for TicketCommentTool {
             TicketEventKind::Comment,
             parse_input("TicketComment", input_json)?,
         )
+        .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1209,6 +1220,7 @@ macro_rules! impl_ticket_thread_event_tool {
                     $kind,
                     parse_input($name, input_json)?,
                 )
+                .map(TicketCommandResult::into_tool_output)
             }
         }
     };
@@ -1235,6 +1247,7 @@ impl Tool for TicketMarkReadyTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketMarkReadyParams = parse_input("TicketMarkReady", input_json)?;
         execute_ticket_mark_ready(&self.backend, params, ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1242,7 +1255,7 @@ fn execute_ticket_mark_ready(
     backend: &TicketToolBackend,
     params: TicketMarkReadyParams,
     ctx: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let ticket = backend
         .mark_ready(
             TicketIdOrSlug::Query(params.ticket.clone()),
@@ -1254,7 +1267,7 @@ fn execute_ticket_mark_ready(
             },
         )
         .map_err(|error| backend_error("TicketMarkReady", error))?;
-    Ok(json_output(
+    Ok(command_result(
         format!("Marked ticket {} routing readiness ready", params.ticket),
         json!({
             "ticket": ticket.meta.id,
@@ -1274,6 +1287,7 @@ impl Tool for TicketIntakeReadyTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketIntakeReadyParams = parse_input("TicketIntakeReady", input_json)?;
         execute_ticket_intake_ready(&self.backend, params, ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1281,7 +1295,7 @@ fn execute_ticket_intake_ready(
     backend: &TicketToolBackend,
     params: TicketIntakeReadyParams,
     ctx: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let ticket = backend
         .mark_ready(
             TicketIdOrSlug::Query(params.ticket.clone()),
@@ -1293,7 +1307,7 @@ fn execute_ticket_intake_ready(
             },
         )
         .map_err(|error| backend_error("TicketIntakeReady", error))?;
-    Ok(json_output(
+    Ok(command_result(
         format!(
             "Marked ticket {} routing readiness ready after intake",
             params.ticket
@@ -1315,7 +1329,7 @@ impl Tool for TicketQueueTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketQueueParams = parse_input("TicketQueue", input_json)?;
-        execute_ticket_queue(&self.backend, params, _ctx)
+        execute_ticket_queue(&self.backend, params, _ctx).map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1323,7 +1337,7 @@ fn execute_ticket_queue(
     backend: &TicketToolBackend,
     params: TicketQueueParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let queued_by = default_author();
     let mut outcome = backend
         .queue_ready(TicketIdOrSlug::Query(params.ticket.clone()), &queued_by)
@@ -1335,7 +1349,7 @@ fn execute_ticket_queue(
         .into_iter()
         .map(|ticket| model_ticket_reference(backend, &ticket, "TicketQueue"))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(json_output(
+    Ok(command_result(
         format!(
             "Queued {} ticket(s) for Orchestrator",
             outcome.queued_tickets.len()
@@ -1359,6 +1373,7 @@ impl Tool for TicketCaseUpdateTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketCaseUpdateParams = parse_input("TicketCaseUpdate", input_json)?;
         execute_ticket_case_update(&self.backend, params, _ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1366,7 +1381,7 @@ fn execute_ticket_case_update(
     backend: &TicketToolBackend,
     params: TicketCaseUpdateParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let record = backend
         .update_case(
             &params.ticket,
@@ -1383,7 +1398,7 @@ fn execute_ticket_case_update(
         )
         .map_err(|error| backend_error("TicketCaseUpdate", error))?;
     let reference = model_ticket_reference(backend, &params.ticket, "TicketCaseUpdate")?;
-    Ok(json_output(
+    Ok(command_result(
         format!(
             "Updated Ticket {} case to {}",
             reference, record.meta.workflow_state
@@ -1403,6 +1418,7 @@ impl Tool for TicketRelationRecordTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketRelationRecordParams = parse_input("TicketRelationRecord", input_json)?;
         execute_ticket_relation_record(&self.backend, params, _ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1410,7 +1426,7 @@ fn execute_ticket_relation_record(
     backend: &TicketToolBackend,
     params: TicketRelationRecordParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let relation = NewTicketRelation {
         kind: params.kind.into_kind(),
         target: params.target.clone(),
@@ -1420,7 +1436,7 @@ fn execute_ticket_relation_record(
     let output = backend
         .add_ticket_relation(TicketIdOrSlug::Id(params.ticket.clone()), relation)
         .map_err(|error| backend_error("TicketRelationRecord", error))?;
-    Ok(json_output(
+    Ok(command_result(
         format!(
             "Recorded ticket relation {} {} {}",
             output.ticket_id, output.kind, output.target
@@ -1438,6 +1454,7 @@ impl Tool for TicketRelationRemoveTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketRelationRemoveParams = parse_input("TicketRelationRemove", input_json)?;
         execute_ticket_relation_remove(&self.backend, params, _ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1445,7 +1462,7 @@ fn execute_ticket_relation_remove(
     backend: &TicketToolBackend,
     params: TicketRelationRemoveParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let output = backend
         .remove_ticket_relation(
             TicketIdOrSlug::Id(params.ticket),
@@ -1453,7 +1470,7 @@ fn execute_ticket_relation_remove(
             TicketIdOrSlug::Id(params.target),
         )
         .map_err(|error| backend_error("TicketRelationRemove", error))?;
-    Ok(json_output(
+    Ok(command_result(
         format!(
             "Removed ticket relation {} {} {}",
             output.ticket_id, output.kind, output.target
@@ -1471,6 +1488,7 @@ impl Tool for TicketRelationQueryTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketRelationQueryParams = parse_input("TicketRelationQuery", input_json)?;
         execute_ticket_relation_query(&self.backend, params, _ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1478,7 +1496,7 @@ fn execute_ticket_relation_query(
     backend: &TicketToolBackend,
     params: TicketRelationQueryParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
     let ticket = params.ticket.clone().map(TicketIdOrSlug::Id);
     let kind = params.kind.map(TicketRelationKindParam::into_kind);
@@ -1492,7 +1510,7 @@ fn execute_ticket_relation_query(
         .take(limit)
         .map(|relation| ticket_relation_json(&relation))
         .collect::<Vec<_>>();
-    Ok(json_output(
+    Ok(command_result(
         format!(
             "Found {} ticket relation(s){}",
             count,
@@ -1517,6 +1535,7 @@ impl Tool for TicketOrchestrationPlanRecordTool {
         let params: TicketOrchestrationPlanRecordParams =
             parse_input("TicketOrchestrationPlanRecord", input_json)?;
         execute_ticket_orchestration_plan_record(&self.backend, params, _ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1524,7 +1543,7 @@ fn execute_ticket_orchestration_plan_record(
     backend: &TicketToolBackend,
     params: TicketOrchestrationPlanRecordParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let accepted_plan = params.accepted_plan.map(|plan| AcceptedOrchestrationPlan {
         summary: plan.summary,
         branch: plan.branch,
@@ -1541,7 +1560,7 @@ fn execute_ticket_orchestration_plan_record(
     let output = backend
         .add_orchestration_plan_record(TicketIdOrSlug::Query(params.ticket.clone()), record)
         .map_err(|error| backend_error("TicketOrchestrationPlanRecord", error))?;
-    Ok(json_output(
+    Ok(command_result(
         format!(
             "Recorded orchestration plan {} for ticket {}",
             output.kind, params.ticket
@@ -1560,6 +1579,7 @@ impl Tool for TicketOrchestrationPlanQueryTool {
         let params: TicketOrchestrationPlanQueryParams =
             parse_input("TicketOrchestrationPlanQuery", input_json)?;
         execute_ticket_orchestration_plan_query(&self.backend, params, _ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1567,7 +1587,7 @@ fn execute_ticket_orchestration_plan_query(
     backend: &TicketToolBackend,
     params: TicketOrchestrationPlanQueryParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
     let ticket = params.ticket.clone().map(TicketIdOrSlug::Query);
     let kind = params
@@ -1583,7 +1603,7 @@ fn execute_ticket_orchestration_plan_query(
         .take(limit)
         .map(|record| serde_json::to_value(record).unwrap_or_else(|_| json!({})))
         .collect::<Vec<_>>();
-    Ok(json_output(
+    Ok(command_result(
         format!(
             "Found {} orchestration plan record(s){}",
             count,
@@ -1607,6 +1627,7 @@ impl Tool for TicketDoctorTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketDoctorParams = parse_input("TicketDoctor", input_json)?;
         execute_ticket_doctor(&self.backend, params, _ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1614,13 +1635,13 @@ fn execute_ticket_doctor(
     backend: &TicketToolBackend,
     params: TicketDoctorParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let limit = bounded(params.limit, DEFAULT_DIAGNOSTIC_LIMIT, MAX_DIAGNOSTIC_LIMIT);
     let report = backend
         .doctor()
         .map_err(|error| backend_error("TicketDoctor", error))?;
     let output = doctor_output(report, limit);
-    Ok(json_output(
+    Ok(command_result(
         format!(
             "Ticket doctor: {} error(s), {} diagnostic(s){}",
             output.error_count,
@@ -1640,6 +1661,7 @@ impl Tool for TicketDependencyCheckTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketDependencyCheckParams = parse_input("TicketDependencyCheck", input_json)?;
         execute_ticket_dependency_check(&self.backend, params, _ctx)
+            .map(TicketCommandResult::into_tool_output)
     }
 }
 
@@ -1647,11 +1669,11 @@ fn execute_ticket_dependency_check(
     backend: &TicketToolBackend,
     params: TicketDependencyCheckParams,
     _context: agen::tool::ToolExecutionContext,
-) -> Result<ToolOutput, ToolError> {
+) -> Result<TicketCommandResult, ToolError> {
     let check = backend
         .dependency_check(TicketIdOrSlug::Query(params.ticket.clone()))
         .map_err(|error| backend_error("TicketDependencyCheck", error))?;
-    Ok(json_output(
+    Ok(command_result(
         format!(
             "Ticket {} dependency check: {}",
             params.ticket,
@@ -1676,6 +1698,30 @@ pub async fn execute_ticket_command(
     command: Value,
     context: agen::tool::ToolExecutionContext,
 ) -> Result<ToolOutput, ToolError> {
+    execute_ticket_command_result(backend, operation, command, context)
+        .map(TicketCommandResult::into_tool_output)
+}
+
+/// Execute a converted command and return domain data without rendering a Tool result.
+///
+/// This shares validation, Backend calls and operation identities with ordinary Tools.
+/// Selecting value output adds no retries or reference lookups.
+pub async fn execute_ticket_command_value(
+    backend: TicketToolBackend,
+    operation: &str,
+    command: Value,
+    context: agen::tool::ToolExecutionContext,
+) -> Result<Value, ToolError> {
+    execute_ticket_command_result(backend, operation, command, context)
+        .map(TicketCommandResult::into_value)
+}
+
+fn execute_ticket_command_result(
+    backend: TicketToolBackend,
+    operation: &str,
+    command: Value,
+    context: agen::tool::ToolExecutionContext,
+) -> Result<TicketCommandResult, ToolError> {
     fn convert<T: serde::de::DeserializeOwned>(command: Value) -> Result<T, ToolError> {
         serde_json::from_value(command)
             .map_err(|error| ToolError::InvalidArgument(format!("invalid Ticket command: {error}")))
@@ -2060,11 +2106,87 @@ fn truncate_text(text: &str, max_bytes: usize) -> String {
     out
 }
 
-fn json_output(summary: String, value: impl Serialize) -> ToolOutput {
-    ToolOutput {
+// Retain typed payloads until presentation so ordinary Tool JSON keeps its field
+// order while native callers never format or reparse Tool text.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum TicketCommandValue {
+    Json(Value),
+    Query(QueryTicketOutput),
+    RelationQuery(TicketRelationQueryOutput),
+    PlanRecord(OrchestrationPlanRecord),
+    PlanQuery(TicketOrchestrationPlanQueryOutput),
+    Doctor(TicketDoctorOutput),
+    Dependency(crate::TicketDependencyCheck),
+}
+
+impl From<Value> for TicketCommandValue {
+    fn from(value: Value) -> Self {
+        Self::Json(value)
+    }
+}
+
+impl From<QueryTicketOutput> for TicketCommandValue {
+    fn from(value: QueryTicketOutput) -> Self {
+        Self::Query(value)
+    }
+}
+
+impl From<TicketRelationQueryOutput> for TicketCommandValue {
+    fn from(value: TicketRelationQueryOutput) -> Self {
+        Self::RelationQuery(value)
+    }
+}
+
+impl From<OrchestrationPlanRecord> for TicketCommandValue {
+    fn from(value: OrchestrationPlanRecord) -> Self {
+        Self::PlanRecord(value)
+    }
+}
+
+impl From<TicketOrchestrationPlanQueryOutput> for TicketCommandValue {
+    fn from(value: TicketOrchestrationPlanQueryOutput) -> Self {
+        Self::PlanQuery(value)
+    }
+}
+
+impl From<TicketDoctorOutput> for TicketCommandValue {
+    fn from(value: TicketDoctorOutput) -> Self {
+        Self::Doctor(value)
+    }
+}
+
+impl From<crate::TicketDependencyCheck> for TicketCommandValue {
+    fn from(value: crate::TicketDependencyCheck) -> Self {
+        Self::Dependency(value)
+    }
+}
+
+struct TicketCommandResult {
+    summary: String,
+    value: TicketCommandValue,
+}
+
+impl TicketCommandResult {
+    fn into_tool_output(self) -> ToolOutput {
+        ToolOutput {
+            summary: self.summary,
+            content: Some(
+                serde_json::to_string_pretty(&self.value).unwrap_or_else(|_| "{}".to_string()),
+            ),
+            attachments: Vec::new(),
+        }
+    }
+
+    fn into_value(self) -> Value {
+        serde_json::to_value(self.value).unwrap_or_else(|_| json!({}))
+    }
+}
+
+fn command_result(summary: String, value: impl Into<TicketCommandValue>) -> TicketCommandResult {
+    TicketCommandResult {
         summary,
-        content: Some(serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())),
-        attachments: Vec::new(),
+        value: value.into(),
     }
 }
 
@@ -2254,11 +2376,46 @@ mod tests {
             .expect("tool exists")
     }
 
+    async fn assert_value_read_matches_tools(
+        backend: &crate::SqliteTicketBackend,
+        operation: &str,
+        input: Value,
+    ) -> Value {
+        let value = execute_ticket_command_value(
+            backend.clone().into(),
+            operation,
+            input.clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let wrapped = execute_ticket_command(
+            backend.clone().into(),
+            operation,
+            input.clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let ordinary = tool_by_name(backend.clone(), operation)
+            .execute(&input.to_string(), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(wrapped.summary, ordinary.summary);
+        assert_eq!(wrapped.content, ordinary.content);
+        assert!(ordinary.attachments.is_empty());
+        assert_eq!(
+            value,
+            serde_json::from_str::<Value>(ordinary.content.as_deref().unwrap()).unwrap()
+        );
+        value
+    }
+
     #[tokio::test]
     async fn internal_commands_share_persisted_edits_post_cas_and_dependency_results_with_tools() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
-        let created = execute_ticket_command(
+        let created = execute_ticket_command_value(
             backend.clone().into(),
             "TicketCreate",
             json!({"title":"Shared execution", "body":"Original"}),
@@ -2266,10 +2423,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let id = serde_json::from_str::<Value>(created.content.as_deref().unwrap()).unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let id = created["id"].as_str().unwrap().to_owned();
+        assert_eq!(created["state"], "open");
+        let listed =
+            assert_value_read_matches_tools(&backend, "QueryTicket", json!({"state":"all"})).await;
+        assert_eq!(listed["count"], 1, "creation must execute only once");
         let edit = tool_by_name(backend.clone(), "TicketEditItem");
         edit.execute(
             &json!({"ticket":id, "old_string":"Original", "new_string":"Tool edit"}).to_string(),
@@ -2277,7 +2435,7 @@ mod tests {
         )
         .await
         .unwrap();
-        execute_ticket_command(
+        let edited = execute_ticket_command_value(
             backend.clone().into(),
             "TicketEditItem",
             json!({"ticket":id, "old_string":"Tool edit", "new_string":"Command edit"}),
@@ -2285,7 +2443,8 @@ mod tests {
         )
         .await
         .unwrap();
-        execute_ticket_command(
+        assert_eq!(edited["body"], "Command edit");
+        let appended = execute_ticket_command_value(
             backend.clone().into(),
             "TicketComment",
             json!({"ticket":id, "body":"Discussion"}),
@@ -2293,7 +2452,13 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(appended, json!({"ticket":id, "event":"comment", "ok":true}));
         let before = backend.show(id.clone().into()).unwrap();
+        assert_eq!(
+            before.events.len(),
+            2,
+            "one initial post and one appended comment"
+        );
         assert_eq!(before.document.body.as_str(), "Command edit");
         let post = before
             .events
@@ -2301,7 +2466,7 @@ mod tests {
             .find(|event| !event.is_initial)
             .unwrap();
         let input = json!({"ticket":id, "event_ref":post.event_ref, "expected_body":"Discussion", "body":"Updated"});
-        execute_ticket_command(
+        let edited_post = execute_ticket_command_value(
             backend.clone().into(),
             "TicketEditPost",
             input.clone(),
@@ -2309,7 +2474,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let native_error = execute_ticket_command(
+        let native_error = execute_ticket_command_value(
             backend.clone().into(),
             "TicketEditPost",
             input.clone(),
@@ -2324,6 +2489,20 @@ mod tests {
         assert_eq!(native_error.to_string(), tool_error.to_string());
         let after = backend.show(id.clone().into()).unwrap();
         assert_eq!(
+            after.events.len(),
+            2,
+            "editing must not append or retry a comment"
+        );
+        assert_eq!(
+            edited_post,
+            ticket_json(
+                &after,
+                DEFAULT_EVENT_LIMIT,
+                DEFAULT_ARTIFACT_LIMIT,
+                DEFAULT_BODY_MAX_BYTES
+            )
+        );
+        assert_eq!(
             after
                 .events
                 .iter()
@@ -2333,20 +2512,31 @@ mod tests {
                 .as_str(),
             "Updated"
         );
-        let input = json!({"ticket":id});
-        let native = execute_ticket_command(
+        let dependency_output = execute_ticket_command(
             backend.clone().into(),
             "TicketDependencyCheck",
-            input.clone(),
+            json!({"ticket":id}),
             Default::default(),
         )
         .await
         .unwrap();
-        let ordinary = tool_by_name(backend, "TicketDependencyCheck")
-            .execute(&input.to_string(), Default::default())
-            .await
-            .unwrap();
-        assert_eq!(native.content, ordinary.content);
+        let check = backend.dependency_check(id.clone().into()).unwrap();
+        assert_eq!(
+            dependency_output.content.as_deref(),
+            Some(serde_json::to_string_pretty(&check).unwrap().as_str())
+        );
+        assert_eq!(
+            dependency_output.summary,
+            format!("Ticket {id} dependency check: queueable")
+        );
+        for (operation, input) in [
+            ("TicketDependencyCheck", json!({"ticket":id})),
+            ("ShowTicket", json!({"id":id})),
+            ("QueryTicket", json!({"state":"all"})),
+            ("TicketDoctor", json!({})),
+        ] {
+            assert_value_read_matches_tools(&backend, operation, input).await;
+        }
     }
 
     #[tokio::test]
@@ -2356,7 +2546,7 @@ mod tests {
         let source = backend.create(NewTicket::new("Source")).unwrap().id;
         let target = backend.create(NewTicket::new("Target")).unwrap().id;
         let relation = json!({"ticket":source, "kind":"related", "target":target});
-        execute_ticket_command(
+        let recorded = execute_ticket_command_value(
             backend.clone().into(),
             "TicketRelationRecord",
             relation.clone(),
@@ -2365,20 +2555,13 @@ mod tests {
         .await
         .unwrap();
         let query = json!({"ticket":source});
-        let native = execute_ticket_command(
-            backend.clone().into(),
-            "TicketRelationQuery",
-            query.clone(),
-            Default::default(),
-        )
-        .await
-        .unwrap();
-        let ordinary = tool_by_name(backend.clone(), "TicketRelationQuery")
-            .execute(&query.to_string(), Default::default())
-            .await
-            .unwrap();
-        assert_eq!(native.content, ordinary.content);
-        execute_ticket_command(
+        let queried =
+            assert_value_read_matches_tools(&backend, "TicketRelationQuery", query.clone()).await;
+        assert_eq!(queried["count"], 1);
+        assert_eq!(queried["relations"][0], recorded);
+        assert_eq!(recorded["ticket_id"], source);
+        assert_eq!(recorded["target"], target);
+        let removed = execute_ticket_command_value(
             backend.clone().into(),
             "TicketRelationRemove",
             relation,
@@ -2386,8 +2569,12 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(removed, recorded);
+        let empty =
+            assert_value_read_matches_tools(&backend, "TicketRelationQuery", query.clone()).await;
+        assert_eq!(empty["count"], 0);
         let plan = json!({"ticket":source, "kind":"accepted_plan", "accepted_plan":{"summary":"Shared execution plan", "branch":"work"}});
-        execute_ticket_command(
+        let planned = execute_ticket_command_value(
             backend.clone().into(),
             "TicketOrchestrationPlanRecord",
             plan,
@@ -2395,21 +2582,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let native = execute_ticket_command(
-            backend.clone().into(),
+        let queried = assert_value_read_matches_tools(
+            &backend,
             "TicketOrchestrationPlanQuery",
             query.clone(),
-            Default::default(),
         )
-        .await
-        .unwrap();
-        let ordinary = tool_by_name(backend.clone(), "TicketOrchestrationPlanQuery")
-            .execute(&query.to_string(), Default::default())
-            .await
-            .unwrap();
-        assert_eq!(native.content, ordinary.content);
+        .await;
+        assert_eq!(
+            queried["count"], 1,
+            "one durable plan, without duplicate execution"
+        );
+        assert_eq!(queried["records"][0], planned);
         let invalid = json!({"ticket":source, "kind":"accepted_plan"});
-        let native = execute_ticket_command(
+        let native = execute_ticket_command_value(
             backend.clone().into(),
             "TicketOrchestrationPlanRecord",
             invalid.clone(),
@@ -2423,7 +2608,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(native.to_string(), ordinary.to_string());
         assert!(matches!(
-            execute_ticket_command(
+            execute_ticket_command_value(
                 backend.clone().into(),
                 "TicketRelationRecord",
                 json!({"ticket":source,"target":target,"kind":"invalid"}),
@@ -2433,7 +2618,7 @@ mod tests {
             Err(ToolError::InvalidArgument(_))
         ));
         assert!(
-            execute_ticket_command(backend.into(), "Unknown", json!({}), Default::default())
+            execute_ticket_command_value(backend.into(), "Unknown", json!({}), Default::default())
                 .await
                 .unwrap_err()
                 .to_string()

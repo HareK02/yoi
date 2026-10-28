@@ -59,6 +59,7 @@ async fn native_backend_conflict_is_a_domain_rejection_not_a_type_rejection_or_r
         &input,
         Some("MR-1"),
         WipCallContext {
+            result_namespaces: Default::default(),
             execution: ToolExecutionContext::direct(),
             security_context: "test".into(),
         },

@@ -34,6 +34,7 @@ async fn notification_wip_executes_same_read_and_honors_profile_denial() {
                 "notification_diagnostics",
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker".into(),
                 },

@@ -1471,6 +1471,7 @@ pub(crate) mod tests {
     }
     fn context() -> WipCallContext {
         WipCallContext {
+            result_namespaces: Default::default(),
             execution: ToolExecutionContext::default(),
             security_context: "test".into(),
         }
@@ -1839,6 +1840,7 @@ mod lifetime_tests {
         };
         let args = BTreeMap::from([("limit".into(), Value::Integer(50))]);
         let context = || WipCallContext {
+            result_namespaces: Default::default(),
             execution: ToolExecutionContext::default(),
             security_context: "test".into(),
         };

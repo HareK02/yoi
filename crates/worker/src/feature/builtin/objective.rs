@@ -17,6 +17,10 @@
 //! logic. Query/detail uses canonical references and bounded bodies/events, omitting internal
 //! storage IDs from output.
 
+#[cfg(test)]
+mod result_tests;
+mod results;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 #[cfg(test)]
@@ -633,13 +637,16 @@ pub fn mount_workspace_http_objective_wip(
 ) -> Result<(), WipMountError> {
     let collection_route = namespace_route.root().to_string();
     let backend = WorkspaceHttpObjectiveBackend::new(client);
+    let result_routes = results::Routes {
+        objective: collection_route.clone(),
+    };
 
     let collection_descriptor = objective_collection_descriptor();
     let collection_validator = descriptor_validator(&collection_descriptor);
     let collection_handler = Arc::new(ObjectiveCollectionWipHandler {
         backend: backend.clone(),
         permissions: permissions.clone(),
-        collection_route: collection_route.clone(),
+        result_routes: result_routes.clone(),
     });
     registry.mount(WipProjection {
         route: collection_route.clone(),
@@ -677,16 +684,18 @@ pub fn mount_workspace_http_objective_wip(
             backend,
             permissions,
             collection_route: collection_route.clone(),
+            result_routes,
         }),
     })?;
     registry.replace_compatibility_tools(&collection_route, OBJECTIVE_TOOL_NAMES)?;
+    registry.publish_result_namespace(namespace_route)?;
     Ok(())
 }
 
 struct ObjectiveCollectionWipHandler {
     backend: WorkspaceHttpObjectiveBackend,
     permissions: Option<ToolPermissionConfig>,
-    collection_route: String,
+    result_routes: results::Routes,
 }
 
 #[async_trait]
@@ -695,7 +704,7 @@ impl WipOperationHandler for ObjectiveCollectionWipHandler {
         &self,
         operation: &str,
         arguments: &BTreeMap<String, Value>,
-        _context: WipCallContext,
+        context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
         let value = match operation {
             "query" => {
@@ -725,34 +734,13 @@ impl WipOperationHandler for ObjectiveCollectionWipHandler {
                 };
                 let permission_input = native_permission_input(arguments, None)?;
                 authorize_native(&self.permissions, "QueryObjective", &permission_input)?;
-                let mut response = self
+                let response = self
                     .backend
                     .query_value(&input)
                     .await
                     .map_err(map_backend_error)?;
-                if let Some(objectives) =
-                    response.get_mut("objectives").and_then(Json::as_array_mut)
-                {
-                    for objective in objectives {
-                        if let Some(reference) = objective
-                            .get("objective")
-                            .and_then(Json::as_str)
-                            .map(ToOwned::to_owned)
-                        {
-                            objective
-                                .as_object_mut()
-                                .expect("projected Objective is an object")
-                                .insert(
-                                    "path".into(),
-                                    Json::String(format!(
-                                        "{}/{}",
-                                        self.collection_route, reference
-                                    )),
-                                );
-                        }
-                    }
-                }
-                response
+                self.result_routes
+                    .query(&response, context.result_namespaces.root("ticket"))?
             }
             "create" => {
                 let input = ObjectiveCreateInput {
@@ -765,32 +753,17 @@ impl WipOperationHandler for ObjectiveCollectionWipHandler {
                 };
                 let permission_input = native_permission_input(arguments, None)?;
                 authorize_native(&self.permissions, "ObjectiveCreate", &permission_input)?;
-                let mut response = self
+                let response = self
                     .backend
                     .create_value(&input)
                     .await
                     .map_err(map_backend_error)?;
-
-                if let Some(reference) = response
-                    .get("objective")
-                    .and_then(Json::as_str)
-                    .map(ToOwned::to_owned)
-                {
-                    response
-                        .as_object_mut()
-                        .expect("projected Objective is an object")
-                        .insert(
-                            "path".into(),
-                            Json::String(format!("{}/{}", self.collection_route, reference)),
-                        );
-                }
-                response
+                self.result_routes
+                    .detail(&response, context.result_namespaces.root("ticket"))?
             }
             _ => return Err(operation_not_found()),
         };
-        Ok(WipOperationOutput::native(
-            json_to_wip(&value).map_err(WipOperationError::OutcomeUnknown)?,
-        ))
+        Ok(WipOperationOutput::native(value))
     }
 }
 
@@ -798,6 +771,7 @@ struct ObjectiveItemResolver {
     backend: WorkspaceHttpObjectiveBackend,
     permissions: Option<ToolPermissionConfig>,
     collection_route: String,
+    result_routes: results::Routes,
 }
 
 impl WipDynamicItemResolver for ObjectiveItemResolver {
@@ -820,6 +794,7 @@ impl WipDynamicItemResolver for ObjectiveItemResolver {
                 backend: self.backend.clone(),
                 permissions: self.permissions.clone(),
                 objective_reference: item_reference.to_string(),
+                result_routes: self.result_routes.clone(),
             }),
         })
     }
@@ -829,6 +804,7 @@ struct ObjectiveItemWipHandler {
     backend: WorkspaceHttpObjectiveBackend,
     permissions: Option<ToolPermissionConfig>,
     objective_reference: String,
+    result_routes: results::Routes,
 }
 
 #[async_trait]
@@ -837,7 +813,7 @@ impl WipOperationHandler for ObjectiveItemWipHandler {
         &self,
         operation: &str,
         arguments: &BTreeMap<String, Value>,
-        _context: WipCallContext,
+        context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
         let permission_input = native_permission_input(arguments, Some(&self.objective_reference))?;
         let response = match operation {
@@ -899,9 +875,10 @@ impl WipOperationHandler for ObjectiveItemWipHandler {
             _ => return Err(operation_not_found()),
         };
 
-        Ok(WipOperationOutput::native(
-            json_to_wip(&response).map_err(WipOperationError::OutcomeUnknown)?,
-        ))
+        Ok(WipOperationOutput::native(self.result_routes.detail(
+            &response,
+            context.result_namespaces.root("ticket"),
+        )?))
     }
 }
 
@@ -1129,7 +1106,7 @@ fn objective_collection_descriptor() -> InterfaceDescriptor {
         documentation: Some(Documentation {
             summary: "Search and create authoritative Workspace Objectives".into(),
             details: Some(
-                "Query results are bounded and include canonical item paths. Ticket references are data only and confer no Ticket authority."
+                "Query returns bounded items with data: Json, entry: Entry, links.tickets, and separate next_cursor/has_more. Inspect a selected entry and its Interface before read; create returns the same item envelope. Linked Ticket Entries are emitted only for committed published result namespaces; allocation alone omits the optional Entry. Publication does not attest existence or authority: selected reads may be missing or denied. No related resources are fetched eagerly."
                     .into(),
             ),
         }),
@@ -1151,7 +1128,7 @@ fn objective_collection_descriptor() -> InterfaceDescriptor {
                     parameter("limit", false, TypeExpr::Integer),
                     parameter("cursor", false, TypeExpr::String),
                 ],
-                returns: json_return("Bounded Objective query with cursor metadata and item paths"),
+                returns: results::declaration(true),
             },
             OperationDeclaration {
                 name: "create".into(),
@@ -1165,7 +1142,7 @@ fn objective_collection_descriptor() -> InterfaceDescriptor {
                     parameter("state", false, TypeExpr::String),
                     parameter("linked_tickets", false, list_of(TypeExpr::String)),
                 ],
-                returns: json_return("Created Objective with bounded context"),
+                returns: results::declaration(false),
             },
         ],
     }
@@ -1177,7 +1154,7 @@ fn objective_item_descriptor() -> InterfaceDescriptor {
         documentation: Some(Documentation {
             summary: "Read and mutate the Objective bound to this object route".into(),
             details: Some(
-                "The Objective identity is taken exclusively from the target path; operations do not accept a second Objective id."
+                "The Objective identity is taken exclusively from the target path; operations do not accept a second Objective id. Results separate bounded data from the subject Entry and linked Ticket coordinates. Inspect the chosen Entry and its Interface before read; unavailable or denied references do not invalidate a successful mutation and must not cause replay."
                     .into(),
             ),
         }),
@@ -1232,7 +1209,7 @@ fn operation(
             details: None,
         }),
         parameters,
-        returns: json_return("Authoritative Objective detail with bounded context"),
+        returns: results::declaration(false),
     }
 }
 
@@ -1248,16 +1225,6 @@ fn parameter(name: &str, required: bool, r#type: TypeExpr) -> ParameterDeclarati
 fn list_of(items: TypeExpr) -> TypeExpr {
     TypeExpr::List {
         items: Box::new(items),
-    }
-}
-
-fn json_return(summary: &str) -> ReturnDeclaration {
-    ReturnDeclaration {
-        documentation: Some(Documentation {
-            summary: summary.into(),
-            details: None,
-        }),
-        r#type: TypeExpr::Json,
     }
 }
 
@@ -1584,15 +1551,18 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct MockWorkspaceClient {
-        auth_denied: std::sync::atomic::AtomicBool,
-        authorizations: Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
+    pub(super) struct MockWorkspaceClient {
+        pub(super) auth_denied: std::sync::atomic::AtomicBool,
+        pub(super) authorizations:
+            Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
         responses: Mutex<VecDeque<crate::worker::WorkspaceResponse>>,
         requests: Mutex<Vec<WorkspaceRequest>>,
     }
 
     impl MockWorkspaceClient {
-        fn new(responses: impl IntoIterator<Item = crate::worker::WorkspaceResponse>) -> Self {
+        pub(super) fn new(
+            responses: impl IntoIterator<Item = crate::worker::WorkspaceResponse>,
+        ) -> Self {
             Self {
                 auth_denied: std::sync::atomic::AtomicBool::new(false),
                 authorizations: Mutex::new(Vec::new()),
@@ -1601,7 +1571,7 @@ mod tests {
             }
         }
 
-        fn requests(&self) -> Vec<WorkspaceRequest> {
+        pub(super) fn requests(&self) -> Vec<WorkspaceRequest> {
             self.requests
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -1657,7 +1627,7 @@ mod tests {
         }
     }
 
-    fn objective_response(title: &str) -> crate::worker::WorkspaceResponse {
+    pub(super) fn objective_response(title: &str) -> crate::worker::WorkspaceResponse {
         crate::worker::WorkspaceResponse {
             status: 200,
             body: json!({
@@ -1902,6 +1872,9 @@ mod tests {
             )),
             permissions: None,
             collection_route: "/objectives".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let initial = resolver.resolve("O-3").unwrap();
         assert_eq!(initial.object.name, "O-3");
@@ -2031,6 +2004,9 @@ mod tests {
                 rules: Vec::new(),
             }),
             objective_reference: "O-3".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let result = denied
             .call(
@@ -2039,6 +2015,7 @@ mod tests {
                 WipCallContext {
                     execution: ToolExecutionContext::direct(),
                     security_context: "test".into(),
+                    result_namespaces: Default::default(),
                 },
             )
             .await;
@@ -2053,7 +2030,9 @@ mod tests {
         let collection = ObjectiveCollectionWipHandler {
             backend,
             permissions: None,
-            collection_route: "/objectives".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let result = collection
             .call(
@@ -2062,6 +2041,7 @@ mod tests {
                 WipCallContext {
                     execution: ToolExecutionContext::direct(),
                     security_context: "test".into(),
+                    result_namespaces: Default::default(),
                 },
             )
             .await;
@@ -2094,11 +2074,14 @@ mod tests {
         let collection = ObjectiveCollectionWipHandler {
             backend: backend.clone(),
             permissions: None,
-            collection_route: "/objectives".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let context = || WipCallContext {
             execution: ToolExecutionContext::direct(),
             security_context: "test".into(),
+            result_namespaces: Default::default(),
         };
         assert!(
             collection
@@ -2115,6 +2098,9 @@ mod tests {
             backend,
             permissions: None,
             objective_reference: "O-3".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         assert!(item.call("read", &BTreeMap::new(), context()).await.is_ok());
         assert!(
@@ -2179,6 +2165,9 @@ mod tests {
             backend: WorkspaceHttpObjectiveBackend::new(client),
             permissions: None,
             objective_reference: "O-404".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         for (operation, arguments) in [
             ("read", BTreeMap::new()),
@@ -2194,6 +2183,7 @@ mod tests {
                     WipCallContext {
                         execution: ToolExecutionContext::direct(),
                         security_context: "test".into(),
+                        result_namespaces: Default::default(),
                     },
                 )
                 .await;
@@ -2245,7 +2235,9 @@ mod tests {
                 crate::worker::TestWorkspaceHttpClient::new("workspace", base_url),
             )),
             permissions: None,
-            collection_route: "/objectives".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let output = match handler
             .call(
@@ -2254,6 +2246,7 @@ mod tests {
                 WipCallContext {
                     execution: ToolExecutionContext::direct(),
                     security_context: "test".into(),
+                    result_namespaces: Default::default(),
                 },
             )
             .await
@@ -2265,8 +2258,12 @@ mod tests {
         let output = crate::wip::wip_to_json(&output.value).unwrap();
         assert_eq!(output["next_cursor"], "next-page");
         assert_eq!(output["has_more"], true);
-        assert_eq!(output["objectives"][0]["path"], "/objectives/O-3");
-        assert_eq!(output["objectives"][0]["linked_tickets"][0], "T-7");
+        assert_eq!(output["items"][0]["entry"], "/objectives/O-3");
+        assert_eq!(output["items"][0]["data"]["linked_tickets"][0], "T-7");
+        assert_eq!(
+            output["items"][0]["links"]["tickets"],
+            json!([{"id":"T-7"}])
+        );
         assert!(!output.to_string().contains("00001OBJECTIVE"));
         assert!(!output.to_string().contains("00001TICKET"));
     }
@@ -2312,12 +2309,18 @@ mod tests {
             backend: backend.clone(),
             permissions: None,
             collection_route: "/objectives".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let before = resolver.resolve("O-3").unwrap().object.validator;
         let handler = ObjectiveItemWipHandler {
             backend,
             permissions: None,
             objective_reference: "O-3".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let output = match handler
             .call(
@@ -2326,6 +2329,7 @@ mod tests {
                 WipCallContext {
                     execution: ToolExecutionContext::direct(),
                     security_context: "test".into(),
+                    result_namespaces: Default::default(),
                 },
             )
             .await
@@ -2335,8 +2339,8 @@ mod tests {
         };
         server.join().unwrap();
         let output = crate::wip::wip_to_json(&output.value).unwrap();
-        assert_eq!(output["objective"], "O-3");
-        assert_eq!(output["title"], "Changed");
+        assert_eq!(output["data"]["objective"], "O-3");
+        assert_eq!(output["data"]["title"], "Changed");
         let after = resolver.resolve("O-3").unwrap().object.validator;
         assert_eq!(before, after);
     }
@@ -2400,6 +2404,9 @@ mod tests {
             backend,
             permissions: None,
             objective_reference: "O-3".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let result = item
             .call(
@@ -2408,6 +2415,7 @@ mod tests {
                 WipCallContext {
                     execution: ToolExecutionContext::direct(),
                     security_context: "test".into(),
+                    result_namespaces: Default::default(),
                 },
             )
             .await;
