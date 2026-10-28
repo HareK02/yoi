@@ -303,3 +303,44 @@ fn assignment_event_and_tag_identifiers_do_not_create_child_objects_or_text_link
         );
     }
 }
+
+#[test]
+fn diagnostics_mr_origin_references_are_independent_of_capture_and_item_page() {
+    for items in [
+        json!([]),
+        json!([{"ticket":"T-42","merge_request_id":null}]),
+    ] {
+        for root in ["", "/changes"] {
+            let data = json!({"items":items,"next_cursor":"opaque-MR-999",
+            "source_checks":[
+                {"resource_kind":"merge_request_events","reference":"MR-1","origin_present":true,"captured":false},
+                {"resource_kind":"job_result","reference":"MR-2","origin_present":true,"captured":true},
+                {"resource_kind":"source_event","reference":"mr-event:MR-3:event","origin_present":true,"captured":true},
+                {"resource_kind":"future_kind","reference":"MR-4","origin_present":true,"captured":false}
+            ]});
+            let output = projected("notification_diagnostics", data.clone(), root, "");
+            assert_eq!(output["data"], data);
+            let expected = if root.is_empty() {
+                json!([{"id":"MR-1"}])
+            } else {
+                json!([{"id":"MR-1","entry":"/changes/MR-1"}])
+            };
+            assert_eq!(output["links"]["merge_requests"], expected);
+            assert!(output.get("entry").is_none());
+            let descriptor = InterfaceDescriptor {
+                format: INTERFACE_FORMAT_V1.into(),
+                documentation: None,
+                types: vec![],
+                operations: vec![OperationDeclaration {
+                    name: "notification_diagnostics".into(),
+                    documentation: None,
+                    parameters: vec![],
+                    returns: declaration("notification_diagnostics", false).unwrap(),
+                }],
+            };
+            descriptor
+                .validate_result("notification_diagnostics", &json_to_wip(&output).unwrap())
+                .unwrap();
+        }
+    }
+}

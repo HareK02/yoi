@@ -249,6 +249,15 @@ impl References {
                     add(&mut refs.tickets, row, "ticket");
                     add(&mut refs.mrs, row, "merge_request_id");
                 }
+                // MR origin checks are independent of capture and of the selected item page.
+                // Other check kinds identify Jobs/events, not published MR Objects.
+                for check in array(data, "source_checks") {
+                    if check.get("resource_kind").and_then(Value::as_str)
+                        == Some("merge_request_events")
+                    {
+                        add(&mut refs.mrs, check, "reference");
+                    }
+                }
             }
             _ => {} // Tag/answer/tracking-history/delivery identifiers and prose are domain data.
         }

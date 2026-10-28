@@ -1169,3 +1169,113 @@ async fn retained_ticket_result_mr_reference_is_model_navigation_not_body_or_sna
     assert_eq!(client.requests().len(), 2);
     client.assert_authorizations_consumed();
 }
+
+#[tokio::test]
+async fn diagnostics_uncaptured_mr_origin_is_typed_lazy_model_navigation_even_on_empty_pages() {
+    for published in [false, true] {
+        let page = json!({"items":[],"next_cursor":"opaque-next",
+            "source_checks":[{"resource_kind":"merge_request_events","reference":"MR-1","origin_present":true,"captured":false}]});
+        let mut responses = vec![crate::worker::WorkspaceResponse {
+            status: 200,
+            body: page.to_string(),
+        }];
+        let mut authorizations = vec![expected_authorization(
+            "notification.diagnostics.read",
+            "merge_request",
+            Some(("merge_request_id", "MR-1")),
+        )];
+        if published {
+            responses.push(crate::worker::WorkspaceResponse {
+                status: 200,
+                body: json!({"merge_request_id":"MR-1","ticket_ids":[],"thread":[]}).to_string(),
+            });
+            authorizations.push(expected_authorization(
+                "merge_request.read",
+                "merge_request",
+                Some(("merge_request_id", "MR-1")),
+            ));
+        }
+        let client =
+            Arc::new(ScriptedWorkspaceClient::new(responses).with_authorizations(authorizations));
+        let mut registry = WipMountRegistry::new();
+        let tickets = registry.allocate_namespace("ticket", "cases").unwrap();
+        let changes = registry
+            .allocate_namespace("merge-request", "changes")
+            .unwrap();
+        crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
+            &mut registry,
+            client.clone(),
+            crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
+            None,
+            &tickets,
+        )
+        .unwrap();
+        if published {
+            crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
+                &mut registry,
+                client.clone(),
+                manifest::MergeRequestFeatureConfig {
+                    show: true,
+                    ..Default::default()
+                },
+                None,
+                &changes,
+            )
+            .unwrap();
+        }
+        let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        let runtime = install_wip_mode_with_mounts(
+            &mut engine,
+            None,
+            "diagnostics-origin-model".into(),
+            registry,
+        )
+        .unwrap();
+        let tools = engine.tool_server_handle();
+        tools.flush_pending();
+        let collection = ticket_result_model_inspect(&tools, &json!("/cases")).await;
+        let result=ticket_result_model_invoke(&tools,&collection,"notification_diagnostics",json!({"filter":{"merge_request":"/changes/MR-1"},"page":{"cursor":"previous-page","limit":1}})).await;
+        assert_eq!(result["data"], page);
+        assert_eq!(result["links"]["merge_requests"][0]["id"], "MR-1");
+        assert_eq!(
+            client.requests().len(),
+            1,
+            "origin reference never prefetches current MR"
+        );
+        let declaration = runtime
+            .host
+            .projection("/cases")
+            .unwrap()
+            .descriptor
+            .operations
+            .into_iter()
+            .find(|op| op.name == "notification_diagnostics")
+            .unwrap();
+        let mut entries = vec![];
+        ticket_result_declared_entries(&declaration.returns.r#type, &result, &mut entries);
+        if published {
+            assert_eq!(entries, vec!["/changes/MR-1"]);
+            let mr =
+                ticket_result_model_inspect(&tools, &result["links"]["merge_requests"][0]["entry"])
+                    .await;
+            let interface = ticket_result_model_inspect(&tools, &mr["interfaces"][0]["path"]).await;
+            assert!(
+                interface["interface_signature"]
+                    .as_str()
+                    .unwrap()
+                    .contains("read(")
+            );
+            ticket_result_model_invoke(&tools, &mr, "read", json!({})).await;
+            assert_eq!(client.requests().len(), 2);
+        } else {
+            assert!(entries.is_empty());
+            assert!(result["links"]["merge_requests"][0].get("entry").is_none());
+        }
+        client.assert_authorizations_consumed();
+        let request = &client.requests()[0];
+        assert!(request.path.contains("cursor=previous-page"));
+        assert!(request.path.contains("merge_request_id=MR-1"));
+        let tree = ticket_result_model_call(&tools, "Tree", json!({"path":"/","depth":3})).await;
+        assert!(!tree.to_string().contains("/changes/MR-1"));
+    }
+}
