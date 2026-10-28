@@ -7,6 +7,14 @@ use crate::worker::WorkspaceResponse;
 use std::sync::{Condvar, Mutex};
 use tracing::instrument::WithSubscriber;
 
+fn operation_body(mutation: bool) -> serde_json::Value {
+    if mutation {
+        serde_json::json!({"connection_id":"connection-1", "validator":"v", "request":{"base_digest":"d", "entrypoints":["main.dcdl"], "changes":[{"kind":"update", "path":"main.dcdl", "expected_digest":"d", "content":UNSAFE}]}})
+    } else {
+        serde_json::json!({"connection_id":"connection-1", "validator":"v", "path":"main.dcdl"})
+    }
+}
+
 const UNSAFE: &str = "secret-token /private/config credential=unsafe";
 
 #[derive(Clone, Copy, Debug)]
@@ -105,6 +113,14 @@ impl WorkspaceClient for Client {
         &self,
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if request.path.ends_with("/authorization/check") {
+            let input: server_api::authorization::OperationAuthorizationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            return Ok(WorkspaceResponse {
+                status: 200,
+                body: serde_json::json!({"scope": input.resource}).to_string(),
+            });
+        }
         {
             let mut state = self.state.lock().unwrap();
             state.requests += 1;
@@ -292,7 +308,7 @@ async fn production_reply_failures_retain_reasons_without_retrying_mutations() {
             let result = backend
                 .post::<serde_json::Value, _>(
                     if mutation { "/commit" } else { "/read" },
-                    &serde_json::json!({"content": UNSAFE}),
+                    &operation_body(mutation),
                     mutation,
                 )
                 .with_subscriber(capture.dispatch())
@@ -331,7 +347,7 @@ async fn production_typed_rejections_preserve_public_codes_and_never_apply() {
                 backend
                     .post::<serde_json::Value, _>(
                         if mutation { "/commit" } else { "/read" },
-                        &(),
+                        &operation_body(mutation),
                         mutation,
                     )
                     .with_subscriber(capture.dispatch())
@@ -356,7 +372,7 @@ async fn production_deadline_is_unknown_after_effect_and_blocking_completion_is_
         let backend =
             WorkspaceConfigBackend::new(client.clone()).with_deadline(Duration::from_secs(1));
         let capture = Capture::default();
-        let body = serde_json::json!({"content": UNSAFE});
+        let body = operation_body(mutation);
         let request = backend
             .post::<serde_json::Value, _>(
                 if mutation { "/commit" } else { "/read" },

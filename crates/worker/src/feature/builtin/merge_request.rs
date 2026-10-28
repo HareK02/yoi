@@ -39,6 +39,7 @@ use manifest::{MergeRequestFeatureConfig, ToolPermissionAction, ToolPermissionCo
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use server_api::authorization::PermissionResource;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -209,6 +210,13 @@ impl Tool for MergeRequestTool {
             Kind::Readiness => {
                 let v: MergeRequestInput = parse(input)?;
                 nonempty_named("merge_request_id", &v.merge_request_id)?;
+                self.authorize(
+                    "merge_request.readiness",
+                    PermissionResource::MergeRequest {
+                        workspace_id: ws.into(),
+                        merge_request_id: v.merge_request_id.clone(),
+                    },
+                )?;
                 (
                     WorkspaceRequestMethod::Get,
                     format!(
@@ -222,6 +230,13 @@ impl Tool for MergeRequestTool {
             Kind::Open => {
                 let v: OpenMergeRequestInput = parse(input)?;
                 nonempty(&v.ticket)?;
+                self.authorize(
+                    "merge_request.open",
+                    PermissionResource::Ticket {
+                        workspace_id: ws.into(),
+                        ticket_id: v.ticket.clone(),
+                    },
+                )?;
                 (
                     WorkspaceRequestMethod::Post,
                     format!(
@@ -236,6 +251,13 @@ impl Tool for MergeRequestTool {
             Kind::Complete => {
                 let v: CompleteMergeRequestInput = parse(input)?;
                 nonempty_named("merge_request_id", &v.merge_request_id)?;
+                self.authorize(
+                    "merge_request.complete",
+                    PermissionResource::MergeRequest {
+                        workspace_id: ws.into(),
+                        merge_request_id: v.merge_request_id.clone(),
+                    },
+                )?;
                 (
                     WorkspaceRequestMethod::Post,
                     format!(
@@ -254,6 +276,13 @@ impl Tool for MergeRequestTool {
                         "Review submit requires injected Reviewer capability".into(),
                     )
                 })?;
+                self.authorize(
+                    "merge_request.review",
+                    PermissionResource::MergeRequest {
+                        workspace_id: ws.into(),
+                        merge_request_id: ctx.merge_request_id.clone(),
+                    },
+                )?;
                 (
                     WorkspaceRequestMethod::Post,
                     format!(
@@ -286,6 +315,14 @@ impl Tool for MergeRequestTool {
 }
 
 impl MergeRequestTool {
+    fn authorize(&self, operation: &str, resource: PermissionResource) -> Result<(), ToolError> {
+        self.client.authorize_operation(operation, &resource)
+            .map_err(|error| {
+                let denied = matches!(&error, crate::worker::WorkspaceClientError::Request(message)
+                    if message.contains("HTTP status 403") || message.contains("HTTP status 401"));
+                ToolError::ExecutionFailed(format!("Merge Request operation authorization failed before dispatch: {operation}; resource={resource:?}; denied={denied}"))
+            })
+    }
     fn show_merge_request(
         &self,
         workspace_id: &str,
@@ -293,6 +330,13 @@ impl MergeRequestTool {
         after: Option<u64>,
         limit: Option<usize>,
     ) -> Result<ToolOutput, ToolError> {
+        self.authorize(
+            "merge_request.read",
+            PermissionResource::MergeRequest {
+                workspace_id: workspace_id.into(),
+                merge_request_id: merge_request_id.into(),
+            },
+        )?;
         let merge_request_id = encode_path_segment(merge_request_id);
         let mut path = format!("/api/w/{workspace_id}/merge-requests/{merge_request_id}");
         let mut query = Vec::new();
@@ -874,6 +918,19 @@ fn map_merge_request_tool_error(error: ToolError, _mutating: bool) -> WipOperati
             ProtocolErrorCode::InvalidArguments,
             format!("{code}: {message}"),
         ),
+        ToolError::ExecutionFailed(message)
+            if message
+                .starts_with("Merge Request operation authorization failed before dispatch:") =>
+        {
+            merge_request_protocol_failure(
+                if message.ends_with("denied=true") {
+                    ProtocolErrorCode::PermissionDenied
+                } else {
+                    ProtocolErrorCode::Internal
+                },
+                message,
+            )
+        }
         ToolError::ExecutionFailed(message) => match merge_request_http_status(&message) {
             Some(401 | 403) => {
                 merge_request_protocol_failure(ProtocolErrorCode::PermissionDenied, message)
@@ -1126,6 +1183,8 @@ mod tests {
 
     #[derive(Debug)]
     struct RecordingWorkspaceClient {
+        auth_denied: std::sync::atomic::AtomicBool,
+        authorizations: Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
         responses: Mutex<VecDeque<WorkspaceResponse>>,
         requests: Mutex<Vec<WorkspaceRequest>>,
     }
@@ -1133,6 +1192,8 @@ mod tests {
     impl RecordingWorkspaceClient {
         fn new(responses: Vec<WorkspaceResponse>) -> Self {
             Self {
+                auth_denied: std::sync::atomic::AtomicBool::new(false),
+                authorizations: Mutex::new(Vec::new()),
                 responses: Mutex::new(responses.into()),
                 requests: Mutex::new(Vec::new()),
             }
@@ -1156,6 +1217,21 @@ mod tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                let input: server_api::authorization::OperationAuthorizationRequest =
+                    serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                self.authorizations.lock().unwrap().push(input.clone());
+                if self.auth_denied.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(WorkspaceResponse {
+                        status: 403,
+                        body: "{}".into(),
+                    });
+                }
+                return Ok(WorkspaceResponse {
+                    status: 200,
+                    body: serde_json::json!({"scope": input.resource}).to_string(),
+                });
+            }
             self.requests.lock().expect("request lock").push(request);
             self.responses
                 .lock()
@@ -1750,5 +1826,132 @@ mod tests {
                 assert!(!j.contains(banned), "{banned} in {j}")
             }
         }
+    }
+    #[tokio::test]
+    async fn denied_merge_request_operations_do_not_reach_provider() {
+        for (kind, input, operation) in [
+            (Kind::Show, json!({"merge_request_id":"MR-1"}), "read"),
+            (
+                Kind::Readiness,
+                json!({"merge_request_id":"MR-1"}),
+                "readiness",
+            ),
+            (
+                Kind::Open,
+                json!({"ticket":"T-1", "repository_key":"repo", "selector_from":"work", "selector_to":"develop"}),
+                "open",
+            ),
+            (
+                Kind::Complete,
+                json!({"merge_request_id":"MR-1", "operation_id":"complete-1", "approval_event_id":"approved", "target_ref_before":"before", "target_ref_after":"after", "strategy":"fast_forward", "resolution":"none"}),
+                "complete",
+            ),
+            (Kind::Review, json!({"decision":"approve"}), "review"),
+        ] {
+            let client = Arc::new(RecordingWorkspaceClient::new(vec![]));
+            client
+                .auth_denied
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let bound: Arc<dyn WorkspaceClient> = if kind == Kind::Review {
+                Arc::new(crate::worker::ReviewerChildWorkspaceClient::new(
+                    client.clone(),
+                    crate::worker::ReviewerContext {
+                        ticket_id: "T-1".into(),
+                        merge_request_id: "MR-1".into(),
+                    },
+                    "secret".into(),
+                ))
+            } else {
+                client.clone()
+            };
+            let tool = MergeRequestTool {
+                client: bound,
+                kind,
+            };
+            let error = tool
+                .execute(&input.to_string(), ToolExecutionContext::direct())
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("denied=true"),
+                "{operation}: {error}"
+            );
+            assert!(matches!(
+                map_merge_request_tool_error(error, kind.mutating()),
+                WipOperationError::Protocol(ProtocolError {
+                    code: ProtocolErrorCode::PermissionDenied,
+                    ..
+                })
+            ));
+            assert!(client.requests.lock().unwrap().is_empty());
+            let auth = client.authorizations.lock().unwrap();
+            assert_eq!(auth.len(), 1);
+            assert_eq!(auth[0].operation, format!("merge_request.{operation}"));
+            assert_eq!(
+                auth[0].resource,
+                if kind == Kind::Open {
+                    PermissionResource::Ticket {
+                        workspace_id: "ws".into(),
+                        ticket_id: "T-1".into(),
+                    }
+                } else {
+                    PermissionResource::MergeRequest {
+                        workspace_id: "ws".into(),
+                        merge_request_id: "MR-1".into(),
+                    }
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_merge_request_rechecks_authority_after_successful_tool_read() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(
+            json!({"merge_request_id":"MR-1"}),
+        )]));
+        MergeRequestTool {
+            client: client.clone(),
+            kind: Kind::Show,
+        }
+        .execute(
+            r#"{"merge_request_id":"MR-1"}"#,
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+        client
+            .auth_denied
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let native = native_merge_request_tools(
+            client.clone(),
+            MergeRequestFeatureConfig {
+                show: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .find(|tool| tool.kind == Kind::Show)
+        .unwrap();
+        let result = execute_native_merge_request_tool(
+            &native,
+            &None,
+            json!({"merge_request_id":"MR-1"}),
+            Some("MR-1"),
+            WipCallContext {
+                execution: ToolExecutionContext::direct(),
+                security_context: "test".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::PermissionDenied,
+                ..
+            }))
+        ));
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        assert_eq!(client.authorizations.lock().unwrap().len(), 2);
     }
 }

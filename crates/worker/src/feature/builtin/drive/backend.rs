@@ -17,6 +17,7 @@ use crate::worker::{
     WorkspaceBinaryRequest, WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod,
 };
 use serde::{Serialize, de::DeserializeOwned};
+use server_api::authorization::PermissionResource;
 use server_api::*;
 
 pub(super) const DEADLINE: Duration = Duration::from_secs(30);
@@ -30,6 +31,14 @@ pub struct DriveBackend {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DriveError {
+    #[error(
+        "Drive operation authorization failed before dispatch: {operation}; resource={resource:?}; denied={denied}"
+    )]
+    Authorization {
+        operation: String,
+        resource: PermissionResource,
+        denied: bool,
+    },
     #[error("Drive access denied")]
     Denied,
     #[error("Drive resource not found")]
@@ -62,6 +71,31 @@ impl DriveBackend {
             .workspace_id()
             .filter(|id| !id.is_empty() && self.client.is_available())
             .ok_or(DriveError::Denied)
+    }
+    fn authorize(&self, operation: &str, resource: PermissionResource) -> Result<(), DriveError> {
+        self.client
+            .authorize_operation(operation, &resource)
+            .map_err(|error| {
+                let denied = matches!(&error, crate::worker::WorkspaceClientError::Request(message)
+                    if message.contains("HTTP status 403") || message.contains("HTTP status 401"));
+                DriveError::Authorization {
+                    operation: operation.into(),
+                    resource,
+                    denied,
+                }
+            })
+    }
+    fn workspace_resource(&self) -> Result<PermissionResource, DriveError> {
+        Ok(PermissionResource::Workspace {
+            workspace_id: self.workspace()?.into(),
+        })
+    }
+    fn entry_resource(&self, entry: &DriveEntryRef) -> Result<PermissionResource, DriveError> {
+        self.validate_ref(entry)?;
+        Ok(PermissionResource::DriveEntry {
+            workspace_id: entry.workspace_id.clone(),
+            node_id: entry.node_id.clone(),
+        })
     }
     fn base(&self) -> Result<String, DriveError> {
         Ok(format!("/api/w/{}/drive", encode(self.workspace()?)))
@@ -176,6 +210,7 @@ impl DriveBackend {
         .await
     }
     pub async fn capabilities(&self) -> Result<DriveCapabilities, DriveError> {
+        self.authorize("drive.capabilities", self.workspace_resource()?)?;
         self.get(
             "/capabilities",
             &serde_json::json!({}),
@@ -184,6 +219,7 @@ impl DriveBackend {
         .await
     }
     pub async fn root(&self) -> Result<DriveEntry, DriveError> {
+        self.authorize("drive.root", self.workspace_resource()?)?;
         let diagnostic = Diagnostic::new(Adapter::Drive, "root", false, None);
         let entry: DriveEntry = self
             .json(
@@ -201,6 +237,7 @@ impl DriveBackend {
         Ok(entry)
     }
     pub async fn metadata(&self, entry: &DriveEntryRef) -> Result<DriveEntry, DriveError> {
+        self.authorize("drive.metadata", self.entry_resource(entry)?)?;
         self.validate_ref(entry)?;
         let diagnostic = Diagnostic::new(Adapter::Drive, "metadata", false, None);
         let result: DriveEntry = self
@@ -226,6 +263,7 @@ impl DriveBackend {
         limit: Option<u32>,
         after: Option<String>,
     ) -> Result<DriveListResponse, DriveError> {
+        self.authorize("drive.list", self.entry_resource(parent)?)?;
         self.validate_ref(parent)?;
         let diagnostic = Diagnostic::new(Adapter::Drive, "list", false, None);
         let result: DriveListResponse = self
@@ -258,6 +296,7 @@ impl DriveBackend {
         Ok(result)
     }
     pub async fn search(&self, query: DriveSearchQuery) -> Result<DriveListResponse, DriveError> {
+        self.authorize("drive.search", self.workspace_resource()?)?;
         let diagnostic = Diagnostic::new(Adapter::Drive, "search", false, None);
         let result: DriveListResponse = self.get("/search", &query, &diagnostic).await?;
         self.validate_page(
@@ -290,6 +329,7 @@ impl DriveBackend {
         entry: &DriveEntryRef,
         max_bytes: u32,
     ) -> Result<DriveReadTextResponse, DriveError> {
+        self.authorize("drive.read_text", self.entry_resource(entry)?)?;
         self.validate_ref(entry)?;
         let diagnostic = Diagnostic::new(Adapter::Drive, "read_text", false, None);
         let result: DriveReadTextResponse = self
@@ -341,6 +381,7 @@ impl DriveBackend {
                 body: None,
                 max_response_bytes: DRIVE_CHUNK_MAX_BYTES as usize,
             };
+            self.authorize("drive.read_chunk", self.entry_resource(&entry.entry)?)?;
             let client = self.client.clone();
             let deadline = self.deadline;
             let response = tokio::time::timeout(
@@ -454,6 +495,24 @@ impl DriveBackend {
             diagnostic.record(Stage::Request, Reason::RequestSize, None);
             return Err(DriveError::Limit);
         }
+        match &request.mutation {
+            DriveMutation::CreateFolder { parent, .. } => {
+                self.authorize("drive.create_folder", self.entry_resource(parent)?)?
+            }
+            DriveMutation::CreateText { parent, .. } => {
+                self.authorize("drive.create_text", self.entry_resource(parent)?)?
+            }
+            DriveMutation::UpdateText { id, .. } => {
+                self.authorize("drive.update_text", self.entry_resource(id)?)?
+            }
+            DriveMutation::Delete { id, .. } => {
+                self.authorize("drive.delete", self.entry_resource(id)?)?
+            }
+            DriveMutation::Relocate { id, parent, .. } => {
+                self.authorize("drive.relocate", self.entry_resource(id)?)?;
+                self.authorize("drive.relocate", self.entry_resource(parent)?)?;
+            }
+        }
         let result = self
             .json(
                 WorkspaceRequest::json(
@@ -479,6 +538,18 @@ impl DriveBackend {
             diagnostic.record(Stage::Request, Reason::RequestSize, None);
             return Err(DriveError::Limit);
         }
+        let node_id = match query.operation {
+            DriveUploadOperation::Create => query.parent_id.as_ref(),
+            DriveUploadOperation::Update => query.id.as_ref(),
+        }
+        .ok_or_else(|| DriveError::Invalid("upload target required".into()))?;
+        self.authorize(
+            "drive.upload",
+            self.entry_resource(&DriveEntryRef {
+                workspace_id: query.entry_workspace_id.clone(),
+                node_id: node_id.clone(),
+            })?,
+        )?;
         let path = format!("{}/upload{}", self.base()?, query_string(&query)?);
         let request = WorkspaceBinaryRequest {
             method: WorkspaceRequestMethod::Put,
@@ -540,6 +611,13 @@ impl DriveBackend {
         if request_id.is_empty() || request_id.len() > 256 {
             return Err(DriveError::Invalid("invalid request ID".into()));
         }
+        self.authorize(
+            "drive.request_status",
+            PermissionResource::DriveRequest {
+                workspace_id: self.workspace()?.into(),
+                request_id: request_id.into(),
+            },
+        )?;
         let response: DriveRequestStatusResponse = self
             .json(
                 WorkspaceRequest::get(format!("{}/requests/{}", self.base()?, encode(request_id))),

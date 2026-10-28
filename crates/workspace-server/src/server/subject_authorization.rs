@@ -143,6 +143,148 @@ fn live_child_grant(
     ))
 }
 
+/// Job domain capabilities attenuate this policy; they are never non-Subject
+/// compatibility. A missing frozen origin cannot mint new operation permissions.
+fn job_permissions(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> ApiResult<Option<Vec<ScopedPermission>>> {
+    let Some(binding) = api
+        .store
+        .worker_registry_projection(api.workspace_id(), worker)?
+        .and_then(|projection| projection.job)
+    else {
+        return Ok(None);
+    };
+    let job = api
+        .store
+        .get_backend_job(api.workspace_id(), &binding.job_id)?
+        .ok_or_else(|| denied("Job authorization binding has no intent"))?;
+    let subject_id = job
+        .request
+        .grants
+        .subjektiv_consolidation
+        .as_ref()
+        .map(|grant| &grant.subject_id)
+        .or_else(|| {
+            job.request
+                .grants
+                .subjektiv_journal
+                .as_ref()
+                .map(|grant| &grant.subject_id)
+        });
+    let Some(subject_id) = subject_id else {
+        // Generic Jobs have no Subject operation capability, even if their Profile
+        // exposes a protected Feature or their source owns a Subject body.
+        return Ok(Some(Vec::new()));
+    };
+    // This shared check validates current attempt, worker, input digest and deadline
+    // for both Job kinds, independently of its optional consolidation payload.
+    subjektiv_job::active_grant(api, api.workspace_id(), worker)?;
+    let origin = job
+        .request
+        .source_worker
+        .as_ref()
+        .ok_or_else(|| denied("saved Job has no frozen operation-authority origin"))?;
+    if current_body_subject(api, origin)?.as_deref() != Some(subject_id.as_str()) {
+        return Err(denied("Job origin is no longer the current Subject body"));
+    }
+    let permissions = policy(api, subject_id)?
+        .map(|policy| policy.execution)
+        .unwrap_or_default();
+    Ok(Some(permissions.into_iter().filter(|permission| {
+        // Domain grants are immutable capabilities, not permission-policy snapshots.
+        // Current policy can narrow them, but cannot turn a Journal Job into a
+        // consolidator or confer other Subject operations on either Job kind.
+        let within_job = if job.request.grants.subjektiv_consolidation.is_some() {
+            matches!(permission.operation.as_str(),
+                "memory.consolidation.supply" | "memory.staging.list" | "memory.staging.read"
+                | "memory.read" | "memory.query" | "memory.resident.read" | "memory.resident.supply"
+                | "memory.candidate.decide" | "memory.proposal.validate" | "memory.changes.list"
+                | "memory.receipt.read" | "memory.surface.prepare" | "memory.surface.supply"
+                | "memory.surface.publish" | "memory.surface.fail")
+        } else {
+            matches!(permission.operation.as_str(),
+                "journal.job.input.read" | "journal.job.input.supply" | "journal.state.read"
+                | "journal.text.read" | "journal.operation.query" | "journal.operation.list"
+                | "journal.operation.coverage.read" | "journal.entry.create" | "journal.entry.fix"
+                | "journal.entry.rewrite" | "journal.position.update" | "journal.unchanged.confirm"
+                | "journal.checkpoint" | "journal.finish")
+        };
+        within_job && matches!(&permission.resource, PermissionResource::Subject {workspace_id, subject_id: granted}
+            if workspace_id == api.workspace_id() && granted == subject_id)
+    }).collect()))
+}
+
+/// Resolve only Host-held Job identity; authorization still validates the live
+/// attempt, frozen origin and current policy before returning the resource.
+pub(super) fn job_subject(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> ApiResult<Option<String>> {
+    let Some(binding) = api
+        .store
+        .worker_registry_projection(api.workspace_id(), worker)?
+        .and_then(|projection| projection.job)
+    else {
+        return Ok(None);
+    };
+    let job = api
+        .store
+        .get_backend_job(api.workspace_id(), &binding.job_id)?
+        .ok_or_else(|| denied("Job authorization binding has no intent"))?;
+    Ok(job
+        .request
+        .grants
+        .subjektiv_consolidation
+        .map(|grant| grant.subject_id)
+        .or_else(|| {
+            job.request
+                .grants
+                .subjektiv_journal
+                .map(|grant| grant.subject_id)
+        }))
+}
+
+pub(super) fn authorize_job_input(
+    api: &WorkspaceApi,
+    request: &BackendJobRequest,
+) -> ApiResult<()> {
+    let binding = request
+        .grants
+        .subjektiv_consolidation
+        .as_ref()
+        .map(|grant| (&grant.subject_id, "memory.consolidation.supply"))
+        .or_else(|| {
+            request
+                .grants
+                .subjektiv_journal
+                .as_ref()
+                .map(|grant| (&grant.subject_id, "journal.job.input.supply"))
+        });
+    let Some((subject_id, operation)) = binding else {
+        return Ok(());
+    };
+    let origin = request
+        .source_worker
+        .as_ref()
+        .ok_or_else(|| denied("saved Job has no frozen operation-authority origin"))?;
+    if current_body_subject(api, origin)?.as_deref() != Some(subject_id.as_str()) {
+        return Err(denied("Job origin is no longer the current Subject body"));
+    }
+    authorize(
+        api,
+        origin,
+        &OperationAuthorizationRequest {
+            operation: operation.into(),
+            resource: PermissionResource::Subject {
+                workspace_id: api.workspace_id().into(),
+                subject_id: subject_id.clone(),
+            },
+        },
+    )
+}
+
 /// None is explicitly the preexisting non-Subject contract, not an all-powerful
 /// grant. Existing Workdir/provider/Ticket checks still apply to those Workers.
 pub(super) fn worker_permissions(
@@ -155,6 +297,9 @@ pub(super) fn worker_permissions(
             .map_err(subjektiv_store_error)?
     {
         return Err(denied("Worker belonged to an explicitly deleted Subject"));
+    }
+    if let Some(permissions) = job_permissions(api, worker)? {
+        return Ok(Some(permissions));
     }
     if let Some(grant) = live_child_grant(api, worker)? {
         return Ok(Some(grant.permissions));
@@ -177,14 +322,57 @@ pub(super) fn authorize(
     authorize_scope(api, worker, request).map(|_| ())
 }
 
+fn resources_cover(
+    api: &WorkspaceApi,
+    granted: &PermissionResource,
+    requested: &PermissionResource,
+) -> ApiResult<bool> {
+    if granted.covers(requested) {
+        return Ok(true);
+    }
+    let (workspace_id, granted_id, requested_id, kind) = match (granted, requested) {
+        (
+            PermissionResource::Ticket {
+                workspace_id: a,
+                ticket_id: ai,
+            },
+            PermissionResource::Ticket {
+                workspace_id: b,
+                ticket_id: bi,
+            },
+        ) if a == b => (a, ai, bi, WorkspaceResourceKind::Ticket),
+        (
+            PermissionResource::Objective {
+                workspace_id: a,
+                objective_id: ai,
+            },
+            PermissionResource::Objective {
+                workspace_id: b,
+                objective_id: bi,
+            },
+        ) if a == b => (a, ai, bi, WorkspaceResourceKind::Objective),
+        _ => return Ok(false),
+    };
+    // Resolve public aliases using identity metadata only. Never fetch Ticket,
+    // Objective or MR bodies to answer an authorization query. Missing aliases
+    // and unrelated resources have the same refusal.
+    let granted_id = api
+        .store
+        .resolve_resource_reference(workspace_id, kind, granted_id)?;
+    let requested_id = api
+        .store
+        .resolve_resource_reference(workspace_id, kind, requested_id)?;
+    Ok(granted_id.is_some() && granted_id == requested_id)
+}
+
 pub(super) fn authorize_scope(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
     request: &OperationAuthorizationRequest,
 ) -> ApiResult<Option<PermissionResource>> {
     request.validate().map_err(denied)?;
-    if let PermissionResource::Workspace { workspace_id } = &request.resource {
-        if workspace_id != &api.config.workspace_id {
+    if let Some(workspace_id) = request.resource.workspace_id() {
+        if workspace_id != api.config.workspace_id {
             return Err(denied("resource belongs to another Workspace"));
         }
     }
@@ -195,11 +383,18 @@ pub(super) fn authorize_scope(
     let Some(permissions) = worker_permissions(api, worker)? else {
         return Ok(None);
     };
-    if let Some(permission) = permissions
-        .iter()
-        .find(|permission| permission.covers(&needed))
-    {
-        return Ok(Some(permission.resource.clone()));
+    for permission in &permissions {
+        if permission.operation == needed.operation
+            && resources_cover(api, &permission.resource, &needed.resource)?
+        {
+            return Ok(Some(if permission.resource.covers(&needed.resource) {
+                permission.resource.clone()
+            } else {
+                // Alias resolution proved exact identity; return the spelling the
+                // caller requested rather than a scope it cannot lexically match.
+                needed.resource.clone()
+            }));
+        }
     }
     Err(denied(format!(
         "operation `{}` is not granted for the requested resource",

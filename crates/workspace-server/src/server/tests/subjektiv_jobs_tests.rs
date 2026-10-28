@@ -7,6 +7,81 @@ use memory::extract::{CandidateKind, ExtractedCandidate, StagingEvidence, Stagin
 use memory::schema::SourceRef;
 use memory::schema::{EvidenceKind, EvidenceOrigin, EvidenceOriginKind};
 
+const MEMORY_JOB_OPERATIONS: &[&str] = &[
+    "memory.consolidation.request",
+    "memory.consolidation.supply",
+    "memory.staging.list",
+    "memory.staging.read",
+    "memory.candidate.decide",
+    "memory.query",
+    "memory.read",
+    "memory.changes.list",
+    "memory.surface.prepare",
+    "memory.surface.supply",
+    "memory.surface.publish",
+    "memory.surface.fail",
+];
+
+fn grant_memory_operations(api: &WorkspaceApi, subject: &str, operations: &[&str]) {
+    use server_api::authorization::{
+        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
+    };
+    let store = open_subjektiv_store(api).unwrap();
+    let previous = store.subject_permissions(subject).unwrap();
+    store
+        .set_subject_permissions(
+            subject,
+            &SubjectPermissionsUpdate {
+                operation_id: Uuid::now_v7().to_string(),
+                expected_change_id: previous.map(|policy| policy.change_id),
+                execution: operations
+                    .iter()
+                    .map(|operation| ScopedPermission {
+                        operation: (*operation).into(),
+                        resource: PermissionResource::Subject {
+                            workspace_id: TEST_WORKSPACE_ID.into(),
+                            subject_id: subject.into(),
+                        },
+                    })
+                    .collect(),
+                delegation: vec![],
+            },
+        )
+        .unwrap();
+}
+
+async fn memory_job_source(api: &WorkspaceApi, subject: &str) -> RuntimeWorkerRef {
+    grant_memory_operations(api, subject, MEMORY_JOB_OPERATIONS);
+    attach_memory_job_source(api, subject).await
+}
+
+async fn attach_memory_job_source(api: &WorkspaceApi, subject: &str) -> RuntimeWorkerRef {
+    seed_test_delivery_binding(api);
+    let Json(created) = create_workspace_worker(
+        State(api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
+            display_name: "Memory Job authority source".into(),
+            singleton_key: None,
+            profile: Some("builtin:companion".into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachments: vec![],
+            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
+                    subject_id: subject.into(),
+                }),
+            },
+            control_operation_id: None,
+            execution_grant: None,
+        }),
+    )
+    .await
+    .unwrap();
+    RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
+}
+
 fn stage(store: &crate::subjektiv::SubjektivStore, subject: &str, id: &str) {
     let origin = EvidenceOrigin {
         kind: EvidenceOriginKind::HumanInput,
@@ -105,10 +180,12 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
     let subject = store
         .create_subject(SubjectRole::new("test-subject").unwrap())
         .unwrap();
+    let source = memory_job_source(&api, &subject.id).await;
     stage(&store, &subject.id, "candidate-first");
     let started = start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
+        Some(source.clone()),
         MemoryConsolidateStagingOperation { force: true },
     )
     .await
@@ -153,6 +230,7 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
     let again = start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
+        Some(source.clone()),
         MemoryConsolidateStagingOperation { force: true },
     )
     .await
@@ -261,6 +339,7 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
     let next = start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
+        Some(source.clone()),
         MemoryConsolidateStagingOperation { force: true },
     )
     .await
@@ -285,11 +364,13 @@ async fn subjektiv_job_surface_only_requires_attempt_owned_generation_and_real_o
     let subject = store
         .create_subject(SubjectRole::new("surface-only").unwrap())
         .unwrap();
+    let source = memory_job_source(&api, &subject.id).await;
     let old = store.prepare_surface_generation(&subject.id).unwrap();
     assert_eq!(
         start_subjektiv_staging_consolidation(
             api.clone(),
             &subject.id,
+            Some(source.clone()),
             MemoryConsolidateStagingOperation { force: false }
         )
         .await
@@ -375,6 +456,7 @@ async fn subjektiv_job_surface_only_requires_attempt_owned_generation_and_real_o
         start_subjektiv_staging_consolidation(
             api.clone(),
             &subject.id,
+            Some(source.clone()),
             MemoryConsolidateStagingOperation { force: true }
         )
         .await
@@ -502,7 +584,8 @@ async fn subjektiv_job_legacy_cutover_waits_foreground_then_removes_only_owned_c
     let subject = store
         .create_subject(SubjectRole::new("legacy-cutover").unwrap())
         .unwrap();
-    let subject_body = spawn_ticket_check_source(&api, "subject-body-protected");
+    let source = memory_job_source(&api, &subject.id).await;
+    let subject_body = source.clone();
     let key = format!("subjektiv-consolidation:{}", subject.id);
     let legacy = api
         .spawn_workspace_worker(
@@ -557,6 +640,7 @@ async fn subjektiv_job_legacy_cutover_waits_foreground_then_removes_only_owned_c
         start_subjektiv_staging_consolidation(
             api.clone(),
             &subject.id,
+            Some(source.clone()),
             MemoryConsolidateStagingOperation { force: true }
         )
         .await
@@ -590,6 +674,7 @@ async fn subjektiv_job_legacy_cutover_waits_foreground_then_removes_only_owned_c
         start_subjektiv_staging_consolidation(
             api.clone(),
             &subject.id,
+            Some(source.clone()),
             MemoryConsolidateStagingOperation { force: true }
         )
         .await
@@ -616,6 +701,7 @@ async fn subjektiv_job_long_receipts_and_escaped_ids_fit_result_budget_without_l
     let subject = store
         .create_subject(SubjectRole::new("result-budget").unwrap())
         .unwrap();
+    let source = memory_job_source(&api, &subject.id).await;
     for i in 0..100 {
         stage(
             &store,
@@ -626,6 +712,7 @@ async fn subjektiv_job_long_receipts_and_escaped_ids_fit_result_budget_without_l
     start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
+        Some(source.clone()),
         MemoryConsolidateStagingOperation { force: true },
     )
     .await
@@ -706,6 +793,7 @@ async fn subjektiv_job_long_receipts_and_escaped_ids_fit_result_budget_without_l
     start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
+        Some(source.clone()),
         MemoryConsolidateStagingOperation { force: true },
     )
     .await
@@ -729,4 +817,267 @@ async fn subjektiv_job_long_receipts_and_escaped_ids_fit_result_budget_without_l
             .len()
             > 16 * 1024
     );
+}
+
+#[tokio::test]
+async fn subjektiv_job_rechecks_current_policy_and_preserves_provider_batch_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("live-job-policy").unwrap())
+        .unwrap();
+    let source = memory_job_source(&api, &subject.id).await;
+    let mut operations = MEMORY_JOB_OPERATIONS.to_vec();
+    operations.extend(["journal.state.read", "session.record"]);
+    grant_memory_operations(&api, &subject.id, &operations);
+    stage(&store, &subject.id, "frozen-candidate");
+    start_subjektiv_staging_consolidation(
+        api.clone(),
+        &subject.id,
+        Some(source.clone()),
+        MemoryConsolidateStagingOperation { force: true },
+    )
+    .await
+    .unwrap();
+    let job = resource(&api, &subject.id);
+    assert_eq!(job.request.source_worker.as_ref(), Some(&source));
+    let attempt = current_attempt(&api, &job);
+    let worker = attempt.worker.as_ref().unwrap();
+    assert_eq!(execution.take_inputs().len(), 1);
+    for operation in ["journal.state.read", "session.record"] {
+        let request = server_api::authorization::OperationAuthorizationRequest {
+            operation: operation.into(),
+            resource: server_api::authorization::PermissionResource::Subject {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                subject_id: subject.id.clone(),
+            },
+        };
+        assert!(subject_authorization::authorize_scope(&api, &source, &request).is_ok());
+        assert!(
+            subject_authorization::authorize_scope(&api, worker, &request).is_err(),
+            "current body policy cannot widen a consolidation Job's domain: {operation}"
+        );
+    }
+    let prepare = || {
+        server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+            server_api::SubjektivSurfacePrepareRequest {},
+        )
+    };
+    // Late arrivals never enter this attempt's frozen batch, and the pending
+    // granted candidate still prevents premature surface preparation.
+    stage(&store, &subject.id, "late-candidate");
+    assert!(
+        subjektiv_job::require_candidate_grant(&api, TEST_WORKSPACE_ID, worker, "frozen-candidate")
+            .is_ok()
+    );
+    assert!(
+        subjektiv_job::require_candidate_grant(&api, TEST_WORKSPACE_ID, worker, "late-candidate")
+            .is_err()
+    );
+    let read_candidate = |id: &str| {
+        server_api::SubjektivMemoryBackendOperation::ReadCandidate(
+            server_api::SubjektivMemoryCandidateReadRequest {
+                candidate_id: id.into(),
+            },
+        )
+    };
+    assert!(
+        op(&api, worker, read_candidate("frozen-candidate"))
+            .await
+            .is_ok()
+    );
+    assert!(
+        op(&api, worker, read_candidate("late-candidate"))
+            .await
+            .is_err()
+    );
+    grant_memory_operations(&api, &subject.id, &["memory.surface.prepare"]);
+    let error = op(&api, worker, read_candidate("frozen-candidate"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.error.to_string().contains("memory.staging.read"),
+        "{error:?}"
+    );
+    let permissions = subject_authorization::worker_permissions(&api, worker)
+        .unwrap()
+        .unwrap();
+    assert_eq!(permissions.len(), 1);
+    assert_eq!(permissions[0].operation, "memory.surface.prepare");
+    // Provider batch checks remain active even when operation policy allows it.
+    assert!(op(&api, worker, prepare()).await.is_err());
+    grant_memory_operations(&api, &subject.id, &[]);
+    let error = op(&api, worker, prepare()).await.unwrap_err();
+    assert!(
+        error.error.to_string().contains("memory.surface.prepare"),
+        "{error:?}"
+    );
+    assert!(
+        subject_authorization::worker_permissions(&api, worker)
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(resource(&api, &subject.id).request, job.request);
+    assert!(execution.take_inputs().is_empty());
+}
+
+#[tokio::test]
+async fn saved_job_without_frozen_source_cannot_use_non_subject_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, _) = test_api_with_recording_backend(dir.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("legacy-job-origin").unwrap())
+        .unwrap();
+    let _source = memory_job_source(&api, &subject.id).await;
+    // Reconstruct a retained pre-migration dispatched attempt through the ledger,
+    // not today's dispatcher: new dispatch itself must reject a missing origin.
+    let request = BackendJobRequest {
+        job_id: "legacy-no-operation-origin".into(),
+        purpose: "subjektiv_consolidation".into(),
+        input_ref: format!("subjektiv://{}/consolidation", subject.id),
+        input: serde_json::json!({"subject_id":subject.id,"candidate_ids":[]}),
+        instruction: "retained legacy input".into(),
+        profile: "builtin:subjektiv-memory-consolidation".into(),
+        grants: crate::backend_job::BackendJobGrants {
+            subjektiv_consolidation: Some(crate::backend_job::SubjektivConsolidationGrant {
+                subject_id: subject.id.clone(),
+                candidate_ids: vec![],
+            }),
+            ..Default::default()
+        },
+        serialization_key: None,
+        source_worker: None,
+        notification_target: None,
+        limits: Default::default(),
+    };
+    let error = subject_authorization::authorize_job_input(&api, &request).unwrap_err();
+    assert!(error.error.to_string().contains("frozen"), "{error:?}");
+    let now = Utc::now().to_rfc3339();
+    let reserved = api
+        .store
+        .reserve_backend_job(TEST_WORKSPACE_ID, &request, &now)
+        .unwrap();
+    let (_, claimed) = api
+        .store
+        .claim_backend_job_attempt_dispatch(
+            TEST_WORKSPACE_ID,
+            &request.job_id,
+            &reserved.attempt.attempt_id,
+            &now,
+        )
+        .unwrap();
+    assert!(claimed);
+    let retained_worker = spawn_ticket_check_source(&api, "retained-legacy-job");
+    api.store
+        .bind_backend_job_attempt_worker(
+            TEST_WORKSPACE_ID,
+            &request.job_id,
+            &reserved.attempt.attempt_id,
+            &retained_worker,
+            None,
+            &now,
+        )
+        .unwrap();
+    let job = resource(&api, &subject.id);
+    let attempt = current_attempt(&api, &job);
+    let worker = attempt.worker.as_ref().unwrap();
+    assert!(subjektiv_job::active_grant(&api, TEST_WORKSPACE_ID, worker).is_ok());
+    let error = op(
+        &api,
+        worker,
+        server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+            server_api::SubjektivSurfacePrepareRequest {},
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.error.to_string().contains("frozen"), "{error:?}");
+    assert!(subject_authorization::worker_permissions(&api, worker).is_err());
+    assert_eq!(resource(&api, &subject.id).request, job.request);
+}
+
+#[tokio::test]
+async fn unset_subject_consolidation_denies_before_job_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("unset-job-policy").unwrap())
+        .unwrap();
+    let source = attach_memory_job_source(&api, &subject.id).await;
+    assert!(store.subject_permissions(&subject.id).unwrap().is_none());
+    stage(&store, &subject.id, "untouched");
+    let error = start_subjektiv_staging_consolidation(
+        api.clone(),
+        &subject.id,
+        Some(source),
+        MemoryConsolidateStagingOperation { force: true },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .error
+            .to_string()
+            .contains("memory.consolidation.request"),
+        "{error:?}"
+    );
+    assert!(execution.take_inputs().is_empty());
+    assert!(
+        api.store
+            .find_active_backend_job_for_resource(
+                TEST_WORKSPACE_ID,
+                &crate::backend_job::subjektiv_serialization_key(&subject.id)
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.pending_staging_backlog(&subject.id).unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn subject_consolidation_request_without_supply_denies_before_model_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("job-supply-denied").unwrap())
+        .unwrap();
+    let source = memory_job_source(&api, &subject.id).await;
+    stage(&store, &subject.id, "not-supplied");
+    grant_memory_operations(&api, &subject.id, &["memory.consolidation.request"]);
+    let error = start_subjektiv_staging_consolidation(
+        api.clone(),
+        &subject.id,
+        Some(source),
+        MemoryConsolidateStagingOperation { force: true },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .error
+            .to_string()
+            .contains("memory.consolidation.supply"),
+        "{error:?}"
+    );
+    assert!(
+        execution.take_inputs().is_empty(),
+        "denied frozen input must not reach the model/runtime"
+    );
+    let saved = resource(&api, &subject.id);
+    let attempt = current_attempt(&api, &saved);
+    assert_eq!(attempt.state, BackendJobAttemptState::Reserved);
+    assert!(
+        attempt.worker.is_none(),
+        "supply refusal must precede claim/allocation"
+    );
+    assert_eq!(
+        saved.request.input["candidate_ids"],
+        serde_json::json!(["not-supplied"])
+    );
+    assert_eq!(store.pending_staging_backlog(&subject.id).unwrap().0, 1);
 }

@@ -477,6 +477,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct RecordingSubjektivClient {
+        deny_staging: bool,
         requests: Mutex<Vec<crate::worker::WorkspaceRequest>>,
     }
 
@@ -497,6 +498,17 @@ mod tests {
             &self,
             request: crate::worker::WorkspaceRequest,
         ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            if let Some(response) = crate::subjektiv::test_subject_authorization_response(
+                &request,
+                "workspace-1",
+                if self.deny_staging {
+                    &[]
+                } else {
+                    &["memory.staging.write"]
+                },
+            ) {
+                return Ok(response);
+            }
             self.requests.lock().unwrap().push(request);
             Ok(crate::worker::WorkspaceResponse {
                 status: 200,
@@ -585,6 +597,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:?}").contains("exclusively HumanInput evidence"));
+    }
+
+    #[tokio::test]
+    async fn denied_subjektiv_staging_never_mutates_or_reports_a_staged_candidate() {
+        let client = Arc::new(RecordingSubjektivClient {
+            deny_staging: true,
+            ..Default::default()
+        });
+        let state = MemoryStagingOutputState::new_subjektiv(
+            SessionCapture::new("session", "segment-1", vec![Item::user_message("decision")]),
+            crate::subjektiv::test_connection(client.clone()),
+            SourceRef {
+                segment_id: "segment-1".into(),
+                range: [0, 0],
+            },
+            "run-1".into(),
+        );
+        let error = StageMemoryCandidateTool { state: state.clone() }
+            .execute(
+                r#"{"kind":"decision","claim":"claim","why_useful":"useful","entry_refs":["E00000000"]}"#,
+                agen::tool::ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("denied"), "{error}");
+        assert!(state.staged().is_empty());
+        assert!(client.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

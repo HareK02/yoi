@@ -143,6 +143,14 @@ impl WorkerObservationProvider for WorkspaceClientWorkerObservationProvider {
                 "Workspace observation requires a scoped Workspace client".to_string(),
             )
         })?;
+        self.client
+            .authorize_operation(
+                "worker.observe.list",
+                &server_api::authorization::PermissionResource::Workspace {
+                    workspace_id: _workspace_id.into(),
+                },
+            )
+            .map_err(workspace_client_error)?;
         let response = self
             .client
             .execute_server_operation(
@@ -176,6 +184,22 @@ impl WorkerObservationProvider for WorkspaceClientWorkerObservationProvider {
                 "Workspace observation requires a scoped Workspace client".to_string(),
             )
         })?;
+        match subject {
+            WorkerObservationSubjectRef::RuntimeWorker {
+                runtime_id,
+                worker_id,
+            } => self.client.authorize_operation(
+                "worker.observe",
+                &server_api::authorization::PermissionResource::Worker {
+                    runtime_id: runtime_id.clone(),
+                    worker_id: worker_id.clone(),
+                },
+            ),
+            WorkerObservationSubjectRef::SubWorker { name } => self
+                .client
+                .authorize_subworker_operation("subworker.observe", name),
+        }
+        .map_err(workspace_client_error)?;
         let response = self
             .client
             .execute_server_operation(

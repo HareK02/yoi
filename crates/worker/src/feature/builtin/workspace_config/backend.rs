@@ -11,9 +11,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
+use server_api::authorization::PermissionResource;
 use server_api::{
-    WorkspaceConfigAccess, WorkspaceConfigApiError, WorkspaceConfigAttachRequest,
-    WorkspaceConfigAttachment, WorkspaceConfigFailureClassification,
+    ConfigTreeChange, WorkspaceConfigAccess, WorkspaceConfigApiError, WorkspaceConfigAttachRequest,
+    WorkspaceConfigAttachment, WorkspaceConfigCommitRequest, WorkspaceConfigFailureClassification,
+    WorkspaceConfigObserveRequest, WorkspaceConfigReadRequest,
 };
 use wip_protocol::{ProtocolError, ProtocolErrorCode};
 
@@ -51,6 +53,96 @@ impl WorkspaceConfigBackend {
     pub(super) fn with_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = deadline;
         self
+    }
+
+    fn authorize(
+        &self,
+        operation: &str,
+        path: &str,
+        recursive: bool,
+    ) -> Result<(), WipOperationError> {
+        let workspace_id = self
+            .client
+            .workspace_id()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                failure(
+                    ProtocolErrorCode::PermissionDenied,
+                    "Workspace config authority unavailable",
+                )
+            })?;
+        let resource = PermissionResource::WorkspaceConfig {
+            workspace_id: workspace_id.into(),
+            path: path.into(),
+            recursive,
+        };
+        self.client
+            .authorize_operation(operation, &resource)
+            .map_err(|error| {
+                let denied = matches!(&error, WorkspaceClientError::Request(message)
+                if message.contains("HTTP status 403") || message.contains("HTTP status 401"));
+                failure(
+                    if denied {
+                        ProtocolErrorCode::PermissionDenied
+                    } else {
+                        ProtocolErrorCode::Internal
+                    },
+                    &format!("Workspace config operation authorization failed before dispatch: {operation}; resource={resource:?}; denied={denied}"),
+                )
+            })
+    }
+
+    fn authorize_post(&self, suffix: &str, body: &str) -> Result<(), WipOperationError> {
+        let invalid = || {
+            failure(
+                ProtocolErrorCode::InvalidArguments,
+                "Invalid Workspace config operation",
+            )
+        };
+        match suffix {
+            "" => {
+                let _: WorkspaceConfigAttachRequest =
+                    serde_json::from_str(body).map_err(|_| invalid())?;
+                self.authorize("workspace_config.attach", "", false)
+            }
+            "/observe" => {
+                let request: WorkspaceConfigObserveRequest =
+                    serde_json::from_str(body).map_err(|_| invalid())?;
+                if request.paths.is_empty() {
+                    return Err(invalid());
+                }
+                for path in request.paths {
+                    self.authorize("workspace_config.observe", &path, request.depth > 0)?;
+                }
+                Ok(())
+            }
+            "/read" => {
+                let request: WorkspaceConfigReadRequest =
+                    serde_json::from_str(body).map_err(|_| invalid())?;
+                self.authorize("workspace_config.read", &request.path, false)
+            }
+            "/commit" => {
+                let request: WorkspaceConfigCommitRequest =
+                    serde_json::from_str(body).map_err(|_| invalid())?;
+                // The commit can also replace the whole-tree entrypoint list.
+                self.authorize("workspace_config.commit", "", false)?;
+                for change in request.request.changes {
+                    match change {
+                        ConfigTreeChange::Create { path, .. }
+                        | ConfigTreeChange::Update { path, .. }
+                        | ConfigTreeChange::Delete { path, .. } => {
+                            self.authorize("workspace_config.commit", &path, false)?
+                        }
+                        ConfigTreeChange::Rename { from, to, .. } => {
+                            self.authorize("workspace_config.commit", &from, false)?;
+                            self.authorize("workspace_config.commit", &to, false)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(invalid()),
+        }
     }
 
     fn base(&self) -> Result<String, WipOperationError> {
@@ -177,6 +269,7 @@ impl WorkspaceConfigBackend {
         &self,
         diagnostic: &Diagnostic,
     ) -> Result<Option<WorkspaceConfigAttachment>, WipOperationError> {
+        self.authorize("workspace_config.current", "", false)?;
         let result: Option<WorkspaceConfigAttachment> =
             self.request(WorkspaceRequest::get(self.base()?), false, diagnostic)?;
         if let Some(attachment) = &result {
@@ -247,6 +340,7 @@ impl WorkspaceConfigBackend {
                 "Workspace config request exceeds limit",
             ));
         }
+        self.authorize_post(suffix, &body)?;
         let request = WorkspaceRequest::json(
             WorkspaceRequestMethod::Post,
             format!("{}{suffix}", self.base()?),

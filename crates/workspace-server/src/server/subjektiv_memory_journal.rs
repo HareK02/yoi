@@ -72,6 +72,22 @@ pub(super) async fn route(
                 SubjektivWorkerAuthority::Subject,
                 "Memory Journal access",
             )?;
+            let operation = match &request {
+                MemoryJournalRequest::Reconcile { .. }
+                | MemoryJournalRequest::ReconcilePage { .. } => "journal.memory.links.reconcile",
+                MemoryJournalRequest::Links { .. } | MemoryJournalRequest::LinksPage { .. } => {
+                    "journal.memory.links.read"
+                }
+                MemoryJournalRequest::Read { .. } => "journal.memory.read",
+                MemoryJournalRequest::Related { .. } => "journal.memory.related.read",
+            };
+            authorize_subjektiv_operation(
+                &api,
+                &worker,
+                &path.workspace_id,
+                subject_id,
+                operation,
+            )?;
             let store = open_subjektiv_store(&api)?;
             let host = JournalHostContext::validated_reader(&store, subject_id).map_err(domain)?;
             store

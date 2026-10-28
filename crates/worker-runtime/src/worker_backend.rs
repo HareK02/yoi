@@ -7103,63 +7103,175 @@ mod tests {
 
     const SAVED_SUBJEKTIV_SYSTEM_PROMPT: &str = "Committed saved Subject Worker system prompt";
 
-    // Substituted Host transport for restore/controller component tests. This
-    // fixture has exactly the two activation grants requested by the saved
-    // Manifest; it grants no protected operations or resources. It does not
-    // exercise authenticated source derivation, Subject policy, or revocation
-    // in the real Workspace Host.
+    // Substituted Host transport for restore/controller component tests. Only
+    // resident Memory read/supply, empty startup Journal read and Session record
+    // are granted, on the saved Subject alone. No Feature activation or unrelated
+    // operations are granted. This does not exercise authenticated source
+    // derivation, Subject policy or revocation in the real Workspace Host.
     fn saved_subjektiv_authorization_fixture(
         input: server_api::authorization::OperationAuthorizationRequest,
     ) -> Result<server_api::authorization::OperationAuthorizationResponse, &'static str> {
         use server_api::authorization::{OperationAuthorizationResponse, PermissionResource};
         if input.validate().is_ok()
-            && matches!(input.operation.as_str(), "subjektiv" | "workdir_catalog")
-            && input.resource == PermissionResource::Feature
+            && matches!(
+                input.operation.as_str(),
+                "memory.resident.read"
+                    | "memory.resident.supply"
+                    | "journal.startup.read"
+                    | "session.record"
+            )
+            && input.resource
+                == (PermissionResource::Subject {
+                    workspace_id: "workspace-saved-subjektiv".into(),
+                    subject_id: "saved-subject".into(),
+                })
         {
             Ok(OperationAuthorizationResponse {
-                scope: Some(PermissionResource::Feature),
+                scope: Some(input.resource),
             })
         } else {
-            Err("saved Subject fixture has no matching exact Feature grant")
+            Err("saved Subject fixture has no matching exact operation/resource grant")
         }
     }
 
+    fn saved_subjektiv_bound_authorization_fixture(
+        input: server_api::authorization::BoundOperationAuthorizationRequest,
+    ) -> Result<server_api::authorization::OperationAuthorizationResponse, &'static str> {
+        use server_api::authorization::{
+            BoundAuthorizationTarget, OperationAuthorizationRequest, PermissionResource,
+        };
+        if input.target != (BoundAuthorizationTarget::Subject {}) {
+            return Err("saved Subject fixture has no matching bound target");
+        }
+        saved_subjektiv_authorization_fixture(OperationAuthorizationRequest {
+            operation: input.operation,
+            resource: PermissionResource::Subject {
+                workspace_id: "workspace-saved-subjektiv".into(),
+                subject_id: "saved-subject".into(),
+            },
+        })
+    }
+
     #[test]
-    fn saved_subjektiv_authorization_fixture_grants_only_exact_feature_activation() {
-        use server_api::authorization::{OperationAuthorizationRequest, PermissionResource};
-        for operation in ["subjektiv", "workdir_catalog"] {
+    fn saved_subjektiv_authorization_fixture_grants_only_exact_restore_operations() {
+        use server_api::authorization::{
+            BoundAuthorizationTarget, BoundOperationAuthorizationRequest,
+            OperationAuthorizationRequest, PermissionResource,
+        };
+        let subject = PermissionResource::Subject {
+            workspace_id: "workspace-saved-subjektiv".into(),
+            subject_id: "saved-subject".into(),
+        };
+        for operation in [
+            "memory.resident.read",
+            "memory.resident.supply",
+            "journal.startup.read",
+            "session.record",
+        ] {
             let response = saved_subjektiv_authorization_fixture(OperationAuthorizationRequest {
                 operation: operation.into(),
-                resource: PermissionResource::Feature,
+                resource: subject.clone(),
             })
             .unwrap();
-            assert_eq!(response.scope, Some(PermissionResource::Feature));
-        }
-        for (operation, resource) in [
-            ("ticket", PermissionResource::Feature),
-            ("subjektiv.journal", PermissionResource::Feature),
-            ("subjektiv.*", PermissionResource::Feature),
-            (
-                "subjektiv",
-                PermissionResource::Workspace {
-                    workspace_id: "workspace-saved-subjektiv".into(),
-                },
-            ),
-            (
-                "subjektiv.journal",
-                PermissionResource::Workspace {
-                    workspace_id: "workspace-saved-subjektiv".into(),
-                },
-            ),
-        ] {
-            assert!(
-                saved_subjektiv_authorization_fixture(OperationAuthorizationRequest {
+            assert_eq!(response.scope, Some(subject.clone()));
+            let bound =
+                saved_subjektiv_bound_authorization_fixture(BoundOperationAuthorizationRequest {
                     operation: operation.into(),
-                    resource,
+                    target: BoundAuthorizationTarget::Subject {},
+                })
+                .unwrap();
+            assert_eq!(bound.scope, Some(subject.clone()));
+            for resource in [
+                PermissionResource::Feature,
+                PermissionResource::Workspace {
+                    workspace_id: "workspace-saved-subjektiv".into(),
+                },
+                PermissionResource::Subject {
+                    workspace_id: "other-workspace".into(),
+                    subject_id: "saved-subject".into(),
+                },
+                PermissionResource::Subject {
+                    workspace_id: "workspace-saved-subjektiv".into(),
+                    subject_id: "other-subject".into(),
+                },
+            ] {
+                assert!(
+                    saved_subjektiv_authorization_fixture(OperationAuthorizationRequest {
+                        operation: operation.into(),
+                        resource,
+                    })
+                    .is_err(),
+                    "out-of-scope grant for {operation}"
+                );
+            }
+            for target in [
+                BoundAuthorizationTarget::WorkdirAttachment {
+                    alias: "checkout".into(),
+                    expected_connection_id: None,
+                },
+                BoundAuthorizationTarget::SubWorker {
+                    name: "child".into(),
+                },
+                BoundAuthorizationTarget::NotificationSource {
+                    source_event_id: "event".into(),
+                },
+            ] {
+                assert!(
+                    saved_subjektiv_bound_authorization_fixture(
+                        BoundOperationAuthorizationRequest {
+                            operation: operation.into(),
+                            target,
+                        }
+                    )
+                    .is_err()
+                );
+            }
+        }
+        for operation in [
+            "",
+            "ticket",
+            "subjektiv",
+            "workdir_catalog",
+            "subjektiv.journal",
+            "subjektiv.*",
+            "memory.resident",
+            "memory.resident.*",
+            "memory.resident.write",
+            "memory.staging.write",
+            "memory.consolidation.request",
+            "journal.startup.supply",
+            "journal.compaction.read",
+        ] {
+            for resource in [PermissionResource::Feature, subject.clone()] {
+                assert!(
+                    saved_subjektiv_authorization_fixture(OperationAuthorizationRequest {
+                        operation: operation.into(),
+                        resource,
+                    })
+                    .is_err(),
+                    "unexpected grant for {operation}"
+                );
+            }
+            assert!(
+                saved_subjektiv_bound_authorization_fixture(BoundOperationAuthorizationRequest {
+                    operation: operation.into(),
+                    target: BoundAuthorizationTarget::Subject {},
                 })
                 .is_err()
             );
         }
+        assert!(
+            serde_json::from_value::<OperationAuthorizationRequest>(serde_json::json!({
+                "resource": subject,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<BoundOperationAuthorizationRequest>(serde_json::json!({
+                "target": {"kind": "subject"},
+            }))
+            .is_err()
+        );
     }
 
     fn saved_subjektiv_policy(
@@ -7253,14 +7365,14 @@ mod tests {
             worker.materialize_durable_session_head().await.unwrap();
             let entries = session_store.read_all(session_id, segment_id).unwrap();
             assert!(
-                matches!(entries.as_slice(), [LogEntry::AnnotatedSegmentStart {
+                matches!(entries.first(), Some(LogEntry::AnnotatedSegmentStart {
                 session_id: committed_session_id,
                 system_prompt: Some(prompt),
                 history,
                 forked_from: None,
                 compacted_from: None,
                 ..
-            }] if *committed_session_id == session_id
+            }) if *committed_session_id == session_id
                 && prompt == SAVED_SUBJEKTIV_SYSTEM_PROMPT
                 && history.is_empty())
             );
@@ -7330,6 +7442,43 @@ mod tests {
                         "subject_id": "saved-subject", "journals": [], "omitted": false,
                     }))
                 }),
+            );
+            let app = app.route(
+                "/api/w/workspace-saved-subjektiv/subjektiv/memory",
+                axum::routing::post(
+                    |axum::Json(input): axum::Json<server_api::SubjektivMemoryBackendRequest>| async move {
+                        assert!(matches!(
+                            input.operation,
+                            server_api::SubjektivMemoryBackendOperation::ResidentContext(_)
+                        ));
+                        axum::Json(serde_json::json!({
+                            "result": "resident_context",
+                            "data": {
+                                "behavior_md": "Saved Subject restore behavior",
+                                "memory_surface": {"availability": "ungenerated", "content": null},
+                            },
+                        }))
+                    },
+                ),
+            );
+            let app = app.route(
+                "/api/w/workspace-saved-subjektiv/authorization/bound-check",
+                axum::routing::post(
+                    |axum::Json(input): axum::Json<
+                        server_api::authorization::BoundOperationAuthorizationRequest,
+                    >| async move {
+                        match saved_subjektiv_bound_authorization_fixture(input) {
+                            Ok(response) => (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::to_value(response).unwrap()),
+                            ),
+                            Err(message) => (
+                                axum::http::StatusCode::FORBIDDEN,
+                                axum::Json(serde_json::json!({ "message": message })),
+                            ),
+                        }
+                    },
+                ),
             );
             let app = app.route(
                 "/api/w/workspace-saved-subjektiv/authorization/check",
@@ -8817,6 +8966,7 @@ mod tests {
             ..
         }) if *session_id == pending_session_id
             && prompt.contains("OPERATION-OWNED-PENDING-SYSTEM-PROMPT")
+            && prompt.contains("Saved Subject restore behavior")
             && history.is_empty())
         );
         assert!(

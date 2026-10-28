@@ -1,33 +1,33 @@
 //! Neutral explicit-allow authorization contracts. Resource containment never crosses kinds.
 //!
-//! # Trusted Feature boundary
+//! # Trusted operation boundary
 //!
-//! A Profile requests execution configuration, not authority. The Worker asks the
-//! Host for each enabled Feature's exact activation name before initialization,
-//! then trusted Feature code asks for each protected operation and its semantic
-//! resource before access or effects. `ticket` on [`PermissionResource::Feature`]
-//! activates Ticket; it implies neither `ticket.create` nor any future operation.
-//! `ticket.create` on a Workspace permits creation there but cannot activate the
-//! Feature. There are no wildcard permissions or implicit dotted-name inheritance.
+//! A Profile requests local composition, not authority. Feature registration and
+//! session-local state need no authorization. Trusted Feature/Host adapters check
+//! each protected read, model supply, subscription or effect immediately before
+//! it occurs; continued background work repeats that check. MCP alone retains
+//! temporary exact activation permission on [`PermissionResource::Feature`]
+//! before discovery can spawn a process.
 //!
-//! Identity is absent from the authorization request intentionally: the Host
-//! authenticates the bound Runtime/Worker and resolves current source permissions,
-//! body ownership and any per-Worker execution grant. A shared client, Profile,
-//! remembered receipt or caller-supplied Subject claim is not authority. Features
-//! depend on this contract, never on a particular Subject policy implementation.
+//! Identity is absent from requests: the Host authenticates the bound Runtime/Worker
+//! and resolves current source policy, body ownership, delegation and Job attenuation.
+//! Bound target queries resolve existing connections, never caller-supplied source
+//! IDs. A remembered receipt, Profile or shared client is not authority; transport
+//! failure never means standalone.
 //!
-//! Supported cooperative boundaries are Feature activation, ordinary Worker
-//! delegation, Ticket creation (Tool/native WIP/typed service), Workdir filesystem
-//! read/write and whole-attachment command execution, and scoped result notify.
-//! Workdir providers still enforce resolved paths, traversal, capability, Ticket
-//! and provider ceilings. The returned scope is for provider narrowing, not a
-//! transferable credential. Scoped checkout/overlap operations are refused until
-//! their complete access semantics are adapted. Other Feature operations retain
-//! their existing owner checks; they do not automatically acquire this operation
-//! policy. Missing calls are trusted Feature bugs, not interception by a universal
-//! Tool executor or protection against malicious Feature code. Connection tests
-//! must exercise each exposed surface, assert a genuine permitted effect and
-//! assert zero downstream calls on denial, including revocation and provider denial.
+//! Workspace permissions cover collection operations only, not individual resources
+//! of another kind. Exact names never imply dotted descendants. Legacy Feature and
+//! Workspace grants retain their wire representation and exact meaning; reading saved
+//! policy/grants does not issue permissions for newly protected operations/resources.
+//! Non-MCP Feature grants remain inert; no schema rewrite or baseline grants are needed.
+//!
+//! Authorization composes with provider checks: ownership, resolved paths, capabilities,
+//! Ticket actor conditions, observation/CAS, review capability, immutable Job batch and
+//! attempt/writer fences remain mandatory. Queries use identity metadata, not protected
+//! bodies, and do not certify existence. Missing targets are still refused by providers.
+//! Connection tests observe permitted real work and zero downstream work on refusal,
+//! including revocation. Missing calls are trusted Feature bugs, not interception by a
+//! universal Tool executor or a sandbox for malicious Feature code.
 //!
 //! # Delegation callers and recovery
 //!
@@ -57,6 +57,55 @@ pub const MAX_SCOPED_PERMISSIONS: usize = 256;
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PermissionResource {
+    Job {
+        workspace_id: String,
+        job_id: String,
+    },
+    Ticket {
+        workspace_id: String,
+        ticket_id: String,
+    },
+    Objective {
+        workspace_id: String,
+        objective_id: String,
+    },
+    MergeRequest {
+        workspace_id: String,
+        merge_request_id: String,
+    },
+    Subject {
+        workspace_id: String,
+        subject_id: String,
+    },
+    DriveEntry {
+        workspace_id: String,
+        node_id: String,
+    },
+    DriveRequest {
+        workspace_id: String,
+        request_id: String,
+    },
+    Repository {
+        workspace_id: String,
+        repository_key: String,
+    },
+    WorkdirAttachment {
+        workspace_id: String,
+        connection_id: String,
+    },
+    WorkspaceConfig {
+        workspace_id: String,
+        path: String,
+        recursive: bool,
+    },
+    Network {
+        url: String,
+    },
+    SubWorker {
+        runtime_id: String,
+        worker_id: String,
+        name: String,
+    },
     Feature,
     Workspace {
         workspace_id: String,
@@ -79,6 +128,55 @@ impl<'de> Deserialize<'de> for PermissionResource {
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
         enum Wire {
+            Job {
+                workspace_id: String,
+                job_id: String,
+            },
+            Ticket {
+                workspace_id: String,
+                ticket_id: String,
+            },
+            Objective {
+                workspace_id: String,
+                objective_id: String,
+            },
+            MergeRequest {
+                workspace_id: String,
+                merge_request_id: String,
+            },
+            Subject {
+                workspace_id: String,
+                subject_id: String,
+            },
+            DriveEntry {
+                workspace_id: String,
+                node_id: String,
+            },
+            DriveRequest {
+                workspace_id: String,
+                request_id: String,
+            },
+            Repository {
+                workspace_id: String,
+                repository_key: String,
+            },
+            WorkdirAttachment {
+                workspace_id: String,
+                connection_id: String,
+            },
+            WorkspaceConfig {
+                workspace_id: String,
+                path: String,
+                recursive: bool,
+            },
+            Network {
+                url: String,
+            },
+            SubWorker {
+                runtime_id: String,
+                worker_id: String,
+                name: String,
+            },
             Feature {},
             Workspace {
                 workspace_id: String,
@@ -94,6 +192,88 @@ impl<'de> Deserialize<'de> for PermissionResource {
             },
         }
         Ok(match Wire::deserialize(deserializer)? {
+            Wire::Job {
+                workspace_id,
+                job_id,
+            } => Self::Job {
+                workspace_id,
+                job_id,
+            },
+            Wire::Ticket {
+                workspace_id,
+                ticket_id,
+            } => Self::Ticket {
+                workspace_id,
+                ticket_id,
+            },
+            Wire::Objective {
+                workspace_id,
+                objective_id,
+            } => Self::Objective {
+                workspace_id,
+                objective_id,
+            },
+            Wire::MergeRequest {
+                workspace_id,
+                merge_request_id,
+            } => Self::MergeRequest {
+                workspace_id,
+                merge_request_id,
+            },
+            Wire::Subject {
+                workspace_id,
+                subject_id,
+            } => Self::Subject {
+                workspace_id,
+                subject_id,
+            },
+            Wire::DriveEntry {
+                workspace_id,
+                node_id,
+            } => Self::DriveEntry {
+                workspace_id,
+                node_id,
+            },
+            Wire::DriveRequest {
+                workspace_id,
+                request_id,
+            } => Self::DriveRequest {
+                workspace_id,
+                request_id,
+            },
+            Wire::Repository {
+                workspace_id,
+                repository_key,
+            } => Self::Repository {
+                workspace_id,
+                repository_key,
+            },
+            Wire::WorkdirAttachment {
+                workspace_id,
+                connection_id,
+            } => Self::WorkdirAttachment {
+                workspace_id,
+                connection_id,
+            },
+            Wire::WorkspaceConfig {
+                workspace_id,
+                path,
+                recursive,
+            } => Self::WorkspaceConfig {
+                workspace_id,
+                path,
+                recursive,
+            },
+            Wire::Network { url } => Self::Network { url },
+            Wire::SubWorker {
+                runtime_id,
+                worker_id,
+                name,
+            } => Self::SubWorker {
+                runtime_id,
+                worker_id,
+                name,
+            },
             Wire::Feature {} => Self::Feature,
             Wire::Workspace { workspace_id } => Self::Workspace { workspace_id },
             Wire::Workdir {
@@ -117,8 +297,122 @@ impl<'de> Deserialize<'de> for PermissionResource {
 }
 
 impl PermissionResource {
+    /// Checks Workspace membership without a target existence or data lookup.
+    pub fn workspace_id(&self) -> Option<&str> {
+        match self {
+            Self::Job { workspace_id, .. }
+            | Self::Ticket { workspace_id, .. }
+            | Self::Objective { workspace_id, .. }
+            | Self::MergeRequest { workspace_id, .. }
+            | Self::Subject { workspace_id, .. }
+            | Self::DriveEntry { workspace_id, .. }
+            | Self::DriveRequest { workspace_id, .. }
+            | Self::Repository { workspace_id, .. }
+            | Self::WorkdirAttachment { workspace_id, .. }
+            | Self::WorkspaceConfig { workspace_id, .. }
+            | Self::Workspace { workspace_id } => Some(workspace_id),
+            _ => None,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::Job {
+                workspace_id,
+                job_id,
+            } => {
+                validate_authorization_identifier(workspace_id)?;
+                validate_authorization_identifier(job_id)
+            }
+            Self::Ticket {
+                workspace_id,
+                ticket_id,
+            } => {
+                validate_authorization_identifier(workspace_id)?;
+                validate_authorization_identifier(ticket_id)
+            }
+            Self::Objective {
+                workspace_id,
+                objective_id,
+            } => {
+                validate_authorization_identifier(workspace_id)?;
+                validate_authorization_identifier(objective_id)
+            }
+            Self::MergeRequest {
+                workspace_id,
+                merge_request_id,
+            } => {
+                validate_authorization_identifier(workspace_id)?;
+                validate_authorization_identifier(merge_request_id)
+            }
+            Self::Subject {
+                workspace_id,
+                subject_id,
+            } => {
+                validate_authorization_identifier(workspace_id)?;
+                validate_authorization_identifier(subject_id)
+            }
+            Self::DriveEntry {
+                workspace_id,
+                node_id,
+            } => {
+                validate_authorization_identifier(workspace_id)?;
+                validate_authorization_identifier(node_id)
+            }
+            Self::DriveRequest {
+                workspace_id,
+                request_id,
+            } => {
+                validate_authorization_identifier(workspace_id)?;
+                validate_authorization_identifier(request_id)
+            }
+            Self::Repository {
+                workspace_id,
+                repository_key,
+            } => {
+                validate_authorization_identifier(workspace_id)?;
+                validate_authorization_identifier(repository_key)
+            }
+            Self::WorkdirAttachment {
+                workspace_id,
+                connection_id,
+            } => {
+                validate_authorization_identifier(workspace_id)?;
+                validate_authorization_identifier(connection_id)
+            }
+            Self::WorkspaceConfig {
+                workspace_id, path, ..
+            } => {
+                validate_authorization_identifier(workspace_id)?;
+                if path.is_empty() {
+                    Ok(())
+                } else {
+                    validate_relative_permission_path(path)
+                }
+            }
+            Self::Network { url } => {
+                let parsed = url::Url::parse(url)
+                    .map_err(|_| "network resource must be an absolute HTTP(S) URL")?;
+                if !matches!(parsed.scheme(), "http" | "https")
+                    || parsed.host_str().is_none()
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                    || url.len() > 8192
+                    || url.chars().any(char::is_control)
+                {
+                    return Err("network resource must be a bounded absolute HTTP(S) URL without credentials".into());
+                }
+                Ok(())
+            }
+            Self::SubWorker {
+                runtime_id,
+                worker_id,
+                name,
+            } => {
+                validate_authorization_identifier(runtime_id)?;
+                validate_authorization_identifier(worker_id)?;
+                validate_authorization_identifier(name)
+            }
             Self::Feature => Ok(()),
             Self::Workspace { workspace_id } => validate_authorization_identifier(workspace_id),
             Self::Workdir {
@@ -144,6 +438,133 @@ impl PermissionResource {
             return false;
         }
         match (self, other) {
+            (
+                Self::Job {
+                    workspace_id: a,
+                    job_id: ai,
+                },
+                Self::Job {
+                    workspace_id: b,
+                    job_id: bi,
+                },
+            ) => a == b && ai == bi,
+            (
+                Self::Ticket {
+                    workspace_id: a,
+                    ticket_id: ai,
+                },
+                Self::Ticket {
+                    workspace_id: b,
+                    ticket_id: bi,
+                },
+            ) => a == b && ai == bi,
+            (
+                Self::Objective {
+                    workspace_id: a,
+                    objective_id: ai,
+                },
+                Self::Objective {
+                    workspace_id: b,
+                    objective_id: bi,
+                },
+            ) => a == b && ai == bi,
+            (
+                Self::MergeRequest {
+                    workspace_id: a,
+                    merge_request_id: ai,
+                },
+                Self::MergeRequest {
+                    workspace_id: b,
+                    merge_request_id: bi,
+                },
+            ) => a == b && ai == bi,
+            (
+                Self::Subject {
+                    workspace_id: a,
+                    subject_id: ai,
+                },
+                Self::Subject {
+                    workspace_id: b,
+                    subject_id: bi,
+                },
+            ) => a == b && ai == bi,
+            (
+                Self::DriveEntry {
+                    workspace_id: a,
+                    node_id: ai,
+                },
+                Self::DriveEntry {
+                    workspace_id: b,
+                    node_id: bi,
+                },
+            ) => a == b && ai == bi,
+            (
+                Self::DriveRequest {
+                    workspace_id: a,
+                    request_id: ai,
+                },
+                Self::DriveRequest {
+                    workspace_id: b,
+                    request_id: bi,
+                },
+            ) => a == b && ai == bi,
+            (
+                Self::Repository {
+                    workspace_id: a,
+                    repository_key: ai,
+                },
+                Self::Repository {
+                    workspace_id: b,
+                    repository_key: bi,
+                },
+            ) => a == b && ai == bi,
+            (
+                Self::WorkdirAttachment {
+                    workspace_id: a,
+                    connection_id: ai,
+                },
+                Self::WorkdirAttachment {
+                    workspace_id: b,
+                    connection_id: bi,
+                },
+            ) => a == b && ai == bi,
+            (Self::Network { url: a }, Self::Network { url: b }) => a == b,
+            (
+                Self::SubWorker {
+                    runtime_id: a,
+                    worker_id: aw,
+                    name: an,
+                },
+                Self::SubWorker {
+                    runtime_id: b,
+                    worker_id: bw,
+                    name: bn,
+                },
+            ) => a == b && aw == bw && an == bn,
+            (
+                Self::WorkspaceConfig {
+                    workspace_id: a,
+                    path: ap,
+                    recursive: ar,
+                },
+                Self::WorkspaceConfig {
+                    workspace_id: b,
+                    path: bp,
+                    recursive: br,
+                },
+            ) => {
+                a == b
+                    && if *ar {
+                        ap.is_empty()
+                            || ap == "."
+                            || ap == bp
+                            || bp
+                                .strip_prefix(ap)
+                                .is_some_and(|tail| tail.starts_with("/"))
+                    } else {
+                        ap == bp && !br
+                    }
+            }
             (Self::Feature, Self::Feature) => true,
             (Self::Workspace { workspace_id: a }, Self::Workspace { workspace_id: b }) => a == b,
             (
@@ -283,9 +704,36 @@ impl OperationAuthorizationRequest {
 #[serde(deny_unknown_fields)]
 pub struct OperationAuthorizationResponse {
     /// Matching granted scope for provider-resolved checks, not a credential.
-    /// `None` identifies the explicit non-Subject legacy authorization path.
+    /// Ordinary checks return `None` on the non-Subject legacy path. Bound
+    /// metadata lookups can still return the concrete target for consistency checks.
     #[serde(default)]
     pub scope: Option<PermissionResource>,
+}
+
+/// Selects existing Host metadata; caller-supplied selectors are not ownership proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BoundAuthorizationTarget {
+    Subject {},
+    WorkdirAttachment {
+        alias: String,
+        expected_connection_id: Option<String>,
+    },
+    SubWorker {
+        name: String,
+    },
+    NotificationSource {
+        source_event_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct BoundOperationAuthorizationRequest {
+    pub operation: String,
+    pub target: BoundAuthorizationTarget,
 }
 
 pub fn validate_operation_name(value: &str) -> Result<(), String> {

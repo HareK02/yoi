@@ -91,6 +91,15 @@ pub(super) fn prepare(api: &WorkspaceApi, reservation: &BackendJobReservation) -
         return Ok(());
     };
     let store = store(api)?;
+    let attribution = store
+        .session_attribution(&grant.session_id)
+        .map_err(|e| Error::Store(e.to_string()))?
+        .filter(|attr| attr.subject_id == grant.subject_id)
+        .ok_or_else(|| {
+            Error::WorkspacePermissionDenied("Journal source attribution missing".into())
+        })?;
+    authorize_source(api, &attribution, "journal.job.input.read")?;
+    authorize_source(api, &attribution, "journal.job.input.supply")?;
     let host = host(api, &store, grant)?;
     let input = saved_input(&reservation.job.request, grant)?;
     let g = store
@@ -238,6 +247,49 @@ fn generation(
     Ok(g)
 }
 
+fn authorize(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    subject: &str,
+    operation: &str,
+) -> Result<()> {
+    let scope = authorize_subjektiv_operation(api, worker, api.workspace_id(), subject, operation)
+        .map_err(|error| error.error)?;
+    if scope.is_none() {
+        return Err(Error::WorkspacePermissionDenied(
+            "Journal requires current Subject operation authority".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn authorize_source(
+    api: &WorkspaceApi,
+    attribution: &crate::subjektiv::SubjectSessionAttribution,
+    operation: &str,
+) -> Result<()> {
+    let worker = RuntimeWorkerRef::new(&attribution.runtime_id, &attribution.worker_id);
+    authorize(api, &worker, &attribution.subject_id, operation)
+}
+
+fn job_operation(request: &JournalJobRequest) -> &'static str {
+    match request {
+        JournalJobRequest::Execute { operation } => match &operation.action {
+            JournalAction::Create { .. } => "journal.entry.create",
+            JournalAction::Rewrite { .. } => "journal.entry.rewrite",
+            JournalAction::Fix { .. } => "journal.entry.fix",
+            JournalAction::UpdatePosition { .. } => "journal.position.update",
+            JournalAction::ConfirmUnchanged => "journal.unchanged.confirm",
+            JournalAction::Checkpoint { .. } => "journal.checkpoint",
+        },
+        JournalJobRequest::ReadState => "journal.state.read",
+        JournalJobRequest::QueryOperation { .. } => "journal.operation.query",
+        JournalJobRequest::ReadOperationCoverage { .. } => "journal.operation.coverage.read",
+        JournalJobRequest::ListOperations { .. } => "journal.operation.list",
+        JournalJobRequest::ReadText { .. } => "journal.text.read",
+    }
+}
+
 pub(super) fn execute(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
@@ -251,6 +303,7 @@ pub(super) fn execute(
     // Dispatch holds this same gate until matching Runtime acceptance is attested.
     // Revalidate after waiting: erasure, cancellation or replacement may have won.
     let (grant, job, attempt) = live(api, worker)?;
+    authorize(api, worker, &grant.subject_id, job_operation(&request))?;
     let store = store(api)?;
     let host = host(api, &store, &grant)?;
     let g = generation(&store, &host, &grant, &job, &attempt)?;
@@ -296,6 +349,7 @@ pub(super) fn finish(
     // Dispatch holds this same gate until matching Runtime acceptance is attested.
     // Revalidate after waiting: erasure, cancellation or replacement may have won.
     let (grant, job, attempt) = live(api, worker)?;
+    authorize(api, worker, &grant.subject_id, "journal.finish")?;
     let store = store(api)?;
     let host = host(api, &store, &grant)?;
     let input = saved_input(&job.request, &grant)?;
@@ -584,6 +638,7 @@ fn dispatch(
     let _gate = gate
         .lock()
         .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
+    authorize_source(api, &attribution, "journal.recording.request")?;
     let store = store(api)?;
     let host =
         JournalHostContext::validated_session(&store, attribution.clone()).map_err(domain)?;
@@ -663,6 +718,7 @@ fn dispatch(
     if input.selected_ranges.is_empty() {
         return Ok(());
     }
+    authorize_source(api, &attribution, "journal.recording.request")?;
     store
         .accept_journal_sources(&host, "Session activity", &input.selected_ranges)
         .map_err(domain)?;
@@ -700,6 +756,7 @@ fn admit_sources(
     attribution: crate::subjektiv::SubjectSessionAttribution,
     dispatch_jobs: bool,
 ) -> Result<JournalRecordingResponse> {
+    authorize_source(api, &attribution, "journal.recording.request")?;
     let store = store(api)?;
     let host =
         JournalHostContext::validated_session(&store, attribution.clone()).map_err(domain)?;
@@ -716,6 +773,7 @@ fn admit_sources(
         (0, 0)
     };
     let capture = capture_input(api, &attribution, order, offset, 48 * 1024)?;
+    authorize_source(api, &attribution, "journal.recording.request")?;
     retain_source(
         api.runtime.as_ref(),
         api.workspace_id(),
@@ -725,6 +783,7 @@ fn admit_sources(
     )?;
     let sources = journal::recording::capture_ranges(&capture).map_err(domain)?;
     for batch in sources.chunks(MAX_JOURNAL_RANGES) {
+        authorize_source(api, &attribution, "journal.recording.request")?;
         id = Some(
             store
                 .accept_journal_sources(&host, "Session activity", batch)
@@ -769,6 +828,13 @@ pub(super) async fn startup_route(
                 )
                 .into());
             }
+            authorize_subjektiv_operation(
+                &api,
+                &worker,
+                &path.workspace_id,
+                subject,
+                "journal.startup.read",
+            )?;
             let store = store(&api)?;
             let reader = JournalHostContext::validated_reader(&store, subject).map_err(domain)?;
             let mut current_writer = None;
@@ -835,6 +901,13 @@ pub(super) async fn compaction_route(
                 )
                 .into());
             }
+            authorize_subjektiv_operation(
+                &api,
+                &worker,
+                &path.workspace_id,
+                subject,
+                "journal.compaction.read",
+            )?;
             let store = store(&api)?;
             let attribution = store
                 .session_attribution(&input.session_id)
@@ -1264,6 +1337,13 @@ pub(super) async fn recording_route(
                 )
                 .into());
             }
+            authorize_subjektiv_operation(
+                &api,
+                &worker,
+                &path.workspace_id,
+                subject,
+                "journal.recording.request",
+            )?;
             require_enabled(&api, &worker)?;
             let store = store(&api)?;
             let attributions = store
@@ -1528,6 +1608,7 @@ pub(super) fn recording_request(
             Error::WorkspacePermissionDenied("Journal Session has no Host writer binding".into())
         })?
         .to_string();
+    let source_worker = RuntimeWorkerRef::new(&attribution.runtime_id, &attribution.worker_id);
     let grant = SubjektivJournalGrant {
         binding_id,
         subject_id: attribution.subject_id,
@@ -1542,7 +1623,7 @@ pub(super) fn recording_request(
         instruction: "Record ONLY the immutable body-bearing capture supplied in this input. These exact canonical source bytes, identities and ranges are the whole input for this Job; do not fetch original Sessions or use ReadJournalText Source. First ReadJournalState; initial/current Journal position/open text remain separately paged by ReadJournalText. Sequentially save CreateJournalEntry/RewriteJournalEntry/FixJournalEntry, current position and receipt-backed CheckpointJournal. Input delivery is not understanding or reflection. Never infer event completion from turn/task/job/compaction boundaries. Preserve exact operation ID/full input after Unknown. SubmitBackendJobResult only after the complete selected prefix has a saved checkpoint; no aggregate JournalRecordResult.".into(),
         profile: "builtin:subjektiv-journal-recording".into(),
         grants: BackendJobGrants { subjektiv_journal: Some(grant), ..Default::default() },
-        serialization_key: Some(journal_serialization_key(journal_id)), source_worker: None, notification_target: None,
+        serialization_key: Some(journal_serialization_key(journal_id)), source_worker: Some(source_worker), notification_target: None,
         limits: crate::backend_job::BackendJobLimits { timeout_seconds: 600, ..Default::default() },
     };
     saved_input(
@@ -1564,6 +1645,7 @@ pub(super) fn capture_input(
     offset: u64,
     budget: usize,
 ) -> Result<session_store::capture::CaptureDto> {
+    authorize_source(api, attr, "journal.recording.request")?;
     match api
         .runtime
         .session_recording_capture(

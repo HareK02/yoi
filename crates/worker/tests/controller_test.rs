@@ -221,8 +221,10 @@ async fn make_worker_with_pwd(
     make_worker_with_pwd_and_manifest(client, MANIFEST_TOML).await
 }
 
-#[derive(Debug)]
-struct AvailableWorkspaceClient;
+#[derive(Debug, Default)]
+struct AvailableWorkspaceClient {
+    consolidation_input_granted: bool,
+}
 
 impl WorkspaceClient for AvailableWorkspaceClient {
     fn workspace_id(&self) -> Option<&str> {
@@ -245,6 +247,28 @@ impl WorkspaceClient for AvailableWorkspaceClient {
             return Ok(WorkspaceResponse {
                 status: 200,
                 body: "{}".into(),
+            });
+        }
+        if request.path == "/api/w/workspace-1/authorization/bound-check" {
+            let input: server_api::authorization::BoundOperationAuthorizationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            assert_eq!(input.operation, "memory.consolidation.supply");
+            assert_eq!(
+                input.target,
+                server_api::authorization::BoundAuthorizationTarget::Subject {}
+            );
+            return Ok(WorkspaceResponse {
+                status: if self.consolidation_input_granted {
+                    200
+                } else {
+                    403
+                },
+                body: serde_json::json!({"scope": {
+                    "kind": "subject",
+                    "workspace_id": "workspace-1",
+                    "subject_id": "consolidation-subject"
+                }})
+                .to_string(),
             });
         }
         Err(WorkspaceClientError::Unavailable("test".to_string()))
@@ -1101,7 +1125,10 @@ async fn backend_job_capability_is_explicit_and_preserves_profile_features() {
         let (mut worker, _pwd) = make_worker_with_manifest_and_workspace_context(
             client,
             resolved.manifest,
-            WorkerWorkspaceContext::with_client(None, Arc::new(AvailableWorkspaceClient)),
+            WorkerWorkspaceContext::with_client(
+                None,
+                Arc::new(AvailableWorkspaceClient::default()),
+            ),
         )
         .await;
         if bound {
@@ -1137,6 +1164,7 @@ async fn backend_job_capability_is_explicit_and_preserves_profile_features() {
 
 #[derive(Debug, Default)]
 struct JournalWorkspaceClient {
+    journal_input_granted: bool,
     requests: Mutex<Vec<WorkspaceRequest>>,
     result_calls: AtomicUsize,
 }
@@ -1158,6 +1186,24 @@ impl WorkspaceClient for JournalWorkspaceClient {
             return Ok(WorkspaceResponse {
                 status: 200,
                 body: "{}".into(),
+            });
+        }
+        if request.path == "/api/w/workspace-test/authorization/bound-check" {
+            let input: server_api::authorization::BoundOperationAuthorizationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            assert_eq!(input.operation, "journal.job.input.supply");
+            assert_eq!(
+                input.target,
+                server_api::authorization::BoundAuthorizationTarget::Subject {}
+            );
+            return Ok(WorkspaceResponse {
+                status: if self.journal_input_granted { 200 } else { 403 },
+                body: serde_json::json!({"scope": {
+                    "kind": "subject",
+                    "workspace_id": "workspace-test",
+                    "subject_id": "journal-subject"
+                }})
+                .to_string(),
             });
         }
         self.requests.lock().unwrap().push(request.clone());
@@ -1248,7 +1294,10 @@ async fn journal_backend_grant_installs_bound_tools_and_seals_saved_finish_befor
         };
         let client = MockClient::sequential(responses);
         let captured = client.clone();
-        let backend = Arc::new(JournalWorkspaceClient::default());
+        let backend = Arc::new(JournalWorkspaceClient {
+            journal_input_granted: granted,
+            ..Default::default()
+        });
         let (mut worker, _pwd) = make_worker_with_manifest_and_workspace_context(
             client,
             manifest,
@@ -1381,7 +1430,12 @@ async fn consolidation_job_preserves_custom_instruction_and_explicit_tool_policy
     let (mut worker, _pwd) = make_worker_with_manifest_and_workspace_context(
         client,
         manifest,
-        WorkerWorkspaceContext::with_client(None, Arc::new(AvailableWorkspaceClient)),
+        WorkerWorkspaceContext::with_client(
+            None,
+            Arc::new(AvailableWorkspaceClient {
+                consolidation_input_granted: true,
+            }),
+        ),
     )
     .await;
     worker
@@ -1417,6 +1471,98 @@ async fn consolidation_job_preserves_custom_instruction_and_explicit_tool_policy
         "TaskCreate",
     ] {
         assert!(tools.iter().any(|name| name == tool));
+    }
+}
+
+#[path = "controller/subject_job_input_supply.rs"]
+mod subject_job_input_supply;
+
+#[tokio::test]
+async fn denied_subject_job_input_supply_stops_before_model_dispatch() {
+    for (profile, consolidation, operation) in [
+        (
+            "subjektiv-memory-consolidation",
+            true,
+            "memory.consolidation.supply",
+        ),
+        (
+            "subjektiv-journal-recording",
+            false,
+            "journal.job.input.supply",
+        ),
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut manifest = ProfileResolver::new()
+            .with_workspace_base(workspace.path())
+            .resolve(
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, profile),
+                ProfileResolveOptions::with_worker_name("denied-subject-job"),
+            )
+            .unwrap()
+            .manifest;
+        if consolidation {
+            manifest
+                .feature
+                .subjektiv
+                .bind_workspace_settings(manifest::WorkspaceMemorySettingsSnapshot {
+                    workspace_id: "workspace-1".into(),
+                    language: "English".into(),
+                })
+                .unwrap();
+        }
+        let journal = Arc::new(JournalWorkspaceClient::default());
+        let backend: Arc<dyn WorkspaceClient> = if consolidation {
+            Arc::new(AvailableWorkspaceClient::default())
+        } else {
+            journal.clone()
+        };
+        let client = MockClient::new(simple_text_events());
+        let captured = client.clone();
+        let (mut worker, _pwd) = make_worker_with_manifest_and_workspace_context(
+            client,
+            manifest,
+            WorkerWorkspaceContext::with_client(None, backend),
+        )
+        .await;
+        worker
+            .bind_backend_job(worker::BackendJobExecutionBinding {
+                job_id: "denied-job".into(),
+                attempt_id: "attempt".into(),
+                input_digest: Some("digest".into()),
+                subjektiv_consolidation: consolidation,
+                subjektiv_journal: !consolidation,
+            })
+            .unwrap();
+        let handle = spawn_controller(worker).await;
+        let mut events = handle.subscribe();
+        let submission_request_id = protocol::new_submission_request_id();
+        handle
+            .send(Method::submit_text(
+                submission_request_id.clone(),
+                "Inspect protected Job input.",
+            ))
+            .await
+            .unwrap();
+        let mut denial = None;
+        assert!(
+            drain_until(&mut events, std::time::Duration::from_secs(2), |event| {
+                if let Event::Error { message, .. } = event {
+                    denial = Some(message.clone());
+                }
+                matches!(event, Event::WorkerState { snapshot }
+                    if snapshot.catalog_status() == WorkerStatus::Idle
+                        && snapshot.last_finished_submission_request_id.as_deref()
+                            == Some(submission_request_id.as_str()))
+            })
+            .await,
+            "denied {operation} Submit did not finish"
+        );
+        let denial = denial.expect("protected Job input denial must be reported");
+        assert!(denial.contains(operation), "{denial}");
+        assert!(denial.contains("403"), "{denial}");
+        assert!(captured.captured_requests().is_empty());
+        assert!(journal.requests.lock().unwrap().is_empty());
+        assert_eq!(journal.result_calls.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -1759,7 +1905,7 @@ permission = "write"
     let (worker, _pwd) = make_worker_with_pwd_manifest_and_workspace_context(
         client,
         manifest_toml,
-        WorkerWorkspaceContext::with_client(None, Arc::new(AvailableWorkspaceClient)),
+        WorkerWorkspaceContext::with_client(None, Arc::new(AvailableWorkspaceClient::default())),
     )
     .await;
     let handle = spawn_controller(worker).await;

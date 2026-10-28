@@ -518,7 +518,10 @@ fn failure(code: ProtocolErrorCode, message: &str) -> WipOperationError {
 }
 fn map_error(error: DriveError) -> WipOperationError {
     let code = match &error {
-        DriveError::Denied => ProtocolErrorCode::PermissionDenied,
+        DriveError::Denied | DriveError::Authorization { denied: true, .. } => {
+            ProtocolErrorCode::PermissionDenied
+        }
+        DriveError::Authorization { denied: false, .. } => ProtocolErrorCode::Internal,
         DriveError::NotFound => ProtocolErrorCode::NotFound,
         DriveError::Conflict => ProtocolErrorCode::ValidatorMismatch,
         DriveError::Invalid(_) => ProtocolErrorCode::InvalidArguments,

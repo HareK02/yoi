@@ -114,6 +114,7 @@ pub(crate) struct WorkerInterceptor {
     log_writer: Option<Arc<dyn SystemItemCommitter>>,
     notification_committer: Option<Arc<dyn DurableNotificationCommitter>>,
     resident_context_source: Option<Arc<dyn SystemPromptContributionSource>>,
+    protected_input_supply: crate::worker::ProtectedInputSupply,
     pending_committed_history: Arc<Mutex<VecDeque<HistoryEntry<SessionHistoryMetadata>>>>,
     /// Next turn index assigned by `on_prompt_submit`.
     next_turn_index: AtomicUsize,
@@ -171,6 +172,7 @@ impl WorkerInterceptor {
             log_writer,
             notification_committer: None,
             resident_context_source: None,
+            protected_input_supply: Default::default(),
             pending_committed_history,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
@@ -207,7 +209,17 @@ impl WorkerInterceptor {
         mut self,
         source: Option<Arc<dyn SystemPromptContributionSource>>,
     ) -> Self {
+        self.protected_input_supply
+            .set_prompt_source(source.clone());
         self.resident_context_source = source;
+        self
+    }
+
+    pub(crate) fn with_protected_input_supply(
+        mut self,
+        supply: crate::worker::ProtectedInputSupply,
+    ) -> Self {
+        self.protected_input_supply = supply;
         self
     }
 
@@ -577,6 +589,15 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
         &self,
         context: PreLlmRequestContext<'_, SessionHistoryMetadata>,
     ) -> InterceptorResult<PreRequestAction> {
+        self.protected_input_supply
+            .authorize(context.history.iter().map(|entry| &entry.annotation))
+            .await
+            .map_err(|reason| {
+                InterceptorError::new(
+                    InterceptorErrorCategory::Dependency,
+                    format!("protected input supply rejected: {reason}"),
+                )
+            })?;
         let context_invocation = context.invocation;
         let context_history = context.history;
         let context = context.items;
@@ -645,6 +666,18 @@ impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
         for entry in &mut system_items {
             self.attach_prompt_provenance(std::slice::from_mut(&mut entry.item));
         }
+        // Hooks may add protected input or revoke authority while preparing this
+        // request. Check their complete output before it can reach the provider,
+        // not only the history that existed before the hooks ran.
+        self.protected_input_supply
+            .authorize_pending(system_items.iter().map(|entry| &entry.metadata))
+            .await
+            .map_err(|reason| {
+                InterceptorError::new(
+                    InterceptorErrorCategory::Dependency,
+                    format!("protected input supply rejected: {reason}"),
+                )
+            })?;
         let mut appended_items: Vec<Item> = system_items
             .iter()
             .map(|entry| entry.item.to_history_item())
@@ -1023,6 +1056,10 @@ mod tests {
 
     #[async_trait]
     impl SystemPromptContributionSource for ConfirmRecordingResidentSource {
+        fn protected_input_kind(&self) -> Option<&'static str> {
+            Some("subject-resident")
+        }
+
         async fn load(&self) -> SystemPromptContribution {
             SystemPromptContribution::Unavailable
         }

@@ -1,6 +1,8 @@
 //! Connected Backend → production Runtime factory → real Controller → Journal → signed
 //! Host startup reader → persisted first input. Only the external model stream is scripted.
 //! Browser authentication is outside this regression: creation enters the real scoped handler.
+//! Policy regressions reuse the parent's canonical source/SQLite RuntimeFixture with
+//! recording Runtime execution; those cases do not claim real Controller/model execution.
 use super::*;
 use agen::llm_client::{
     LlmClient, Request,
@@ -12,6 +14,40 @@ use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
 use super::super::restored_parent_control_tests::connected_restore_tempdir;
+
+fn connected_subject_permissions(
+    subject: &str,
+) -> Vec<server_api::authorization::ScopedPermission> {
+    JOURNAL_OPERATIONS
+        .iter()
+        .copied()
+        .chain([
+            "memory.extract.read",
+            "memory.extract.supply",
+            "memory.resident.read",
+            "memory.resident.supply",
+            "memory.consolidation.request",
+            "memory.consolidation.supply",
+            "memory.surface.prepare",
+            "memory.surface.supply",
+            "memory.surface.publish",
+            "memory.surface.fail",
+            "memory.staging.list",
+            "memory.staging.read",
+            "memory.candidate.decide",
+            "memory.query",
+            "memory.read",
+            "memory.changes.list",
+        ])
+        .map(|operation| server_api::authorization::ScopedPermission {
+            operation: operation.into(),
+            resource: server_api::authorization::PermissionResource::Subject {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                subject_id: subject.into(),
+            },
+        })
+        .collect()
+}
 
 #[derive(Clone, Default)]
 struct ConnectedJournalModel {
@@ -399,31 +435,12 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     let owner =
         seed_test_workspace_owner_token(api.store.as_ref(), "connected-journal-owner").await;
     // This fixture exercises Journal continuity, not unset-policy refusal. Assign
-    // the companion's exact activation keys through authenticated administration;
+    // the companion's required Subject operations through authenticated administration;
     // no filesystem, shell or delegation permission is granted to its body.
     let update = server_api::authorization::SubjectPermissionsUpdate {
         operation_id: "connected-journal-activation".into(),
         expected_change_id: None,
-        execution: [
-            "task",
-            "subjektiv",
-            "web",
-            "image",
-            "sub_worker",
-            "worker",
-            "workspace_worker_discovery",
-            "objective",
-            "manage_workdir",
-            "workdir_catalog",
-            "drive",
-            "ticket",
-        ]
-        .into_iter()
-        .map(|name| server_api::authorization::ScopedPermission {
-            operation: name.into(),
-            resource: server_api::authorization::PermissionResource::Feature,
-        })
-        .collect(),
+        execution: connected_subject_permissions(&subject.id),
         delegation: Vec::new(),
     };
     let response = build_router(api.clone())
@@ -1606,26 +1623,7 @@ async fn connected_restore_fixture_with_pending_head(
     let update = server_api::authorization::SubjectPermissionsUpdate {
         operation_id: "restore-host-auth-permissions".into(),
         expected_change_id: None,
-        execution: [
-            "task",
-            "subjektiv",
-            "web",
-            "image",
-            "sub_worker",
-            "worker",
-            "workspace_worker_discovery",
-            "objective",
-            "manage_workdir",
-            "workdir_catalog",
-            "drive",
-            "ticket",
-        ]
-        .into_iter()
-        .map(|name| server_api::authorization::ScopedPermission {
-            operation: name.into(),
-            resource: server_api::authorization::PermissionResource::Feature,
-        })
-        .collect(),
+        execution: connected_subject_permissions(&subject.id),
         delegation: vec![],
     };
     let response = build_router(api.clone())
@@ -2553,4 +2551,165 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
         );
     }
     shutdown_workspace_feature_storage(api).await.unwrap();
+}
+
+fn replace_recording_fixture_policy(
+    f: &RuntimeFixture,
+    execution: Vec<server_api::authorization::ScopedPermission>,
+) {
+    let subject = &f
+        .request
+        .grants
+        .subjektiv_journal
+        .as_ref()
+        .unwrap()
+        .subject_id;
+    let previous = f.store.subject_permissions(subject).unwrap().unwrap();
+    f.store
+        .set_subject_permissions(
+            subject,
+            &server_api::authorization::SubjectPermissionsUpdate {
+                operation_id: Uuid::now_v7().to_string(),
+                expected_change_id: Some(previous.change_id),
+                execution,
+                delegation: vec![],
+            },
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn journal_supply_denial_precedes_generation_claim_and_dispatch_then_exact_grant_allows_processing()
+ {
+    let f = RuntimeFixture::new().await;
+    let grant = f.request.grants.subjektiv_journal.as_ref().unwrap();
+    let execution = connected_subject_permissions(&grant.subject_id);
+    assert!(
+        execution
+            .iter()
+            .any(|permission| permission.operation == "journal.job.input.supply")
+    );
+    replace_recording_fixture_policy(
+        &f,
+        execution
+            .iter()
+            .filter(|permission| permission.operation != "journal.job.input.supply")
+            .cloned()
+            .collect(),
+    );
+    assert!(f.execution.take_inputs().is_empty());
+    let error = f
+        .api
+        .dispatch_backend_job_reservation(f.reserved.clone())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("journal.job.input.supply"),
+        "{error:?}"
+    );
+    assert!(
+        f.execution.take_inputs().is_empty(),
+        "denied input must not reach Runtime/model dispatch"
+    );
+    assert!(
+        f.store
+            .active_journal_generation(&f.host, &f.id)
+            .unwrap()
+            .is_none()
+    );
+    let attempt = f
+        .api
+        .store
+        .get_backend_job_attempt(
+            TEST_WORKSPACE_ID,
+            &f.request.job_id,
+            &f.reserved.attempt.attempt_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.state, BackendJobAttemptState::Reserved);
+    assert!(attempt.worker.is_none());
+    let saved = f
+        .api
+        .store
+        .get_backend_job(TEST_WORKSPACE_ID, &f.request.job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.request, f.request,
+        "refusal preserves immutable capture and selection"
+    );
+
+    replace_recording_fixture_policy(&f, execution);
+    let dispatched = f
+        .api
+        .dispatch_backend_job_reservation(f.reserved.clone())
+        .unwrap();
+    let worker = dispatched.attempt.worker.as_ref().unwrap();
+    assert_eq!(f.execution.take_inputs().len(), 1);
+    let JournalJobResponse::State(state) =
+        subjektiv_journal::execute(&f.api, worker, JournalJobRequest::ReadState).unwrap()
+    else {
+        panic!("actual Journal state required")
+    };
+    assert_eq!(state.selected_ranges, grant.selected_ranges);
+    assert_eq!(dispatched.job.request, f.request);
+
+    // The body really holds Memory and session permissions. A Journal capability
+    // cannot inherit those merely because their Subject resource is identical.
+    for operation in [
+        "memory.read",
+        "memory.consolidation.supply",
+        "session.record",
+    ] {
+        let needed = server_api::authorization::OperationAuthorizationRequest {
+            operation: operation.into(),
+            resource: server_api::authorization::PermissionResource::Subject {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                subject_id: grant.subject_id.clone(),
+            },
+        };
+        assert!(subject_authorization::authorize_scope(&f.api, &f.source, &needed).is_ok());
+        assert!(
+            subject_authorization::authorize_scope(&f.api, worker, &needed).is_err(),
+            "Journal domain ceiling must reject {operation}"
+        );
+    }
+
+    // Exercise the signed bound Subject API for the Job, not only the internal
+    // permission helper. Metadata resolution must not require body singleton ownership.
+    let mut api = f.api.clone();
+    let identity = RuntimeIdentityMaterial::generate(&worker.runtime_id).unwrap();
+    configure_runtime_request_auth(&mut api, &identity, &worker.runtime_id);
+    for (operation, expected) in [
+        ("journal.job.input.supply", StatusCode::OK),
+        ("memory.read", StatusCode::FORBIDDEN),
+    ] {
+        let response = build_router(api.clone())
+            .oneshot(runtime_source_request(
+                &identity,
+                Some(&worker.worker_id),
+                "POST",
+                &format!("/api/w/{TEST_WORKSPACE_ID}/authorization/bound-check"),
+                serde_json::to_vec(&json!({"operation":operation,"target":{"kind":"subject"}}))
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 2 * 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status, expected, "{operation}: {body}");
+        if status == StatusCode::OK {
+            assert_eq!(
+                body,
+                json!({"scope":{"kind":"subject","workspace_id":TEST_WORKSPACE_ID,"subject_id":grant.subject_id}})
+            );
+        } else {
+            assert!(body.get("scope").is_none());
+        }
+    }
 }

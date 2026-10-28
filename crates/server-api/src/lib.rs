@@ -1388,6 +1388,20 @@ pub trait ServerApi {
         #[body] request: authorization::OperationAuthorizationRequest,
     ) -> Result<authorization::OperationAuthorizationResponse, RepositoryApiError>;
 
+    #[post(
+        "/api/w/{workspace_id}/authorization/bound-check",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        openapi = false,
+    )]
+    async fn bound_operation_authorize(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: authorization::BoundOperationAuthorizationRequest,
+    ) -> Result<authorization::OperationAuthorizationResponse, RepositoryApiError>;
+
     #[get(
         "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/permissions",
         status = 200,
@@ -14798,6 +14812,7 @@ mod openapi_artifact_tests {
         // operations, but must not appear as unauthenticated operations in the public OpenAPI.
         const SIGNED_INTERNAL: &[&str] = &[
             "operation_authorize",
+            "bound_operation_authorize",
             "current_worker_workspace_config_get",
             "current_worker_workspace_config_attach",
             "current_worker_workspace_config_observe",

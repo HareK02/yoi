@@ -2210,6 +2210,13 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         delivery_id: &str,
         source: &TicketAssignmentTrackingSourceContext,
     ) -> Result<()>;
+    /// Resolve only persisted source ownership metadata, never notification content.
+    /// Missing and ambiguous identities both return None.
+    fn notification_source_resource(
+        &self,
+        workspace_id: &str,
+        source_event_id: &str,
+    ) -> Result<Option<server_api::authorization::PermissionResource>>;
     fn notification_diagnostics(
         &self,
         workspace_id: &str,
@@ -4710,6 +4717,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             ));
         }
         self.with_conn(|conn| {
+            if kind == WorkspaceResourceKind::Ticket {
+                // Identity-only projection with the same ambiguity rule as the
+                // Ticket provider; authorization must not load protected bodies.
+                let mut statement = conn.prepare(
+                    "SELECT ticket_id FROM typed_tickets
+                     WHERE workspace_id = ?1 AND (ticket_id = ?2 OR slug = ?2)
+                     UNION SELECT resource_id FROM workspace_resource_keys
+                     WHERE workspace_id = ?1 AND resource_kind = 'ticket' AND resource_key = ?2
+                     LIMIT 2",
+                )?;
+                let ids = statement.query_map(params![workspace_id, reference], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                return Ok(match ids.as_slice() { [id] => Some(id.clone()), _ => None });
+            }
             if let Some(resource_id) = conn
                 .query_row(
                     "SELECT resource_id FROM workspace_resource_keys
@@ -9160,6 +9181,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             created_at,
             None,
         )
+    }
+    fn notification_source_resource(
+        &self,
+        workspace_id: &str,
+        source_event_id: &str,
+    ) -> Result<Option<server_api::authorization::PermissionResource>> {
+        notification_diagnostics::source_resource(self, workspace_id, source_event_id)
     }
     fn notification_diagnostics(
         &self,

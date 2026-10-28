@@ -39,7 +39,39 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn grant_permissions(store: &crate::subjektiv::SubjektivStore, subject_id: &str) {
+        store
+            .set_subject_permissions(
+                subject_id,
+                &server_api::authorization::SubjectPermissionsUpdate {
+                    operation_id: format!("memory-journal-fixture-grant-{subject_id}"),
+                    expected_change_id: None,
+                    execution: [
+                        "journal.memory.links.reconcile",
+                        "journal.memory.links.read",
+                        "journal.memory.read",
+                        "journal.memory.related.read",
+                    ]
+                    .into_iter()
+                    .map(|operation| server_api::authorization::ScopedPermission {
+                        operation: operation.into(),
+                        resource: server_api::authorization::PermissionResource::Subject {
+                            workspace_id: TEST_WORKSPACE_ID.into(),
+                            subject_id: subject_id.into(),
+                        },
+                    })
+                    .collect(),
+                    delegation: vec![],
+                },
+            )
+            .unwrap();
+    }
+
     async fn new() -> Self {
+        Self::with_permissions(true).await
+    }
+
+    async fn with_permissions(granted: bool) -> Self {
         use session_store::{LogEntry, Store as _, WorkerSessionStore};
         let dir = tempfile::tempdir().unwrap();
         let mut api = test_api(dir.path()).await;
@@ -49,6 +81,9 @@ impl Fixture {
         let subject = store
             .create_subject(crate::subjektiv::SubjectRole::new("memory-journal").unwrap())
             .unwrap();
+        if granted {
+            Self::grant_permissions(&store, &subject.id);
+        }
         let worker = Self::body_worker(&api, &subject.id);
         let source_worker = RuntimeWorkerRef::new(RUNTIME, Uuid::new_v4().to_string());
         seed_worker_source_member(&api, RUNTIME, &source_worker.worker_id);
@@ -648,29 +683,38 @@ async fn memory_journal_router_ids_do_not_grant_cross_subject_reads_or_reconcili
         .create_subject(crate::subjektiv::SubjectRole::new("other").unwrap())
         .unwrap();
     let other_worker = Fixture::body_worker(&f.api, &other.id);
-    for request in [
-        MemoryJournalRequest::Reconcile {
-            selector: f.selector.clone(),
-        },
-        MemoryJournalRequest::Links {
-            selector: f.selector.clone(),
-        },
-        f.read_request(),
-        MemoryJournalRequest::Related {
-            journal_id: f.journal_id.clone(),
-            entry_id: f.entry_id.clone(),
-            after: None,
-            limit: 32,
-        },
-    ] {
-        let (status, bytes) = f.call_as(&other_worker, request).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "{}",
-            String::from_utf8_lossy(&bytes)
-        );
-        assert!(!String::from_utf8_lossy(&bytes).contains(JOURNAL_BODY));
+    for granted in [false, true] {
+        if granted {
+            Fixture::grant_permissions(&f.store, &other.id);
+        }
+        for request in [
+            MemoryJournalRequest::Reconcile {
+                selector: f.selector.clone(),
+            },
+            MemoryJournalRequest::Links {
+                selector: f.selector.clone(),
+            },
+            f.read_request(),
+            MemoryJournalRequest::Related {
+                journal_id: f.journal_id.clone(),
+                entry_id: f.entry_id.clone(),
+                after: None,
+                limit: 32,
+            },
+        ] {
+            let (status, bytes) = f.call_as(&other_worker, request).await;
+            assert_eq!(
+                status,
+                if granted {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            assert!(!String::from_utf8_lossy(&bytes).contains(JOURNAL_BODY));
+        }
     }
     // A model cannot override the authenticated Subject with an additional JSON field.
     let mut body = serde_json::to_value(f.read_request()).unwrap();
@@ -733,3 +777,82 @@ async fn memory_journal_router_correction_reverse_lookup_preserves_memory_and_or
 
 #[path = "subjektiv_journal_browser_tests.rs"]
 mod browser_tests;
+
+#[tokio::test]
+async fn memory_journal_unset_or_revoked_permissions_deny_every_route_without_link_writes() {
+    for revoked in [false, true] {
+        let f = Fixture::with_permissions(revoked).await;
+        let lease = f
+            .api
+            .store
+            .require_current_worker_singleton_owner(TEST_WORKSPACE_ID, &f.worker)
+            .unwrap()
+            .unwrap();
+        let (subject, _) = subjektiv_scope_from_singleton_key(&lease.key).unwrap();
+        if revoked {
+            let policy = f.store.subject_permissions(&subject).unwrap().unwrap();
+            f.store
+                .set_subject_permissions(
+                    &subject,
+                    &server_api::authorization::SubjectPermissionsUpdate {
+                        operation_id: "revoke-memory-journal".into(),
+                        expected_change_id: Some(policy.change_id),
+                        execution: vec![],
+                        delegation: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        let count_links = || {
+            f.api
+                .feature_storage
+                .open(&f.api.subjektiv_registration)
+                .unwrap()
+                .with_connection(|conn| {
+                    Ok(
+                        conn.query_row("SELECT COUNT(*) FROM memory_journal_links", [], |row| {
+                            row.get::<_, i64>(0)
+                        })?,
+                    )
+                })
+                .unwrap()
+        };
+        let before = count_links();
+        let requests = [
+            MemoryJournalRequest::Reconcile {
+                selector: f.selector.clone(),
+            },
+            MemoryJournalRequest::Links {
+                selector: f.selector.clone(),
+            },
+            MemoryJournalRequest::ReconcilePage {
+                selector: f.selector.clone(),
+                source_offset: 0,
+                limit: 1,
+            },
+            MemoryJournalRequest::LinksPage {
+                selector: f.selector.clone(),
+                source_offset: 0,
+                limit: 1,
+            },
+            f.read_request(),
+            MemoryJournalRequest::Related {
+                journal_id: f.journal_id.clone(),
+                entry_id: f.entry_id.clone(),
+                after: None,
+                limit: 1,
+            },
+        ];
+        for request in requests {
+            let (status, body) = f.call_as(&f.worker, request).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(!String::from_utf8_lossy(&body).contains(JOURNAL_BODY));
+            assert_eq!(count_links(), before);
+        }
+    }
+}

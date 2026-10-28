@@ -119,6 +119,19 @@ impl Tool for ListWorkspaceWorkersTool {
             ));
         }
 
+        let workspace_id = self.client.workspace_id().ok_or_else(|| {
+            ToolError::ExecutionFailed(
+                "Workspace Worker discovery requires Workspace identity".into(),
+            )
+        })?;
+        self.client
+            .authorize_operation(
+                "worker.discover",
+                &server_api::authorization::PermissionResource::Workspace {
+                    workspace_id: workspace_id.into(),
+                },
+            )
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         let page = self
             .client
             .list_workspace_workers(WorkspaceWorkerDiscoveryRequest {
@@ -178,6 +191,8 @@ mod tests {
     #[derive(Debug)]
     struct RecordingClient {
         requests: Mutex<Vec<WorkspaceWorkerDiscoveryRequest>>,
+        authorizations: Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
+        denied: std::sync::atomic::AtomicBool,
         result: WorkspaceWorkerDiscoveryPage,
         unavailable: bool,
     }
@@ -197,9 +212,24 @@ mod tests {
 
         fn execute(
             &self,
-            _request: WorkspaceRequest,
+            request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-            panic!("discovery must not use generic Workspace request authority")
+            assert!(
+                request.path.ends_with("/authorization/check"),
+                "discovery must use dedicated source proof, not generic request authority"
+            );
+            self.authorizations
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(request.body.as_deref().unwrap()).unwrap());
+            Ok(WorkspaceResponse {
+                status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) {
+                    403
+                } else {
+                    200
+                },
+                body: r#"{"scope":null}"#.into(),
+            })
         }
 
         fn list_workspace_workers(
@@ -235,6 +265,8 @@ mod tests {
     async fn tool_preserves_typed_subject_and_forwards_lookup() {
         let client = Arc::new(RecordingClient {
             requests: Mutex::new(Vec::new()),
+            authorizations: Mutex::default(),
+            denied: std::sync::atomic::AtomicBool::new(false),
             result: page(),
             unavailable: false,
         });
@@ -263,6 +295,8 @@ mod tests {
     async fn missing_backend_authority_fails_closed() {
         let client = Arc::new(RecordingClient {
             requests: Mutex::new(Vec::new()),
+            authorizations: Mutex::default(),
+            denied: std::sync::atomic::AtomicBool::new(false),
             result: page(),
             unavailable: true,
         });
@@ -270,6 +304,53 @@ mod tests {
             .execute("{}", ToolExecutionContext::default())
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("denied"));
+        assert!(error.to_string().contains("Host-bound"));
+    }
+    #[tokio::test]
+    async fn discovery_checks_live_authority_before_protected_read() {
+        let client = Arc::new(RecordingClient {
+            requests: Mutex::default(),
+            authorizations: Mutex::default(),
+            denied: std::sync::atomic::AtomicBool::new(true),
+            result: page(),
+            unavailable: false,
+        });
+        let tool = ListWorkspaceWorkersTool {
+            client: client.clone(),
+        };
+        assert!(
+            tool.execute("{}", ToolExecutionContext::direct())
+                .await
+                .is_err()
+        );
+        assert!(client.requests.lock().unwrap().is_empty());
+        client
+            .denied
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            tool.execute("{}", ToolExecutionContext::direct())
+                .await
+                .is_ok()
+        );
+        client
+            .denied
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            tool.execute("{}", ToolExecutionContext::direct())
+                .await
+                .is_err()
+        );
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        let authorizations = client.authorizations.lock().unwrap();
+        assert_eq!(authorizations.len(), 3);
+        for request in authorizations.iter() {
+            assert_eq!(request.operation, "worker.discover");
+            assert_eq!(
+                request.resource,
+                server_api::authorization::PermissionResource::Workspace {
+                    workspace_id: "workspace-1".into()
+                }
+            );
+        }
     }
 }

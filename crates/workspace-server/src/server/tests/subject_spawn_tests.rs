@@ -18,6 +18,30 @@ async fn subject_callbacks_finish_before_waiting_host_parents_release_capacity()
                 crate::subjektiv::SubjectRole::new(format!("companion-{index}")).unwrap(),
             )
             .unwrap();
+        subjektiv
+            .set_subject_permissions(
+                &subject.id,
+                &server_api::authorization::SubjectPermissionsUpdate {
+                    operation_id: format!("subject-callback-grant-{index}"),
+                    expected_change_id: None,
+                    execution: [
+                        "memory.resident.read",
+                        "session.record",
+                        "journal.startup.read",
+                    ]
+                    .into_iter()
+                    .map(|operation| server_api::authorization::ScopedPermission {
+                        operation: operation.into(),
+                        resource: server_api::authorization::PermissionResource::Subject {
+                            workspace_id: TEST_WORKSPACE_ID.into(),
+                            subject_id: subject.id.clone(),
+                        },
+                    })
+                    .collect(),
+                    delegation: vec![],
+                },
+            )
+            .unwrap();
         let singleton_key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
         let reserved = api
             .config_store

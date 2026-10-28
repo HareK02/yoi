@@ -70,6 +70,7 @@ const INPUT_BUDGET_ERROR_MARKER: &str = "surface_editor_input_budget_exceeded";
 struct InputBudgetLlmClient {
     inner: Box<dyn LlmClient>,
     input_token_budget: usize,
+    authorize_supply: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
 impl Clone for InputBudgetLlmClient {
@@ -77,6 +78,7 @@ impl Clone for InputBudgetLlmClient {
         Self {
             inner: self.inner.clone_boxed(),
             input_token_budget: self.input_token_budget,
+            authorize_supply: self.authorize_supply.clone(),
         }
     }
 }
@@ -92,6 +94,7 @@ impl LlmClient for InputBudgetLlmClient {
         request: Request,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
     {
+        (self.authorize_supply)().map_err(ClientError::Config)?;
         let estimated = estimated_editor_request_tokens(&request)
             .map_err(|error| ClientError::Config(error.to_string()))?;
         if estimated > self.input_token_budget {
@@ -383,6 +386,13 @@ impl SubjektivSurfaceLifecycleTask {
                 client: Box::new(InputBudgetLlmClient {
                     inner: self.client.clone_boxed(),
                     input_token_budget: generation.input_token_budget,
+                    authorize_supply: {
+                        let host = self.host.clone();
+                        Arc::new(move || {
+                            host.authorize_operation("memory.surface.supply")
+                                .map_err(|error| error.to_string())
+                        })
+                    },
                 }),
                 system_prompt,
                 input,
@@ -659,6 +669,7 @@ mod tests {
     #[derive(Debug)]
     struct SurfaceWorkspaceClient {
         conflict_count: usize,
+        allowed_operations: Mutex<Vec<&'static str>>,
         input_token_budget: usize,
         prepare_calls: AtomicUsize,
         publish_calls: AtomicUsize,
@@ -676,6 +687,12 @@ mod tests {
         fn new(conflict_count: usize) -> Self {
             Self {
                 conflict_count,
+                allowed_operations: Mutex::new(vec![
+                    "memory.surface.prepare",
+                    "memory.surface.supply",
+                    "memory.surface.publish",
+                    "memory.surface.fail",
+                ]),
                 input_token_budget: 12_000,
                 prepare_calls: AtomicUsize::new(0),
                 publish_calls: AtomicUsize::new(0),
@@ -729,6 +746,13 @@ mod tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if let Some(response) = crate::subjektiv::test_subject_authorization_response(
+                &request,
+                "workspace-1",
+                &self.allowed_operations.lock().unwrap(),
+            ) {
+                return Ok(response);
+            }
             if request.path.ends_with("/workers/self/backend-job-result") {
                 assert!(
                     self.publish_calls.load(Ordering::SeqCst) > 0
@@ -1037,6 +1061,39 @@ permission = "write"
     }
 
     #[tokio::test]
+    async fn revoked_surface_supply_stops_the_next_request_before_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let check = allowed.clone();
+        let client = InputBudgetLlmClient {
+            inner: Box::new(SurfaceEditorClient {
+                calls: calls.clone(),
+            }),
+            input_token_budget: 2_000,
+            authorize_supply: Arc::new(move || {
+                if check.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err("memory.surface.supply denied".into())
+                }
+            }),
+        };
+        let _stream = client
+            .stream(editor_request("system policy", "protected surface"))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        allowed.store(false, Ordering::SeqCst);
+        let result = client
+            .stream(editor_request("system policy", "same protected surface"))
+            .await;
+        assert!(
+            matches!(result, Err(ClientError::Config(reason)) if reason.contains("memory.surface.supply denied"))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn actual_editor_request_is_rejected_before_provider_when_over_budget() {
         let calls = Arc::new(AtomicUsize::new(0));
         let client = InputBudgetLlmClient {
@@ -1044,6 +1101,7 @@ permission = "write"
                 calls: calls.clone(),
             }),
             input_token_budget: 32,
+            authorize_supply: Arc::new(|| Ok(())),
         };
         let request = editor_request("system policy", &"x".repeat(1_000));
 
@@ -1063,6 +1121,7 @@ permission = "write"
                 calls: calls.clone(),
             }),
             input_token_budget: 2_000,
+            authorize_supply: Arc::new(|| Ok(())),
         };
         let _stream = client
             .stream(editor_request("system policy", "small initial request"))
@@ -1077,6 +1136,53 @@ permission = "write"
 
         assert!(error.to_string().contains(INPUT_BUDGET_ERROR_MARKER));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn denied_surface_prepare_never_reads_materials_or_calls_provider() {
+        let workspace = Arc::new(SurfaceWorkspaceClient::new(0));
+        workspace
+            .allowed_operations
+            .lock()
+            .unwrap()
+            .retain(|operation| *operation != "memory.surface.prepare");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let error = test_task(workspace.clone(), calls.clone())
+            .generate(None, BackgroundTaskCancellation::default(), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("denied"));
+        assert_eq!(workspace.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(workspace.publish_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(workspace.failure_reasons.lock().unwrap().is_empty());
+        assert!(workspace.job_results.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_surface_supply_stops_actual_editor_before_provider_or_publish() {
+        let workspace = Arc::new(SurfaceWorkspaceClient::new(0));
+        workspace
+            .allowed_operations
+            .lock()
+            .unwrap()
+            .retain(|operation| *operation != "memory.surface.supply");
+        *workspace.failure_status.lock().unwrap() = "failed_confirmed".into();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let outcome = test_task(workspace.clone(), calls.clone())
+            .generate(None, BackgroundTaskCancellation::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome["availability"], "failed");
+        assert_eq!(outcome["reason_code"], "editor_failed");
+        assert_eq!(workspace.prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(workspace.publish_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            workspace.failure_reasons.lock().unwrap().as_slice(),
+            ["editor_failed"]
+        );
+        assert!(workspace.job_results.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -12,6 +12,8 @@
 //! not mutation authority. Delivery/start cursors are independent of handling history; Runtime
 //! acceptance, Worker liveness, and the absence of diagnostics never attest model processing.
 #[cfg(test)]
+mod authorization_tests;
+#[cfg(test)]
 mod tests;
 use super::*;
 use crate::worker::WorkspaceServerOperation;
@@ -352,6 +354,33 @@ impl Tool for PublicAssignmentTool {
                 }
             }
         };
+        let ticket_id = match &operation {
+            WorkspaceServerOperation::TicketAssignmentSet { ticket_id, .. }
+            | WorkspaceServerOperation::TicketAssignmentClear { ticket_id, .. }
+            | WorkspaceServerOperation::TicketAssignmentsPage { ticket_id, .. }
+            | WorkspaceServerOperation::TicketAssignmentDiagnostics { ticket_id, .. }
+            | WorkspaceServerOperation::TicketAssignmentAnswer { ticket_id, .. }
+            | WorkspaceServerOperation::TicketImplementationResult { ticket_id, .. }
+            | WorkspaceServerOperation::TicketImplementationResultGet { ticket_id, .. } => {
+                ticket_id
+            }
+            _ => unreachable!("public assignment operation"),
+        };
+        assignment_tracking::authorize_ticket_target(
+            self.client.as_ref(),
+            match self.kind {
+                PublicAssignmentKind::Assign => "ticket.assignment.assign",
+                PublicAssignmentKind::Clear => "ticket.assignment.clear",
+                PublicAssignmentKind::Assignments => "ticket.assignment.query",
+                PublicAssignmentKind::Diagnostics => "ticket.assignment.diagnostics",
+                PublicAssignmentKind::Answer => "ticket.assignment.answer",
+                PublicAssignmentKind::ImplementationResult => "ticket.implementation_result.write",
+                PublicAssignmentKind::ImplementationResultQuery => {
+                    "ticket.implementation_result.read"
+                }
+            },
+            ticket_id,
+        )?;
         let response = self
             .client
             .execute_server_operation(operation)

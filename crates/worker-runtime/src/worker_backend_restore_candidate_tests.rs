@@ -232,17 +232,16 @@ mod restore_candidate {
                                     calls.lock().unwrap().push((
                                         "POST".into(), authorization_path.into(),
                                     ));
-                                    let response = if input.operation == "task"
-                                        && input.resource == server_api::authorization::PermissionResource::Feature
-                                    {
-                                        server_api::authorization::OperationAuthorizationResponse {
-                                            scope: Some(server_api::authorization::PermissionResource::Feature),
-                                        }
-                                    } else {
-                                        saved_subjektiv_authorization_fixture(input)
-                                            .expect("only the saved fixture Feature grants are available")
-                                    };
-                                    axum::Json(response)
+                                    match saved_subjektiv_authorization_fixture(input) {
+                                        Ok(response) => (
+                                            axum::http::StatusCode::OK,
+                                            axum::Json(serde_json::to_value(response).unwrap()),
+                                        ),
+                                        Err(message) => (
+                                            axum::http::StatusCode::FORBIDDEN,
+                                            axum::Json(serde_json::json!({ "message": message })),
+                                        ),
+                                    }
                                 }
                             }),
                         )
@@ -1410,8 +1409,8 @@ mod restore_candidate {
             .unwrap();
         assert_eq!(fixture.model.call_count.load(Ordering::SeqCst), 4);
         assert!(
-            !fixture.host.calls.lock().unwrap().is_empty(),
-            "activation must reach the configured Host transport"
+            fixture.host.calls.lock().unwrap().is_empty(),
+            "local TaskCreate, FIFO drain and receipt replay must not call the Host"
         );
         fixture.assert_no_modifying_host_calls();
         assert!(
@@ -1471,12 +1470,45 @@ mod restore_candidate {
                 let record_calls = calls.clone();
                 let startup_calls = Arc::new(AtomicUsize::new(0));
                 let startups = startup_calls.clone();
+                let memory_calls = Arc::new(AtomicUsize::new(0));
+                let memories = memory_calls.clone();
+                let authorization_operations = Arc::new(Mutex::new(Vec::new()));
+                let operations = authorization_operations.clone();
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 request.request.workspace_api.as_mut().unwrap().base_url = format!("http://{}", listener.local_addr().unwrap());
                 let app = axum::Router::new()
-                    .route("/api/w/workspace-saved-subjektiv/authorization/check", axum::routing::post(
-                        |axum::Json(input): axum::Json<server_api::authorization::OperationAuthorizationRequest>| async move {
-                            axum::Json(saved_subjektiv_authorization_fixture(input).unwrap())
+                    .route("/api/w/workspace-saved-subjektiv/authorization/bound-check", axum::routing::post(
+                        move |axum::Json(input): axum::Json<server_api::authorization::BoundOperationAuthorizationRequest>| {
+                            let operations = operations.clone();
+                            async move {
+                                operations.lock().unwrap().push(input.operation.clone());
+                                match saved_subjektiv_bound_authorization_fixture(input) {
+                                    Ok(response) => (
+                                        axum::http::StatusCode::OK,
+                                        axum::Json(serde_json::to_value(response).unwrap()),
+                                    ),
+                                    Err(message) => (
+                                        axum::http::StatusCode::FORBIDDEN,
+                                        axum::Json(serde_json::json!({ "message": message })),
+                                    ),
+                                }
+                            }
+                        }))
+                    .route("/api/w/workspace-saved-subjektiv/subjektiv/memory", axum::routing::post(
+                        move |axum::Json(input): axum::Json<server_api::SubjektivMemoryBackendRequest>| {
+                            let memories = memories.clone();
+                            async move {
+                                assert!(matches!(input.operation,
+                                    server_api::SubjektivMemoryBackendOperation::ResidentContext(_)));
+                                memories.fetch_add(1, Ordering::SeqCst);
+                                axum::Json(serde_json::json!({
+                                    "result": "resident_context",
+                                    "data": {
+                                        "behavior_md": "Repaired Subject resident behavior",
+                                        "memory_surface": { "availability": "ungenerated", "content": null },
+                                    },
+                                }))
+                            }
                         }))
                     .route("/api/w/workspace-saved-subjektiv/subjektiv/sessions", axum::routing::post(
                         move |axum::Json(input): axum::Json<server_api::SubjektivRecordSessionRequest>| {
@@ -1512,26 +1544,69 @@ mod restore_candidate {
                 assert!(matches!(failed.subjektiv_session_attribution,
                     Some(session_store::SubjektivSessionAttributionState::OutcomeUnknown { session_id: id, .. }) if id == session_id));
                 assert_eq!(startup_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(memory_calls.load(Ordering::SeqCst), 0);
+                assert!(authorization_operations.lock().unwrap().is_empty());
                 factory.cleanup_failed_restore(&request).await.unwrap();
                 assert!(factory.recover_saved_restore_source(&request).await.unwrap());
                 let repaired = metadata.read_by_name(&name).unwrap().unwrap();
                 assert_eq!(repaired.active.as_ref().unwrap().session_id, session_id);
                 assert!(matches!(repaired.subjektiv_session_attribution,
                     Some(session_store::SubjektivSessionAttributionState::Confirmed { session_id: id, .. }) if id == session_id));
-                let segments = WorkerSessionStore::new(aggregate.join("session")).unwrap()
-                    .list_segments(session_id).unwrap();
+                let session = WorkerSessionStore::new(aggregate.join("session")).unwrap();
+                let segments = session.list_segments(session_id).unwrap();
                 assert_eq!(segments.len(), 1, "retry must retain exactly one seed");
+                let entries = session.read_all(session_id,
+                    repaired.active.as_ref().unwrap().segment_id.unwrap()).unwrap();
+                assert_eq!(entries.len(), 2, "one head plus its protected-input checkpoint");
+                let prompt = match &entries[0] {
+                    LogEntry::AnnotatedSegmentStart {
+                        session_id: id, system_prompt: Some(prompt), history,
+                        forked_from: None, compacted_from: None, ..
+                    } => {
+                        assert_eq!(*id, session_id);
+                        assert!(history.is_empty(), "repair must not admit model input");
+                        prompt
+                    }
+                    other => panic!("repair must retain a complete initial head: {other:?}"),
+                };
+                let checkpoint = match &entries[1] {
+                    LogEntry::Extension { domain, payload, .. }
+                        if domain == "worker.protected_inputs.v1" => payload,
+                    other => panic!("missing protected-input checkpoint: {other:?}"),
+                };
+                let expected_startups = usize::from(!materialized);
+                assert_eq!(startup_calls.load(Ordering::SeqCst), expected_startups);
+                assert_eq!(memory_calls.load(Ordering::SeqCst), expected_startups);
+                assert_eq!(calls.load(Ordering::SeqCst), 2 + expected_startups,
+                    "lost receipt retry plus publication verification only for a pending head");
+                let mut operations = authorization_operations.lock().unwrap().clone();
+                operations.sort();
                 if materialized {
                     assert_eq!(session_files(), original);
-                    assert_eq!(startup_calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(prompt, SAVED_SUBJEKTIV_SYSTEM_PROMPT);
+                    assert_eq!(checkpoint, &serde_json::json!({ "version": 1, "kinds": [] }));
+                    assert!(operations.is_empty(), "existing head repair must not refetch protected context");
                 } else {
-                    assert_eq!(startup_calls.load(Ordering::SeqCst), 1);
+                    assert!(prompt.contains("Repaired Subject resident behavior"));
+                    assert_eq!(checkpoint, &serde_json::json!({
+                        "version": 1, "kinds": ["subject-resident"],
+                    }));
+                    assert_eq!(operations, [
+                        "journal.startup.read",
+                        // Both the resident source and its Host adapter authorize the read.
+                        "memory.resident.read", "memory.resident.read",
+                        "memory.resident.supply", "memory.resident.supply",
+                    ], "empty Journal startup must not require a supply grant");
                 }
                 let after_repair = persisted_files(&aggregate);
                 let calls_after_repair = calls.load(Ordering::SeqCst);
+                let authorization_count = authorization_operations.lock().unwrap().len();
                 assert!(!factory.recover_saved_restore_source(&request).await.unwrap());
                 assert_eq!(persisted_files(&aggregate), after_repair);
                 assert_eq!(calls.load(Ordering::SeqCst), calls_after_repair);
+                assert_eq!(startup_calls.load(Ordering::SeqCst), expected_startups);
+                assert_eq!(memory_calls.load(Ordering::SeqCst), expected_startups);
+                assert_eq!(authorization_operations.lock().unwrap().len(), authorization_count);
                 assert!(factory.failed_restore_resources.lock().unwrap().is_empty());
                 drop(host);
                 Ok(())

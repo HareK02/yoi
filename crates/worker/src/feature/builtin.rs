@@ -5,6 +5,7 @@
 //! an external plugin-loading surface.
 
 mod backend_diagnostic;
+pub(crate) mod backend_job_input;
 pub mod backend_job_result;
 pub(crate) mod bash;
 
@@ -37,6 +38,7 @@ pub(crate) mod subjektiv_memory;
 pub(crate) mod subjektiv_session;
 pub mod task;
 pub mod ticket;
+pub(crate) mod web;
 pub mod worker_observation;
 pub mod workspace_config;
 pub mod workspace_worker_discovery;

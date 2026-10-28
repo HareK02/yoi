@@ -1534,7 +1534,7 @@ impl ProtocolProviderRegistrar<'_> {
     }
 }
 
-/// Restore preserves the saved Feature composition; only new activation asks
+/// Restore preserves saved composition; only new MCP activation asks
 /// for admission. Neither mode grants authority for protected operations.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum FeatureInstallation {
@@ -1545,7 +1545,6 @@ pub(crate) enum FeatureInstallation {
 
 /// Install-time context provided to a feature module.
 pub struct FeatureInstallContext<'a> {
-    installation: FeatureInstallation,
     feature_id: &'a FeatureId,
     declarations: &'a FeatureContributionDeclarations,
     pending_tools: &'a mut Vec<ToolDefinition>,
@@ -1558,10 +1557,6 @@ pub struct FeatureInstallContext<'a> {
 }
 
 impl FeatureInstallContext<'_> {
-    pub(crate) fn is_restoring(&self) -> bool {
-        self.installation == FeatureInstallation::Restore
-    }
-
     pub fn feature_id(&self) -> &FeatureId {
         self.feature_id
     }
@@ -1769,52 +1764,13 @@ pub struct FeatureRegistryBuilder {
     activation_guard: Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
 }
 
-/// Profile switches request activation, not authority. Names are the actual
-/// public config keys (not internal module ids such as `builtin:sub-worker-control`).
-/// Check even switches whose runtime prerequisites will later make them inert.
-/// No parent/child permission inheritance is performed here.
-pub(crate) fn authorize_requested_features(
-    client: &dyn crate::worker::WorkspaceClient,
-    config: &manifest::FeatureConfig,
-) -> Result<(), crate::worker::WorkspaceClientError> {
-    for (name, enabled) in [
-        ("task", config.task.enabled),
-        ("memory", config.memory.enabled()),
-        ("subjektiv", config.subjektiv.enabled()),
-        ("web", config.web.enabled),
-        ("image", config.image.enabled),
-        ("sub_worker", config.sub_worker.enabled),
-        ("flow", config.flow.enabled),
-        ("worker", config.worker.enabled),
-        (
-            "workspace_worker_discovery",
-            config.workspace_worker_discovery.enabled,
-        ),
-        ("objective", config.objective.enabled),
-        ("manage_workdir", config.manage_workdir.enabled),
-        ("workdir_catalog", config.workdir_catalog.enabled),
-        ("workspace_config", config.workspace_config.enabled),
-        ("drive", config.drive.enabled),
-        ("ticket", config.ticket.enabled),
-        ("merge_request", config.merge_request.any()),
-        ("orchestration", config.orchestration.enabled),
-    ] {
-        if enabled {
-            client.authorize_feature_activation(name).map_err(|error| {
-                crate::worker::WorkspaceClientError::Request(format!(
-                    "Feature `{name}` activation rejected: {error}"
-                ))
-            })?;
-        }
-    }
-    Ok(())
-}
-
+/// MCP alone retains its temporary activation check before discovery can spawn
+/// a process. Local Feature composition is not authority; each trusted Feature
+/// checks its concrete protected operation at the access/effect boundary.
 pub(crate) fn authorize_requested_manifest(
     client: &dyn crate::worker::WorkspaceClient,
     manifest: &manifest::WorkerManifest,
 ) -> Result<(), crate::worker::WorkspaceClientError> {
-    authorize_requested_features(client, &manifest.feature)?;
     if !manifest.mcp.stdio_servers.is_empty() {
         client.authorize_feature_activation("mcp")?;
     }
@@ -2254,7 +2210,6 @@ impl FeatureRegistryBuilder {
 
             let install_result = {
                 let mut context = FeatureInstallContext {
-                    installation: self.installation,
                     feature_id: &descriptor.id,
                     declarations: &declarations,
                     pending_tools,
@@ -2468,7 +2423,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_activation_uses_exact_public_config_names_before_install() {
+    fn local_feature_configuration_makes_no_activation_requests() {
         let mut config = manifest::FeatureConfig::default();
         config.workdir_catalog.enabled = false;
         // Enabling each config key independently also detects default-on flags.
@@ -2504,16 +2459,15 @@ mod tests {
                 allowed: vec![name.into()],
                 requested: Default::default(),
             };
-            authorize_requested_features(&client, &requested).unwrap();
-            assert_eq!(*client.requested.lock().unwrap(), [name], "{name}");
+            let mut manifest = manifest::WorkerManifest::from_toml("[worker]\nname='local-features'\n[model]\nscheme='anthropic'\nmodel_id='scripted'\n[engine]\n[scope]\nallow=[]").unwrap();
+            manifest.feature = requested;
+            authorize_requested_manifest(&client, &manifest).unwrap();
+            assert!(client.requested.lock().unwrap().is_empty(), "{name}");
         }
     }
 
     #[test]
-    fn ticket_operation_permission_does_not_enable_feature_or_install_services() {
-        let mut config = manifest::FeatureConfig::default();
-        config.workdir_catalog.enabled = false;
-        config.ticket.enabled = true;
+    fn feature_registration_never_requires_ticket_activation_permission() {
         for allowed in [vec![], vec!["ticket.create"], vec!["ticket"]] {
             let client = Arc::new(ActivationClient {
                 allowed: allowed.iter().map(|name| name.to_string()).collect(),
@@ -2524,22 +2478,13 @@ mod tests {
                     .with_provided_service(provided_service("ticket.test", "1")),
             );
             let calls = module.install_calls.clone();
-            let config = config.clone();
-            let registry = FeatureRegistryBuilder::new()
-                .with_module(module)
-                .with_activation_guard(move || {
-                    authorize_requested_features(client.as_ref(), &config)
-                        .map_err(|error| error.to_string())
-                });
+            let registry = FeatureRegistryBuilder::new().with_module(module);
             let mut tools = Vec::new();
             let report = registry.install_into_pending(&mut tools, &mut HookRegistryBuilder::new());
-            let permitted = allowed == ["ticket"];
-            assert_eq!(report.has_errors(), !permitted);
-            assert_eq!(calls.load(Ordering::SeqCst), usize::from(permitted));
+            assert!(client.requested.lock().unwrap().is_empty());
+            assert!(!report.has_errors());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert!(tools.is_empty());
-            if !permitted {
-                assert!(report.error_message().contains("ticket"));
-            }
         }
     }
 

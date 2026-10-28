@@ -194,8 +194,29 @@ impl Provider {
             ))
         }
     }
-    fn request(&self, path: &str) -> Result<Json, WipOperationError> {
+    fn list_operation(domain: Domain) -> &'static str {
+        match domain {
+            Domain::Repository => "repository.list",
+            Domain::Workdir => "workdir.list",
+            Domain::Attachment => "workdir.attachment.list",
+        }
+    }
+    fn list_request(&self, domain: Domain, path: &str) -> Result<Json, WipOperationError> {
+        let resource = PermissionResource::Workspace {
+            workspace_id: self.backend.workspace_id().map_err(map_tool_error)?.into(),
+        };
+        self.request(path, Self::list_operation(domain), &resource)
+    }
+    fn request(
+        &self,
+        path: &str,
+        operation: &str,
+        resource: &PermissionResource,
+    ) -> Result<Json, WipOperationError> {
         let workspace = self.backend.workspace_id().map_err(map_tool_error)?;
+        self.backend
+            .authorize(operation, resource)
+            .map_err(map_tool_error)?;
         let response = self
             .backend
             .client
@@ -228,11 +249,14 @@ impl Provider {
         })
     }
     fn inventory(&self, domain: Domain) -> Result<Vec<Json>, WipOperationError> {
-        let response = self.request(match domain {
-            Domain::Repository => "repositories",
-            Domain::Workdir => "workers/self/workdir-catalog?limit=1",
-            Domain::Attachment => "workers/self/workdir-attachments?limit=1",
-        })?;
+        let response = self.list_request(
+            domain,
+            match domain {
+                Domain::Repository => "repositories",
+                Domain::Workdir => "workers/self/workdir-catalog?limit=1",
+                Domain::Attachment => "workers/self/workdir-attachments?limit=1",
+            },
+        )?;
         response
             .get("items")
             .and_then(Json::as_array)
@@ -242,12 +266,24 @@ impl Provider {
             })
     }
     fn raw_item(&self, domain: Domain, id: &str) -> Result<Json, WipOperationError> {
+        let workspace_id = self
+            .backend
+            .workspace_id()
+            .map_err(map_tool_error)?
+            .to_owned();
         match domain {
             Domain::Attachment => self
-                .request(&format!(
-                    "workers/self/workdir-attachments?limit=1&connection_id={}",
-                    encode_path_segment(id)
-                ))?
+                .request(
+                    &format!(
+                        "workers/self/workdir-attachments?limit=1&connection_id={}",
+                        encode_path_segment(id)
+                    ),
+                    "workdir.attachment.read",
+                    &PermissionResource::WorkdirAttachment {
+                        workspace_id,
+                        connection_id: id.into(),
+                    },
+                )?
                 .get("items")
                 .and_then(Json::as_array)
                 .cloned()
@@ -268,12 +304,34 @@ impl Provider {
                 } else {
                     "working-directories"
                 };
-                self.request(&format!("{prefix}/{}", encode_path_segment(id)))?
-                    .get("item")
-                    .cloned()
-                    .ok_or_else(|| {
-                        WipOperationError::OutcomeUnknown("invalid Workspace inventory item".into())
-                    })
+                let (operation, resource) = if matches!(domain, Domain::Repository) {
+                    (
+                        "repository.read",
+                        PermissionResource::Repository {
+                            workspace_id,
+                            repository_key: id.into(),
+                        },
+                    )
+                } else {
+                    (
+                        "workdir.read",
+                        PermissionResource::Workdir {
+                            working_directory_id: id.into(),
+                            path: ".".into(),
+                            recursive: true,
+                        },
+                    )
+                };
+                self.request(
+                    &format!("{prefix}/{}", encode_path_segment(id)),
+                    operation,
+                    &resource,
+                )?
+                .get("item")
+                .cloned()
+                .ok_or_else(|| {
+                    WipOperationError::OutcomeUnknown("invalid Workspace inventory item".into())
+                })
             }
         }
     }
@@ -369,11 +427,11 @@ impl Provider {
             if self.config_content
                 && raw.get("alias").and_then(Json::as_str)
                     == Some(crate::feature::builtin::workspace_config::ATTACHMENT_ALIAS)
-                && let Ok(Some(current)) =
+                && let Some(current) =
                     crate::feature::builtin::workspace_config::backend::WorkspaceConfigBackend::new(
                         self.backend.client.clone(),
                     )
-                    .current()
+                    .current()?
                 && current.connection_id == id
                 && raw.get("working_directory_id").and_then(Json::as_str)
                     == Some(current.working_directory_id.as_str())
@@ -429,7 +487,7 @@ impl WipOperationHandler for CollectionHandler {
             };
             match self
                 .provider
-                .request(path)
+                .list_request(self.domain, path)
                 .ok()
                 .and_then(|p| p.get("digest").and_then(Json::as_str).map(str::to_owned))
             {
@@ -523,7 +581,7 @@ impl WipOperationHandler for CollectionHandler {
                             .unwrap_or_default();
                         format!("workers/self/workdir-catalog?limit={limit}{suffix}")
                     };
-                    let page = self.provider.request(&path)?;
+                    let page = self.provider.list_request(self.domain, &path)?;
                     let raws = page
                         .get("items")
                         .and_then(Json::as_array)
@@ -1083,6 +1141,10 @@ pub(crate) mod tests {
         pub(crate) workdirs: Vec<Json>,
         pub(crate) attachments: Vec<Json>,
         pub(crate) requests: Vec<WorkspaceRequest>,
+        pub(crate) authorizations: Vec<server_api::authorization::OperationAuthorizationRequest>,
+        pub(crate) bound_authorizations:
+            Vec<server_api::authorization::BoundOperationAuthorizationRequest>,
+        pub(crate) authorization_denied: bool,
         pub(crate) denied: bool,
         config_current: Option<Json>,
         generation: usize,
@@ -1097,6 +1159,9 @@ pub(crate) mod tests {
                     workdirs: vec![],
                     attachments: vec![],
                     requests: vec![],
+                    authorizations: vec![],
+                    bound_authorizations: vec![],
+                    authorization_denied: false,
                     denied: false,
                     config_current: None,
                     generation: 0,
@@ -1122,6 +1187,41 @@ pub(crate) mod tests {
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             let mut state = self.state.lock().unwrap();
+            if request.path.ends_with("/authorization/bound-check") {
+                let auth: server_api::authorization::BoundOperationAuthorizationRequest =
+                    serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                let connection = match &auth.target {
+                    server_api::authorization::BoundAuthorizationTarget::WorkdirAttachment {
+                        alias,
+                        expected_connection_id,
+                    } => state
+                        .attachments
+                        .iter()
+                        .find(|item| {
+                            item["alias"].as_str() == Some(alias.as_str())
+                                && expected_connection_id
+                                    .as_deref()
+                                    .is_none_or(|id| item["connection_id"].as_str() == Some(id))
+                        })
+                        .and_then(|item| item["connection_id"].as_str())
+                        .map(str::to_owned),
+                    _ => panic!("unexpected bound target"),
+                };
+                state.bound_authorizations.push(auth);
+                return Ok(WorkspaceResponse {
+                    status: if state.authorization_denied { 403 } else if connection.is_none() { 409 } else { 200 },
+                    body: json!({"scope":{"kind":"workdir_attachment", "workspace_id":"test-workspace", "connection_id":connection.unwrap_or_default()}}).to_string(),
+                });
+            }
+            if request.path.ends_with("/authorization/check") {
+                state
+                    .authorizations
+                    .push(serde_json::from_str(request.body.as_deref().unwrap()).unwrap());
+                return Ok(WorkspaceResponse {
+                    status: if state.authorization_denied { 403 } else { 200 },
+                    body: r#"{"scope":null}"#.into(),
+                });
+            }
             state.requests.push(request.clone());
             if state.denied {
                 return Ok(WorkspaceResponse {
@@ -1331,13 +1431,7 @@ pub(crate) mod tests {
                 .is_none()
         );
         client.state.lock().unwrap().denied = true;
-        assert!(
-            p.projected(Domain::Attachment, &raw)
-                .ok()
-                .unwrap()
-                .get("content_path")
-                .is_none()
-        );
+        assert!(p.projected(Domain::Attachment, &raw).is_err());
     }
 
     #[test]
@@ -1673,6 +1767,52 @@ pub(crate) mod tests {
             }),
             Err(WipMountError::OperationCollision { .. })
         ));
+    }
+    #[tokio::test]
+    async fn wip_inventory_and_dynamic_items_recheck_authority_before_reads() {
+        let client = Arc::new(CatalogClient::default());
+        let p = provider(client.clone(), true, true, None);
+        client.state.lock().unwrap().authorization_denied = true;
+        for domain in [Domain::Repository, Domain::Workdir, Domain::Attachment] {
+            assert!(p.inventory(domain).is_err());
+            assert!(p.raw_item(domain, "target").is_err());
+            let handler = CollectionHandler {
+                provider: p.clone(),
+                domain,
+            };
+            assert!(
+                handler
+                    .call("list", &BTreeMap::new(), context())
+                    .await
+                    .is_err()
+            );
+            let resolver = ItemResolver {
+                provider: p.clone(),
+                domain,
+            };
+            assert!(resolver.resolve(&encode_identity("target")).is_none());
+        }
+        assert!(client.state.lock().unwrap().requests.is_empty());
+        client.state.lock().unwrap().authorization_denied = false;
+        let raw = p
+            .raw_item(Domain::Repository, "registered-key")
+            .ok()
+            .unwrap();
+        assert_eq!(raw["repository_key"], "registered-key");
+        let reads = client.state.lock().unwrap().requests.len();
+        client.state.lock().unwrap().authorization_denied = true;
+        assert!(p.raw_item(Domain::Repository, "registered-key").is_err());
+        assert_eq!(client.state.lock().unwrap().requests.len(), reads);
+        let state = client.state.lock().unwrap();
+        let last = state.authorizations.last().unwrap();
+        assert_eq!(last.operation, "repository.read");
+        assert_eq!(
+            last.resource,
+            PermissionResource::Repository {
+                workspace_id: "test-workspace".into(),
+                repository_key: "registered-key".into()
+            }
+        );
     }
 }
 

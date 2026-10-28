@@ -67,6 +67,14 @@ impl WorkspaceClient for Client {
         &self,
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if request.path == "/api/w/workspace/authorization/check" {
+            let _: server_api::authorization::OperationAuthorizationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            return Ok(WorkspaceResponse {
+                status: 200,
+                body: json!({"scope":null}).to_string(),
+            });
+        }
         self.requests.lock().unwrap().push(request);
         Ok(WorkspaceResponse {
             status: self.status,
@@ -155,5 +163,75 @@ async fn notification_tool_rejects_raw_or_undeclared_backend_content() {
             .await
             .unwrap_err();
         assert!(!error.to_string().contains("SECRET"));
+    }
+}
+
+// Transport fixture for the Feature contract; real Host/store binding is covered
+// by the Server router connection test, not claimed by this model of the Host.
+#[derive(Debug)]
+pub(super) struct BoundClient {
+    pub inner: Arc<assignment_tracking::authorization_tests::AuthorizedClient>,
+    pub bound: Mutex<Vec<String>>,
+}
+impl BoundClient {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: assignment_tracking::authorization_tests::AuthorizedClient::new(json!({
+                "items":[],"next_cursor":null,"source_checks":[{
+                    "resource_kind":"source_event","reference":"saved","origin_present":true,"captured":true
+                }]
+            })),
+            bound: Mutex::new(vec![]),
+        })
+    }
+}
+impl WorkspaceClient for BoundClient {
+    fn workspace_id(&self) -> Option<&str> {
+        Some("workspace")
+    }
+    fn kind(&self) -> &str {
+        "bound-notification-fixture"
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn execute(
+        &self,
+        mut request: WorkspaceRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if request.path == "/api/w/workspace/authorization/bound-check" {
+            use server_api::authorization::{
+                BoundAuthorizationTarget, BoundOperationAuthorizationRequest,
+                OperationAuthorizationRequest, PermissionResource,
+            };
+            let auth: BoundOperationAuthorizationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            let BoundAuthorizationTarget::NotificationSource { source_event_id } = auth.target
+            else {
+                panic!("wrong binding")
+            };
+            self.bound.lock().unwrap().push(source_event_id.clone());
+            let job_id = match source_event_id.as_str() {
+                "backend-job-notification:hash-A" | "legacy-A" => "Job-A",
+                "backend-job-notification:hash-B" | "legacy-B" | "mr-event:legacy-B:e" => "Job-B",
+                _ => return Ok(WorkspaceResponse {
+                    status: 403,
+                    body: json!({"message":"Notification source is unavailable or not authorized"})
+                        .to_string(),
+                }),
+            };
+            request.path = "/api/w/workspace/authorization/check".into();
+            request.body = Some(
+                serde_json::to_string(&OperationAuthorizationRequest {
+                    operation: auth.operation,
+                    resource: PermissionResource::Job {
+                        workspace_id: "workspace".into(),
+                        job_id: job_id.into(),
+                    },
+                })
+                .unwrap(),
+            );
+        }
+        self.inner.execute(request)
     }
 }

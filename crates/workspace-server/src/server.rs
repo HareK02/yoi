@@ -4746,6 +4746,8 @@ impl WorkspaceApi {
                 resource_reused: reservation.resource_reused,
             });
         }
+        subject_authorization::authorize_job_input(self, &reservation.job.request)
+            .map_err(|error| error.error)?;
         subjektiv_journal::prepare(self, &reservation)?;
         let (reservation, claimed) = self.store.claim_backend_job_attempt_dispatch(
             &self.config.workspace_id,
@@ -7502,6 +7504,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::operation_authorize(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::bound_operation_authorize(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::subjektiv_subject_permissions_get(service.clone()))
         .merge(server_api::server_api_axum::subjektiv_subject_permissions_set(service.clone()))
         .merge(server_api::server_api_axum::subjektiv_subject_create(
@@ -9547,6 +9552,139 @@ impl server_api::ServerApi for ServerApiContractService {
                 let worker = subject_authorization::source_from_context(&context)?;
                 let scope = subject_authorization::authorize_scope(&api, &worker, &request)?;
                 Ok(server_api::authorization::OperationAuthorizationResponse { scope })
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn bound_operation_authorize(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::authorization::BoundOperationAuthorizationRequest,
+    ) -> std::result::Result<
+        server_api::authorization::OperationAuthorizationResponse,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?.clone();
+        api.store
+            .db_executor()
+            .run(move || {
+                use server_api::authorization::{
+                    BoundAuthorizationTarget, OperationAuthorizationRequest,
+                    OperationAuthorizationResponse, PermissionResource,
+                };
+                validate_workspace_scope(&api, &workspace_id)?;
+                let scope = match request.target {
+                    BoundAuthorizationTarget::Subject {} => {
+                        let worker = subject_authorization::source_from_context(&context)?;
+                        let subject_id = if let Some(subject_id) =
+                            subject_authorization::job_subject(&api, &worker)?
+                        {
+                            subject_id
+                        } else {
+                            subjektiv_worker_scope_from_store(&api, &workspace_id, &context)?
+                                .subject_id
+                        };
+                        authorize_subjektiv_operation(
+                            &api,
+                            &worker,
+                            &workspace_id,
+                            &subject_id,
+                            &request.operation,
+                        )?
+                    }
+                    BoundAuthorizationTarget::WorkdirAttachment {
+                        alias,
+                        expected_connection_id,
+                    } => {
+                        let worker = subject_authorization::source_from_context(&context)?;
+                        let unavailable = || {
+                            Error::WorkspacePermissionDenied(
+                                "Workdir attachment is absent or its connection changed".into(),
+                            )
+                        };
+                        if api
+                            .store
+                            .get_worker_registry(&workspace_id, &worker)?
+                            .is_none()
+                        {
+                            return Err(unavailable().into());
+                        }
+                        let link = api
+                            .store
+                            .list_worker_workdir_links(&workspace_id, &worker)?
+                            .into_iter()
+                            .find(|link| {
+                                link.unlinked_at.is_none()
+                                    && link.alias == alias
+                                    && expected_connection_id.as_deref().is_none_or(|expected| {
+                                        expected == link.connection_id.as_str()
+                                    })
+                            })
+                            .ok_or_else(unavailable)?;
+                        let resource = PermissionResource::WorkdirAttachment {
+                            workspace_id: workspace_id.clone(),
+                            connection_id: link.connection_id,
+                        };
+                        subject_authorization::authorize_scope(
+                            &api,
+                            &worker,
+                            &OperationAuthorizationRequest {
+                                operation: request.operation,
+                                resource: resource.clone(),
+                            },
+                        )?;
+                        // Even legacy authorization returns the observed concrete
+                        // connection so the effect can compare it again, not reuse
+                        // this query as a credential or resolve a replacement alias.
+                        Some(resource)
+                    }
+                    BoundAuthorizationTarget::NotificationSource { source_event_id } => {
+                        let worker = subject_authorization::source_from_context(&context)?;
+                        let unavailable = || {
+                            Error::WorkspacePermissionDenied(
+                                "Notification source is unavailable or not authorized".into(),
+                            )
+                        };
+                        let resource = api
+                            .store
+                            .notification_source_resource(&workspace_id, &source_event_id)?
+                            .ok_or_else(unavailable)?;
+                        subject_authorization::authorize_scope(
+                            &api,
+                            &worker,
+                            &OperationAuthorizationRequest {
+                                operation: request.operation,
+                                resource: resource.clone(),
+                            },
+                        )
+                        .map_err(|_| unavailable())?;
+                        // Return the actual target even on the ordinary non-Subject
+                        // path; a broader matching grant is not ownership metadata.
+                        Some(resource)
+                    }
+                    BoundAuthorizationTarget::SubWorker { name } => {
+                        let worker = subject_authorization::source_from_context(&context)?;
+                        // Names select a parent-owned capability, not a lookup of
+                        // a child session or a grant to read that child's data.
+                        let resource = PermissionResource::SubWorker {
+                            runtime_id: worker.runtime_id.clone(),
+                            worker_id: worker.worker_id.clone(),
+                            name,
+                        };
+                        let allowed = subject_authorization::authorize_scope(
+                            &api,
+                            &worker,
+                            &OperationAuthorizationRequest {
+                                operation: request.operation,
+                                resource: resource.clone(),
+                            },
+                        )?;
+                        allowed.map(|_| resource)
+                    }
+                };
+                Ok(OperationAuthorizationResponse { scope })
             })
             .await
             .map_err(ApiError::into_repository_api_error)
@@ -22652,6 +22790,32 @@ fn subjektiv_subject_scope(
     Ok((scope.subject_id, scope.worker, authority))
 }
 
+// Resolve Subject identity through the existing Host binding before calling this
+// boundary. Model arguments and Feature configuration never choose its resource.
+fn authorize_subjektiv_operation(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    workspace_id: &str,
+    subject_id: &str,
+    operation: &str,
+) -> ApiResult<Option<server_api::authorization::PermissionResource>> {
+    let resource = server_api::authorization::PermissionResource::Subject {
+        workspace_id: workspace_id.into(),
+        subject_id: subject_id.into(),
+    };
+    subject_authorization::authorize_scope(
+        api,
+        worker,
+        &server_api::authorization::OperationAuthorizationRequest {
+            operation: operation.into(),
+            resource: resource.clone(),
+        },
+    )
+    // The binding query returns only the authorized concrete target, never a
+    // wildcard ceiling or a broader permission that happened to cover it.
+    .map(|scope| scope.map(|_| resource))
+}
+
 fn require_subjektiv_worker_authority(
     actual: SubjektivWorkerAuthority,
     expected: SubjektivWorkerAuthority,
@@ -23052,6 +23216,13 @@ async fn scoped_stage_subjektiv_candidate(
                 &request.session_id,
             )?;
             let subject_id = attribution.subject_id.clone();
+            authorize_subjektiv_operation(
+                &api,
+                &RuntimeWorkerRef::new(&attribution.runtime_id, &attribution.worker_id),
+                &path.workspace_id,
+                &subject_id,
+                "memory.staging.write",
+            )?;
             let session_id = attribution.session_id.as_str();
             for source_ref in &mut request.operation.source_refs {
                 if source_ref
@@ -23128,6 +23299,13 @@ async fn scoped_record_subjektiv_session(
                     &request.session_id,
                 )?
             };
+            authorize_subjektiv_operation(
+                &api,
+                &RuntimeWorkerRef::new(&attribution.runtime_id, &attribution.worker_id),
+                &path.workspace_id,
+                &attribution.subject_id,
+                "session.record",
+            )?;
             subjektiv_journal::bind_host_session(&api, attribution.clone())?;
             Ok(Json(server_api::SubjektivRecordSessionResponse {
                 subject_id: attribution.subject_id,
@@ -23238,6 +23416,17 @@ async fn scoped_subjektiv_session_backend(
                 authority,
                 SubjektivWorkerAuthority::Subject,
                 "Session history read",
+            )?;
+            authorize_subjektiv_operation(
+                &api,
+                &controller,
+                &path.workspace_id,
+                &subject_id,
+                match &request.operation {
+                    server_api::SubjektivSessionBackendOperation::List(_) => "session.list",
+                    server_api::SubjektivSessionBackendOperation::Search(_) => "session.search",
+                    server_api::SubjektivSessionBackendOperation::Read(_) => "session.read",
+                },
             )?;
             let store = match open_subjektiv_store(&api) {
                 Ok(store) => store,
@@ -24550,6 +24739,27 @@ async fn scoped_subjektiv_memory_backend(
             } else {
                 subjektiv_subject_scope(&api, &path.workspace_id, &context)?
             };
+            authorize_subjektiv_operation(
+                &api,
+                &source_worker,
+                &path.workspace_id,
+                &subject_id,
+                match &request.operation {
+                    Op::ResidentSummary(_) | Op::ResidentContext(_) => "memory.resident.read",
+                    Op::ValidateProposal(_) => "memory.proposal.validate",
+                    Op::ReceiptStatus(_) => "memory.receipt.read",
+                    Op::StageExplicit(_) => "memory.staging.write",
+                    Op::ListCandidates(_) => "memory.staging.list",
+                    Op::ReadCandidate(_) => "memory.staging.read",
+                    Op::DecideCandidate(_) => "memory.candidate.decide",
+                    Op::PrepareSurface(_) => "memory.surface.prepare",
+                    Op::PublishSurface(_) => "memory.surface.publish",
+                    Op::FailSurface(_) => "memory.surface.fail",
+                    Op::Query(_) => "memory.query",
+                    Op::Read(_) => "memory.read",
+                    Op::ListChanges(_) => "memory.changes.list",
+                },
+            )?;
             let store = open_subjektiv_store(&api)?;
             // Authentication, live Worker/Job authority and committed Session provenance
             // remain Backend-owned. Only the domain operation/projection is shared.
@@ -24657,23 +24867,31 @@ async fn scoped_subjektiv_memory_consolidation(
     Json(operation): Json<MemoryConsolidateStagingOperation>,
 ) -> ApiResult<Json<MemoryConsolidationOutput>> {
     let scope_api = api.clone();
-    let subject_id = api
+    let (subject_id, source_worker) = api
         .host_executors
         .host()?
         .run(move || {
             validate_workspace_scope(&scope_api, &path.workspace_id)?;
-            let (subject_id, _, authority) =
+            let (subject_id, worker, authority) =
                 subjektiv_subject_scope(&scope_api, &path.workspace_id, &context)?;
             require_subjektiv_worker_authority(
                 authority,
                 SubjektivWorkerAuthority::Subject,
                 "consolidation request",
             )?;
-            Ok::<_, ApiError>(subject_id)
+            authorize_subjektiv_operation(
+                &scope_api,
+                &worker,
+                &path.workspace_id,
+                &subject_id,
+                "memory.consolidation.request",
+            )?;
+            Ok::<_, ApiError>((subject_id, worker))
         })
         .await?;
     Ok(Json(
-        start_subjektiv_staging_consolidation(api, &subject_id, operation).await?,
+        start_subjektiv_staging_consolidation(api, &subject_id, Some(source_worker), operation)
+            .await?,
     ))
 }
 
@@ -24730,14 +24948,25 @@ mod subject_surface_consolidation_policy_tests {
 async fn start_subjektiv_staging_consolidation(
     api: WorkspaceApi,
     subject_id: &str,
+    source_worker: Option<RuntimeWorkerRef>,
     operation: MemoryConsolidateStagingOperation,
 ) -> ApiResult<MemoryConsolidationOutput> {
     let job_api = api.clone();
     let subject = subject_id.to_owned();
+    let read_worker = source_worker.clone();
     let (candidate_count, total_bytes) = api
         .store
         .db_executor()
         .run(move || {
+            if let Some(worker) = &read_worker {
+                authorize_subjektiv_operation(
+                    &job_api,
+                    worker,
+                    job_api.workspace_id(),
+                    &subject,
+                    "memory.consolidation.request",
+                )?;
+            }
             open_subjektiv_store(&job_api)?
                 .pending_staging_backlog(&subject)
                 .map_err(|error| ApiError::from(subjektiv_store_error(error)))
@@ -24752,10 +24981,20 @@ async fn start_subjektiv_staging_consolidation(
     }
     let job_api = api.clone();
     let subject = subject_id.to_owned();
+    let read_worker = source_worker.clone();
     let surface_availability = api
         .store
         .db_executor()
         .run(move || {
+            if let Some(worker) = &read_worker {
+                authorize_subjektiv_operation(
+                    &job_api,
+                    worker,
+                    job_api.workspace_id(),
+                    &subject,
+                    "memory.consolidation.request",
+                )?;
+            }
             open_subjektiv_store(&job_api)?
                 .resident_surface(&subject)
                 .map(|surface| surface.availability)
@@ -24791,7 +25030,18 @@ async fn start_subjektiv_staging_consolidation(
     let subject = subject_id.to_owned();
     api.host_executors
         .host()?
-        .run(move || subjektiv_job::dispatch(&api, &subject, candidate_count, total_bytes))
+        .run(move || {
+            if let Some(worker) = &source_worker {
+                authorize_subjektiv_operation(
+                    &api,
+                    worker,
+                    api.workspace_id(),
+                    &subject,
+                    "memory.consolidation.request",
+                )?;
+            }
+            subjektiv_job::dispatch(&api, &subject, source_worker, candidate_count, total_bytes)
+        })
         .await
 }
 
@@ -37835,6 +38085,360 @@ mod tests {
     mod restored_parent_control_tests;
     mod subject_authorization_tests;
     mod subject_deletion_tests;
+    mod notification_source_authorization_tests {
+        // Real Feature -> signed router -> Subject policy -> SQLite metadata and
+        // diagnostics. Only transport scheduling and Runtime execution are fixtures.
+        use super::*;
+        use agen::tool::ToolExecutionContext;
+        use server_api::authorization::{
+            BoundAuthorizationTarget, PermissionResource, ScopedPermission,
+            SubjectPermissionsUpdate,
+        };
+        use worker::{
+            WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
+            WorkspaceResponse,
+        };
+
+        struct Client {
+            api: WorkspaceApi,
+            identity: Arc<RuntimeIdentityMaterial>,
+            worker: RuntimeWorkerRef,
+            handle: tokio::runtime::Handle,
+            reads: std::sync::atomic::AtomicUsize,
+        }
+        impl std::fmt::Debug for Client {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("NotificationRouterClient")
+            }
+        }
+        impl WorkspaceClient for Client {
+            fn workspace_id(&self) -> Option<&str> {
+                Some(TEST_WORKSPACE_ID)
+            }
+            fn kind(&self) -> &str {
+                "signed-notification-router"
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn execute(
+                &self,
+                request: WorkspaceRequest,
+            ) -> std::result::Result<WorkspaceResponse, WorkspaceClientError> {
+                let method = match request.method {
+                    WorkspaceRequestMethod::Get => "GET",
+                    WorkspaceRequestMethod::Post => "POST",
+                    _ => panic!("unexpected method"),
+                };
+                if request.path.contains("/notification-diagnostics") {
+                    self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let request = runtime_source_request(
+                    &self.identity,
+                    Some(&self.worker.worker_id),
+                    method,
+                    &request.path,
+                    request.body.unwrap_or_default().into_bytes(),
+                );
+                let execute = move || {
+                    self.handle.block_on(async {
+                        let response = build_router(self.api.clone())
+                            .oneshot(request)
+                            .await
+                            .unwrap();
+                        let status = response.status().as_u16();
+                        let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+                            .await
+                            .unwrap();
+                        Ok(WorkspaceResponse {
+                            status,
+                            body: String::from_utf8(body.to_vec()).unwrap(),
+                        })
+                    })
+                };
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    std::thread::scope(|scope| scope.spawn(execute).join()).unwrap()
+                } else {
+                    execute()
+                }
+            }
+        }
+        fn job(id: &str) -> PermissionResource {
+            PermissionResource::Job {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                job_id: id.into(),
+            }
+        }
+        fn assign(api: &WorkspaceApi, subject: &str, resources: Vec<PermissionResource>) {
+            let store = open_subjektiv_store(api).unwrap();
+            let previous = store.subject_permissions(subject).unwrap();
+            store
+                .set_subject_permissions(
+                    subject,
+                    &SubjectPermissionsUpdate {
+                        operation_id: Uuid::now_v7().to_string(),
+                        expected_change_id: previous.map(|policy| policy.change_id),
+                        execution: resources
+                            .into_iter()
+                            .map(|resource| ScopedPermission {
+                                operation: "notification.diagnostics.read".into(),
+                                resource,
+                            })
+                            .collect(),
+                        delegation: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn notification_source_host_binding_denies_other_jobs_and_returns_actual_scope() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut api = test_api(dir.path()).await;
+            register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+            api.runtime
+                .register_or_replace(WorkdirlessFixtureRuntime::default());
+            let subject = open_subjektiv_store(&api)
+                .unwrap()
+                .create_subject(crate::subjektiv::SubjectRole::new("notification-source").unwrap())
+                .unwrap()
+                .id;
+            let mut workers = Vec::new();
+            for attached in [true, false] {
+                let Json(created) = create_workspace_worker(
+                    State(api.clone()),
+                    HeaderMap::new(),
+                    Json(CreateWorkspaceWorkerRequest {
+                        runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.into(),
+                        display_name: "Notification source reader".into(),
+                        singleton_key: None,
+                        profile: Some("builtin:companion".into()),
+                        ticket_assignment: None,
+                        initial_submit: vec![],
+                        workdir_attachments: vec![],
+                        feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+                            subjektiv: attached.then(|| {
+                                server_api::SubjektivWorkerConnectionRequest {
+                                    subject_id: subject.clone(),
+                                }
+                            }),
+                        },
+                        control_operation_id: None,
+                        execution_grant: None,
+                    }),
+                )
+                .await
+                .unwrap();
+                workers.push(RuntimeWorkerRef::new(created.runtime_id, created.worker_id));
+            }
+            let identity =
+                Arc::new(RuntimeIdentityMaterial::generate(&workers[0].runtime_id).unwrap());
+            configure_runtime_request_auth(&mut api, &identity, &workers[0].runtime_id);
+            let mut events = Vec::new();
+            for id in ["Job-A", "Job-B"] {
+                let request = BackendJobRequest {
+                    job_id: id.into(),
+                    purpose: "notification_binding".into(),
+                    input_ref: "test://notification".into(),
+                    input: json!({}),
+                    instruction: "fixture".into(),
+                    profile: "builtin:backend-job".into(),
+                    grants: Default::default(),
+                    serialization_key: None,
+                    source_worker: None,
+                    notification_target: None,
+                    limits: Default::default(),
+                };
+                let attempt = api
+                    .store
+                    .reserve_backend_job(TEST_WORKSPACE_ID, &request, TEST_CREATED_AT)
+                    .unwrap()
+                    .attempt;
+                let worker =
+                    RuntimeWorkerRef::new(&workers[0].runtime_id, format!("notification-job-{id}"));
+                let mut registry = api
+                    .store
+                    .get_worker_registry(TEST_WORKSPACE_ID, &workers[1])
+                    .unwrap()
+                    .unwrap();
+                registry.worker = worker.clone();
+                api.store.upsert_worker_registry(&registry).unwrap();
+                api.store
+                    .claim_backend_job_attempt_dispatch(
+                        TEST_WORKSPACE_ID,
+                        id,
+                        &attempt.attempt_id,
+                        TEST_CREATED_AT,
+                    )
+                    .unwrap();
+                api.store
+                    .bind_backend_job_attempt_worker(
+                        TEST_WORKSPACE_ID,
+                        id,
+                        &attempt.attempt_id,
+                        &worker,
+                        Some("run"),
+                        TEST_CREATED_AT,
+                    )
+                    .unwrap();
+                api.store
+                    .accept_backend_job_result(
+                        TEST_WORKSPACE_ID,
+                        &worker,
+                        &BackendJobResultSubmission {
+                            job_id: id.into(),
+                            attempt_id: attempt.attempt_id.clone(),
+                            input_digest: request.input_digest().unwrap(),
+                            result: json!({"protected":"not authorization metadata"}),
+                        },
+                        TEST_CREATED_AT,
+                    )
+                    .unwrap();
+                events.push(crate::backend_job::delivery_id(id, &attempt.attempt_id));
+            }
+            api.config_store.with_conn(|conn| {
+                for (event, legacy) in [(&events[0],"legacy-A"),(&events[1],"legacy-B"),(&events[1],"mr-event:legacy-B:e")] {
+                    conn.execute("INSERT INTO notification_sources(workspace_id,ticket_id,input_event_id,role,assignment_id,kind,facts_json) SELECT workspace_id,ticket_id,?3,role,assignment_id,kind,facts_json FROM notification_sources WHERE workspace_id=?1 AND input_event_id=?2",rusqlite::params![TEST_WORKSPACE_ID,event,legacy])?;
+                }
+                Ok(())
+            }).unwrap();
+            let client = Arc::new(Client {
+                api: api.clone(),
+                identity: identity.clone(),
+                worker: workers[0].clone(),
+                handle: tokio::runtime::Handle::current(),
+                reads: Default::default(),
+            });
+            #[derive(Clone)]
+            struct UnusedModel;
+            #[async_trait::async_trait]
+            impl agen::llm_client::LlmClient for UnusedModel {
+                fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
+                    Box::new(self.clone())
+                }
+                async fn stream(
+                    &self,
+                    _: agen::llm_client::Request,
+                ) -> std::result::Result<
+                    agen::llm_client::ResponseStream,
+                    agen::llm_client::ClientError,
+                > {
+                    panic!("notification authorization fixture must not call a model")
+                }
+            }
+            let manifest = worker::WorkerManifest::from_toml("[worker]\nname='notification-reader'\n[model]\nscheme='anthropic'\nmodel_id='unused'\n[engine]\n[scope]\nallow=[]\n[feature.workdir_catalog]\nenabled=false\n[feature.ticket]\nenabled=true").unwrap();
+            let engine = agen::Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(UnusedModel);
+            let mut host = worker::Worker::new(
+                manifest,
+                engine,
+                session_store::FsStore::new(dir.path().join("reader")).unwrap(),
+                worker::WorkerWorkspaceContext::with_client(
+                    Some(worker::WorkspaceId::new(TEST_WORKSPACE_ID).unwrap()),
+                    client.clone(),
+                ),
+                worker::WorkerFilesystemAuthority::None,
+                manifest::Scope::empty(),
+            )
+            .await
+            .unwrap();
+            let report =
+                host.install_features(worker::feature::FeatureRegistryBuilder::new().with_module(
+                    worker::feature::builtin::ticket::TicketFeature::new(
+                        client.clone(),
+                        worker::feature::builtin::ticket::TicketFeatureAccess::read_only(),
+                    ),
+                ));
+            assert!(!report.has_errors());
+            let tools = host.engine().tool_server_handle();
+            tools.flush_pending();
+            let tool = tools.get_tool("NotificationDiagnostics").unwrap().1;
+            let read = |event: &str, supplied: Option<&str>| {
+                json!({"source_event_id":event,"job_id":supplied}).to_string()
+            };
+            assert!(
+                tool.execute(&read(&events[0], None), ToolExecutionContext::direct())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("403")
+            );
+            assert_eq!(client.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assign(&api, &subject, vec![job("Job-A")]);
+            let mut refusals = Vec::new();
+            for event in [&events[1], "legacy-B", "mr-event:legacy-B:e", "missing"] {
+                let denied = tool
+                    .execute(&read(event, Some("Job-A")), ToolExecutionContext::direct())
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(denied.contains("403"), "{denied}");
+                refusals.push(denied);
+            }
+            assert!(refusals.windows(2).all(|pair| pair[0] == pair[1]));
+            assert_eq!(client.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+            for event in [&events[0], "legacy-A"] {
+                let output = tool
+                    .execute(&read(event, None), ToolExecutionContext::direct())
+                    .await
+                    .unwrap();
+                let page: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+                assert_eq!(page["items"][0]["job_id"], "Job-A");
+                assert_eq!(page["source_checks"][0]["captured"], true);
+                assert!(!output.content.unwrap().contains("protected"));
+            }
+            assign(&api, &subject, vec![]);
+            assert!(
+                tool.execute(&read("legacy-A", None), ToolExecutionContext::direct())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(client.reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let bound = || BoundAuthorizationTarget::NotificationSource {
+                source_event_id: "legacy-A".into(),
+            };
+            assign(&api, &subject, vec![job("Job-A")]);
+            let scope = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        client.authorize_bound_operation_scope(
+                            "notification.diagnostics.read",
+                            bound(),
+                        )
+                    })
+                    .join()
+                    .unwrap()
+            })
+            .unwrap();
+            assert_eq!(
+                scope,
+                Some(job("Job-A")),
+                "return the authorized exact Job target"
+            );
+            let legacy = Client {
+                api,
+                identity,
+                worker: workers[1].clone(),
+                handle: tokio::runtime::Handle::current(),
+                reads: Default::default(),
+            };
+            let scope = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        legacy.authorize_bound_operation_scope(
+                            "notification.diagnostics.read",
+                            bound(),
+                        )
+                    })
+                    .join()
+                    .unwrap()
+            })
+            .unwrap();
+            assert_eq!(
+                scope,
+                Some(job("Job-A")),
+                "non-Subject path also returns actual target"
+            );
+        }
+    }
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod subjektiv_journal_tests;
@@ -46421,6 +47025,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_authorization_rechecks_host_subject_and_exact_parent_without_target_lookup() {
+        use server_api::authorization::{
+            PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
+        };
+
+        // Real signed router, Host binding and permission storage; only Runtime
+        // execution is substituted. No child or protected-data fixture is created.
+        let workspace = tempfile::tempdir().unwrap();
+        let mut api = test_api(workspace.path()).await;
+        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+        api.runtime
+            .register_or_replace(WorkdirlessFixtureRuntime::default());
+        let store = open_subjektiv_store(&api).unwrap();
+        let subject = store
+            .create_subject_with_behavior(
+                crate::subjektiv::SubjectRole::new("bound-authorization").unwrap(),
+                "Protected behavior must not appear in authorization responses.".into(),
+            )
+            .unwrap();
+        let Json(created) = create_workspace_worker(
+            State(api.clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.into(),
+                display_name: "Bound authorization source".into(),
+                singleton_key: None,
+                profile: Some("builtin:companion".into()),
+                ticket_assignment: None,
+                initial_submit: vec![],
+                workdir_attachments: vec![],
+                feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+                    subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
+                        subject_id: subject.id.clone(),
+                    }),
+                },
+                control_operation_id: None,
+                execution_grant: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let identity = RuntimeIdentityMaterial::generate(&created.runtime_id).unwrap();
+        configure_runtime_request_auth(&mut api, &identity, &created.runtime_id);
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/authorization/bound-check");
+        let subject_request =
+            json!({"operation":"memory.resident.supply", "target":{"kind":"subject"}});
+        let check = |body: Value| {
+            runtime_source_request(
+                &identity,
+                Some(&created.worker_id),
+                "POST",
+                &path,
+                serde_json::to_vec(&body).unwrap(),
+            )
+        };
+        let denied = build_router(api.clone())
+            .oneshot(check(subject_request.clone()))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let subject_resource = PermissionResource::Subject {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            subject_id: subject.id.clone(),
+        };
+        let child_resource = PermissionResource::SubWorker {
+            runtime_id: created.runtime_id.clone(),
+            worker_id: created.worker_id.clone(),
+            name: "not-started-child".into(),
+        };
+        let policy = store
+            .set_subject_permissions(
+                &subject.id,
+                &SubjectPermissionsUpdate {
+                    operation_id: Uuid::now_v7().to_string(),
+                    expected_change_id: None,
+                    execution: vec![
+                        ScopedPermission {
+                            operation: "memory.resident.supply".into(),
+                            resource: subject_resource.clone(),
+                        },
+                        ScopedPermission {
+                            operation: "worker.session.read".into(),
+                            resource: child_resource.clone(),
+                        },
+                    ],
+                    delegation: vec![],
+                },
+            )
+            .unwrap();
+        for (body, expected) in [
+            (subject_request.clone(), subject_resource),
+            (
+                json!({"operation":"worker.session.read", "target":{"kind":"sub_worker", "name":"not-started-child"}}),
+                child_resource,
+            ),
+        ] {
+            let response = build_router(api.clone())
+                .oneshot(check(body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value, json!({"scope": expected}));
+        }
+        // A different child name cannot inherit this grant. Caller-provided Subject
+        // identities are rejected at the wire boundary, not used as selectors.
+        for body in [
+            json!({"operation":"worker.session.read", "target":{"kind":"sub_worker", "name":"other-child"}}),
+            json!({"operation":"memory.resident.supply", "target":{"kind":"subject", "subject_id":"other-subject"}}),
+        ] {
+            let response = build_router(api.clone())
+                .oneshot(check(body))
+                .await
+                .unwrap();
+            assert!(response.status().is_client_error());
+        }
+        store
+            .set_subject_permissions(
+                &subject.id,
+                &SubjectPermissionsUpdate {
+                    operation_id: Uuid::now_v7().to_string(),
+                    expected_change_id: Some(policy.change_id),
+                    execution: vec![],
+                    delegation: vec![],
+                },
+            )
+            .unwrap();
+        let revoked = build_router(api.clone())
+            .oneshot(check(subject_request))
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
+        let unsigned = Request::builder()
+            .method("POST")
+            .uri(&path)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"operation":"memory.resident.supply", "target":{"kind":"subject"}})
+                    .to_string(),
+            ))
+            .unwrap();
+        let response = build_router(api).oneshot(unsigned).await.unwrap();
+        assert!(response.status().is_client_error());
+    }
+
+    #[tokio::test]
     async fn subjektiv_subject_worker_and_staging_derive_scope_from_singleton_authority() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
@@ -46441,6 +47192,46 @@ mod tests {
             .create_subject_with_behavior(
                 crate::subjektiv::SubjectRole::new("companion").unwrap(),
                 "Prefer explicit evidence.".to_string(),
+            )
+            .unwrap();
+        use server_api::authorization::{
+            PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
+        };
+        let resource = PermissionResource::Subject {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            subject_id: subject.id.clone(),
+        };
+        let mut execution: Vec<_> = [
+            "memory.resident.read",
+            "memory.resident.supply",
+            "memory.staging.write",
+            "memory.receipt.read",
+            "session.record",
+            "session.list",
+            "session.search",
+        ]
+        .into_iter()
+        .map(|operation| ScopedPermission {
+            operation: operation.into(),
+            resource: resource.clone(),
+        })
+        .collect();
+        execution.push(ScopedPermission {
+            operation: "memory.resident.read".into(),
+            resource: PermissionResource::Workspace {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            },
+        });
+        open_subjektiv_store(&api)
+            .unwrap()
+            .set_subject_permissions(
+                &subject.id,
+                &SubjectPermissionsUpdate {
+                    operation_id: "staging-scope-fixture".into(),
+                    expected_change_id: None,
+                    execution,
+                    delegation: vec![],
+                },
             )
             .unwrap();
         let request = CreateWorkspaceWorkerRequest {

@@ -8,6 +8,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use protocol::Segment;
+use server_api::authorization::PermissionResource;
 use server_api::{
     BrowserWorkerWorkingDirectorySelection, CreateWorkspaceWorkerRequest,
     CreateWorkspaceWorkerTicketAssignmentRequest,
@@ -104,28 +105,59 @@ struct WorkspaceWorkerControlService {
 }
 
 impl WorkspaceWorkerControlService {
-    fn known_subworkers(&self) -> Vec<serde_json::Value> {
-        self.registry
-            .as_ref()
-            .map(|registry| {
-                registry
-                    .list_internal()
-                    .into_iter()
-                    .map(|internal| {
-                        serde_json::json!({
-                            "subject": { "kind": "sub_worker", "name": internal.worker_name },
-                            "relation": "direct_child",
-                            "origin": "sub_worker_spawn",
-                            "permissions": ["send_input", "stop", "observe"],
-                            "summary": {
-                                "display_name": internal.worker_name,
-                                "status": format!("{:?}", internal.session.status()).to_lowercase(),
-                            }
-                        })
-                    })
-                    .collect()
+    fn authorize_runtime_worker(
+        &self,
+        operation: &str,
+        runtime_id: &str,
+        worker_id: &str,
+    ) -> Result<(), WorkspaceClientError> {
+        if !self.runtime_worker_control {
+            return Err(WorkspaceClientError::Unavailable(
+                "Runtime Worker control is not enabled for this Worker".into(),
+            ));
+        }
+        self.client.authorize_operation(
+            operation,
+            &PermissionResource::Worker {
+                runtime_id: runtime_id.into(),
+                worker_id: worker_id.into(),
+            },
+        )
+    }
+
+    fn authorize_subworker(&self, operation: &str, name: &str) -> Result<(), WorkspaceClientError> {
+        // Explicit standalone sessions retain parent-owned local child control.
+        // A failed or incomplete Workspace binding must never take this path.
+        if !self.client.is_available()
+            && self.client.workspace_id().is_none()
+            && self.client.kind() == "unavailable"
+        {
+            return Ok(());
+        }
+        self.client.authorize_subworker_operation(operation, name)
+    }
+
+    fn known_subworkers(&self) -> Result<Vec<serde_json::Value>, WorkspaceClientError> {
+        let Some(registry) = &self.registry else {
+            return Ok(Vec::new());
+        };
+        registry
+            .list_internal()
+            .into_iter()
+            .map(|internal| {
+                self.authorize_subworker("subworker.observe", &internal.worker_name)?;
+                Ok(serde_json::json!({
+                    "subject": { "kind": "sub_worker", "name": internal.worker_name },
+                    "relation": "direct_child",
+                    "origin": "sub_worker_spawn",
+                    "permissions": ["send_input", "stop", "observe"],
+                    "summary": {
+                        "display_name": internal.worker_name,
+                        "status": format!("{:?}", internal.session.status()).to_lowercase(),
+                    }
+                }))
             })
-            .unwrap_or_default()
+            .collect()
     }
 }
 
@@ -147,6 +179,12 @@ impl WorkerControlService for WorkspaceWorkerControlService {
 
     async fn list_workers(&self) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let response = if self.runtime_worker_control {
+            self.client.authorize_operation(
+                "worker.list",
+                &PermissionResource::Workspace {
+                    workspace_id: self.workspace_id.clone(),
+                },
+            )?;
             self.client.execute_server_operation(
                 crate::worker::WorkspaceServerOperation::WorkerControlList,
             )?
@@ -200,7 +238,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                 .map(serde_json::Value::to_string)
                 .is_none_or(|subject| seen.insert(subject))
         });
-        for worker in self.known_subworkers() {
+        for worker in self.known_subworkers()? {
             let is_new = worker
                 .get("subject")
                 .map(serde_json::Value::to_string)
@@ -227,6 +265,14 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                 runtime_id,
                 worker_id,
             } => {
+                self.authorize_runtime_worker(
+                    match kind {
+                        WorkerControlInputKind::User => "worker.send_input",
+                        WorkerControlInputKind::Notify => "worker.notify",
+                    },
+                    &runtime_id,
+                    &worker_id,
+                )?;
                 let kind = match kind {
                     WorkerControlInputKind::User => "user",
                     WorkerControlInputKind::Notify => "notify",
@@ -292,6 +338,14 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                 runtime_id,
                 worker_id,
             } => {
+                self.authorize_runtime_worker(
+                    match kind {
+                        WorkerControlStopKind::Cancel => "worker.cancel",
+                        WorkerControlStopKind::Stop => "worker.stop",
+                    },
+                    &runtime_id,
+                    &worker_id,
+                )?;
                 let operation = match kind {
                     WorkerControlStopKind::Cancel => {
                         crate::worker::WorkspaceServerOperation::WorkerControlCancel {
@@ -374,6 +428,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                 "Runtime Worker control is not enabled for this Worker".to_string(),
             ));
         }
+        self.authorize_runtime_worker("worker.restore", &runtime_id, &worker_id)?;
         self.client.execute_server_operation(
             crate::worker::WorkspaceServerOperation::WorkerControlRestore {
                 runtime_id,
@@ -394,6 +449,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                 "Runtime Worker control is not enabled for this Worker".to_string(),
             ));
         }
+        self.authorize_runtime_worker("worker.remove", runtime_id, worker_id)?;
         self.client
             .execute_worker_remove(runtime_id, worker_id, reason)
     }
@@ -411,7 +467,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     .and_then(|registry| registry.get_internal(name))
                     .is_some();
                 if known && matches!(permission, "send_input" | "stop" | "observe") {
-                    Ok(())
+                    self.authorize_subworker(&format!("subworker.{permission}"), name)
                 } else {
                     Err(WorkspaceClientError::Request(
                         "unknown Worker or permission not granted".to_string(),
@@ -427,6 +483,11 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                         "Runtime Worker control is not enabled for this Worker".to_string(),
                     ));
                 }
+                self.authorize_runtime_worker(
+                    &format!("worker.{permission}"),
+                    runtime_id,
+                    worker_id,
+                )?;
                 let response = self.client.execute_server_operation(
                     crate::worker::WorkspaceServerOperation::WorkerControlList,
                 )?;
@@ -566,6 +627,15 @@ impl WorkerLifecycleService for WorkspaceWorkerLifecycleService {
         request: WorkerLifecycleSpawnRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let body = workspace_worker_create_request(request)?;
+        let workspace_id = self.client.workspace_id().ok_or_else(|| {
+            WorkspaceClientError::Unavailable("Worker creation requires Workspace identity".into())
+        })?;
+        self.client.authorize_operation(
+            "worker.create",
+            &PermissionResource::Workspace {
+                workspace_id: workspace_id.into(),
+            },
+        )?;
         self.client.execute_server_operation(
             crate::worker::WorkspaceServerOperation::WorkerControlSpawn(body),
         )
@@ -1321,6 +1391,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingWorkspaceClient {
         requests: Mutex<Vec<WorkspaceRequest>>,
+        authorizations: Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
+        denied: std::sync::atomic::AtomicBool,
         removals: Mutex<Vec<(String, String, String)>>,
     }
 
@@ -1341,6 +1413,18 @@ mod tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                let auth = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                self.authorizations.lock().unwrap().push(auth);
+                return Ok(WorkspaceResponse {
+                    status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) {
+                        403
+                    } else {
+                        200
+                    },
+                    body: r#"{"scope":null}"#.into(),
+                });
+            }
             let is_worker_list = request.path.ends_with("/worker-control/workers");
             self.requests.lock().unwrap().push(request);
             Ok(WorkspaceResponse {
@@ -2331,5 +2415,167 @@ mod tests {
         assert!(validate_relative_cwd("../repo").is_err());
         assert!(validate_relative_cwd("/repo").is_err());
         assert_eq!(validate_relative_cwd("repo/src").unwrap(), "repo/src");
+    }
+    // Connection: production control/lifecycle services and WorkspaceClient authorization
+    // transport; only the Host verdict and downstream Backend are fixture boundaries.
+    #[tokio::test]
+    async fn every_runtime_control_effect_rechecks_host_before_backend_dispatch() {
+        async fn call(
+            control: &dyn WorkerControlService,
+            op: &str,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            let subject = WorkerControlSubject::RuntimeWorker {
+                runtime_id: "target-runtime".into(),
+                worker_id: "target-worker".into(),
+            };
+            match op {
+                "worker.list" => control.list_workers().await,
+                "worker.send_input" | "worker.notify" => {
+                    control
+                        .send_input(
+                            subject,
+                            "input".into(),
+                            if op == "worker.notify" {
+                                WorkerControlInputKind::Notify
+                            } else {
+                                WorkerControlInputKind::User
+                            },
+                        )
+                        .await
+                }
+                "worker.cancel" | "worker.stop" => {
+                    control
+                        .stop_worker(
+                            subject,
+                            if op == "worker.cancel" {
+                                WorkerControlStopKind::Cancel
+                            } else {
+                                WorkerControlStopKind::Stop
+                            },
+                            None,
+                        )
+                        .await
+                }
+                "worker.restore" => {
+                    control
+                        .restore_worker(
+                            "target-runtime".into(),
+                            "target-worker".into(),
+                            server_api::WorkerRestoreRequest {
+                                request_id: "restore-intent".into(),
+                                expected_observation_token: "observed".into(),
+                            },
+                        )
+                        .await
+                }
+                "worker.remove" => control.remove_runtime_worker(
+                    "target-runtime",
+                    "target-worker",
+                    "requested removal",
+                ),
+                "worker.create" => {
+                    control
+                        .spawn_worker(WorkerLifecycleSpawnRequest {
+                            orchestrator_assignment_id: None,
+                            runtime_id: "target-runtime".into(),
+                            workdir_attachments: vec![],
+                            profile: "builtin:coder".into(),
+                            singleton_key: None,
+                            ticket_id: None,
+                            operation_id: Some("spawn-intent".into()),
+                            execution_grant: None,
+                            display_name: "child".into(),
+                            initial_submit: vec![Segment::text("work")],
+                        })
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        }
+        for op in [
+            "worker.list",
+            "worker.send_input",
+            "worker.notify",
+            "worker.cancel",
+            "worker.stop",
+            "worker.restore",
+            "worker.remove",
+            "worker.create",
+        ] {
+            let client = Arc::new(RecordingWorkspaceClient::default());
+            let control = test_control(client.clone());
+            client
+                .denied
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(call(control.as_ref(), op).await.is_err(), "{op}");
+            assert!(client.requests.lock().unwrap().is_empty(), "{op}");
+            assert!(client.removals.lock().unwrap().is_empty(), "{op}");
+            client
+                .denied
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                call(control.as_ref(), op).await.unwrap().is_success(),
+                "{op}"
+            );
+            let effects =
+                client.requests.lock().unwrap().len() + client.removals.lock().unwrap().len();
+            assert_eq!(effects, 1, "{op}");
+            client
+                .denied
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(call(control.as_ref(), op).await.is_err(), "{op}");
+            assert_eq!(
+                client.requests.lock().unwrap().len() + client.removals.lock().unwrap().len(),
+                effects,
+                "{op}"
+            );
+            let checks = client.authorizations.lock().unwrap();
+            assert_eq!(checks.len(), 3, "{op}");
+            for check in checks.iter() {
+                assert_eq!(check.operation, op);
+                assert_eq!(
+                    check.resource,
+                    if matches!(op, "worker.list" | "worker.create") {
+                        PermissionResource::Workspace {
+                            workspace_id: if op == "worker.list" {
+                                "workspace%2Ftest"
+                            } else {
+                                "workspace/test"
+                            }
+                            .into(),
+                        }
+                    } else {
+                        PermissionResource::Worker {
+                            runtime_id: "target-runtime".into(),
+                            worker_id: "target-worker".into(),
+                        }
+                    }
+                );
+            }
+        }
+    }
+    #[test]
+    fn only_explicit_standalone_retains_local_subworker_authority_without_host() {
+        for workspace_id in [None, Some("bound-workspace".to_string())] {
+            let identity = workspace_id
+                .as_ref()
+                .map(|id| crate::worker::WorkspaceId::new(id.clone()).unwrap());
+            let client = crate::worker::unavailable_workspace_client(
+                identity.as_ref(),
+                "unavailable fixture",
+            );
+            let control = WorkspaceWorkerControlService {
+                client,
+                workspace_id: workspace_id.clone().unwrap_or_default(),
+                registry: None,
+                runtime_worker_control: false,
+            };
+            assert_eq!(
+                control
+                    .authorize_subworker("subworker.stop", "child")
+                    .is_ok(),
+                workspace_id.is_none()
+            );
+        }
     }
 }

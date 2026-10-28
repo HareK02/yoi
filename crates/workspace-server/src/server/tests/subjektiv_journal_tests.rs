@@ -11,10 +11,100 @@ use subjektiv::journal::*;
 #[path = "subjektiv_journal_connected_tests.rs"]
 mod connected;
 
+const JOURNAL_OPERATIONS: &[&str] = &[
+    "session.record",
+    "journal.startup.read",
+    "journal.startup.supply",
+    "journal.compaction.read",
+    "journal.compaction.supply",
+    "journal.recording.request",
+    "journal.job.input.read",
+    "journal.job.input.supply",
+    "journal.entry.create",
+    "journal.entry.rewrite",
+    "journal.entry.fix",
+    "journal.position.update",
+    "journal.unchanged.confirm",
+    "journal.checkpoint",
+    "journal.state.read",
+    "journal.operation.query",
+    "journal.operation.coverage.read",
+    "journal.operation.list",
+    "journal.text.read",
+    "journal.finish",
+];
+
+fn grant_journal_operations(store: &crate::subjektiv::SubjektivStore, subject: &str) {
+    use server_api::authorization::{
+        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
+    };
+    let previous = store.subject_permissions(subject).unwrap();
+    store
+        .set_subject_permissions(
+            subject,
+            &SubjectPermissionsUpdate {
+                operation_id: format!("journal-fixture-grant-{subject}"),
+                expected_change_id: previous.map(|policy| policy.change_id),
+                execution: JOURNAL_OPERATIONS
+                    .iter()
+                    .map(|operation| ScopedPermission {
+                        operation: (*operation).into(),
+                        resource: PermissionResource::Subject {
+                            workspace_id: TEST_WORKSPACE_ID.into(),
+                            subject_id: subject.into(),
+                        },
+                    })
+                    .collect(),
+                delegation: vec![],
+            },
+        )
+        .unwrap();
+}
+
+fn spawn_journal_source(api: &WorkspaceApi, subject: &str, name: &str) -> RuntimeWorkerRef {
+    seed_test_delivery_binding(api);
+    api.spawn_workspace_worker(
+        EMBEDDED_WORKER_RUNTIME_ID,
+        WorkerSpawnRequest {
+            requested_worker_name: Some(name.into()),
+            intent: WorkerSpawnIntent::WorkspaceCompanion,
+            singleton_key: Some(crate::subjektiv::subject_worker_singleton_key(subject).unwrap()),
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: ProfileSelector::Builtin("builtin:companion".into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachment_requests: vec![],
+            resolved_workdir_attachment_requests: vec![],
+            resolved_workdir_attachments: vec![],
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: vec![],
+            resolved_workspace_api: None,
+            resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
+            resolved_control_operation: None,
+            resolved_execution_grant: None,
+        },
+    )
+    .unwrap()
+    .worker
+    .unwrap()
+    .worker
+}
+
 fn bind_fixture_session(
     store: &crate::subjektiv::SubjektivStore,
     attr: crate::subjektiv::SubjectSessionAttribution,
 ) -> JournalHostContext {
+    if store
+        .subject_permissions(&attr.subject_id)
+        .unwrap()
+        .is_none()
+    {
+        grant_journal_operations(store, &attr.subject_id);
+    }
     let binding = store
         .claim_journal_writer(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
         .unwrap();
@@ -245,7 +335,7 @@ impl Fixture {
         let subject = store
             .create_subject(crate::subjektiv::SubjectRole::new("journal-test").unwrap())
             .unwrap();
-        let source = spawn_ticket_check_source(&api, "journal-source");
+        let source = spawn_journal_source(&api, &subject.id, "journal-source");
         let attr = store
             .record_session_attribution(
                 crate::subjektiv::SubjectSessionAttribution::new(
@@ -308,7 +398,7 @@ impl Fixture {
                 ..Default::default()
             },
             serialization_key: Some(journal_serialization_key(&id)),
-            source_worker: None,
+            source_worker: Some(source.clone()),
             notification_target: None,
             limits: Default::default(),
         };
@@ -593,6 +683,36 @@ fn message(text: &str) -> session_store::LoggedItem {
         content: vec![session_store::LoggedContentPart::Text { text: text.into() }],
     }
 }
+pub(super) async fn model_supply_job_fixture(
+    missing_origin: bool,
+) -> (tempfile::TempDir, WorkspaceApi, BackendJobReservation) {
+    let fixture = if missing_origin {
+        RuntimeFixture::with_history_and_origin(
+            vec![session_store::LoggedHistoryEntry {
+                item: message(SOURCE_SENTINEL),
+                metadata: session_store::LoggedSessionHistoryMetadata {
+                    input_metadata: None,
+                    entry_id: session_store::LoggedSessionHistoryEntryId(
+                        "historical-source".into(),
+                    ),
+                    origin: session_store::LoggedSessionHistoryOrigin::LocalHumanInput,
+                    derivation: None,
+                },
+            }],
+            false,
+        )
+        .await
+    } else {
+        RuntimeFixture::new().await
+    };
+    let reservation = if missing_origin {
+        fixture.reserved
+    } else {
+        fixture.dispatch_input()
+    };
+    (fixture.dir, fixture.api, reservation)
+}
+
 impl RuntimeFixture {
     async fn new() -> Self {
         Self::with_history(vec![session_store::LoggedHistoryEntry {
@@ -607,15 +727,21 @@ impl RuntimeFixture {
         .await
     }
     async fn with_history(history: Vec<session_store::LoggedHistoryEntry>) -> Self {
+        Self::with_history_and_origin(history, true).await
+    }
+    async fn with_history_and_origin(
+        history: Vec<session_store::LoggedHistoryEntry>,
+        frozen_origin: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (api, execution) = test_api_with_recording_backend(dir.path()).await;
-        let source = spawn_ticket_check_source(&api, "original-source");
-        let session = session_store::new_session_id();
-        seed_session_history(&session_root(dir.path(), &source), session, history);
         let store = open_subjektiv_store(&api).unwrap();
         let subject = store
             .create_subject(crate::subjektiv::SubjectRole::new("source-reader-test").unwrap())
             .unwrap();
+        let source = spawn_journal_source(&api, &subject.id, "original-source");
+        let session = session_store::new_session_id();
+        seed_session_history(&session_root(dir.path(), &source), session, history);
         let attr = store
             .record_session_attribution(
                 crate::subjektiv::SubjectSessionAttribution::new(
@@ -699,7 +825,10 @@ impl RuntimeFixture {
         store
             .accept_journal_sources(&host, "bounded captured prefix", &input.selected_ranges)
             .unwrap();
-        let request = subjektiv_journal::recording_request(&host, attr, &id, input).unwrap();
+        let mut request = subjektiv_journal::recording_request(&host, attr, &id, input).unwrap();
+        if !frozen_origin {
+            request.source_worker = None;
+        }
         assert!(
             request.input["capture"]["entries"]
                 .as_array()
@@ -1346,7 +1475,7 @@ async fn journal_reserved_restart_dispatches_exact_intent_once_and_unbound_unkno
 }
 
 #[tokio::test]
-async fn archived_original_session_remains_readable_then_releases_its_pin_after_saved_completion() {
+async fn subject_source_removal_is_fenced_and_pin_releases_after_saved_completion() {
     let f = RuntimeFixture::new().await;
     let dispatched = f.dispatch_input();
     let worker = dispatched.attempt.worker.as_ref().unwrap();
@@ -1369,18 +1498,21 @@ async fn archived_original_session_remains_readable_then_releases_its_pin_after_
         .unwrap();
     assert_eq!(
         response.status,
-        StatusCode::OK.as_u16(),
+        StatusCode::CONFLICT.as_u16(),
         "{}",
         response.body
     );
-    let archive = f
-        .api
-        .config_store
-        .worker_session_archive(TEST_WORKSPACE_ID, &f.source, &f.session.to_string())
-        .unwrap()
-        .expect("durable archive binding");
-    assert!(!session_root(f.dir.path(), &f.source).exists());
-    // Archive movement neither changes nor reclaims the saved immutable body.
+    assert!(response.body.contains("journal_handoff_incomplete"));
+    assert!(session_root(f.dir.path(), &f.source).exists());
+    assert!(
+        f.api
+            .config_store
+            .worker_session_archive(TEST_WORKSPACE_ID, &f.source, &f.session.to_string())
+            .unwrap()
+            .is_none()
+    );
+    // Stopping the body is not release. Keep its source while the active
+    // writer/Job still depends on current ownership and saved completion.
     // The Job cannot fall back to a retained or archived Session read.
     let saved = f
         .api
@@ -1440,18 +1572,69 @@ async fn archived_original_session_remains_readable_then_releases_its_pin_after_
     )
     .await;
     assert!(
+        !retention.pins(f.session).unwrap().is_empty(),
+        "saved reflection alone does not release the still-owned source"
+    );
+    // This deterministic fixture has no Controller to prove a live disconnect.
+    // Seed an explicitly completed historical release, as in the archive-recovery
+    // component tests; connected release proof is exercised separately.
+    let lease = f
+        .api
+        .store
+        .require_current_worker_singleton_owner(TEST_WORKSPACE_ID, &f.source)
+        .unwrap()
+        .unwrap();
+    let binding_id = f.host.writer_binding_id().unwrap();
+    let operation = "completed-source-release-before-archive";
+    f.api
+        .config_store
+        .reserve_subject_release(TEST_WORKSPACE_ID, &lease, binding_id, operation)
+        .unwrap();
+    f.store
+        .release_journal_writer(&JournalWriterBinding {
+            subject_id: f
+                .request
+                .grants
+                .subjektiv_journal
+                .as_ref()
+                .unwrap()
+                .subject_id
+                .clone(),
+            runtime_id: f.source.runtime_id.clone(),
+            worker_id: f.source.worker_id.clone(),
+            binding_id: binding_id.into(),
+        })
+        .unwrap();
+    f.api
+        .config_store
+        .confirm_subject_release_proof(TEST_WORKSPACE_ID, &lease, binding_id, operation, false)
+        .unwrap();
+    f.api
+        .config_store
+        .release_subject_singleton(TEST_WORKSPACE_ID, &lease, binding_id, operation)
+        .unwrap();
+    let response = WorkerRemovalService::new(&f.api)
+        .execute_target_removal_on_host(f.api.runtime.as_ref(), &f.source, "archive original", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status,
+        StatusCode::OK.as_u16(),
+        "{}",
+        response.body
+    );
+    assert!(
         retention.pins(f.session).unwrap().is_empty(),
-        "archive pin is released only after saved reflection"
+        "completed reflection and explicit release allow archive and source pin release"
     );
     assert!(!session_root(f.dir.path(), worker).exists());
-    assert_eq!(
+    assert!(
         f.api
             .config_store
             .worker_session_archive(TEST_WORKSPACE_ID, &f.source, &f.session.to_string())
             .unwrap()
-            .unwrap()
-            .archive_id,
-        archive.archive_id
+            .is_some(),
+        "the explicitly released source is archived after saved reflection"
     );
 }
 

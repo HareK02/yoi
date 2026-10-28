@@ -7028,6 +7028,262 @@
           {
             "additionalProperties": false,
             "properties": {
+              "job_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "job",
+                "type": "string"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id",
+              "job_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "ticket",
+                "type": "string"
+              },
+              "ticket_id": {
+                "type": "string"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id",
+              "ticket_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "objective",
+                "type": "string"
+              },
+              "objective_id": {
+                "type": "string"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id",
+              "objective_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "merge_request",
+                "type": "string"
+              },
+              "merge_request_id": {
+                "type": "string"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id",
+              "merge_request_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "subject",
+                "type": "string"
+              },
+              "subject_id": {
+                "type": "string"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id",
+              "subject_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "drive_entry",
+                "type": "string"
+              },
+              "node_id": {
+                "type": "string"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id",
+              "node_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "drive_request",
+                "type": "string"
+              },
+              "request_id": {
+                "type": "string"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id",
+              "request_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "repository",
+                "type": "string"
+              },
+              "repository_key": {
+                "type": "string"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id",
+              "repository_key"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "connection_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "workdir_attachment",
+                "type": "string"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id",
+              "connection_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "workspace_config",
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "recursive": {
+                "type": "boolean"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id",
+              "path",
+              "recursive"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "network",
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "url"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "sub_worker",
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "runtime_id": {
+                "type": "string"
+              },
+              "worker_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "runtime_id",
+              "worker_id",
+              "name"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
               "kind": {
                 "const": "feature",
                 "type": "string"
@@ -18349,7 +18605,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:fc3064f2d7b0d2c2b11e166007943b0cac0cad0918e34d071e20079cf38d655e"
+    "x-yoi-source-digest": "sha256:1f5ae1d92ac04d33a05b9d4a34252e017e668d5c33520490bdfff7a6cde1e3cb"
   },
   "openapi": "3.1.0",
   "paths": {

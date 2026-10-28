@@ -5,6 +5,9 @@ use std::collections::VecDeque;
 
 #[derive(Debug)]
 struct Client {
+    auth_denied: std::sync::atomic::AtomicBool,
+    denied_resource: Mutex<Option<server_api::authorization::PermissionResource>>,
+    authorizations: Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
     responses: Mutex<VecDeque<Result<WorkspaceResponse, WorkspaceClientError>>>,
     requests: Mutex<Vec<WorkspaceRequest>>,
     capabilities: Mutex<WorkspaceResponse>,
@@ -12,6 +15,9 @@ struct Client {
 impl Client {
     fn new(responses: Vec<WorkspaceResponse>) -> Arc<Self> {
         Arc::new(Self {
+            auth_denied: std::sync::atomic::AtomicBool::new(false),
+            denied_resource: Mutex::new(None),
+            authorizations: Mutex::new(Vec::new()),
             responses: Mutex::new(responses.into_iter().map(Ok).collect()),
             requests: Mutex::new(Vec::new()),
             capabilities: Mutex::new(response(DriveCapabilities { write: false })),
@@ -32,6 +38,23 @@ impl WorkspaceClient for Client {
         &self,
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if request.path.ends_with("/authorization/check") {
+            let input: server_api::authorization::OperationAuthorizationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            self.authorizations.lock().unwrap().push(input.clone());
+            if self.auth_denied.load(std::sync::atomic::Ordering::SeqCst)
+                || self.denied_resource.lock().unwrap().as_ref() == Some(&input.resource)
+            {
+                return Ok(WorkspaceResponse {
+                    status: 403,
+                    body: "{}".into(),
+                });
+            }
+            return Ok(WorkspaceResponse {
+                status: 200,
+                body: serde_json::json!({"scope": input.resource}).to_string(),
+            });
+        }
         let capabilities = request.path == "/api/w/workspace/drive/capabilities";
         self.requests.lock().unwrap().push(request);
         if capabilities {
@@ -520,6 +543,7 @@ async fn drive_native_entry_is_directly_resolvable_but_never_indexable_and_binds
 
 #[derive(Debug)]
 struct ChunkClient {
+    revoke_after_chunk: std::sync::atomic::AtomicBool,
     json: Arc<Client>,
     chunks: Mutex<VecDeque<crate::worker::WorkspaceBinaryResponse>>,
     requests: Mutex<Vec<crate::worker::WorkspaceBinaryRequest>>,
@@ -545,6 +569,14 @@ impl WorkspaceClient for ChunkClient {
         request: crate::worker::WorkspaceBinaryRequest,
     ) -> Result<crate::worker::WorkspaceBinaryResponse, WorkspaceClientError> {
         self.requests.lock().unwrap().push(request);
+        if self
+            .revoke_after_chunk
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.json
+                .auth_denied
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(self
             .chunks
             .lock()
@@ -558,6 +590,7 @@ fn chunk_client(
     chunks: Vec<crate::worker::WorkspaceBinaryResponse>,
 ) -> Arc<ChunkClient> {
     Arc::new(ChunkClient {
+        revoke_after_chunk: std::sync::atomic::AtomicBool::new(false),
         json: Client::new(vec![response(metadata)]),
         chunks: Mutex::new(chunks.into()),
         requests: Mutex::new(Vec::new()),
@@ -1050,6 +1083,14 @@ impl WorkspaceClient for NativeMutations {
         &self,
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if request.path.ends_with("/authorization/check") {
+            let input: server_api::authorization::OperationAuthorizationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            return Ok(WorkspaceResponse {
+                status: 200,
+                body: serde_json::json!({"scope": input.resource}).to_string(),
+            });
+        }
         let mut state = self.0.lock().unwrap();
         let suffix = request
             .path
@@ -1325,4 +1366,181 @@ async fn drive_same_feature_remount_rejects_retained_object_with_fresh_common_sc
     let result: Value = serde_json::from_str(result.content.as_deref().unwrap()).unwrap();
     assert!(result["content"].as_str().unwrap().contains("hello"));
     assert!(client.0.lock().unwrap().2.is_empty());
+}
+
+// The real Tool/backend/client authorization connection is exercised; only Host transport is substituted.
+#[tokio::test]
+async fn denied_drive_operations_do_not_reach_provider_and_bind_actual_resources() {
+    use server_api::authorization::PermissionResource;
+    for operation in [
+        "capabilities",
+        "root",
+        "metadata",
+        "list",
+        "search",
+        "read_text",
+        "create_folder",
+        "create_text",
+        "update_text",
+        "relocate",
+        "delete",
+        "upload",
+        "request_status",
+    ] {
+        let client = Client::new(vec![]);
+        client
+            .auth_denied
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let backend = DriveBackend::new(client.clone());
+        let entry = entry("2", "old");
+        let result = match operation {
+            "capabilities" => backend.capabilities().await.map(|_| ()),
+            "root" => backend.root().await.map(|_| ()),
+            "metadata" => backend.metadata(&entry.entry).await.map(|_| ()),
+            "list" => backend.list(&entry.entry, None, None).await.map(|_| ()),
+            "search" => backend
+                .search(serde_json::from_value(json!({"query":"note"})).unwrap())
+                .await
+                .map(|_| ()),
+            "read_text" => backend.read(&entry.entry, 10).await.map(|_| ()),
+            "request_status" => backend.status("request-1").await.map(|_| ()),
+            "upload" => backend
+                .upload(
+                    DriveUploadQuery {
+                        operation: DriveUploadOperation::Create,
+                        request_id: "request-1".into(),
+                        entry_workspace_id: "workspace".into(),
+                        parent_id: Some("2".into()),
+                        name: Some("new".into()),
+                        id: None,
+                        expected_mutation_id: None,
+                        content_type: "text/plain".into(),
+                        size: 0,
+                        sha256: digest(b""),
+                    },
+                    vec![],
+                )
+                .await
+                .map(|_| ()),
+            _ => {
+                let mutation = match operation {
+                    "create_folder" => DriveMutation::CreateFolder {
+                        parent: entry.entry,
+                        name: "new".into(),
+                    },
+                    "create_text" => DriveMutation::CreateText {
+                        parent: entry.entry,
+                        name: "new".into(),
+                        text: "new".into(),
+                        content_type: "text/plain".into(),
+                    },
+                    "update_text" => DriveMutation::UpdateText {
+                        id: entry.entry,
+                        expected_mutation_id: "old".into(),
+                        text: "new".into(),
+                        content_type: "text/plain".into(),
+                    },
+                    "relocate" => DriveMutation::Relocate {
+                        id: entry.entry,
+                        expected_mutation_id: "old".into(),
+                        parent: DriveEntryRef {
+                            workspace_id: "workspace".into(),
+                            node_id: "3".into(),
+                        },
+                        name: "new".into(),
+                    },
+                    "delete" => DriveMutation::Delete {
+                        id: entry.entry,
+                        expected_mutation_id: "old".into(),
+                    },
+                    _ => unreachable!(),
+                };
+                backend
+                    .mutate(DriveMutationRequest {
+                        request_id: "request-1".into(),
+                        mutation,
+                    })
+                    .await
+                    .map(|_| ())
+            }
+        };
+        assert!(
+            matches!(result, Err(DriveError::Authorization { denied: true, .. })),
+            "{operation}: {result:?}"
+        );
+        assert!(client.requests.lock().unwrap().is_empty(), "{operation}");
+        let auth = client.authorizations.lock().unwrap();
+        assert_eq!(auth.len(), 1);
+        assert_eq!(auth[0].operation, format!("drive.{operation}"));
+        let expected = match operation {
+            "capabilities" | "root" | "search" => PermissionResource::Workspace {
+                workspace_id: "workspace".into(),
+            },
+            "request_status" => PermissionResource::DriveRequest {
+                workspace_id: "workspace".into(),
+                request_id: "request-1".into(),
+            },
+            _ => PermissionResource::DriveEntry {
+                workspace_id: "workspace".into(),
+                node_id: "2".into(),
+            },
+        };
+        assert_eq!(auth[0].resource, expected);
+    }
+}
+
+#[tokio::test]
+async fn image_permission_revocation_blocks_next_chunk_and_returns_no_attachment() {
+    let mut metadata = entry("2", "old");
+    metadata.size = Some(DRIVE_CHUNK_MAX_BYTES + 1);
+    let client = chunk_client(
+        metadata.clone(),
+        vec![chunk(vec![0; DRIVE_CHUNK_MAX_BYTES as usize])],
+    );
+    client
+        .revoke_after_chunk
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let feature = DriveFeature::new(client.clone(), Arc::new(WorkdirSessionRouter::new()));
+    let result = execute(&feature, "DriveViewImage", json!({"entry":metadata.entry})).await;
+    assert!(matches!(
+        result,
+        Err(DriveError::Authorization { denied: true, .. })
+    ));
+    assert_eq!(client.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn drive_relocate_checks_destination_before_any_mutation() {
+    use server_api::authorization::PermissionResource;
+    let client = Client::new(vec![]);
+    *client.denied_resource.lock().unwrap() = Some(PermissionResource::DriveEntry {
+        workspace_id: "workspace".into(),
+        node_id: "3".into(),
+    });
+    let backend = DriveBackend::new(client.clone());
+    let result = backend
+        .mutate(DriveMutationRequest {
+            request_id: "request-1".into(),
+            mutation: DriveMutation::Relocate {
+                id: entry("2", "old").entry,
+                expected_mutation_id: "old".into(),
+                parent: entry("3", "old").entry,
+                name: "moved".into(),
+            },
+        })
+        .await;
+    assert!(matches!(
+        result,
+        Err(DriveError::Authorization { denied: true, .. })
+    ));
+    assert!(client.requests.lock().unwrap().is_empty());
+    let auth = client.authorizations.lock().unwrap();
+    assert_eq!(auth.len(), 2);
+    assert_eq!(
+        auth[1].resource,
+        PermissionResource::DriveEntry {
+            workspace_id: "workspace".into(),
+            node_id: "3".into()
+        }
+    );
 }
