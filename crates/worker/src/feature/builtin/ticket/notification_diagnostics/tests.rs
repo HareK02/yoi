@@ -21,9 +21,14 @@ async fn notification_wip_executes_same_read_and_honors_profile_denial() {
                 rules: vec![],
             }),
             collection_route: "/tickets".into(),
+            merge_request_route: "/merge-requests".into(),
+            objective_route: "/objectives".into(),
             observations: Arc::new(Mutex::new(TicketObservationState::default())),
         };
-        let args = BTreeMap::from([("ticket".into(), WipValue::String("T-755".into()))]);
+        let args = BTreeMap::from([(
+            "filter".into(),
+            json_to_wip(&json!({"ticket":"/tickets/T-755"})).unwrap(),
+        )]);
         let result = handler
             .call(
                 "notification_diagnostics",

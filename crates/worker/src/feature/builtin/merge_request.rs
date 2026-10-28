@@ -1,10 +1,17 @@
 //! Connects enabled Merge Request Tools to the Workspace API and native WIP.
 //!
-//! The native projection accepts only `/merge-requests` and its immediate canonical IDs, binding
-//! each item's subject to its route. It removes `merge_request_id` from descriptors and reconstructs
-//! it for original schema and permission evaluation. Only enabled regular Tools are projected;
-//! no Backend-wide catalog or custom query is added. [`crate::wip`] owns shared reference,
-//! permission, Client-lifetime, and unknown-outcome contracts.
+//! The collection opens a repository candidate linked to a Ticket Entry; an item is one Merge
+//! Request whose identity is exclusively route-bound. Keeping these Objects separate prevents a
+//! read/review/integration from selecting a different subject in arguments. The item Interface owns
+//! independent `read`, `readiness`, `review`, and `complete` actions: reading is not a readiness
+//! judgment, a review attests a source, and completion records an already-applied integration. None
+//! implies another action, Git integration, or Ticket conclusion.
+//!
+//! Native v2 contracts are defined in the child `native` module, independently of Tool JSON Schema.
+//! Their declarations drive descriptor generation, input validation, and command-field conversion.
+//! Tool mode parses its own DTOs. Both enter the shared typed command dispatcher, including Backend
+//! operation authorization; native never calls `Tool::execute`. Only configured actions are mounted.
+//! [`crate::wip`] owns shared reference, permission, Client-lifetime, and unknown-outcome contracts.
 //!
 //! # Injected review capability
 //!
@@ -19,7 +26,8 @@
 //! item-read response hashes are observed; mutations discard observations. Receipts do not fabricate
 //! complete representations or local mutation generations. Open results include the new item path.
 //! Item responses are checked against the bound MR; subject mismatches after mutations are not
-//! treated as unexecuted operations. Optional argument omission/null stays as in original Tool input.
+//! treated as unexecuted operations. Native omission and explicit nullable unions are distinct;
+//! native input changes do not change ordinary Tool omission/null behavior.
 
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureInstructionContribution,
@@ -30,7 +38,7 @@ use crate::permission::permission_action_for;
 use crate::wip::{
     WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount, WipMountError,
     WipMountRegistry, WipNamespaceRoute, WipOperationError, WipOperationHandler,
-    WipOperationOutput, WipProjection, WipProjectionKind, json_to_wip, wip_to_json,
+    WipOperationOutput, WipProjection, WipProjectionKind, json_to_wip,
 };
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 use agen::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -41,12 +49,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use server_api::authorization::PermissionResource;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use wip_protocol::{
     Documentation, INTERFACE_FORMAT_V1, InterfaceDescriptor, Object, OperationDeclaration,
-    ParameterDeclaration, ProtocolError, ProtocolErrorCode, ReturnDeclaration, TypeExpr,
-    Value as WipValue,
+    ProtocolError, ProtocolErrorCode, Value as WipValue,
 };
 
 pub const FEATURE_ID: &str = "merge_request";
@@ -190,178 +197,16 @@ impl Kind {
         matches!(self, Self::Open | Self::Review | Self::Complete)
     }
 }
+mod command;
+mod native;
+
 #[async_trait]
 impl Tool for MergeRequestTool {
     async fn execute(&self, input: &str, _: ToolExecutionContext) -> Result<ToolOutput, ToolError> {
-        let ws = self.client.workspace_id().ok_or_else(|| {
-            ToolError::ExecutionFailed("Merge Request tools require Workspace identity".into())
-        })?;
-        if matches!(self.kind, Kind::Show) {
-            let value: ShowMergeRequestInput = parse(input)?;
-            nonempty_named("merge_request_id", &value.merge_request_id)?;
-            if value.limit.is_some_and(|limit| !(1..=200).contains(&limit)) {
-                return Err(ToolError::InvalidArgument(
-                    "limit must be between 1 and 200".into(),
-                ));
-            }
-            return self.show_merge_request(ws, &value.merge_request_id, value.after, value.limit);
-        }
-        let (method, path, body) = match self.kind {
-            Kind::Readiness => {
-                let v: MergeRequestInput = parse(input)?;
-                nonempty_named("merge_request_id", &v.merge_request_id)?;
-                self.authorize(
-                    "merge_request.readiness",
-                    PermissionResource::MergeRequest {
-                        workspace_id: ws.into(),
-                        merge_request_id: v.merge_request_id.clone(),
-                    },
-                )?;
-                (
-                    WorkspaceRequestMethod::Get,
-                    format!(
-                        "/api/w/{ws}/merge-requests/{}/readiness",
-                        encode_path_segment(&v.merge_request_id)
-                    ),
-                    None,
-                )
-            }
-            Kind::Show => unreachable!("ShowMergeRequest is handled above"),
-            Kind::Open => {
-                let v: OpenMergeRequestInput = parse(input)?;
-                nonempty(&v.ticket)?;
-                self.authorize(
-                    "merge_request.open",
-                    PermissionResource::Ticket {
-                        workspace_id: ws.into(),
-                        ticket_id: v.ticket.clone(),
-                    },
-                )?;
-                (
-                    WorkspaceRequestMethod::Post,
-                    format!(
-                        "/api/w/{ws}/tickets/{}/merge-request",
-                        encode_path_segment(&v.ticket)
-                    ),
-                    Some(
-                        json!({"repository_key":v.repository_key,"selector_from":v.selector_from,"selector_to":v.selector_to,"summary":v.summary}),
-                    ),
-                )
-            }
-            Kind::Complete => {
-                let v: CompleteMergeRequestInput = parse(input)?;
-                nonempty_named("merge_request_id", &v.merge_request_id)?;
-                self.authorize(
-                    "merge_request.complete",
-                    PermissionResource::MergeRequest {
-                        workspace_id: ws.into(),
-                        merge_request_id: v.merge_request_id.clone(),
-                    },
-                )?;
-                (
-                    WorkspaceRequestMethod::Post,
-                    format!(
-                        "/api/w/{ws}/merge-requests/{}/complete",
-                        encode_path_segment(&v.merge_request_id)
-                    ),
-                    Some(
-                        json!({"operation_id":v.operation_id,"approval_event_id":v.approval_event_id,"target_ref_before":v.target_ref_before,"target_ref_after":v.target_ref_after,"strategy":match v.strategy{MergeStrategyInput::FastForward=>"fast_forward",MergeStrategyInput::Merge=>"merge"},"resolution":match v.resolution{MergeResolutionInput::None=>"none",MergeResolutionInput::Clean=>"clean",MergeResolutionInput::ConflictsResolved=>"conflicts_resolved"}}),
-                    ),
-                )
-            }
-            Kind::Review => {
-                let v: ReviewMergeRequestInput = parse(input)?;
-                let ctx = self.client.reviewer_context().ok_or_else(|| {
-                    ToolError::ExecutionFailed(
-                        "Review submit requires injected Reviewer capability".into(),
-                    )
-                })?;
-                self.authorize(
-                    "merge_request.review",
-                    PermissionResource::MergeRequest {
-                        workspace_id: ws.into(),
-                        merge_request_id: ctx.merge_request_id.clone(),
-                    },
-                )?;
-                (
-                    WorkspaceRequestMethod::Post,
-                    format!(
-                        "/api/w/{ws}/merge-requests/{}/reviews",
-                        encode_path_segment(&ctx.merge_request_id)
-                    ),
-                    Some(
-                        json!({"decision":match v.decision{ReviewDecisionInput::Approve=>"approve",ReviewDecisionInput::RequestChanges=>"request_changes"},"body":v.body,"findings":v.findings.into_iter().map(|f|json!({"severity":f.severity,"code":f.code,"path":f.path,"line":f.line,"body":f.body})).collect::<Vec<_>>() }),
-                    ),
-                )
-            }
-        };
-        let req = match body {
-            Some(v) => WorkspaceRequest::json(method, path, v.to_string()),
-            None => WorkspaceRequest::get(path),
-        };
-        let res = self
-            .client
-            .execute(req)
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-        if !res.is_success() {
-            return Err(api_error("Merge Request API", &res));
-        }
-        Ok(ToolOutput {
-            summary: self.kind.name().into(),
-            content: Some(res.body),
-            attachments: vec![],
-        })
-    }
-}
-
-impl MergeRequestTool {
-    fn authorize(&self, operation: &str, resource: PermissionResource) -> Result<(), ToolError> {
-        self.client.authorize_operation(operation, &resource)
-            .map_err(|error| {
-                let denied = matches!(&error, crate::worker::WorkspaceClientError::Request(message)
-                    if message.contains("HTTP status 403") || message.contains("HTTP status 401"));
-                ToolError::ExecutionFailed(format!("Merge Request operation authorization failed before dispatch: {operation}; resource={resource:?}; denied={denied}"))
-            })
-    }
-    fn show_merge_request(
-        &self,
-        workspace_id: &str,
-        merge_request_id: &str,
-        after: Option<u64>,
-        limit: Option<usize>,
-    ) -> Result<ToolOutput, ToolError> {
-        self.authorize(
-            "merge_request.read",
-            PermissionResource::MergeRequest {
-                workspace_id: workspace_id.into(),
-                merge_request_id: merge_request_id.into(),
-            },
-        )?;
-        let merge_request_id = encode_path_segment(merge_request_id);
-        let mut path = format!("/api/w/{workspace_id}/merge-requests/{merge_request_id}");
-        let mut query = Vec::new();
-        if let Some(after) = after {
-            query.push(format!("after={after}"));
-        }
-        if let Some(limit) = limit {
-            query.push(format!("limit={limit}"));
-        }
-        if !query.is_empty() {
-            path.push('?');
-            path.push_str(&query.join("&"));
-        }
-        let response = self
-            .client
-            .execute(WorkspaceRequest::get(path))
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        if !response.is_success() {
-            return Err(api_error("Merge Request API", &response));
-        }
-        Ok(ToolOutput {
-            summary: self.kind.name().into(),
-            content: Some(response.body),
-            attachments: vec![],
-        })
+        command::execute(
+            self.client.clone(),
+            command::Command::from_tool(self.kind, input)?,
+        )
     }
 }
 
@@ -490,8 +335,8 @@ impl FeatureModule for MergeRequestFeature {
     }
 }
 
-const MERGE_REQUEST_COLLECTION_INTERFACE: &str = "yoi.merge-request/collection/v1";
-const MERGE_REQUEST_ITEM_INTERFACE: &str = "yoi.merge-request/item/v1";
+const MERGE_REQUEST_COLLECTION_INTERFACE: &str = "yoi.merge-request/collection/v2";
+const MERGE_REQUEST_ITEM_INTERFACE: &str = "yoi.merge-request/item/v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeMergeRequestSurface {
@@ -501,7 +346,6 @@ enum NativeMergeRequestSurface {
 
 #[derive(Clone, Copy, Debug)]
 struct NativeMergeRequestOperation {
-    operation: &'static str,
     surface: NativeMergeRequestSurface,
     identity_field: Option<&'static str>,
 }
@@ -509,27 +353,22 @@ struct NativeMergeRequestOperation {
 fn native_merge_request_operation(kind: Kind) -> NativeMergeRequestOperation {
     match kind {
         Kind::Show => NativeMergeRequestOperation {
-            operation: "read",
             surface: NativeMergeRequestSurface::Item,
             identity_field: Some("merge_request_id"),
         },
         Kind::Open => NativeMergeRequestOperation {
-            operation: "open",
             surface: NativeMergeRequestSurface::Collection,
             identity_field: None,
         },
         Kind::Review => NativeMergeRequestOperation {
-            operation: "review",
             surface: NativeMergeRequestSurface::Item,
             identity_field: None,
         },
         Kind::Readiness => NativeMergeRequestOperation {
-            operation: "check_readiness",
             surface: NativeMergeRequestSurface::Item,
             identity_field: Some("merge_request_id"),
         },
         Kind::Complete => NativeMergeRequestOperation {
-            operation: "complete",
             surface: NativeMergeRequestSurface::Item,
             identity_field: Some("merge_request_id"),
         },
@@ -539,11 +378,10 @@ fn native_merge_request_operation(kind: Kind) -> NativeMergeRequestOperation {
 #[derive(Clone)]
 struct NativeMergeRequestTool {
     name: String,
-    schema: Value,
-    tool: Arc<dyn Tool>,
+    contract: native::Contract,
+    roots: native::ReferenceRoots,
     kind: Kind,
     projection: NativeMergeRequestOperation,
-    description: String,
     client: Arc<dyn WorkspaceClient>,
 }
 
@@ -555,20 +393,12 @@ fn native_merge_request_tools(
         .into_iter()
         .filter(|kind| kind.enabled(config))
         .map(|kind| {
-            let (meta, tool) = definition(client.clone(), kind)();
-            jsonschema::validator_for(&meta.input_schema).map_err(|error| {
-                WipMountError::InvalidProjection {
-                    route: "/merge-requests".into(),
-                    message: format!("Merge Request tool schema cannot be retained: {error}"),
-                }
-            })?;
             Ok(NativeMergeRequestTool {
-                name: meta.name,
-                schema: meta.input_schema,
-                tool,
+                name: kind.name().into(),
+                contract: native::contract(kind),
+                roots: native::ReferenceRoots::default(),
                 kind,
                 projection: native_merge_request_operation(kind),
-                description: meta.description,
                 client: client.clone(),
             })
         })
@@ -593,7 +423,11 @@ pub fn mount_workspace_http_merge_request_wip(
     namespace_route: &WipNamespaceRoute,
 ) -> Result<(), WipMountError> {
     let collection_route = namespace_route.root().to_string();
-    let tools = native_merge_request_tools(client, config)?;
+    let roots = native::reference_roots(registry);
+    let mut tools = native_merge_request_tools(client, config)?;
+    for tool in &mut tools {
+        tool.roots = roots.clone();
+    }
     let claimed_tools = tools
         .iter()
         .map(|tool| tool.name.as_str())
@@ -613,14 +447,14 @@ pub fn mount_workspace_http_merge_request_wip(
     let collection_descriptor = merge_request_descriptor(
         &collection_tools,
         "Open Merge Requests through existing scoped authority",
-        "Only collection-scoped Merge Request Feature operations enabled for this Worker are published. Opening retains repository and selector inputs; Ticket completion is a separate Ticket operation.",
+        "Open links a Ticket Entry to a repository {key, source, target}. Collection and route-bound item objects separate creation from subject operations. Inspect v2 contracts; v1 flattened inputs are not accepted. Ticket conclusion is independent.",
     )?;
     registry.mount(WipProjection {
         route: collection_route.clone(),
         capability: "merge-request:collection".into(),
         kind: WipProjectionKind::Native,
         object: Object {
-            name: "merge-requests".into(),
+            name: collection_route.trim_start_matches('/').into(),
             description: Some(
                 "Authoritative Merge Request collection through scoped Backend authority".into(),
             ),
@@ -647,7 +481,7 @@ pub fn mount_workspace_http_merge_request_wip(
     let item_descriptor = merge_request_descriptor(
         &item_tools,
         "Inspect and operate on the Merge Request bound to this object route",
-        "The subject Merge Request identity comes exclusively from the target route. Repository selectors, exact review capability/candidate, approval, target refs, strategy, and resolution remain ordinary Backend-validated preconditions.",
+        "The subject Merge Request identity comes exclusively from the target route. Read uses an optional page record. Review requires the exact injected capability; complete groups approval and target observations in integration. Backend validates business preconditions. No operation retries unknown outcomes.",
     )?;
     registry.mount_dynamic(WipDynamicMount {
         collection_route: collection_route.clone(),
@@ -671,7 +505,7 @@ fn merge_request_operation_map(
 ) -> HashMap<String, NativeMergeRequestTool> {
     tools
         .into_iter()
-        .map(|tool| (tool.projection.operation.to_string(), tool))
+        .map(|tool| (tool.contract.name.to_string(), tool))
         .collect()
 }
 
@@ -694,9 +528,8 @@ impl WipOperationHandler for MergeRequestCollectionWipHandler {
             .tools
             .get(operation)
             .ok_or_else(merge_request_operation_not_found)?;
-        let input = native_merge_request_input(arguments, None, tool.projection.identity_field)?;
         let output =
-            execute_native_merge_request_tool(tool, &self.permissions, input, None, context)
+            execute_native_merge_request_tool(tool, &self.permissions, arguments, None, context)
                 .await?;
         let mut response = merge_request_tool_output_json(output)?;
         match tool.kind {
@@ -784,15 +617,10 @@ impl WipOperationHandler for MergeRequestItemWipHandler {
             .tools
             .get(operation)
             .ok_or_else(merge_request_operation_not_found)?;
-        let input = native_merge_request_input(
-            arguments,
-            Some(&self.merge_request_id),
-            tool.projection.identity_field,
-        )?;
         let output = execute_native_merge_request_tool(
             tool,
             &self.permissions,
-            input,
+            arguments,
             Some(&self.merge_request_id),
             context,
         )
@@ -818,9 +646,9 @@ impl WipOperationHandler for MergeRequestItemWipHandler {
 async fn execute_native_merge_request_tool(
     tool: &NativeMergeRequestTool,
     permissions: &Option<ToolPermissionConfig>,
-    input: Value,
+    arguments: &BTreeMap<String, WipValue>,
     bound_merge_request: Option<&str>,
-    context: WipCallContext,
+    _context: WipCallContext,
 ) -> Result<ToolOutput, WipOperationError> {
     if tool.kind == Kind::Review {
         let reviewer = tool.client.reviewer_context().ok_or_else(|| {
@@ -836,52 +664,30 @@ async fn execute_native_merge_request_tool(
             ));
         }
     }
-    let validator = jsonschema::validator_for(&tool.schema).map_err(|error| {
-        merge_request_protocol_failure(
-            ProtocolErrorCode::Internal,
-            format!("stored Merge Request tool schema is invalid: {error}"),
-        )
-    })?;
-    if let Err(error) = validator.validate(&input) {
-        return Err(merge_request_protocol_failure(
-            ProtocolErrorCode::InvalidArguments,
-            format!("Merge Request operation input violates its typed Tool schema: {error}"),
-        ));
-    }
+    let input = native_merge_request_input(tool, arguments, bound_merge_request)?;
+    // Legacy Tool permission patterns remain an additional fail-closed ceiling, evaluated on
+    // normalized domain fields. Backend authorization is always performed by command::execute.
     authorize_native_merge_request(permissions, &tool.name, &input)?;
-    let input = serde_json::to_string(&input).map_err(|error| {
-        merge_request_protocol_failure(ProtocolErrorCode::InvalidArguments, error.to_string())
-    })?;
-    tool.tool
-        .execute(&input, context.execution)
-        .await
+    let command = native::command(tool.kind, input)?;
+    command::execute(tool.client.clone(), command)
         .map_err(|error| map_merge_request_tool_error(error, tool.kind.mutating()))
 }
 
 fn native_merge_request_input(
+    tool: &NativeMergeRequestTool,
     arguments: &BTreeMap<String, WipValue>,
     bound_merge_request: Option<&str>,
-    identity_field: Option<&str>,
 ) -> Result<Value, WipOperationError> {
-    if bound_merge_request.is_some() && arguments.contains_key("merge_request_id") {
-        return Err(merge_request_protocol_failure(
-            ProtocolErrorCode::InvalidArguments,
-            "the subject Merge Request is bound exclusively by the object route",
-        ));
+    let mut input = native::convert(&tool.contract, arguments, &tool.roots)?;
+    if let (Some(merge_request_id), Some(field)) =
+        (bound_merge_request, tool.projection.identity_field)
+    {
+        input
+            .as_object_mut()
+            .expect("native contract produces a record")
+            .insert(field.into(), Value::String(merge_request_id.into()));
     }
-    let mut input = serde_json::Map::new();
-    for (name, value) in arguments {
-        input.insert(
-            name.clone(),
-            wip_to_json(value).map_err(|message| {
-                merge_request_protocol_failure(ProtocolErrorCode::InvalidArguments, message)
-            })?,
-        );
-    }
-    if let (Some(merge_request_id), Some(field)) = (bound_merge_request, identity_field) {
-        input.insert(field.into(), Value::String(merge_request_id.into()));
-    }
-    Ok(Value::Object(input))
+    Ok(input)
 }
 
 fn authorize_native_merge_request(
@@ -1063,77 +869,7 @@ fn merge_request_descriptor(
 fn merge_request_operation_declaration(
     tool: &NativeMergeRequestTool,
 ) -> Result<OperationDeclaration, WipMountError> {
-    let properties = tool
-        .schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .ok_or_else(|| WipMountError::InvalidProjection {
-            route: "/merge-requests".into(),
-            message: format!(
-                "Merge Request tool `{}` schema has no properties",
-                tool.name
-            ),
-        })?;
-    let required = tool
-        .schema
-        .get("required")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect::<BTreeSet<_>>();
-    let parameters = properties
-        .iter()
-        .filter(|(name, _)| tool.projection.identity_field != Some(name.as_str()))
-        .map(|(name, schema)| ParameterDeclaration {
-            name: name.clone(),
-            required: required.contains(name.as_str()),
-            documentation: schema
-                .get("description")
-                .and_then(Value::as_str)
-                .map(|summary| Documentation {
-                    summary: summary.into(),
-                    details: None,
-                }),
-            r#type: merge_request_schema_type_expr(schema),
-        })
-        .collect();
-    Ok(OperationDeclaration {
-        name: tool.projection.operation.into(),
-        documentation: Some(Documentation {
-            summary: tool.description.clone(),
-            details: Some(format!(
-                "Delegates to the existing `{}` Merge Request operation and retains its exact JSON Schema and Backend authority checks.",
-                tool.name
-            )),
-        }),
-        parameters,
-        returns: ReturnDeclaration {
-            documentation: Some(Documentation {
-                summary: "Authoritative bounded Merge Request operation result".into(),
-                details: None,
-            }),
-            r#type: TypeExpr::Json,
-        },
-    })
-}
-
-fn merge_request_schema_type_expr(schema: &Value) -> TypeExpr {
-    match schema.get("type").and_then(Value::as_str) {
-        Some("string") => TypeExpr::String,
-        Some("boolean") => TypeExpr::Boolean,
-        Some("integer") => TypeExpr::Integer,
-        Some("number") => TypeExpr::Number,
-        Some("array") => TypeExpr::List {
-            items: Box::new(
-                schema
-                    .get("items")
-                    .map(merge_request_schema_type_expr)
-                    .unwrap_or(TypeExpr::Json),
-            ),
-        },
-        _ => TypeExpr::Json,
-    }
+    Ok(native::declaration(&tool.contract))
 }
 
 fn merge_request_protocol_failure(
@@ -1182,15 +918,16 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex};
 
     #[derive(Debug)]
-    struct RecordingWorkspaceClient {
-        auth_denied: std::sync::atomic::AtomicBool,
-        authorizations: Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
+    pub(super) struct RecordingWorkspaceClient {
+        pub(super) auth_denied: std::sync::atomic::AtomicBool,
+        pub(super) authorizations:
+            Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
         responses: Mutex<VecDeque<WorkspaceResponse>>,
-        requests: Mutex<Vec<WorkspaceRequest>>,
+        pub(super) requests: Mutex<Vec<WorkspaceRequest>>,
     }
 
     impl RecordingWorkspaceClient {
-        fn new(responses: Vec<WorkspaceResponse>) -> Self {
+        pub(super) fn new(responses: Vec<WorkspaceResponse>) -> Self {
             Self {
                 auth_denied: std::sync::atomic::AtomicBool::new(false),
                 authorizations: Mutex::new(Vec::new()),
@@ -1241,7 +978,7 @@ mod tests {
         }
     }
 
-    fn response(body: serde_json::Value) -> WorkspaceResponse {
+    pub(super) fn response(body: serde_json::Value) -> WorkspaceResponse {
         WorkspaceResponse {
             status: 200,
             body: body.to_string(),
@@ -1437,7 +1174,7 @@ mod tests {
             native_merge_request_tools(client.clone(), config)
                 .unwrap()
                 .into_iter()
-                .map(|tool| (tool.projection.surface, tool.projection.operation))
+                .map(|tool| (tool.projection.surface, tool.contract.name))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -1458,7 +1195,7 @@ mod tests {
             operations(orchestrator),
             [
                 (NativeMergeRequestSurface::Item, "read"),
-                (NativeMergeRequestSurface::Item, "check_readiness"),
+                (NativeMergeRequestSurface::Item, "readiness"),
                 (NativeMergeRequestSurface::Item, "complete"),
             ]
         );
@@ -1485,14 +1222,7 @@ mod tests {
             .iter()
             .find(|operation| operation.name == "complete")
             .unwrap();
-        for required in [
-            "operation_id",
-            "approval_event_id",
-            "target_ref_before",
-            "target_ref_after",
-            "strategy",
-            "resolution",
-        ] {
+        for required in ["operation_id", "integration"] {
             assert!(
                 complete
                     .parameters
@@ -1541,44 +1271,36 @@ mod tests {
 
     #[test]
     fn native_input_preserves_null_omission_permissions_and_route_identity() {
-        let arguments = BTreeMap::from([
-            ("body".into(), WipValue::String("approved".into())),
-            ("findings".into(), json_to_wip(&json!([])).unwrap()),
-            ("optional".into(), WipValue::Unit),
-        ]);
-        let input = native_merge_request_input(&arguments, Some("MR-1"), Some("merge_request_id"))
-            .unwrap_or_else(|_| panic!("route-bound input should project"));
-        assert_eq!(
-            input,
-            json!({
-                "merge_request_id": "MR-1",
-                "body": "approved",
-                "findings": [],
-                "optional": null
-            })
-        );
-        let omitted = native_merge_request_input(
-            &BTreeMap::from([("body".into(), WipValue::String("approved".into()))]),
-            Some("MR-1"),
-            Some("merge_request_id"),
+        let tool = native_merge_request_tools(
+            Arc::new(TestWorkspaceHttpClient::new("workspace", "http://unused")),
+            MergeRequestFeatureConfig {
+                show: true,
+                ..Default::default()
+            },
         )
-        .unwrap_or_else(|_| panic!("omitted optional input should project"));
-        assert_eq!(
-            omitted,
-            json!({"merge_request_id": "MR-1", "body": "approved"})
-        );
+        .unwrap()
+        .remove(0);
+        let arguments = BTreeMap::from([(
+            "page".into(),
+            json_to_wip(&json!({"after": {"$case": "null"}})).unwrap(),
+        )]);
+        let input = native_merge_request_input(&tool, &arguments, Some("MR-1"))
+            .unwrap_or_else(|_| panic!("valid native input"));
+        assert_eq!(input, json!({"merge_request_id": "MR-1", "after": null}));
+        let omitted = native_merge_request_input(&tool, &BTreeMap::new(), Some("MR-1"))
+            .unwrap_or_else(|_| panic!("valid native input"));
+        assert_eq!(omitted, json!({"merge_request_id": "MR-1"}));
         assert!(matches!(
             native_merge_request_input(
+                &tool,
                 &BTreeMap::from([("merge_request_id".into(), WipValue::String("MR-2".into()))]),
-                Some("MR-1"),
-                Some("merge_request_id")
+                Some("MR-1")
             ),
             Err(WipOperationError::Protocol(ProtocolError {
                 code: ProtocolErrorCode::InvalidArguments,
                 ..
             }))
         ));
-
         let permissions = Some(ToolPermissionConfig {
             default_action: ToolPermissionAction::Allow,
             rules: vec![manifest::ToolPermissionRule {
@@ -1630,11 +1352,15 @@ mod tests {
         assert!(!serialized.contains("secret-capability"));
         assert!(!serialized.contains("capability_token"));
 
-        let input = json!({"decision": "approve", "body": "", "findings": []});
+        let WipValue::Record(input) =
+            json_to_wip(&json!({"decision": "approve", "body": "", "findings": []})).unwrap()
+        else {
+            unreachable!()
+        };
         let rejected = execute_native_merge_request_tool(
             &tool,
             &None,
-            input.clone(),
+            &input,
             Some("MR-2"),
             WipCallContext {
                 execution: ToolExecutionContext::direct(),
@@ -1654,7 +1380,7 @@ mod tests {
         execute_native_merge_request_tool(
             &tool,
             &None,
-            input,
+            &input,
             Some("MR-1"),
             WipCallContext {
                 execution: ToolExecutionContext::direct(),
@@ -1936,7 +1662,7 @@ mod tests {
         let result = execute_native_merge_request_tool(
             &native,
             &None,
-            json!({"merge_request_id":"MR-1"}),
+            &BTreeMap::new(),
             Some("MR-1"),
             WipCallContext {
                 execution: ToolExecutionContext::direct(),

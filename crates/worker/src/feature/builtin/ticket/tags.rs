@@ -142,131 +142,199 @@ pub(super) fn validate_ids(name: &str, ids: &[String]) -> Result<(), ToolError> 
     Ok(())
 }
 
-fn parse<T: serde::de::DeserializeOwned>(input: &str) -> Result<T, ToolError> {
-    serde_json::from_str(input).map_err(|error| ToolError::InvalidArgument(error.to_string()))
-}
-
 #[derive(Clone)]
 struct TagTool {
     client: Arc<dyn WorkspaceClient>,
     kind: TagToolKind,
 }
 
+// Internal command DTOs belong to the shared execution boundary, not a native schema.
+enum Command {
+    List(ListInput),
+    Create(CreateInput),
+    Rename(RenameInput),
+    Delete(DeleteInput),
+    Set(SetInput),
+}
+
+impl Command {
+    fn kind(&self) -> TagToolKind {
+        match self {
+            Self::List(..) => TagToolKind::List,
+            Self::Create(..) => TagToolKind::Create,
+            Self::Rename(..) => TagToolKind::Rename,
+            Self::Delete(..) => TagToolKind::Delete,
+            Self::Set(..) => TagToolKind::Set,
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for TagTool {
-    async fn execute(&self, input: &str, _: ToolExecutionContext) -> Result<ToolOutput, ToolError> {
-        self.client
-            .workspace_id()
-            .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| {
-                ToolError::InvalidArgument(
-                    "Classification tools require Backend Workspace identity; no local fallback"
-                        .into(),
-                )
-            })?;
-        let backend = WorkspaceHttpTicketBackend::new(self.client.clone());
-        let content = match self.kind {
-            TagToolKind::List => {
-                let input: ListInput = parse(input)?;
-                if input.limit.is_some_and(|limit| limit > 200) {
-                    return Err(ToolError::InvalidArgument(
-                        "limit must be at most 200".into(),
-                    ));
-                }
-                if let Some(after) = &input.after {
-                    required("after", after)?;
-                }
-                let limit = input.limit.unwrap_or(200);
-                let mut tags = backend
-                    .list_workspace_tags(ticket::TagListRequest {
-                        after: input.after,
-                        limit: Some(limit),
-                    })
-                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-                tags.truncate(limit);
-                json!(tags)
-            }
-            TagToolKind::Set => {
-                let input: SetInput = parse(input)?;
-                required("ticket", &input.ticket)?;
-                required("operation_key", &input.operation_key)?;
-                validate_ids("expected_tag_ids", &input.expected_tag_ids)?;
-                validate_ids("tag_ids", &input.tag_ids)?;
-                let tags = backend
-                    .set_ticket_tags(
-                        TicketIdOrSlug::from(input.ticket.as_str()),
-                        ticket::TicketTagSetRequest {
-                            expected_tag_ids: input.expected_tag_ids,
-                            tag_ids: input.tag_ids,
-                            operation_key: input.operation_key,
-                        },
-                    )
-                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-                if tags.len() > 100 {
-                    return Err(ToolError::ExecutionFailed(
-                        "Backend returned more than 100 Ticket tags".into(),
-                    ));
-                }
-                json!(tags)
-            }
-            kind => {
-                let request = match kind {
-                    TagToolKind::Create => {
-                        let input: CreateInput = parse(input)?;
-                        validate_name(&input.name)?;
-                        ticket::WorkspaceTagMutation {
-                            operation_key: input.operation_key,
-                            action: ticket::WorkspaceTagAction::Create { name: input.name },
-                        }
-                    }
-                    TagToolKind::Rename => {
-                        let input: RenameInput = parse(input)?;
-                        required("tag_id", &input.tag_id)?;
-                        required(
-                            "expected_last_operation_key",
-                            &input.expected_last_operation_key,
-                        )?;
-                        validate_name(&input.name)?;
-                        ticket::WorkspaceTagMutation {
-                            operation_key: input.operation_key,
-                            action: ticket::WorkspaceTagAction::Rename {
-                                tag_id: input.tag_id,
-                                expected_last_operation_key: input.expected_last_operation_key,
-                                name: input.name,
-                            },
-                        }
-                    }
-                    TagToolKind::Delete => {
-                        let input: DeleteInput = parse(input)?;
-                        required("tag_id", &input.tag_id)?;
-                        required(
-                            "expected_last_operation_key",
-                            &input.expected_last_operation_key,
-                        )?;
-                        ticket::WorkspaceTagMutation {
-                            operation_key: input.operation_key,
-                            action: ticket::WorkspaceTagAction::Delete {
-                                tag_id: input.tag_id,
-                                expected_last_operation_key: input.expected_last_operation_key,
-                            },
-                        }
-                    }
-                    _ => unreachable!(),
-                };
-                required("operation_key", &request.operation_key)?;
-                json!(
-                    backend
-                        .mutate_workspace_tag(request)
-                        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?
-                )
-            }
+    async fn execute(
+        &self,
+        input: &str,
+        ctx: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let command = match self.kind {
+            TagToolKind::List => Command::List(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
+            TagToolKind::Create => Command::Create(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
+            TagToolKind::Rename => Command::Rename(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
+            TagToolKind::Delete => Command::Delete(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
+            TagToolKind::Set => Command::Set(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
         };
-        Ok(ToolOutput {
-            summary: self.kind.name().into(),
-            content: Some(content.to_string()),
-            attachments: Vec::new(),
-        })
+        execute_domain(self.client.clone(), command, ctx).await
     }
+}
+
+/// Convert an adapter-owned internal command; never invokes Tool execution or its schema.
+pub(super) async fn execute_native(
+    client: Arc<dyn WorkspaceClient>,
+    tool_name: &str,
+    command: Value,
+    ctx: ToolExecutionContext,
+) -> Option<Result<ToolOutput, ToolError>> {
+    let parse = |error: serde_json::Error| ToolError::InvalidArgument(error.to_string());
+    let command = match tool_name {
+        "WorkspaceTagList" => serde_json::from_value(command).map(Command::List),
+        "WorkspaceTagCreate" => serde_json::from_value(command).map(Command::Create),
+        "WorkspaceTagRename" => serde_json::from_value(command).map(Command::Rename),
+        "WorkspaceTagDelete" => serde_json::from_value(command).map(Command::Delete),
+        "TicketTagsSet" => serde_json::from_value(command).map(Command::Set),
+        _ => return None,
+    };
+    Some(match command {
+        Ok(command) => execute_domain(client, command, ctx).await,
+        Err(error) => Err(parse(error)),
+    })
+}
+
+async fn execute_domain(
+    client: Arc<dyn WorkspaceClient>,
+    command: Command,
+    _ctx: ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let kind = command.kind();
+    client
+        .workspace_id()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            ToolError::InvalidArgument(
+                "Classification tools require Backend Workspace identity; no local fallback".into(),
+            )
+        })?;
+    let backend = WorkspaceHttpTicketBackend::new(client.clone());
+    let content = match command {
+        Command::List(input) => {
+            if input.limit.is_some_and(|limit| limit > 200) {
+                return Err(ToolError::InvalidArgument(
+                    "limit must be at most 200".into(),
+                ));
+            }
+            if let Some(after) = &input.after {
+                required("after", after)?;
+            }
+            let limit = input.limit.unwrap_or(200);
+            let mut tags = backend
+                .list_workspace_tags(ticket::TagListRequest {
+                    after: input.after,
+                    limit: Some(limit),
+                })
+                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            tags.truncate(limit);
+            json!(tags)
+        }
+        Command::Set(input) => {
+            required("ticket", &input.ticket)?;
+            required("operation_key", &input.operation_key)?;
+            validate_ids("expected_tag_ids", &input.expected_tag_ids)?;
+            validate_ids("tag_ids", &input.tag_ids)?;
+            let tags = backend
+                .set_ticket_tags(
+                    TicketIdOrSlug::from(input.ticket.as_str()),
+                    ticket::TicketTagSetRequest {
+                        expected_tag_ids: input.expected_tag_ids,
+                        tag_ids: input.tag_ids,
+                        operation_key: input.operation_key,
+                    },
+                )
+                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            if tags.len() > 100 {
+                return Err(ToolError::ExecutionFailed(
+                    "Backend returned more than 100 Ticket tags".into(),
+                ));
+            }
+            json!(tags)
+        }
+        mutation @ (Command::Create(_) | Command::Rename(_) | Command::Delete(_)) => {
+            let request = match mutation {
+                Command::Create(input) => {
+                    validate_name(&input.name)?;
+                    ticket::WorkspaceTagMutation {
+                        operation_key: input.operation_key,
+                        action: ticket::WorkspaceTagAction::Create { name: input.name },
+                    }
+                }
+                Command::Rename(input) => {
+                    required("tag_id", &input.tag_id)?;
+                    required(
+                        "expected_last_operation_key",
+                        &input.expected_last_operation_key,
+                    )?;
+                    validate_name(&input.name)?;
+                    ticket::WorkspaceTagMutation {
+                        operation_key: input.operation_key,
+                        action: ticket::WorkspaceTagAction::Rename {
+                            tag_id: input.tag_id,
+                            expected_last_operation_key: input.expected_last_operation_key,
+                            name: input.name,
+                        },
+                    }
+                }
+                Command::Delete(input) => {
+                    required("tag_id", &input.tag_id)?;
+                    required(
+                        "expected_last_operation_key",
+                        &input.expected_last_operation_key,
+                    )?;
+                    ticket::WorkspaceTagMutation {
+                        operation_key: input.operation_key,
+                        action: ticket::WorkspaceTagAction::Delete {
+                            tag_id: input.tag_id,
+                            expected_last_operation_key: input.expected_last_operation_key,
+                        },
+                    }
+                }
+                _ => unreachable!(),
+            };
+            required("operation_key", &request.operation_key)?;
+            json!(
+                backend
+                    .mutate_workspace_tag(request)
+                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?
+            )
+        }
+    };
+    Ok(ToolOutput {
+        summary: kind.name().into(),
+        content: Some(content.to_string()),
+        attachments: Vec::new(),
+    })
 }
 
 pub(super) fn definition(client: Arc<dyn WorkspaceClient>, kind: TagToolKind) -> ToolDefinition {
@@ -281,4 +349,147 @@ pub(super) fn definition(client: Arc<dyn WorkspaceClient>, kind: TagToolKind) ->
             }) as Arc<dyn Tool>,
         )
     })
+}
+
+#[cfg(test)]
+mod native_command_tests {
+    use super::*;
+    use assignment_tracking::authorization_tests::{AuthorizedClient, ticket};
+    use server_api::authorization::PermissionResource;
+
+    #[tokio::test]
+    async fn internal_tag_commands_preserve_resource_authorization_cas_and_replay_requests() {
+        let tag = json!({"workspace_id":"workspace", "id":"tag-1", "name":"Name", "last_operation_key":"observed", "deleted":false});
+        for (kind, operation, input, response, resource) in [
+            (
+                TagToolKind::List,
+                "ticket.tag.list",
+                json!({"limit":2,"after":"tag/0?"}),
+                json!([tag.clone()]),
+                PermissionResource::Workspace {
+                    workspace_id: "workspace".into(),
+                },
+            ),
+            (
+                TagToolKind::Create,
+                "ticket.tag.create",
+                json!({"name":"Name","operation_key":"stable"}),
+                tag.clone(),
+                PermissionResource::Workspace {
+                    workspace_id: "workspace".into(),
+                },
+            ),
+            (
+                TagToolKind::Rename,
+                "ticket.tag.rename",
+                json!({"tag_id":"tag-1","name":"Name","expected_last_operation_key":"observed","operation_key":"stable"}),
+                tag.clone(),
+                PermissionResource::Workspace {
+                    workspace_id: "workspace".into(),
+                },
+            ),
+            (
+                TagToolKind::Delete,
+                "ticket.tag.delete",
+                json!({"tag_id":"tag-1","expected_last_operation_key":"observed","operation_key":"stable"}),
+                tag.clone(),
+                PermissionResource::Workspace {
+                    workspace_id: "workspace".into(),
+                },
+            ),
+            (
+                TagToolKind::Set,
+                "ticket.tags.set",
+                json!({"ticket":"T-A","expected_tag_ids":["tag-0"],"tag_ids":["tag-1"],"operation_key":"stable"}),
+                json!([tag]),
+                ticket("T-A"),
+            ),
+        ] {
+            let client = AuthorizedClient::new(response);
+            assert!(
+                execute_native(
+                    client.clone(),
+                    kind.name(),
+                    input.clone(),
+                    ToolExecutionContext::direct()
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            assert!(client.requests.lock().unwrap().is_empty());
+            client.grant(operation, resource);
+            let (_, tool) = definition(client.clone(), kind)();
+            let ordinary = tool
+                .execute(&input.to_string(), ToolExecutionContext::direct())
+                .await
+                .unwrap();
+            let native = execute_native(
+                client.clone(),
+                kind.name(),
+                input.clone(),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(native.content, ordinary.content);
+            {
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests[0], requests[1]);
+            }
+            client.grants.lock().unwrap().clear();
+            assert!(
+                execute_native(
+                    client.clone(),
+                    kind.name(),
+                    input,
+                    ToolExecutionContext::direct()
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            assert_eq!(client.requests.lock().unwrap().len(), 2);
+            assert!(
+                execute_native(
+                    client,
+                    "Unknown",
+                    Value::Null,
+                    ToolExecutionContext::direct()
+                )
+                .await
+                .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_tag_commands_apply_business_validation_before_dispatch() {
+        let client = AuthorizedClient::new(json!({}));
+        for (name, input) in [
+            (
+                "WorkspaceTagCreate",
+                json!({"name":" ","operation_key":"stable"}),
+            ),
+            ("WorkspaceTagList", json!({"limit":201})),
+            (
+                "TicketTagsSet",
+                json!({"ticket":"T-A","expected_tag_ids":[],"tag_ids":["duplicate","duplicate"],"operation_key":"stable"}),
+            ),
+            (
+                "WorkspaceTagRename",
+                json!({"tag_id":"tag-1","name":"Name","operation_key":"stable"}),
+            ),
+        ] {
+            assert!(matches!(
+                execute_native(client.clone(), name, input, ToolExecutionContext::direct())
+                    .await
+                    .unwrap(),
+                Err(ToolError::InvalidArgument(_))
+            ));
+        }
+        assert!(client.requests.lock().unwrap().is_empty());
+        assert!(client.authorizations.lock().unwrap().is_empty());
+    }
 }

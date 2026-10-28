@@ -1,4 +1,4 @@
-use super::tests::cases;
+use super::tests::{cases, native_args};
 use super::*;
 use assignment_tracking::authorization_tests::{AuthorizedClient, ticket};
 
@@ -53,15 +53,12 @@ async fn public_operations_require_exact_ticket_grants_on_tool_and_wip() {
             ),
             permissions: None,
             ticket_reference: "T-743".into(),
+            collection_route: "/tickets".into(),
+            merge_request_route: "/merge-requests".into(),
+            objective_route: "/objectives".into(),
             observations: Arc::new(Mutex::new(TicketObservationState::default())),
         };
-        let args = input
-            .as_object()
-            .unwrap()
-            .iter()
-            .filter(|(key, _)| key.as_str() != "ticket")
-            .map(|(key, value)| (key.clone(), json_to_wip(value).unwrap()))
-            .collect();
+        let args = native_args(kind, &input);
         let projection = native_ticket_operation(kind.name()).unwrap();
         handler
             .call(

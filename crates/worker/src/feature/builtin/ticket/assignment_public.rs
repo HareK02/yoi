@@ -197,6 +197,31 @@ struct PublicAssignmentTool {
     client: Arc<dyn WorkspaceClient>,
     kind: PublicAssignmentKind,
 }
+// Internal command DTOs belong to the shared execution boundary, not a native schema.
+enum Command {
+    Assign(AssignInput),
+    Clear(ClearInput),
+    Assignments(AssignmentsInput),
+    Diagnostics(DiagnosticsInput),
+    Answer(AnswerInput),
+    ImplementationResult(ImplementationResultInput),
+    ImplementationResultQuery(ImplementationResultQuery),
+}
+
+impl Command {
+    fn kind(&self) -> PublicAssignmentKind {
+        match self {
+            Self::Assign(..) => PublicAssignmentKind::Assign,
+            Self::Clear(..) => PublicAssignmentKind::Clear,
+            Self::Assignments(..) => PublicAssignmentKind::Assignments,
+            Self::Diagnostics(..) => PublicAssignmentKind::Diagnostics,
+            Self::Answer(..) => PublicAssignmentKind::Answer,
+            Self::ImplementationResult(..) => PublicAssignmentKind::ImplementationResult,
+            Self::ImplementationResultQuery(..) => PublicAssignmentKind::ImplementationResultQuery,
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for PublicAssignmentTool {
     async fn execute(
@@ -204,253 +229,302 @@ impl Tool for PublicAssignmentTool {
         input: &str,
         ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        self.client
-            .workspace_id()
-            .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| {
-                ToolError::InvalidArgument(
-                    "Assignment tools require Backend Workspace identity; no local fallback".into(),
-                )
-            })?;
-        let parse = |error: serde_json::Error| ToolError::InvalidArgument(error.to_string());
-        let operation = match self.kind {
-            PublicAssignmentKind::Assign => {
-                let input: AssignInput = serde_json::from_str(input).map_err(parse)?;
-                identity("ticket", &input.ticket)?;
-                identity("operation_id", &input.operation_id)?;
-                optional_identity("expected_assignment_id", &input.expected_assignment_id)?;
-                match &input.principal {
-                    server_api::TicketAssignmentPrincipal::User { account_id } => {
-                        identity("account_id", account_id)?
-                    }
-                    server_api::TicketAssignmentPrincipal::Worker {
-                        runtime_id,
-                        worker_id,
-                    } => {
-                        identity("runtime_id", runtime_id)?;
-                        identity("worker_id", worker_id)?;
-                    }
-                    server_api::TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
-                        identity("agent_key", agent_key)?
-                    }
-                }
-                WorkspaceServerOperation::TicketAssignmentSet {
-                    ticket_id: input.ticket,
-                    role: server_api::TicketAssignmentRole::Orchestrator,
-                    request: server_api::SetTicketRoleAssignmentRequest {
-                        orchestrator_assignment_id: None,
-                        operation_id: input.operation_id,
-                        principal: input.principal,
-                        expected_assignment_id: input.expected_assignment_id,
-                        workdir_bindings: vec![],
-                    },
-                }
-            }
-            PublicAssignmentKind::Clear => {
-                let input: ClearInput = serde_json::from_str(input).map_err(parse)?;
-                identity("ticket", &input.ticket)?;
-                identity("assignment_id", &input.assignment_id)?;
-                identity("operation_id", &input.operation_id)?;
-                WorkspaceServerOperation::TicketAssignmentClear {
-                    ticket_id: input.ticket,
-                    role: server_api::TicketAssignmentRole::Orchestrator,
-                    query: server_api::ClearTicketRoleAssignmentQuery {
-                        operation_id: Some(input.operation_id),
-                        assignment_id: Some(input.assignment_id),
-                    },
-                }
-            }
-            PublicAssignmentKind::Assignments => {
-                let mut input: AssignmentsInput = serde_json::from_str(input).map_err(parse)?;
-                identity("ticket", &input.ticket)?;
-                optional_identity("after_assignment_id", &input.query.after_assignment_id)?;
-                input.query.limit = Some(page(input.query.limit)?);
-                WorkspaceServerOperation::TicketAssignmentsPage {
-                    ticket_id: input.ticket,
-                    query: input.query,
-                }
-            }
-            PublicAssignmentKind::Diagnostics => {
-                let mut input: DiagnosticsInput = serde_json::from_str(input).map_err(parse)?;
-                identity("ticket", &input.ticket)?;
-                identity("assignment_id", &input.query.assignment_id)?;
-                optional_identity("after_input_event_id", &input.query.after_input_event_id)?;
-                optional_identity(
-                    "after_start_operation_id",
-                    &input.query.after_start_operation_id,
-                )?;
-                input.query.limit = Some(page(input.query.limit)?);
-                WorkspaceServerOperation::TicketAssignmentDiagnostics {
-                    ticket_id: input.ticket,
-                    query: input.query,
-                }
-            }
-            PublicAssignmentKind::ImplementationResult => {
-                let input: ImplementationResultInput =
-                    serde_json::from_str(input).map_err(parse)?;
-                identity("ticket", &input.ticket)?;
-                // Retry identity belongs to the Host, never model input. Missing trusted
-                // context must fail closed rather than minting a replacement identity.
-                identity("tool call_id", &ctx.call_id)?;
-                let operation_key = format!(
-                    "ticket-implementation-result:{}:{}",
-                    input.ticket, ctx.call_id
-                );
-                identity("operation_key", &operation_key)?;
-                if input.body.trim().is_empty()
-                    || input.body.len() > 16384
-                    || input.body.contains('\0')
-                {
-                    return Err(ToolError::InvalidArgument(
-                        "Result body must be nonblank, NUL-free and at most 16384 bytes".into(),
-                    ));
-                }
-                if let Some(mr) = &input.merge_request {
-                    identity("merge_request_id", &mr.merge_request_id)?;
-                    identity("subject_ref", &mr.subject_ref)?;
-                }
-                WorkspaceServerOperation::TicketImplementationResult {
-                    ticket_id: input.ticket,
-                    request: server_api::TicketImplementationResultRequest {
-                        operation_key,
-                        kind: input.kind,
-                        body: input.body,
-                        merge_request: input.merge_request,
-                    },
-                }
-            }
-            PublicAssignmentKind::ImplementationResultQuery => {
-                let input: ImplementationResultQuery =
-                    serde_json::from_str(input).map_err(parse)?;
-                identity("ticket", &input.ticket)?;
-                identity("result_id", &input.result_id)?;
-                WorkspaceServerOperation::TicketImplementationResultGet {
-                    ticket_id: input.ticket,
-                    result_id: input.result_id,
-                }
-            }
-            PublicAssignmentKind::Answer => {
-                let input: AnswerInput = serde_json::from_str(input).map_err(parse)?;
-                identity("ticket", &input.ticket)?;
-                for (name, value) in [
-                    ("assignment_id", &input.request.0.assignment_id),
-                    (
-                        "expected_last_event_id",
-                        &input.request.0.expected_last_event_id,
-                    ),
-                    ("operation_key", &input.request.0.operation_key),
-                ] {
-                    identity(name, value)?;
-                }
-                let body = &input.request.0.body;
-                if body.trim().is_empty() || body.len() > 16384 || body.contains('\0') {
-                    return Err(ToolError::InvalidArgument(
-                        "Answer body must be nonempty, at most 16384 bytes and without NUL".into(),
-                    ));
-                }
-                WorkspaceServerOperation::TicketAssignmentAnswer {
-                    ticket_id: input.ticket,
-                    request: input.request,
-                }
-            }
-        };
-        let ticket_id = match &operation {
-            WorkspaceServerOperation::TicketAssignmentSet { ticket_id, .. }
-            | WorkspaceServerOperation::TicketAssignmentClear { ticket_id, .. }
-            | WorkspaceServerOperation::TicketAssignmentsPage { ticket_id, .. }
-            | WorkspaceServerOperation::TicketAssignmentDiagnostics { ticket_id, .. }
-            | WorkspaceServerOperation::TicketAssignmentAnswer { ticket_id, .. }
-            | WorkspaceServerOperation::TicketImplementationResult { ticket_id, .. }
-            | WorkspaceServerOperation::TicketImplementationResultGet { ticket_id, .. } => {
-                ticket_id
-            }
-            _ => unreachable!("public assignment operation"),
-        };
-        assignment_tracking::authorize_ticket_target(
-            self.client.as_ref(),
-            match self.kind {
-                PublicAssignmentKind::Assign => "ticket.assignment.assign",
-                PublicAssignmentKind::Clear => "ticket.assignment.clear",
-                PublicAssignmentKind::Assignments => "ticket.assignment.query",
-                PublicAssignmentKind::Diagnostics => "ticket.assignment.diagnostics",
-                PublicAssignmentKind::Answer => "ticket.assignment.answer",
-                PublicAssignmentKind::ImplementationResult => "ticket.implementation_result.write",
-                PublicAssignmentKind::ImplementationResultQuery => {
-                    "ticket.implementation_result.read"
-                }
-            },
-            ticket_id,
-        )?;
-        let response = self
-            .client
-            .execute_server_operation(operation)
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        if !response.is_success() {
-            return Err(ToolError::ExecutionFailed(format!(
-                "Assignment request failed with HTTP status {}: {}",
-                response.status,
-                response.body.chars().take(1024).collect::<String>()
-            )));
-        }
-        if response.body.len() > 1024 * 1024 {
-            return Err(ToolError::ExecutionFailed(
-                "Assignment response exceeds 1 MiB; request a smaller page".into(),
-            ));
-        }
-        // Decode the actual public DTO and serialize only its declared fields; no raw
-        // backend payload/credentials or alternative result authority reaches the model.
-        let decode = |error: serde_json::Error| {
-            ToolError::ExecutionFailed(format!(
-                "Invalid Backend assignment response (outcome unknown after dispatch): {error}"
-            ))
-        };
-        let content = match self.kind {
-            PublicAssignmentKind::Assign | PublicAssignmentKind::Clear => serde_json::to_value(
-                serde_json::from_str::<server_api::TicketRoleAssignmentMutationResponse>(
-                    &response.body,
-                )
-                .map_err(decode)?,
+        let command = match self.kind {
+            PublicAssignmentKind::Assign => Command::Assign(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
             ),
-            PublicAssignmentKind::Assignments => {
-                let result: server_api::TicketAssignmentsPage =
-                    serde_json::from_str(&response.body).map_err(decode)?;
-                if result.0.items.len() > 100 {
-                    return Err(ToolError::ExecutionFailed(
-                        "Assignment page exceeds 100 items".into(),
-                    ));
-                }
-                serde_json::to_value(result)
-            }
-            PublicAssignmentKind::Diagnostics => {
-                let result: server_api::TicketAssignmentDiagnosticsPage =
-                    serde_json::from_str(&response.body).map_err(decode)?;
-                if result.inputs.len() > 100 || result.starts.len() > 100 {
-                    return Err(ToolError::ExecutionFailed(
-                        "Diagnostic page exceeds 100 items".into(),
-                    ));
-                }
-                serde_json::to_value(result)
-            }
-            PublicAssignmentKind::ImplementationResult
-            | PublicAssignmentKind::ImplementationResultQuery => serde_json::to_value(
-                serde_json::from_str::<server_api::TicketImplementationResultReceipt>(
-                    &response.body,
-                )
-                .map_err(decode)?,
+            PublicAssignmentKind::Clear => Command::Clear(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
             ),
-            PublicAssignmentKind::Answer => serde_json::to_value(
-                serde_json::from_str::<server_api::TicketAssignmentAnswerResponse>(&response.body)
-                    .map_err(decode)?,
+            PublicAssignmentKind::Assignments => Command::Assignments(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
             ),
-        }
-        .map_err(|error| ToolError::Internal(error.to_string()))?;
-        Ok(ToolOutput {
-            summary: self.kind.name().into(),
-            content: Some(content.to_string()),
-            attachments: vec![],
-        })
+            PublicAssignmentKind::Diagnostics => Command::Diagnostics(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
+            PublicAssignmentKind::Answer => Command::Answer(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
+            PublicAssignmentKind::ImplementationResult => Command::ImplementationResult(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
+            PublicAssignmentKind::ImplementationResultQuery => Command::ImplementationResultQuery(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
+        };
+        execute_domain(self.client.clone(), command, ctx).await
     }
 }
+
+/// Convert an adapter-owned internal command; never invokes Tool execution or its schema.
+pub(super) async fn execute_native(
+    client: Arc<dyn WorkspaceClient>,
+    tool_name: &str,
+    command: Value,
+    ctx: ToolExecutionContext,
+) -> Option<Result<ToolOutput, ToolError>> {
+    let parse = |error: serde_json::Error| ToolError::InvalidArgument(error.to_string());
+    let command = match tool_name {
+        "TicketOrchestratorAssign" => serde_json::from_value(command).map(Command::Assign),
+        "TicketOrchestratorClear" => serde_json::from_value(command).map(Command::Clear),
+        "TicketAssignmentsQuery" => serde_json::from_value(command).map(Command::Assignments),
+        "TicketAssignmentDiagnostics" => serde_json::from_value(command).map(Command::Diagnostics),
+        "TicketAssignmentAnswer" => serde_json::from_value(command).map(Command::Answer),
+        "TicketImplementationResult" => {
+            serde_json::from_value(command).map(Command::ImplementationResult)
+        }
+        "TicketImplementationResultQuery" => {
+            serde_json::from_value(command).map(Command::ImplementationResultQuery)
+        }
+        _ => return None,
+    };
+    Some(match command {
+        Ok(command) => execute_domain(client, command, ctx).await,
+        Err(error) => Err(parse(error)),
+    })
+}
+
+async fn execute_domain(
+    client: Arc<dyn WorkspaceClient>,
+    command: Command,
+    ctx: ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let kind = command.kind();
+    client
+        .workspace_id()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            ToolError::InvalidArgument(
+                "Assignment tools require Backend Workspace identity; no local fallback".into(),
+            )
+        })?;
+    let operation = match command {
+        Command::Assign(input) => {
+            identity("ticket", &input.ticket)?;
+            identity("operation_id", &input.operation_id)?;
+            optional_identity("expected_assignment_id", &input.expected_assignment_id)?;
+            match &input.principal {
+                server_api::TicketAssignmentPrincipal::User { account_id } => {
+                    identity("account_id", account_id)?
+                }
+                server_api::TicketAssignmentPrincipal::Worker {
+                    runtime_id,
+                    worker_id,
+                } => {
+                    identity("runtime_id", runtime_id)?;
+                    identity("worker_id", worker_id)?;
+                }
+                server_api::TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
+                    identity("agent_key", agent_key)?
+                }
+            }
+            WorkspaceServerOperation::TicketAssignmentSet {
+                ticket_id: input.ticket,
+                role: server_api::TicketAssignmentRole::Orchestrator,
+                request: server_api::SetTicketRoleAssignmentRequest {
+                    orchestrator_assignment_id: None,
+                    operation_id: input.operation_id,
+                    principal: input.principal,
+                    expected_assignment_id: input.expected_assignment_id,
+                    workdir_bindings: vec![],
+                },
+            }
+        }
+        Command::Clear(input) => {
+            identity("ticket", &input.ticket)?;
+            identity("assignment_id", &input.assignment_id)?;
+            identity("operation_id", &input.operation_id)?;
+            WorkspaceServerOperation::TicketAssignmentClear {
+                ticket_id: input.ticket,
+                role: server_api::TicketAssignmentRole::Orchestrator,
+                query: server_api::ClearTicketRoleAssignmentQuery {
+                    operation_id: Some(input.operation_id),
+                    assignment_id: Some(input.assignment_id),
+                },
+            }
+        }
+        Command::Assignments(mut input) => {
+            identity("ticket", &input.ticket)?;
+            optional_identity("after_assignment_id", &input.query.after_assignment_id)?;
+            input.query.limit = Some(page(input.query.limit)?);
+            WorkspaceServerOperation::TicketAssignmentsPage {
+                ticket_id: input.ticket,
+                query: input.query,
+            }
+        }
+        Command::Diagnostics(mut input) => {
+            identity("ticket", &input.ticket)?;
+            identity("assignment_id", &input.query.assignment_id)?;
+            optional_identity("after_input_event_id", &input.query.after_input_event_id)?;
+            optional_identity(
+                "after_start_operation_id",
+                &input.query.after_start_operation_id,
+            )?;
+            input.query.limit = Some(page(input.query.limit)?);
+            WorkspaceServerOperation::TicketAssignmentDiagnostics {
+                ticket_id: input.ticket,
+                query: input.query,
+            }
+        }
+        Command::ImplementationResult(input) => {
+            identity("ticket", &input.ticket)?;
+            // Retry identity belongs to the Host, never model input. Missing trusted
+            // context must fail closed rather than minting a replacement identity.
+            identity("tool call_id", &ctx.call_id)?;
+            let operation_key = format!(
+                "ticket-implementation-result:{}:{}",
+                input.ticket, ctx.call_id
+            );
+            identity("operation_key", &operation_key)?;
+            if input.body.trim().is_empty() || input.body.len() > 16384 || input.body.contains('\0')
+            {
+                return Err(ToolError::InvalidArgument(
+                    "Result body must be nonblank, NUL-free and at most 16384 bytes".into(),
+                ));
+            }
+            if let Some(mr) = &input.merge_request {
+                identity("merge_request_id", &mr.merge_request_id)?;
+                identity("subject_ref", &mr.subject_ref)?;
+            }
+            WorkspaceServerOperation::TicketImplementationResult {
+                ticket_id: input.ticket,
+                request: server_api::TicketImplementationResultRequest {
+                    operation_key,
+                    kind: input.kind,
+                    body: input.body,
+                    merge_request: input.merge_request,
+                },
+            }
+        }
+        Command::ImplementationResultQuery(input) => {
+            identity("ticket", &input.ticket)?;
+            identity("result_id", &input.result_id)?;
+            WorkspaceServerOperation::TicketImplementationResultGet {
+                ticket_id: input.ticket,
+                result_id: input.result_id,
+            }
+        }
+        Command::Answer(input) => {
+            identity("ticket", &input.ticket)?;
+            for (name, value) in [
+                ("assignment_id", &input.request.0.assignment_id),
+                (
+                    "expected_last_event_id",
+                    &input.request.0.expected_last_event_id,
+                ),
+                ("operation_key", &input.request.0.operation_key),
+            ] {
+                identity(name, value)?;
+            }
+            let body = &input.request.0.body;
+            if body.trim().is_empty() || body.len() > 16384 || body.contains('\0') {
+                return Err(ToolError::InvalidArgument(
+                    "Answer body must be nonempty, at most 16384 bytes and without NUL".into(),
+                ));
+            }
+            WorkspaceServerOperation::TicketAssignmentAnswer {
+                ticket_id: input.ticket,
+                request: input.request,
+            }
+        }
+    };
+    let ticket_id = match &operation {
+        WorkspaceServerOperation::TicketAssignmentSet { ticket_id, .. }
+        | WorkspaceServerOperation::TicketAssignmentClear { ticket_id, .. }
+        | WorkspaceServerOperation::TicketAssignmentsPage { ticket_id, .. }
+        | WorkspaceServerOperation::TicketAssignmentDiagnostics { ticket_id, .. }
+        | WorkspaceServerOperation::TicketAssignmentAnswer { ticket_id, .. }
+        | WorkspaceServerOperation::TicketImplementationResult { ticket_id, .. }
+        | WorkspaceServerOperation::TicketImplementationResultGet { ticket_id, .. } => ticket_id,
+        _ => unreachable!("public assignment operation"),
+    };
+    assignment_tracking::authorize_ticket_target(
+        client.as_ref(),
+        match kind {
+            PublicAssignmentKind::Assign => "ticket.assignment.assign",
+            PublicAssignmentKind::Clear => "ticket.assignment.clear",
+            PublicAssignmentKind::Assignments => "ticket.assignment.query",
+            PublicAssignmentKind::Diagnostics => "ticket.assignment.diagnostics",
+            PublicAssignmentKind::Answer => "ticket.assignment.answer",
+            PublicAssignmentKind::ImplementationResult => "ticket.implementation_result.write",
+            PublicAssignmentKind::ImplementationResultQuery => "ticket.implementation_result.read",
+        },
+        ticket_id,
+    )?;
+    let response = client
+        .execute_server_operation(operation)
+        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+    if !response.is_success() {
+        return Err(ToolError::ExecutionFailed(format!(
+            "Assignment request failed with HTTP status {}: {}",
+            response.status,
+            response.body.chars().take(1024).collect::<String>()
+        )));
+    }
+    if response.body.len() > 1024 * 1024 {
+        return Err(ToolError::ExecutionFailed(
+            "Assignment response exceeds 1 MiB; request a smaller page".into(),
+        ));
+    }
+    // Decode the actual public DTO and serialize only its declared fields; no raw
+    // backend payload/credentials or alternative result authority reaches the model.
+    let decode = |error: serde_json::Error| {
+        ToolError::ExecutionFailed(format!(
+            "Invalid Backend assignment response (outcome unknown after dispatch): {error}"
+        ))
+    };
+    let content = match kind {
+        PublicAssignmentKind::Assign | PublicAssignmentKind::Clear => serde_json::to_value(
+            serde_json::from_str::<server_api::TicketRoleAssignmentMutationResponse>(
+                &response.body,
+            )
+            .map_err(decode)?,
+        ),
+        PublicAssignmentKind::Assignments => {
+            let result: server_api::TicketAssignmentsPage =
+                serde_json::from_str(&response.body).map_err(decode)?;
+            if result.0.items.len() > 100 {
+                return Err(ToolError::ExecutionFailed(
+                    "Assignment page exceeds 100 items".into(),
+                ));
+            }
+            serde_json::to_value(result)
+        }
+        PublicAssignmentKind::Diagnostics => {
+            let result: server_api::TicketAssignmentDiagnosticsPage =
+                serde_json::from_str(&response.body).map_err(decode)?;
+            if result.inputs.len() > 100 || result.starts.len() > 100 {
+                return Err(ToolError::ExecutionFailed(
+                    "Diagnostic page exceeds 100 items".into(),
+                ));
+            }
+            serde_json::to_value(result)
+        }
+        PublicAssignmentKind::ImplementationResult
+        | PublicAssignmentKind::ImplementationResultQuery => serde_json::to_value(
+            serde_json::from_str::<server_api::TicketImplementationResultReceipt>(&response.body)
+                .map_err(decode)?,
+        ),
+        PublicAssignmentKind::Answer => serde_json::to_value(
+            serde_json::from_str::<server_api::TicketAssignmentAnswerResponse>(&response.body)
+                .map_err(decode)?,
+        ),
+    }
+    .map_err(|error| ToolError::Internal(error.to_string()))?;
+    Ok(ToolOutput {
+        summary: kind.name().into(),
+        content: Some(content.to_string()),
+        attachments: vec![],
+    })
+}
+
 pub(super) fn definition(
     client: Arc<dyn WorkspaceClient>,
     kind: PublicAssignmentKind,
@@ -466,4 +540,122 @@ pub(super) fn definition(
             }) as Arc<dyn Tool>,
         )
     })
+}
+
+#[cfg(test)]
+mod native_command_tests {
+    use super::*;
+    use assignment_tracking::authorization_tests::{AuthorizedClient, ticket};
+
+    #[tokio::test]
+    async fn internal_commands_share_exact_authorization_requests_and_host_retry_identity() {
+        for (kind, input, response) in super::tests::cases() {
+            let operation = match kind {
+                PublicAssignmentKind::Assign => "ticket.assignment.assign",
+                PublicAssignmentKind::Clear => "ticket.assignment.clear",
+                PublicAssignmentKind::Assignments => "ticket.assignment.query",
+                PublicAssignmentKind::Diagnostics => "ticket.assignment.diagnostics",
+                PublicAssignmentKind::Answer => "ticket.assignment.answer",
+                PublicAssignmentKind::ImplementationResult => "ticket.implementation_result.write",
+                PublicAssignmentKind::ImplementationResultQuery => {
+                    "ticket.implementation_result.read"
+                }
+            };
+            let client = AuthorizedClient::new(response);
+            let ctx = ToolExecutionContext::new("host-call", "batch", 0);
+            assert!(
+                execute_native(client.clone(), kind.name(), input.clone(), ctx.clone())
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(client.requests.lock().unwrap().is_empty());
+            client.grant(operation, ticket("T-743"));
+            let (_, tool) = definition(client.clone(), kind)();
+            let ordinary = tool.execute(&input.to_string(), ctx.clone()).await.unwrap();
+            let native = execute_native(client.clone(), kind.name(), input.clone(), ctx.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(native.content, ordinary.content);
+            {
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(
+                    requests[0],
+                    requests[1],
+                    "{} must preserve the exact request including CAS and replay identities",
+                    kind.name()
+                );
+                if matches!(kind, PublicAssignmentKind::ImplementationResult) {
+                    let body: Value =
+                        serde_json::from_str(requests[1].body.as_deref().unwrap()).unwrap();
+                    assert_eq!(
+                        body["operation_key"],
+                        "ticket-implementation-result:T-743:host-call"
+                    );
+                }
+            }
+            let mut other = input.clone();
+            other["ticket"] = json!("T-other");
+            assert!(
+                execute_native(client.clone(), kind.name(), other, ctx.clone())
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            client.grants.lock().unwrap().clear();
+            assert!(
+                execute_native(client.clone(), kind.name(), input, ctx)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert_eq!(client.requests.lock().unwrap().len(), 2);
+            assert!(
+                execute_native(
+                    client.clone(),
+                    "Unknown",
+                    Value::Null,
+                    ToolExecutionContext::direct()
+                )
+                .await
+                .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_assign_requires_observed_null_and_result_rejects_missing_host_identity() {
+        let client = AuthorizedClient::new(json!({}));
+        let mut assign = super::tests::cases().remove(0).1;
+        assign
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_assignment_id");
+        assert!(matches!(
+            execute_native(
+                client.clone(),
+                "TicketOrchestratorAssign",
+                assign,
+                ToolExecutionContext::direct()
+            )
+            .await
+            .unwrap(),
+            Err(ToolError::InvalidArgument(_))
+        ));
+        let result = json!({"ticket":"T-743", "kind":"result", "body":"Done"});
+        assert!(matches!(
+            execute_native(
+                client.clone(),
+                "TicketImplementationResult",
+                result,
+                ToolExecutionContext::new("", "batch", 0)
+            )
+            .await
+            .unwrap(),
+            Err(ToolError::InvalidArgument(_))
+        ));
+        assert!(client.requests.lock().unwrap().is_empty());
+        assert!(client.authorizations.lock().unwrap().is_empty());
+    }
 }

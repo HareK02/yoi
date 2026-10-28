@@ -924,48 +924,55 @@ impl Tool for TicketCreateTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketCreateParams = parse_input("TicketCreate", input_json)?;
-        if params
-            .state
-            .is_some_and(|state| !matches!(state.into_state(), TicketState::Open))
-        {
-            return Err(backend_error(
-                "TicketCreate",
-                TicketError::InvalidWorkflowTransition {
-                    from: "creation".to_owned(),
-                    to: params
-                        .state
-                        .expect("checked non-open state")
-                        .into_state()
-                        .as_str()
-                        .to_owned(),
-                },
-            ));
-        }
-        let mut input = NewTicket::new(params.title);
-        if let Some(body) = params.body {
-            input.body = MarkdownText::new(body);
-        }
-        input.author = None;
-        input.assignee = params.assignee;
-        input.readiness = params.readiness;
-        input.risk_flags = params.risk_flags;
-        input.workflow_state = params.state.map(TicketStateParam::into_state);
-        input.queued_by = None;
-        input.queued_at = params.queued_at;
-        input.targets = params.targets;
-
-        let created = self
-            .backend
-            .create(input)
-            .map_err(|error| backend_error("TicketCreate", error))?;
-        Ok(json_output(
-            format!("Created ticket {}", created.id),
-            json!(TicketRefOutput {
-                id: created.id,
-                state: "open".to_string(),
-            }),
-        ))
+        execute_ticket_create(&self.backend, params, _ctx)
     }
+}
+
+fn execute_ticket_create(
+    backend: &TicketToolBackend,
+    params: TicketCreateParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    if params
+        .state
+        .is_some_and(|state| !matches!(state.into_state(), TicketState::Open))
+    {
+        return Err(backend_error(
+            "TicketCreate",
+            TicketError::InvalidWorkflowTransition {
+                from: "creation".to_owned(),
+                to: params
+                    .state
+                    .expect("checked non-open state")
+                    .into_state()
+                    .as_str()
+                    .to_owned(),
+            },
+        ));
+    }
+    let mut input = NewTicket::new(params.title);
+    if let Some(body) = params.body {
+        input.body = MarkdownText::new(body);
+    }
+    input.author = None;
+    input.assignee = params.assignee;
+    input.readiness = params.readiness;
+    input.risk_flags = params.risk_flags;
+    input.workflow_state = params.state.map(TicketStateParam::into_state);
+    input.queued_by = None;
+    input.queued_at = params.queued_at;
+    input.targets = params.targets;
+
+    let created = backend
+        .create(input)
+        .map_err(|error| backend_error("TicketCreate", error))?;
+    Ok(json_output(
+        format!("Created ticket {}", created.id),
+        json!(TicketRefOutput {
+            id: created.id,
+            state: "open".to_string(),
+        }),
+    ))
 }
 
 #[async_trait]
@@ -976,43 +983,50 @@ impl Tool for TicketEditItemTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketEditItemParams = parse_input("TicketEditItem", input_json)?;
-        let body_replacement = match (params.old_string, params.new_string) {
-            (Some(old_string), Some(new_string)) => Some(TicketBodyReplacement {
-                old_string,
-                new_string,
-                replace_all: params.replace_all,
-            }),
-            (None, None) => None,
-            _ => {
-                return Err(backend_error(
-                    "TicketEditItem",
-                    TicketError::Conflict(
-                        "old_string and new_string must be provided together".to_string(),
-                    ),
-                ));
-            }
-        };
-        let edit = crate::TicketItemEdit {
-            title: params.title,
-            body: params.body.map(MarkdownText::new),
-            body_replacement,
-            targets: params.targets,
-            author: None,
-        };
-        let ticket = self
-            .backend
-            .edit_item(TicketIdOrSlug::from(params.ticket), edit)
-            .map_err(|error| backend_error("TicketEditItem", error))?;
-        Ok(json_output(
-            format!("Edited ticket {}", ticket.meta.id),
-            ticket_json(
-                &ticket,
-                DEFAULT_EVENT_LIMIT,
-                DEFAULT_ARTIFACT_LIMIT,
-                16 * 1024,
-            ),
-        ))
+        execute_ticket_edit_item(&self.backend, params, _ctx)
     }
+}
+
+fn execute_ticket_edit_item(
+    backend: &TicketToolBackend,
+    params: TicketEditItemParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let body_replacement = match (params.old_string, params.new_string) {
+        (Some(old_string), Some(new_string)) => Some(TicketBodyReplacement {
+            old_string,
+            new_string,
+            replace_all: params.replace_all,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(backend_error(
+                "TicketEditItem",
+                TicketError::Conflict(
+                    "old_string and new_string must be provided together".to_string(),
+                ),
+            ));
+        }
+    };
+    let edit = crate::TicketItemEdit {
+        title: params.title,
+        body: params.body.map(MarkdownText::new),
+        body_replacement,
+        targets: params.targets,
+        author: None,
+    };
+    let ticket = backend
+        .edit_item(TicketIdOrSlug::from(params.ticket), edit)
+        .map_err(|error| backend_error("TicketEditItem", error))?;
+    Ok(json_output(
+        format!("Edited ticket {}", ticket.meta.id),
+        ticket_json(
+            &ticket,
+            DEFAULT_EVENT_LIMIT,
+            DEFAULT_ARTIFACT_LIMIT,
+            16 * 1024,
+        ),
+    ))
 }
 
 #[async_trait]
@@ -1023,28 +1037,35 @@ impl Tool for TicketEditPostTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketEditPostParams = parse_input("TicketEditPost", input_json)?;
-        let ticket = self
-            .backend
-            .edit_post(
-                TicketIdOrSlug::from(params.ticket),
-                crate::TicketPostEdit {
-                    event_ref: params.event_ref,
-                    expected_body: MarkdownText::new(params.expected_body),
-                    body: MarkdownText::new(params.body),
-                    author: default_author(),
-                },
-            )
-            .map_err(|error| backend_error("TicketEditPost", error))?;
-        Ok(json_output(
-            format!("Edited Ticket post in {}", ticket.meta.id),
-            ticket_json(
-                &ticket,
-                DEFAULT_EVENT_LIMIT,
-                DEFAULT_ARTIFACT_LIMIT,
-                DEFAULT_BODY_MAX_BYTES,
-            ),
-        ))
+        execute_ticket_edit_post(&self.backend, params, _ctx)
     }
+}
+
+fn execute_ticket_edit_post(
+    backend: &TicketToolBackend,
+    params: TicketEditPostParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let ticket = backend
+        .edit_post(
+            TicketIdOrSlug::from(params.ticket),
+            crate::TicketPostEdit {
+                event_ref: params.event_ref,
+                expected_body: MarkdownText::new(params.expected_body),
+                body: MarkdownText::new(params.body),
+                author: default_author(),
+            },
+        )
+        .map_err(|error| backend_error("TicketEditPost", error))?;
+    Ok(json_output(
+        format!("Edited Ticket post in {}", ticket.meta.id),
+        ticket_json(
+            &ticket,
+            DEFAULT_EVENT_LIMIT,
+            DEFAULT_ARTIFACT_LIMIT,
+            DEFAULT_BODY_MAX_BYTES,
+        ),
+    ))
 }
 
 #[async_trait]
@@ -1055,37 +1076,44 @@ impl Tool for QueryTicketTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: QueryTicketParams = parse_input("QueryTicket", input_json)?;
-        let (filter, state_filter, params_limit) = params
-            .into_query()
-            .map_err(|error| backend_error("QueryTicket", error))?;
-        let limit = bounded(params_limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
-        let tickets = self
-            .backend
-            .list(filter)
-            .map_err(|error| backend_error("QueryTicket", error))?;
-        let count = tickets.len();
-        let returned_tickets: Vec<_> = tickets
-            .into_iter()
-            .take(limit)
-            .map(ticket_summary_json)
-            .collect();
-        let output = QueryTicketOutput {
-            state_filter: state_filter.to_string(),
-            count,
-            returned: returned_tickets.len(),
-            truncated: count > returned_tickets.len(),
-            limit,
-            tickets: returned_tickets,
-        };
-        Ok(json_output(
-            format!(
-                "Listed {} ticket(s) for state {state_filter}{}",
-                output.returned,
-                if output.truncated { " (truncated)" } else { "" }
-            ),
-            output,
-        ))
+        execute_query_ticket(&self.backend, params, _ctx)
     }
+}
+
+fn execute_query_ticket(
+    backend: &TicketToolBackend,
+    params: QueryTicketParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let (filter, state_filter, params_limit) = params
+        .into_query()
+        .map_err(|error| backend_error("QueryTicket", error))?;
+    let limit = bounded(params_limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+    let tickets = backend
+        .list(filter)
+        .map_err(|error| backend_error("QueryTicket", error))?;
+    let count = tickets.len();
+    let returned_tickets: Vec<_> = tickets
+        .into_iter()
+        .take(limit)
+        .map(ticket_summary_json)
+        .collect();
+    let output = QueryTicketOutput {
+        state_filter: state_filter.to_string(),
+        count,
+        returned: returned_tickets.len(),
+        truncated: count > returned_tickets.len(),
+        limit,
+        tickets: returned_tickets,
+    };
+    Ok(json_output(
+        format!(
+            "Listed {} ticket(s) for state {state_filter}{}",
+            output.returned,
+            if output.truncated { " (truncated)" } else { "" }
+        ),
+        output,
+    ))
 }
 
 #[async_trait]
@@ -1096,41 +1124,47 @@ impl Tool for ShowTicketTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: ShowTicketParams = parse_input("ShowTicket", input_json)?;
-        let query = id_or_query(params.id, params.query)?;
-        let event_limit = bounded(params.event_limit, DEFAULT_EVENT_LIMIT, MAX_EVENT_LIMIT);
-        let artifact_limit = bounded(
-            params.artifact_limit,
-            DEFAULT_ARTIFACT_LIMIT,
-            MAX_ARTIFACT_LIMIT,
-        );
-        let body_max_bytes = bounded(
-            params.body_max_bytes,
-            DEFAULT_BODY_MAX_BYTES,
-            MAX_BODY_MAX_BYTES,
-        );
-        let ticket = self
-            .backend
-            .show(query)
-            .map_err(|error| backend_error("ShowTicket", error))?;
-        let summary = format!(
-            "Ticket {} state {}",
-            ticket.meta.id,
-            ticket.meta.workflow_state.as_str()
-        );
-        Ok(json_output(
-            summary,
-            ticket_json(&ticket, event_limit, artifact_limit, body_max_bytes),
-        ))
+        execute_show_ticket(&self.backend, params, _ctx)
     }
+}
+
+fn execute_show_ticket(
+    backend: &TicketToolBackend,
+    params: ShowTicketParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let query = id_or_query(params.id, params.query)?;
+    let event_limit = bounded(params.event_limit, DEFAULT_EVENT_LIMIT, MAX_EVENT_LIMIT);
+    let artifact_limit = bounded(
+        params.artifact_limit,
+        DEFAULT_ARTIFACT_LIMIT,
+        MAX_ARTIFACT_LIMIT,
+    );
+    let body_max_bytes = bounded(
+        params.body_max_bytes,
+        DEFAULT_BODY_MAX_BYTES,
+        MAX_BODY_MAX_BYTES,
+    );
+    let ticket = backend
+        .show(query)
+        .map_err(|error| backend_error("ShowTicket", error))?;
+    let summary = format!(
+        "Ticket {} state {}",
+        ticket.meta.id,
+        ticket.meta.workflow_state.as_str()
+    );
+    Ok(json_output(
+        summary,
+        ticket_json(&ticket, event_limit, artifact_limit, body_max_bytes),
+    ))
 }
 
 fn execute_ticket_thread_event(
     backend: &TicketToolBackend,
     tool_name: &str,
     kind: TicketEventKind,
-    input_json: &str,
+    params: TicketThreadEventParams,
 ) -> Result<ToolOutput, ToolError> {
-    let params: TicketThreadEventParams = parse_input(tool_name, input_json)?;
     let role = kind.as_str().to_string();
     backend
         .add_event(
@@ -1155,7 +1189,7 @@ impl Tool for TicketCommentTool {
             &self.backend,
             "TicketComment",
             TicketEventKind::Comment,
-            input_json,
+            parse_input("TicketComment", input_json)?,
         )
     }
 }
@@ -1169,7 +1203,12 @@ macro_rules! impl_ticket_thread_event_tool {
                 input_json: &str,
                 _ctx: agen::tool::ToolExecutionContext,
             ) -> Result<ToolOutput, ToolError> {
-                execute_ticket_thread_event(&self.backend, $name, $kind, input_json)
+                execute_ticket_thread_event(
+                    &self.backend,
+                    $name,
+                    $kind,
+                    parse_input($name, input_json)?,
+                )
             }
         }
     };
@@ -1195,28 +1234,35 @@ impl Tool for TicketMarkReadyTool {
         ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketMarkReadyParams = parse_input("TicketMarkReady", input_json)?;
-        let ticket = self
-            .backend
-            .mark_ready(
-                TicketIdOrSlug::Query(params.ticket.clone()),
-                TicketMarkReady {
-                    operation_key: format!("ticket-mark-ready:{}", ctx.call_id),
-                    reason: params.reason,
-                    author: None,
-                    intake_summary: None,
-                },
-            )
-            .map_err(|error| backend_error("TicketMarkReady", error))?;
-        Ok(json_output(
-            format!("Marked ticket {} routing readiness ready", params.ticket),
-            json!({
-                "ticket": ticket.meta.id,
-                "state": ticket.meta.workflow_state.as_str(),
-                "targets": ticket.meta.targets,
-                "ok": true
-            }),
-        ))
+        execute_ticket_mark_ready(&self.backend, params, ctx)
     }
+}
+
+fn execute_ticket_mark_ready(
+    backend: &TicketToolBackend,
+    params: TicketMarkReadyParams,
+    ctx: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let ticket = backend
+        .mark_ready(
+            TicketIdOrSlug::Query(params.ticket.clone()),
+            TicketMarkReady {
+                operation_key: format!("ticket-mark-ready:{}", ctx.call_id),
+                reason: params.reason,
+                author: None,
+                intake_summary: None,
+            },
+        )
+        .map_err(|error| backend_error("TicketMarkReady", error))?;
+    Ok(json_output(
+        format!("Marked ticket {} routing readiness ready", params.ticket),
+        json!({
+            "ticket": ticket.meta.id,
+            "state": ticket.meta.workflow_state.as_str(),
+            "targets": ticket.meta.targets,
+            "ok": true
+        }),
+    ))
 }
 
 #[async_trait]
@@ -1227,31 +1273,38 @@ impl Tool for TicketIntakeReadyTool {
         ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketIntakeReadyParams = parse_input("TicketIntakeReady", input_json)?;
-        let ticket = self
-            .backend
-            .mark_ready(
-                TicketIdOrSlug::Query(params.ticket.clone()),
-                TicketMarkReady {
-                    operation_key: format!("ticket-intake-ready:{}", ctx.call_id),
-                    reason: params.reason,
-                    author: None,
-                    intake_summary: Some(TicketIntakeSummary::new(params.intake_summary)),
-                },
-            )
-            .map_err(|error| backend_error("TicketIntakeReady", error))?;
-        Ok(json_output(
-            format!(
-                "Marked ticket {} routing readiness ready after intake",
-                params.ticket
-            ),
-            json!({
-                "ticket": ticket.meta.id,
-                "state": ticket.meta.workflow_state.as_str(),
-                "targets": ticket.meta.targets,
-                "ok": true
-            }),
-        ))
+        execute_ticket_intake_ready(&self.backend, params, ctx)
     }
+}
+
+fn execute_ticket_intake_ready(
+    backend: &TicketToolBackend,
+    params: TicketIntakeReadyParams,
+    ctx: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let ticket = backend
+        .mark_ready(
+            TicketIdOrSlug::Query(params.ticket.clone()),
+            TicketMarkReady {
+                operation_key: format!("ticket-intake-ready:{}", ctx.call_id),
+                reason: params.reason,
+                author: None,
+                intake_summary: Some(TicketIntakeSummary::new(params.intake_summary)),
+            },
+        )
+        .map_err(|error| backend_error("TicketIntakeReady", error))?;
+    Ok(json_output(
+        format!(
+            "Marked ticket {} routing readiness ready after intake",
+            params.ticket
+        ),
+        json!({
+            "ticket": ticket.meta.id,
+            "state": ticket.meta.workflow_state.as_str(),
+            "targets": ticket.meta.targets,
+            "ok": true
+        }),
+    ))
 }
 
 #[async_trait]
@@ -1262,32 +1315,39 @@ impl Tool for TicketQueueTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketQueueParams = parse_input("TicketQueue", input_json)?;
-        let queued_by = default_author();
-        let mut outcome = self
-            .backend
-            .queue_ready(TicketIdOrSlug::Query(params.ticket.clone()), &queued_by)
-            .map_err(|error| backend_error("TicketQueue", error))?;
-        outcome.requested_ticket =
-            model_ticket_reference(&self.backend, &outcome.requested_ticket, "TicketQueue")?;
-        outcome.queued_tickets = outcome
-            .queued_tickets
-            .into_iter()
-            .map(|ticket| model_ticket_reference(&self.backend, &ticket, "TicketQueue"))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(json_output(
-            format!(
-                "Queued {} ticket(s) for Orchestrator",
-                outcome.queued_tickets.len()
-            ),
-            json!({
-                "ticket": outcome.requested_ticket,
-                "queued_tickets": outcome.queued_tickets,
-                "state": "queued",
-                "queued_by": queued_by,
-                "ok": true
-            }),
-        ))
+        execute_ticket_queue(&self.backend, params, _ctx)
     }
+}
+
+fn execute_ticket_queue(
+    backend: &TicketToolBackend,
+    params: TicketQueueParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let queued_by = default_author();
+    let mut outcome = backend
+        .queue_ready(TicketIdOrSlug::Query(params.ticket.clone()), &queued_by)
+        .map_err(|error| backend_error("TicketQueue", error))?;
+    outcome.requested_ticket =
+        model_ticket_reference(backend, &outcome.requested_ticket, "TicketQueue")?;
+    outcome.queued_tickets = outcome
+        .queued_tickets
+        .into_iter()
+        .map(|ticket| model_ticket_reference(backend, &ticket, "TicketQueue"))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json_output(
+        format!(
+            "Queued {} ticket(s) for Orchestrator",
+            outcome.queued_tickets.len()
+        ),
+        json!({
+            "ticket": outcome.requested_ticket,
+            "queued_tickets": outcome.queued_tickets,
+            "state": "queued",
+            "queued_by": queued_by,
+            "ok": true
+        }),
+    ))
 }
 
 #[async_trait]
@@ -1298,33 +1358,40 @@ impl Tool for TicketCaseUpdateTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketCaseUpdateParams = parse_input("TicketCaseUpdate", input_json)?;
-        let record = self
-            .backend
-            .update_case(
-                &params.ticket,
-                crate::TicketCaseUpdate {
-                    expected_content_digest: params.expected_content_digest,
-                    expected_state: params.expected_state,
-                    expected_closure_operation_key: params.expected_closure_operation_key,
-                    operation_key: params.operation_key,
-                    action: params.action,
-                    explanation: params.explanation,
-                    references: params.references,
-                    author: None,
-                },
-            )
-            .map_err(|error| backend_error("TicketCaseUpdate", error))?;
-        let reference = model_ticket_reference(&self.backend, &params.ticket, "TicketCaseUpdate")?;
-        Ok(json_output(
-            format!(
-                "Updated Ticket {} case to {}",
-                reference, record.meta.workflow_state
-            ),
-            json!({
-                "ticket": reference, "state": record.meta.workflow_state, "closure_operation_key": record.closure_operation_key, "current_closure": record.current_closure.as_ref().map(|j| json!({"operation_key": j.operation_key, "reason": j.reason, "author": j.author, "explanation": truncate_text(&j.explanation, DEFAULT_BODY_MAX_BYTES)})), "ok": true
-            }),
-        ))
+        execute_ticket_case_update(&self.backend, params, _ctx)
     }
+}
+
+fn execute_ticket_case_update(
+    backend: &TicketToolBackend,
+    params: TicketCaseUpdateParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let record = backend
+        .update_case(
+            &params.ticket,
+            crate::TicketCaseUpdate {
+                expected_content_digest: params.expected_content_digest,
+                expected_state: params.expected_state,
+                expected_closure_operation_key: params.expected_closure_operation_key,
+                operation_key: params.operation_key,
+                action: params.action,
+                explanation: params.explanation,
+                references: params.references,
+                author: None,
+            },
+        )
+        .map_err(|error| backend_error("TicketCaseUpdate", error))?;
+    let reference = model_ticket_reference(backend, &params.ticket, "TicketCaseUpdate")?;
+    Ok(json_output(
+        format!(
+            "Updated Ticket {} case to {}",
+            reference, record.meta.workflow_state
+        ),
+        json!({
+            "ticket": reference, "state": record.meta.workflow_state, "closure_operation_key": record.closure_operation_key, "current_closure": record.current_closure.as_ref().map(|j| json!({"operation_key": j.operation_key, "reason": j.reason, "author": j.author, "explanation": truncate_text(&j.explanation, DEFAULT_BODY_MAX_BYTES)})), "ok": true
+        }),
+    ))
 }
 
 #[async_trait]
@@ -1335,24 +1402,31 @@ impl Tool for TicketRelationRecordTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketRelationRecordParams = parse_input("TicketRelationRecord", input_json)?;
-        let relation = NewTicketRelation {
-            kind: params.kind.into_kind(),
-            target: params.target.clone(),
-            note: params.note,
-            author: None,
-        };
-        let output = self
-            .backend
-            .add_ticket_relation(TicketIdOrSlug::Id(params.ticket.clone()), relation)
-            .map_err(|error| backend_error("TicketRelationRecord", error))?;
-        Ok(json_output(
-            format!(
-                "Recorded ticket relation {} {} {}",
-                output.ticket_id, output.kind, output.target
-            ),
-            ticket_relation_json(&output),
-        ))
+        execute_ticket_relation_record(&self.backend, params, _ctx)
     }
+}
+
+fn execute_ticket_relation_record(
+    backend: &TicketToolBackend,
+    params: TicketRelationRecordParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let relation = NewTicketRelation {
+        kind: params.kind.into_kind(),
+        target: params.target.clone(),
+        note: params.note,
+        author: None,
+    };
+    let output = backend
+        .add_ticket_relation(TicketIdOrSlug::Id(params.ticket.clone()), relation)
+        .map_err(|error| backend_error("TicketRelationRecord", error))?;
+    Ok(json_output(
+        format!(
+            "Recorded ticket relation {} {} {}",
+            output.ticket_id, output.kind, output.target
+        ),
+        ticket_relation_json(&output),
+    ))
 }
 
 #[async_trait]
@@ -1363,22 +1437,29 @@ impl Tool for TicketRelationRemoveTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketRelationRemoveParams = parse_input("TicketRelationRemove", input_json)?;
-        let output = self
-            .backend
-            .remove_ticket_relation(
-                TicketIdOrSlug::Id(params.ticket),
-                params.kind.into_kind(),
-                TicketIdOrSlug::Id(params.target),
-            )
-            .map_err(|error| backend_error("TicketRelationRemove", error))?;
-        Ok(json_output(
-            format!(
-                "Removed ticket relation {} {} {}",
-                output.ticket_id, output.kind, output.target
-            ),
-            ticket_relation_json(&output),
-        ))
+        execute_ticket_relation_remove(&self.backend, params, _ctx)
     }
+}
+
+fn execute_ticket_relation_remove(
+    backend: &TicketToolBackend,
+    params: TicketRelationRemoveParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let output = backend
+        .remove_ticket_relation(
+            TicketIdOrSlug::Id(params.ticket),
+            params.kind.into_kind(),
+            TicketIdOrSlug::Id(params.target),
+        )
+        .map_err(|error| backend_error("TicketRelationRemove", error))?;
+    Ok(json_output(
+        format!(
+            "Removed ticket relation {} {} {}",
+            output.ticket_id, output.kind, output.target
+        ),
+        ticket_relation_json(&output),
+    ))
 }
 
 #[async_trait]
@@ -1389,34 +1470,41 @@ impl Tool for TicketRelationQueryTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketRelationQueryParams = parse_input("TicketRelationQuery", input_json)?;
-        let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
-        let ticket = params.ticket.clone().map(TicketIdOrSlug::Id);
-        let kind = params.kind.map(TicketRelationKindParam::into_kind);
-        let relations = self
-            .backend
-            .query_ticket_relations(ticket, kind)
-            .map_err(|error| backend_error("TicketRelationQuery", error))?;
-        let count = relations.len();
-        let truncated = count > limit;
-        let returned_relations = relations
-            .into_iter()
-            .take(limit)
-            .map(|relation| ticket_relation_json(&relation))
-            .collect::<Vec<_>>();
-        Ok(json_output(
-            format!(
-                "Found {} ticket relation(s){}",
-                count,
-                if truncated { " (truncated)" } else { "" }
-            ),
-            TicketRelationQueryOutput {
-                count,
-                returned: returned_relations.len(),
-                truncated,
-                relations: returned_relations,
-            },
-        ))
+        execute_ticket_relation_query(&self.backend, params, _ctx)
     }
+}
+
+fn execute_ticket_relation_query(
+    backend: &TicketToolBackend,
+    params: TicketRelationQueryParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+    let ticket = params.ticket.clone().map(TicketIdOrSlug::Id);
+    let kind = params.kind.map(TicketRelationKindParam::into_kind);
+    let relations = backend
+        .query_ticket_relations(ticket, kind)
+        .map_err(|error| backend_error("TicketRelationQuery", error))?;
+    let count = relations.len();
+    let truncated = count > limit;
+    let returned_relations = relations
+        .into_iter()
+        .take(limit)
+        .map(|relation| ticket_relation_json(&relation))
+        .collect::<Vec<_>>();
+    Ok(json_output(
+        format!(
+            "Found {} ticket relation(s){}",
+            count,
+            if truncated { " (truncated)" } else { "" }
+        ),
+        TicketRelationQueryOutput {
+            count,
+            returned: returned_relations.len(),
+            truncated,
+            relations: returned_relations,
+        },
+    ))
 }
 
 #[async_trait]
@@ -1428,31 +1516,38 @@ impl Tool for TicketOrchestrationPlanRecordTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketOrchestrationPlanRecordParams =
             parse_input("TicketOrchestrationPlanRecord", input_json)?;
-        let accepted_plan = params.accepted_plan.map(|plan| AcceptedOrchestrationPlan {
-            summary: plan.summary,
-            branch: plan.branch,
-            worktree: plan.worktree,
-            role_plan: plan.role_plan,
-        });
-        let record = NewOrchestrationPlanRecord {
-            kind: params.kind.into_kind(),
-            related_ticket: params.related_ticket,
-            note: params.note,
-            accepted_plan,
-            author: None,
-        };
-        let output = self
-            .backend
-            .add_orchestration_plan_record(TicketIdOrSlug::Query(params.ticket.clone()), record)
-            .map_err(|error| backend_error("TicketOrchestrationPlanRecord", error))?;
-        Ok(json_output(
-            format!(
-                "Recorded orchestration plan {} for ticket {}",
-                output.kind, params.ticket
-            ),
-            output,
-        ))
+        execute_ticket_orchestration_plan_record(&self.backend, params, _ctx)
     }
+}
+
+fn execute_ticket_orchestration_plan_record(
+    backend: &TicketToolBackend,
+    params: TicketOrchestrationPlanRecordParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let accepted_plan = params.accepted_plan.map(|plan| AcceptedOrchestrationPlan {
+        summary: plan.summary,
+        branch: plan.branch,
+        worktree: plan.worktree,
+        role_plan: plan.role_plan,
+    });
+    let record = NewOrchestrationPlanRecord {
+        kind: params.kind.into_kind(),
+        related_ticket: params.related_ticket,
+        note: params.note,
+        accepted_plan,
+        author: None,
+    };
+    let output = backend
+        .add_orchestration_plan_record(TicketIdOrSlug::Query(params.ticket.clone()), record)
+        .map_err(|error| backend_error("TicketOrchestrationPlanRecord", error))?;
+    Ok(json_output(
+        format!(
+            "Recorded orchestration plan {} for ticket {}",
+            output.kind, params.ticket
+        ),
+        output,
+    ))
 }
 
 #[async_trait]
@@ -1464,36 +1559,43 @@ impl Tool for TicketOrchestrationPlanQueryTool {
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketOrchestrationPlanQueryParams =
             parse_input("TicketOrchestrationPlanQuery", input_json)?;
-        let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
-        let ticket = params.ticket.clone().map(TicketIdOrSlug::Query);
-        let kind = params
-            .relation_kind
-            .map(OrchestrationPlanKindParam::into_kind);
-        let records = self
-            .backend
-            .query_orchestration_plan_records(ticket, kind)
-            .map_err(|error| backend_error("TicketOrchestrationPlanQuery", error))?;
-        let count = records.len();
-        let truncated = count > limit;
-        let returned_records = records
-            .into_iter()
-            .take(limit)
-            .map(|record| serde_json::to_value(record).unwrap_or_else(|_| json!({})))
-            .collect::<Vec<_>>();
-        Ok(json_output(
-            format!(
-                "Found {} orchestration plan record(s){}",
-                count,
-                if truncated { " (truncated)" } else { "" }
-            ),
-            TicketOrchestrationPlanQueryOutput {
-                count,
-                returned: returned_records.len(),
-                truncated,
-                records: returned_records,
-            },
-        ))
+        execute_ticket_orchestration_plan_query(&self.backend, params, _ctx)
     }
+}
+
+fn execute_ticket_orchestration_plan_query(
+    backend: &TicketToolBackend,
+    params: TicketOrchestrationPlanQueryParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+    let ticket = params.ticket.clone().map(TicketIdOrSlug::Query);
+    let kind = params
+        .relation_kind
+        .map(OrchestrationPlanKindParam::into_kind);
+    let records = backend
+        .query_orchestration_plan_records(ticket, kind)
+        .map_err(|error| backend_error("TicketOrchestrationPlanQuery", error))?;
+    let count = records.len();
+    let truncated = count > limit;
+    let returned_records = records
+        .into_iter()
+        .take(limit)
+        .map(|record| serde_json::to_value(record).unwrap_or_else(|_| json!({})))
+        .collect::<Vec<_>>();
+    Ok(json_output(
+        format!(
+            "Found {} orchestration plan record(s){}",
+            count,
+            if truncated { " (truncated)" } else { "" }
+        ),
+        TicketOrchestrationPlanQueryOutput {
+            count,
+            returned: returned_records.len(),
+            truncated,
+            records: returned_records,
+        },
+    ))
 }
 
 #[async_trait]
@@ -1504,22 +1606,29 @@ impl Tool for TicketDoctorTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketDoctorParams = parse_input("TicketDoctor", input_json)?;
-        let limit = bounded(params.limit, DEFAULT_DIAGNOSTIC_LIMIT, MAX_DIAGNOSTIC_LIMIT);
-        let report = self
-            .backend
-            .doctor()
-            .map_err(|error| backend_error("TicketDoctor", error))?;
-        let output = doctor_output(report, limit);
-        Ok(json_output(
-            format!(
-                "Ticket doctor: {} error(s), {} diagnostic(s){}",
-                output.error_count,
-                output.diagnostic_count,
-                if output.truncated { " (truncated)" } else { "" }
-            ),
-            output,
-        ))
+        execute_ticket_doctor(&self.backend, params, _ctx)
     }
+}
+
+fn execute_ticket_doctor(
+    backend: &TicketToolBackend,
+    params: TicketDoctorParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let limit = bounded(params.limit, DEFAULT_DIAGNOSTIC_LIMIT, MAX_DIAGNOSTIC_LIMIT);
+    let report = backend
+        .doctor()
+        .map_err(|error| backend_error("TicketDoctor", error))?;
+    let output = doctor_output(report, limit);
+    Ok(json_output(
+        format!(
+            "Ticket doctor: {} error(s), {} diagnostic(s){}",
+            output.error_count,
+            output.diagnostic_count,
+            if output.truncated { " (truncated)" } else { "" }
+        ),
+        output,
+    ))
 }
 
 #[async_trait]
@@ -1530,22 +1639,141 @@ impl Tool for TicketDependencyCheckTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketDependencyCheckParams = parse_input("TicketDependencyCheck", input_json)?;
-        let check = self
-            .backend
-            .dependency_check(TicketIdOrSlug::Query(params.ticket.clone()))
-            .map_err(|error| backend_error("TicketDependencyCheck", error))?;
-        Ok(json_output(
-            format!(
-                "Ticket {} dependency check: {}",
-                params.ticket,
-                if check.queue_guard.can_queue_for_orchestrator {
-                    "queueable"
-                } else {
-                    "not queueable"
-                }
-            ),
-            check,
-        ))
+        execute_ticket_dependency_check(&self.backend, params, _ctx)
+    }
+}
+
+fn execute_ticket_dependency_check(
+    backend: &TicketToolBackend,
+    params: TicketDependencyCheckParams,
+    _context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let check = backend
+        .dependency_check(TicketIdOrSlug::Query(params.ticket.clone()))
+        .map_err(|error| backend_error("TicketDependencyCheck", error))?;
+    Ok(json_output(
+        format!(
+            "Ticket {} dependency check: {}",
+            params.ticket,
+            if check.queue_guard.can_queue_for_orchestrator {
+                "queueable"
+            } else {
+                "not queueable"
+            }
+        ),
+        check,
+    ))
+}
+
+/// Execute an internal Ticket command after an adapter validates and converts its contract.
+///
+/// These DTOs are shared with ordinary Tool input conversion, not a native public contract.
+/// This boundary never invokes Tools or validates their JSON schemas. Backend authorization,
+/// business validation and durable operation identities remain shared.
+pub async fn execute_ticket_command(
+    backend: TicketToolBackend,
+    operation: &str,
+    command: Value,
+    context: agen::tool::ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    fn convert<T: serde::de::DeserializeOwned>(command: Value) -> Result<T, ToolError> {
+        serde_json::from_value(command)
+            .map_err(|error| ToolError::InvalidArgument(format!("invalid Ticket command: {error}")))
+    }
+    match operation {
+        "TicketCreate" => {
+            execute_ticket_create(&backend, convert::<TicketCreateParams>(command)?, context)
+        }
+        "TicketEditItem" => {
+            execute_ticket_edit_item(&backend, convert::<TicketEditItemParams>(command)?, context)
+        }
+        "TicketEditPost" => {
+            execute_ticket_edit_post(&backend, convert::<TicketEditPostParams>(command)?, context)
+        }
+        "QueryTicket" => {
+            execute_query_ticket(&backend, convert::<QueryTicketParams>(command)?, context)
+        }
+        "ShowTicket" => {
+            execute_show_ticket(&backend, convert::<ShowTicketParams>(command)?, context)
+        }
+        "TicketMarkReady" => execute_ticket_mark_ready(
+            &backend,
+            convert::<TicketMarkReadyParams>(command)?,
+            context,
+        ),
+        "TicketIntakeReady" => execute_ticket_intake_ready(
+            &backend,
+            convert::<TicketIntakeReadyParams>(command)?,
+            context,
+        ),
+        "TicketQueue" => {
+            execute_ticket_queue(&backend, convert::<TicketQueueParams>(command)?, context)
+        }
+        "TicketCaseUpdate" => execute_ticket_case_update(
+            &backend,
+            convert::<TicketCaseUpdateParams>(command)?,
+            context,
+        ),
+        "TicketRelationRecord" => execute_ticket_relation_record(
+            &backend,
+            convert::<TicketRelationRecordParams>(command)?,
+            context,
+        ),
+        "TicketRelationRemove" => execute_ticket_relation_remove(
+            &backend,
+            convert::<TicketRelationRemoveParams>(command)?,
+            context,
+        ),
+        "TicketRelationQuery" => execute_ticket_relation_query(
+            &backend,
+            convert::<TicketRelationQueryParams>(command)?,
+            context,
+        ),
+        "TicketOrchestrationPlanRecord" => execute_ticket_orchestration_plan_record(
+            &backend,
+            convert::<TicketOrchestrationPlanRecordParams>(command)?,
+            context,
+        ),
+        "TicketOrchestrationPlanQuery" => execute_ticket_orchestration_plan_query(
+            &backend,
+            convert::<TicketOrchestrationPlanQueryParams>(command)?,
+            context,
+        ),
+        "TicketDoctor" => {
+            execute_ticket_doctor(&backend, convert::<TicketDoctorParams>(command)?, context)
+        }
+        "TicketDependencyCheck" => execute_ticket_dependency_check(
+            &backend,
+            convert::<TicketDependencyCheckParams>(command)?,
+            context,
+        ),
+        "TicketComment" => execute_ticket_thread_event(
+            &backend,
+            operation,
+            TicketEventKind::Comment,
+            convert(command)?,
+        ),
+        "TicketPlan" => execute_ticket_thread_event(
+            &backend,
+            operation,
+            TicketEventKind::Plan,
+            convert(command)?,
+        ),
+        "TicketDecision" => execute_ticket_thread_event(
+            &backend,
+            operation,
+            TicketEventKind::Decision,
+            convert(command)?,
+        ),
+        "TicketImplementationReport" => execute_ticket_thread_event(
+            &backend,
+            operation,
+            TicketEventKind::ImplementationReport,
+            convert(command)?,
+        ),
+        _ => Err(ToolError::InvalidArgument(format!(
+            "unknown Ticket command: {operation}"
+        ))),
     }
 }
 
@@ -2024,6 +2252,193 @@ mod tests {
                 (meta.name == name).then_some(meta.description)
             })
             .expect("tool exists")
+    }
+
+    #[tokio::test]
+    async fn internal_commands_share_persisted_edits_post_cas_and_dependency_results_with_tools() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let created = execute_ticket_command(
+            backend.clone().into(),
+            "TicketCreate",
+            json!({"title":"Shared execution", "body":"Original"}),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let id = serde_json::from_str::<Value>(created.content.as_deref().unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let edit = tool_by_name(backend.clone(), "TicketEditItem");
+        edit.execute(
+            &json!({"ticket":id, "old_string":"Original", "new_string":"Tool edit"}).to_string(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        execute_ticket_command(
+            backend.clone().into(),
+            "TicketEditItem",
+            json!({"ticket":id, "old_string":"Tool edit", "new_string":"Command edit"}),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        execute_ticket_command(
+            backend.clone().into(),
+            "TicketComment",
+            json!({"ticket":id, "body":"Discussion"}),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let before = backend.show(id.clone().into()).unwrap();
+        assert_eq!(before.document.body.as_str(), "Command edit");
+        let post = before
+            .events
+            .iter()
+            .find(|event| !event.is_initial)
+            .unwrap();
+        let input = json!({"ticket":id, "event_ref":post.event_ref, "expected_body":"Discussion", "body":"Updated"});
+        execute_ticket_command(
+            backend.clone().into(),
+            "TicketEditPost",
+            input.clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let native_error = execute_ticket_command(
+            backend.clone().into(),
+            "TicketEditPost",
+            input.clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap_err();
+        let tool_error = tool_by_name(backend.clone(), "TicketEditPost")
+            .execute(&input.to_string(), Default::default())
+            .await
+            .unwrap_err();
+        assert_eq!(native_error.to_string(), tool_error.to_string());
+        let after = backend.show(id.clone().into()).unwrap();
+        assert_eq!(
+            after
+                .events
+                .iter()
+                .find(|event| !event.is_initial)
+                .unwrap()
+                .body
+                .as_str(),
+            "Updated"
+        );
+        let input = json!({"ticket":id});
+        let native = execute_ticket_command(
+            backend.clone().into(),
+            "TicketDependencyCheck",
+            input.clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let ordinary = tool_by_name(backend, "TicketDependencyCheck")
+            .execute(&input.to_string(), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(native.content, ordinary.content);
+    }
+
+    #[tokio::test]
+    async fn internal_relation_and_plan_commands_share_tools_business_validation_and_queries() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let source = backend.create(NewTicket::new("Source")).unwrap().id;
+        let target = backend.create(NewTicket::new("Target")).unwrap().id;
+        let relation = json!({"ticket":source, "kind":"related", "target":target});
+        execute_ticket_command(
+            backend.clone().into(),
+            "TicketRelationRecord",
+            relation.clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let query = json!({"ticket":source});
+        let native = execute_ticket_command(
+            backend.clone().into(),
+            "TicketRelationQuery",
+            query.clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let ordinary = tool_by_name(backend.clone(), "TicketRelationQuery")
+            .execute(&query.to_string(), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(native.content, ordinary.content);
+        execute_ticket_command(
+            backend.clone().into(),
+            "TicketRelationRemove",
+            relation,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let plan = json!({"ticket":source, "kind":"accepted_plan", "accepted_plan":{"summary":"Shared execution plan", "branch":"work"}});
+        execute_ticket_command(
+            backend.clone().into(),
+            "TicketOrchestrationPlanRecord",
+            plan,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let native = execute_ticket_command(
+            backend.clone().into(),
+            "TicketOrchestrationPlanQuery",
+            query.clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let ordinary = tool_by_name(backend.clone(), "TicketOrchestrationPlanQuery")
+            .execute(&query.to_string(), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(native.content, ordinary.content);
+        let invalid = json!({"ticket":source, "kind":"accepted_plan"});
+        let native = execute_ticket_command(
+            backend.clone().into(),
+            "TicketOrchestrationPlanRecord",
+            invalid.clone(),
+            Default::default(),
+        )
+        .await
+        .unwrap_err();
+        let ordinary = tool_by_name(backend.clone(), "TicketOrchestrationPlanRecord")
+            .execute(&invalid.to_string(), Default::default())
+            .await
+            .unwrap_err();
+        assert_eq!(native.to_string(), ordinary.to_string());
+        assert!(matches!(
+            execute_ticket_command(
+                backend.clone().into(),
+                "TicketRelationRecord",
+                json!({"ticket":source,"target":target,"kind":"invalid"}),
+                Default::default()
+            )
+            .await,
+            Err(ToolError::InvalidArgument(_))
+        ));
+        assert!(
+            execute_ticket_command(backend.into(), "Unknown", json!({}), Default::default())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown Ticket command")
+        );
     }
 
     #[tokio::test]

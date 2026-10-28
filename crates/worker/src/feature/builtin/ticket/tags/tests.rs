@@ -358,6 +358,9 @@ async fn classification_wip_uses_normal_permissions_and_route_bound_ticket_ident
         ),
         permissions: None,
         ticket_reference: "T-740".into(),
+        collection_route: "/tickets".into(),
+        merge_request_route: "/merge-requests".into(),
+        objective_route: "/objectives".into(),
         observations: Arc::new(Mutex::new(TicketObservationState::default())),
     };
     handler
@@ -368,8 +371,8 @@ async fn classification_wip_uses_normal_permissions_and_route_bound_ticket_ident
         .insert("T-740".into(), "content-1".into());
     let mut args = BTreeMap::from([
         ("operation_key".into(), WipValue::String("set-1".into())),
-        ("tag_ids".into(), json_to_wip(&json!(["tag-1"])).unwrap()),
-        ("expected_tag_ids".into(), json_to_wip(&json!([])).unwrap()),
+        ("tags".into(), json_to_wip(&json!(["tag-1"])).unwrap()),
+        ("observed".into(), json_to_wip(&json!({"tags":[]})).unwrap()),
     ]);
     assert!(
         handler

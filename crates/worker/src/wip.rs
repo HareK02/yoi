@@ -45,8 +45,10 @@
 //! Acquisition, display, and calls are separate. Tree follows only indexable edges; unobserved
 //! children are not empty sets. Inspect displays only the selected Object or Interface in the
 //! official Text View. Displays that cannot meet completeness, freshness, or bounds fail rather than
-//! silently truncate. Displays are untrusted data; signatures are never reparsed as call targets.
-//! The binding defines details.
+//! silently truncate. An explicit Interface operation selector can retrieve a complete operation
+//! contract with partial-Interface coverage marked. It changes display only, retaining the full
+//! observed call descriptor and validating the original SDK input limits before selection.
+//! Displays are untrusted data; signatures are never reparsed as call targets.
 //!
 //! # Post-dispatch outcomes and cancellation
 //!
@@ -562,6 +564,17 @@ impl WipMountRegistry {
         }
         self.namespaces.insert(root.clone(), owner.to_string());
         Ok(WipNamespaceRoute { root })
+    }
+
+    /// Return the unique Host allocation for a provider, not an authorization grant.
+    /// Ambiguous allocations cannot be used to interpret cross-domain Entry input.
+    pub(crate) fn namespace_root(&self, owner: &str) -> Option<&str> {
+        let mut roots = self
+            .namespaces
+            .iter()
+            .filter(|(_, provider)| provider.as_str() == owner);
+        let (root, _) = roots.next()?;
+        roots.next().is_none().then_some(root.as_str())
     }
 
     pub fn mount(
@@ -3240,12 +3253,20 @@ mod tests {
             ["Inspect", "Invoke", "Tree"]
         );
         let metrics = runtime.metrics();
-        assert!(
-            metrics.ordinary_schema_bytes > metrics.wip_schema_bytes,
-            "ordinary={} WIP={}",
-            metrics.ordinary_schema_bytes,
-            metrics.wip_schema_bytes
-        );
+        assert!(metrics.ordinary_schema_bytes > 0);
+        assert!(metrics.wip_schema_bytes > 0);
+
+        // Binding overhead is fixed, not a promise to save bytes for every tiny Tool set.
+        let mut larger = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        for index in 0..48 {
+            larger.register_tool(echo_definition(format!("Echo{index}"), Arc::clone(&calls)));
+        }
+        let larger = install_wip_mode(&mut larger, None, "worker-b".into())
+            .unwrap()
+            .metrics();
+        assert!(larger.ordinary_schema_bytes > metrics.ordinary_schema_bytes);
+        assert_eq!(larger.wip_schema_bytes, metrics.wip_schema_bytes);
+        assert!(larger.ordinary_schema_bytes > larger.wip_schema_bytes);
     }
 
     #[tokio::test]
@@ -3904,7 +3925,7 @@ mod tests {
         let error = runtime
             .invoke(
                 "/features/ticket/tickets/T-1".into(),
-                crate::wip::root_reference("yoi.ticket/item/v1"),
+                crate::wip::root_reference("yoi.ticket/item/v2"),
                 "read".into(),
                 json!({}),
                 ToolExecutionContext::direct(),
@@ -6194,7 +6215,7 @@ mod tests {
         authoring
             .call(
                 collection.into(),
-                crate::wip::root_reference("yoi.ticket/collection/v1"),
+                crate::wip::root_reference("yoi.ticket/collection/v2"),
                 "query".into(),
                 json!({}),
                 ToolExecutionContext::direct(),
@@ -6204,9 +6225,9 @@ mod tests {
         let created = authoring
             .call(
                 collection.into(),
-                crate::wip::root_reference("yoi.ticket/collection/v1"),
+                crate::wip::root_reference("yoi.ticket/collection/v2"),
                 "create".into(),
-                json!({"title": "New ticket"}),
+                json!({"content":{"title": "New ticket"}}),
                 ToolExecutionContext::direct(),
             )
             .await
@@ -6221,7 +6242,7 @@ mod tests {
         authoring
             .call(
                 item.into(),
-                crate::wip::root_reference("yoi.ticket/item/v1"),
+                crate::wip::root_reference("yoi.ticket/item/v2"),
                 "comment".into(),
                 json!({"body": "Native comment"}),
                 ToolExecutionContext::direct(),
@@ -6322,9 +6343,9 @@ mod tests {
         let result = workflow
             .call(
                 item.into(),
-                crate::wip::root_reference("yoi.ticket/item/v1"),
+                crate::wip::root_reference("yoi.ticket/item/v2"),
                 "record_relation".into(),
-                json!({"kind": "depends_on", "target": "T-10"}),
+                json!({"kind": "depends_on", "target": "/tickets/T-10"}),
                 ToolExecutionContext::direct(),
             )
             .await
@@ -6402,6 +6423,9 @@ mod tests {
             coder_engine.register_tool(definition);
         }
         let mut coder_registry = WipMountRegistry::new();
+        coder_registry
+            .allocate_namespace("ticket", "cases")
+            .unwrap();
         let route = coder_registry
             .allocate_namespace("merge-request", "merge-requests")
             .unwrap();
@@ -6433,13 +6457,11 @@ mod tests {
         let opened = coder
             .call(
                 collection.into(),
-                crate::wip::root_reference("yoi.merge-request/collection/v1"),
+                crate::wip::root_reference("yoi.merge-request/collection/v2"),
                 "open".into(),
                 json!({
-                    "ticket": "T-685",
-                    "repository_key": "main",
-                    "selector_from": "work/T-685-native-mr",
-                    "selector_to": "develop"
+                    "ticket": "/cases/T-685",
+                    "repository": {"key":"main","source":"work/T-685-native-mr","target":"develop"}
                 }),
                 ToolExecutionContext::direct(),
             )
@@ -6460,9 +6482,9 @@ mod tests {
         coder
             .call(
                 item.clone(),
-                crate::wip::root_reference("yoi.merge-request/item/v1"),
+                crate::wip::root_reference("yoi.merge-request/item/v2"),
                 "read".into(),
-                json!({"after": 7, "limit": 25}),
+                json!({"page":{"after":{"$case":"value","value":7},"limit":{"$case":"value","value":25}}}),
                 ToolExecutionContext::direct(),
             )
             .await
@@ -6553,7 +6575,7 @@ mod tests {
         reviewer
             .call(
                 item.clone(),
-                crate::wip::root_reference("yoi.merge-request/item/v1"),
+                crate::wip::root_reference("yoi.merge-request/item/v2"),
                 "review".into(),
                 json!({"decision": "approve", "body": "approved", "findings": []}),
                 ToolExecutionContext::direct(),
@@ -6646,8 +6668,8 @@ mod tests {
         orchestrator
             .call(
                 item.clone(),
-                crate::wip::root_reference("yoi.merge-request/item/v1"),
-                "check_readiness".into(),
+                crate::wip::root_reference("yoi.merge-request/item/v2"),
+                "readiness".into(),
                 json!({}),
                 ToolExecutionContext::direct(),
             )
@@ -6657,15 +6679,13 @@ mod tests {
         orchestrator
             .call(
                 item.clone(),
-                crate::wip::root_reference("yoi.merge-request/item/v1"),
+                crate::wip::root_reference("yoi.merge-request/item/v2"),
                 "complete".into(),
                 json!({
                     "operation_id": "merge-op-1",
-                    "approval_event_id": "review-1",
-                    "target_ref_before": "target-1",
-                    "target_ref_after": "result-1",
-                    "strategy": "fast_forward",
-                    "resolution": "clean"
+                    "integration": {"approval_event_id": "review-1",
+                    "target": {"before": "target-1", "after": "result-1"},
+                    "strategy": "fast_forward", "resolution": "clean"}
                 }),
                 ToolExecutionContext::direct(),
             )
@@ -6682,7 +6702,7 @@ mod tests {
         let rejected = orchestrator
             .call(
                 collection.into(),
-                crate::wip::root_reference("yoi.merge-request/collection/v1"),
+                crate::wip::root_reference("yoi.merge-request/collection/v2"),
                 "complete_ticket".into(),
                 json!({}),
                 ToolExecutionContext::direct(),
@@ -7244,6 +7264,7 @@ mod tests {
         assert!(error.to_string().contains("PermissionDenied"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
+    include!("wip/ticket_native_tests.rs");
 }
 
 #[cfg(test)]

@@ -1975,15 +1975,42 @@ where
         let workspace_client = worker.workspace_client_handle();
         let engine = worker.engine_mut();
 
-        if feature_config.merge_request.any() && wip_mode {
-            let namespace_route = wip_mount_registry
-                .allocate_namespace("merge-request", "merge-requests")
-                .map_err(|error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("allocate Merge Request WIP namespace: {error}"),
-                    )
-                })?;
+        // Allocate cross-domain input reference coordinates before mounting either provider.
+        // Allocation is not publication or authorization; current handlers still check both.
+        let mut allocate = |enabled, owner, name| {
+            if enabled && wip_mode {
+                wip_mount_registry
+                    .allocate_namespace(owner, name)
+                    .map(Some)
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("allocate {owner} WIP namespace: {error}"),
+                        )
+                    })
+            } else {
+                Ok(None)
+            }
+        };
+        let merge_request_namespace = allocate(
+            feature_config.merge_request.any() || feature_config.ticket.enabled,
+            "merge-request",
+            "merge-requests",
+        )?;
+        let ticket_namespace = allocate(
+            feature_config.ticket.enabled || feature_config.merge_request.open,
+            "ticket",
+            "tickets",
+        )?;
+        let objective_namespace = allocate(
+            feature_config.objective.enabled || feature_config.ticket.enabled,
+            "objective",
+            "objectives",
+        )?;
+
+        if feature_config.merge_request.any()
+            && let Some(namespace_route) = &merge_request_namespace
+        {
             crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
                 &mut wip_mount_registry,
                 workspace_client.clone(),
@@ -1999,21 +2026,15 @@ where
             })?;
         }
 
-        if feature_config.ticket.enabled && wip_mode {
+        if feature_config.ticket.enabled
+            && let Some(namespace_route) = &ticket_namespace
+        {
             let ticket_access = crate::feature::builtin::ticket::TicketFeatureAccess {
                 authoring: feature_config.ticket.authoring,
                 thread: feature_config.ticket.thread,
                 intake: feature_config.ticket.intake,
                 workflow: feature_config.ticket.workflow,
             };
-            let namespace_route = wip_mount_registry
-                .allocate_namespace("ticket", "tickets")
-                .map_err(|error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("allocate Ticket WIP namespace: {error}"),
-                    )
-                })?;
             crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
                 &mut wip_mount_registry,
                 workspace_client.clone(),
@@ -2039,15 +2060,7 @@ where
                 ) {
                     engine.register_tool(definition);
                 }
-                if wip_mode {
-                    let namespace_route = wip_mount_registry
-                        .allocate_namespace("objective", "objectives")
-                        .map_err(|error| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                format!("allocate Objective WIP namespace: {error}"),
-                            )
-                        })?;
+                if let Some(namespace_route) = &objective_namespace {
                     crate::feature::builtin::objective::mount_workspace_http_objective_wip(
                         &mut wip_mount_registry,
                         workspace_client.clone(),
@@ -4315,6 +4328,8 @@ mod tests {
                 }
             }
         }
+
+        include!("controller/native_record_tests.rs");
 
         struct LargeOutputTool;
 

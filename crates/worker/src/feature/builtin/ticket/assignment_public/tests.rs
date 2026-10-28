@@ -81,6 +81,36 @@ pub(super) fn cases() -> Vec<(PublicAssignmentKind, Value, Value)> {
         ),
     ]
 }
+// Paired inputs exercise the two public contracts against identical domain requests.
+pub(super) fn native_args(kind: PublicAssignmentKind, input: &Value) -> BTreeMap<String, WipValue> {
+    let value = match kind {
+        PublicAssignmentKind::Assign => {
+            let mut principal = input["principal"].clone();
+            let case = principal.as_object_mut().unwrap().remove("kind").unwrap();
+            json!({"principal":{"$case":case,"value":principal},"observed":{"assignment_id":if input["expected_assignment_id"].is_null(){json!({"$case":"null"})}else{json!({"$case":"value","value":input["expected_assignment_id"]})}},"operation_id":input["operation_id"]})
+        }
+        PublicAssignmentKind::Clear => {
+            json!({"assignment_id":input["assignment_id"],"operation_id":input["operation_id"]})
+        }
+        PublicAssignmentKind::Assignments => {
+            json!({"page":{"cursor":input["after_assignment_id"],"limit":input["limit"]}})
+        }
+        PublicAssignmentKind::Diagnostics => {
+            json!({"assignment_id":input["assignment_id"],"page":{"after_input_event_id":input["after_input_event_id"],"after_start_operation_id":input["after_start_operation_id"],"limit":input["limit"]}})
+        }
+        PublicAssignmentKind::Answer => {
+            json!({"observed":{"assignment_id":input["assignment_id"],"expected_last_event_id":input["expected_last_event_id"]},"operation_key":input["operation_key"],"body":input["body"]})
+        }
+        PublicAssignmentKind::ImplementationResult => {
+            json!({"kind":input["kind"],"body":input["body"]})
+        }
+        PublicAssignmentKind::ImplementationResultQuery => json!({"result_id":input["result_id"]}),
+    };
+    match json_to_wip(&value).unwrap() {
+        WipValue::Record(fields) => fields,
+        _ => unreachable!(),
+    }
+}
 #[tokio::test]
 async fn public_assignment_schemas_require_observations_and_exclude_model_actor_claims() {
     for (kind, input, response) in cases() {
@@ -737,15 +767,12 @@ async fn implementation_result_wip_and_native_dispatch_preserve_trusted_call_con
         ),
         permissions: None,
         ticket_reference: "T-743".into(),
+        collection_route: "/tickets".into(),
+        merge_request_route: "/merge-requests".into(),
+        objective_route: "/objectives".into(),
         observations: Arc::new(Mutex::new(TicketObservationState::default())),
     };
-    let args: BTreeMap<_, _> = input
-        .as_object()
-        .unwrap()
-        .iter()
-        .filter(|(key, _)| key.as_str() != "ticket")
-        .map(|(key, value)| (key.clone(), json_to_wip(value).unwrap()))
-        .collect();
+    let args = native_args(kind, &input);
     for call_id in ["call-a", "call-b"] {
         handler
             .call(
@@ -828,15 +855,13 @@ async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inp
             ),
             permissions: None,
             ticket_reference: "T-743".into(),
+            collection_route: "/tickets".into(),
+            merge_request_route: "/merge-requests".into(),
+            objective_route: "/objectives".into(),
             observations: Arc::new(Mutex::new(TicketObservationState::default())),
         };
         input.as_object_mut().unwrap().remove("ticket");
-        let args: BTreeMap<_, _> = input
-            .as_object()
-            .unwrap()
-            .iter()
-            .map(|(key, value)| (key.clone(), json_to_wip(value).unwrap()))
-            .collect();
+        let args = native_args(kind, &input);
         let operation = native_ticket_operation(kind.name()).unwrap().operation;
         handler
             .call(
@@ -882,15 +907,12 @@ async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inp
             rules: vec![],
         }),
         ticket_reference: "T-743".into(),
+        collection_route: "/tickets".into(),
+        merge_request_route: "/merge-requests".into(),
+        objective_route: "/objectives".into(),
         observations: Arc::new(Mutex::new(TicketObservationState::default())),
     };
-    let args = input
-        .as_object()
-        .unwrap()
-        .iter()
-        .filter(|(k, _)| k.as_str() != "ticket")
-        .map(|(k, v)| (k.clone(), json_to_wip(v).unwrap()))
-        .collect();
+    let args = native_args(PublicAssignmentKind::Answer, &input);
     assert!(matches!(
         denied
             .call(

@@ -13,128 +13,147 @@ struct DiagnosticsTool {
 #[async_trait]
 impl Tool for DiagnosticsTool {
     async fn execute(&self, input: &str, _: ToolExecutionContext) -> Result<ToolOutput, ToolError> {
-        let workspace_id = self
-            .client
-            .workspace_id()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| {
-                ToolError::InvalidArgument(
-                    "Notification diagnostics require a Backend Workspace; no local fallback"
-                        .into(),
-                )
-            })?;
-        let query: server_api::NotificationDiagnosticsQuery =
-            serde_json::from_str(input).map_err(|e| ToolError::InvalidArgument(e.to_string()))?;
-        if !(1..=100).contains(&query.limit.unwrap_or(50)) {
-            return Err(ToolError::InvalidArgument(
-                "limit must be between 1 and 100".into(),
-            ));
-        }
-        for value in [
-            &query.ticket,
-            &query.merge_request_id,
-            &query.job_id,
-            &query.source_event_id,
-            &query.assignment_id,
-            &query.delivery_id,
-            &query.source_id,
-            &query.cursor,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
-                return Err(ToolError::InvalidArgument(
-                    "Notification filters must be nonempty, control-free and at most 512 bytes"
-                        .into(),
-                ));
-            }
-        }
-        use server_api::authorization::PermissionResource;
-        let mut resources = Vec::new();
-        if let Some(job_id) = &query.job_id {
-            resources.push(PermissionResource::Job {
-                workspace_id: workspace_id.into(),
-                job_id: job_id.clone(),
-            });
-        }
-        if let Some(ticket_id) = &query.ticket {
-            resources.push(PermissionResource::Ticket {
-                workspace_id: workspace_id.into(),
-                ticket_id: ticket_id.clone(),
-            });
-        }
-        if let Some(merge_request_id) = &query.merge_request_id {
-            resources.push(PermissionResource::MergeRequest {
-                workspace_id: workspace_id.into(),
-                merge_request_id: merge_request_id.clone(),
-            });
-        }
-        // source_checks probes origins independently of the page's other filters.
-        // Opaque (including hashed and legacy Job) identities must resolve from
-        // Host metadata, never from a caller-supplied Job filter.
-        let mut bound_source = None;
-        if let Some(event) = &query.source_event_id {
-            // Ticket ordinals are scoped by source_checks to this Ticket. All
-            // global identities use persisted ownership, including legacy Job
-            // IDs whose spelling happens to resemble an MR identity.
-            if !(event.starts_with("ticket-event:") && query.ticket.is_some()) {
-                bound_source = Some(event.clone());
-            }
-        }
-        if resources.is_empty() && bound_source.is_none() {
-            resources.push(PermissionResource::Workspace {
-                workspace_id: workspace_id.into(),
-            });
-        }
-        for resource in resources {
-            self.client
-                .authorize_operation("notification.diagnostics.read", &resource)
-                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        }
-        if let Some(source_event_id) = bound_source {
-            self.client
-                .authorize_bound_operation(
-                    "notification.diagnostics.read",
-                    server_api::authorization::BoundAuthorizationTarget::NotificationSource {
-                        source_event_id,
-                    },
-                )
-                .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        }
-        let response = self
-            .client
-            .execute_server_operation(WorkspaceServerOperation::NotificationDiagnostics { query })
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-        if !response.is_success() {
-            // Do not expose an arbitrary error body from upstream.
-            return Err(ToolError::ExecutionFailed(format!(
-                "Notification diagnostics failed with HTTP status {}",
-                response.status
-            )));
-        }
-        if response.body.len() > 1024 * 1024 {
-            return Err(ToolError::ExecutionFailed(
-                "Notification response exceeds 1 MiB".into(),
-            ));
-        }
-        let page: server_api::NotificationDiagnosticsPage = serde_json::from_str(&response.body)
-            .map_err(|_| {
-                ToolError::ExecutionFailed("Invalid notification diagnostics response".into())
-            })?;
-        if page.items.len() > 100 {
-            return Err(ToolError::ExecutionFailed(
-                "Notification response exceeds 100 items".into(),
-            ));
-        }
-        Ok(ToolOutput {
-            summary: NAME.into(),
-            content: Some(
-                serde_json::to_string(&page).map_err(|e| ToolError::Internal(e.to_string()))?,
-            ),
-            attachments: vec![],
-        })
+        let query = serde_json::from_str(input)
+            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+        execute_domain(self.client.clone(), query).await
     }
+}
+
+/// Convert an adapter-owned internal command without Tool execution or schema validation.
+pub(super) async fn execute_native(
+    client: Arc<dyn WorkspaceClient>,
+    tool_name: &str,
+    command: Value,
+    _ctx: ToolExecutionContext,
+) -> Option<Result<ToolOutput, ToolError>> {
+    if tool_name != NAME {
+        return None;
+    }
+    Some(match serde_json::from_value(command) {
+        Ok(query) => execute_domain(client, query).await,
+        Err(error) => Err(ToolError::InvalidArgument(error.to_string())),
+    })
+}
+
+async fn execute_domain(
+    client: Arc<dyn WorkspaceClient>,
+    query: server_api::NotificationDiagnosticsQuery,
+) -> Result<ToolOutput, ToolError> {
+    let workspace_id = client
+        .workspace_id()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            ToolError::InvalidArgument(
+                "Notification diagnostics require a Backend Workspace; no local fallback".into(),
+            )
+        })?;
+    if !(1..=100).contains(&query.limit.unwrap_or(50)) {
+        return Err(ToolError::InvalidArgument(
+            "limit must be between 1 and 100".into(),
+        ));
+    }
+    for value in [
+        &query.ticket,
+        &query.merge_request_id,
+        &query.job_id,
+        &query.source_event_id,
+        &query.assignment_id,
+        &query.delivery_id,
+        &query.source_id,
+        &query.cursor,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+            return Err(ToolError::InvalidArgument(
+                "Notification filters must be nonempty, control-free and at most 512 bytes".into(),
+            ));
+        }
+    }
+    use server_api::authorization::PermissionResource;
+    let mut resources = Vec::new();
+    if let Some(job_id) = &query.job_id {
+        resources.push(PermissionResource::Job {
+            workspace_id: workspace_id.into(),
+            job_id: job_id.clone(),
+        });
+    }
+    if let Some(ticket_id) = &query.ticket {
+        resources.push(PermissionResource::Ticket {
+            workspace_id: workspace_id.into(),
+            ticket_id: ticket_id.clone(),
+        });
+    }
+    if let Some(merge_request_id) = &query.merge_request_id {
+        resources.push(PermissionResource::MergeRequest {
+            workspace_id: workspace_id.into(),
+            merge_request_id: merge_request_id.clone(),
+        });
+    }
+    // source_checks probes origins independently of the page's other filters.
+    // Opaque (including hashed and legacy Job) identities must resolve from
+    // Host metadata, never from a caller-supplied Job filter.
+    let mut bound_source = None;
+    if let Some(event) = &query.source_event_id {
+        // Ticket ordinals are scoped by source_checks to this Ticket. All
+        // global identities use persisted ownership, including legacy Job
+        // IDs whose spelling happens to resemble an MR identity.
+        if !(event.starts_with("ticket-event:") && query.ticket.is_some()) {
+            bound_source = Some(event.clone());
+        }
+    }
+    if resources.is_empty() && bound_source.is_none() {
+        resources.push(PermissionResource::Workspace {
+            workspace_id: workspace_id.into(),
+        });
+    }
+    for resource in resources {
+        client
+            .authorize_operation("notification.diagnostics.read", &resource)
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+    }
+    if let Some(source_event_id) = bound_source {
+        client
+            .authorize_bound_operation(
+                "notification.diagnostics.read",
+                server_api::authorization::BoundAuthorizationTarget::NotificationSource {
+                    source_event_id,
+                },
+            )
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+    }
+    let response = client
+        .execute_server_operation(WorkspaceServerOperation::NotificationDiagnostics { query })
+        .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+    if !response.is_success() {
+        // Do not expose an arbitrary error body from upstream.
+        return Err(ToolError::ExecutionFailed(format!(
+            "Notification diagnostics failed with HTTP status {}",
+            response.status
+        )));
+    }
+    if response.body.len() > 1024 * 1024 {
+        return Err(ToolError::ExecutionFailed(
+            "Notification response exceeds 1 MiB".into(),
+        ));
+    }
+    let page: server_api::NotificationDiagnosticsPage = serde_json::from_str(&response.body)
+        .map_err(|_| {
+            ToolError::ExecutionFailed("Invalid notification diagnostics response".into())
+        })?;
+    if page.items.len() > 100 {
+        return Err(ToolError::ExecutionFailed(
+            "Notification response exceeds 100 items".into(),
+        ));
+    }
+    Ok(ToolOutput {
+        summary: NAME.into(),
+        content: Some(
+            serde_json::to_string(&page).map_err(|e| ToolError::Internal(e.to_string()))?,
+        ),
+        attachments: vec![],
+    })
 }
 #[cfg(test)]
 mod authorization_tests {
@@ -234,7 +253,7 @@ mod authorization_tests {
     async fn notification_ticket_grant_rejects_other_ticket_and_wip_rechecks_revocation() {
         let client =
             AuthorizedClient::new(json!({"items":[],"next_cursor":null,"source_checks":[]}));
-        client.grant("notification.diagnostics.read", ticket("T-A"));
+        client.grant("notification.diagnostics.read", ticket("T-1"));
         let (_, tool) = definition(client.clone())();
         assert!(
             tool.execute(r#"{"ticket":"T-B"}"#, ToolExecutionContext::direct())
@@ -252,9 +271,14 @@ mod authorization_tests {
             ),
             permissions: None,
             collection_route: "/tickets".into(),
+            merge_request_route: "/merge-requests".into(),
+            objective_route: "/objectives".into(),
             observations: Arc::new(Mutex::new(TicketObservationState::default())),
         };
-        let args = BTreeMap::from([("ticket".into(), WipValue::String("T-A".into()))]);
+        let args = BTreeMap::from([(
+            "filter".into(),
+            json_to_wip(&json!({"ticket":"/tickets/T-1"})).unwrap(),
+        )]);
         handler
             .call(
                 "notification_diagnostics",
@@ -318,9 +342,14 @@ mod authorization_tests {
             ),
             permissions: None,
             collection_route: "/tickets".into(),
+            merge_request_route: "/merge-requests".into(),
+            objective_route: "/objectives".into(),
             observations: Arc::new(Mutex::new(TicketObservationState::default())),
         };
-        let args = BTreeMap::from([("job_id".into(), WipValue::String("Job-A".into()))]);
+        let args = BTreeMap::from([(
+            "filter".into(),
+            json_to_wip(&json!({"job_id":"Job-A"})).unwrap(),
+        )]);
         handler
             .call(
                 "notification_diagnostics",
@@ -453,4 +482,86 @@ pub(super) fn definition(client: Arc<dyn WorkspaceClient>) -> ToolDefinition {
             }) as Arc<dyn Tool>,
         )
     })
+}
+
+#[cfg(test)]
+mod native_command_tests {
+    use super::*;
+    use assignment_tracking::authorization_tests::{AuthorizedClient, ticket};
+    use server_api::authorization::PermissionResource;
+
+    #[tokio::test]
+    async fn internal_notification_command_requires_all_origins_and_shares_tool_request() {
+        let client =
+            AuthorizedClient::new(json!({"items":[],"next_cursor":null,"source_checks":[]}));
+        let input = json!({"ticket":"T-A","job_id":"Job-A","cursor":"source/7?","limit":2});
+        client.grant("notification.diagnostics.read", ticket("T-A"));
+        assert!(
+            execute_native(
+                client.clone(),
+                NAME,
+                input.clone(),
+                ToolExecutionContext::direct()
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert!(client.requests.lock().unwrap().is_empty());
+        client.grant(
+            "notification.diagnostics.read",
+            PermissionResource::Job {
+                workspace_id: "workspace".into(),
+                job_id: "Job-A".into(),
+            },
+        );
+        let (_, tool) = definition(client.clone())();
+        let ordinary = tool
+            .execute(&input.to_string(), ToolExecutionContext::direct())
+            .await
+            .unwrap();
+        let native = execute_native(
+            client.clone(),
+            NAME,
+            input.clone(),
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(native.content, ordinary.content);
+        {
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests[0], requests[1]);
+        }
+        client.grants.lock().unwrap().clear();
+        assert!(
+            execute_native(client.clone(), NAME, input, ToolExecutionContext::direct())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(client.requests.lock().unwrap().len(), 2);
+        assert!(
+            execute_native(
+                client.clone(),
+                "Unknown",
+                Value::Null,
+                ToolExecutionContext::direct()
+            )
+            .await
+            .is_none()
+        );
+        assert!(matches!(
+            execute_native(
+                client,
+                NAME,
+                json!({"limit":0}),
+                ToolExecutionContext::direct()
+            )
+            .await
+            .unwrap(),
+            Err(ToolError::InvalidArgument(_))
+        ));
+    }
 }

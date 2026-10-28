@@ -150,15 +150,47 @@ async fn tracking_operations_authorize_exact_ticket_before_dispatch_and_recheck_
             ),
             permissions: None,
             ticket_reference: "T-A".into(),
+            collection_route: "/tickets".into(),
+            merge_request_route: "/merge-requests".into(),
+            objective_route: "/objectives".into(),
             observations: Arc::new(Mutex::new(TicketObservationState::default())),
         };
-        let args = input
-            .as_object()
-            .unwrap()
-            .iter()
-            .filter(|(key, _)| key.as_str() != "ticket")
-            .map(|(key, value)| (key.clone(), json_to_wip(value).unwrap()))
-            .collect();
+        let mut native = input.clone();
+        native.as_object_mut().unwrap().remove("ticket");
+        if matches!(kind, TrackingToolKind::Update) {
+            let fields = native.as_object_mut().unwrap();
+            let assignment = fields.remove("assignment_id").unwrap();
+            let event = fields.remove("expected_last_event_id").unwrap();
+            fields.insert(
+                "observed".into(),
+                json!({"assignment_id":assignment,"expected_last_event_id":event}),
+            );
+            for field in ["waiting_reason", "progress", "next_action", "result"] {
+                if let Some(value) = native["tracking"].get_mut(field) {
+                    *value = if value.is_null() {
+                        json!({"$case":"null"})
+                    } else {
+                        json!({"$case":"value","value":value.clone()})
+                    };
+                }
+            }
+        }
+        if matches!(kind, TrackingToolKind::History) {
+            let fields = native.as_object_mut().unwrap();
+            let cursor = fields.remove("after_event_id");
+            let limit = fields.remove("limit");
+            let mut page = serde_json::Map::new();
+            if let Some(v) = cursor {
+                page.insert("cursor".into(), v);
+            }
+            if let Some(v) = limit {
+                page.insert("limit".into(), v);
+            }
+            fields.insert("page".into(), Value::Object(page));
+        }
+        let WipValue::Record(args) = json_to_wip(&native).unwrap() else {
+            unreachable!()
+        };
         let projection = native_ticket_operation(kind.name()).unwrap();
         assert!(matches!(
             handler
