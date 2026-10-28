@@ -44,6 +44,11 @@ enum Mode {
     WorkersHelp,
     Mcp(mcp_cli::McpCliCommand),
     Plugin(plugin_cli::PluginCliCommand),
+    PluginCatalog {
+        command: plugin_cli::PluginCatalogCommand,
+        args: plugin_cli::PluginCliArgs,
+        target: client::ResolvedTarget,
+    },
     Objective {
         cli: objective_cli::ObjectiveCli,
         target: client::ResolvedTarget,
@@ -184,6 +189,19 @@ async fn run(mode: Mode) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Mode::PluginCatalog {
+            command,
+            args,
+            target,
+        } => {
+            let output = plugin_cli::run_catalog(command, args, target).await;
+            print!("{}", output.stdout);
+            if output.success {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         Mode::Objective { cli, target } => {
             match tokio::task::spawn_blocking(move || objective_cli::run(cli, target)).await {
                 Ok(Ok(output)) => {
@@ -612,9 +630,38 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             )?));
         }
         "plugin" => {
-            let _target = resolve_local_cli_connection(connection_resolver, CliCommand::Plugin)?;
-            let plugin_cli = parse_plugin_args(&args[1..])?;
-            return Ok(Mode::Plugin(plugin_cli));
+            let cli = parse_plugin_args(&args[1..])?;
+            if let plugin_cli::PluginCliCommand::Catalog { command, args } = cli {
+                if target_selection.explicit_local {
+                    return Err(ParseError("yoi plugin catalog requires a Backend Workspace target and cannot use --local".into()));
+                }
+                let target = resolve_tui_target(
+                    connection_resolver,
+                    CliCommand::PluginCatalog,
+                    &target_selection,
+                    &current_dir()?,
+                )?
+                .resolve()
+                .map_err(|error| ParseError(error.to_string()))?;
+                if matches!(target, client::ResolvedTarget::Standalone) {
+                    return Err(ParseError(
+                        "yoi plugin catalog requires a Backend Workspace target".into(),
+                    ));
+                }
+                return Ok(Mode::PluginCatalog {
+                    command,
+                    args,
+                    target,
+                });
+            }
+            if target_selection.backend_url.is_some() || target_selection.workspace_id.is_some() {
+                return Err(backend_target_option_error_for_local_command(
+                    CliCommand::Plugin,
+                    "--backend/--workspace-id",
+                ));
+            }
+            // Explicit-path authoring has no connection or Workspace dependency.
+            return Ok(Mode::Plugin(cli));
         }
         "login" => {
             if target_selection.explicit_local {
@@ -1738,7 +1785,8 @@ async fn run_login(backend_url: &str, no_wait: bool) -> Result<(), ParseError> {
 fn parse_plugin_args(args: &[String]) -> Result<plugin_cli::PluginCliCommand, ParseError> {
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(ParseError(
-            "yoi plugin requires `new`, `check`, or `pack`".to_string(),
+            "yoi plugin requires an authoring or catalog command; see `yoi plugin --help`"
+                .to_string(),
         ));
     };
     match subcommand.as_str() {
@@ -1789,6 +1837,16 @@ fn parse_plugin_args(args: &[String]) -> Result<plugin_cli::PluginCliCommand, Pa
                     "yoi plugin pack accepts exactly one plugin directory".to_string(),
                 )),
             }
+        }
+        "upload" | "install" | "list" | "show" | "add-artifact" | "revoke" | "uninstall"
+        | "operation" => {
+            if rest
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+            {
+                return Err(ParseError(plugin_usage().to_string()));
+            }
+            plugin_cli::parse_catalog_args(subcommand, rest).map_err(ParseError)
         }
         "--help" | "-h" => Err(ParseError(plugin_usage().to_string())),
         other => Err(ParseError(format!(
@@ -1847,7 +1905,7 @@ fn parse_plugin_pack_args(
 }
 
 fn plugin_usage() -> &'static str {
-    "usage: yoi plugin new <rust-component-tool|rust-component-https-tool> <path-or-name> [--json]\n       yoi plugin check <path-or-package> [--json]\n       yoi plugin pack <path> [--output <file>] [--json]"
+    "usage: yoi plugin new <rust-component-tool|rust-component-https-tool> <path-or-name> [--json]\n       yoi plugin check <path-or-package> [--json]\n       yoi plugin pack <path> [--output <file>] [--json]\n\nCatalog commands require a Backend Workspace target (select --backend/--workspace-id before `plugin`):\n       yoi [TARGET] plugin upload <package> [--json]\n       yoi [TARGET] plugin install --upload-id <id> --alias <alias> --operation-key <key> [--json]\n       yoi [TARGET] plugin list [--cursor <cursor>] [--limit <1..100>] [--json]\n       yoi [TARGET] plugin show <installation-id> [--json]\n       yoi [TARGET] plugin add-artifact <installation-id> --upload-id <id> --expected-last-operation-id <id> --operation-key <key> [--json]\n       yoi [TARGET] plugin revoke <installation-id> --artifact-digest <digest> --reason <reason> --expected-last-operation-id <id> --operation-key <key> [--json]\n       yoi [TARGET] plugin uninstall <installation-id> --expected-last-operation-id <id> --operation-key <key> [--json]\n       yoi [TARGET] plugin operation <operation-id> [--json]\nUpload/install only register artifacts; they do not enable or start Workers. Use the observed last_operation from show; a replay receipt is not a fresh observation. Reconcile uncertain mutations before retrying with the same key and exact input."
 }
 
 fn parse_mcp_args(args: &[String]) -> Result<mcp_cli::McpCliCommand, ParseError> {
@@ -2083,7 +2141,7 @@ Host commands:
   worker delete/prune          Safely clean up legacy Worker metadata only
   ticket <COMMAND>             Manage Tickets through a Backend target
   objective <COMMAND>          Manage Objectives through a Backend target
-  plugin <COMMAND>             Author/check/pack explicit Plugin packages
+  plugin <COMMAND>             Author packages or manage Backend Plugin catalog
   mcp <COMMAND>                Inspect configured MCP servers
   session <COMMAND>            Inspect/prune Standalone session logs
   --local subject <COMMAND>    Explicitly create/list local Subjects (create <ROLE>, list)
@@ -2514,11 +2572,9 @@ backend = "shared"
         assert!(TOP_LEVEL_HELP.contains("default_connection = \"local\""));
         assert!(TOP_LEVEL_HELP.contains("yoi-server"));
         assert!(TOP_LEVEL_HELP.contains("yoi-runtime"));
-        assert!(
-            TOP_LEVEL_HELP.contains(
-                "plugin <COMMAND>             Author/check/pack explicit Plugin packages"
-            )
-        );
+        assert!(TOP_LEVEL_HELP.contains(
+            "plugin <COMMAND>             Author packages or manage Backend Plugin catalog"
+        ));
         assert!(!TOP_LEVEL_HELP.contains("Build/check/list/show plugins"));
         assert!(TOP_LEVEL_HELP.contains("yoi workspace create"));
         assert!(!TOP_LEVEL_HELP.contains("yoi workspace serve"));
@@ -3808,10 +3864,8 @@ backend = "shared"
     }
 
     #[test]
-    fn plugin_cli_rejects_ambient_catalog_commands_and_options() {
+    fn plugin_cli_rejects_ambient_catalog_options() {
         for args in [
-            vec!["plugin", "list"],
-            vec!["plugin", "show", "project:echo"],
             vec!["plugin", "check", "plugin", "--workspace=/tmp/ws"],
             vec!["plugin", "check", "plugin", "--profile", "project:inspect"],
         ] {
@@ -3829,6 +3883,111 @@ backend = "shared"
             }
             _ => panic!("expected Plugin check mode"),
         }
+    }
+
+    #[test]
+    fn plugin_authoring_never_resolves_a_connection_or_workspace() {
+        struct NoConnection;
+        impl CliConnectionResolver for NoConnection {
+            fn resolve_connection(
+                &self,
+                _: CliCommand,
+                _: cli_connection::CliConnectionInput<'_>,
+            ) -> Result<Box<dyn Target>, ParseError> {
+                panic!("offline Plugin authoring must not resolve a connection")
+            }
+        }
+        for args in [
+            vec!["plugin", "new", "rust-component-tool", "destination"],
+            vec!["plugin", "check", "explicit.yoi-plugin"],
+            vec![
+                "--local",
+                "plugin",
+                "pack",
+                "explicit",
+                "--output=explicit.yoi-plugin",
+            ],
+        ] {
+            let argv = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            assert!(matches!(
+                parse_args_slice_with_connection_resolver(&argv, &NoConnection).unwrap(),
+                Mode::Plugin(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn plugin_catalog_uses_backend_workspace_selection_and_rejects_local() {
+        let resolver = DefaultBackendCliConnectionResolver {
+            backend_url: "http://selected.example",
+        };
+        for args in [
+            vec!["plugin", "list"],
+            vec![
+                "--backend",
+                "http://selected.example",
+                "plugin",
+                "show",
+                "installation",
+            ],
+            vec![
+                "--workspace-id",
+                "explicit-workspace",
+                "plugin",
+                "operation",
+                "operation",
+            ],
+        ] {
+            let argv = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            match parse_args_slice_with_connection_resolver(&argv, &resolver).unwrap() {
+                Mode::PluginCatalog {
+                    target:
+                        client::ResolvedTarget::Backend {
+                            base_url,
+                            workspace_id,
+                        },
+                    ..
+                } => {
+                    assert_eq!(base_url, "http://selected.example");
+                    assert_eq!(
+                        workspace_id,
+                        if args.contains(&"--workspace-id") {
+                            "explicit-workspace"
+                        } else {
+                            "workspace-from-backend"
+                        }
+                    );
+                }
+                other => panic!("expected Backend Plugin catalog mode, got {other:?}"),
+            }
+        }
+        let argv = ["--local", "plugin", "list"].map(str::to_string);
+        assert!(
+            parse_args_slice_with_connection_resolver(&argv, &resolver)
+                .unwrap_err()
+                .0
+                .contains("requires a Backend")
+        );
+    }
+
+    #[test]
+    fn plugin_explicit_workspace_does_not_discover_repository_and_offline_backend_is_not_local() {
+        let resolver = FixedCliConnectionResolver {
+            backend_url: "http://selected.example",
+        };
+        let argv = ["--workspace-id", "explicit", "plugin", "list"].map(str::to_string);
+        // This resolver has no repository discovery implementation.
+        assert!(matches!(
+            parse_args_slice_with_connection_resolver(&argv, &resolver).unwrap(),
+            Mode::PluginCatalog { .. }
+        ));
+        let argv = ["plugin", "list"].map(str::to_string);
+        assert!(
+            parse_args_slice_with_connection_resolver(&argv, &OfflineBackendCliConnectionResolver)
+                .unwrap_err()
+                .0
+                .contains("Backend is offline")
+        );
     }
 
     #[test]

@@ -60,3 +60,7 @@ required-features = ["typescript"]
 [[example]]
 name = "generate_drive_api_types"
 required-features = ["typescript"]
+
+[[example]]
+name = "generate_plugin_api_types"
+required-features = ["typescript"]

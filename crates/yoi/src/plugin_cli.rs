@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 use manifest::plugin::{
@@ -38,6 +38,360 @@ pub(crate) enum PluginCliCommand {
         output: Option<PathBuf>,
         args: PluginCliArgs,
     },
+    Catalog {
+        command: PluginCatalogCommand,
+        args: PluginCliArgs,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PluginCatalogCommand {
+    Upload(PathBuf),
+    Install(server_api::PluginInstallRequest),
+    List(server_api::PluginListRequest),
+    Show(String),
+    AddArtifact {
+        installation_id: String,
+        request: server_api::PluginAddArtifactRequest,
+    },
+    Revoke {
+        installation_id: String,
+        request: server_api::PluginRevokeRequest,
+    },
+    Uninstall {
+        installation_id: String,
+        request: server_api::PluginUninstallRequest,
+    },
+    Operation(String),
+}
+
+pub(crate) fn parse_catalog_args(
+    subcommand: &str,
+    args: &[String],
+) -> std::result::Result<PluginCliCommand, String> {
+    let allowed: &[&str] = match subcommand {
+        "upload" | "show" | "operation" => &[],
+        "install" => &["--upload-id", "--alias", "--operation-key"],
+        "list" => &["--cursor", "--limit"],
+        "add-artifact" => &[
+            "--upload-id",
+            "--expected-last-operation-id",
+            "--operation-key",
+        ],
+        "revoke" => &[
+            "--artifact-digest",
+            "--reason",
+            "--expected-last-operation-id",
+            "--operation-key",
+        ],
+        "uninstall" => &["--expected-last-operation-id", "--operation-key"],
+        _ => return Err(format!("unknown yoi plugin subcommand `{subcommand}`")),
+    };
+    let mut options = std::collections::BTreeMap::new();
+    let mut positional = Vec::new();
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--json" {
+            json = true;
+        } else if arg.starts_with('-') {
+            let (name, inline) = arg
+                .split_once('=')
+                .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+            if !allowed.contains(&name) {
+                return Err(format!("unknown yoi plugin {subcommand} option `{name}`"));
+            }
+            let value = match inline {
+                Some(value) => value,
+                None => {
+                    index += 1;
+                    args.get(index)
+                        .map(String::as_str)
+                        .ok_or_else(|| format!("{name} requires a value"))?
+                }
+            };
+            if value.trim().is_empty() || value.starts_with('-') {
+                return Err(format!("{name} requires a nonempty value"));
+            }
+            if options
+                .insert(name.to_string(), value.to_string())
+                .is_some()
+            {
+                return Err(format!("{name} must not be provided more than once"));
+            }
+        } else {
+            positional.push(arg.clone());
+        }
+        index += 1;
+    }
+    let required = |name: &str| -> std::result::Result<String, String> {
+        options
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("yoi plugin {subcommand} requires {name}"))
+    };
+    let one_positional = || -> std::result::Result<String, String> {
+        match positional.as_slice() {
+            [value] if !value.trim().is_empty() => Ok(value.clone()),
+            _ => Err(format!(
+                "yoi plugin {subcommand} requires exactly one {}",
+                if subcommand == "upload" {
+                    "package path"
+                } else if subcommand == "operation" {
+                    "operation ID"
+                } else {
+                    "installation ID"
+                }
+            )),
+        }
+    };
+    if matches!(subcommand, "install" | "list") && !positional.is_empty() {
+        return Err(format!(
+            "yoi plugin {subcommand} accepts no positional arguments"
+        ));
+    }
+    let command = match subcommand {
+        "upload" => PluginCatalogCommand::Upload(PathBuf::from(one_positional()?)),
+        "install" => PluginCatalogCommand::Install(server_api::PluginInstallRequest {
+            upload_id: required("--upload-id")?,
+            alias: required("--alias")?,
+            operation_key: required("--operation-key")?,
+        }),
+        "list" => {
+            let limit = options
+                .get("--limit")
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| (1..=100).contains(n))
+                        .ok_or_else(|| "--limit must be between 1 and 100".to_string())
+                })
+                .transpose()?;
+            PluginCatalogCommand::List(server_api::PluginListRequest {
+                cursor: options.get("--cursor").cloned(),
+                limit,
+            })
+        }
+        "show" => PluginCatalogCommand::Show(one_positional()?),
+        "add-artifact" => PluginCatalogCommand::AddArtifact {
+            installation_id: one_positional()?,
+            request: server_api::PluginAddArtifactRequest {
+                upload_id: required("--upload-id")?,
+                expected_last_operation: required("--expected-last-operation-id")?,
+                operation_key: required("--operation-key")?,
+            },
+        },
+        "revoke" => PluginCatalogCommand::Revoke {
+            installation_id: one_positional()?,
+            request: server_api::PluginRevokeRequest {
+                artifact_digest: required("--artifact-digest")?,
+                reason: required("--reason")?,
+                expected_last_operation: required("--expected-last-operation-id")?,
+                operation_key: required("--operation-key")?,
+            },
+        },
+        "uninstall" => PluginCatalogCommand::Uninstall {
+            installation_id: one_positional()?,
+            request: server_api::PluginUninstallRequest {
+                expected_last_operation: required("--expected-last-operation-id")?,
+                operation_key: required("--operation-key")?,
+            },
+        },
+        "operation" => PluginCatalogCommand::Operation(one_positional()?),
+        _ => unreachable!("validated subcommand"),
+    };
+    Ok(PluginCliCommand::Catalog {
+        command,
+        args: PluginCliArgs { json },
+    })
+}
+
+// Use the shared credential resolver without exposing token storage or adding a
+// second login path. The generated client owns path encoding and response bounds.
+struct PluginAuthorizer(client::BackendApiClient);
+
+impl server_api::client_support::RequestAuthorizer for PluginAuthorizer {
+    fn authorize(
+        &self,
+        request: server_api::client_support::AuthorizerRequest<'_>,
+    ) -> std::result::Result<
+        reqwest::header::HeaderMap,
+        server_api::client_support::AuthorizationError,
+    > {
+        let prepared = self
+            .0
+            .request(request.method.clone(), request.path_and_query)
+            .and_then(|builder| builder.build().map_err(client::BackendApiClientError::Http))
+            .map_err(|_| server_api::client_support::AuthorizationError::new())?;
+        Ok(prepared.headers().clone())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogFailure {
+    status: Option<u16>,
+    error: String,
+    message: String,
+    diagnostics: Vec<server_api::Diagnostic>,
+}
+
+impl CatalogFailure {
+    fn local(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: None,
+            error: "plugin_cli".into(),
+            message: error.to_string(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+impl From<server_api::client_support::ClientError<server_api::RepositoryApiError>>
+    for CatalogFailure
+{
+    fn from(
+        error: server_api::client_support::ClientError<server_api::RepositoryApiError>,
+    ) -> Self {
+        match error {
+            server_api::client_support::ClientError::Public { status, error } => Self {
+                status: Some(status.as_u16()),
+                error: error.error,
+                message: error.message,
+                diagnostics: error.diagnostics,
+            },
+            server_api::client_support::ClientError::Failure(error) => Self::local(error),
+        }
+    }
+}
+
+pub(crate) struct CatalogOutput {
+    pub success: bool,
+    pub stdout: String,
+}
+
+pub(crate) async fn run_catalog(
+    command: PluginCatalogCommand,
+    args: PluginCliArgs,
+    target: client::ResolvedTarget,
+) -> CatalogOutput {
+    let result = async {
+        let client::ResolvedTarget::Backend { base_url, workspace_id } = target else {
+            return Err(CatalogFailure::local("Plugin catalog requires a Backend Workspace target; use --backend and --workspace-id"));
+        };
+        let backend = client::BackendApiClient::from_stored_token(&base_url).map_err(CatalogFailure::local)?;
+        // No redirect may forward a bearer credential to another origin.
+        let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .build().map_err(CatalogFailure::local)?;
+        let api = server_api::ServerApiClient::builder(backend.origin().as_str())
+            .map_err(CatalogFailure::local)?.client(http).authorizer(PluginAuthorizer(backend))
+            .response_body_limit(16 * 1024 * 1024).build().map_err(CatalogFailure::local)?;
+        execute_catalog(command, &api, workspace_id).await
+    }.await;
+    catalog_output(result, args.json)
+}
+
+fn catalog_output(
+    result: std::result::Result<serde_json::Value, CatalogFailure>,
+    json: bool,
+) -> CatalogOutput {
+    let (success, value) = match result {
+        Ok(value) => (true, value),
+        Err(error) => (
+            false,
+            serde_json::json!({
+                "status": "failed", "diagnostic": error,
+                "reconciliation": "A failed response does not prove a mutation was not committed. Reconcile the saved operation; retry only with the same operation key and exact input. Do not refresh expected-last-operation-id for a replay."
+            }),
+        ),
+    };
+    let rendered = serde_json::to_string_pretty(&value).expect("JSON value is serializable");
+    let stdout = if json {
+        format!("{rendered}\n")
+    } else {
+        format!(
+            "plugin catalog: {}\n{rendered}\n",
+            if success {
+                "backend response (registration does not enable or start a Worker)"
+            } else {
+                "failed"
+            }
+        )
+    };
+    CatalogOutput { success, stdout }
+}
+
+async fn execute_catalog<A: server_api::client_support::RequestAuthorizer>(
+    command: PluginCatalogCommand,
+    api: &server_api::ServerApiClient<A>,
+    workspace_id: String,
+) -> std::result::Result<serde_json::Value, CatalogFailure> {
+    let value = match command {
+        PluginCatalogCommand::Upload(input) => {
+            let bytes = read_upload(&input).map_err(CatalogFailure::local)?;
+            serde_json::to_value(api.plugin_upload(workspace_id, bytes.into()).await?)
+        }
+        PluginCatalogCommand::Install(request) => {
+            serde_json::to_value(api.plugin_install(workspace_id, request).await?)
+        }
+        PluginCatalogCommand::List(query) => {
+            serde_json::to_value(api.plugin_list(workspace_id, query).await?)
+        }
+        PluginCatalogCommand::Show(id) => {
+            serde_json::to_value(api.plugin_show(workspace_id, id).await?)
+        }
+        PluginCatalogCommand::AddArtifact {
+            installation_id,
+            request,
+        } => serde_json::to_value(
+            api.plugin_artifact_add(workspace_id, installation_id, request)
+                .await?,
+        ),
+        PluginCatalogCommand::Revoke {
+            installation_id,
+            request,
+        } => serde_json::to_value(
+            api.plugin_revoke(workspace_id, installation_id, request)
+                .await?,
+        ),
+        PluginCatalogCommand::Uninstall {
+            installation_id,
+            request,
+        } => serde_json::to_value(
+            api.plugin_uninstall(workspace_id, installation_id, request)
+                .await?,
+        ),
+        PluginCatalogCommand::Operation(id) => {
+            serde_json::to_value(api.plugin_operation(workspace_id, id).await?)
+        }
+    };
+    value.map_err(CatalogFailure::local)
+}
+
+fn read_upload(input: &Path) -> Result<Vec<u8>> {
+    let limit = PluginPackageLimits::default().max_package_size_bytes;
+    let file = fs::File::open(input)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(
+            "Plugin upload requires an explicit .yoi-plugin regular file; pack directories first"
+                .into(),
+        );
+    }
+    if metadata.len() > limit {
+        return Err(
+            format!("Plugin upload exceeds the shared package limit of {limit} bytes").into(),
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(
+            format!("Plugin upload exceeds the shared package limit of {limit} bytes").into(),
+        );
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn run(command: PluginCliCommand) -> Result<()> {
@@ -62,6 +416,9 @@ pub(crate) fn run(command: PluginCliCommand) -> Result<()> {
             output,
             args,
         } => render_pack(&input, output.as_deref(), &args)?,
+        PluginCliCommand::Catalog { .. } => {
+            return Err("Plugin catalog requires Backend dispatch".into());
+        }
     };
     print!("{rendered}");
     Ok(())
@@ -570,6 +927,422 @@ fn bound_text(mut text: String) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn catalog_command(subcommand: &str, args: &[&str]) -> PluginCatalogCommand {
+        let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        match parse_catalog_args(subcommand, &args).unwrap() {
+            PluginCliCommand::Catalog { command, .. } => command,
+            _ => panic!("expected catalog command"),
+        }
+    }
+
+    #[test]
+    fn catalog_parser_requires_explicit_mutation_keys_and_observed_operations() {
+        for (subcommand, args, missing) in [
+            (
+                "install",
+                vec!["--upload-id", "upload", "--alias", "alias"],
+                "--operation-key",
+            ),
+            (
+                "add-artifact",
+                vec![
+                    "installation",
+                    "--upload-id",
+                    "upload",
+                    "--operation-key",
+                    "key",
+                ],
+                "--expected-last-operation-id",
+            ),
+            (
+                "revoke",
+                vec![
+                    "installation",
+                    "--artifact-digest",
+                    "sha256:artifact",
+                    "--reason",
+                    "reason",
+                    "--operation-key",
+                    "key",
+                ],
+                "--expected-last-operation-id",
+            ),
+            (
+                "uninstall",
+                vec!["installation", "--operation-key", "key"],
+                "--expected-last-operation-id",
+            ),
+            (
+                "uninstall",
+                vec!["installation", "--expected-last-operation-id", "observed"],
+                "--operation-key",
+            ),
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(
+                parse_catalog_args(subcommand, &args)
+                    .unwrap_err()
+                    .contains(missing)
+            );
+        }
+        for args in [
+            vec![
+                "installation",
+                "--operation-key=",
+                "--expected-last-operation-id=observed",
+            ],
+            vec![
+                "installation",
+                "--operation-key=key",
+                "--operation-key=other",
+                "--expected-last-operation-id=observed",
+            ],
+            vec![
+                "installation",
+                "--operation-key=key",
+                "--expected-last-operation-id= ",
+            ],
+            vec![
+                "installation",
+                "--operation-key=key",
+                "--expected-last-operation-id=observed",
+                "--operator",
+            ],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(parse_catalog_args("uninstall", &args).is_err());
+        }
+        for limit in ["0", "101", "-1", "not-a-number"] {
+            assert!(parse_catalog_args("list", &[format!("--limit={limit}")]).is_err());
+        }
+        assert!(parse_catalog_args("list", &["extra".into()]).is_err());
+        assert!(parse_catalog_args("show", &[]).is_err());
+        assert!(parse_catalog_args("operation", &["one".into(), "two".into()]).is_err());
+    }
+
+    #[test]
+    fn upload_reads_explicit_regular_bytes_with_the_shared_package_bound() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("package.yoi-plugin");
+        let bytes = b"exact uploaded bytes\0";
+        fs::write(&input, bytes).unwrap();
+        assert_eq!(read_upload(&input).unwrap(), bytes);
+        assert!(
+            read_upload(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("regular file")
+        );
+        let file = fs::File::create(&input).unwrap();
+        file.set_len(PluginPackageLimits::default().max_package_size_bytes + 1)
+            .unwrap();
+        assert!(
+            read_upload(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("shared package limit")
+        );
+    }
+
+    // The real argv parser, generated HTTP client and output conversion are connected
+    // here. Only the remote Server and credential issuance are replaced; this does
+    // not attest Server authentication, catalog persistence or domain validation.
+    mod catalog_http {
+        use super::*;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct TestAuthorizer;
+        impl server_api::client_support::RequestAuthorizer for TestAuthorizer {
+            fn authorize(
+                &self,
+                _: server_api::client_support::AuthorizerRequest<'_>,
+            ) -> std::result::Result<
+                reqwest::header::HeaderMap,
+                server_api::client_support::AuthorizationError,
+            > {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    reqwest::header::AUTHORIZATION,
+                    "Bearer test-only".parse().unwrap(),
+                );
+                Ok(headers)
+            }
+        }
+
+        async fn server(
+            status: u16,
+            response: serde_json::Value,
+        ) -> (String, tokio::task::JoinHandle<(String, Vec<u8>)>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(10), async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let (headers, body_start, content_len) = loop {
+                        let mut buf = [0; 4096];
+                        let len = stream.read(&mut buf).await.unwrap();
+                        assert_ne!(len, 0, "request ended before headers");
+                        request.extend_from_slice(&buf[..len]);
+                        if let Some(end) = request.windows(4).position(|b| b == b"\r\n\r\n") {
+                            let headers = String::from_utf8(request[..end].to_vec()).unwrap();
+                            let content_len = headers.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                            }).unwrap_or(0);
+                            break (headers, end + 4, content_len);
+                        }
+                    };
+                    while request.len() - body_start < content_len {
+                        let mut buf = [0; 4096];
+                        let len = stream.read(&mut buf).await.unwrap();
+                        assert_ne!(len, 0, "request ended before body");
+                        request.extend_from_slice(&buf[..len]);
+                    }
+                    let body = serde_json::to_vec(&response).unwrap();
+                    stream.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                    (headers, request[body_start..].to_vec())
+                }).await.expect("bounded mock Server request")
+            });
+            (origin, task)
+        }
+
+        fn installation() -> serde_json::Value {
+            serde_json::json!({"installation_id":"inst/one", "alias":"alias", "package_id":"example", "last_operation":"saved-operation", "uninstalled":false, "artifacts":[]})
+        }
+
+        #[tokio::test]
+        async fn catalog_commands_send_exact_workspace_paths_query_and_caller_mutation_inputs() {
+            let dir = tempdir().unwrap();
+            let package = dir.path().join("explicit.yoi-plugin");
+            fs::write(&package, b"exact\0archive bytes").unwrap();
+            let upload_path = package.to_str().unwrap();
+            let operation = |kind| serde_json::json!({"operation_id":"saved-operation", "kind":kind, "installation":installation()});
+            let mut summary = installation();
+            summary.as_object_mut().unwrap().remove("artifacts");
+            let upload = serde_json::json!({"upload_id":"upload", "expires_at":"2026-10-30T00:00:00Z", "artifact":{
+                "package_id":"example", "name":"Example", "version":"1.0.0", "description":null,
+                "package_digest":"sha256:logical", "artifact_digest":"sha256:archive", "artifact_size":19,
+                "schema_version":2, "world":"yoi:plugin/tool-plugin@2.0.0", "required_imports":[], "tools":[],
+                "connections":[], "requested_grants":[], "config_schema":{"identity":"example", "version":"1", "digest":"sha256:schema", "namespace":"example", "dcdl":"schema"},
+                "revoked":false, "revocation_reason":null
+            }});
+            let cases = vec![
+                (
+                    "upload",
+                    vec![upload_path],
+                    "POST",
+                    "/api/w/ws%20space/plugin-uploads",
+                    None,
+                    upload,
+                ),
+                (
+                    "install",
+                    vec![
+                        "--upload-id=upload",
+                        "--alias=alias",
+                        "--operation-key=exact-key",
+                    ],
+                    "POST",
+                    "/api/w/ws%20space/plugins",
+                    Some(
+                        serde_json::json!({"upload_id":"upload", "alias":"alias", "operation_key":"exact-key"}),
+                    ),
+                    operation("install"),
+                ),
+                (
+                    "list",
+                    vec!["--cursor=next /+=", "--limit=7"],
+                    "GET",
+                    "/api/w/ws%20space/plugins",
+                    None,
+                    serde_json::json!({"installations":[summary], "next_cursor":"opaque-next"}),
+                ),
+                (
+                    "show",
+                    vec!["inst/one"],
+                    "GET",
+                    "/api/w/ws%20space/plugins/inst%2Fone",
+                    None,
+                    installation(),
+                ),
+                (
+                    "add-artifact",
+                    vec![
+                        "inst/one",
+                        "--upload-id=upload",
+                        "--expected-last-operation-id=observed-operation",
+                        "--operation-key=exact-key",
+                    ],
+                    "POST",
+                    "/api/w/ws%20space/plugins/inst%2Fone/artifacts",
+                    Some(
+                        serde_json::json!({"upload_id":"upload", "expected_last_operation":"observed-operation", "operation_key":"exact-key"}),
+                    ),
+                    operation("add_artifact"),
+                ),
+                (
+                    "revoke",
+                    vec![
+                        "inst/one",
+                        "--artifact-digest=sha256:archive",
+                        "--reason=explicit reason",
+                        "--expected-last-operation-id=observed-operation",
+                        "--operation-key=exact-key",
+                    ],
+                    "POST",
+                    "/api/w/ws%20space/plugins/inst%2Fone/revoke",
+                    Some(
+                        serde_json::json!({"artifact_digest":"sha256:archive", "reason":"explicit reason", "expected_last_operation":"observed-operation", "operation_key":"exact-key"}),
+                    ),
+                    operation("revoke"),
+                ),
+                (
+                    "uninstall",
+                    vec![
+                        "inst/one",
+                        "--expected-last-operation-id=observed-operation",
+                        "--operation-key=exact-key",
+                    ],
+                    "POST",
+                    "/api/w/ws%20space/plugins/inst%2Fone/uninstall",
+                    Some(
+                        serde_json::json!({"expected_last_operation":"observed-operation", "operation_key":"exact-key"}),
+                    ),
+                    operation("uninstall"),
+                ),
+                (
+                    "operation",
+                    vec!["saved/operation"],
+                    "GET",
+                    "/api/w/ws%20space/plugin-operations/saved%2Foperation",
+                    None,
+                    operation("install"),
+                ),
+            ];
+            for (subcommand, args, method, path, expected_body, response) in cases {
+                let (origin, captured) = server(200, response.clone()).await;
+                let api = server_api::ServerApiClient::builder(origin.as_str())
+                    .unwrap()
+                    .authorizer(TestAuthorizer)
+                    .build()
+                    .unwrap();
+                let result =
+                    execute_catalog(catalog_command(subcommand, &args), &api, "ws space".into())
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    result, response,
+                    "{subcommand} output must retain authoritative metadata"
+                );
+                let output = catalog_output(Ok(result), true);
+                assert!(output.success);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&output.stdout).unwrap(),
+                    response
+                );
+                let (headers, body) = captured.await.unwrap();
+                let mut start = headers.lines().next().unwrap().split_whitespace();
+                assert_eq!(start.next(), Some(method));
+                let url =
+                    reqwest::Url::parse(&format!("{origin}{}", start.next().unwrap())).unwrap();
+                assert_eq!(url.path(), path, "{subcommand}");
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer test-only")
+                );
+                if subcommand == "list" {
+                    let query = url
+                        .query_pairs()
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    assert_eq!(query.get("cursor").unwrap(), "next /+=");
+                    assert_eq!(query.get("limit").unwrap(), "7");
+                }
+                if subcommand == "upload" {
+                    assert_eq!(body, b"exact\0archive bytes");
+                    assert!(headers.contains("application/octet-stream"));
+                } else if let Some(expected) = expected_body {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                        expected
+                    );
+                } else {
+                    assert!(body.is_empty());
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn catalog_rejections_keep_concrete_diagnostics_without_retry() {
+            for (status, code) in [
+                (401, "unauthenticated"),
+                (403, "forbidden"),
+                (409, "plugin_operation_conflict"),
+                (413, "plugin_upload_too_large"),
+            ] {
+                let diagnostics = serde_json::json!([{"code":"catalog_rejected", "severity":"error", "message":"safe blocker detail"}]);
+                let response = serde_json::json!({"error":code,"message":"concrete rejection detail","diagnostics":diagnostics});
+                let (origin, captured) = server(status, response).await;
+                let api = server_api::ServerApiClient::builder(origin.as_str())
+                    .unwrap()
+                    .authorizer(TestAuthorizer)
+                    .build()
+                    .unwrap();
+                let result = execute_catalog(
+                    catalog_command(
+                        "uninstall",
+                        &[
+                            "inst",
+                            "--expected-last-operation-id=observed",
+                            "--operation-key=exact",
+                        ],
+                    ),
+                    &api,
+                    "ws".into(),
+                )
+                .await;
+                let output = catalog_output(result, true);
+                assert!(!output.success);
+                let report: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+                assert_eq!(report["diagnostic"]["status"], status);
+                assert_eq!(report["diagnostic"]["error"], code);
+                assert_eq!(report["diagnostic"]["message"], "concrete rejection detail");
+                assert_eq!(report["diagnostic"]["diagnostics"], diagnostics);
+                assert!(
+                    report["reconciliation"]
+                        .as_str()
+                        .unwrap()
+                        .contains("same operation key and exact input")
+                );
+                let (_, body) = captured.await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["expected_last_operation"], "observed");
+                assert_eq!(body["operation_key"], "exact");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_standalone_target_is_rejected_with_json_diagnostic() {
+        let output = run_catalog(
+            catalog_command("list", &[]),
+            PluginCliArgs { json: true },
+            client::ResolvedTarget::Standalone,
+        )
+        .await;
+        assert!(!output.success);
+        let report: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+        assert!(
+            report["diagnostic"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Backend Workspace target")
+        );
+    }
 
     fn built_tool_package(destination: &Path) {
         render_new(

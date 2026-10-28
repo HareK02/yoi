@@ -9,7 +9,12 @@ pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, Web
 pub mod authorization;
 mod drive;
 mod notification;
+mod plugin;
+mod plugin_types;
 pub use notification::*;
+pub use plugin::*;
+#[cfg(feature = "typescript")]
+pub use plugin_types::plugin_api_typescript;
 mod ticket_browse;
 pub use ticket_browse::*;
 pub mod repository_openapi_typescript;
@@ -205,6 +210,15 @@ macro_rules! impl_openapi_schema {
 }
 
 impl_openapi_schema!(
+    PluginInstallRequest,
+    PluginAddArtifactRequest,
+    PluginRevokeRequest,
+    PluginUninstallRequest,
+    PluginListRequest,
+    PluginUploadResponse,
+    PluginInstallation,
+    PluginListResponse,
+    PluginOperationResponse,
     SubjectPermissionsResponse,
     SubjectPermissionsMutationResponse,
     SubjectPermissionInterruption,
@@ -2890,6 +2904,73 @@ pub trait ServerApi {
         #[path] working_directory_id: String,
         #[body] request: WorkingDirectoryRemovalRequest,
     ) -> Result<WorkingDirectoryRemovalResponse, RepositoryApiError>;
+    #[post("/api/w/{workspace_id}/plugin-uploads", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_upload(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[binary] body: BinaryBody,
+    ) -> Result<PluginUploadResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/plugins", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_install(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[body] request: PluginInstallRequest,
+    ) -> Result<PluginOperationResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/plugins", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true)]
+    async fn plugin_list(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[query] query: PluginListRequest,
+    ) -> Result<PluginListResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/plugins/{installation_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true)]
+    async fn plugin_show(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] installation_id: String,
+    ) -> Result<PluginInstallation, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/plugins/{installation_id}/artifacts", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_artifact_add(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] installation_id: String,
+        #[body] request: PluginAddArtifactRequest,
+    ) -> Result<PluginOperationResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/plugins/{installation_id}/revoke", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_revoke(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] installation_id: String,
+        #[body] request: PluginRevokeRequest,
+    ) -> Result<PluginOperationResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/plugins/{installation_id}/uninstall", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_uninstall(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] installation_id: String,
+        #[body] request: PluginUninstallRequest,
+    ) -> Result<PluginOperationResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/plugin-operations/{operation_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true)]
+    async fn plugin_operation(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] operation_id: String,
+    ) -> Result<PluginOperationResponse, RepositoryApiError>;
+
     // Ordinary operations accept member browser sessions or trusted Worker request
     // context. The service resolves Worker grants; no operation accepts an actor or
     // grant ID from the caller. Grant management is Workspace-owner-only.

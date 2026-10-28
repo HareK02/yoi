@@ -100,6 +100,10 @@ mod schema_convergence {
                             version: 105,
                             name: "Durable Subject deletion snapshots and Job admission fences".into(),
                         },
+                        WorkspaceSchemaMigrationStep {
+                            version: 106,
+                            name: crate::plugin_catalog::MIGRATION_NAME.into(),
+                        },
                     ]
                 );
                 assert_eq!(
@@ -116,6 +120,7 @@ mod schema_convergence {
                     let mut expected = history.clone();
                     expected.push((104, "Converge Passkey results and Job input retention".into()));
                     expected.push((105, "Durable Subject deletion snapshots and Job admission fences".into()));
+                    expected.push((106, crate::plugin_catalog::MIGRATION_NAME.into()));
                     assert_eq!(workspace_schema_migration_history(conn)?, expected);
                     for table in ["passkey_credentials", "passkey_metadata", "passkey_addition_receipts", "backend_jobs", "backend_job_attempts"] {
                         assert_eq!(state_contract_schema_signature(conn, table), fresh.with_conn(|c| Ok(state_contract_schema_signature(c, table)))?, "{table}");
@@ -145,7 +150,7 @@ mod schema_convergence {
                         assert_eq!(feature_rows(conn, job_variant), rows);
                         assert_eq!(
                             workspace_schema_migration_history(conn)?.len(),
-                            history.len() + 2
+                            history.len() + plan.migrations.len()
                         );
                         Ok(())
                     })
@@ -183,7 +188,7 @@ mod schema_convergence {
                 upgraded
                     .with_conn(|conn| {
                         assert_eq!(feature_rows(conn, job_variant), rows);
-                        assert_eq!(current_schema_version(conn)?, 105);
+                        assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
                         Ok(())
                     })
                     .unwrap();

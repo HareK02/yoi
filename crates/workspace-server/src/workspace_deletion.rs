@@ -16,6 +16,11 @@ use crate::{Error, Result};
 /// Explicit domain-owned purge inventory. The deletion operation tombstone is intentionally
 /// excluded so retries and audit remain available after the Workspace row is gone.
 const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
+    "plugin_references",
+    "plugin_operations",
+    "plugin_uploads",
+    "plugin_artifacts",
+    "plugin_installations",
     "artifacts",
     "audit_events",
     "backend_job_deliveries",
@@ -1281,6 +1286,84 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn workspace_purge_removes_plugin_references_and_catalog_without_cross_workspace_loss() {
+        let (store, owner, workspace_id) = setup();
+        for workspace in ["workspace-a", "workspace-b"] {
+            store.with_conn(|conn| {
+                let digest = format!("sha256:{}", "a".repeat(64));
+                conn.execute("INSERT INTO plugin_installations VALUES(?1,'installation','alias','package','operation',0)", [workspace])?;
+                conn.execute("INSERT INTO plugin_artifacts VALUES(?1,'installation',?2,?2,'1',1,'{}',0,NULL)", params![workspace,digest])?;
+                conn.execute("INSERT INTO plugin_uploads VALUES(?1,'upload','actor',9999999999,?2,1,'{}')", params![workspace,digest])?;
+                conn.execute("INSERT INTO plugin_operations VALUES(?1,'operation','actor','install','key',?2,'{}')", params![workspace,"f".repeat(64)])?;
+                for kind in ["config","pending","active","restorable"] {
+                    conn.execute("INSERT INTO plugin_references VALUES(?1,?2,'owner','installation',?3)", params![workspace,kind,digest])?;
+                }
+                Ok(())
+            }).unwrap();
+        }
+        let counts = |workspace: &str| {
+            store
+                .with_conn(|conn| {
+                    [
+                        "plugin_references",
+                        "plugin_operations",
+                        "plugin_uploads",
+                        "plugin_artifacts",
+                        "plugin_installations",
+                    ]
+                    .map(|table| {
+                        Ok(conn.query_row(
+                            &format!("SELECT count(*) FROM {table} WHERE workspace_id=?1"),
+                            [workspace],
+                            |r| r.get::<_, i64>(0),
+                        )?)
+                    })
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()
+                })
+                .unwrap()
+        };
+        let other = counts("workspace-b");
+        assert_eq!(counts("workspace-a"), vec![4, 1, 1, 1, 1]);
+        let preflight = store
+            .workspace_deletion_preflight(&owner, &workspace_id)
+            .unwrap();
+        let operation = store
+            .reserve_workspace_deletion(
+                &owner,
+                &workspace_id,
+                &WorkspaceDeletionRequest {
+                    operation_id: "purge-plugins".into(),
+                    expected_workspace_updated_at: preflight.expected_workspace_updated_at,
+                    confirmation: "Alpha".into(),
+                },
+            )
+            .unwrap()
+            .operation;
+        assert_eq!(
+            store
+                .finalize_workspace_deletion(&operation.operation_id)
+                .unwrap()
+                .state,
+            WorkspaceDeletionState::Succeeded
+        );
+        assert_eq!(counts("workspace-a"), vec![0; 5]);
+        assert_eq!(counts("workspace-b"), other);
+        store
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+                        .get::<_, i64>(
+                        0
+                    ))?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

@@ -851,11 +851,11 @@ async fn notification_routing_fresh_and_upgraded_schema_and_guards_match() {
     };
     assert_eq!(current_schema_version(&conn).unwrap(), 98);
     drop(conn);
-    // Compare the complete current composition, not upgraded98 against fresh105.
+    // Compare the complete current composition, not upgraded98 against fresh current schema.
     let upgraded_store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     let upgraded = upgraded_store
         .with_conn(|conn| {
-            assert_eq!(current_schema_version(conn)?, 105);
+            assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
             Ok(snapshot(conn))
         })
         .unwrap();

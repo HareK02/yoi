@@ -1,4 +1,5 @@
 -- Canonical composed Workspace Server schema. New databases are created directly at this generation.
+-- Plugin catalog schema is composed by store.rs.
 -- Ticket creates its standalone schema first; replace those empty tables with the composed authority.
 DROP TABLE typed_ticket_event_attributes;
 DROP TABLE typed_ticket_event_references;

@@ -30,6 +30,7 @@ pub(crate) enum CliCommand {
     Ticket,
     Objective,
     Plugin,
+    PluginCatalog,
     Mcp,
     Session,
     Subject,
@@ -49,7 +50,8 @@ impl CliCommand {
             CliCommand::WorkerCleanup => "yoi worker management",
             CliCommand::Ticket => "yoi ticket",
             CliCommand::Objective => "yoi objective",
-            CliCommand::Plugin => "yoi plugin",
+            CliCommand::Plugin => "yoi plugin authoring",
+            CliCommand::PluginCatalog => "yoi plugin catalog",
             CliCommand::Mcp => "yoi mcp",
             CliCommand::Session => "yoi session",
             CliCommand::Subject => "yoi subject",
@@ -65,7 +67,7 @@ impl CliCommand {
             | CliCommand::Panel
             | CliCommand::Ticket
             | CliCommand::Objective => CliConnectionRequirement::ConnectionAware,
-            CliCommand::Login => CliConnectionRequirement::BackendOnly,
+            CliCommand::Login | CliCommand::PluginCatalog => CliConnectionRequirement::BackendOnly,
             CliCommand::Keys
             | CliCommand::SetupModel
             | CliCommand::Serve
@@ -317,10 +319,12 @@ mod tests {
                 command.display_name()
             );
         }
-        assert_eq!(
-            CliCommand::Login.connection_requirement(),
-            CliConnectionRequirement::BackendOnly
-        );
+        for command in [CliCommand::Login, CliCommand::PluginCatalog] {
+            assert_eq!(
+                command.connection_requirement(),
+                CliConnectionRequirement::BackendOnly
+            );
+        }
 
         for command in [
             CliCommand::Keys,

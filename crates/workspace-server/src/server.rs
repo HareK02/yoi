@@ -46,6 +46,8 @@ use worker_protocol::*;
 mod drive;
 #[path = "server_drive_grants.rs"]
 mod drive_grants;
+#[path = "server_plugin.rs"]
+mod plugin;
 #[path = "server_workspace_config.rs"]
 mod workspace_config;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -3418,11 +3420,12 @@ async fn authorize_scoped_workspace_request(
         .map_err(|error| {
             runtime_request_proof_rejection(&method, &request_path, workspace_id, &error)
         })?;
-        if is_workspace_config_editor_path(&request_path) {
+        if is_workspace_config_editor_path(&request_path) || plugin::is_catalog_path(&request_path)
+        {
             return Err(repository_api_rejection(
                 &request_path,
                 StatusCode::FORBIDDEN,
-                "Runtime configuration editor access denied",
+                "Runtime user-management access denied",
             ));
         }
         request.extensions_mut().insert(source);
@@ -3576,11 +3579,12 @@ async fn authorize_workspace_api_request(
                 );
             }
         };
-        if is_workspace_config_editor_path(&request_path) {
+        if is_workspace_config_editor_path(&request_path) || plugin::is_catalog_path(&request_path)
+        {
             return repository_api_rejection(
                 &request_path,
                 StatusCode::FORBIDDEN,
-                "Runtime configuration editor access denied",
+                "Runtime user-management access denied",
             );
         }
         request.extensions_mut().insert(source);
@@ -4358,6 +4362,8 @@ impl WorkspaceApi {
         runtime_subscription_broker
             .register_embedded_runtime(embedded_runtime_id, embedded_subscription_runtime);
         let database_path = config.database_path.clone();
+        let plugin_root =
+            ServerConfig::server_data_root_for_data_dir(&config.data_root).join("plugin-artifacts");
         let executor = store.db_executor();
         let config_executor = executor.clone();
         let (config_store, repository_secrets) = executor
@@ -4367,6 +4373,7 @@ impl WorkspaceApi {
                         .open_store(&database_path)?
                         .with_db_executor(config_executor),
                 );
+                config_store.plugin_gc(&plugin_root)?;
                 let repository_secrets = Arc::new(RepositorySecretService::open(
                     config_store.clone(),
                     &database_path,
@@ -7603,6 +7610,7 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::current_worker_workdir_catalog(
             service.clone(),
         ))
+        .merge(plugin::router(service.clone()))
         .merge(server_api::server_api_axum::current_worker_workspace_config_get(service.clone()))
         .merge(server_api::server_api_axum::current_worker_workspace_config_attach(service.clone()))
         .merge(
@@ -13316,6 +13324,94 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn plugin_upload(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        body: server_api::BinaryBody,
+    ) -> std::result::Result<server_api::PluginUploadResponse, server_api::RepositoryApiError> {
+        let api = self.workspace_api()?;
+        plugin::upload(api, actor, workspace_id, body).await
+    }
+
+    async fn plugin_install(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        request: server_api::PluginInstallRequest,
+    ) -> std::result::Result<server_api::PluginOperationResponse, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?;
+        plugin::install(api, actor, workspace_id, request).await
+    }
+
+    async fn plugin_list(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        query: server_api::PluginListRequest,
+    ) -> std::result::Result<server_api::PluginListResponse, server_api::RepositoryApiError> {
+        let api = self.workspace_api()?;
+        plugin::list(api, actor, workspace_id, query).await
+    }
+
+    async fn plugin_show(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        installation_id: String,
+    ) -> std::result::Result<server_api::PluginInstallation, server_api::RepositoryApiError> {
+        let api = self.workspace_api()?;
+        plugin::show(api, actor, workspace_id, installation_id).await
+    }
+
+    async fn plugin_artifact_add(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        installation_id: String,
+        request: server_api::PluginAddArtifactRequest,
+    ) -> std::result::Result<server_api::PluginOperationResponse, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?;
+        plugin::artifact_add(api, actor, workspace_id, installation_id, request).await
+    }
+
+    async fn plugin_revoke(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        installation_id: String,
+        request: server_api::PluginRevokeRequest,
+    ) -> std::result::Result<server_api::PluginOperationResponse, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?;
+        plugin::revoke(api, actor, workspace_id, installation_id, request).await
+    }
+
+    async fn plugin_uninstall(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        installation_id: String,
+        request: server_api::PluginUninstallRequest,
+    ) -> std::result::Result<server_api::PluginOperationResponse, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?;
+        plugin::uninstall(api, actor, workspace_id, installation_id, request).await
+    }
+
+    async fn plugin_operation(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        operation_id: String,
+    ) -> std::result::Result<server_api::PluginOperationResponse, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?;
+        plugin::operation(api, actor, workspace_id, operation_id).await
     }
 
     async fn drive_root(
@@ -38062,6 +38158,10 @@ mod tests {
 
     mod ticket_case_signed_tests {
         include!("server_ticket_case_signed_tests.rs");
+    }
+
+    mod plugin_tests {
+        include!("server_plugin_tests.rs");
     }
 
     mod ticket_tags_tests {

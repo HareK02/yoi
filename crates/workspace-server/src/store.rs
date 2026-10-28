@@ -127,7 +127,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 105;
+const LATEST_SCHEMA_VERSION: i64 = 106;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -459,6 +459,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 105,
         name: "Durable Subject deletion snapshots and Job admission fences",
         apply: subject_deletion_store::migrate,
+    },
+    Migration {
+        version: 106,
+        name: crate::plugin_catalog::MIGRATION_NAME,
+        apply: crate::plugin_catalog::migrate,
     },
 ];
 
@@ -1334,6 +1339,64 @@ pub struct HostingAdminInitialBearer {
 
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
+    fn plugin_upload(
+        &self,
+        root: &Path,
+        workspace: &str,
+        actor: &str,
+        bytes: &[u8],
+    ) -> Result<server_api::PluginUploadResponse>;
+    fn plugin_install(
+        &self,
+        workspace: &str,
+        actor: &str,
+        request: &server_api::PluginInstallRequest,
+    ) -> Result<server_api::PluginOperationResponse>;
+    fn plugin_add_artifact(
+        &self,
+        workspace: &str,
+        actor: &str,
+        installation: &str,
+        request: &server_api::PluginAddArtifactRequest,
+    ) -> Result<server_api::PluginOperationResponse>;
+    fn plugin_revoke(
+        &self,
+        workspace: &str,
+        actor: &str,
+        installation: &str,
+        request: &server_api::PluginRevokeRequest,
+    ) -> Result<server_api::PluginOperationResponse>;
+    fn plugin_uninstall(
+        &self,
+        workspace: &str,
+        actor: &str,
+        installation: &str,
+        request: &server_api::PluginUninstallRequest,
+    ) -> Result<server_api::PluginOperationResponse>;
+    fn plugin_show(
+        &self,
+        workspace: &str,
+        installation: &str,
+    ) -> Result<server_api::PluginInstallation>;
+    fn plugin_list(
+        &self,
+        workspace: &str,
+        request: &server_api::PluginListRequest,
+    ) -> Result<server_api::PluginListResponse>;
+    fn plugin_operation(
+        &self,
+        workspace: &str,
+        operation: &str,
+    ) -> Result<server_api::PluginOperationResponse>;
+    fn plugin_artifact_bytes(
+        &self,
+        root: &Path,
+        workspace: &str,
+        installation: &str,
+        artifact_digest: &str,
+    ) -> Result<Vec<u8>>;
+    fn plugin_gc(&self, root: &Path) -> Result<u64>;
+
     /// Bounded owner for whole synchronous operations from async callers. Move owned inputs
     /// and services into one closure covering connection/mutex waits, source authorization,
     /// receipts, CAS, audit, commit and ordered publication. Do not split checks around awaits
@@ -4670,6 +4733,90 @@ fn insert_workspace_runtime_binding_audit(
 
 #[async_trait]
 impl ControlPlaneStore for SqliteWorkspaceStore {
+    fn plugin_upload(
+        &self,
+        root: &Path,
+        workspace: &str,
+        actor: &str,
+        bytes: &[u8],
+    ) -> Result<server_api::PluginUploadResponse> {
+        SqliteWorkspaceStore::plugin_upload(self, root, workspace, actor, bytes)
+    }
+    fn plugin_install(
+        &self,
+        workspace: &str,
+        actor: &str,
+        request: &server_api::PluginInstallRequest,
+    ) -> Result<server_api::PluginOperationResponse> {
+        SqliteWorkspaceStore::plugin_install(self, workspace, actor, request)
+    }
+    fn plugin_add_artifact(
+        &self,
+        workspace: &str,
+        actor: &str,
+        installation: &str,
+        request: &server_api::PluginAddArtifactRequest,
+    ) -> Result<server_api::PluginOperationResponse> {
+        SqliteWorkspaceStore::plugin_add_artifact(self, workspace, actor, installation, request)
+    }
+    fn plugin_revoke(
+        &self,
+        workspace: &str,
+        actor: &str,
+        installation: &str,
+        request: &server_api::PluginRevokeRequest,
+    ) -> Result<server_api::PluginOperationResponse> {
+        SqliteWorkspaceStore::plugin_revoke(self, workspace, actor, installation, request)
+    }
+    fn plugin_uninstall(
+        &self,
+        workspace: &str,
+        actor: &str,
+        installation: &str,
+        request: &server_api::PluginUninstallRequest,
+    ) -> Result<server_api::PluginOperationResponse> {
+        SqliteWorkspaceStore::plugin_uninstall(self, workspace, actor, installation, request)
+    }
+    fn plugin_show(
+        &self,
+        workspace: &str,
+        installation: &str,
+    ) -> Result<server_api::PluginInstallation> {
+        SqliteWorkspaceStore::plugin_show(self, workspace, installation)
+    }
+    fn plugin_list(
+        &self,
+        workspace: &str,
+        request: &server_api::PluginListRequest,
+    ) -> Result<server_api::PluginListResponse> {
+        SqliteWorkspaceStore::plugin_list(self, workspace, request)
+    }
+    fn plugin_operation(
+        &self,
+        workspace: &str,
+        operation: &str,
+    ) -> Result<server_api::PluginOperationResponse> {
+        SqliteWorkspaceStore::plugin_operation(self, workspace, operation)
+    }
+    fn plugin_artifact_bytes(
+        &self,
+        root: &Path,
+        workspace: &str,
+        installation: &str,
+        artifact_digest: &str,
+    ) -> Result<Vec<u8>> {
+        SqliteWorkspaceStore::plugin_artifact_bytes(
+            self,
+            root,
+            workspace,
+            installation,
+            artifact_digest,
+        )
+    }
+    fn plugin_gc(&self, root: &Path) -> Result<u64> {
+        SqliteWorkspaceStore::plugin_gc(self, root)
+    }
+
     fn db_executor(&self) -> crate::db_executor::DbExecutor {
         self.db_executor.clone()
     }
@@ -15640,6 +15787,10 @@ fn create_workspace_schema_structure_from_sql(
     conn.execute_batch(
         &schema_sql
             .replace(
+                "-- Plugin catalog schema is composed by store.rs.",
+                include_str!("plugin_catalog_schema.sql"),
+            )
+            .replace(
                 "-- Ticket-owned assignment schema is composed by store.rs.",
                 ticket::TICKET_ASSIGNMENT_SCHEMA_SQL,
             )
@@ -16648,6 +16799,7 @@ fn apply_migrations_with_secret_source(
     }
 
     verify_schema_history(conn, LATEST_SCHEMA_VERSION)?;
+    crate::plugin_catalog::verify(conn)?;
     verify_workspace_runtime_binding_schema(conn)?;
     verify_workspace_runtime_verification_schema(conn)?;
     verify_workspace_deletion_schema(conn)?;
@@ -19092,7 +19244,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         fixture.commit().unwrap();
     }
 
-    fn prepare_schema_v50(path: &Path, workspace_id: Option<&str>) {
+    pub(super) fn prepare_schema_v50(path: &Path, workspace_id: Option<&str>) {
         prepare_schema_v52(path);
         let conn = Connection::open(path).unwrap();
         configure_sqlite(&conn).unwrap();
@@ -19341,6 +19493,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:103, name:"Passkey metadata and atomic addition results".into()},
                 WorkspaceSchemaMigrationStep {version:104, name:"Converge Passkey results and Job input retention".into()},
                 WorkspaceSchemaMigrationStep {version:105, name:"Durable Subject deletion snapshots and Job admission fences".into()},
+                WorkspaceSchemaMigrationStep {version:106, name:crate::plugin_catalog::MIGRATION_NAME.into()},
             ]
         );
 
@@ -19456,6 +19609,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (103, "Passkey metadata and atomic addition results".to_string()),
 (104, "Converge Passkey results and Job input retention".to_string()),
 (105, "Durable Subject deletion snapshots and Job admission fences".to_string()),
+(106, crate::plugin_catalog::MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -22742,7 +22896,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (102, "Durable failed Subject creation recovery".into()),
                          (103, "Passkey metadata and atomic addition results".into()),
                          (104, "Converge Passkey results and Job input retention".into()),
-                         (105, "Durable Subject deletion snapshots and Job admission fences".into())]);
+                         (105, "Durable Subject deletion snapshots and Job admission fences".into()),
+                         (106, crate::plugin_catalog::MIGRATION_NAME.into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
@@ -26936,6 +27091,7 @@ INSERT INTO worker_registry (
             .unwrap();
         store.with_conn(|conn| {
             // This fixture deliberately reconstructs schema 102 from fresh.
+            conn.execute_batch("DROP TABLE plugin_references; DROP TABLE plugin_artifacts; DROP TABLE plugin_installations; DROP TABLE plugin_uploads; DROP TABLE plugin_operations;")?;
             // Remove the newer Subject fence composition, not just its receipt.
             let triggers=conn.prepare("SELECT name,tbl_name FROM sqlite_schema WHERE type='trigger' AND tbl_name LIKE 'notification_%' AND name NOT LIKE 'subject_deleted_%' AND sql LIKE '%subject_deletion_jobs%'")?
                 .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -26947,7 +27103,7 @@ INSERT INTO worker_registry (
                 DROP TRIGGER passkey_metadata_insert;
                 DROP TABLE passkey_addition_receipts;
                 DROP TABLE passkey_metadata;
-                UPDATE __yoi_schema_migrations SET version=102 WHERE version=105;
+                UPDATE __yoi_schema_migrations SET version=102 WHERE version=106;
                 CREATE TRIGGER backend_job_input_retirement BEFORE UPDATE ON backend_job_attempts BEGIN SELECT RAISE(ABORT,'collision'); END;")?; Ok(())
         }).unwrap();
         drop(store);
@@ -28259,3 +28415,7 @@ mod repository_key_migration_tests;
 #[cfg(test)]
 #[path = "frozen_runtime_binding_tests.rs"]
 mod frozen_runtime_binding_tests;
+
+#[cfg(test)]
+#[path = "plugin_catalog/migration_tests.rs"]
+mod plugin_catalog_migration_tests;
