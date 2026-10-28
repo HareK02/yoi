@@ -268,6 +268,602 @@ async fn assert_config_catalog(runtime: &worker::wip::WipRuntime, attached: &Att
     assert!(workdir["source"].get("grant_id").is_none());
 }
 
+// Ordinary workspace-server lib integration tests: model-facing Inspect/Invoke -> production
+// WIP adapter -> signed Backend router -> temporary canonical store and its existing evaluator.
+// Only HTTP transport is in-process; response loss is injected after real commit dispatch.
+struct ConfigBatchWipFixture {
+    backend: ManualCoderAssignmentFixture,
+    client: Arc<ConfigRouterClient>,
+    wip: worker::wip::WipRuntime,
+}
+fn config_batch_runtime(client: Arc<ConfigRouterClient>) -> worker::wip::WipRuntime {
+    let feature = worker::feature::builtin::workspace_config::WorkspaceConfigFeature::for_workspace(
+        client.clone(),
+        true,
+    );
+    let mut mounts = worker::wip::WipMountRegistry::new();
+    worker::feature::builtin::workspace_config::wip::mount_workspace_config_wip(
+        &mut mounts,
+        &feature,
+    )
+    .unwrap();
+    worker::wip::WipRuntime::from_mounts(
+        mounts,
+        format!(
+            "{}:{}@{TEST_WORKSPACE_ID}",
+            client.worker.runtime_id, client.worker.worker_id
+        ),
+    )
+    .unwrap()
+}
+impl ConfigBatchWipFixture {
+    async fn new() -> Self {
+        let mut backend = manual_worker_assignment_fixture().await;
+        let identity = RuntimeIdentityMaterial::generate(&backend.worker.runtime_id).unwrap();
+        configure_runtime_request_auth(&mut backend.api, &identity, &backend.worker.runtime_id);
+        grant(&backend.api, &backend.worker, Access::ReadWrite).await;
+        attach(&backend.api, &backend.worker).await;
+        let client = Arc::new(ConfigRouterClient {
+            api: backend.api.clone(),
+            worker: backend.worker.clone(),
+            identity: Arc::new(identity),
+            runtime: tokio::runtime::Handle::current(),
+            paths: Default::default(),
+            drop_next_commit_response: Default::default(),
+        });
+        let wip = config_batch_runtime(client.clone());
+        Self {
+            backend,
+            client,
+            wip,
+        }
+    }
+    fn state(&self) -> crate::config_source::WorkspaceConfigState {
+        self.backend
+            .api
+            .config_store
+            .load_workspace_config(TEST_WORKSPACE_ID)
+            .unwrap()
+            .unwrap()
+    }
+    fn commits(&self) -> usize {
+        self.client
+            .paths
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.ends_with("/commit"))
+            .count()
+    }
+    async fn inspect(&self) -> Value {
+        let object = config_inspect(&self.wip, "/workspace-config").await;
+        let interface = object["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|interface| {
+                interface["reference"]
+                    == json!({
+                        "scope":"/workspace-config", "name":"yoi.workspace-config/node/v1"
+                    })
+            })
+            .unwrap();
+        let output = self
+            .wip
+            .inspect(interface["path"].as_str().unwrap().into(), true)
+            .await
+            .unwrap();
+        serde_json::from_str(output.content.as_deref().unwrap()).unwrap()
+    }
+    async fn apply(&self, changes: Value) -> Value {
+        self.inspect().await;
+        self.apply_observed(changes).await
+    }
+    async fn apply_observed(&self, changes: Value) -> Value {
+        let before = self.commits();
+        let output = config_call(
+            &self.wip,
+            "/workspace-config",
+            "apply_changes",
+            json!({"changes":changes}),
+        )
+        .await
+        .unwrap();
+        let result: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+        assert_eq!(result.as_object().unwrap().len(), 2, "{result}");
+        assert_eq!(result["digest"], self.state().snapshot.digest);
+        assert!(
+            result["activation"]
+                .as_str()
+                .unwrap()
+                .contains("not rewritten"),
+            "{result}"
+        );
+        assert_eq!(
+            self.commits(),
+            before + 1,
+            "one atomic batch, one commit dispatch"
+        );
+        result
+    }
+    async fn reject(&self, label: &str, arguments: Value) -> agen::tool::ToolError {
+        self.inspect().await;
+        let before = self.state();
+        let commits = self.commits();
+        let error = config_call(&self.wip, "/workspace-config", "apply_changes", arguments)
+            .await
+            .unwrap_err();
+        assert!(
+            !error.to_string().contains("outcome unknown"),
+            "{label}: {error}"
+        );
+        assert_eq!(
+            self.state(),
+            before,
+            "{label}: no partial canonical write or projection change"
+        );
+        assert!(
+            self.commits() <= commits + 1,
+            "{label}: never automatically retry rejection"
+        );
+        error
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_config_apply_inspect_publishes_typed_cases_constraints_and_results() {
+    let fixture = ConfigBatchWipFixture::new().await;
+    let definition = fixture.inspect().await;
+    let signature = definition["interface_signature"].as_str().unwrap();
+    // Assert the actual Text View, not a descriptor constructed by the test. This is display
+    // verification only: none of this text is parsed into production request arguments.
+    let declarations = signature
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("///"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let declarations = declarations
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for expected in [
+        "operation apply_changes(",
+        "changes: [union {",
+        "create({ path: string, content: string, content_type?: enum { decodal, text, }, }),",
+        "update({ path: string, content: string, }),",
+        "delete({ path: string, }),",
+        "rename({ from: string, to: string, }),",
+        "-> { digest: string, activation: string, }",
+    ] {
+        assert!(
+            declarations.contains(expected),
+            "missing {expected}: {signature}"
+        );
+    }
+    assert!(!declarations.contains("changes: json"), "{signature}");
+    assert!(!declarations.contains("changes?:"), "{signature}");
+    assert!(
+        !declarations.contains("expected_digest:"),
+        "model cannot manage CAS: {signature}"
+    );
+    // Summaries (not invisible documentation.details) must explain non-type constraints.
+    for expected in [
+        "1..=256",
+        "262144",
+        "512",
+        "UTF-8",
+        "canonical",
+        "relative",
+        "both rename endpoints",
+        "once per batch",
+        "defaults to decodal",
+        "existing entrypoints",
+        "schema",
+        "Whole-tree CAS",
+        "stale",
+        "not hot application",
+        "OutcomeUnknown",
+        "Raw kind-tagged input is not accepted",
+        "composite",
+        "all changes commit together or none",
+    ] {
+        assert!(
+            signature.contains(expected),
+            "missing public constraint {expected}: {signature}"
+        );
+    }
+    for case in ["create", "update", "delete", "rename"] {
+        // The renderer quotes documentation strings, including the JSON examples.
+        assert!(
+            signature.contains(&format!(r#"\"$case\":\"{case}\""#)),
+            "missing public JSON example for {case}: {signature}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_config_apply_model_union_cases_and_composite_persist_evaluated_imports() {
+    let fixture = ConfigBatchWipFixture::new().await;
+    // Public Invoke union encoding and fields shown by Inspect; no internal Change fixtures.
+    fixture.apply(json!([
+        {"$case":"create","value":{"path":"notes/edit.txt","content":"old","content_type":"text"}},
+        {"$case":"create","value":{"path":"notes/source.txt","content":"move me","content_type":"text"}},
+        {"$case":"create","value":{"path":"notes/obsolete.txt","content":"remove me","content_type":"text"}}
+    ])).await;
+    // Subsequent calls use the Client's returned root validator, without reinspection or
+    // model-supplied preconditions. All four variants share the same public contract.
+    fixture
+        .apply_observed(json!([{"$case":"update","value":{"path":"notes/edit.txt","content":"updated"}}]))
+        .await;
+    fixture
+        .apply_observed(
+            json!([{"$case":"rename","value":{"from":"notes/source.txt","to":"notes/moved.txt"}}]),
+        )
+        .await;
+    fixture
+        .apply_observed(json!([{"$case":"delete","value":{"path":"notes/obsolete.txt"}}]))
+        .await;
+    let state = fixture.state();
+    let entry = |path: &str| {
+        state
+            .snapshot
+            .get(&config_source::VirtualPath::parse(path).unwrap())
+    };
+    assert_eq!(entry("notes/edit.txt").unwrap().content, "updated");
+    assert_eq!(
+        entry("notes/edit.txt").unwrap().content_type,
+        config_source::ConfigContentType::Text
+    );
+    assert_eq!(entry("notes/moved.txt").unwrap().content, "move me");
+    assert_eq!(
+        entry("notes/moved.txt").unwrap().content_type,
+        config_source::ConfigContentType::Text
+    );
+    assert!(entry("notes/source.txt").is_none());
+    assert!(entry("notes/obsolete.txt").is_none());
+
+    fixture.apply(json!([
+        {"$case":"create","value":{"path":"fragments/batch.dcdl","content":"{ common = { language = \"TYPED_BATCH\"; }; }"}},
+        {"$case":"update","value":{"path":"main.dcdl","content":"{ prompts = import \"./fragments/batch.dcdl\"; } as WorkspaceConfigSchema"}},
+        {"$case":"delete","value":{"path":"notes/edit.txt"}},
+        {"$case":"rename","value":{"from":"notes/moved.txt","to":"notes/final.txt"}}
+    ])).await;
+    let state = fixture.state();
+    let fragment = state
+        .snapshot
+        .get(&config_source::VirtualPath::parse("fragments/batch.dcdl").unwrap())
+        .unwrap();
+    assert_eq!(
+        fragment.content_type,
+        config_source::ConfigContentType::Decodal,
+        "omitted content_type defaults to decodal"
+    );
+    assert_eq!(
+        fragment.content,
+        "{\n    common = {\n        language = \"TYPED_BATCH\";\n    };\n}\n"    );
+    assert_eq!(
+        state
+            .snapshot
+            .get(&config_source::VirtualPath::parse("notes/final.txt").unwrap())
+            .unwrap()
+            .content,
+        "move me"
+    );
+    for absent in ["notes/edit.txt", "notes/moved.txt"] {
+        assert!(
+            state
+                .snapshot
+                .get(&config_source::VirtualPath::parse(absent).unwrap())
+                .is_none()
+        );
+    }
+    let prompts = crate::prompt_settings::project_prompts_from_workspace_config(&state).unwrap();
+    assert_eq!(prompts.templates["common.language"], "TYPED_BATCH");
+    assert_eq!(
+        state.contract.entrypoints,
+        vec![config_source::VirtualPath::parse("main.dcdl").unwrap()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_config_apply_model_shape_errors_reject_without_commit() {
+    let fixture = ConfigBatchWipFixture::new().await;
+    for (label, arguments) in [
+        ("missing changes", json!({})),
+        ("changes not list", json!({"changes":{}})),
+        (
+            "unknown case",
+            json!({"changes":[{"$case":"replace","value":{"path":"main.dcdl","content":"{}"}}]}),
+        ),
+        (
+            "raw Backend kind is not WIP union",
+            json!({"changes":[{"kind":"create","path":"notes/raw.txt","content":"raw","content_type":"text"}]}),
+        ),
+        (
+            "create missing content",
+            json!({"changes":[{"$case":"create","value":{"path":"notes/missing.txt"}}]}),
+        ),
+        (
+            "update missing path",
+            json!({"changes":[{"$case":"update","value":{"content":"{}"}}]}),
+        ),
+        (
+            "delete missing path",
+            json!({"changes":[{"$case":"delete","value":{}}]}),
+        ),
+        (
+            "rename missing to",
+            json!({"changes":[{"$case":"rename","value":{"from":"main.dcdl"}}]}),
+        ),
+        (
+            "null is not omitted content_type",
+            json!({"changes":[{"$case":"create","value":{"path":"notes/null.dcdl","content":"{}","content_type":null}}]}),
+        ),
+        (
+            "invalid content_type",
+            json!({"changes":[{"$case":"create","value":{"path":"notes/type.txt","content":"x","content_type":"json"}}]}),
+        ),
+        (
+            "wrong field type",
+            json!({"changes":[{"$case":"delete","value":{"path":123}}]}),
+        ),
+        (
+            "extra payload field",
+            json!({"changes":[{"$case":"update","value":{"path":"main.dcdl","content":"{}","expected_digest":"model supplied"}}]}),
+        ),
+        (
+            "extra union field",
+            json!({"changes":[{"$case":"delete","value":{"path":"main.dcdl"},"kind":"delete"}]}),
+        ),
+        (
+            "extra argument",
+            json!({"changes":[],"entrypoints":["notes/new.dcdl"]}),
+        ),
+    ] {
+        let commits = fixture.commits();
+        fixture.reject(label, arguments).await;
+        assert_eq!(
+            fixture.commits(),
+            commits,
+            "{label}: invalid model shape cannot reach commit"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_config_apply_invalid_candidates_and_collisions_leave_canonical_tree_unchanged() {
+    let fixture = ConfigBatchWipFixture::new().await;
+    fixture.apply(json!([
+        {"$case":"create","value":{"path":"notes/source.txt","content":"source","content_type":"text"}},
+        {"$case":"create","value":{"path":"notes/other.txt","content":"other","content_type":"text"}}
+    ])).await;
+    for (label, changes) in [
+        ("empty batch", json!([])),
+        (
+            "traversal",
+            json!([{"$case":"create","value":{"path":"../escape","content":"{}"}}]),
+        ),
+        (
+            "absolute path",
+            json!([{"$case":"create","value":{"path":"/workspace-config/escape","content":"{}"}}]),
+        ),
+        (
+            "noncanonical path",
+            json!([{"$case":"create","value":{"path":"notes//escape","content":"{}"}}]),
+        ),
+        (
+            "overlong UTF-8 path",
+            json!([{"$case":"create","value":{"path":"é".repeat(257),"content":"{}"}}]),
+        ),
+        (
+            "parse failure",
+            json!([{"$case":"update","value":{"path":"main.dcdl","content":"{"}}]),
+        ),
+        (
+            "schema failure",
+            json!([{"$case":"update","value":{"path":"main.dcdl","content":"{ prompts = 42; } as WorkspaceConfigSchema"}}]),
+        ),
+        (
+            "missing import",
+            json!([{"$case":"update","value":{"path":"main.dcdl","content":"import \"./missing.dcdl\""}}]),
+        ),
+        (
+            "duplicate target",
+            json!([
+                {"$case":"update","value":{"path":"notes/source.txt","content":"changed"}},
+                {"$case":"delete","value":{"path":"notes/source.txt"}}
+            ]),
+        ),
+        (
+            "rename source touched twice",
+            json!([
+                {"$case":"rename","value":{"from":"notes/source.txt","to":"notes/moved.txt"}},
+                {"$case":"delete","value":{"path":"notes/source.txt"}}
+            ]),
+        ),
+        (
+            "rename destination touched twice",
+            json!([
+                {"$case":"rename","value":{"from":"notes/source.txt","to":"notes/moved.txt"}},
+                {"$case":"create","value":{"path":"notes/moved.txt","content":"collision","content_type":"text"}}
+            ]),
+        ),
+        (
+            "two rename destinations collide",
+            json!([
+                {"$case":"rename","value":{"from":"notes/source.txt","to":"notes/moved.txt"}},
+                {"$case":"rename","value":{"from":"notes/other.txt","to":"notes/moved.txt"}}
+            ]),
+        ),
+        (
+            "occupied rename destination",
+            json!([{"$case":"rename","value":{"from":"notes/source.txt","to":"notes/other.txt"}}]),
+        ),
+        (
+            "required entrypoint deletion",
+            json!([{"$case":"delete","value":{"path":"main.dcdl"}}]),
+        ),
+    ] {
+        // A valid first change must not leak from a later rejected change/candidate.
+        let mut batch = vec![
+            json!({"$case":"create","value":{"path":"notes/atomic-marker.txt","content":"must not persist","content_type":"text"}}),
+        ];
+        if label == "empty batch" {
+            batch.clear();
+        } else {
+            batch.extend(changes.as_array().unwrap().iter().cloned());
+        }
+        fixture.reject(label, json!({"changes":batch})).await;
+    }
+    let oversized = (0..257)
+        .map(|index| {
+            json!({"$case":"create","value":{
+                "path":format!("notes/large-{index}.txt"),"content":"","content_type":"text"
+            }})
+        })
+        .collect::<Vec<_>>();
+    fixture
+        .reject("batch limit", json!({"changes":oversized}))
+        .await;
+    fixture.reject("aggregate text limit", json!({"changes":[
+        {"$case":"create","value":{"path":"notes/large-a.txt","content":"x".repeat(131072),"content_type":"text"}},
+        {"$case":"create","value":{"path":"notes/large-b.txt","content":"x".repeat(131073),"content_type":"text"}}
+    ]})).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_config_apply_stale_root_observation_rejects_unrelated_tree_change() {
+    let fixture = ConfigBatchWipFixture::new().await;
+    fixture.inspect().await;
+    let before = fixture.state();
+    // Independent model-facing cache over the same signed client and canonical store.
+    let other = config_batch_runtime(fixture.client.clone());
+    config_inspect(&other, "/workspace-config").await;
+    config_call(&other, "/workspace-config", "apply_changes", json!({"changes":[
+        {"$case":"create","value":{"path":"notes/other-editor.txt","content":"concurrent edit","content_type":"text"}}
+    ]})).await.unwrap();
+    let concurrent = fixture.state();
+    assert_ne!(before.snapshot.digest, concurrent.snapshot.digest);
+    assert_eq!(
+        before
+            .snapshot
+            .get(&config_source::VirtualPath::parse("main.dcdl").unwrap()),
+        concurrent
+            .snapshot
+            .get(&config_source::VirtualPath::parse("main.dcdl").unwrap())
+    );
+    let commits = fixture.commits();
+    let error = config_call(&fixture.wip, "/workspace-config", "apply_changes", json!({"changes":[
+        {"$case":"create","value":{"path":"notes/stale-editor.txt","content":"must not save","content_type":"text"}}
+    ]})).await.unwrap_err();
+    assert!(error.to_string().contains("ValidatorMismatch"), "{error}");
+    assert_eq!(fixture.state(), concurrent);
+    assert_eq!(
+        fixture.commits(),
+        commits,
+        "stale root cannot dispatch a fresh commit"
+    );
+    fixture.apply(json!([{"$case":"create","value":{"path":"notes/fresh-editor.txt","content":"new decision","content_type":"text"}}])).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_config_apply_cached_contract_cannot_bypass_readonly_or_revocation() {
+    for revoke in [false, true] {
+        let fixture = ConfigBatchWipFixture::new().await;
+        let definition = fixture.inspect().await;
+        assert!(
+            definition["interface_signature"]
+                .as_str()
+                .unwrap()
+                .contains("apply_changes(")
+        );
+        let before = fixture.state();
+        if revoke {
+            workspace_config::revoke_grant(
+                &fixture.backend.api,
+                &test_owner_actor(),
+                TEST_WORKSPACE_ID,
+                &attached_grant_id(&fixture.backend.api, &fixture.backend.worker),
+            )
+            .await
+            .unwrap();
+        } else {
+            workspace_config::attach(
+                &fixture.backend.api,
+                &fixture.backend.worker,
+                Attach {
+                    alias: None,
+                    access: Some(Access::ReadOnly),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let commits = fixture.commits();
+        let error = config_call(&fixture.wip, "/workspace-config", "apply_changes", json!({"changes":[
+            {"$case":"create","value":{"path":"notes/denied.txt","content":"denied","content_type":"text"}}
+        ]})).await.unwrap_err();
+        assert!(
+            !error.to_string().contains("outcome unknown"),
+            "{error}"
+        );
+        assert_eq!(fixture.state(), before);
+        assert_eq!(fixture.commits(), commits);
+        if !revoke {
+            let readonly = fixture.inspect().await;
+            assert!(
+                !readonly["interface_signature"]
+                    .as_str()
+                    .unwrap()
+                    .contains("apply_changes("),
+                "{readonly}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspace_config_apply_known_rejection_differs_from_lost_response_without_retry() {
+    let fixture = ConfigBatchWipFixture::new().await;
+    let commits = fixture.commits();
+    fixture.reject("known Backend evaluation rejection", json!({"changes":[
+        {"$case":"create","value":{"path":"notes/no-partial.txt","content":"not committed","content_type":"text"}},
+        {"$case":"update","value":{"path":"main.dcdl","content":"{ prompts = 42; } as WorkspaceConfigSchema"}}
+    ]})).await;
+    assert_eq!(
+        fixture.commits(),
+        commits + 1,
+        "known rejection came from real Backend evaluation"
+    );
+    fixture.inspect().await;
+    let commits = fixture.commits();
+    fixture
+        .client
+        .drop_next_commit_response
+        .store(true, Ordering::SeqCst);
+    let error = config_call(&fixture.wip, "/workspace-config", "apply_changes", json!({"changes":[
+        {"$case":"create","value":{"path":"notes/unknown.txt","content":"committed once","content_type":"text"}}
+    ]})).await.unwrap_err();
+    assert!(
+        error.to_string().contains("outcome unknown"),
+        "{error}"
+    );
+    let state = fixture.state();
+    assert_eq!(
+        state
+            .snapshot
+            .get(&config_source::VirtualPath::parse("notes/unknown.txt").unwrap())
+            .unwrap()
+            .content,
+        "committed once"
+    );
+    assert_eq!(
+        fixture.commits(),
+        commits + 1,
+        "lost response never triggers automatic retry"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn workspace_config_real_selected_invoke_backend_wip_edit_create_delete_import_and_unknown() {
     use worker::feature::builtin::workspace_config::wip::mount_workspace_config_wip;
@@ -432,8 +1028,8 @@ async fn workspace_config_real_selected_invoke_backend_wip_edit_create_delete_im
         .unwrap();
     config_inspect(&wip, CONTENT_ROOT).await;
     config_call(&wip,CONTENT_ROOT,"apply_changes",json!({"changes":[
-        {"kind":"create","path":"fragments/prompts.dcdl","content_type":"decodal","content":"{ common = { language = \"CONFIG_WIP_E2E\"; }; }"},
-        {"kind":"update","path":"main.dcdl","content":"{ prompts = import \"./fragments/prompts.dcdl\"; } as WorkspaceConfigSchema"}
+        {"$case":"create","value":{"path":"fragments/prompts.dcdl","content_type":"decodal","content":"{ common = { language = \"CONFIG_WIP_E2E\"; }; }"}},
+        {"$case":"update","value":{"path":"main.dcdl","content":"{ prompts = import \"./fragments/prompts.dcdl\"; } as WorkspaceConfigSchema"}}
     ]})).await.unwrap();
     // Confirm through ORIGINAL config reader/projection, not a copied WIP store.
     let state = fixture

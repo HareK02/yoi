@@ -419,18 +419,21 @@ fn descriptor(names: &[String]) -> InterfaceDescriptor {
             summary: "Logical Workspace configuration file operations".into(),
             details: Some("Backend grants, semantic validation, atomic whole-tree CAS and activation apply. Validators and change digests are managed automatically. apply_changes atomically accepts create/update/delete/rename changes without validators or expected_digest fields. Saving updates configuration for future operation boundaries, not already-running Worker manifests. No OS or command access.".into()),
         }),
-        operations: names.iter().filter(|name| !matches!(name.as_str(), "read_lines" | "search_text" | "edit" | "write")).map(|name| OperationDeclaration {
+        operations: names.iter().filter(|name| !matches!(name.as_str(), "read_lines" | "search_text" | "edit" | "write")).map(|name| {
+            if name == "apply_changes" {
+                return super::contract::declaration();
+            }
+            OperationDeclaration {
             name: name.clone(), documentation: None,
             parameters: match name.as_str() {
                 "attach" => vec![parameter("access", false, TypeExpr::String)],
                 "read" => crate::file_operation::parameters(name, false).unwrap(),
                 "delete" => vec![],
                 "create" => vec![parameter("path", false, TypeExpr::String), parameter("content", true, TypeExpr::String), parameter("content_type", false, TypeExpr::String)],
-                "apply_changes" => vec![parameter("changes", true, TypeExpr::Json)],
                 _ => vec![],
             },
             returns: ReturnDeclaration { documentation: None, r#type: TypeExpr::Json },
-        }).collect(),
+        }}).collect(),
     }
 }
 
@@ -830,13 +833,9 @@ impl ConfigHandler {
                 }]
             }
             "apply_changes" => {
-                let Some(value) = arguments.get("changes") else {
-                    return Err(invalid());
-                };
-                serde_json::from_value::<Vec<Change>>(
-                    crate::wip::wip_to_json(value).map_err(|_| invalid())?,
-                )
-                .map_err(|_| invalid())?
+                let mut command = super::contract::convert(arguments)?;
+                serde_json::from_value::<Vec<Change>>(command["changes"].take())
+                    .map_err(|_| invalid())?
             }
             _ => return Err(invalid()),
         };
@@ -884,10 +883,11 @@ impl ConfigHandler {
                 unknown()
             })?;
         let value = json_to_wip(&json!({"digest": result.digest,
-            "activation": "Saved to canonical Workspace configuration; existing Worker manifests are not rewritten"})).map_err(|_| {
-                diagnostic.record(Stage::Completion, Reason::Decode, None);
-                unknown()
-            })?;
+            "activation": super::contract::ACTIVATION}))
+        .map_err(|_| {
+            diagnostic.record(Stage::Completion, Reason::Decode, None);
+            unknown()
+        })?;
         Ok(WipOperationOutput::native_with_validator(
             value,
             object_validator(
