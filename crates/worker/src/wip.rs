@@ -3053,6 +3053,7 @@ mod tests {
     #[derive(Debug)]
     struct ScriptedWorkspaceClient {
         responses: Mutex<VecDeque<crate::worker::WorkspaceResponse>>,
+        authorizations: Mutex<VecDeque<Json>>,
         requests: Mutex<Vec<crate::worker::WorkspaceRequest>>,
     }
 
@@ -3060,8 +3061,18 @@ mod tests {
         fn new(responses: impl IntoIterator<Item = crate::worker::WorkspaceResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses.into_iter().collect()),
+                authorizations: Mutex::new(VecDeque::new()),
                 requests: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_authorizations(self, expected: impl IntoIterator<Item = Json>) -> Self {
+            *self.authorizations.lock().unwrap() = expected.into_iter().collect();
+            self
+        }
+
+        fn assert_authorizations_consumed(&self) {
+            assert!(self.authorizations.lock().unwrap().is_empty());
         }
 
         fn requests(&self) -> Vec<crate::worker::WorkspaceRequest> {
@@ -3089,6 +3100,19 @@ mod tests {
             &self,
             request: crate::worker::WorkspaceRequest,
         ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            if request.path == "/api/w/workspace/authorization/check" {
+                let actual: Json = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                let expected = self.authorizations.lock().unwrap().pop_front();
+                assert_eq!(
+                    Some(actual),
+                    expected,
+                    "unexpected operation/resource authorization"
+                );
+                return Ok(crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: json!({"scope": null}).to_string(),
+                });
+            }
             self.requests
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -3103,6 +3127,14 @@ mod tests {
                     )
                 })
         }
+    }
+
+    fn expected_authorization(operation: &str, kind: &str, id: Option<(&str, &str)>) -> Json {
+        let mut resource = json!({"kind": kind, "workspace_id": "workspace"});
+        if let Some((field, value)) = id {
+            resource[field] = json!(value);
+        }
+        json!({"operation": operation, "resource": resource})
     }
 
     fn objective_detail_response(content_digest: &str) -> crate::worker::WorkspaceResponse {
@@ -6107,15 +6139,18 @@ mod tests {
             status: 204,
             body: String::new(),
         };
-        let authoring_client = Arc::new(ScriptedWorkspaceClient::new([
-            query_response,
-            crate::worker::WorkspaceResponse {
-                status: 200,
-                body: json!({"scope": null}).to_string(),
-            },
-            create_response,
-            comment_response,
-        ]));
+        let authoring_client = Arc::new(
+            ScriptedWorkspaceClient::new([query_response, create_response, comment_response])
+                .with_authorizations([
+                    expected_authorization("ticket.query", "workspace", None),
+                    expected_authorization("ticket.create", "workspace", None),
+                    expected_authorization(
+                        "ticket.event.add",
+                        "ticket",
+                        Some(("ticket_id", "T-9")),
+                    ),
+                ]),
+        );
         let authoring_access =
             crate::feature::builtin::ticket::TicketFeatureAccess::workspace_authoring();
         let mut authoring_engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
@@ -6194,38 +6229,64 @@ mod tests {
             .await
             .unwrap();
         let authoring_requests = authoring_client.requests();
-        assert_eq!(authoring_requests.len(), 4);
+        authoring_client.assert_authorizations_consumed();
+        assert_eq!(authoring_requests.len(), 3);
         assert!(authoring_requests[0].path.ends_with("/tickets/query"));
-        assert!(authoring_requests[1].path.ends_with("/authorization/check"));
-        assert!(authoring_requests[2].path.ends_with("/tickets"));
+        assert!(authoring_requests[1].path.ends_with("/tickets"));
         assert!(
-            authoring_requests[3]
+            authoring_requests[2]
                 .path
                 .ends_with("/tickets/T-9/thread-events")
         );
 
-        let workflow_client = Arc::new(ScriptedWorkspaceClient::new([
-            crate::worker::WorkspaceResponse {
-                status: 200,
-                body: json!({"id": "00001SOURCE", "resource_key": "T-9"}).to_string(),
-            },
-            crate::worker::WorkspaceResponse {
-                status: 200,
-                body: json!({"id": "00001TARGET", "resource_key": "T-10"}).to_string(),
-            },
-            crate::worker::WorkspaceResponse {
-                status: 200,
-                body: json!({
-                    "ticket_id": "00001SOURCE",
-                    "kind": "depends_on",
-                    "target": "00001TARGET",
-                    "note": null,
-                    "author": "workspace",
-                    "at": "2026-10-03T00:00:00Z"
-                })
-                .to_string(),
-            },
-        ]));
+        let workflow_client = Arc::new(
+            ScriptedWorkspaceClient::new([
+                crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: json!({"id": "00001SOURCE", "resource_key": "T-9"}).to_string(),
+                },
+                crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: json!({"id": "00001TARGET", "resource_key": "T-10"}).to_string(),
+                },
+                crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: json!({
+                        "ticket_id": "00001SOURCE",
+                        "kind": "depends_on",
+                        "target": "00001TARGET",
+                        "note": null,
+                        "author": "workspace",
+                        "at": "2026-10-03T00:00:00Z"
+                    })
+                    .to_string(),
+                },
+            ])
+            .with_authorizations([
+                expected_authorization(
+                    "ticket.relation.record",
+                    "ticket",
+                    Some(("ticket_id", "T-9")),
+                ),
+                expected_authorization(
+                    "ticket.relation.record",
+                    "ticket",
+                    Some(("ticket_id", "T-10")),
+                ),
+                expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-9"))),
+                expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-10"))),
+                expected_authorization(
+                    "ticket.relation.record",
+                    "ticket",
+                    Some(("ticket_id", "T-9")),
+                ),
+                expected_authorization(
+                    "ticket.relation.record",
+                    "ticket",
+                    Some(("ticket_id", "T-10")),
+                ),
+            ]),
+        );
         let workflow_access = crate::feature::builtin::ticket::TicketFeatureAccess::workflow();
         let mut workflow_engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
         for definition in crate::feature::builtin::ticket::enabled_ticket_definitions(
@@ -6271,6 +6332,7 @@ mod tests {
         let result = result.content.unwrap();
         assert!(result.contains("T-9"));
         assert!(result.contains("T-10"));
+        workflow_client.assert_authorizations_consumed();
         let workflow_requests = workflow_client.requests();
         assert_eq!(workflow_requests.len(), 3);
         assert!(workflow_requests[0].path.ends_with("/tickets/T-9"));
@@ -6323,6 +6385,9 @@ mod tests {
                 })
                 .to_string(),
             },
+        ]).with_authorizations([
+            expected_authorization("merge_request.open", "ticket", Some(("ticket_id", "T-685"))),
+            expected_authorization("merge_request.read", "merge_request", Some(("merge_request_id", "MR-1")))
         ]));
         let coder_config = MergeRequestFeatureConfig {
             show: true,
@@ -6402,6 +6467,7 @@ mod tests {
             )
             .await
             .unwrap();
+        coder_client.assert_authorizations_consumed();
         let coder_requests = coder_client.requests();
         assert_eq!(coder_requests.len(), 2);
         assert_eq!(
@@ -6436,6 +6502,8 @@ mod tests {
                 })
                 .to_string(),
             },
+        ]).with_authorizations([
+            expected_authorization("merge_request.review", "merge_request", Some(("merge_request_id", "MR-1")))
         ]));
         let reviewer_client: Arc<dyn crate::worker::WorkspaceClient> =
             Arc::new(ReviewerChildWorkspaceClient::new(
@@ -6492,6 +6560,7 @@ mod tests {
             )
             .await
             .unwrap();
+        reviewer_inner.assert_authorizations_consumed();
         let reviewer_requests = reviewer_inner.requests();
         assert_eq!(reviewer_requests.len(), 1);
         assert_eq!(
@@ -6502,28 +6571,42 @@ mod tests {
             serde_json::from_str(reviewer_requests[0].body.as_deref().unwrap()).unwrap();
         assert_eq!(review_body["capability_token"], "review-capability-secret");
 
-        let orchestrator_client = Arc::new(ScriptedWorkspaceClient::new([
-            crate::worker::WorkspaceResponse {
-                status: 200,
-                body: json!({
-                    "ready": true,
-                    "blockers": [],
-                    "subject_ref": "source-1",
-                    "review": {"event_id": "review-1", "decision": "approve"}
-                })
-                .to_string(),
-            },
-            crate::worker::WorkspaceResponse {
-                status: 200,
-                body: json!({
-                    "event_id": "merge-1",
-                    "approved_source_ref": "source-1",
-                    "target_ref_before": "target-1",
-                    "target_ref_after": "result-1"
-                })
-                .to_string(),
-            },
-        ]));
+        let orchestrator_client = Arc::new(
+            ScriptedWorkspaceClient::new([
+                crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: json!({
+                        "ready": true,
+                        "blockers": [],
+                        "subject_ref": "source-1",
+                        "review": {"event_id": "review-1", "decision": "approve"}
+                    })
+                    .to_string(),
+                },
+                crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: json!({
+                        "event_id": "merge-1",
+                        "approved_source_ref": "source-1",
+                        "target_ref_before": "target-1",
+                        "target_ref_after": "result-1"
+                    })
+                    .to_string(),
+                },
+            ])
+            .with_authorizations([
+                expected_authorization(
+                    "merge_request.readiness",
+                    "merge_request",
+                    Some(("merge_request_id", "MR-1")),
+                ),
+                expected_authorization(
+                    "merge_request.complete",
+                    "merge_request",
+                    Some(("merge_request_id", "MR-1")),
+                ),
+            ]),
+        );
         let orchestrator_config = MergeRequestFeatureConfig {
             readiness_check: true,
             complete: true,
@@ -6610,6 +6693,7 @@ mod tests {
             rejected.to_string().contains("operation is not declared"),
             "{rejected}"
         );
+        orchestrator_client.assert_authorizations_consumed();
         let orchestrator_requests = orchestrator_client.requests();
         assert_eq!(orchestrator_requests.len(), 2);
         assert_eq!(
@@ -6654,17 +6738,50 @@ mod tests {
             status: 200,
             body: json!({"resource_key": "T-7"}).to_string(),
         };
-        let client = Arc::new(ScriptedWorkspaceClient::new([
-            query_response,
-            objective_detail_response("rev-1"),
-            objective_detail_response("rev-1"),
-            objective_detail_response("rev-2"),
-            objective_detail_response("rev-3"),
-            ticket_response(),
-            objective_detail_response("rev-4"),
-            ticket_response(),
-            objective_detail_response("rev-5"),
-        ]));
+        let client = Arc::new(
+            ScriptedWorkspaceClient::new([
+                query_response,
+                objective_detail_response("rev-1"),
+                objective_detail_response("rev-1"),
+                objective_detail_response("rev-2"),
+                objective_detail_response("rev-3"),
+                ticket_response(),
+                objective_detail_response("rev-4"),
+                ticket_response(),
+                objective_detail_response("rev-5"),
+            ])
+            .with_authorizations([
+                expected_authorization("objective.query", "workspace", None),
+                expected_authorization("objective.create", "workspace", None),
+                expected_authorization(
+                    "objective.read",
+                    "objective",
+                    Some(("objective_id", "O-3")),
+                ),
+                expected_authorization(
+                    "objective.edit",
+                    "objective",
+                    Some(("objective_id", "O-3")),
+                ),
+                expected_authorization(
+                    "objective.set_state",
+                    "objective",
+                    Some(("objective_id", "O-3")),
+                ),
+                expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-7"))),
+                expected_authorization(
+                    "objective.link_ticket",
+                    "objective",
+                    Some(("objective_id", "O-3")),
+                ),
+                expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-7"))),
+                expected_authorization(
+                    "objective.unlink_ticket",
+                    "objective",
+                    Some(("objective_id", "O-3")),
+                ),
+            ]),
+        );
         let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
         for definition in
             crate::feature::builtin::objective::workspace_http_objective_tools(client.clone())
@@ -6764,6 +6881,7 @@ mod tests {
         }
 
         let requests = client.requests();
+        client.assert_authorizations_consumed();
         assert_eq!(requests.len(), 9);
         assert_eq!(
             requests

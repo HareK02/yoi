@@ -25,6 +25,7 @@ use workdir::{
     WorkdirSessionCapabilities, WorkdirSessionHandle, WriteRequest, WriteResult,
 };
 
+use server_api::authorization::PermissionResource;
 use server_api::{
     WorkingDirectoryCreateRequest as WorkdirCreateRequest,
     WorkingDirectoryCreateResponse as WorkdirCreateResponse,
@@ -648,8 +649,74 @@ impl WorkspaceHttpWorkdirBackend {
         Ok(workspace_id)
     }
 
+    fn authorize(&self, operation: &str, resource: &PermissionResource) -> Result<(), ToolError> {
+        self.client
+            .authorize_operation(operation, resource)
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("HTTP status 401") || message.contains("HTTP status 403") {
+                    ToolError::StructuredConflict {
+                        code: "workspace_http_403".into(),
+                        message: format!("Host denied {operation} for {resource:?}"),
+                    }
+                } else {
+                    ToolError::ExecutionFailed(format!(
+                        "Host authorization failed before {operation}: {message}"
+                    ))
+                }
+            })
+    }
+
+    fn authorize_workspace(&self, operation: &str) -> Result<(), ToolError> {
+        self.authorize(
+            operation,
+            &PermissionResource::Workspace {
+                workspace_id: self.workspace_id()?.into(),
+            },
+        )
+    }
+
+    fn authorize_workdir(&self, operation: &str, id: &str) -> Result<(), ToolError> {
+        self.authorize(
+            operation,
+            &PermissionResource::Workdir {
+                working_directory_id: id.into(),
+                path: ".".into(),
+                recursive: true,
+            },
+        )
+    }
+
+    fn authorize_detach(
+        &self,
+        alias: &str,
+        expected_connection_id: Option<&str>,
+    ) -> Result<String, ToolError> {
+        self.client
+            .authorize_workdir_attachment_operation("workdir.detach", alias, expected_connection_id)
+            .map_err(|error| {
+                let message = error.to_string();
+                if message.contains("HTTP status 401") || message.contains("HTTP status 403") {
+                    ToolError::StructuredConflict {
+                        code: "workspace_http_403".into(),
+                        message: format!("Host denied workdir.detach for attachment {alias}"),
+                    }
+                } else if message.contains("HTTP status 409") {
+                    ToolError::StructuredConflict {
+                        code: "workspace_http_409".into(),
+                        message: "attachment lifetime changed before local cleanup".into(),
+                    }
+                } else {
+                    ToolError::ExecutionFailed(format!(
+                        "Host authorization failed before workdir.detach for {alias}: {message}"
+                    ))
+                }
+            })
+    }
+
     fn list(&self) -> Result<ToolOutput, ToolError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
+        self.authorize_workspace("workdir.list")?;
         let response = self.execute_json::<WorkdirListResponse>(WorkspaceRequest::get(format!(
             "/api/w/{workspace_id}/working-directories"
         )))?;
@@ -679,6 +746,13 @@ impl WorkspaceHttpWorkdirBackend {
             selector,
             operation_id: Some(operation_id),
         };
+        self.authorize(
+            "workdir.create",
+            &PermissionResource::Repository {
+                workspace_id: self.workspace_id()?.into(),
+                repository_key: repository_key.into(),
+            },
+        )?;
         let response = self.execute_json::<WorkdirCreateResponse>(WorkspaceRequest::json(
             WorkspaceRequestMethod::Post,
             format!("/api/w/{workspace_id}/working-directories"),
@@ -720,10 +794,15 @@ impl WorkspaceHttpWorkdirBackend {
                 response.environment.clone(),
             ),
         ) {
-            let _ = self.detach(alias);
-            return Err(ToolError::ExecutionFailed(format!(
-                "attach Workdir session route: {error}"
-            )));
+            let rollback = self.detach(alias);
+            return Err(ToolError::ExecutionFailed(match rollback {
+                Ok(_) => {
+                    format!("attach Workdir session route: {error}; Backend attachment rolled back")
+                }
+                Err(rollback_error) => format!(
+                    "attach Workdir session route: {error}; Backend attachment rollback failed: {rollback_error}; inspect the current attachment before retrying"
+                ),
+            }));
         }
         workdir_output(
             format!("Attached Workdir {working_directory_id} as {alias}"),
@@ -737,6 +816,7 @@ impl WorkspaceHttpWorkdirBackend {
         working_directory_id: &str,
     ) -> Result<WorkdirSessionAttachmentResponse, ToolError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
+        self.authorize_workdir("workdir.attach", working_directory_id)?;
         self.execute_json::<WorkdirSessionAttachmentResponse>(WorkspaceRequest::json(
             WorkspaceRequestMethod::Post,
             format!("/api/w/{workspace_id}/workers/self/workdir-attachments"),
@@ -759,9 +839,11 @@ impl WorkspaceHttpWorkdirBackend {
     ) -> Result<ToolOutput, ToolError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
         let alias_path = encode_path_segment(alias);
-        let suffix = expected_connection_id
-            .map(|id| format!("?expected_connection_id={}", encode_path_segment(id)))
-            .unwrap_or_default();
+        let connection_id = self.authorize_detach(alias, expected_connection_id)?;
+        let suffix = format!(
+            "?expected_connection_id={}",
+            encode_path_segment(&connection_id)
+        );
         let response = self.execute_json::<WorkdirAttachmentResponse>(WorkspaceRequest {
             method: WorkspaceRequestMethod::Delete,
             path: format!(
@@ -786,11 +868,13 @@ impl WorkspaceHttpWorkdirBackend {
         )?;
         let workspace_id = encode_path_segment(self.workspace_id()?);
         let workdir_path = encode_path_segment(workdir_id);
+        let reason = validate_delete_reason(&input.reason)?;
+        self.authorize_workdir("workdir.delete", workdir_id)?;
         let response = self.execute_json::<WorkdirRemovalResponse>(WorkspaceRequest::json(
             WorkspaceRequestMethod::Delete,
             format!("/api/w/{workspace_id}/working-directories/{workdir_path}"),
             serde_json::to_string(&WorkdirRemovalRequest {
-                reason: validate_delete_reason(&input.reason)?.to_string(),
+                reason: reason.to_string(),
             })
             .map_err(decode_error)?,
         ))?;
@@ -816,11 +900,20 @@ impl WorkspaceHttpWorkdirBackend {
     ) -> Result<ToolOutput, ToolError> {
         let _mutation_guard = self.attachment_mutation_lock.lock().await;
         let alias = validate_identity(alias, DETACH_TOOL, "alias")?;
+        // Denial must precede local route exclusion and child cleanup as well as DELETE.
+        let authorized_connection_id = self.authorize_detach(alias, expected_connection_id)?;
         if let Some(expected) = expected_connection_id {
             // Under the shared local mutation lock, check lifetime before any
             // local route exclusion or child cleanup. Backend DELETE still performs
             // the authoritative conditional mutation under its lifecycle lock.
             let workspace = encode_path_segment(self.workspace_id()?);
+            self.authorize(
+                "workdir.attachment.read",
+                &PermissionResource::WorkdirAttachment {
+                    workspace_id: self.workspace_id()?.into(),
+                    connection_id: expected.into(),
+                },
+            )?;
             let page: serde_json::Value = self.execute_json(WorkspaceRequest::get(format!(
                 "/api/w/{workspace}/workers/self/workdir-attachments?limit=1&connection_id={}",
                 encode_path_segment(expected)
@@ -857,7 +950,7 @@ impl WorkspaceHttpWorkdirBackend {
                 "stop Internal SubWorkers before Workdir detach: {error}"
             )));
         }
-        let result = match self.detach_expected(alias, expected_connection_id) {
+        let result = match self.detach_expected(alias, Some(&authorized_connection_id)) {
             Ok(result) => result,
             Err(error) => {
                 self.session_router.cancel_detach(&alias_key);
@@ -1248,6 +1341,10 @@ mod tests {
     #[derive(Debug)]
     struct RecordingWorkspaceClient {
         requests: Mutex<Vec<WorkspaceRequest>>,
+        authorizations: Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
+        bound_authorizations:
+            Mutex<Vec<server_api::authorization::BoundOperationAuthorizationRequest>>,
+        denied: std::sync::atomic::AtomicBool,
         responses: Mutex<Vec<WorkspaceResponse>>,
     }
 
@@ -1255,6 +1352,9 @@ mod tests {
         fn new(responses: Vec<WorkspaceResponse>) -> Self {
             Self {
                 requests: Mutex::new(Vec::new()),
+                authorizations: Mutex::default(),
+                bound_authorizations: Mutex::default(),
+                denied: std::sync::atomic::AtomicBool::new(false),
                 responses: Mutex::new(responses.into_iter().rev().collect()),
             }
         }
@@ -1281,6 +1381,36 @@ mod tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/bound-check") {
+                let auth: server_api::authorization::BoundOperationAuthorizationRequest =
+                    serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                let connection_id = match &auth.target {
+                    server_api::authorization::BoundAuthorizationTarget::WorkdirAttachment {
+                        expected_connection_id,
+                        ..
+                    } => expected_connection_id
+                        .clone()
+                        .unwrap_or_else(|| "fixture-connection".into()),
+                    _ => panic!("unexpected bound target"),
+                };
+                self.bound_authorizations.lock().unwrap().push(auth);
+                return Ok(WorkspaceResponse {
+                    status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) { 403 } else { 200 },
+                    body: json!({"scope":{"kind":"workdir_attachment", "workspace_id":"workspace/test", "connection_id":connection_id}}).to_string(),
+                });
+            }
+            if request.path.ends_with("/authorization/check") {
+                let auth = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                self.authorizations.lock().unwrap().push(auth);
+                return Ok(WorkspaceResponse {
+                    status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) {
+                        403
+                    } else {
+                        200
+                    },
+                    body: r#"{"scope":null}"#.into(),
+                });
+            }
             self.requests.lock().unwrap().push(request);
             self.responses
                 .lock()
@@ -1627,7 +1757,7 @@ mod tests {
         assert_eq!(requests[2].method, WorkspaceRequestMethod::Post);
         assert_eq!(
             requests[3].path,
-            "/api/w/workspace%2Ftest/workers/self/workdir-attachments/checkout"
+            "/api/w/workspace%2Ftest/workers/self/workdir-attachments/checkout?expected_connection_id=fixture-connection"
         );
         assert_eq!(requests[3].method, WorkspaceRequestMethod::Delete);
         assert_eq!(
@@ -2001,7 +2131,7 @@ mod tests {
         assert_eq!(client.requests().len(), 1);
         assert_eq!(
             client.requests()[0].path,
-            "/api/w/workspace%2Ftest/workers/self/workdir-attachments/checkout"
+            "/api/w/workspace%2Ftest/workers/self/workdir-attachments/checkout?expected_connection_id=fixture-connection"
         );
     }
 
@@ -2193,5 +2323,113 @@ mod tests {
         .unwrap();
 
         assert_eq!(reopen_calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn host_denial_blocks_lifecycle_requests_and_local_child_cleanup() {
+        let client = Arc::new(RecordingWorkspaceClient::new(Vec::new()));
+        client.denied.store(true, Ordering::SeqCst);
+        let router = Arc::new(workdir::WorkdirSessionRouter::new());
+        router
+            .attach(
+                workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+                WorkspaceAttachedWorkdirSession::handle_for_workdir(
+                    client.clone(),
+                    "checkout",
+                    "wd",
+                ),
+            )
+            .unwrap();
+        let cleanup = Arc::new(AtomicUsize::new(0));
+        let observed = cleanup.clone();
+        let backend = WorkspaceHttpWorkdirBackend::new(client.clone())
+            .with_session_router(router.clone())
+            .with_child_lifecycle(
+                Some(Arc::new(move || {
+                    let observed = observed.clone();
+                    Box::pin(async move {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                })),
+                None,
+            );
+        assert!(backend.list().is_err());
+        assert!(
+            backend
+                .create(
+                    WorkdirCreateInput {
+                        runtime_id: None,
+                        repository_key: "repo".into(),
+                        selector: None,
+                        display_name: None,
+                    },
+                    "create-intent".into()
+                )
+                .is_err()
+        );
+        assert!(
+            backend
+                .attach(WorkdirAttachInput {
+                    alias: "new".into(),
+                    working_directory_id: "wd".into()
+                })
+                .is_err()
+        );
+        assert!(
+            backend
+                .delete(WorkdirDeleteInput {
+                    working_directory_id: "wd".into(),
+                    reason: "remove unused".into()
+                })
+                .is_err()
+        );
+        assert!(backend.detach_managed("checkout", None).await.is_err());
+        assert!(
+            backend
+                .detach_managed("checkout", Some("connection"))
+                .await
+                .is_err()
+        );
+        assert!(client.requests().is_empty());
+        assert_eq!(cleanup.load(Ordering::SeqCst), 0);
+        assert!(router.resolve(Some("checkout")).is_ok());
+        let checks = client.authorizations.lock().unwrap();
+        assert_eq!(
+            checks
+                .iter()
+                .map(|r| r.operation.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "workdir.list",
+                "workdir.create",
+                "workdir.attach",
+                "workdir.delete"
+            ]
+        );
+        assert_eq!(
+            checks[1].resource,
+            PermissionResource::Repository {
+                workspace_id: "workspace/test".into(),
+                repository_key: "repo".into()
+            }
+        );
+        assert_eq!(
+            checks[2].resource,
+            PermissionResource::Workdir {
+                working_directory_id: "wd".into(),
+                path: ".".into(),
+                recursive: true
+            }
+        );
+        let bound = client.bound_authorizations.lock().unwrap();
+        assert_eq!(bound.len(), 2);
+        assert_eq!(bound[1].operation, "workdir.detach");
+        assert_eq!(
+            bound[1].target,
+            server_api::authorization::BoundAuthorizationTarget::WorkdirAttachment {
+                alias: "checkout".into(),
+                expected_connection_id: Some("connection".into()),
+            }
+        );
     }
 }

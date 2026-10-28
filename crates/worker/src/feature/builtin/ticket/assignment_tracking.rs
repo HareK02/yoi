@@ -107,6 +107,30 @@ fn encode_segment(value: &str) -> String {
         .collect()
 }
 
+pub(super) fn authorize_ticket_target(
+    client: &dyn WorkspaceClient,
+    operation: &str,
+    ticket_id: &str,
+) -> Result<(), ToolError> {
+    let workspace_id = client
+        .workspace_id()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            ToolError::InvalidArgument(
+                "Ticket authorization requires Backend Workspace identity".into(),
+            )
+        })?;
+    client
+        .authorize_operation(
+            operation,
+            &server_api::authorization::PermissionResource::Ticket {
+                workspace_id: workspace_id.into(),
+                ticket_id: ticket_id.into(),
+            },
+        )
+        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))
+}
+
 #[derive(Clone)]
 struct TrackingTool {
     client: Arc<dyn WorkspaceClient>,
@@ -128,7 +152,7 @@ impl Tool for TrackingTool {
             })?;
         let prefix = format!("/workspaces/{}/tickets", encode_segment(workspace));
         let parse_error = |error: serde_json::Error| ToolError::InvalidArgument(error.to_string());
-        let (method, path, body) = match self.kind {
+        let (method, path, body, ticket_id) = match self.kind {
             TrackingToolKind::Query => {
                 let input: QueryInput = serde_json::from_str(input).map_err(parse_error)?;
                 required("ticket", &input.ticket)?;
@@ -143,7 +167,7 @@ impl Tool for TrackingTool {
                         encode_segment(&assignment_id)
                     ));
                 }
-                (WorkspaceRequestMethod::Get, path, None)
+                (WorkspaceRequestMethod::Get, path, None, input.ticket)
             }
             TrackingToolKind::History => {
                 let input: HistoryInput = serde_json::from_str(input).map_err(parse_error)?;
@@ -164,7 +188,7 @@ impl Tool for TrackingTool {
                     required("after_event_id", &after)?;
                     path.push_str(&format!("&after_event_id={}", encode_segment(&after)));
                 }
-                (WorkspaceRequestMethod::Get, path, None)
+                (WorkspaceRequestMethod::Get, path, None, input.ticket)
             }
             TrackingToolKind::Update => {
                 let input: UpdateInput = serde_json::from_str(input).map_err(parse_error)?;
@@ -186,6 +210,7 @@ impl Tool for TrackingTool {
                         encode_segment(&input.ticket)
                     ),
                     Some(body.to_string()),
+                    input.ticket,
                 )
             }
         };
@@ -193,6 +218,15 @@ impl Tool for TrackingTool {
             Some(body) => WorkspaceRequest::json(method, path, body),
             None => WorkspaceRequest::get(path),
         };
+        authorize_ticket_target(
+            self.client.as_ref(),
+            match self.kind {
+                TrackingToolKind::Query => "ticket.assignment.query",
+                TrackingToolKind::History => "ticket.assignment.history",
+                TrackingToolKind::Update => "ticket.assignment.update",
+            },
+            &ticket_id,
+        )?;
         let response = self
             .client
             .execute(request)
@@ -240,6 +274,9 @@ pub(super) fn definition(
 }
 
 #[cfg(test)]
+pub(super) mod authorization_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::worker::{WorkspaceClientError, WorkspaceResponse};
@@ -251,6 +288,13 @@ mod tests {
         requests: Mutex<Vec<WorkspaceRequest>>,
     }
     impl WorkspaceClient for Transport {
+        fn authorize_operation(
+            &self,
+            _: &str,
+            _: &server_api::authorization::PermissionResource,
+        ) -> Result<(), WorkspaceClientError> {
+            Ok(())
+        }
         fn workspace_id(&self) -> Option<&str> {
             self.workspace.as_deref()
         }

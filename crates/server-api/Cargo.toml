@@ -21,6 +21,7 @@ serde_json.workspace = true
 sha2.workspace = true
 ticket.workspace = true
 ts-rs = { version = "12.0.1", optional = true }
+url.workspace = true
 webauthn-rs-proto = "0.5.5"
 workdir.workspace = true
 

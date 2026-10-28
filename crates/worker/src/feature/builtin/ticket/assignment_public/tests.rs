@@ -8,6 +8,13 @@ struct Transport {
     available: bool,
 }
 impl WorkspaceClient for Transport {
+    fn authorize_operation(
+        &self,
+        _: &str,
+        _: &server_api::authorization::PermissionResource,
+    ) -> Result<(), WorkspaceClientError> {
+        Ok(())
+    }
     fn workspace_id(&self) -> Option<&str> {
         self.available.then_some("workspace")
     }
@@ -35,7 +42,7 @@ fn transport(status: u16, body: Value) -> Arc<Transport> {
         }),
     })
 }
-fn cases() -> Vec<(PublicAssignmentKind, Value, Value)> {
+pub(super) fn cases() -> Vec<(PublicAssignmentKind, Value, Value)> {
     vec![
         (
             PublicAssignmentKind::Assign,

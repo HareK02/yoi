@@ -251,7 +251,7 @@ impl Tool for WorkspaceTicketReadTool {
         let workspace_id = self.client.workspace_id().ok_or_else(|| {
             ToolError::InvalidArgument("Workspace Ticket reads require workspace identity".into())
         })?;
-        let (path, body) = match self.kind {
+        let (path, body, target) = match self.kind {
             WorkspaceTicketReadKind::Query => {
                 let input: WorkspaceQueryTicketInput = serde_json::from_str(&input)
                     .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
@@ -266,6 +266,7 @@ impl Tool for WorkspaceTicketReadTool {
                     format!("/api/w/{workspace_id}/tickets/query"),
                     serde_json::to_value(input)
                         .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?,
+                    None,
                 )
             }
             WorkspaceTicketReadKind::Show => {
@@ -276,14 +277,22 @@ impl Tool for WorkspaceTicketReadTool {
                         "ShowTicket.id must not be empty".into(),
                     ));
                 }
-                let path = format!("/api/w/{workspace_id}/tickets/{}/show", input.id.trim());
+                let path = format!(
+                    "/api/w/{workspace_id}/tickets/{}/show",
+                    WorkspaceHttpTicketBackend::ticket_path(&TicketIdOrSlug::from(input.id.trim()))
+                );
                 let body = json!({
                     "event_limit": input.event_limit,
                     "event_cursor": input.event_cursor,
                 });
-                (path, body)
+                (path, body, Some(TicketIdOrSlug::from(input.id.trim())))
             }
         };
+        match target {
+            Some(id) => authorize_ticket_item(self.client.as_ref(), "ticket.read", &id),
+            None => authorize_ticket_operation(self.client.as_ref(), "ticket.query"),
+        }
+        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         let response = self
             .client
             .execute(WorkspaceRequest::json(
@@ -822,15 +831,8 @@ impl FeatureModule for TicketFeature {
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
         let workspace_client = self.workspace_client();
-        // Direct new registry installs may not have a matching manifest switch.
-        // Restore retains saved composition; operations still require live authority.
-        if !context.is_restoring() {
-            workspace_client
-                .authorize_feature_activation(FEATURE_ID)
-                .map_err(|error| {
-                    FeatureInstallError::Install(format!("Ticket activation rejected: {error}"))
-                })?;
-        }
+        // Installation only registers local surfaces. Protected operations recheck
+        // current Host authority at each backend access, including after restore.
         let ticket_service: Arc<dyn TicketService> = Arc::new(WorkspaceTicketService {
             backend: WorkspaceHttpTicketBackend::new(workspace_client.clone()),
             access: self.access,
@@ -856,6 +858,41 @@ impl FeatureModule for TicketFeature {
         }
         Ok(())
     }
+}
+
+/// Collection operations use Workspace authority; provider actor, Ticket identity,
+/// CAS and replay checks remain independent. No decision is cached across calls.
+fn authorize_ticket_operation(client: &dyn WorkspaceClient, operation: &str) -> TicketResult<()> {
+    let workspace_id = client
+        .workspace_id()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            TicketError::Conflict("Ticket authorization requires Workspace identity".into())
+        })?;
+    client
+        .authorize_operation(
+            operation,
+            &server_api::authorization::PermissionResource::Workspace {
+                workspace_id: workspace_id.to_owned(),
+            },
+        )
+        .map_err(|error| {
+            TicketError::Conflict(format!("Ticket operation authorization failed: {error}"))
+        })
+}
+
+fn authorize_ticket_item(
+    client: &dyn WorkspaceClient,
+    operation: &str,
+    id: &TicketIdOrSlug,
+) -> TicketResult<()> {
+    let ticket_id = match id {
+        TicketIdOrSlug::Id(value) | TicketIdOrSlug::Slug(value) | TicketIdOrSlug::Query(value) => {
+            value
+        }
+    };
+    assignment_tracking::authorize_ticket_target(client, operation, ticket_id)
+        .map_err(|error| TicketError::Conflict(error.to_string()))
 }
 
 #[derive(Clone, Debug)]
@@ -889,8 +926,10 @@ impl WorkspaceHttpTicketBackend {
     fn show_unprojected(&self, ticket_ref: &str) -> TicketResult<Ticket> {
         let client = self.client.clone();
         let workspace_id = self.client.workspace_id().unwrap_or_default().to_string();
-        let ticket_path = Self::ticket_path(&TicketIdOrSlug::from(ticket_ref));
+        let id = TicketIdOrSlug::from(ticket_ref);
+        let ticket_path = Self::ticket_path(&id);
         let request = move || {
+            authorize_ticket_item(client.as_ref(), "ticket.read", &id)?;
             Self::request_unprojected(
                 client,
                 WorkspaceRequestMethod::Get,
@@ -1005,6 +1044,7 @@ impl WorkspaceHttpTicketBackend {
         base: &str,
         reference: &TicketIdOrSlug,
     ) -> TicketResult<String> {
+        authorize_ticket_item(client.as_ref(), "ticket.read", reference)?;
         let response: Value = Self::request(
             client,
             WorkspaceRequestMethod::Get,
@@ -1058,6 +1098,7 @@ impl WorkspaceHttpTicketBackend {
         let base = format!("/api/w/{workspace_id}/tickets");
         match operation {
             TicketBackendOperation::ListWorkspaceTags { request } => {
+                authorize_ticket_operation(client.as_ref(), "ticket.tag.list")?;
                 let mut endpoint = format!(
                     "/api/w/{workspace_id}/ticket-tags?limit={}",
                     request.limit.unwrap_or(200).min(200)
@@ -1069,21 +1110,33 @@ impl WorkspaceHttpTicketBackend {
                 Self::request(client, WorkspaceRequestMethod::Get, endpoint, None)
                     .map(TicketBackendOperationResult::WorkspaceTags)
             }
-            TicketBackendOperation::MutateWorkspaceTag { request } => Self::request(
-                client,
-                WorkspaceRequestMethod::Post,
-                format!("/api/w/{workspace_id}/ticket-tags"),
-                Some(json!(request)),
-            )
-            .map(TicketBackendOperationResult::WorkspaceTag),
-            TicketBackendOperation::SetTicketTags { id, request } => Self::request(
-                client,
-                WorkspaceRequestMethod::Put,
-                format!("{base}/{}/tags", Self::ticket_path(&id)),
-                Some(json!(request)),
-            )
-            .map(TicketBackendOperationResult::WorkspaceTags),
+            TicketBackendOperation::MutateWorkspaceTag { request } => {
+                let operation = match &request.action {
+                    ticket::WorkspaceTagAction::Create { .. } => "ticket.tag.create",
+                    ticket::WorkspaceTagAction::Rename { .. } => "ticket.tag.rename",
+                    ticket::WorkspaceTagAction::Delete { .. } => "ticket.tag.delete",
+                };
+                authorize_ticket_operation(client.as_ref(), operation)?;
+                Self::request(
+                    client,
+                    WorkspaceRequestMethod::Post,
+                    format!("/api/w/{workspace_id}/ticket-tags"),
+                    Some(json!(request)),
+                )
+                .map(TicketBackendOperationResult::WorkspaceTag)
+            }
+            TicketBackendOperation::SetTicketTags { id, request } => {
+                authorize_ticket_item(client.as_ref(), "ticket.tags.set", &id)?;
+                Self::request(
+                    client,
+                    WorkspaceRequestMethod::Put,
+                    format!("{base}/{}/tags", Self::ticket_path(&id)),
+                    Some(json!(request)),
+                )
+                .map(TicketBackendOperationResult::WorkspaceTags)
+            }
             TicketBackendOperation::DefaultIntakeReadyStateChangeBody { from } => {
+                authorize_ticket_operation(client.as_ref(), "ticket.intake.default_body")?;
                 let value = Self::request::<String>(
                     client,
                     WorkspaceRequestMethod::Post,
@@ -1093,6 +1146,7 @@ impl WorkspaceHttpTicketBackend {
                 Ok(TicketBackendOperationResult::Text(value))
             }
             TicketBackendOperation::List { filter } => {
+                authorize_ticket_operation(client.as_ref(), "ticket.list")?;
                 let state = match filter.state {
                     ticket::TicketStateSelector::Active => "active".to_string(),
                     ticket::TicketStateSelector::All => "all".to_string(),
@@ -1111,6 +1165,7 @@ impl WorkspaceHttpTicketBackend {
                 Ok(TicketBackendOperationResult::Tickets(tickets))
             }
             TicketBackendOperation::Show { id } => {
+                authorize_ticket_item(client.as_ref(), "ticket.read", &id)?;
                 let ticket: Ticket = Self::request(
                     client,
                     WorkspaceRequestMethod::Get,
@@ -1135,22 +1190,7 @@ impl WorkspaceHttpTicketBackend {
                         "Tickets must be created open; closing requires a case judgment".into(),
                     ));
                 }
-                // Shared trusted boundary for Tool, WIP and Ticket service callers.
-                // Activation (`ticket`) is not `ticket.create`. Other Ticket operations
-                // are not yet adapted to this seam; missing checks there are not
-                // supplied automatically by a universal Tool executor.
-                client
-                    .authorize_operation(
-                        "ticket.create",
-                        &server_api::authorization::PermissionResource::Workspace {
-                            workspace_id: workspace_id.clone(),
-                        },
-                    )
-                    .map_err(|error| {
-                        TicketError::Conflict(format!(
-                            "Ticket create authorization failed: {error}"
-                        ))
-                    })?;
+                authorize_ticket_operation(client.as_ref(), "ticket.create")?;
                 let ticket = Self::request(
                     client,
                     WorkspaceRequestMethod::Post,
@@ -1162,6 +1202,7 @@ impl WorkspaceHttpTicketBackend {
                 Ok(TicketBackendOperationResult::TicketRef(ticket))
             }
             TicketBackendOperation::EditItem { id, edit } => {
+                authorize_ticket_item(client.as_ref(), "ticket.edit_item", &id)?;
                 let ticket = Self::request(
                     client,
                     WorkspaceRequestMethod::Patch,
@@ -1173,6 +1214,7 @@ impl WorkspaceHttpTicketBackend {
                 Ok(TicketBackendOperationResult::Ticket(ticket))
             }
             TicketBackendOperation::EditPost { id, edit } => {
+                authorize_ticket_item(client.as_ref(), "ticket.edit_post", &id)?;
                 let (previous, current): (Ticket, Ticket) = Self::request(
                     client,
                     WorkspaceRequestMethod::Patch,
@@ -1184,6 +1226,7 @@ impl WorkspaceHttpTicketBackend {
                 Ok(TicketBackendOperationResult::TicketSnapshots { previous, current })
             }
             TicketBackendOperation::DependencyCheck { id } => {
+                authorize_ticket_item(client.as_ref(), "ticket.dependency.check", &id)?;
                 let check = Self::request(
                     client,
                     WorkspaceRequestMethod::Get,
@@ -1192,34 +1235,44 @@ impl WorkspaceHttpTicketBackend {
                 )?;
                 Ok(TicketBackendOperationResult::DependencyCheck(check))
             }
-            TicketBackendOperation::AddEvent { id, event } => Self::request_unit(
-                client,
-                WorkspaceRequestMethod::Post,
-                format!("{base}/{}/thread-events", Self::ticket_path(&id)),
-                Some(serde_json::to_value(event).map_err(|error| {
-                    TicketError::Conflict(format!("serialize Ticket event: {error}"))
-                })?),
-            ),
+            TicketBackendOperation::AddEvent { id, event } => {
+                authorize_ticket_item(client.as_ref(), "ticket.event.add", &id)?;
+                Self::request_unit(
+                    client,
+                    WorkspaceRequestMethod::Post,
+                    format!("{base}/{}/thread-events", Self::ticket_path(&id)),
+                    Some(serde_json::to_value(event).map_err(|error| {
+                        TicketError::Conflict(format!("serialize Ticket event: {error}"))
+                    })?),
+                )
+            }
             TicketBackendOperation::AddStateChanged { .. } => Err(TicketError::Conflict(
                 "Case changes require an explicit TicketCaseUpdate judgment".into(),
             )),
-            TicketBackendOperation::AddIntakeSummary { id, summary } => Self::request_unit(
-                client,
-                WorkspaceRequestMethod::Post,
-                format!("{base}/{}/intake-summaries", Self::ticket_path(&id)),
-                Some(serde_json::to_value(summary).map_err(|error| {
-                    TicketError::Conflict(format!("serialize Ticket intake summary: {error}"))
-                })?),
-            ),
+            TicketBackendOperation::AddIntakeSummary { id, summary } => {
+                authorize_ticket_item(client.as_ref(), "ticket.intake_summary.add", &id)?;
+                Self::request_unit(
+                    client,
+                    WorkspaceRequestMethod::Post,
+                    format!("{base}/{}/intake-summaries", Self::ticket_path(&id)),
+                    Some(serde_json::to_value(summary).map_err(|error| {
+                        TicketError::Conflict(format!("serialize Ticket intake summary: {error}"))
+                    })?),
+                )
+            }
             TicketBackendOperation::UpdateCase { ticket, request } => {
+                let id = TicketIdOrSlug::from(ticket.as_str());
+                authorize_ticket_item(client.as_ref(), "ticket.case.update", &id)?;
                 let mut body = serde_json::to_value(request).map_err(|error| {
                     TicketError::Conflict(format!("serialize Ticket case judgment: {error}"))
                 })?;
+                authorize_ticket_item(client.as_ref(), "ticket.read", &id)?;
                 // Domain callers cannot supply HTTP actor authority either.
                 body.as_object_mut()
                     .expect("typed case update is an object")
                     .remove("author");
                 let encoded_ticket = Self::ticket_path(&TicketIdOrSlug::from(ticket.as_str()));
+                authorize_ticket_item(client.as_ref(), "ticket.case.update", &id)?;
                 let _: ticket::TicketSummary = Self::request(
                     client.clone(),
                     WorkspaceRequestMethod::Post,
@@ -1228,6 +1281,9 @@ impl WorkspaceHttpTicketBackend {
                 )?;
                 // The mutation receipt returns a bounded summary. Read the full
                 // current authority; never fabricate history from that summary.
+                authorize_ticket_item(client.as_ref(), "ticket.read", &id).map_err(|error| {
+                    TicketError::Conflict(format!("Ticket case judgment may already have succeeded; follow-up read authorization failed: {error}"))
+                })?;
                 Self::request(
                     client,
                     WorkspaceRequestMethod::Get,
@@ -1236,23 +1292,34 @@ impl WorkspaceHttpTicketBackend {
                 )
                 .map(TicketBackendOperationResult::Ticket)
             }
-            TicketBackendOperation::MarkReady { id, request } => Self::request(
-                client,
-                WorkspaceRequestMethod::Post,
-                format!("{base}/{}/workflow/mark-ready", Self::ticket_path(&id)),
-                Some(serde_json::to_value(request).map_err(|error| {
-                    TicketError::Conflict(format!("serialize Ticket mark-ready request: {error}"))
-                })?),
-            )
-            .map(TicketBackendOperationResult::Ticket),
-            TicketBackendOperation::QueueReady { id, .. } => Self::request(
-                client,
-                WorkspaceRequestMethod::Post,
-                format!("{base}/{}/workflow/queue", Self::ticket_path(&id)),
-                None,
-            )
-            .map(TicketBackendOperationResult::QueueOutcome),
+            TicketBackendOperation::MarkReady { id, request } => {
+                authorize_ticket_item(client.as_ref(), "ticket.mark_ready", &id)?;
+                Self::request(
+                    client,
+                    WorkspaceRequestMethod::Post,
+                    format!("{base}/{}/workflow/mark-ready", Self::ticket_path(&id)),
+                    Some(serde_json::to_value(request).map_err(|error| {
+                        TicketError::Conflict(format!(
+                            "serialize Ticket mark-ready request: {error}"
+                        ))
+                    })?),
+                )
+                .map(TicketBackendOperationResult::Ticket)
+            }
+            TicketBackendOperation::QueueReady { id, .. } => {
+                authorize_ticket_item(client.as_ref(), "ticket.queue", &id)?;
+                Self::request(
+                    client,
+                    WorkspaceRequestMethod::Post,
+                    format!("{base}/{}/workflow/queue", Self::ticket_path(&id)),
+                    None,
+                )
+                .map(TicketBackendOperationResult::QueueOutcome)
+            }
             TicketBackendOperation::AddTicketRelation { id, relation } => {
+                let target_id = TicketIdOrSlug::from(relation.target.as_str());
+                authorize_ticket_item(client.as_ref(), "ticket.relation.record", &id)?;
+                authorize_ticket_item(client.as_ref(), "ticket.relation.record", &target_id)?;
                 let source_resource_key =
                     Self::resolve_ticket_resource_key(client.clone(), &base, &id)?;
                 let target_resource_key = Self::resolve_ticket_resource_key(
@@ -1260,6 +1327,8 @@ impl WorkspaceHttpTicketBackend {
                     &base,
                     &TicketIdOrSlug::Id(relation.target.clone()),
                 )?;
+                authorize_ticket_item(client.as_ref(), "ticket.relation.record", &id)?;
+                authorize_ticket_item(client.as_ref(), "ticket.relation.record", &target_id)?;
                 let mut relation: TicketRelation = Self::request(
                     client,
                     WorkspaceRequestMethod::Post,
@@ -1274,6 +1343,9 @@ impl WorkspaceHttpTicketBackend {
                 Ok(TicketBackendOperationResult::Relation(relation))
             }
             TicketBackendOperation::RemoveTicketRelation { id, kind, target } => {
+                let target_id = target.clone();
+                authorize_ticket_item(client.as_ref(), "ticket.relation.remove", &id)?;
+                authorize_ticket_item(client.as_ref(), "ticket.relation.remove", &target_id)?;
                 let source_resource_key =
                     Self::resolve_ticket_resource_key(client.clone(), &base, &id)?;
                 let target_resource_key =
@@ -1283,6 +1355,8 @@ impl WorkspaceHttpTicketBackend {
                     | TicketIdOrSlug::Slug(value)
                     | TicketIdOrSlug::Query(value) => value,
                 };
+                authorize_ticket_item(client.as_ref(), "ticket.relation.remove", &id)?;
+                authorize_ticket_item(client.as_ref(), "ticket.relation.remove", &target_id)?;
                 let mut relation: TicketRelation = Self::request(
                     client,
                     WorkspaceRequestMethod::Delete,
@@ -1295,6 +1369,10 @@ impl WorkspaceHttpTicketBackend {
                 Ok(TicketBackendOperationResult::Relation(relation))
             }
             TicketBackendOperation::QueryTicketRelations { ticket, kind } => {
+                match &ticket {
+                    Some(id) => authorize_ticket_item(client.as_ref(), "ticket.relation.query", id),
+                    None => authorize_ticket_operation(client.as_ref(), "ticket.relation.query"),
+                }?;
                 let relations = Self::request(
                     client,
                     WorkspaceRequestMethod::Post,
@@ -1304,6 +1382,7 @@ impl WorkspaceHttpTicketBackend {
                 Ok(TicketBackendOperationResult::Relations(relations))
             }
             TicketBackendOperation::RelationView { id } => {
+                authorize_ticket_item(client.as_ref(), "ticket.relation.read", &id)?;
                 let view = Self::request(
                     client,
                     WorkspaceRequestMethod::Get,
@@ -1313,6 +1392,7 @@ impl WorkspaceHttpTicketBackend {
                 Ok(TicketBackendOperationResult::RelationView(view))
             }
             TicketBackendOperation::AddOrchestrationPlanRecord { id, record } => {
+                authorize_ticket_item(client.as_ref(), "ticket.orchestration_plan.record", &id)?;
                 let record = Self::request(
                     client,
                     WorkspaceRequestMethod::Post,
@@ -1328,6 +1408,17 @@ impl WorkspaceHttpTicketBackend {
                 ))
             }
             TicketBackendOperation::QueryOrchestrationPlanRecords { ticket, kind } => {
+                match &ticket {
+                    Some(id) => authorize_ticket_item(
+                        client.as_ref(),
+                        "ticket.orchestration_plan.query",
+                        id,
+                    ),
+                    None => authorize_ticket_operation(
+                        client.as_ref(),
+                        "ticket.orchestration_plan.query",
+                    ),
+                }?;
                 let records = Self::request(
                     client,
                     WorkspaceRequestMethod::Post,
@@ -1339,6 +1430,7 @@ impl WorkspaceHttpTicketBackend {
                 ))
             }
             TicketBackendOperation::Doctor => {
+                authorize_ticket_operation(client.as_ref(), "ticket.doctor")?;
                 let report = Self::request(
                     client,
                     WorkspaceRequestMethod::Get,
@@ -2245,6 +2337,11 @@ fn map_ticket_tool_error(error: ToolError) -> WipOperationError {
             ProtocolErrorCode::InvalidArguments,
             format!("{code}: {message}"),
         ),
+        ToolError::ExecutionFailed(message)
+            if message.contains("Ticket case judgment may already have succeeded") =>
+        {
+            WipOperationError::OutcomeUnknown(message)
+        }
         ToolError::ExecutionFailed(message) => {
             // Parse the transport status before the public detail. A message
             // mentioning a different HTTP status must not change classification.
@@ -2557,6 +2654,12 @@ mod tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                return Ok(crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: "{}".into(),
+                });
+            }
             let mut response = self.response.clone();
             // Legacy adapters read a snapshot before the mutation. Let tests
             // inject mutation rejection independently of that successful read.
@@ -3590,7 +3693,6 @@ mod tests {
     fn workspace_feature(access: TicketFeatureAccess) -> TicketFeature {
         let client: Arc<dyn WorkspaceClient> = Arc::new(CreateAuthorizationClient {
             workspace: Some("workspace"),
-            activation_allowed: true,
             allowed: true,
             backend_status: 200,
             requests: Default::default(),
@@ -3919,7 +4021,31 @@ mod tests {
             })
             .unwrap_err();
 
-        assert!(error.to_string().contains("ticket REST request failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("Ticket operation authorization failed")
+        );
+    }
+
+    fn permit_ticket_authorization(listener: &TcpListener, operation: &str) {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut buffer = [0_u8; 8192];
+        let len = stream.read(&mut buffer).unwrap();
+        let request = String::from_utf8_lossy(&buffer[..len]);
+        assert!(
+            request.starts_with("POST /api/w/workspace-a/authorization/check HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            request.contains(&format!("\"operation\":\"{operation}\"")),
+            "{request}"
+        );
+        assert!(request.contains("\"workspace_id\":\"workspace-a\""));
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
     }
 
     #[test]
@@ -3927,6 +4053,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
+            permit_ticket_authorization(&listener, "ticket.event.add");
             let (mut stream, _) = listener.accept().unwrap();
             let mut buffer = [0_u8; 8192];
             let size = stream.read(&mut buffer).unwrap();
@@ -3961,10 +4088,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
+            permit_ticket_authorization(&listener, "ticket.relation.record");
+            permit_ticket_authorization(&listener, "ticket.relation.record");
             for (expected_path, resource_key) in [
                 ("GET /api/w/workspace-a/tickets/01SOURCE HTTP/1.1", "T-1"),
                 ("GET /api/w/workspace-a/tickets/01TARGET HTTP/1.1", "T-2"),
             ] {
+                permit_ticket_authorization(&listener, "ticket.read");
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut buffer = [0_u8; 8192];
                 let len = stream.read(&mut buffer).unwrap();
@@ -3979,6 +4109,8 @@ mod tests {
                 .unwrap();
             }
 
+            permit_ticket_authorization(&listener, "ticket.relation.record");
+            permit_ticket_authorization(&listener, "ticket.relation.record");
             let (mut stream, _) = listener.accept().unwrap();
             let mut buffer = [0_u8; 8192];
             let len = stream.read(&mut buffer).unwrap();
@@ -4030,10 +4162,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
+            permit_ticket_authorization(&listener, "ticket.relation.remove");
+            permit_ticket_authorization(&listener, "ticket.relation.remove");
             for (expected_path, resource_key) in [
                 ("GET /api/w/workspace-a/tickets/01SOURCE HTTP/1.1", "T-1"),
                 ("GET /api/w/workspace-a/tickets/01TARGET HTTP/1.1", "T-2"),
             ] {
+                permit_ticket_authorization(&listener, "ticket.read");
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut buffer = [0_u8; 8192];
                 let len = stream.read(&mut buffer).unwrap();
@@ -4052,6 +4187,8 @@ mod tests {
                 .unwrap();
             }
 
+            permit_ticket_authorization(&listener, "ticket.relation.remove");
+            permit_ticket_authorization(&listener, "ticket.relation.remove");
             let (mut stream, _) = listener.accept().unwrap();
             let mut buffer = [0_u8; 8192];
             let len = stream.read(&mut buffer).unwrap();
@@ -4111,6 +4248,7 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let response_body = serde_json::to_string(&ticket).unwrap();
         let server = thread::spawn(move || {
+            permit_ticket_authorization(&listener, "ticket.read");
             let (mut stream, _) = listener.accept().unwrap();
             let mut buffer = [0_u8; 8192];
             let len = stream.read(&mut buffer).unwrap();
@@ -4152,7 +4290,6 @@ mod tests {
     #[derive(Debug)]
     struct CreateAuthorizationClient {
         workspace: Option<&'static str>,
-        activation_allowed: bool,
         allowed: bool,
         backend_status: u16,
         requests: Mutex<Vec<WorkspaceRequest>>,
@@ -4173,22 +4310,14 @@ mod tests {
             request: WorkspaceRequest,
         ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
             let authorization = request.path.ends_with("/authorization/check");
-            let mut permitted = self.allowed;
+            let permitted = self.allowed;
             if authorization {
                 assert_eq!(request.method, WorkspaceRequestMethod::Post);
                 let body: Value = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
-                if body["operation"] == "ticket" {
-                    assert_eq!(
-                        body,
-                        json!({"operation":"ticket", "resource":{"kind":"feature"}})
-                    );
-                    permitted = self.activation_allowed;
-                } else {
-                    assert_eq!(
-                        body,
-                        json!({"operation":"ticket.create", "resource":{"kind":"workspace","workspace_id":"workspace"}})
-                    );
-                }
+                assert_eq!(
+                    body,
+                    json!({"operation":"ticket.create", "resource":{"kind":"workspace","workspace_id":"workspace"}})
+                );
             } else {
                 assert_eq!(request.path, "/api/w/workspace/tickets");
             }
@@ -4227,7 +4356,6 @@ mod tests {
             for surface in ["tool", "wip", "service", "backend"] {
                 let client = Arc::new(CreateAuthorizationClient {
                     workspace: Some("workspace"),
-                    activation_allowed: true,
                     allowed,
                     backend_status,
                     requests: Default::default(),
@@ -4321,11 +4449,7 @@ mod tests {
                     );
                 }
                 let requests = client.requests.lock().unwrap();
-                assert_eq!(
-                    requests.len(),
-                    1 + usize::from(allowed) + usize::from(surface == "service"),
-                    "{surface}"
-                );
+                assert_eq!(requests.len(), 1 + usize::from(allowed), "{surface}");
                 assert!(requests[0].path.ends_with("/authorization/check"));
                 assert_eq!(
                     requests
@@ -4339,35 +4463,27 @@ mod tests {
     }
 
     #[test]
-    fn direct_ticket_install_requires_activation_even_without_manifest_switch() {
+    fn direct_ticket_install_registers_tools_and_services_without_activation_or_data_access() {
         assert!(!manifest::FeatureConfig::default().ticket.enabled);
-        for create_allowed in [false, true] {
+        for allowed in [false, true] {
             let client = Arc::new(CreateAuthorizationClient {
                 workspace: Some("workspace"),
-                activation_allowed: false,
-                allowed: create_allowed,
+                allowed,
                 backend_status: 200,
                 requests: Default::default(),
             });
             let mut tools = Vec::new();
-            // No manifest-config guard: this is the explicit module install path.
             let report = FeatureRegistryBuilder::new()
                 .with_module(ticket_tools_feature(
                     client.clone(),
                     TicketFeatureAccess::workspace_authoring(),
                 ))
                 .install_into_pending(&mut tools, &mut HookRegistryBuilder::default());
-            assert!(report.has_errors());
-            assert!(
-                report
-                    .error_message()
-                    .contains("Ticket activation rejected")
-            );
-            assert!(report.error_message().contains("HTTP status 403"));
-            assert!(tools.is_empty());
-            assert!(report.installed_instruction_contributions().is_empty());
-            assert!(report.services.providers().is_empty());
-            assert_eq!(client.requests.lock().unwrap().len(), 1);
+            assert!(!report.has_errors(), "{}", report.error_message());
+            assert!(tools.iter().any(|tool| tool().0.name == "TicketCreate"));
+            assert!(!report.installed_instruction_contributions().is_empty());
+            assert!(!report.services.providers().is_empty());
+            assert!(client.requests.lock().unwrap().is_empty());
         }
     }
 
@@ -4375,7 +4491,6 @@ mod tests {
     fn restored_ticket_keeps_tools_and_services_but_rejects_revoked_operation() {
         let client = Arc::new(CreateAuthorizationClient {
             workspace: Some("workspace"),
-            activation_allowed: false,
             allowed: false,
             backend_status: 200,
             requests: Default::default(),
@@ -4411,7 +4526,6 @@ mod tests {
     fn installed_ticket_service_readonly_profile_cannot_create_with_host_permission() {
         let client = Arc::new(CreateAuthorizationClient {
             workspace: Some("workspace"),
-            activation_allowed: true,
             allowed: true,
             backend_status: 200,
             requests: Default::default(),
@@ -4436,14 +4550,10 @@ mod tests {
                 .to_string()
                 .contains("Profile authoring policy")
         );
-        let requests = client.requests.lock().unwrap();
-        assert_eq!(
-            requests.len(),
-            1,
-            "only activation; no create check or backend effect"
+        assert!(
+            client.requests.lock().unwrap().is_empty(),
+            "no activation, authorization or create effect"
         );
-        let body: Value = serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
-        assert_eq!(body["operation"], "ticket");
     }
 
     #[test]
@@ -4470,7 +4580,6 @@ mod tests {
         {
             let client = Arc::new(CreateAuthorizationClient {
                 workspace,
-                activation_allowed: true,
                 allowed,
                 backend_status,
                 requests: Default::default(),
@@ -4530,5 +4639,712 @@ mod tests {
         server.join().unwrap();
         assert_eq!(created.id, "01TEST");
         assert_eq!(created.slug, "http-ticket");
+    }
+    /// Connection suite: real Feature/Task/Tool/WIP/service/backend adapters and
+    /// WorkspaceClient authorization transport; only the remote Host is replaced.
+    /// The fixture evaluates exact shared permission containment and persists allowed
+    /// creates in an isolated SQLite backend. Signed source/grant validation belongs
+    /// to the Server suite, not to this in-process Host fixture.
+    #[derive(Debug)]
+    struct ScopedTicketHost {
+        permissions: Mutex<Vec<server_api::authorization::ScopedPermission>>,
+        requests: Mutex<Vec<WorkspaceRequest>>,
+        store: ticket::SqliteTicketBackend,
+        _root: tempfile::TempDir,
+    }
+
+    impl ScopedTicketHost {
+        fn new(permissions: Vec<server_api::authorization::ScopedPermission>) -> Arc<Self> {
+            let root = tempfile::tempdir().unwrap();
+            Arc::new(Self {
+                store: ticket::SqliteTicketBackend::open(
+                    root.path().join("tickets.db"),
+                    "workspace",
+                )
+                .unwrap(),
+                _root: root,
+                permissions: Mutex::new(permissions),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+        fn downstream_count(&self) -> usize {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| !request.path.ends_with("/authorization/check"))
+                .count()
+        }
+    }
+
+    fn ticket_permission(
+        operation: &str,
+        workspace_id: &str,
+    ) -> server_api::authorization::ScopedPermission {
+        server_api::authorization::ScopedPermission {
+            operation: operation.into(),
+            resource: server_api::authorization::PermissionResource::Workspace {
+                workspace_id: workspace_id.into(),
+            },
+        }
+    }
+
+    impl WorkspaceClient for ScopedTicketHost {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace")
+        }
+        fn kind(&self) -> &str {
+            "scoped-ticket-host-fixture"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            self.requests.lock().unwrap().push(request.clone());
+            if request.path.ends_with("/authorization/check") {
+                let needed: server_api::authorization::OperationAuthorizationRequest =
+                    serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                needed.validate().unwrap();
+                let needed = server_api::authorization::ScopedPermission {
+                    operation: needed.operation,
+                    resource: needed.resource,
+                };
+                let scope = self
+                    .permissions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|permission| permission.covers(&needed))
+                    .map(|permission| permission.resource.clone());
+                return Ok(crate::worker::WorkspaceResponse {
+                    status: if scope.is_some() { 200 } else { 403 },
+                    body: scope
+                        .map(|scope| json!({"scope":scope}))
+                        .unwrap_or_else(
+                            || json!({"message":"operation or resource is not granted"}),
+                        )
+                        .to_string(),
+                });
+            }
+            assert_eq!(
+                request.path, "/api/w/workspace/tickets",
+                "unexpected protected downstream request"
+            );
+            assert_eq!(request.method, WorkspaceRequestMethod::Post);
+            let created = self
+                .store
+                .create(serde_json::from_str(request.body.as_deref().unwrap()).unwrap())
+                .unwrap();
+            Ok(crate::worker::WorkspaceResponse {
+                status: 200,
+                body: serde_json::to_string(&created).unwrap(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn task_and_ticket_install_with_create_only_then_deny_revoked_and_out_of_scope_without_downstream()
+     {
+        for surface in ["tool", "wip", "service", "backend"] {
+            let client =
+                ScopedTicketHost::new(vec![ticket_permission("ticket.create", "workspace")]);
+            let mut tools = Vec::new();
+            let report = FeatureRegistryBuilder::new()
+                .with_module(super::super::task::task_tools_feature())
+                .with_module(ticket_tools_feature(
+                    client.clone(),
+                    TicketFeatureAccess::workspace_authoring(),
+                ))
+                .install_into_pending(&mut tools, &mut HookRegistryBuilder::default());
+            assert!(!report.has_errors(), "{}", report.error_message());
+            assert!(
+                client.requests.lock().unwrap().is_empty(),
+                "registration has no protected access"
+            );
+            let (_, task) = tools
+                .iter()
+                .find(|definition| definition().0.name == "TaskCreate")
+                .unwrap()();
+            task.execute(
+                r#"{"subject":"local", "description":"session only"}"#,
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                client.requests.lock().unwrap().is_empty(),
+                "local task needs no Host grant"
+            );
+            let service = report
+                .services
+                .service::<dyn TicketService>(&ServiceId::builtin(TICKET_SERVICE_ID))
+                .unwrap();
+            // The same bound adapters survive policy replacement; they must not cache success.
+            for phase in ["allowed", "revoked", "out_of_scope", "legacy_feature_only"] {
+                if phase != "allowed" {
+                    *client.permissions.lock().unwrap() = match phase {
+                        "out_of_scope" => {
+                            vec![ticket_permission("ticket.create", "another-workspace")]
+                        }
+                        "legacy_feature_only" => {
+                            vec![server_api::authorization::ScopedPermission {
+                                operation: "ticket".into(),
+                                resource: server_api::authorization::PermissionResource::Feature,
+                            }]
+                        }
+                        _ => Vec::new(),
+                    };
+                }
+                let before = client.downstream_count();
+                let result = match surface {
+                    "tool" => {
+                        let (_, tool) = tools
+                            .iter()
+                            .find(|definition| definition().0.name == "TicketCreate")
+                            .unwrap()();
+                        tool.execute(
+                            r#"{"title":"Authorized create"}"#,
+                            ToolExecutionContext::direct(),
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                    }
+                    "wip" => {
+                        let handler = TicketCollectionWipHandler {
+                            tools: operation_map(
+                                native_ticket_tools(
+                                    client.clone(),
+                                    TicketFeatureAccess::workspace_authoring(),
+                                )
+                                .unwrap(),
+                            ),
+                            permissions: None,
+                            collection_route: "/tickets".into(),
+                            observations: Arc::new(Mutex::new(TicketObservationState::default())),
+                        };
+                        handler
+                            .call(
+                                "create",
+                                &BTreeMap::from([(
+                                    "title".into(),
+                                    WipValue::String("Authorized create".into()),
+                                )]),
+                                WipCallContext {
+                                    execution: ToolExecutionContext::direct(),
+                                    security_context: "test".into(),
+                                },
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| match error {
+                                WipOperationError::Protocol(ProtocolError {
+                                    code: ProtocolErrorCode::PermissionDenied,
+                                    message,
+                                    ..
+                                }) => message,
+                                _ => {
+                                    panic!("definitive authorization denial is not outcome-unknown")
+                                }
+                            })
+                    }
+                    "service" => service
+                        .create(NewTicket::new("Authorized create"))
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    _ => WorkspaceHttpTicketBackend::new(client.clone())
+                        .create(NewTicket::new("Authorized create"))
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                };
+                assert_eq!(
+                    result.is_ok(),
+                    phase == "allowed",
+                    "{surface}/{phase}: {result:?}"
+                );
+                assert_eq!(
+                    client.downstream_count() - before,
+                    usize::from(phase == "allowed"),
+                    "{surface}/{phase}"
+                );
+                assert_eq!(
+                    client.store.list(TicketListQuery::all()).unwrap().len(),
+                    1,
+                    "only the allowed call persisted a Ticket"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_backend_operations_deny_before_any_protected_request() {
+        let id = TicketIdOrSlug::from("T-739");
+        let mut case = decision_input();
+        case.as_object_mut().unwrap().remove("ticket");
+        let mut operations = vec![
+            (
+                "ticket.tag.list",
+                TicketBackendOperation::ListWorkspaceTags {
+                    request: ticket::TagListRequest {
+                        after: None,
+                        limit: None,
+                    },
+                },
+            ),
+            (
+                "ticket.tags.set",
+                TicketBackendOperation::SetTicketTags {
+                    id: id.clone(),
+                    request: ticket::TicketTagSetRequest {
+                        operation_key: "set".into(),
+                        expected_tag_ids: vec![],
+                        tag_ids: vec![],
+                    },
+                },
+            ),
+            (
+                "ticket.intake.default_body",
+                TicketBackendOperation::DefaultIntakeReadyStateChangeBody {
+                    from: "open".into(),
+                },
+            ),
+            (
+                "ticket.list",
+                TicketBackendOperation::List {
+                    filter: TicketListQuery::all(),
+                },
+            ),
+            (
+                "ticket.read",
+                TicketBackendOperation::Show { id: id.clone() },
+            ),
+            (
+                "ticket.create",
+                TicketBackendOperation::Create {
+                    input: NewTicket::new("Denied"),
+                },
+            ),
+            (
+                "ticket.edit_item",
+                TicketBackendOperation::EditItem {
+                    id: id.clone(),
+                    edit: ticket::TicketItemEdit {
+                        title: Some("Denied".into()),
+                        ..Default::default()
+                    },
+                },
+            ),
+            (
+                "ticket.edit_post",
+                TicketBackendOperation::EditPost {
+                    id: id.clone(),
+                    edit: ticket::TicketPostEdit {
+                        event_ref: "post".into(),
+                        expected_body: "old".into(),
+                        body: "new".into(),
+                        author: "not-authority".into(),
+                    },
+                },
+            ),
+            (
+                "ticket.dependency.check",
+                TicketBackendOperation::DependencyCheck { id: id.clone() },
+            ),
+            (
+                "ticket.event.add",
+                TicketBackendOperation::AddEvent {
+                    id: id.clone(),
+                    event: NewTicketEvent::new(ticket::TicketEventKind::Comment, "Denied"),
+                },
+            ),
+            (
+                "ticket.intake_summary.add",
+                TicketBackendOperation::AddIntakeSummary {
+                    id: id.clone(),
+                    summary: TicketIntakeSummary::new("Denied"),
+                },
+            ),
+            (
+                "ticket.case.update",
+                TicketBackendOperation::UpdateCase {
+                    ticket: "T-739".into(),
+                    request: serde_json::from_value(case).unwrap(),
+                },
+            ),
+            (
+                "ticket.mark_ready",
+                TicketBackendOperation::MarkReady {
+                    id: id.clone(),
+                    request: ticket::TicketMarkReady {
+                        operation_key: "ready".into(),
+                        reason: None,
+                        author: None,
+                        intake_summary: None,
+                    },
+                },
+            ),
+            (
+                "ticket.queue",
+                TicketBackendOperation::QueueReady {
+                    id: id.clone(),
+                    queued_by: "not-authority".into(),
+                },
+            ),
+            (
+                "ticket.relation.record",
+                TicketBackendOperation::AddTicketRelation {
+                    id: id.clone(),
+                    relation: NewTicketRelation {
+                        kind: TicketRelationKind::Related,
+                        target: "T-740".into(),
+                        note: None,
+                        author: None,
+                    },
+                },
+            ),
+            (
+                "ticket.relation.remove",
+                TicketBackendOperation::RemoveTicketRelation {
+                    id: id.clone(),
+                    kind: TicketRelationKind::Related,
+                    target: TicketIdOrSlug::from("T-740"),
+                },
+            ),
+            (
+                "ticket.relation.query",
+                TicketBackendOperation::QueryTicketRelations {
+                    ticket: None,
+                    kind: None,
+                },
+            ),
+            (
+                "ticket.relation.read",
+                TicketBackendOperation::RelationView { id: id.clone() },
+            ),
+            (
+                "ticket.orchestration_plan.record",
+                TicketBackendOperation::AddOrchestrationPlanRecord {
+                    id,
+                    record: NewOrchestrationPlanRecord {
+                        kind: OrchestrationPlanKind::Before,
+                        related_ticket: Some("T-740".into()),
+                        note: None,
+                        accepted_plan: None,
+                        author: None,
+                    },
+                },
+            ),
+            (
+                "ticket.orchestration_plan.query",
+                TicketBackendOperation::QueryOrchestrationPlanRecords {
+                    ticket: None,
+                    kind: None,
+                },
+            ),
+            ("ticket.doctor", TicketBackendOperation::Doctor),
+        ];
+        for (name, action) in [
+            (
+                "ticket.tag.create",
+                ticket::WorkspaceTagAction::Create { name: "tag".into() },
+            ),
+            (
+                "ticket.tag.rename",
+                ticket::WorkspaceTagAction::Rename {
+                    tag_id: "tag".into(),
+                    expected_last_operation_key: "old".into(),
+                    name: "new".into(),
+                },
+            ),
+            (
+                "ticket.tag.delete",
+                ticket::WorkspaceTagAction::Delete {
+                    tag_id: "tag".into(),
+                    expected_last_operation_key: "old".into(),
+                },
+            ),
+        ] {
+            operations.push((
+                name,
+                TicketBackendOperation::MutateWorkspaceTag {
+                    request: ticket::WorkspaceTagMutation {
+                        operation_key: "tag-op".into(),
+                        action,
+                    },
+                },
+            ));
+        }
+        for (name, operation) in operations {
+            let client = ScopedTicketHost::new(vec![]);
+            let error = WorkspaceHttpTicketBackend::new(client.clone())
+                .invoke(operation)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("HTTP status 403"),
+                "{name}: {error}"
+            );
+            assert_eq!(client.downstream_count(), 0, "{name}");
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{name}");
+            let check: Value = serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+            assert_eq!(check["operation"], name);
+            let collection = matches!(
+                name,
+                "ticket.tag.list"
+                    | "ticket.intake.default_body"
+                    | "ticket.list"
+                    | "ticket.create"
+                    | "ticket.relation.query"
+                    | "ticket.orchestration_plan.query"
+                    | "ticket.doctor"
+                    | "ticket.tag.create"
+                    | "ticket.tag.rename"
+                    | "ticket.tag.delete"
+            );
+            assert_eq!(
+                check["resource"],
+                if collection {
+                    json!({"kind":"workspace", "workspace_id":"workspace"})
+                } else {
+                    json!({"kind":"ticket", "workspace_id":"workspace", "ticket_id":"T-739"})
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket_read_tools_native_wip_and_handoff_service_deny_before_read() {
+        for kind in [
+            WorkspaceTicketReadKind::Query,
+            WorkspaceTicketReadKind::Show,
+        ] {
+            let client = ScopedTicketHost::new(vec![]);
+            let (_, tool) = workspace_ticket_read_definition(client.clone(), kind)();
+            let input = match kind {
+                WorkspaceTicketReadKind::Query => "{}",
+                WorkspaceTicketReadKind::Show => r#"{"id":"T-739"}"#,
+            };
+            assert!(
+                tool.execute(input, ToolExecutionContext::direct())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("HTTP status 403")
+            );
+            assert_eq!(client.downstream_count(), 0);
+        }
+        let client = ScopedTicketHost::new(vec![]);
+        let service = WorkspaceTicketService {
+            backend: WorkspaceHttpTicketBackend::new(client.clone()),
+            access: TicketFeatureAccess::read_only(),
+        };
+        assert!(
+            service
+                .ticket_handoff("T-739")
+                .unwrap_err()
+                .to_string()
+                .contains("HTTP status 403")
+        );
+        assert_eq!(client.downstream_count(), 0);
+        let handler = TicketItemWipHandler {
+            tools: operation_map(
+                native_ticket_tools(client.clone(), TicketFeatureAccess::read_only()).unwrap(),
+            ),
+            permissions: None,
+            ticket_reference: "T-739".into(),
+            observations: Arc::new(Mutex::new(TicketObservationState::default())),
+        };
+        let error = handler
+            .call(
+                "read",
+                &BTreeMap::new(),
+                WipCallContext {
+                    execution: ToolExecutionContext::direct(),
+                    security_context: "test".into(),
+                },
+            )
+            .await
+            .err()
+            .expect("native read must reject before accessing Ticket data");
+        assert!(matches!(
+            error,
+            WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::PermissionDenied,
+                ..
+            })
+        ));
+        assert_eq!(client.downstream_count(), 0);
+    }
+    #[test]
+    fn ticket_specific_grants_do_not_cross_tickets_or_allow_relationship_target_access() {
+        let mut wrong_ticket = ticket_permission("ticket.read", "workspace");
+        wrong_ticket.resource = server_api::authorization::PermissionResource::Ticket {
+            workspace_id: "workspace".into(),
+            ticket_id: "T-740".into(),
+        };
+        for permission in [ticket_permission("ticket.read", "workspace"), wrong_ticket] {
+            let client = ScopedTicketHost::new(vec![permission]);
+            assert!(
+                WorkspaceHttpTicketBackend::new(client.clone())
+                    .show(TicketIdOrSlug::from("T-739"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("HTTP status 403")
+            );
+            assert_eq!(client.downstream_count(), 0);
+        }
+        let mut source_grant = ticket_permission("ticket.relation.record", "workspace");
+        source_grant.resource = server_api::authorization::PermissionResource::Ticket {
+            workspace_id: "workspace".into(),
+            ticket_id: "T-739".into(),
+        };
+        let client = ScopedTicketHost::new(vec![source_grant]);
+        assert!(
+            WorkspaceHttpTicketBackend::new(client.clone())
+                .add_ticket_relation(
+                    TicketIdOrSlug::from("T-739"),
+                    NewTicketRelation {
+                        kind: TicketRelationKind::Related,
+                        target: "T-740".into(),
+                        note: None,
+                        author: None
+                    }
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("HTTP status 403")
+        );
+        assert_eq!(
+            client.downstream_count(),
+            0,
+            "deny target before reading either record"
+        );
+        let requests = client.requests.lock().unwrap();
+        let targets: Vec<Value> = requests
+            .iter()
+            .map(|request| {
+                serde_json::from_str::<Value>(request.body.as_deref().unwrap()).unwrap()["resource"]
+                    ["ticket_id"]
+                    .clone()
+            })
+            .collect();
+        assert_eq!(targets, vec![json!("T-739"), json!("T-740")]);
+    }
+
+    #[derive(Debug)]
+    struct MidCallRevocationHost {
+        case: bool,
+        provider_requests: Mutex<Vec<WorkspaceRequest>>,
+        record: Value,
+    }
+    impl WorkspaceClient for MidCallRevocationHost {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace")
+        }
+        fn kind(&self) -> &str {
+            "mid-call-revocation-fixture"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                let check: Value = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                assert_eq!(check["resource"]["kind"], "ticket");
+                let operation = check["operation"].as_str().unwrap();
+                let calls = self.provider_requests.lock().unwrap().len();
+                let revoked = if self.case {
+                    calls > 0 && operation == "ticket.read"
+                } else {
+                    calls >= 2 && operation == "ticket.relation.record"
+                };
+                return Ok(crate::worker::WorkspaceResponse {
+                    status: if revoked { 403 } else { 200 },
+                    body: if revoked {
+                        json!({"message":"permission revoked during operation"}).to_string()
+                    } else {
+                        "{}".into()
+                    },
+                });
+            }
+            assert!(if self.case {
+                request.path.ends_with("/case")
+            } else {
+                request.method == WorkspaceRequestMethod::Get
+            });
+            self.provider_requests.lock().unwrap().push(request);
+            Ok(crate::worker::WorkspaceResponse {
+                status: 200,
+                body: if self.case {
+                    self.record["meta"].to_string()
+                } else {
+                    json!({"resource_key":"T-739"}).to_string()
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn permission_revoked_during_operation_prevents_next_access_without_disguising_prior_effect() {
+        for case in [false, true] {
+            let client = Arc::new(MidCallRevocationHost {
+                case,
+                provider_requests: Default::default(),
+                record: serde_json::from_str(
+                    &decision_client(200, TicketState::Closed).response.body,
+                )
+                .unwrap(),
+            });
+            let backend = WorkspaceHttpTicketBackend::new(client.clone());
+            let error = if case {
+                let mut request = decision_input();
+                request.as_object_mut().unwrap().remove("ticket");
+                backend
+                    .update_case("T-739", serde_json::from_value(request).unwrap())
+                    .unwrap_err()
+            } else {
+                backend
+                    .add_ticket_relation(
+                        TicketIdOrSlug::from("T-739"),
+                        NewTicketRelation {
+                            kind: TicketRelationKind::Related,
+                            target: "T-740".into(),
+                            note: None,
+                            author: None,
+                        },
+                    )
+                    .unwrap_err()
+            };
+            assert!(error.to_string().contains("HTTP status 403"), "{error}");
+            let requests = client.provider_requests.lock().unwrap();
+            if case {
+                assert_eq!(
+                    requests.len(),
+                    1,
+                    "judgment dispatched, but no post-write record read"
+                );
+                assert!(matches!(
+                    map_ticket_tool_error(ToolError::ExecutionFailed(error.to_string())),
+                    WipOperationError::OutcomeUnknown(_)
+                ));
+            } else {
+                assert_eq!(
+                    requests.len(),
+                    2,
+                    "two permitted reads, no relationship effect after revocation"
+                );
+                assert!(
+                    requests
+                        .iter()
+                        .all(|request| request.method == WorkspaceRequestMethod::Get)
+                );
+            }
+        }
     }
 }

@@ -2898,6 +2898,22 @@ impl CompactionJournalHost {
 }
 
 impl worker::subjektiv::SubjektivHost for CompactionJournalHost {
+    fn authorize_operation(
+        &self,
+        _: &worker::subjektiv::SubjektivHostContext,
+        operation: &str,
+    ) -> Result<(), worker::subjektiv::SubjektivHostError> {
+        // This fixture retains legacy Journal input even when fresh compaction
+        // reads are disabled. Supply permissions are independent of read capability.
+        match operation {
+            "journal.compaction.read" if self.granted => Ok(()),
+            "journal.startup.supply" | "journal.compaction.supply" => Ok(()),
+            _ => Err(worker::subjektiv::SubjektivHostError::PermissionDenied(
+                format!("compaction fixture did not grant {operation}"),
+            )),
+        }
+    }
+
     fn settings(&self) -> worker::subjektiv::SubjektivHostSettings {
         worker::subjektiv::SubjektivHostSettings {
             language: "English".into(),
@@ -3479,7 +3495,12 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
 #[tokio::test]
 async fn journal_empty_disabled_and_available_compaction_preserve_inputs_without_failure_warnings()
 {
-    assert_journal_compaction_cases(&["absent", "available", "disabled", "no-host"]).await;
+    assert_journal_compaction_cases(&["absent", "available", "disabled"]).await;
+}
+
+#[tokio::test]
+async fn journal_retained_input_without_host_refuses_compaction_before_provider_or_rewrite() {
+    assert_journal_compaction_cases(&["no-host"]).await;
 }
 
 #[tokio::test]
@@ -3543,12 +3564,29 @@ async fn assert_journal_compaction_cases(cases: &[&'static str]) {
         // This observes the real Feature warning while compacting into FsStore.
         let logs = diagnostics::CapturedWarnings::default();
         use tracing::instrument::WithSubscriber;
-        fixture
+        let before_segment = fixture.worker.segment_id();
+        let before_requests = observed.requests().len();
+        let result = fixture
             .worker
             .compact(0)
             .with_subscriber(logs.subscriber())
-            .await
-            .unwrap();
+            .await;
+        if case == "no-host" {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("retained protected input journal requires its matching source")
+            );
+            assert_eq!(observed.requests().len(), before_requests);
+            assert_eq!(fixture.worker.segment_id(), before_segment);
+            assert_eq!(
+                journal_body(&fixture.worker),
+                "PREVIOUS_JOURNAL_DELEGATED_CONTEXT"
+            );
+            continue;
+        }
+        result.unwrap();
         let log = logs.text();
         let failure = match case {
             "unavailable" => Some(("snapshot", "host_unavailable")),

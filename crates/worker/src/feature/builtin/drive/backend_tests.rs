@@ -170,6 +170,14 @@ impl WorkspaceClient for Client {
         &self,
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if request.path.ends_with("/authorization/check") {
+            let input: server_api::authorization::OperationAuthorizationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            return Ok(WorkspaceResponse {
+                status: 200,
+                body: serde_json::json!({"scope": input.resource}).to_string(),
+            });
+        }
         let is_status = request.path.contains("/requests/");
         let fault = if is_status { self.receipt } else { self.fault };
         let mutation = request.method == WorkspaceRequestMethod::Post;
@@ -542,7 +550,7 @@ async fn production_deadline_does_not_cancel_effect_or_infer_uncommitted_from_sn
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_reply_loss_keeps_original_receipt_and_retained_effect_without_reexecution() {
     use axum::{
         Router,
@@ -563,6 +571,7 @@ async fn http_reply_loss_keeps_original_receipt_and_retained_effect_without_reex
     }
     let stored = Arc::new(Mutex::new(Stored::default()));
     let router = Router::new()
+        .route("/api/w/workspace/authorization/check", post(|body: axum::body::Bytes| async move { let input: server_api::authorization::OperationAuthorizationRequest = serde_json::from_slice(&body).unwrap(); axum::Json(serde_json::json!({"scope":input.resource})) }))
         .route("/api/w/workspace/drive/metadata", get(|| async { SECRET }))
         .route(
             "/api/w/workspace/drive/mutate",
@@ -624,7 +633,7 @@ async fn http_reply_loss_keeps_original_receipt_and_retained_effect_without_reex
         .with_subscriber(capture.dispatch())
         .await
         .unwrap_err();
-    assert!(matches!(error, DriveError::Unavailable));
+    assert!(matches!(error, DriveError::Unavailable), "{error:?}");
     safe(&capture, Reason::Decode, &error.to_string());
     let capture = Capture::default();
     let response = backend

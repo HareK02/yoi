@@ -1124,6 +1124,30 @@ async fn subjektiv_runtime_waits_leave_db_and_control_free_and_cancel_retains_th
         .await
         .unwrap()
         .1;
+        if let Some(operation) = match kind {
+            "read" => Some("session.read"),
+            "search" => Some("session.search"),
+            _ => None,
+        } {
+            open_subjektiv_store(&fixture.api)
+                .unwrap()
+                .set_subject_permissions(
+                    &subject.id,
+                    &server_api::authorization::SubjectPermissionsUpdate {
+                        operation_id: format!("session-wait-grant-{kind}"),
+                        expected_change_id: None,
+                        execution: vec![server_api::authorization::ScopedPermission {
+                            operation: operation.into(),
+                            resource: server_api::authorization::PermissionResource::Subject {
+                                workspace_id: WORKSPACE.into(),
+                                subject_id: subject.id.clone(),
+                            },
+                        }],
+                        delegation: vec![],
+                    },
+                )
+                .unwrap();
+        }
         let singleton = if kind == "legacy_scope" {
             format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{}", subject.id)
         } else {

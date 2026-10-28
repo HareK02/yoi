@@ -1523,9 +1523,13 @@ where
             .register_tool(tools::routed_view_image_tool(workdir_sessions));
     }
     if feature_config.web.enabled {
-        worker
-            .engine_mut()
-            .register_tools(tools::web_builtin_tools(web_config));
+        let web = tools::WebTools::new(web_config).with_authorizer(Arc::new(
+            crate::feature::builtin::web::WorkspaceWebAuthorizer(worker.workspace_client_handle()),
+        ));
+        worker.engine_mut().register_tools(vec![
+            tools::web_search_tool(web.clone()),
+            tools::web_fetch_tool(web),
+        ]);
     }
 
     let worker_enabled = feature_config.worker.enabled;
@@ -1552,6 +1556,18 @@ where
                 std::io::ErrorKind::InvalidInput,
                 "Backend Job result capability requires Backend Workspace API authority",
             ));
+        }
+        if binding.subjektiv_consolidation || binding.subjektiv_journal {
+            feature_registry.add_module(
+                crate::feature::builtin::backend_job_input::SubjectJobInputFeature::new(
+                    workspace_client.clone(),
+                    if binding.subjektiv_consolidation {
+                        "memory.consolidation.supply"
+                    } else {
+                        "journal.job.input.supply"
+                    },
+                ),
+            );
         }
         let mut result_feature =
             crate::feature::builtin::backend_job_result::BackendJobResultFeature::new(
@@ -1655,7 +1671,6 @@ where
     if ordinary_subjektiv_features_enabled
         && lifecycle_enabled
         && let Some(host) = subjektiv_host.as_ref()
-        && (host.host.journal_startup_granted() || host.host.journal_compaction_granted())
     {
         worker.install_session_context_source(Arc::new(
             crate::feature::builtin::journal::JournalContextSource::new(
@@ -1765,8 +1780,18 @@ where
         );
     }
     let wip_mode = worker.manifest().worker.mode == manifest::WorkerMode::Wip;
+    let drive_client = worker.workspace_client_handle();
+    if feature_config.drive.enabled
+        && (!drive_client.is_available()
+            || drive_client.workspace_id().is_none_or(|id| id.is_empty()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "Drive is configured but its Backend Workspace connection is unavailable; no Drive access started",
+        ));
+    }
     let drive_feature = crate::feature::builtin::drive::DriveFeature::configured(
-        worker.workspace_client_handle(),
+        drive_client,
         feature_config.drive.enabled,
         worker.workdir_sessions(),
     )
@@ -4088,6 +4113,8 @@ mod tests {
         struct DriveWorkspaceHost {
             available: bool,
             workspace: Option<&'static str>,
+            granted: bool,
+            operations: Arc<std::sync::Mutex<Vec<String>>>,
         }
 
         impl crate::worker::WorkspaceClient for DriveWorkspaceHost {
@@ -4107,11 +4134,25 @@ mod tests {
             {
                 if request.path == "/api/w/workspace-1/authorization/check" {
                     assert_eq!(request.method, crate::worker::WorkspaceRequestMethod::Post);
+                    let input: server_api::authorization::OperationAuthorizationRequest =
+                        serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                    assert!(matches!(
+                        input.operation.as_str(),
+                        "drive.capabilities" | "drive.root"
+                    ));
+                    assert_eq!(
+                        input.resource,
+                        server_api::authorization::PermissionResource::Workspace {
+                            workspace_id: "workspace-1".into()
+                        }
+                    );
+                    self.operations.lock().unwrap().push(input.operation);
                     return Ok(crate::worker::WorkspaceResponse {
-                        status: 200,
-                        body: serde_json::json!({"scope":null}).to_string(),
+                        status: if self.granted { 200 } else { 403 },
+                        body: serde_json::json!({"scope":input.resource}).to_string(),
                     });
                 }
+                self.operations.lock().unwrap().push(request.path.clone());
                 // Native discovery reads metadata and the current caller's ceiling, never inventory or mutations.
                 assert_eq!(request.method, crate::worker::WorkspaceRequestMethod::Get);
                 if request.path == "/api/w/workspace-1/drive/capabilities" {
@@ -4132,14 +4173,16 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn drive_controller_wiring_requires_activation_and_workspace_host_in_both_modes() {
+        async fn drive_controller_registers_without_authorization_and_checks_each_access_in_both_modes()
+         {
             use crate::feature::FeatureModule as _;
             for mode in [manifest::WorkerMode::Tools, manifest::WorkerMode::Wip] {
-                for (enabled, available, workspace) in [
-                    (false, true, Some("workspace-1")),
-                    (true, false, Some("workspace-1")),
-                    (true, true, None),
-                    (true, true, Some("workspace-1")),
+                for (enabled, available, workspace, granted) in [
+                    (false, true, Some("workspace-1"), false),
+                    (true, false, Some("workspace-1"), false),
+                    (true, true, None, false),
+                    (true, true, Some("workspace-1"), false),
+                    (true, true, Some("workspace-1"), true),
                 ] {
                     let root = TempDir::new().unwrap();
                     let mut manifest = manifest::WorkerManifest::from_toml(
@@ -4156,10 +4199,13 @@ mod tests {
                         session_store::FsStore::new(root.path().join("sessions")).unwrap(),
                         session_store::FsWorkerStore::new(root.path().join("workers")).unwrap(),
                     );
+                    let operations = Arc::new(std::sync::Mutex::new(Vec::new()));
                     let host: Arc<dyn crate::worker::WorkspaceClient> =
                         Arc::new(DriveWorkspaceHost {
                             available,
                             workspace,
+                            granted,
+                            operations: operations.clone(),
                         });
                     let context = crate::worker::WorkerWorkspaceContext::with_client(
                         workspace.map(|id| crate::worker::WorkspaceId::new(id).unwrap()),
@@ -4201,12 +4247,17 @@ mod tests {
                     if enabled && (!available || workspace.is_none()) {
                         assert_eq!(
                             registered.unwrap_err().kind(),
-                            std::io::ErrorKind::PermissionDenied
+                            std::io::ErrorKind::NotConnected
                         );
+                        assert!(operations.lock().unwrap().is_empty());
                         assert!(requests.lock().unwrap().is_empty());
                         continue;
                     }
                     registered.unwrap();
+                    assert!(
+                        operations.lock().unwrap().is_empty(),
+                        "registration must not access Drive or authorize activation"
+                    );
                     let configured = enabled && available && workspace.is_some();
                     let tools = worker.engine().tool_server_handle();
                     tools.flush_pending();
@@ -4218,6 +4269,13 @@ mod tests {
                             tool.name
                         );
                     }
+                    if configured && mode == manifest::WorkerMode::Tools {
+                        let (_, root_tool) = tools.get_tool("DriveRoot").unwrap();
+                        let output = root_tool
+                            .execute("{}", ToolExecutionContext::direct())
+                            .await;
+                        assert_eq!(output.is_ok(), granted, "{output:?}");
+                    }
                     if mode == manifest::WorkerMode::Wip {
                         let (_, tree) = tools.get_tool("Tree").unwrap();
                         let output = tree
@@ -4226,7 +4284,7 @@ mod tests {
                                 ToolExecutionContext::new("drive-wiring-tree", "batch", 0),
                             )
                             .await;
-                        assert_eq!(output.is_ok(), configured, "{output:?}");
+                        assert_eq!(output.is_ok(), configured && granted, "{output:?}");
                         if let Ok(output) = output {
                             let tree: serde_json::Value =
                                 serde_json::from_str(&output.content.unwrap()).unwrap();
@@ -4235,6 +4293,16 @@ mod tests {
                             // not an observed empty Workspace hierarchy.
                             assert_eq!(tree["children"], serde_json::Value::Null);
                         }
+                    }
+                    if configured && !granted {
+                        assert!(
+                            operations
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .all(|operation| !operation.starts_with('/')),
+                            "denied access must not reach Drive provider"
+                        );
                     }
                     worker.run_text("Inspect enabled features").await.unwrap();
                     let requests = requests.lock().unwrap();

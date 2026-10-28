@@ -305,7 +305,93 @@ fn lifecycle_task_spec(name: &'static str, description: &'static str) -> Backgro
     spec
 }
 
+#[derive(Clone)]
+struct MemoryExtractionAuthority {
+    workspace: Arc<dyn WorkspaceClient>,
+    subject: Option<crate::subjektiv::SubjektivHostConnection>,
+}
+
+impl MemoryExtractionAuthority {
+    fn authorize(&self, operation: &str) -> Result<(), HookError> {
+        let result = match &self.subject {
+            Some(host) => host
+                .host
+                .authorize_operation(&host.context, operation)
+                .map_err(|error| error.to_string()),
+            None => super::memory::authorize_workspace_memory_operation(
+                self.workspace.as_ref(),
+                operation,
+            )
+            .map_err(|error| error.to_string()),
+        };
+        result.map_err(|error| {
+            HookError::new(
+                HookErrorCategory::Dependency,
+                format!("Memory background operation {operation} not started: {error}"),
+            )
+        })
+    }
+}
+
+impl FeatureModule for MemoryExtractionAuthority {
+    fn descriptor(&self) -> FeatureDescriptor {
+        FeatureDescriptor::builtin("memory-extraction-authority", "Memory extraction authority")
+            .with_hook(crate::feature::HookDeclaration::new(
+                "supply",
+                crate::feature::FeatureHookPoint::PreLlmRequest,
+            ))
+            .with_hook(crate::feature::HookDeclaration::new(
+                "access",
+                crate::feature::FeatureHookPoint::PreToolCall,
+            ))
+    }
+
+    fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
+        context.hooks().add_pre_llm_request(
+            "supply",
+            crate::hook::HookExecutionPolicy::fail_closed(),
+            self.clone(),
+        )?;
+        context.hooks().add_pre_tool_call("access", self.clone())
+    }
+}
+
+#[async_trait]
+impl crate::hook::Hook<crate::hook::PreLlmRequest> for MemoryExtractionAuthority {
+    async fn call(
+        &self,
+        _context: &crate::hook::PreRequestContext,
+    ) -> Result<crate::hook::HookPreRequestAction, HookError> {
+        self.authorize("memory.extract.supply")?;
+        Ok(crate::hook::HookPreRequestAction::Continue)
+    }
+}
+
+#[async_trait]
+impl crate::hook::Hook<crate::hook::PreToolCall> for MemoryExtractionAuthority {
+    async fn call(
+        &self,
+        context: &crate::hook::ToolCallSummary,
+    ) -> Result<crate::hook::HookPreToolAction, HookError> {
+        match context.tool_name.as_str() {
+            "ShowOverview" | "SearchEntries" | "ReadEntry" => {
+                self.authorize("memory.extract.read")?
+            }
+            "StageMemoryCandidate" => self.authorize("memory.staging.write")?,
+            _ => {}
+        }
+        Ok(crate::hook::HookPreToolAction::Continue)
+    }
+}
+
 impl MemoryLifecycleTask {
+    fn authority(&self) -> MemoryExtractionAuthority {
+        MemoryExtractionAuthority {
+            workspace: Arc::clone(&self.workspace_client),
+            subject: self.subjektiv_host.clone(),
+        }
+    }
+
     fn pointer_domain(&self) -> &'static str {
         match self.target {
             ExtractionTarget::WorkspaceMemory => extract::EXTRACT_DOMAIN,
@@ -346,6 +432,7 @@ impl MemoryLifecycleTask {
         } else {
             audit
         };
+        self.authority().authorize("memory.extract.read")?;
         let capture = match self.capture.capture() {
             Ok(capture) => capture,
             Err(error) => {
@@ -556,7 +643,9 @@ impl MemoryLifecycleTask {
                 let _ = sender.send(()).await;
             });
         };
+        self.authority().authorize("memory.extract.supply")?;
         let features = FeatureRegistryBuilder::new()
+            .with_module(self.authority())
             .with_module(SessionExploreFeature::new(SessionExploreState::new(
                 view.clone(),
             )))
@@ -693,6 +782,14 @@ impl MemoryLifecycleTask {
                 .await;
             return Ok(());
         }
+        self.authority().authorize("memory.extract.commit")?;
+        context.generation_fence.ensure_current()?;
+        if cancellation.is_cancelled() {
+            return Err(HookError::new(
+                HookErrorCategory::Cancelled,
+                "Memory extraction cancelled before pointer commit",
+            ));
+        }
         if !self
             .extensions
             .append_if_current(&capture.location(), self.pointer_domain(), payload)
@@ -739,24 +836,26 @@ impl FeatureBackgroundTask for MemoryLifecycleTask {
         } else {
             Ok(())
         };
+        extraction?;
         if !cancellation.is_cancelled() {
             context.generation_fence.ensure_current()?;
             match self.target {
                 ExtractionTarget::WorkspaceMemory if self.config.consolidation_request_enabled => {
-                    self.request_consolidation(false).await;
+                    self.request_consolidation(false).await?;
                 }
                 ExtractionTarget::Subjektiv => {
-                    self.request_consolidation(true).await;
+                    self.request_consolidation(true).await?;
                 }
                 ExtractionTarget::WorkspaceMemory => {}
             }
         }
-        extraction
+        Ok(())
     }
 }
 
 impl MemoryLifecycleTask {
-    async fn request_consolidation(&self, subjektiv: bool) {
+    async fn request_consolidation(&self, subjektiv: bool) -> Result<(), HookError> {
+        self.authority().authorize("memory.consolidation.request")?;
         let audit = WorkerAuditBase::new(
             memory::audit::AuditWorker::MemoryConsolidation,
             memory::audit::AuditTrigger::StagingBacklog,
@@ -805,8 +904,13 @@ impl MemoryLifecycleTask {
                         None,
                     )
                     .await;
+                return Err(HookError::new(
+                    HookErrorCategory::Dependency,
+                    format!("Memory consolidation request not completed: {error}"),
+                ));
             }
         }
+        Ok(())
     }
 
     async fn record_preparation_failure(
@@ -1020,7 +1124,7 @@ impl WorkerAuditBase {
             consolidation,
         };
         if self.persist_legacy_backend {
-            let _ = workspace_client
+            if let Err(error) = workspace_client
                 .execute_memory_backend_operation(
                     memory::backend::MemoryBackendOperation::AppendAudit(
                         memory::backend::MemoryAppendAuditOperation {
@@ -1030,7 +1134,10 @@ impl WorkerAuditBase {
                         },
                     ),
                 )
-                .await;
+                .await
+            {
+                tracing::warn!(%error, "optional Memory audit not persisted");
+            }
         }
         if let Some(tx) = event_tx {
             let _ = tx.send(Event::MemoryWorker(protocol::MemoryWorkerEvent {
@@ -1078,6 +1185,8 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct RecordingWorkspaceClient {
+        denied: std::sync::atomic::AtomicBool,
+        checks: Mutex<Vec<String>>,
         requests: Mutex<Vec<crate::worker::WorkspaceRequest>>,
     }
 
@@ -1098,6 +1207,22 @@ mod tests {
             &self,
             request: crate::worker::WorkspaceRequest,
         ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            if request.path.contains("/authorization/") {
+                let check: serde_json::Value =
+                    serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                self.checks
+                    .lock()
+                    .unwrap()
+                    .push(check["operation"].as_str().unwrap().to_owned());
+                return Ok(crate::worker::WorkspaceResponse {
+                    status: if self.denied.load(Ordering::SeqCst) {
+                        403
+                    } else {
+                        200
+                    },
+                    body: "{}".into(),
+                });
+            }
             let is_subjektiv_stage = request.path.ends_with("/subjektiv/staging");
             let is_subjektiv_consolidation = request.path.ends_with("/subjektiv/consolidation");
             let is_stage_candidate = request
@@ -1186,6 +1311,7 @@ mod tests {
 
     #[derive(Clone)]
     struct ScriptClient {
+        revoke_after_request: Option<Arc<RecordingWorkspaceClient>>,
         responses: Arc<Vec<Vec<LlmEvent>>>,
         calls: Arc<AtomicUsize>,
     }
@@ -1193,6 +1319,7 @@ mod tests {
     impl ScriptClient {
         fn new(responses: Vec<Vec<LlmEvent>>) -> Self {
             Self {
+                revoke_after_request: None,
                 responses: Arc::new(responses),
                 calls: Arc::new(AtomicUsize::new(0)),
             }
@@ -1211,6 +1338,9 @@ mod tests {
         ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
         {
             let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(host) = &self.revoke_after_request {
+                host.denied.store(true, Ordering::SeqCst);
+            }
             let events = self.responses.get(index).cloned().ok_or_else(|| {
                 ClientError::Config("memory lifecycle test client exhausted".to_string())
             })?;
@@ -1526,6 +1656,72 @@ permission = "write"
         assert_eq!(
             manifest.engine.reasoning,
             Some(ReasoningControl::Effort(ReasoningEffort::Medium))
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_background_extraction_never_reads_capture_or_calls_model_or_writes() {
+        let client = ScriptClient::new(Vec::new());
+        let calls = Arc::clone(&client.calls);
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, _) = broadcast::channel(16);
+        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        workspace_client.denied.store(true, Ordering::SeqCst);
+        let mut task = test_task(
+            capture(2, 250),
+            Box::new(client),
+            extension_writes.clone(),
+            event_tx,
+            workspace_client.clone(),
+        );
+        task.capture =
+            CommittedSessionCaptureHandle::new(|| panic!("denial must precede protected capture"));
+        run_background_task(task).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(extension_writes.lock().unwrap().is_empty());
+        assert!(workspace_client.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            *workspace_client.checks.lock().unwrap(),
+            vec!["memory.extract.read"]
+        );
+    }
+
+    #[tokio::test]
+    async fn background_revocation_blocks_next_model_supply_and_pointer_commit() {
+        let workspace_client = Arc::new(RecordingWorkspaceClient::default());
+        let mut client =
+            ScriptClient::new(vec![finish_empty_events("finish-1"), completed_events()]);
+        client.revoke_after_request = Some(workspace_client.clone());
+        let calls = Arc::clone(&client.calls);
+        let extension_writes = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, _) = broadcast::channel(16);
+        run_background_task(test_task(
+            capture(2, 250),
+            Box::new(client),
+            extension_writes.clone(),
+            event_tx,
+            workspace_client.clone(),
+        ))
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(extension_writes.lock().unwrap().is_empty());
+        assert!(
+            !workspace_client
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.path.ends_with("/consolidation"))
+        );
+        assert!(
+            workspace_client
+                .checks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|operation| operation.as_str() == "memory.extract.supply")
+                .count()
+                >= 3
         );
     }
 

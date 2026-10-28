@@ -6,7 +6,7 @@ use super::*;
 use crate::feature::FeatureRegistryBuilder;
 use crate::feature::builtin::backend_diagnostic::tests::Capture;
 use crate::hook::HookRegistryBuilder;
-use crate::wip::{WipMountRegistry, WipRuntime};
+use crate::wip::{WipMountRegistry, WipOperationError, WipRuntime};
 use crate::worker::{
     WorkspaceClient, WorkspaceClientError, WorkspaceRequest, WorkspaceRequestMethod,
     WorkspaceResponse,
@@ -19,9 +19,16 @@ use server_api::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use tracing::instrument::WithSubscriber;
+use wip_protocol::ProtocolErrorCode;
 
 #[derive(Debug)]
 struct State {
+    operation_denied: bool,
+    denied_path: Option<String>,
+    permissions: Option<Vec<server_api::authorization::ScopedPermission>>,
+    authorization_status: Option<u16>,
+    entrypoints: Vec<String>,
+    authorizations: Vec<server_api::authorization::OperationAuthorizationRequest>,
     granted: bool,
     read_only: bool,
     active: Option<WorkspaceConfigAttachment>,
@@ -49,6 +56,12 @@ impl Router {
         Arc::new(Self {
             workspace: "workspace-1",
             state: Arc::new(Mutex::new(State {
+                operation_denied: false,
+                denied_path: None,
+                permissions: None,
+                authorization_status: None,
+                entrypoints: vec!["main.dcdl".into()],
+                authorizations: Vec::new(),
                 granted: true,
                 read_only: false,
                 active: None,
@@ -170,6 +183,39 @@ impl WorkspaceClient for Router {
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let mut state = self.state.lock().unwrap();
+        if request.path.ends_with("/authorization/check") {
+            let input: server_api::authorization::OperationAuthorizationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            state.authorizations.push(input.clone());
+            let path_denied = matches!(&input.resource, server_api::authorization::PermissionResource::WorkspaceConfig {path, ..} if state.denied_path.as_ref() == Some(path));
+            let needed = server_api::authorization::ScopedPermission {
+                operation: input.operation.clone(),
+                resource: input.resource.clone(),
+            };
+            let scope = state
+                .permissions
+                .as_ref()
+                .map(|permissions| permissions.iter().find(|grant| grant.covers(&needed)));
+            let status = state.authorization_status.unwrap_or_else(|| {
+                if state.operation_denied || path_denied || matches!(scope, Some(None)) {
+                    403
+                } else {
+                    200
+                }
+            });
+            return Ok(if status != 200 {
+                WorkspaceResponse {
+                    status,
+                    body: "{}".into(),
+                }
+            } else {
+                let resource = scope
+                    .flatten()
+                    .map(|grant| &grant.resource)
+                    .unwrap_or(&input.resource);
+                response(&serde_json::json!({"scope": resource}))
+            });
+        }
         state.requests.push(request.clone());
         let prefix = "/api/w/workspace-1/workers/self/workspace-config";
         if self.workspace != "workspace-1" || !request.path.starts_with(prefix) || !state.granted {
@@ -288,7 +334,7 @@ impl WorkspaceClient for Router {
                     connection_id: state.active.as_ref().unwrap().connection_id.clone(),
                     validator: state.validator(""),
                     digest: state.tree_digest(),
-                    entrypoints: vec!["main.dcdl".into()],
+                    entrypoints: state.entrypoints.clone(),
                     nodes,
                 };
                 match state.malformed_observe_reply {
@@ -344,7 +390,6 @@ impl WorkspaceClient for Router {
                         WorkspaceConfigFailureClassification::NotCommitted,
                     ));
                 }
-                assert_eq!(request.request.entrypoints, ["main.dcdl"]);
                 if request.validator != state.validator("")
                     || request.request.base_digest != state.tree_digest()
                 {
@@ -436,6 +481,7 @@ impl WorkspaceClient for Router {
                     ));
                 }
                 state.entries = entries;
+                state.entrypoints = request.request.entrypoints;
                 state.applied_commits += 1;
                 if state.lose_commit_reply {
                     state.lose_commit_reply = false;
@@ -1300,5 +1346,127 @@ async fn production_postcommit_transport_loss_retains_cause_and_unknown_without_
     assert_eq!(
         state.entries["main.dcdl"].1,
         "saved-before-observation-loss"
+    );
+}
+
+#[path = "authorization_tests.rs"]
+mod authorization_tests;
+
+#[tokio::test]
+async fn denied_config_operations_have_no_provider_access_or_attachment_effects() {
+    for operation in ["current", "attach", "observe", "read", "commit"] {
+        let client = Router::new();
+        client.state.lock().unwrap().operation_denied = true;
+        let backend = backend::WorkspaceConfigBackend::new(client.clone());
+        let result = match operation {
+            "current" => backend.current_async().await.map(|_| ()),
+            "attach" => backend.post::<Json, _>("", &json!({"alias":"workspace-config", "access":"read_only"}), true).await.map(|_| ()),
+            "observe" => backend.post::<Json, _>("/observe", &json!({"connection_id":"c", "paths":["profiles"], "depth":1}), false).await.map(|_| ()),
+            "read" => backend.post::<Json, _>("/read", &json!({"connection_id":"c", "path":"main.dcdl", "validator":"v"}), false).await.map(|_| ()),
+            "commit" => backend.post::<Json, _>("/commit", &json!({"connection_id":"c", "validator":"v", "request":{"base_digest":"d", "entrypoints":["main.dcdl"], "changes":[{"kind":"delete", "path":"main.dcdl", "expected_digest":"d"}]}}), true).await.map(|_| ()),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(
+                result,
+                Err(WipOperationError::Protocol(wip_protocol::ProtocolError {
+                    code: ProtocolErrorCode::PermissionDenied,
+                    ..
+                }))
+            ),
+            "{operation}"
+        );
+        let state = client.state.lock().unwrap();
+        assert!(state.requests.is_empty());
+        assert!(state.active.is_none());
+        assert_eq!(state.applied_commits, 0);
+        assert_eq!(state.authorizations.len(), 1);
+        assert_eq!(
+            state.authorizations[0].operation,
+            format!("workspace_config.{operation}")
+        );
+        assert_eq!(
+            state.authorizations[0].resource,
+            server_api::authorization::PermissionResource::WorkspaceConfig {
+                workspace_id: "workspace-1".into(),
+                path: match operation {
+                    "observe" => "profiles",
+                    "read" => "main.dcdl",
+                    _ => "",
+                }
+                .into(),
+                recursive: operation == "observe"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn config_wip_read_and_attach_replay_recheck_current_operation_authority() {
+    let client = Router::new();
+    let (feature, runtime) = runtime(client.clone());
+    feature
+        .attach("initial", Some(ConfigAccess::ReadOnly))
+        .await
+        .unwrap();
+    observe_interface(&runtime, "/workspace-config/main.dcdl", true).await;
+    call(&runtime, "/workspace-config/main.dcdl", "read", json!({}))
+        .await
+        .unwrap();
+    let requests = {
+        let mut state = client.state.lock().unwrap();
+        assert!(
+            state
+                .authorizations
+                .iter()
+                .any(|a| a.operation == "workspace_config.read")
+        );
+        state.operation_denied = true;
+        state.requests.len()
+    };
+    assert!(
+        call(&runtime, "/workspace-config/main.dcdl", "read", json!({}))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        feature
+            .attach("initial", Some(ConfigAccess::ReadOnly))
+            .await
+            .unwrap_err(),
+        ConfigAttachError::Denied
+    );
+    let state = client.state.lock().unwrap();
+    assert_eq!(state.requests.len(), requests);
+    assert_eq!(state.applied_commits, 0);
+}
+
+#[tokio::test]
+async fn config_rename_checks_both_paths_before_commit() {
+    let client = Router::new();
+    client.state.lock().unwrap().denied_path = Some("destination.dcdl".into());
+    let backend = backend::WorkspaceConfigBackend::new(client.clone());
+    let result = backend.post::<Json, _>("/commit", &json!({"connection_id":"c", "validator":"v", "request":{"base_digest":"d", "entrypoints":["main.dcdl"], "changes":[{"kind":"rename", "from":"main.dcdl", "to":"destination.dcdl", "expected_digest":"d"}]}}), true).await;
+    assert!(matches!(
+        result,
+        Err(WipOperationError::Protocol(wip_protocol::ProtocolError {
+            code: ProtocolErrorCode::PermissionDenied,
+            ..
+        }))
+    ));
+    let state = client.state.lock().unwrap();
+    assert!(state.requests.is_empty());
+    assert_eq!(state.applied_commits, 0);
+    assert_eq!(
+        state
+            .authorizations
+            .iter()
+            .map(|a| match &a.resource {
+                server_api::authorization::PermissionResource::WorkspaceConfig { path, .. } =>
+                    path.as_str(),
+                _ => panic!("wrong resource"),
+            })
+            .collect::<Vec<_>>(),
+        ["", "main.dcdl", "destination.dcdl"]
     );
 }

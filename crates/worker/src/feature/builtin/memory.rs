@@ -242,6 +242,27 @@ impl dyn WorkspaceClient + '_ {
 #[cfg(test)]
 const RESIDENT_SUMMARY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+pub(crate) fn subject_memory_operation_name(
+    operation: &server_api::SubjektivMemoryBackendOperation,
+) -> &'static str {
+    use server_api::SubjektivMemoryBackendOperation as Operation;
+    match operation {
+        Operation::ResidentSummary(_) | Operation::ResidentContext(_) => "memory.resident.read",
+        Operation::Query(_) => "memory.query",
+        Operation::Read(_) => "memory.read",
+        Operation::ListChanges(_) => "memory.changes.list",
+        Operation::ValidateProposal(_) => "memory.proposal.validate",
+        Operation::ReceiptStatus(_) => "memory.receipt.read",
+        Operation::StageExplicit(_) => "memory.staging.write",
+        Operation::ListCandidates(_) => "memory.staging.list",
+        Operation::ReadCandidate(_) => "memory.staging.read",
+        Operation::DecideCandidate(_) => "memory.candidate.decide",
+        Operation::PrepareSurface(_) => "memory.surface.prepare",
+        Operation::PublishSurface(_) => "memory.surface.publish",
+        Operation::FailSurface(_) => "memory.surface.fail",
+    }
+}
+
 async fn execute_subjektiv_memory_operation(
     client: &dyn WorkspaceClient,
     operation: server_api::SubjektivMemoryBackendOperation,
@@ -268,6 +289,7 @@ fn execute_subjektiv_memory_operation_with(
                     client.kind()
                 ),
             })?;
+    client.authorize_subject_operation(subject_memory_operation_name(&operation))?;
     let response = execute(
         client,
         WorkspaceRequest::json(
@@ -287,6 +309,40 @@ fn execute_subjektiv_memory_operation_with(
     Ok(serde_json::from_str(&response.body)?)
 }
 
+pub(super) fn authorize_workspace_memory_operation(
+    client: &dyn WorkspaceClient,
+    operation: &str,
+) -> Result<(), WorkspaceMemoryBackendError> {
+    let workspace_id =
+        client
+            .workspace_id()
+            .ok_or_else(|| WorkspaceMemoryBackendError::Unavailable {
+                reason: "Memory operation requires a Host-bound Workspace identity".into(),
+            })?;
+    client.authorize_operation(
+        operation,
+        &server_api::authorization::PermissionResource::Workspace {
+            workspace_id: workspace_id.to_owned(),
+        },
+    )?;
+    Ok(())
+}
+
+fn memory_operation_name(operation: &MemoryBackendOperation) -> &'static str {
+    match operation {
+        MemoryBackendOperation::Query(_) => "memory.query",
+        MemoryBackendOperation::ReadDocument(_) => "memory.document.read",
+        MemoryBackendOperation::UpdateDocument(_) => "memory.document.update",
+        MemoryBackendOperation::ResidentSummary(_) => "memory.resident.read",
+        MemoryBackendOperation::AppendAudit(_) => "memory.audit.append",
+        MemoryBackendOperation::StageCandidate(_) => "memory.staging.write",
+        MemoryBackendOperation::StageExtracted(_) => "memory.staging.write",
+        MemoryBackendOperation::StagingList(_) => "memory.staging.list",
+        MemoryBackendOperation::StagingRead(_) => "memory.staging.read",
+        MemoryBackendOperation::StagingClose(_) => "memory.staging.close",
+    }
+}
+
 async fn execute_memory_backend(
     client: &dyn WorkspaceClient,
     operation: MemoryBackendOperation,
@@ -300,6 +356,7 @@ async fn execute_memory_backend(
                     client.kind()
                 ),
             })?;
+    authorize_workspace_memory_operation(client, memory_operation_name(&operation))?;
     let response = client.execute(WorkspaceRequest::json(
         WorkspaceRequestMethod::Post,
         format!("/api/w/{workspace_id}/memory/backend"),
@@ -335,6 +392,11 @@ async fn execute_memory_consolidation(
                     client.kind()
                 ),
             })?;
+    if subjektiv {
+        client.authorize_subject_operation("memory.consolidation.request")?;
+    } else {
+        authorize_workspace_memory_operation(client, "memory.consolidation.request")?;
+    }
     let response = client.execute(WorkspaceRequest::json(
         WorkspaceRequestMethod::Post,
         format!(
@@ -514,6 +576,8 @@ impl Tool for SubjectConsolidationTool {
                 )?)
             }
         };
+        self.host
+            .authorize_operation(subject_memory_operation_name(&operation))?;
         let response = match self.host.memory(operation) {
             Ok(response) => response,
             Err(SubjektivHostError::Conflict { code, message }) => {
@@ -713,8 +777,32 @@ fn query_schema() -> serde_json::Value {
     })
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum ResidentRepresentation {
+    #[default]
+    Unknown,
+    NotStarted,
+    Supplied,
+}
+
 struct WorkspaceResidentSummarySource {
     client: Arc<dyn WorkspaceClient>,
+    // Unknown/restored prompts must be checked. Only an explicitly unstarted
+    // initial contribution can omit checks when no protected content was supplied.
+    representation: Mutex<ResidentRepresentation>,
+}
+
+impl WorkspaceResidentSummarySource {
+    fn not_started(&self) -> SystemPromptContribution {
+        let mut representation = self
+            .representation
+            .lock()
+            .expect("resident representation poisoned");
+        if *representation == ResidentRepresentation::Unknown {
+            *representation = ResidentRepresentation::NotStarted;
+        }
+        SystemPromptContribution::Unavailable
+    }
 }
 
 #[derive(Default)]
@@ -739,7 +827,39 @@ fn resident_summary_contribution(
 
 #[async_trait]
 impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
+    fn protected_input_kind(&self) -> Option<&'static str> {
+        match *self
+            .representation
+            .lock()
+            .expect("resident representation poisoned")
+        {
+            ResidentRepresentation::NotStarted => None,
+            ResidentRepresentation::Unknown | ResidentRepresentation::Supplied => {
+                Some("workspace-memory")
+            }
+        }
+    }
+
+    async fn authorize_supply(&self) -> Result<(), String> {
+        if *self
+            .representation
+            .lock()
+            .expect("resident representation poisoned")
+            == ResidentRepresentation::NotStarted
+        {
+            return Ok(());
+        }
+        authorize_workspace_memory_operation(self.client.as_ref(), "memory.resident.supply")
+            .map_err(|error| error.to_string())
+    }
+
     async fn load(&self) -> SystemPromptContribution {
+        if let Err(error) =
+            authorize_workspace_memory_operation(self.client.as_ref(), "memory.resident.supply")
+        {
+            tracing::warn!(%error, operation = "memory.resident.supply", "optional resident Memory not started; no protected read or prompt contribution");
+            return self.not_started();
+        }
         match self
             .client
             .execute_memory_backend_operation(
@@ -750,15 +870,32 @@ impl SystemPromptContributionSource for WorkspaceResidentSummarySource {
             .await
         {
             Ok(memory::backend::MemoryBackendOperationResult::ResidentSummary(output)) => {
-                resident_summary_contribution(output)
+                if let Err(error) = authorize_workspace_memory_operation(
+                    self.client.as_ref(),
+                    "memory.resident.supply",
+                ) {
+                    tracing::warn!(%error, operation = "memory.resident.supply", "optional resident Memory prompt contribution not supplied");
+                    return self.not_started();
+                }
+                let contribution = resident_summary_contribution(output);
+                if matches!(contribution, SystemPromptContribution::Ready(_)) {
+                    *self
+                        .representation
+                        .lock()
+                        .expect("resident representation poisoned") =
+                        ResidentRepresentation::Supplied;
+                } else {
+                    self.not_started();
+                }
+                contribution
             }
             Ok(other) => {
                 tracing::debug!(?other, "unexpected resident Memory Backend result");
-                SystemPromptContribution::Unavailable
+                self.not_started()
             }
             Err(error) => {
-                tracing::debug!(%error, "resident Memory summary unavailable");
-                SystemPromptContribution::Unavailable
+                tracing::warn!(%error, operation = "memory.resident.read", "optional resident Memory not started; protected read failed and no prompt contribution supplied");
+                self.not_started()
             }
         }
     }
@@ -775,6 +912,7 @@ impl WorkspaceSubjektivResidentSummarySource {
     async fn fetch(
         &self,
     ) -> Result<server_api::SubjektivResidentContextOutput, SubjektivHostError> {
+        self.host.authorize_operation("memory.resident.read")?;
         match self.host.memory(
             server_api::SubjektivMemoryBackendOperation::ResidentContext(Default::default()),
         )? {
@@ -826,6 +964,16 @@ impl WorkspaceSubjektivResidentSummarySource {
 /// Invalidate applied before rewrite so identical bodies can be represented again.
 #[async_trait]
 impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource {
+    fn protected_input_kind(&self) -> Option<&'static str> {
+        Some("subject-resident")
+    }
+
+    async fn authorize_supply(&self) -> Result<(), String> {
+        self.host
+            .authorize_operation("memory.resident.supply")
+            .map_err(|error| error.to_string())
+    }
+
     async fn load(&self) -> SystemPromptContribution {
         self.load_initial().await.0
     }
@@ -836,36 +984,45 @@ impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource 
         SystemPromptContribution,
         Option<crate::worker::PromptContributionCompletion>,
     ) {
-        match self.fetch().await {
-            Ok(output) => match self.render(&output) {
-                Ok((rendered, _)) => {
-                    let state = self.behavior_state.clone();
-                    let behavior = output.behavior_md;
-                    (
-                        SystemPromptContribution::Ready(rendered),
-                        Some(Box::new(move || {
-                            state
-                                .lock()
-                                .expect("subject behavior state poisoned")
-                                .applied = Some(behavior);
-                        })),
-                    )
-                }
-                Err(error) => {
-                    tracing::error!(%error, "subject resident context render failed");
-                    (SystemPromptContribution::Ready("The Host could not render the Subject resident context. Do not treat this as unset behavior or infer replacement behavior from Memory.".into()), None)
-                }
-            },
+        match self.load_initial_checked().await {
+            Ok(contribution) => contribution,
             Err(error) => {
-                tracing::error!(%error, "subject resident context fetch failed");
-                (SystemPromptContribution::Ready("The Host could not fetch the Subject resident context. Do not treat this as unset behavior or infer replacement behavior from Memory.".into()), None)
+                tracing::error!(%error, "required Subject resident context not started; no prompt supplied");
+                (SystemPromptContribution::Unavailable, None)
             }
         }
+    }
+
+    async fn load_initial_checked(
+        &self,
+    ) -> Result<
+        (
+            SystemPromptContribution,
+            Option<crate::worker::PromptContributionCompletion>,
+        ),
+        String,
+    > {
+        self.authorize_supply().await?;
+        let output = self.fetch().await.map_err(|error| error.to_string())?;
+        let (rendered, _) = self.render(&output)?;
+        self.authorize_supply().await?;
+        let state = self.behavior_state.clone();
+        let behavior = output.behavior_md;
+        Ok((
+            SystemPromptContribution::Ready(rendered),
+            Some(Box::new(move || {
+                state
+                    .lock()
+                    .expect("subject behavior state poisoned")
+                    .applied = Some(behavior);
+            })),
+        ))
     }
 
     async fn load_changed_resident_context(
         &self,
     ) -> Result<Option<ResidentContextRefresh>, String> {
+        self.authorize_supply().await?;
         let output = self.fetch().await.map_err(|error| error.to_string())?;
         let changed = self
             .behavior_state
@@ -878,6 +1035,7 @@ impl SystemPromptContributionSource for WorkspaceSubjektivResidentSummarySource 
             return Ok(None);
         }
         let (rendered, prompt_provenance) = self.render(&output)?;
+        self.authorize_supply().await?;
         Ok(Some(ResidentContextRefresh {
             body: rendered,
             behavior_md: output.behavior_md,
@@ -1074,7 +1232,15 @@ struct SubjektivResidentRestoreRefreshHook {
 #[async_trait]
 impl Hook<WorkerRestored> for SubjektivResidentRestoreRefreshHook {
     async fn call(&self, context: &crate::hook::WorkerRestoredContext) -> Result<(), HookError> {
-        let contribution = self.source.load().await;
+        let (contribution, _) = self
+            .source
+            .load_initial_checked()
+            .await
+            .map_err(|error| HookError::new(HookErrorCategory::Dependency, error))?;
+        self.source
+            .authorize_supply()
+            .await
+            .map_err(|error| HookError::new(HookErrorCategory::Dependency, error))?;
         let (surface_ready, summary) = match &contribution {
             SystemPromptContribution::Ready(summary) => (true, Some(summary.as_str())),
             SystemPromptContribution::Unavailable => (false, None),
@@ -1164,6 +1330,7 @@ impl MemoryFeatureInstallPlan {
 
         let resident_summary_source = config.profile.resident.inject_summary.then(|| {
             Arc::new(WorkspaceResidentSummarySource {
+                representation: Mutex::new(ResidentRepresentation::Unknown),
                 client: Arc::clone(&client),
             }) as Arc<dyn SystemPromptContributionSource>
         });
@@ -1388,7 +1555,7 @@ mod tests {
     struct SubjectResidentClient {
         availability: memory::backend::MemoryResidentSummaryAvailability,
         content: Option<String>,
-        scope_allowed: bool,
+        scope_allowed: std::sync::atomic::AtomicBool,
         behavior: Mutex<String>,
         paths: Mutex<Vec<String>>,
         timeouts: Mutex<Vec<Duration>>,
@@ -1402,7 +1569,7 @@ mod tests {
             Self {
                 availability,
                 content: content.map(str::to_string),
-                scope_allowed: true,
+                scope_allowed: std::sync::atomic::AtomicBool::new(true),
                 behavior: Mutex::new("Be deliberate.".to_string()),
                 paths: Mutex::new(Vec::new()),
                 timeouts: Mutex::new(Vec::new()),
@@ -1413,7 +1580,7 @@ mod tests {
             Self {
                 availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
                 content: Some("must not be injected".into()),
-                scope_allowed: false,
+                scope_allowed: std::sync::atomic::AtomicBool::new(false),
                 behavior: Mutex::new("must not be injected".to_string()),
                 paths: Mutex::new(Vec::new()),
                 timeouts: Mutex::new(Vec::new()),
@@ -1438,6 +1605,22 @@ mod tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/bound-check") {
+                let request: server_api::authorization::BoundOperationAuthorizationRequest =
+                    serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                assert!(matches!(
+                    request.target,
+                    server_api::authorization::BoundAuthorizationTarget::Subject {}
+                ));
+                return Ok(WorkspaceResponse {
+                    status: if self.scope_allowed.load(std::sync::atomic::Ordering::SeqCst) {
+                        200
+                    } else {
+                        403
+                    },
+                    body: "{}".into(),
+                });
+            }
             self.paths.lock().unwrap().push(request.path.clone());
             assert!(request.path.ends_with("/subjektiv/memory"));
             let request: server_api::SubjektivMemoryBackendRequest =
@@ -1446,7 +1629,7 @@ mod tests {
                 request.operation,
                 server_api::SubjektivMemoryBackendOperation::ResidentContext(_)
             ));
-            if !self.scope_allowed {
+            if !self.scope_allowed.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(WorkspaceResponse {
                     status: 403,
                     body: "subject scope unavailable".into(),
@@ -1475,7 +1658,9 @@ mod tests {
             request: WorkspaceRequest,
             timeout: Duration,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-            self.timeouts.lock().unwrap().push(timeout);
+            if !request.path.contains("/authorization/") {
+                self.timeouts.lock().unwrap().push(timeout);
+            }
             self.execute(request)
         }
     }
@@ -1498,24 +1683,20 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let content = content.map(str::to_string);
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).unwrap();
-            let body = serde_json::json!({
-                "status": "ok",
-                "result": {
-                    "kind": "resident_summary",
-                    "availability": availability,
-                    "content": content,
-                }
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).unwrap();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let size = stream.read(&mut request).unwrap();
+                let body = if String::from_utf8_lossy(&request[..size]).contains("/authorization/check") {
+                    serde_json::json!({"scope":{"kind":"workspace","workspace_id":"workspace"}})
+                } else {
+                    serde_json::json!({
+                        "status": "ok",
+                        "result": { "kind": "resident_summary", "availability": availability, "content": content }
+                    })
+                }.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
         });
         Arc::new(crate::worker::TestWorkspaceHttpClient::new(
             "workspace",
@@ -1540,15 +1721,22 @@ mod tests {
         })
         .to_string();
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request).unwrap();
-            let response = format!(
-                "HTTP/1.1 {status} rejected\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).unwrap();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let size = stream.read(&mut request).unwrap();
+                let is_authorization =
+                    String::from_utf8_lossy(&request[..size]).contains("/authorization/");
+                let (status, response_body) = if is_authorization {
+                    (200, "{}")
+                } else {
+                    (status, body.as_str())
+                };
+                write!(stream, "HTTP/1.1 {status} response\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}", response_body.len()).unwrap();
+                if !is_authorization {
+                    break;
+                }
+            }
         });
         Arc::new(crate::worker::TestWorkspaceHttpClient::new(
             "workspace",
@@ -2001,14 +2189,12 @@ permission = "write"
             .unwrap()
             .unwrap();
 
-        let SystemPromptContribution::Ready(failure) = source.load().await else {
-            panic!("fetch failure must be explicit in resident context");
+        let error = match source.load_initial_checked().await {
+            Err(error) => error,
+            Ok(_) => panic!("required resident fetch must fail startup"),
         };
-        assert!(failure.contains("could not fetch"));
-        assert_eq!(
-            client.paths.lock().unwrap().clone(),
-            vec!["/api/w/workspace/subjektiv/memory".to_string()]
-        );
+        assert!(error.contains("403"));
+        assert_eq!(client.paths.lock().unwrap().clone(), Vec::<String>::new());
     }
 
     #[test]
@@ -2093,6 +2279,221 @@ permission = "write"
             descriptor.hooks[2].point,
             FeatureHookPoint::BeforeSessionRewrite
         );
+    }
+
+    #[derive(Debug)]
+    struct MemoryAuthorizationFixture {
+        status: std::sync::atomic::AtomicU16,
+        effects: std::sync::atomic::AtomicUsize,
+        checks: Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
+    }
+
+    impl MemoryAuthorizationFixture {
+        fn new(status: u16) -> Self {
+            Self {
+                status: std::sync::atomic::AtomicU16::new(status),
+                effects: std::sync::atomic::AtomicUsize::new(0),
+                checks: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    // Exercise the production authorization request adapter and Memory dispatcher;
+    // only the Host transport/provider effect is replaced.
+    impl WorkspaceClient for MemoryAuthorizationFixture {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("workspace")
+        }
+        fn kind(&self) -> &str {
+            "memory-authorization-fixture"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            use std::sync::atomic::Ordering;
+            if request.path.ends_with("/authorization/check") {
+                let check = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                self.checks.lock().unwrap().push(check);
+                let status = self.status.load(Ordering::SeqCst);
+                if status == 0 {
+                    return Err(WorkspaceClientError::Unavailable(
+                        "authorization transport offline".into(),
+                    ));
+                }
+                return Ok(WorkspaceResponse {
+                    status,
+                    body: if status == 200 {
+                        r#"{"scope":{"kind":"workspace","workspace_id":"workspace"}}"#.into()
+                    } else {
+                        r#"{"message":"operation not granted"}"#.into()
+                    },
+                });
+            }
+            assert!(request.path.ends_with("/memory/backend"));
+            let operation: server_api::MemoryBackendRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            self.effects.fetch_add(1, Ordering::SeqCst);
+            let result = if matches!(operation.0, MemoryBackendOperation::ResidentSummary(_)) {
+                MemoryBackendOperationResult::ResidentSummary(
+                    memory::backend::MemoryResidentSummaryOutput {
+                        availability: memory::backend::MemoryResidentSummaryAvailability::Ready,
+                        content: Some("protected summary".into()),
+                    },
+                )
+            } else {
+                MemoryBackendOperationResult::ToolOutput(MemoryToolOutput {
+                    summary: "effect completed".into(),
+                    content: None,
+                })
+            };
+            Ok(WorkspaceResponse {
+                status: 200,
+                body: serde_json::to_string(&MemoryBackendHttpResponse::Ok { result }).unwrap(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn resident_read_denied_before_provider_access_and_prompt_supply() {
+        use std::sync::atomic::Ordering;
+        let client = Arc::new(MemoryAuthorizationFixture::new(403));
+        let source = WorkspaceResidentSummarySource {
+            representation: Mutex::new(ResidentRepresentation::Unknown),
+            client: client.clone(),
+        };
+        assert_eq!(source.load().await, SystemPromptContribution::Unavailable);
+        assert_eq!(client.effects.load(Ordering::SeqCst), 0);
+        let checks = client.checks.lock().unwrap();
+        assert_eq!(checks[0].operation, "memory.resident.supply");
+        assert_eq!(
+            checks[0].resource,
+            server_api::authorization::PermissionResource::Workspace {
+                workspace_id: "workspace".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn resident_cached_supply_rechecks_authority_but_unstarted_optional_source_supplies_nothing()
+     {
+        use std::sync::atomic::Ordering;
+        let client = Arc::new(MemoryAuthorizationFixture::new(200));
+        let source = WorkspaceResidentSummarySource {
+            representation: Mutex::new(ResidentRepresentation::Unknown),
+            client: client.clone(),
+        };
+        assert!(matches!(
+            source.load().await,
+            SystemPromptContribution::Ready(_)
+        ));
+        client.status.store(403, Ordering::SeqCst);
+        assert!(source.authorize_supply().await.unwrap_err().contains("403"));
+        assert_eq!(client.effects.load(Ordering::SeqCst), 1);
+
+        let never_started = WorkspaceResidentSummarySource {
+            representation: Mutex::new(ResidentRepresentation::Unknown),
+            client: client.clone(),
+        };
+        // Unknown includes restore: saved protected content must not bypass checks.
+        assert!(never_started.authorize_supply().await.is_err());
+        assert_eq!(
+            never_started.load().await,
+            SystemPromptContribution::Unavailable
+        );
+        // Optional initial refusal left no protected content to supply.
+        never_started.authorize_supply().await.unwrap();
+        assert_eq!(client.effects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn subject_cached_and_changed_resident_supply_reject_revocation_without_new_reads() {
+        let manifest = subject_manifest("workspace");
+        let client = Arc::new(SubjectResidentClient::new(
+            memory::backend::MemoryResidentSummaryAvailability::Ready,
+            Some("private surface"),
+        ));
+        let source = backend_resident_source(&manifest, client.clone(), test_prompts())
+            .unwrap()
+            .unwrap();
+        let (initial, completion) = source.load_initial_checked().await.unwrap();
+        assert!(matches!(initial, SystemPromptContribution::Ready(_)));
+        completion.unwrap()();
+        assert_eq!(client.paths.lock().unwrap().len(), 1);
+        client
+            .scope_allowed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            source
+                .authorize_supply()
+                .await
+                .unwrap_err()
+                .contains("denied")
+        );
+        assert!(source.load_changed_resident_context().await.is_err());
+        assert_eq!(client.paths.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_tool_rechecks_current_authority_before_each_effect() {
+        use std::sync::atomic::Ordering;
+        let client = Arc::new(MemoryAuthorizationFixture::new(200));
+        let (_, tool) = workspace_http_memory_tools(client.clone())
+            .into_iter()
+            .map(|definition| definition())
+            .find(|(meta, _)| meta.name == "MemoryReadDocument")
+            .unwrap();
+        tool.execute("{}", ToolExecutionContext::direct())
+            .await
+            .unwrap();
+        assert_eq!(client.effects.load(Ordering::SeqCst), 1);
+        client.status.store(403, Ordering::SeqCst);
+        let error = tool
+            .execute("{}", ToolExecutionContext::direct())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("403"));
+        assert_eq!(client.effects.load(Ordering::SeqCst), 1);
+        assert_eq!(client.checks.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn memory_authorization_transport_failure_is_not_permission_denial() {
+        use std::sync::atomic::Ordering;
+        let client = MemoryAuthorizationFixture::new(0);
+        let error = execute_memory_backend(
+            &client,
+            MemoryBackendOperation::ReadDocument(MemoryDocumentReadOperation {
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            WorkspaceMemoryBackendError::Request(WorkspaceClientError::Unavailable(_))
+        ));
+        assert_eq!(client.effects.load(Ordering::SeqCst), 0);
+        client.status.store(403, Ordering::SeqCst);
+        let error = execute_memory_backend(
+            &client,
+            MemoryBackendOperation::ReadDocument(MemoryDocumentReadOperation {
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            WorkspaceMemoryBackendError::Request(WorkspaceClientError::Request(_))
+        ));
+        assert!(error.to_string().contains("authorization denied"));
+        assert_eq!(client.effects.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2186,10 +2587,15 @@ permission = "write"
                 host: crate::subjektiv::test_connection(repository_error_client(status, code)),
                 operation: SubjectConsolidationOperation::DecideCandidate,
             };
-            let output = tool
-                .execute(&input, ToolExecutionContext::direct())
-                .await
-                .expect("typed conflicts are model-visible retry output");
+            let result = tool.execute(&input, ToolExecutionContext::direct()).await;
+            if status == 403 {
+                let error =
+                    result.expect_err("provider permission denial is not a retryable conflict");
+                assert!(error.to_string().contains("permission denied"));
+                assert!(error.to_string().contains(code));
+                continue;
+            }
+            let output = result.expect("typed conflicts are model-visible retry output");
             let content: serde_json::Value =
                 serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
             assert_eq!(content["status"], "error");

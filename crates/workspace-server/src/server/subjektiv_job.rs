@@ -179,6 +179,7 @@ fn bounded_candidate_batch(
 pub(super) fn dispatch(
     api: &WorkspaceApi,
     subject_id: &str,
+    source_worker: Option<RuntimeWorkerRef>,
     candidate_count: usize,
     total_bytes: u64,
 ) -> ApiResult<MemoryConsolidationOutput> {
@@ -206,7 +207,7 @@ pub(super) fn dispatch(
         profile: format!("builtin:{SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE}"),
         grants: BackendJobGrants { subjektiv_consolidation: Some(SubjektivConsolidationGrant { subject_id: subject_id.into(), candidate_ids }), ..Default::default() },
         serialization_key: None,
-        source_worker: None,
+        source_worker,
         notification_target: None,
         limits: crate::backend_job::BackendJobLimits { timeout_seconds: 600, ..Default::default() },
     };

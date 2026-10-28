@@ -4431,6 +4431,7 @@ dependencies = [
  "ticket",
  "tokio",
  "ts-rs",
+ "url",
  "webauthn-rs-proto",
  "workdir",
 ]

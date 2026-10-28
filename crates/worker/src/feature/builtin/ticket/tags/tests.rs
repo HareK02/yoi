@@ -4,6 +4,7 @@ use crate::worker::{WorkspaceClientError, WorkspaceResponse};
 #[derive(Debug)]
 struct RecordingClient {
     requests: Mutex<Vec<WorkspaceRequest>>,
+    authorizations: Mutex<std::collections::VecDeque<Value>>,
     body: String,
     identity: bool,
     status: u16,
@@ -22,6 +23,14 @@ impl WorkspaceClient for RecordingClient {
         &self,
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if request.path == "/api/w/workspace/authorization/check" {
+            let body: Value = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            assert_eq!(Some(body), self.authorizations.lock().unwrap().pop_front());
+            return Ok(WorkspaceResponse {
+                status: 200,
+                body: json!({"scope": null}).to_string(),
+            });
+        }
         self.requests.lock().unwrap().push(request);
         Ok(WorkspaceResponse {
             status: self.status,
@@ -29,9 +38,19 @@ impl WorkspaceClient for RecordingClient {
         })
     }
 }
-fn recording(body: Value) -> Arc<RecordingClient> {
+fn expected_authorization(operation: &str, ticket_id: Option<&str>) -> Value {
+    let resource = match ticket_id {
+        Some(ticket_id) => {
+            json!({"kind":"ticket", "workspace_id":"workspace", "ticket_id":ticket_id})
+        }
+        None => json!({"kind":"workspace", "workspace_id":"workspace"}),
+    };
+    json!({"operation":operation, "resource":resource})
+}
+fn recording(body: Value, expected: impl IntoIterator<Item = Value>) -> Arc<RecordingClient> {
     Arc::new(RecordingClient {
         requests: Mutex::new(Vec::new()),
+        authorizations: Mutex::new(expected.into_iter().collect()),
         body: body.to_string(),
         identity: true,
         status: 200,
@@ -69,7 +88,7 @@ fn cases() -> Vec<(TagToolKind, Value, &'static str)> {
 #[tokio::test]
 async fn classification_tool_schemas_require_observations_and_reject_actor_claims() {
     for (kind, input, name) in cases() {
-        let client = recording(json!([]));
+        let client = recording(json!([]), []);
         let (meta, tool) = definition(client.clone(), kind)();
         assert_eq!(meta.name, name);
         let validator = jsonschema::validator_for(&meta.input_schema).unwrap();
@@ -111,7 +130,10 @@ async fn classification_tool_schemas_require_observations_and_reject_actor_claim
 #[tokio::test]
 async fn classification_reads_forward_id_filters_and_preserve_tag_observations() {
     let item = json!({"resource_key":"T-740", "title":"Classify", "state":"open", "closure_operation_key":null, "current_closure":null, "legacy_handoff":null, "closure_history":[], "assignment_tracking":[], "tags":[tag()], "matched_fields":[], "linked_objective_keys":[], "relation_count":0, "blocker_count":0, "unresolved_blocker_count":0, "unresolved_review_count":0, "merge_requests":[]});
-    let client = recording(json!({"items":[item], "page":{"has_more":false, "next_cursor":null}}));
+    let client = recording(
+        json!({"items":[item], "page":{"has_more":false, "next_cursor":null}}),
+        [expected_authorization("ticket.query", None)],
+    );
     let (meta, tool) =
         workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Query)();
     for field in ["tag_ids", "tag_ids_any", "tag_ids_none"] {
@@ -122,6 +144,7 @@ async fn classification_reads_forward_id_filters_and_preserve_tag_observations()
         .execute(&input.to_string(), ToolExecutionContext::direct())
         .await
         .unwrap();
+    assert!(client.authorizations.lock().unwrap().is_empty());
     let value: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
     assert_eq!(value["tickets"][0]["tags"], json!([tag()]));
     assert_eq!(value["tickets"][0]["state"], "open");
@@ -140,13 +163,17 @@ async fn classification_reads_forward_id_filters_and_preserve_tag_observations()
         }
     }
     let detail = json!({"resource_key":"T-740", "content_digest":"content-1", "title":"Classify", "body":"Body", "body_truncated":false, "targets":[], "initial_post":{"sequence":0,"event_ref":"initial","is_initial":true,"kind":"comment","body":"Body","body_truncated":false,"body_digest":"a".repeat(64),"editable":true,"author":null,"at":null,"edited_at":null,"edited_by":null}, "state":"open", "closure_operation_key":null, "current_closure":null, "legacy_handoff":null, "closure_history":[], "assignment_tracking":[], "tags":[tag()], "events":[], "linked_objectives":[], "assignments":[], "implementation_reports":[], "merge_requests":[]});
-    let client = recording(detail);
+    let client = recording(
+        detail,
+        [expected_authorization("ticket.read", Some("T-740"))],
+    );
     let (_, tool) =
         workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Show)();
     let output = tool
         .execute(r#"{"id":"T-740"}"#, ToolExecutionContext::direct())
         .await
         .unwrap();
+    assert!(client.authorizations.lock().unwrap().is_empty());
     let value: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
     assert_eq!(value["tags"], json!([tag()]));
     assert_eq!(value["content_digest"], "content-1");
@@ -156,7 +183,7 @@ async fn classification_reads_forward_id_filters_and_preserve_tag_observations()
         assert!(value.as_object().unwrap().contains_key(field), "{field}");
         assert_eq!(value[field], Value::Null);
     }
-    let client = recording(json!({}));
+    let client = recording(json!({}), []);
     let (_, tool) =
         workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Query)();
     for field in ["tag_ids", "tag_ids_any", "tag_ids_none"] {
@@ -190,7 +217,7 @@ async fn classification_reads_forward_id_filters_and_preserve_tag_observations()
 
 #[tokio::test]
 async fn classification_tools_reject_invalid_names_ids_and_keys_before_dispatch() {
-    let client = recording(json!([]));
+    let client = recording(json!([]), []);
     for name in [" ".to_string(), "x\n".to_string(), "é".repeat(65)] {
         let (_, tool) = definition(client.clone(), TagToolKind::Create)();
         assert!(matches!(
@@ -244,6 +271,7 @@ async fn classification_tools_require_backend_workspace_and_bound_list_results()
     let missing = Arc::new(RecordingClient {
         requests: Mutex::new(Vec::new()),
         body: "[]".into(),
+        authorizations: Mutex::new(Default::default()),
         identity: false,
         status: 200,
     });
@@ -256,7 +284,10 @@ async fn classification_tools_require_backend_workspace_and_bound_list_results()
         ));
     }
     assert!(missing.requests.lock().unwrap().is_empty());
-    let client = recording(json!(vec![tag(); 201]));
+    let client = recording(
+        json!(vec![tag(); 201]),
+        (0..3).map(|_| expected_authorization("ticket.tag.list", None)),
+    );
     let (_, tool) = definition(client.clone(), TagToolKind::List)();
     for (input, expected) in [
         (json!({}), 200),
@@ -270,6 +301,7 @@ async fn classification_tools_require_backend_workspace_and_bound_list_results()
         let value: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
         assert_eq!(value.as_array().unwrap().len(), expected);
     }
+    assert!(client.authorizations.lock().unwrap().is_empty());
     let requests = client.requests.lock().unwrap();
     assert_eq!(
         requests[1].path,
@@ -279,7 +311,10 @@ async fn classification_tools_require_backend_workspace_and_bound_list_results()
 
 #[tokio::test]
 async fn classification_wip_uses_normal_permissions_and_route_bound_ticket_identity() {
-    let client = recording(json!([tag()]));
+    let client = recording(
+        json!([tag()]),
+        [expected_authorization("ticket.tags.set", Some("T-740"))],
+    );
     let tools =
         native_ticket_tools(client.clone(), TicketFeatureAccess::workspace_authoring()).unwrap();
     let set = tools
@@ -377,6 +412,7 @@ async fn classification_wip_uses_normal_permissions_and_route_bound_ticket_ident
             .await
             .is_err()
     );
+    assert!(client.authorizations.lock().unwrap().is_empty());
     assert_eq!(client.requests.lock().unwrap().len(), 1);
     let read_only = TicketFeatureAccess::read_only().tool_names();
     assert!(read_only.contains(&"WorkspaceTagList"));
@@ -389,6 +425,11 @@ async fn classification_tools_preserve_backend_permission_and_stale_set_failures
         let client = Arc::new(RecordingClient {
             requests: Mutex::new(Vec::new()),
             body: "{}".into(),
+            authorizations: Mutex::new(
+                [expected_authorization("ticket.tags.set", Some("T-740"))]
+                    .into_iter()
+                    .collect(),
+            ),
             identity: true,
             status,
         });
@@ -399,6 +440,7 @@ async fn classification_tools_preserve_backend_permission_and_stale_set_failures
             .await
             .unwrap_err();
         assert!(error.to_string().contains(&status.to_string()));
+        assert!(client.authorizations.lock().unwrap().is_empty());
         assert_eq!(client.requests.lock().unwrap().len(), 1);
     }
 }
@@ -417,7 +459,19 @@ fn classification_tools_http_mutations_survive_backend_reopen_and_stale_compare(
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server_db = db.clone();
     let server = std::thread::spawn(move || {
-        for _ in 0..10 {
+        let mut authorizations = std::collections::VecDeque::from([
+            expected_authorization("ticket.tag.create", None),
+            expected_authorization("ticket.tag.create", None),
+            expected_authorization("ticket.tags.set", Some(&ticket_id)),
+            expected_authorization("ticket.tags.set", Some(&ticket_id)),
+            expected_authorization("ticket.tags.set", Some(&ticket_id)),
+            expected_authorization("ticket.tags.set", Some(&ticket_id)),
+            expected_authorization("ticket.tags.set", Some(&ticket_id)),
+            expected_authorization("ticket.tag.rename", None),
+            expected_authorization("ticket.tag.delete", None),
+            expected_authorization("ticket.tag.list", None),
+        ]);
+        for _ in 0..20 {
             let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -446,7 +500,11 @@ fn classification_tools_http_mutations_survive_backend_reopen_and_stale_compare(
             let backend =
                 ticket::SqliteTicketBackend::open_verified(&server_db, "workspace").unwrap();
             let line = headers.lines().next().unwrap();
-            let result = if line.starts_with("POST /api/w/workspace/ticket-tags ") {
+            let result = if line.starts_with("POST /api/w/workspace/authorization/check ") {
+                let actual: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(Some(actual), authorizations.pop_front());
+                Ok(json!({"scope": null}))
+            } else if line.starts_with("POST /api/w/workspace/ticket-tags ") {
                 backend
                     .mutate_workspace_tag(serde_json::from_slice(&body).unwrap())
                     .map(|tag| json!(tag))
@@ -475,6 +533,7 @@ fn classification_tools_http_mutations_survive_backend_reopen_and_stale_compare(
             };
             write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
         }
+        assert!(authorizations.is_empty());
     });
     let client: Arc<dyn WorkspaceClient> = Arc::new(crate::worker::TestWorkspaceHttpClient::new(
         "workspace",

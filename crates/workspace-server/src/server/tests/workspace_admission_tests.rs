@@ -821,6 +821,23 @@ async fn create_and_restore_session_callbacks_finish_while_deletion_start_waits(
     let subject = subjektiv
         .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
         .unwrap();
+    subjektiv
+        .set_subject_permissions(
+            &subject.id,
+            &server_api::authorization::SubjectPermissionsUpdate {
+                operation_id: "session-callback-grant".into(),
+                expected_change_id: None,
+                execution: vec![server_api::authorization::ScopedPermission {
+                    operation: "session.record".into(),
+                    resource: server_api::authorization::PermissionResource::Subject {
+                        workspace_id: TEST_WORKSPACE_ID.into(),
+                        subject_id: subject.id.clone(),
+                    },
+                }],
+                delegation: vec![],
+            },
+        )
+        .unwrap();
     let (entered, mut entries) = mpsc::unbounded_channel();
     let (release, released) = std::sync::mpsc::channel();
     let released = Arc::new(Mutex::new(released));

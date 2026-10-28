@@ -28,7 +28,7 @@ pub use tracker::{ChangeStat, Tracker};
 pub use view_image::{
     detect_image_mime, read_workdir_bytes, routed_view_image_tool, view_image_tool,
 };
-pub use web::{web_fetch_tool, web_search_tool};
+pub use web::{WebOperationAuthorizer, WebTools, web_fetch_tool, web_search_tool};
 pub use write::write_tool;
 
 /// Build the filesystem/command tool surface for a single Workdir session.

@@ -965,6 +965,13 @@ mod tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if let Some(response) = crate::subjektiv::test_subject_authorization_response(
+                &request,
+                "workspace-test",
+                &["memory.receipt.read"],
+            ) {
+                return Ok(response);
+            }
             let request: SubjektivMemoryBackendRequest =
                 serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
             let SubjektivMemoryBackendOperation::ReceiptStatus(input) = request.operation else {
@@ -1004,8 +1011,15 @@ mod tests {
 
         fn execute(
             &self,
-            _request: WorkspaceRequest,
+            request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if let Some(response) = crate::subjektiv::test_subject_authorization_response(
+                &request,
+                "workspace-test",
+                &["memory.query"],
+            ) {
+                return Ok(response);
+            }
             Ok(WorkspaceResponse {
                 status: 409,
                 body: serde_json::to_string(&server_api::RepositoryApiError::new(
@@ -1043,6 +1057,13 @@ mod tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if let Some(response) = crate::subjektiv::test_subject_authorization_response(
+                &request,
+                "workspace-test",
+                &["memory.read"],
+            ) {
+                return Ok(response);
+            }
             let request: SubjektivMemoryBackendRequest =
                 serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
             assert!(matches!(
@@ -1059,6 +1080,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct RecordingWorkspaceClient {
+        deny_memory: bool,
         requests: Mutex<Vec<WorkspaceRequest>>,
         staged: Mutex<HashSet<String>>,
         fail_stages: AtomicUsize,
@@ -1081,6 +1103,17 @@ mod tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if let Some(response) = crate::subjektiv::test_subject_authorization_response(
+                &request,
+                "workspace-test",
+                if self.deny_memory {
+                    &[]
+                } else {
+                    &["memory.receipt.read", "memory.staging.write"]
+                },
+            ) {
+                return Ok(response);
+            }
             self.requests.lock().unwrap().push(request.clone());
             let request: SubjektivMemoryBackendRequest =
                 serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
@@ -1340,6 +1373,38 @@ mod tests {
             assert_eq!(value["status"], "error");
             assert_eq!(value["error"]["code"], code);
         }
+    }
+
+    #[tokio::test]
+    async fn denied_memory_reads_never_reach_backend_or_return_protected_content() {
+        let client = Arc::new(RecordingWorkspaceClient {
+            deny_memory: true,
+            ..Default::default()
+        });
+        let state = SubjektivMemoryState {
+            host: crate::subjektiv::test_connection(client.clone()),
+            capture: feature().state.capture,
+        };
+        for (operation, input) in [
+            (ReadOperation::Query, "{}"),
+            (ReadOperation::Read, r#"{"memory_id":"memory-1"}"#),
+        ] {
+            let error = SubjektivReadTool {
+                state: state.clone(),
+                operation,
+            }
+            .execute(input, ToolExecutionContext::new("call-denied", "batch", 0))
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("denied"), "{error}");
+        }
+        assert!(
+            state
+                .receipt_status("explicit:session-1:call-denied")
+                .is_err()
+        );
+        assert!(client.requests.lock().unwrap().is_empty());
+        assert!(client.staged.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -23,6 +23,15 @@ fn activation(name: &str) -> ScopedPermission {
         resource: PermissionResource::Feature,
     }
 }
+fn subject_permission(subject: &str, operation: &str) -> ScopedPermission {
+    ScopedPermission {
+        operation: operation.into(),
+        resource: PermissionResource::Subject {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            subject_id: subject.into(),
+        },
+    }
+}
 fn create_permission() -> ScopedPermission {
     ScopedPermission {
         operation: "ticket.create".into(),
@@ -106,6 +115,18 @@ impl Fixture {
         let source = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
         let identity = Arc::new(RuntimeIdentityMaterial::generate(&source.runtime_id).unwrap());
         configure_runtime_request_auth(&mut api, &identity, &source.runtime_id);
+        open_subjektiv_store(&api)
+            .unwrap()
+            .set_subject_permissions(
+                &subject,
+                &SubjectPermissionsUpdate {
+                    operation_id: "fixture-session-setup".into(),
+                    expected_change_id: None,
+                    execution: vec![subject_permission(&subject, "session.record")],
+                    delegation: vec![],
+                },
+            )
+            .unwrap();
         // The execution fixture does not bootstrap a Session. Exercise the real
         // signed startup callback explicitly so the policy store sees the active
         // Journal writer, just as it does after normal Runtime startup.
@@ -113,6 +134,19 @@ impl Fixture {
             &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/sessions"),
             serde_json::to_vec(&json!({"session_id":session_store::new_session_id().to_string(),"create_if_missing":true})).unwrap())).await;
         assert_eq!(status, StatusCode::OK, "source startup callback: {body}");
+        // Reproduce a migrated/unset policy only after authorized setup. Retain
+        // immutable setup history; no protected callback is bypassed by this input.
+        api.feature_storage
+            .open(&api.subjektiv_registration)
+            .unwrap()
+            .with_connection(|connection| {
+                connection.execute(
+                    "DELETE FROM subject_permissions WHERE subject_id = ?1",
+                    [&subject],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         let owner =
             seed_test_workspace_owner_token(api.store.as_ref(), "subject-authority-owner").await;
         assert!(
@@ -435,6 +469,326 @@ async fn signed_current_body_uses_explicit_policy_and_old_unset_body_denies() {
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    let legacy_client = f.client(&legacy);
+    let (installed, tool) =
+        ticket_tool_host(&f._dir.path().join("legacy-ticket"), legacy_client.clone()).await;
+    assert!(installed);
+    assert!(legacy_client.requests.lock().unwrap().is_empty());
+    tool.unwrap()
+        .execute(
+            r#"{"title":"Unattached Worker retains provider-authorized create"}"#,
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ticket_posts(&legacy_client), 1);
+    assert_eq!(
+        browser_ticket_backend(&f.api)
+            .unwrap()
+            .list(Default::default())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+fn concrete_resource_permissions(f: &Fixture) -> Vec<ScopedPermission> {
+    let workspace = TEST_WORKSPACE_ID.to_owned();
+    [
+        (
+            "ticket.read",
+            PermissionResource::Ticket {
+                workspace_id: workspace.clone(),
+                ticket_id: "resource-ticket".into(),
+            },
+        ),
+        (
+            "objective.read",
+            PermissionResource::Objective {
+                workspace_id: workspace.clone(),
+                objective_id: "resource-objective".into(),
+            },
+        ),
+        (
+            "merge_request.read",
+            PermissionResource::MergeRequest {
+                workspace_id: workspace.clone(),
+                merge_request_id: "resource-mr".into(),
+            },
+        ),
+        (
+            "memory.resident.read",
+            PermissionResource::Subject {
+                workspace_id: workspace.clone(),
+                subject_id: f.subject.clone(),
+            },
+        ),
+        (
+            "drive.read_text",
+            PermissionResource::DriveEntry {
+                workspace_id: workspace.clone(),
+                node_id: "resource-entry".into(),
+            },
+        ),
+        (
+            "drive.request_status",
+            PermissionResource::DriveRequest {
+                workspace_id: workspace.clone(),
+                request_id: "resource-request".into(),
+            },
+        ),
+        (
+            "workdir.create",
+            PermissionResource::Repository {
+                workspace_id: workspace.clone(),
+                repository_key: "test-repository".into(),
+            },
+        ),
+        (
+            "workdir.detach",
+            PermissionResource::WorkdirAttachment {
+                workspace_id: workspace.clone(),
+                connection_id: "resource-attachment".into(),
+            },
+        ),
+        (
+            "workspace_config.read",
+            PermissionResource::WorkspaceConfig {
+                workspace_id: workspace,
+                path: "main.dcdl".into(),
+                recursive: false,
+            },
+        ),
+        (
+            "web.fetch",
+            PermissionResource::Network {
+                url: "https://example.invalid/resource".into(),
+            },
+        ),
+        (
+            "worker.observe",
+            PermissionResource::SubWorker {
+                runtime_id: f.source.runtime_id.clone(),
+                worker_id: f.source.worker_id.clone(),
+                name: "resource-child".into(),
+            },
+        ),
+    ]
+    .into_iter()
+    .map(|(operation, resource)| ScopedPermission {
+        operation: operation.into(),
+        resource,
+    })
+    .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_host_never_expands_saved_workspace_or_feature_grants_to_new_resource_kinds() {
+    let f = Fixture::new().await;
+    let requested = concrete_resource_permissions(&f);
+    let workspace_grants: Vec<_> = requested
+        .iter()
+        .map(|permission| ScopedPermission {
+            operation: permission.operation.clone(),
+            resource: PermissionResource::Workspace {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            },
+        })
+        .collect();
+    f.assign(workspace_grants.clone(), vec![]).await;
+    for permission in &requested {
+        let (status, body) = f.check(&f.source, permission).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "Workspace is not a parent resource: {permission:?}: {body}"
+        );
+    }
+    // Same-operation Workspace grants above isolate kind containment from the
+    // separate rule that an old Feature activation name grants no dotted operation.
+    let feature_names: std::collections::BTreeSet<_> = requested
+        .iter()
+        .map(|permission| permission.operation.split('.').next().unwrap())
+        .collect();
+    f.assign(feature_names.into_iter().map(activation).collect(), vec![])
+        .await;
+    for permission in &requested {
+        assert_eq!(
+            f.check(&f.source, permission).await.0,
+            StatusCode::FORBIDDEN,
+            "{permission:?}"
+        );
+    }
+    f.assign(requested.clone(), vec![]).await;
+    for permission in &requested {
+        let (status, body) = f.check(&f.source, permission).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "exact resource must be usable: {permission:?}: {body}"
+        );
+        assert_eq!(body, json!({"scope": permission.resource}));
+    }
+    // These are current persisted policies, not mocked authorization answers.
+    assert_eq!(
+        open_subjektiv_store(&f.api)
+            .unwrap()
+            .subject_permissions(&f.subject)
+            .unwrap()
+            .unwrap()
+            .execution,
+        requested
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_host_rejects_cross_workspace_resource_claims_before_alias_resolution() {
+    let f = Fixture::new().await;
+    let permissions = concrete_resource_permissions(&f);
+    f.assign(permissions.clone(), vec![]).await;
+    for permission in permissions
+        .iter()
+        .filter(|permission| permission.resource.workspace_id().is_some())
+    {
+        let mut forged = serde_json::to_value(permission).unwrap();
+        forged["resource"]["workspace_id"] = json!("forged-workspace");
+        let forged: ScopedPermission = serde_json::from_value(forged).unwrap();
+        let (status, body) = f.check(&f.source, &forged).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{forged:?}: {body}");
+        assert!(
+            !body.to_string().contains("scope"),
+            "refusal must not return effective scope: {body}"
+        );
+    }
+}
+
+fn seed_resource_ticket(f: &Fixture, title: &str, slug: &str) -> [String; 3] {
+    let backend = browser_ticket_backend(&f.api).unwrap();
+    let mut input = NewTicket::new(title);
+    input.slug = Some(slug.into());
+    input.body = "PRIVATE_AUTHORIZATION_BODY_MUST_NOT_BE_RETURNED".into();
+    let created = backend.create(input).unwrap();
+    let stored = backend.show(created.id.clone().into()).unwrap();
+    let resource_key = created.resource_key.unwrap();
+    assert!(resource_key.starts_with("T-"));
+    assert_eq!(stored.meta.slug, slug);
+    assert_ne!(created.id, resource_key);
+    assert_ne!(created.id, slug);
+    [created.id, resource_key, stored.meta.slug]
+}
+
+fn ticket_read_permission(reference: &str) -> ScopedPermission {
+    ScopedPermission {
+        operation: "ticket.read".into(),
+        resource: PermissionResource::Ticket {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            ticket_id: reference.into(),
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_host_ticket_grant_accepts_only_same_ticket_internal_id_code_and_slug() {
+    let f = Fixture::new().await;
+    let a = seed_resource_ticket(&f, "Allowed resource A", "resource-a-slug");
+    let b = seed_resource_ticket(&f, "Denied resource B", "resource-b-slug");
+    for granted in &a {
+        f.assign(vec![ticket_read_permission(granted)], vec![])
+            .await;
+        for requested in &a {
+            let permission = ticket_read_permission(requested);
+            let (status, body) = f.check(&f.source, &permission).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "grant {granted}, request {requested}: {body}"
+            );
+            assert_eq!(
+                body,
+                json!({"scope": permission.resource}),
+                "same identity must return the caller's requested spelling, not a broader scope"
+            );
+        }
+        let absent = f
+            .check(
+                &f.source,
+                &ticket_read_permission("resource-does-not-exist"),
+            )
+            .await;
+        assert_eq!(absent.0, StatusCode::FORBIDDEN);
+        for requested in &b {
+            assert_eq!(
+                f.check(&f.source, &ticket_read_permission(requested)).await,
+                absent,
+                "another existing Ticket and a missing Ticket must have the same refusal"
+            );
+        }
+        // Alias lookup cannot cross resource kinds even when identity text matches.
+        for resource in [
+            PermissionResource::Objective {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                objective_id: granted.clone(),
+            },
+            PermissionResource::MergeRequest {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                merge_request_id: granted.clone(),
+            },
+        ] {
+            let permission = ScopedPermission {
+                operation: "ticket.read".into(),
+                resource,
+            };
+            assert_eq!(
+                f.check(&f.source, &permission).await.0,
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+    f.assign(vec![], vec![]).await;
+    let absent = f
+        .check(
+            &f.source,
+            &ticket_read_permission("resource-does-not-exist"),
+        )
+        .await;
+    for reference in a.iter().chain(&b) {
+        assert_eq!(
+            f.check(&f.source, &ticket_read_permission(reference)).await,
+            absent,
+            "revocation must deny all spellings of an existing target just like an absent target"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_host_ungranted_operation_does_not_disclose_ticket_or_subject_existence() {
+    let f = Fixture::new().await;
+    let ticket = seed_resource_ticket(&f, "Private existence fixture", "private-existence-slug");
+    // An unrelated operation on the right Subject is not permission to read it.
+    f.assign(
+        vec![subject_permission(&f.subject, "session.record")],
+        vec![],
+    )
+    .await;
+    for (existing, missing) in [
+        (
+            ticket_read_permission(&ticket[0]),
+            ticket_read_permission("no-such-ticket"),
+        ),
+        (
+            subject_permission(&f.subject, "memory.resident.read"),
+            subject_permission("no-such-subject", "memory.resident.read"),
+        ),
+    ] {
+        let denial = f.check(&f.source, &existing).await;
+        assert_eq!(denial.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            denial,
+            f.check(&f.source, &missing).await,
+            "an ungranted operation must not distinguish existing and absent protected targets"
+        );
+        assert!(!denial.1.to_string().contains("PRIVATE_AUTHORIZATION_BODY"));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -655,7 +1009,7 @@ impl agen::llm_client::LlmClient for UnusedModel {
 }
 async fn ticket_worker_host_with_service(
     root: &Path,
-    client: Arc<RouterClient>,
+    client: Arc<dyn WorkspaceClient>,
 ) -> (
     worker::Worker<UnusedModel, session_store::FsStore>,
     bool,
@@ -718,12 +1072,15 @@ async fn ticket_worker_host_with_service(
 }
 async fn ticket_worker_host(
     root: &Path,
-    client: Arc<RouterClient>,
+    client: Arc<dyn WorkspaceClient>,
 ) -> (worker::Worker<UnusedModel, session_store::FsStore>, bool) {
     let (host, installed, _) = ticket_worker_host_with_service(root, client).await;
     (host, installed)
 }
-async fn ticket_tool_host(root: &Path, client: Arc<RouterClient>) -> (bool, Option<Arc<dyn Tool>>) {
+async fn ticket_tool_host(
+    root: &Path,
+    client: Arc<dyn WorkspaceClient>,
+) -> (bool, Option<Arc<dyn Tool>>) {
     let (host, installed) = ticket_worker_host(root, client).await;
     let server = host.engine().tool_server_handle();
     server.flush_pending();
@@ -731,7 +1088,7 @@ async fn ticket_tool_host(root: &Path, client: Arc<RouterClient>) -> (bool, Opti
     if !installed {
         assert!(
             tool.is_none(),
-            "denied activation must not partially install TicketCreate"
+            "failed installation must not partially install TicketCreate"
         );
     }
     (installed, tool)
@@ -752,35 +1109,58 @@ fn value(output: ToolOutput) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn worker_feature_activation_is_distinct_from_ticket_create_and_revocation_precedes_backend_call()
- {
+async fn ticket_registration_is_local_and_only_create_permission_allows_backend_effects() {
     let f = Fixture::new().await;
     let client = f.client(&f.source);
-    for (name, permissions, installed) in [
-        ("unset", vec![], false),
-        ("operation-only", vec![create_permission()], false),
-        ("activation-only", vec![activation("ticket")], true),
+    let mut wrong_workspace = create_permission();
+    wrong_workspace.resource = PermissionResource::Ticket {
+        workspace_id: TEST_WORKSPACE_ID.into(),
+        ticket_id: "another-ticket".into(),
+    };
+    let (installed, tool) = ticket_tool_host(&f._dir.path().join("unset"), client.clone()).await;
+    assert!(installed);
+    assert!(
+        client.requests.lock().unwrap().is_empty(),
+        "registration performs no HTTP"
+    );
+    assert!(
+        tool.unwrap()
+            .execute(
+                r#"{"title":"unset must not create"}"#,
+                ToolExecutionContext::direct()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(ticket_posts(&client), 0);
+    for (name, permissions) in [
+        ("empty", vec![]),
+        ("old-feature-only", vec![activation("ticket")]),
+        ("wrong-resource", vec![wrong_workspace]),
     ] {
         f.assign(permissions, vec![]).await;
-        let (actual, tool) = ticket_tool_host(&f._dir.path().join(name), client.clone()).await;
-        assert_eq!(actual, installed, "{name}");
-        if let Some(tool) = tool {
-            let result = tool
-                .execute(
-                    r#"{"title":"must not reach TicketBackend"}"#,
-                    ToolExecutionContext::direct(),
-                )
-                .await;
-            assert!(result.is_err(), "activation alone cannot create a Ticket");
-            assert_eq!(
-                ticket_posts(&client),
-                0,
-                "denial must precede TicketBackend HTTP call"
-            );
-        }
+        client.requests.lock().unwrap().clear();
+        let (installed, tool) = ticket_tool_host(&f._dir.path().join(name), client.clone()).await;
+        assert!(installed, "{name}");
+        assert!(
+            client.requests.lock().unwrap().is_empty(),
+            "{name}: registration performs no HTTP"
+        );
+        let result = tool
+            .unwrap()
+            .execute(
+                r#"{"title":"must not reach TicketBackend"}"#,
+                ToolExecutionContext::direct(),
+            )
+            .await;
+        assert!(result.is_err(), "{name}");
+        assert_eq!(
+            ticket_posts(&client),
+            0,
+            "{name}: deny before downstream create"
+        );
     }
-    f.assign(vec![activation("ticket"), create_permission()], vec![])
-        .await;
+    f.assign(vec![create_permission()], vec![]).await;
     let (installed, tool) = ticket_tool_host(&f._dir.path().join("allowed"), client.clone()).await;
     assert!(installed);
     let tool = tool.unwrap();
@@ -814,6 +1194,309 @@ async fn worker_feature_activation_is_distinct_from_ticket_create_and_revocation
         "old installed Tool must recheck before backend call"
     );
     assert_eq!(backend.list(Default::default()).unwrap().len(), 1);
+}
+
+fn local_task_manifest() -> worker::WorkerManifest {
+    worker::WorkerManifest::from_toml(
+        r#"
+        [worker]
+        name = "local-authorization-tasks"
+        [model]
+        scheme = "anthropic"
+        model_id = "unused"
+        [engine]
+        [scope]
+        allow = []
+        [feature.workdir_catalog]
+        enabled = false
+        [feature.task]
+        enabled = true
+    "#,
+    )
+    .unwrap()
+}
+
+fn local_bootstrap(
+    root: &Path,
+    manifest: worker::WorkerManifest,
+    client: Arc<dyn WorkspaceClient>,
+) -> worker::WorkerBootstrap<
+    session_store::CombinedStore<session_store::FsStore, session_store::FsWorkerStore>,
+> {
+    worker::WorkerBootstrap::new(
+        manifest,
+        session_store::CombinedStore::new(
+            session_store::FsStore::new(root.join("sessions")).unwrap(),
+            session_store::FsWorkerStore::new(root.join("worker-metadata")).unwrap(),
+        ),
+        worker::PromptCatalogSource::builtins_only(),
+        worker::WorkerWorkspaceContext::with_client(
+            Some(worker::WorkspaceId::new(TEST_WORKSPACE_ID).unwrap()),
+            client,
+        ),
+        worker::WorkerFilesystemAuthority::None,
+        worker::WorkerBootstrapLayout::Direct {
+            runtime_base: root.join("runtime"),
+        },
+    )
+    .with_model_client(UnusedModel)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unset_subject_local_task_startup_create_update_and_history_replay_make_no_http_calls() {
+    let f = Fixture::new().await;
+    let client = f.client(&f.source);
+    assert!(
+        open_subjektiv_store(&f.api)
+            .unwrap()
+            .subject_permissions(&f.subject)
+            .unwrap()
+            .is_none()
+    );
+    let prepared = local_bootstrap(
+        &f._dir.path().join("task-start"),
+        local_task_manifest(),
+        client.clone(),
+    )
+    .prepare()
+    .await
+    .unwrap();
+    let tools = prepared.worker().engine().tool_server_handle();
+    let boot = prepared.start().await.unwrap();
+    tools.flush_pending();
+    let create_args = r#"{"subject":"Local task","description":"No external operation"}"#;
+    let create = tools.get_tool("TaskCreate").unwrap().1;
+    let created = value(
+        create
+            .execute(create_args, ToolExecutionContext::direct())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(created["taskid"], 1);
+    assert_eq!(created["status"], "pending");
+    let update_args = r#"{"taskid":1,"status":"completed"}"#;
+    let update = tools.get_tool("TaskUpdate").unwrap().1;
+    let updated = value(
+        update
+            .execute(update_args, ToolExecutionContext::direct())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(updated["status"], "completed");
+    boot.handle
+        .send(protocol::Method::Shutdown {
+            command: protocol::WorkerCommandEnvelope::new(1),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), boot.controller_task)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Replay uses the Feature's production history boundary, not a test store.
+    let history = [
+        agen::Item::tool_call("local-create", "TaskCreate", create_args),
+        agen::Item::tool_call("local-update", "TaskUpdate", update_args),
+    ];
+    let replay = worker::feature::builtin::TaskFeature::from_history(&history);
+    let mut prepared = local_bootstrap(
+        &f._dir.path().join("task-replay"),
+        local_task_manifest(),
+        client.clone(),
+    )
+    .prepare()
+    .await
+    .unwrap();
+    let report = prepared
+        .worker_mut()
+        .install_features(worker::feature::FeatureRegistryBuilder::new().with_module(replay));
+    assert!(!report.has_errors(), "{}", report.error_message());
+    let tools = prepared.worker().engine().tool_server_handle();
+    tools.flush_pending();
+    let task = value(
+        tools
+            .get_tool("TaskGet")
+            .unwrap()
+            .1
+            .execute(r#"{"taskid":1}"#, ToolExecutionContext::direct())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(task, updated, "replay preserves local Task state");
+    assert!(
+        client.requests.lock().unwrap().is_empty(),
+        "startup, Tools and replay must make zero activation or operation HTTP calls"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unset_subject_mcp_activation_denies_before_discovery_process_spawn() {
+    let f = Fixture::new().await;
+    let client = f.client(&f.source);
+    let marker = f._dir.path().join("mcp-spawned");
+    let mut manifest = local_task_manifest();
+    manifest
+        .mcp
+        .stdio_servers
+        .push(manifest::McpStdioServerConfig {
+            name: "must-not-discover".into(),
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf spawned > \"$1\"".into(),
+                "mcp-fixture".into(),
+                marker.display().to_string(),
+            ],
+            cwd: None,
+            env: Default::default(),
+        });
+    let error = match local_bootstrap(&f._dir.path().join("mcp-denied"), manifest, client.clone())
+        .start()
+        .await
+    {
+        Ok(boot) => {
+            boot.controller_task.abort();
+            panic!("MCP startup must be denied")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(error.contains("mcp") && error.contains("403"), "{error}");
+    assert!(
+        !marker.exists(),
+        "denial must precede discovery's process effect"
+    );
+    let requests = client.requests.lock().unwrap();
+    assert_eq!(
+        requests.as_slice(),
+        &[("POST".into(), authorization_path())],
+        "only MCP's retained activation check may run"
+    );
+}
+
+#[derive(Debug, Default)]
+struct FailedAuthorizationTransport {
+    requests: Mutex<Vec<String>>,
+}
+impl WorkspaceClient for FailedAuthorizationTransport {
+    fn workspace_id(&self) -> Option<&str> {
+        Some(TEST_WORKSPACE_ID)
+    }
+    fn kind(&self) -> &str {
+        "failed-transport"
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn execute(
+        &self,
+        request: WorkspaceRequest,
+    ) -> std::result::Result<WorkspaceResponse, WorkspaceClientError> {
+        self.requests.lock().unwrap().push(request.path);
+        Err(WorkspaceClientError::Request(
+            "injected connection failure".into(),
+        ))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ticket_registration_without_host_is_local_but_operations_never_fall_back_to_standalone() {
+    let dir = tempfile::tempdir().unwrap();
+    let failed = Arc::new(FailedAuthorizationTransport::default());
+    let bound_id = worker::WorkspaceId::new(TEST_WORKSPACE_ID).unwrap();
+    for (name, client) in [
+        (
+            "unconnected",
+            worker::WorkerWorkspaceContext::no_workspace().client_handle(),
+        ),
+        (
+            "standalone",
+            worker::WorkerWorkspaceContext::local_filesystem(None).client_handle(),
+        ),
+        (
+            "unavailable-bound",
+            worker::WorkerWorkspaceContext::unavailable(Some(bound_id), "connection unavailable")
+                .client_handle(),
+        ),
+        (
+            "transport-error",
+            failed.clone() as Arc<dyn WorkspaceClient>,
+        ),
+    ] {
+        let (installed, tool) = ticket_tool_host(&dir.path().join(name), client).await;
+        assert!(installed, "{name}: local registration needs no Host");
+        let error = tool
+            .unwrap()
+            .execute(
+                r#"{"title":"must not create"}"#,
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !error.to_string().contains("403"),
+            "unavailable is not policy denial: {name}: {error}"
+        );
+    }
+    assert_eq!(
+        failed.requests.lock().unwrap().as_slice(),
+        &[authorization_path()],
+        "communication failure must not issue downstream create"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subject_operation_allow_does_not_enlarge_real_provider_write_scope() {
+    let f = Fixture::new().await;
+    let permission = ScopedPermission {
+        operation: "filesystem.write".into(),
+        resource: PermissionResource::Workdir {
+            working_directory_id: "read-only-provider".into(),
+            path: ".".into(),
+            recursive: true,
+        },
+    };
+    f.assign(vec![permission.clone()], vec![]).await;
+    assert_eq!(f.check(&f.source, &permission).await.0, StatusCode::OK);
+    let root = tempfile::tempdir().unwrap();
+    let mut config = manifest::ScopeConfig {
+        allow: manifest::Scope::writable(root.path())
+            .unwrap()
+            .allow_rules(),
+        deny: vec![],
+    };
+    config.allow[0].permission = manifest::Permission::Read;
+    let client = f.client(&f.source);
+    let session = worker::authorized_workdir::authorized_workdir_session(
+        Arc::new(workdir::LocalWorkdirSession::new(
+            manifest::Scope::from_config(&config).unwrap(),
+            root.path().to_path_buf(),
+        )),
+        client.clone(),
+        "read-only-provider".into(),
+    );
+    let result = session
+        .write(workdir::WriteRequest {
+            path: workdir::WorkdirPath::new("denied.txt").unwrap(),
+            content: b"must-not-write".to_vec(),
+            expected_hash: None,
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "Host grant cannot override the provider's read-only scope"
+    );
+    assert!(!root.path().join("denied.txt").exists());
+    assert!(
+        client
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, path)| path == &authorization_path()),
+        "real Host authorization must be connected to provider dispatch"
+    );
 }
 
 fn creation_record_counts(f: &Fixture) -> [i64; 3] {
@@ -1032,7 +1715,7 @@ async fn subject_control_creation_recovers_control_grant_failure_and_lost_respon
 async fn explicit_delegation_creates_workdirless_ticketless_editor_and_replays_one_worker_and_grant()
  {
     let f = Fixture::new().await;
-    let grant_permissions = vec![activation("ticket"), create_permission()];
+    let grant_permissions = vec![create_permission()];
     let policy = f.assign(vec![], grant_permissions.clone()).await;
     assert_eq!(
         f.check(&f.source, &create_permission()).await.0,
@@ -1327,8 +2010,7 @@ async fn native_wip_ticket_create_uses_same_signed_authorization_before_real_bac
         0,
         "WIP denial must not call TicketBackend HTTP"
     );
-    f.assign(vec![activation("ticket"), create_permission()], vec![])
-        .await;
+    f.assign(vec![create_permission()], vec![]).await;
     invoke
         .execute(&args, ToolExecutionContext::direct())
         .await
@@ -1575,8 +2257,7 @@ async fn installed_ticket_service_and_raw_backend_recheck_current_signed_source(
             .unwrap()
             .is_empty()
     );
-    f.assign(vec![activation("ticket"), create_permission()], vec![])
-        .await;
+    f.assign(vec![create_permission()], vec![]).await;
     let allowed = service.clone();
     let created =
         tokio::task::spawn_blocking(move || allowed.create(NewTicket::new("Service authorized")))
@@ -2148,32 +2829,13 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
             recursive: true,
         },
     };
-    let mut child_permissions: Vec<_> = [
-        "task",
-        "web",
-        "image",
-        "sub_worker",
-        "flow",
-        "worker",
-        "workspace_worker_discovery",
-        "objective",
-        "manage_workdir",
-        "workdir_catalog",
-        "drive",
-        "ticket",
-        "merge_request",
-        "subjektiv",
-    ]
-    .into_iter()
-    .map(activation)
-    .collect();
-    child_permissions.push(read_permission.clone());
+    let child_permissions = vec![read_permission.clone()];
     // Set policy before startup: the actual source Controller sees this policy,
     // not an unset body or a registry/singleton row manufactured by the test.
     let (status, body) = response(&api, human_request(&owner, "POST",
         &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
         Some(json!({"operation_id":"connected-authorization-policy", "expected_change_id":null,
-            "execution":(["task", "subjektiv", "web", "image", "sub_worker", "worker", "workspace_worker_discovery", "objective", "manage_workdir", "workdir_catalog", "drive", "ticket"].into_iter().map(activation).collect::<Vec<_>>()),
+            "execution":(["session.record", "memory.resident.read", "memory.resident.supply", "journal.startup.read", "journal.startup.supply"].into_iter().map(|operation| subject_permission(&subject, operation)).collect::<Vec<_>>()),
             "delegation":child_permissions.clone()})))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let Json(source) = create_workspace_worker(
@@ -2357,4 +3019,286 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
             .is_empty(),
         "generic Profile delegation requires no Ticket"
     );
+}
+
+fn attach_authorization_metadata(
+    f: &Fixture,
+    worker: &RuntimeWorkerRef,
+    id: &str,
+) -> WorkerWorkdirLinkRecord {
+    // Materialization/provider execution is outside this metadata-resolution test.
+    // Connection identities still come from the production attachment ledger.
+    seed_cleanup_workdir_for_runtime(&f.api, id, &worker.runtime_id, "present", "clean");
+    f.api
+        .store
+        .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            worker: worker.clone(),
+            workdir_id: id.into(),
+            alias: "checkout".into(),
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            linked_at: now_registry_timestamp(),
+            unlinked_at: None,
+        })
+        .unwrap()
+}
+
+async fn attachment_bound_check(
+    f: &Fixture,
+    worker: &RuntimeWorkerRef,
+    alias: &str,
+    expected: Option<&str>,
+) -> (StatusCode, Value) {
+    response(
+        &f.api,
+        runtime_source_request(
+            &f.identity,
+            Some(&worker.worker_id),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/authorization/bound-check"),
+            serde_json::to_vec(&json!({"operation":"workdir.detach", "target":{
+                "kind":"workdir_attachment", "alias":alias, "expected_connection_id":expected,
+            }}))
+            .unwrap(),
+        ),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bound_attachment_uses_current_source_metadata_and_policy_not_alias_as_authority() {
+    let f = Fixture::new().await;
+    let link = attach_authorization_metadata(&f, &f.source, "bound-subject-workdir");
+    let permission = ScopedPermission {
+        operation: "workdir.detach".into(),
+        resource: PermissionResource::WorkdirAttachment {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            connection_id: link.connection_id.clone(),
+        },
+    };
+    let (status, denied) = attachment_bound_check(&f, &f.source, "checkout", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "unset: {denied}");
+    assert!(denied.get("scope").is_none());
+    f.assign(vec![permission.clone()], vec![permission.clone()])
+        .await;
+    let (status, allowed) =
+        attachment_bound_check(&f, &f.source, "checkout", Some(&link.connection_id)).await;
+    assert_eq!(status, StatusCode::OK, "{allowed}");
+    assert_eq!(allowed, json!({"scope":permission.resource}));
+    for (alias, expected) in [
+        ("missing", None),
+        ("checkout", Some("different-connection")),
+    ] {
+        let (status, body) = attachment_bound_check(&f, &f.source, alias, expected).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.get("scope").is_none());
+    }
+    let child = f.child("bound-attachment-child", vec![permission]).await;
+    let (status, body) =
+        attachment_bound_check(&f, &child, "checkout", Some(&link.connection_id)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a delegated operation cannot borrow its source's alias: {body}"
+    );
+    f.assign(vec![], vec![]).await;
+    assert_eq!(
+        attachment_bound_check(&f, &f.source, "checkout", None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let retained = f
+        .api
+        .store
+        .list_worker_workdir_links(TEST_WORKSPACE_ID, &f.source)
+        .unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].connection_id, link.connection_id);
+    assert!(
+        retained[0].unlinked_at.is_none(),
+        "authorization alone never detaches the route"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_bound_attachment_returns_concrete_resource_and_rejects_replaced_connection() {
+    let f = Fixture::new().await;
+    let Json(created) = create_workspace_worker(
+        State(f.api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: f.source.runtime_id.clone(),
+            display_name: "Legacy attachment owner".into(),
+            singleton_key: None,
+            profile: Some("builtin:coder".into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachments: vec![],
+            feature_connections: Default::default(),
+            control_operation_id: None,
+            execution_grant: None,
+        }),
+    )
+    .await
+    .unwrap();
+    let worker = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
+    let first = attach_authorization_metadata(&f, &worker, "legacy-bound-workdir");
+    let (status, body) =
+        attachment_bound_check(&f, &worker, "checkout", Some(&first.connection_id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({"scope":PermissionResource::WorkdirAttachment {
+            workspace_id: TEST_WORKSPACE_ID.into(), connection_id: first.connection_id.clone(),
+        }})
+    );
+    f.api
+        .store
+        .detach_worker_workdir_connection(
+            TEST_WORKSPACE_ID,
+            &worker,
+            "checkout",
+            &first.connection_id,
+            &now_registry_timestamp(),
+        )
+        .unwrap();
+    let second = attach_authorization_metadata(&f, &worker, "legacy-bound-workdir");
+    assert_ne!(second.connection_id, first.connection_id);
+    let (status, body) =
+        attachment_bound_check(&f, &worker, "checkout", Some(&first.connection_id)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "stale connection must not select replacement: {body}"
+    );
+    assert!(body.get("scope").is_none());
+    let (status, body) = attachment_bound_check(&f, &worker, "checkout", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["scope"]["connection_id"], second.connection_id);
+    assert!(
+        f.api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+            .unwrap()
+            .iter()
+            .any(|link| link.connection_id == second.connection_id && link.unlinked_at.is_none())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn job_origin_replacement_revokes_new_operations_without_changing_frozen_request() {
+    let f = Fixture::new().await;
+    let permission = subject_permission(&f.subject, "memory.surface.prepare");
+    f.assign(
+        vec![
+            permission.clone(),
+            create_permission(),
+            subject_permission(&f.subject, "memory.consolidation.request"),
+            subject_permission(&f.subject, "memory.consolidation.supply"),
+        ],
+        vec![],
+    )
+    .await;
+    let output = subjektiv_job::dispatch(&f.api, &f.subject, Some(f.source.clone()), 0, 0).unwrap();
+    assert_eq!(output.status, "started");
+    let job = f
+        .api
+        .store
+        .find_active_backend_job_for_resource(
+            TEST_WORKSPACE_ID,
+            &crate::backend_job::subjektiv_serialization_key(&f.subject),
+        )
+        .unwrap()
+        .unwrap();
+    let attempt = f
+        .api
+        .store
+        .get_backend_job_attempt(
+            TEST_WORKSPACE_ID,
+            &job.request.job_id,
+            &crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt),
+        )
+        .unwrap()
+        .unwrap();
+    let worker = attempt.worker.as_ref().unwrap();
+    let needed = server_api::authorization::OperationAuthorizationRequest {
+        operation: permission.operation.clone(),
+        resource: permission.resource.clone(),
+    };
+    assert_eq!(
+        subject_authorization::authorize_scope(&f.api, worker, &needed).unwrap(),
+        Some(permission.resource)
+    );
+    let forbidden = server_api::authorization::OperationAuthorizationRequest {
+        operation: "ticket.create".into(),
+        resource: create_permission().resource,
+    };
+    assert!(
+        subject_authorization::authorize_scope(&f.api, worker, &forbidden).is_err(),
+        "Job capabilities must not inherit its body's unrelated Workspace permissions"
+    );
+    // The signed startup callback created a real, empty writer binding. Release
+    // it through the domain's pending-source/generation checks before applying
+    // historical disconnection input; singleton release is not writer revocation.
+    // This execution fixture has no live Controller and does not prove cancellation.
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let attribution = store
+        .subject_session_attributions(&f.subject)
+        .unwrap()
+        .into_iter()
+        .find(|attr| attr.runtime_id == f.source.runtime_id && attr.worker_id == f.source.worker_id)
+        .unwrap();
+    let host =
+        subjektiv::journal::JournalHostContext::validated_session(&store, attribution).unwrap();
+    store
+        .release_journal_writer(&subjektiv::journal::JournalWriterBinding {
+            subject_id: f.subject.clone(),
+            runtime_id: f.source.runtime_id.clone(),
+            worker_id: f.source.worker_id.clone(),
+            binding_id: host.writer_binding_id().unwrap().into(),
+        })
+        .unwrap();
+    f.release_source_lease();
+    let Json(replacement) = create_workspace_worker(
+        State(f.api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: f.source.runtime_id.clone(),
+            display_name: "Replacement Job origin".into(),
+            singleton_key: None,
+            profile: Some("project:authority-source".into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachments: vec![],
+            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
+                    subject_id: f.subject.clone(),
+                }),
+            },
+            control_operation_id: None,
+            execution_grant: None,
+        }),
+    )
+    .await
+    .unwrap();
+    let replacement = RuntimeWorkerRef::new(replacement.runtime_id, replacement.worker_id);
+    assert!(subject_authorization::authorize_scope(&f.api, &replacement, &needed).is_ok());
+    assert!(
+        subjektiv_job::active_grant(&f.api, TEST_WORKSPACE_ID, worker).is_ok(),
+        "the attempt itself is still live"
+    );
+    assert!(
+        subject_authorization::authorize_scope(&f.api, worker, &needed).is_err(),
+        "a new body cannot refresh an old frozen Job origin"
+    );
+    let saved = f
+        .api
+        .store
+        .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.request, job.request);
+    assert_eq!(saved.request.source_worker.as_ref(), Some(&f.source));
 }
