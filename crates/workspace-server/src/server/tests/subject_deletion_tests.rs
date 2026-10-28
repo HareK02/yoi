@@ -3,6 +3,18 @@
 //! canonical removal suites, rather than claiming HTTP acceptance proves shutdown.
 use super::*;
 
+async fn consolidation_origin(api: &WorkspaceApi, subject: &str) -> RuntimeWorkerRef {
+    super::subjektiv_jobs_tests::grant_memory_operations(
+        api,
+        subject,
+        &[
+            "memory.consolidation.request",
+            "memory.consolidation.supply",
+        ],
+    );
+    super::subjektiv_jobs_tests::attach_memory_job_source(api, subject).await
+}
+
 async fn delete_request(
     api: &WorkspaceApi,
     subject: &str,
@@ -510,9 +522,12 @@ async fn pending_consolidation_is_purged_and_captured_dispatch_and_late_result_a
             candidate,
         ))
         .unwrap();
+    let origin = consolidation_origin(&api, &subject.id).await;
+    seed_worker_session_for_cleanup(dir.path(), &origin);
     let started = start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
+        Some(origin.clone()),
         MemoryConsolidateStagingOperation { force: true },
     )
     .await
@@ -526,6 +541,7 @@ async fn pending_consolidation_is_purged_and_captured_dispatch_and_late_result_a
         )
         .unwrap()
         .unwrap();
+    assert_eq!(job.request.source_worker.as_ref(), Some(&origin));
     let attempt = api
         .store
         .get_backend_job_attempt(
@@ -766,13 +782,17 @@ async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_r
                 candidate,
             ))
             .unwrap();
-        start_subjektiv_staging_consolidation(
+        let origin = consolidation_origin(&api, &subject.id).await;
+        seed_worker_session_for_cleanup(dir.path(), &origin);
+        let started = start_subjektiv_staging_consolidation(
             api.clone(),
             &subject.id,
+            Some(origin.clone()),
             MemoryConsolidateStagingOperation { force: true },
         )
         .await
         .unwrap();
+        assert_eq!(started.status, "started");
         let job = api
             .store
             .find_active_backend_job_for_resource(
@@ -781,6 +801,7 @@ async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_r
             )
             .unwrap()
             .unwrap();
+        assert_eq!(job.request.source_worker.as_ref(), Some(&origin));
         let attempt = api
             .store
             .get_backend_job_attempt(

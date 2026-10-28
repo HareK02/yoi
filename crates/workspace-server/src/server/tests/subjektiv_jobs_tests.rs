@@ -22,7 +22,7 @@ const MEMORY_JOB_OPERATIONS: &[&str] = &[
     "memory.surface.fail",
 ];
 
-fn grant_memory_operations(api: &WorkspaceApi, subject: &str, operations: &[&str]) {
+pub(super) fn grant_memory_operations(api: &WorkspaceApi, subject: &str, operations: &[&str]) {
     use server_api::authorization::{
         PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
     };
@@ -55,7 +55,10 @@ async fn memory_job_source(api: &WorkspaceApi, subject: &str) -> RuntimeWorkerRe
     attach_memory_job_source(api, subject).await
 }
 
-async fn attach_memory_job_source(api: &WorkspaceApi, subject: &str) -> RuntimeWorkerRef {
+pub(super) async fn attach_memory_job_source(
+    api: &WorkspaceApi,
+    subject: &str,
+) -> RuntimeWorkerRef {
     seed_test_delivery_binding(api);
     let Json(created) = create_workspace_worker(
         State(api.clone()),
