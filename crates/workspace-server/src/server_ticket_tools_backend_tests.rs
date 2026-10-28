@@ -196,26 +196,6 @@ impl TicketSurface {
         let reference_field = if name == "ShowTicket" { "id" } else { "ticket" };
         let path = format!("/tickets/{}", input[reference_field].as_str().unwrap());
         input.as_object_mut().unwrap().remove(reference_field);
-        match name {
-            "ShowTicket" => {
-                let mut page = serde_json::Map::new();
-                for (legacy, native) in [("event_limit", "limit"), ("event_cursor", "cursor")] {
-                    if let Some(value) = input.as_object_mut().unwrap().remove(legacy) {
-                        page.insert(native.into(), value);
-                    }
-                }
-                if !page.is_empty() {
-                    input["page"] = page.into();
-                }
-            }
-            "TicketAssignmentAnswer" => {
-                let fields = input.as_object_mut().unwrap();
-                let assignment_id = fields.remove("assignment_id").unwrap();
-                let expected_last_event_id = fields.remove("expected_last_event_id").unwrap();
-                input["observed"] = serde_json::json!({"assignment_id":assignment_id,"expected_last_event_id":expected_last_event_id});
-            }
-            _ => {}
-        }
         // Observe the real item representation before invoking a mutation. Tracking
         // reads alone do not establish the Ticket WIP object validator. Explicit
         // refresh also reconciles stale observations after an unknown result;
@@ -235,7 +215,9 @@ impl TicketSurface {
             }
             assert!(input.as_object().unwrap().is_empty());
             input = serde_json::json!({"page": page});
-            return execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":"read","arguments":input}), context).await;
+            let output = execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":"read","arguments":input}), context).await?;
+            let canonical_path = format!("/tickets/{}", output["data"]["ticket"].as_str().unwrap());
+            return Ok(Self::native_data(output, &canonical_path));
         }
         execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":"read","arguments":{}}), ToolExecutionContext::direct()).await?;
         let inspected = execute_tool(
@@ -261,7 +243,19 @@ impl TicketSurface {
             "TicketImplementationResultQuery" => "implementation_result_query",
             _ => unreachable!(),
         };
-        execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":operation,"arguments":input}), context).await
+        let output = execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":operation,"arguments":input}), context).await?;
+        Ok(Self::native_data(output, &path))
+    }
+
+    // Native results keep navigation typed while ordinary Tools retain their domain JSON.
+    // Assert the signed route's native envelope before sharing the persistence assertions.
+    fn native_data(mut output: serde_json::Value, expected_entry: &str) -> serde_json::Value {
+        assert_eq!(output["entry"], expected_entry);
+        for domain in ["tickets", "objectives", "merge_requests"] {
+            assert!(output["links"][domain].is_array());
+        }
+        assert!(output.get("data").is_some());
+        output["data"].take()
     }
 }
 fn ticket_client(
