@@ -639,8 +639,8 @@ async fn workspace_config_production_slash_deep_discover_read_edit_and_atomic_im
         CONTENT_ROOT,
         "apply_changes",
         json!({"changes":[
-            {"kind":"create","path":"profiles/new.dcdl","content":"model = imported"},
-            {"kind":"update","path":"main.dcdl","content":"import profiles/new.dcdl"}
+            {"$case":"create","value":{"path":"profiles/new.dcdl","content":"model = imported"}},
+            {"$case":"update","value":{"path":"main.dcdl","content":"import profiles/new.dcdl"}}
         ]}),
     )
     .await

@@ -24,6 +24,9 @@
 
 pub mod backend;
 mod content;
+mod contract;
+#[cfg(test)]
+mod contract_tests;
 pub mod wip;
 
 use std::sync::Arc;
