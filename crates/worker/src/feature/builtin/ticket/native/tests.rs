@@ -234,7 +234,11 @@ fn assignment_principal_and_cas_are_declared_compounds_not_opaque_json() {
             .is_err()
         );
     }
-    let declaration = contract("orchestrator_assign").declaration();
+    let declaration = contract("orchestrator_assign").declaration(&ReferenceRoots {
+        ticket: "/cases",
+        merge_request: "/changes",
+        objective: "/goals",
+    });
     assert!(
         declaration
             .parameters

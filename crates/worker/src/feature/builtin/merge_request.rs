@@ -869,7 +869,7 @@ fn merge_request_descriptor(
 fn merge_request_operation_declaration(
     tool: &NativeMergeRequestTool,
 ) -> Result<OperationDeclaration, WipMountError> {
-    Ok(native::declaration(&tool.contract))
+    Ok(native::declaration(&tool.contract, &tool.roots))
 }
 
 fn merge_request_protocol_failure(

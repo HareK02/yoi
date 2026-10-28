@@ -606,7 +606,7 @@ pub(super) fn contract(op: &str) -> Contract {
             "query_orchestration_plans",
             "Read bounded project-level plan records; planning history is not execution authority.",
             vec![
-                p("kind", false, plan_kind()),
+                rename("kind", "relation_kind", false, plan_kind()),
                 p("limit", false, Shape::Integer),
             ],
         ),

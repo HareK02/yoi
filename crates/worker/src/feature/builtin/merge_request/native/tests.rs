@@ -59,7 +59,7 @@ async fn inspect_interface(runtime: &WipRuntime, path: &str) -> String {
 
 #[test]
 fn native_contract_exposes_records_enums_nullable_and_entry_without_tool_schema() {
-    let open = contract(Kind::Open).declaration();
+    let open = contract(Kind::Open).declaration(&roots().contract_roots());
     assert!(matches!(open.parameters[0].r#type, TypeExpr::Entry));
     let TypeExpr::Record { ref fields } = open.parameters[1].r#type else {
         panic!("repository record")
@@ -71,7 +71,7 @@ fn native_contract_exposes_records_enums_nullable_and_entry_without_tool_schema(
             .collect::<Vec<_>>(),
         [("key", true), ("source", true), ("target", true)]
     );
-    let review = contract(Kind::Review).declaration();
+    let review = contract(Kind::Review).declaration(&roots().contract_roots());
     assert!(review.parameters[0].required);
     assert!(matches!(review.parameters[0].r#type, TypeExpr::Enum { .. }));
     let TypeExpr::List { items } = &review.parameters[2].r#type else {
@@ -404,4 +404,89 @@ async fn native_review_typed_findings_reaches_only_injected_route_and_never_retr
         json!({"severity":"major","body":"Fix it","path":"src/main.rs","line":12,"code":null})
     );
     assert_eq!(body["capability_token"], "secret-capability");
+}
+
+#[tokio::test]
+async fn mr_only_inspect_supplies_reserved_ticket_coordinates_without_observing_ticket() {
+    let client = Arc::new(RecordingWorkspaceClient::new(vec![response(
+        json!({"merge_request_id":"MR-1"}),
+    )]));
+    let mut registry = WipMountRegistry::new();
+    registry
+        .allocate_namespace("ticket", "hidden-cases")
+        .unwrap();
+    let route = registry
+        .allocate_namespace("merge-request", "changes")
+        .unwrap();
+    mount_workspace_http_merge_request_wip(
+        &mut registry,
+        client.clone(),
+        MergeRequestFeatureConfig {
+            open: true,
+            ..Default::default()
+        },
+        None,
+        &route,
+    )
+    .unwrap();
+    let runtime = WipRuntime::from_mounts(registry, "mr-only-input-discovery".into()).unwrap();
+    let tree = runtime.tree("/".into(), 1, false).await.unwrap();
+    assert!(!tree.content.unwrap().contains("hidden-cases"));
+    let object = runtime.inspect("/changes".into(), false).await.unwrap();
+    let object: Value = serde_json::from_str(&object.content.unwrap()).unwrap();
+    let shown = &object["interfaces"][0];
+    let definition = runtime
+        .inspect(shown["path"].as_str().unwrap().into(), false)
+        .await
+        .unwrap();
+    let definition: Value = serde_json::from_str(&definition.content.unwrap()).unwrap();
+    let signature = definition["interface_signature"].as_str().unwrap();
+    // The model has a known Ticket ID, but obtains the required input coordinates solely
+    // from the native Inspect contract; it never observes or invokes the reserved domain.
+    let doc = signature
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("/// "))
+        .map(|text| serde_json::from_str::<String>(text).unwrap())
+        .find(|text| text.starts_with("Ticket Entry: collection root "))
+        .unwrap();
+    let encoded = doc
+        .strip_prefix("Ticket Entry: collection root ")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let root: String = serde_json::from_str(encoded).unwrap();
+    assert_eq!(root, "/hidden-cases");
+    assert!(signature.contains("Coordinates do not imply Object publication"));
+    assert!(runtime.inspect(root.clone(), false).await.is_err());
+    let input = json!({"ticket":format!("{root}/T-797"),"repository":{"key":"main","source":"work","target":"develop"}});
+    runtime
+        .invoke(
+            "/changes".into(),
+            wip_protocol::InterfaceReference {
+                scope: shown["reference"]["scope"].as_str().unwrap().into(),
+                name: shown["reference"]["name"].as_str().unwrap().into(),
+            },
+            "open".into(),
+            input,
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+    let requests = client.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/api/w/ws/tickets/T-797/merge-request");
+    assert_eq!(
+        client.authorizations.lock().unwrap()[0].resource,
+        server_api::authorization::PermissionResource::Ticket {
+            workspace_id: "ws".into(),
+            ticket_id: "T-797".into()
+        }
+    );
+    assert!(
+        runtime
+            .inspect(format!("{root}/T-797"), false)
+            .await
+            .is_err()
+    );
 }

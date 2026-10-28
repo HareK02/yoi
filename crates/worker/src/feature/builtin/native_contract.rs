@@ -3,6 +3,9 @@
 //! These shapes are authored for native operations, not derived from Tool schemas. WIP validates
 //! the generated declaration before destination mapping; authorization and business constraints
 //! remain with the domain handler. Conversion neither resolves objects nor grants access.
+//! Declaration and conversion receive the same allocated reference roots. Input Entry documentation
+//! exposes these coordinates even for unpublished domains, without claiming an Object observation;
+//! the Interface validator changes with the coordinates and Backend authority is checked at execution.
 //!
 //! WIP 0.2 represents unions as records with `$case` and an optional `value`, and has no nullable
 //! type. Nullable inputs therefore expose an explicit `null | value(T)` union rather than an
@@ -88,7 +91,7 @@ pub struct ReferenceRoots<'a> {
 }
 
 impl Contract {
-    pub fn declaration(&self) -> OperationDeclaration {
+    pub fn declaration(&self, roots: &ReferenceRoots<'_>) -> OperationDeclaration {
         OperationDeclaration {
             name: self.name.into(),
             documentation: Some(Documentation {
@@ -101,8 +104,8 @@ impl Contract {
                 .map(|input| ParameterDeclaration {
                     name: input.name.into(),
                     required: input.required,
-                    documentation: input.ty.documentation(),
-                    r#type: input.ty.declaration(),
+                    documentation: input.ty.documentation(roots),
+                    r#type: input.ty.declaration(roots),
                 })
                 .collect(),
             // Typed result Entries are owned separately from this input contract.
@@ -122,7 +125,7 @@ impl Contract {
             format: INTERFACE_FORMAT_V1.into(),
             documentation: None,
             types: Vec::new(),
-            operations: vec![self.declaration()],
+            operations: vec![self.declaration(roots)],
         };
         descriptor.validate().map_err(invalid)?;
         // validate_call is the upstream type validator. These inert targets exist only to
@@ -150,29 +153,49 @@ impl Contract {
 }
 
 impl Shape {
-    fn documentation(&self) -> Option<Documentation> {
+    fn documentation(&self, roots: &ReferenceRoots<'_>) -> Option<Documentation> {
         let summary = match self {
-            Self::Reference(ReferenceKind::Ticket) => {
-                "Ticket Entry: an exact item path under the current Ticket collection"
-            }
-            Self::Reference(ReferenceKind::MergeRequest) => {
-                "Merge Request Entry: an exact item path under the current Merge Request collection"
-            }
-            Self::Reference(ReferenceKind::Objective) => {
-                "Objective Entry: an exact item path under the current Objective collection; leaf O- followed by decimal digits, or an 8–128 character ASCII alphanumeric canonical ID"
+            Self::Reference(kind) => {
+                let name = match kind {
+                    ReferenceKind::Ticket => "Ticket",
+                    ReferenceKind::MergeRequest => "Merge Request",
+                    ReferenceKind::Objective => "Objective",
+                };
+                let root = kind.root(roots);
+                if root.is_empty() {
+                    format!(
+                        "{name} Entry: no unique input collection is available; no reference is accepted"
+                    )
+                } else {
+                    let leaf = match kind {
+                        ReferenceKind::Ticket => {
+                            "T- followed by decimal digits, or an 8–128 character ASCII alphanumeric canonical ID"
+                        }
+                        ReferenceKind::Objective => {
+                            "O- followed by decimal digits, or an 8–128 character ASCII alphanumeric canonical ID"
+                        }
+                        ReferenceKind::MergeRequest => {
+                            "1–128 ASCII alphanumeric or -_.~ characters, excluding . and .."
+                        }
+                    };
+                    format!(
+                        "{name} Entry: collection root {root:?}; append /<id> for an exact item path; id is {leaf}. Coordinates do not imply Object publication, existence, observation or execution authority; Backend authorization is checked at call time"
+                    )
+                }
             }
             Self::Nullable(_) => {
                 "Explicit null uses {$case: null}; a present value uses {$case: value, value: T}"
+                    .into()
             }
             _ => return None,
         };
         Some(Documentation {
-            summary: summary.into(),
+            summary,
             details: None,
         })
     }
 
-    fn declaration(&self) -> TypeExpr {
+    fn declaration(&self, roots: &ReferenceRoots<'_>) -> TypeExpr {
         match self {
             Self::String => TypeExpr::String,
             Self::Boolean => TypeExpr::Boolean,
@@ -195,13 +218,13 @@ impl Shape {
                     },
                     UnionCase {
                         name: "value".into(),
-                        documentation: inner.documentation(),
-                        payload: Some(inner.declaration()),
+                        documentation: inner.documentation(roots),
+                        payload: Some(inner.declaration(roots)),
                     },
                 ],
             },
             Self::List(items) => TypeExpr::List {
-                items: Box::new(items.declaration()),
+                items: Box::new(items.declaration(roots)),
             },
             Self::Record(fields) => TypeExpr::Record {
                 fields: fields
@@ -209,8 +232,8 @@ impl Shape {
                     .map(|input| FieldDeclaration {
                         name: input.name.into(),
                         required: input.required,
-                        documentation: input.ty.documentation(),
-                        r#type: input.ty.declaration(),
+                        documentation: input.ty.documentation(roots),
+                        r#type: input.ty.declaration(roots),
                     })
                     .collect(),
             },
@@ -220,7 +243,10 @@ impl Shape {
                     .map(|case| UnionCase {
                         name: case.name.into(),
                         documentation: None,
-                        payload: case.payload.as_ref().map(Self::declaration),
+                        payload: case
+                            .payload
+                            .as_ref()
+                            .map(|payload| payload.declaration(roots)),
                     })
                     .collect(),
             },
@@ -350,16 +376,20 @@ fn insert(
 }
 
 impl ReferenceKind {
+    fn root<'a>(self, roots: &ReferenceRoots<'a>) -> &'a str {
+        match self {
+            Self::Ticket => roots.ticket,
+            Self::MergeRequest => roots.merge_request,
+            Self::Objective => roots.objective,
+        }
+    }
+
     fn identity<'a>(
         self,
         path: &'a str,
         roots: &ReferenceRoots<'_>,
     ) -> Result<&'a str, WipOperationError> {
-        let root = match self {
-            Self::Ticket => roots.ticket,
-            Self::MergeRequest => roots.merge_request,
-            Self::Objective => roots.objective,
-        };
+        let root = self.root(roots);
         wip_protocol::validate_path(root).map_err(invalid)?;
         wip_protocol::validate_path(path).map_err(invalid)?;
         let leaf = path
@@ -499,7 +529,7 @@ mod tests {
             destination: Destination::Flatten,
         }]);
         assert!(matches!(
-            contract.declaration().parameters[0].r#type,
+            contract.declaration(&ROOTS).parameters[0].r#type,
             TypeExpr::Union { .. }
         ));
         let arguments = fields([(
@@ -578,7 +608,7 @@ mod tests {
             false,
             Shape::Nullable(Box::new(Shape::String)),
         )]);
-        let declaration = contract.declaration();
+        let declaration = contract.declaration(&ROOTS);
         assert!(!declaration.parameters[0].required);
         assert!(matches!(
             &declaration.parameters[0].r#type,
@@ -684,7 +714,7 @@ mod tests {
             },
         )]);
         assert!(matches!(
-            contract.declaration().parameters[0].r#type,
+            contract.declaration(&ROOTS).parameters[0].r#type,
             TypeExpr::Union { .. }
         ));
         for (value, expected_json, expected_reason) in [
@@ -743,7 +773,7 @@ mod tests {
             true,
             Shape::Reference(ReferenceKind::Objective),
         )]);
-        let parameter = &contract.declaration().parameters[0];
+        let parameter = &contract.declaration(&ROOTS).parameters[0];
         assert_eq!(parameter.r#type, TypeExpr::Entry);
         assert!(
             parameter
@@ -814,7 +844,7 @@ mod tests {
             ("change", text("/workspace/changes/MR-9")),
         ]);
         assert!(matches!(
-            contract.declaration().parameters[0].r#type,
+            contract.declaration(&ROOTS).parameters[0].r#type,
             TypeExpr::Entry
         ));
         assert_eq!(

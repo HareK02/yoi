@@ -130,9 +130,25 @@ async fn mr_only_controller_reserves_ticket_coordinates_without_publishing_ticke
         )
         .await
         .unwrap();
-    assert!(definition.content.unwrap().contains("ticket: entry"));
+    let definition: serde_json::Value = serde_json::from_str(&definition.content.unwrap()).unwrap();
+    let signature = definition["interface_signature"].as_str().unwrap();
+    assert!(signature.contains("ticket: entry"));
+    let doc = signature
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("/// "))
+        .map(|text| serde_json::from_str::<String>(text).unwrap())
+        .find(|text| text.starts_with("Ticket Entry: collection root "))
+        .unwrap();
+    let root: String = serde_json::from_str(
+        doc.strip_prefix("Ticket Entry: collection root ")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
     let (_, invoke) = tools.get_tool("Invoke").unwrap();
-    let input = serde_json::json!({"path":"/merge-requests","interface":object["interfaces"][0]["reference"],"operation":"open","arguments":{"ticket":"/tickets/T-42","repository":{"key":"main","source":"work/T-42","target":"develop"}}});
+    let input = serde_json::json!({"path":"/merge-requests","interface":object["interfaces"][0]["reference"],"operation":"open","arguments":{"ticket":format!("{root}/T-42"),"repository":{"key":"main","source":"work/T-42","target":"develop"}}});
     invoke
         .execute(&input.to_string(), ToolExecutionContext::direct())
         .await

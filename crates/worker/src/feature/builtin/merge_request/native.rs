@@ -4,8 +4,9 @@
 //! consumers must Inspect the current Object and then its Interface again, use Ticket Entries,
 //! group repository/page/integration records, and invoke `readiness`. Tool mode is unchanged.
 //!
-//! Examples below show Invoke's JSON binding, not Tool JSON. Substitute the actual allocated
-//! Ticket collection path discovered from the current registry (it need not be `/tickets`).
+//! Examples below show Invoke's JSON binding, not Tool JSON. Read the allocated Ticket collection
+//! root from the Entry parameter's Inspect documentation (it need not be `/tickets`). This input
+//! coordinate remains available when Ticket Objects are unpublished; it is not an observation or grant.
 //!
 //! ```text
 //! collection.open({ticket: "/tickets/T-797",
@@ -186,8 +187,18 @@ pub(super) fn contract(kind: Kind) -> Contract {
     }
 }
 
-pub(super) fn declaration(contract: &Contract) -> OperationDeclaration {
-    contract.declaration()
+impl ReferenceRoots {
+    fn contract_roots(&self) -> crate::feature::builtin::native_contract::ReferenceRoots<'_> {
+        crate::feature::builtin::native_contract::ReferenceRoots {
+            ticket: &self.ticket,
+            merge_request: &self.merge_request,
+            objective: &self.objective,
+        }
+    }
+}
+
+pub(super) fn declaration(contract: &Contract, roots: &ReferenceRoots) -> OperationDeclaration {
+    contract.declaration(&roots.contract_roots())
 }
 
 pub(super) fn convert(
@@ -195,14 +206,7 @@ pub(super) fn convert(
     arguments: &BTreeMap<String, WipValue>,
     roots: &ReferenceRoots,
 ) -> Result<Value, WipOperationError> {
-    contract.convert(
-        arguments,
-        &crate::feature::builtin::native_contract::ReferenceRoots {
-            ticket: &roots.ticket,
-            merge_request: &roots.merge_request,
-            objective: &roots.objective,
-        },
-    )
+    contract.convert(arguments, &roots.contract_roots())
 }
 
 pub(super) fn command(kind: Kind, mut input: Value) -> Result<command::Command, WipOperationError> {

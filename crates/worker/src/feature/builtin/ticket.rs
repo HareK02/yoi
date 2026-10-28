@@ -2040,8 +2040,14 @@ pub fn mount_workspace_http_ticket_wip(
         .collect::<Vec<_>>();
     let observations = Arc::new(Mutex::new(TicketObservationState::default()));
 
+    let roots = crate::feature::builtin::native_contract::ReferenceRoots {
+        ticket: &collection_route,
+        merge_request: &merge_request_route,
+        objective: &objective_route,
+    };
     let collection_descriptor = ticket_descriptor(
         &collection_tools,
+        &roots,
         "Search and create authoritative Workspace Tickets",
         "Search results remain bounded and carry canonical item paths. Operations are exactly the Ticket tools enabled for this Worker.",
     )?;
@@ -2077,6 +2083,7 @@ pub fn mount_workspace_http_ticket_wip(
 
     let item_descriptor = ticket_descriptor(
         &item_tools,
+        &roots,
         "Read and operate on the Ticket bound to this object route",
         "The subject Ticket identity comes exclusively from the target route. Separate relation and dependency targets remain explicit operation inputs.",
     )?;
@@ -2593,12 +2600,13 @@ fn descriptor_validator(descriptor: &InterfaceDescriptor) -> Vec<u8> {
 
 fn ticket_descriptor(
     tools: &[NativeTicketTool],
+    roots: &crate::feature::builtin::native_contract::ReferenceRoots<'_>,
     summary: &str,
     details: &str,
 ) -> Result<InterfaceDescriptor, WipMountError> {
     let operations = tools
         .iter()
-        .map(ticket_operation_declaration)
+        .map(|tool| ticket_operation_declaration(tool, roots))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(InterfaceDescriptor {
         format: INTERFACE_FORMAT_V1.into(),
@@ -2613,8 +2621,9 @@ fn ticket_descriptor(
 
 fn ticket_operation_declaration(
     tool: &NativeTicketTool,
+    roots: &crate::feature::builtin::native_contract::ReferenceRoots<'_>,
 ) -> Result<OperationDeclaration, WipMountError> {
-    Ok(native::contract(tool.projection.operation).declaration())
+    Ok(native::contract(tool.projection.operation).declaration(roots))
 }
 
 fn protocol_failure(code: ProtocolErrorCode, message: impl Into<String>) -> WipOperationError {
@@ -3287,7 +3296,17 @@ mod tests {
         let client = decision_client(200, TicketState::Closed);
         let tools =
             native_ticket_tools(client.clone(), TicketFeatureAccess::work_report()).unwrap();
-        let descriptor = ticket_descriptor(&tools, "Ticket", "bound").unwrap();
+        let descriptor = ticket_descriptor(
+            &tools,
+            &crate::feature::builtin::native_contract::ReferenceRoots {
+                ticket: "/tickets",
+                merge_request: "/merge-requests",
+                objective: "/objectives",
+            },
+            "Ticket",
+            "bound",
+        )
+        .unwrap();
         let case_update = descriptor
             .operations
             .iter()
@@ -3405,6 +3424,11 @@ mod tests {
                 .filter(|tool| tool.projection.surface == NativeTicketSurface::Item)
                 .cloned()
                 .collect::<Vec<_>>(),
+            &crate::feature::builtin::native_contract::ReferenceRoots {
+                ticket: "/tickets",
+                merge_request: "/merge-requests",
+                objective: "/objectives",
+            },
             "items",
             "route bound",
         )
