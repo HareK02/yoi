@@ -3,13 +3,14 @@ use yoi_plugin_pdk::wit_bindgen;
 use yoi_plugin_pdk::{ToolContext, ToolError, ToolOutput};
 
 wit_bindgen::generate!({
-    world: "tool",
-    path: "../../../../resources/plugin/wit",
+    world: "tool-plugin",
+    path: "wit",
     generate_all,
     runtime_path: "yoi_plugin_pdk::wit_bindgen::rt",
 });
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EchoInput {
     text: String,
 }
@@ -21,6 +22,9 @@ struct EchoOutput<'a> {
 }
 
 fn handle_echo(ctx: ToolContext, input: EchoInput) -> Result<ToolOutput, ToolError> {
+    if ctx.tool_name() != "example_echo" {
+        return Err(ToolError::unsupported_tool(ctx.tool_name()));
+    }
     if input.text.trim().is_empty() {
         return Err(ToolError::invalid_input("`text` must not be empty"));
     }

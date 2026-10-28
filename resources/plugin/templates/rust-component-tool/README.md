@@ -1,5 +1,5 @@
-# Rust Component Plugin雛形
+# Rust Tool Component雛形
 
-提案段階の`yoi:plugin/tool@1.0.0`を対象にしたオフラインpackageの雛形である。YoiはPluginのインストールやWorker内での実行を提供していない。
+guest境界は生成されたWIT bindingsに任せ、手書きpointer ABIとWASI依存を持たせない。呼出し間の永続状態やServiceを成功stubとして公開しない。
 
-guest側の型付き入出力とエラー表現はRust PDKが担当し、ファイル・ネットワーク・環境への権限は付与しない。`plugin.component.wasm`はpackage検査用のテキストplaceholderであり、実行可能なcomponentの証拠にはならない。
+`plugin.component.wasm`はソースからbuildして配置する成果物であり、placeholderをpackageへ混入させない。PDKからのbuild成功と、Hostの認可・実行経路の完成は別の判断である。

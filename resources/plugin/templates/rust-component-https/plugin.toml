@@ -1,0 +1,28 @@
+schema_version = 2
+id = "example.rust_component_https"
+name = "Rust HTTPS Component Tool Template"
+version = "0.1.0"
+surfaces = ["tool"]
+config_schema = "{}"
+requested_grants = [{ kind = "https", slot = "api" }]
+
+[runtime]
+kind = "wasm-component"
+component = "plugin.component.wasm"
+world = "yoi:plugin/https-tool-plugin@2.0.0"
+required_imports = ["yoi:host/errors@2.0.0", "yoi:host/connections@2.0.0", "yoi:host/http@2.0.0"]
+
+[[tools]]
+name = "example_status"
+description = "Observe the status response through an explicitly bound HTTPS slot."
+input_schema = { type = "object", properties = {}, additionalProperties = false }
+output_schema = { type = "object", properties = { status = { type = "integer" }, body_bytes = { type = "integer" } }, required = ["status", "body_bytes"], additionalProperties = false }
+# Even GET may have side effects. Host receipt/admission policy still applies.
+error_codes = ["invalid_input", "invalid_output", "serialization", "unsupported_tool", "failed"]
+external_write = true
+
+[[connections]]
+name = "api"
+# Package requests HTTPS bounds; Workspace binding supplies origin and secrets.
+methods = ["GET"]
+path_prefixes = ["/status"]

@@ -1847,7 +1847,7 @@ fn parse_plugin_pack_args(
 }
 
 fn plugin_usage() -> &'static str {
-    "usage: yoi plugin new <rust-component-tool|rust-component-service> <path-or-name> [--json]\n       yoi plugin check <path-or-package> [--json]\n       yoi plugin pack <path> [--output <file>] [--json]"
+    "usage: yoi plugin new <rust-component-tool|rust-component-https-tool> <path-or-name> [--json]\n       yoi plugin check <path-or-package> [--json]\n       yoi plugin pack <path> [--output <file>] [--json]"
 }
 
 fn parse_mcp_args(args: &[String]) -> Result<mcp_cli::McpCliCommand, ParseError> {

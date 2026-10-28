@@ -15,11 +15,17 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_ignored = "0.1.14"
 sha2 = "0.10"
+crc32fast = "1"
+wasmparser = "0.244.0"
+wit-parser = "0.244.0"
+wit-component = "0.244.0"
+jsonschema = { version = "0.33.0", default-features = false }
 secrets = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+wit-component = { version = "0.244.0", features = ["dummy-module"] }
 serial_test = "3.4.0"
 tempfile = { workspace = true }

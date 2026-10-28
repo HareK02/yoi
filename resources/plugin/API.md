@@ -1,6 +1,6 @@
 # Workspace Plugin APIの設計契約
 
-本書はWorkspace管理のPluginに採用する設計を定める。実行形式はWebAssembly Component Model、engineはWasmtime、guest/Host境界はWITとする。実装済みAPIの利用ガイドではない。既存の[v1 Tool world](wit/yoi-plugin-tool-v1.wit)、[v1 instance world](wit/yoi-plugin-instance-v1.wit)、[v1 Host imports](wit/deps/yoi-host/yoi-host-v1.wit)、PDK、templateは旧v1のoffline authoring資産であり、本書のv2実行契約をまだ提供していない。
+本書はWorkspace管理のPluginに採用する設計を定める。実行形式はWebAssembly Component Model、engineはWasmtime、guest/Host境界はWITとする。実装済みAPIの利用ガイドではない。旧[v1 Tool world](legacy/wit/yoi-plugin-tool-v1.wit)、[v1 instance world](legacy/wit/yoi-plugin-instance-v1.wit)、[v1 Host imports](legacy/wit/deps/yoi-host/yoi-host-v1.wit)は歴史資料として隔離する。v2の機械的契約は[Tool worlds](wit/yoi-plugin-v2.wit)と[Host imports](wit/deps/yoi-host/yoi-host-v2.wit)で定める。PDKやtemplateのbuild成功はHost実装やWorker実行経路の完成を意味しない。
 
 管理、guest実行、Server上の拡張データを横断する判断をWIT資産の近くで一か所に保持する。実装時には各wire型と境界testを契約の機械的な根拠にし、ここには所有境界・失敗保証・採用理由を残す。作業順と進捗の正本はO-4、T-469、T-465、T-533とする。
 
