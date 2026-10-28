@@ -325,7 +325,7 @@ impl SqliteWorkspaceStore {
         let now = Utc::now().to_rfc3339();
         self.with_conn_mut(|conn| {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let policy=load_removal_policy(&tx,&req.workspace_id,&req.worker,erased_journal)?.ok_or_else(|| StoreError::InvalidInput(format!("policy-missing:{}",req.workspace_id)))?;
+            let policy=load_removal_policy(&tx,&req.workspace_id,&req.worker,erased_journal,true)?.ok_or_else(|| StoreError::InvalidInput(format!("policy-missing:{}",req.workspace_id)))?;
             let worker=match load_worker(&tx,&req.workspace_id,&req.worker)? {
                 Some(v)=>v,
                 None=>{
@@ -371,7 +371,7 @@ impl SqliteWorkspaceStore {
                 return Err(StoreError::InvalidInput(format!("stale:{plan_id}:plan state {} is not executable", state_s(plan.state))));
             }
             if !plan.blockers.is_empty(){return Err(StoreError::InvalidInput(format!("blocked:{}",serde_json::to_string(&plan.blockers).unwrap())));}
-            let policy=load_removal_policy(&tx,workspace_id,&plan.worker,plan.policy_id==ERASED_JOURNAL_POLICY_ID)?.ok_or_else(||StoreError::InvalidInput(format!("policy-missing:{workspace_id}")))?;
+            let policy=load_removal_policy(&tx,workspace_id,&plan.worker,plan.policy_id==ERASED_JOURNAL_POLICY_ID,plan.policy_id=="backend-subject-removal-archive-v1")?.ok_or_else(||StoreError::InvalidInput(format!("policy-missing:{workspace_id}")))?;
             if policy.policy_id!=plan.policy_id||policy.policy_digest!=plan.policy_digest{
                 mark_stale(&tx,&plan,"policy content changed")?;tx.commit()?;
                 return Err(stale_error(&plan,"policy content changed"));
@@ -1020,6 +1020,7 @@ fn load_removal_policy(
     w: &str,
     worker: &RuntimeWorkerRef,
     erased_journal: bool,
+    preserve_subject_history: bool,
 ) -> crate::Result<Option<WorkerRetentionPolicy>> {
     let Some(mut policy) = load_policy(c, w)? else {
         return Ok(None);
@@ -1044,6 +1045,25 @@ fn load_removal_policy(
         policy.archive_retention = update.archive_retention;
         policy.diagnostics_disposition = update.diagnostics_disposition;
         policy.diagnostics_retention_seconds = None;
+    } else if preserve_subject_history && policy.session_disposition == SessionDisposition::Purge && c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND substr(singleton_key,1,10)='subjektiv:')",
+        params![w, worker.runtime_id, worker.worker_id],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // Removing a Subject body releases occupancy, not its original history.
+        // A configured Purge must not silently erase an unfinished Journal. Explicit
+        // Session erasure uses the separate, proof-bound branch above.
+        let update = WorkerRetentionPolicyUpdate {
+            policy_id: "backend-subject-removal-archive-v1".into(),
+            session_disposition: SessionDisposition::Archive,
+            metadata_disposition: policy.metadata_disposition,
+            archive_retention: policy.archive_retention,
+            diagnostics_disposition: policy.diagnostics_disposition,
+            diagnostics_retention_seconds: policy.diagnostics_retention_seconds,
+        };
+        policy.policy_id = update.policy_id.clone();
+        policy.policy_digest = worker_retention_policy_digest(&update);
+        policy.session_disposition = update.session_disposition;
     }
     Ok(Some(policy))
 }

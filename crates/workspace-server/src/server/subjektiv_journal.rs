@@ -92,6 +92,20 @@ pub(super) fn prepare(api: &WorkspaceApi, reservation: &BackendJobReservation) -
     };
     let store = store(api)?;
     let host = host(api, &store, grant)?;
+    let attr = store
+        .session_attribution(&grant.session_id)
+        .map_err(|e| Error::Store(e.to_string()))?
+        .ok_or_else(|| {
+            Error::WorkspacePermissionDenied("Journal Session attribution missing".into())
+        })?;
+    if store
+        .journal_worker_was_released(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
+        .map_err(domain)?
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "released Journal body cannot dispatch another attempt".into(),
+        ));
+    }
     let input = saved_input(&reservation.job.request, grant)?;
     let g = store
         .prepare_journal_input(
@@ -584,6 +598,18 @@ fn dispatch(
         .lock()
         .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
     let store = store(api)?;
+    if store
+        .journal_worker_was_released(
+            &attribution.subject_id,
+            &attribution.runtime_id,
+            &attribution.worker_id,
+        )
+        .map_err(domain)?
+    {
+        // Deletion can retain an unfinished prefix. It must not mint attempts or
+        // transfer the removed body's write capability to its successor.
+        return Ok(());
+    }
     let host =
         JournalHostContext::validated_session(&store, attribution.clone()).map_err(domain)?;
     if let Some(g) = store
@@ -1740,8 +1766,8 @@ fn finish_erased_release(
         .release_subject_singleton(api.workspace_id(), &lease, binding_id, &operation)
 }
 
-/// Normal deletion cannot substitute for Subject release, even for a stopped or disabled body.
-/// Explicit erasure remains a separate monotonic source/diagnostics destruction path.
+/// Ordinary removal owns writer revocation and occupancy release. Before execution
+/// only preserve/erase source requirements are checked; an active writer is not a blocker.
 pub(super) fn prepare_worker_removal(
     service: &WorkerRemovalService,
     runtime: &RuntimeRegistry,
@@ -1762,7 +1788,6 @@ pub(super) fn prepare_worker_removal(
         &service.journal_registration,
     )
     .map_err(|e| Error::Store(e.to_string()))?;
-    let host = JournalHostContext::validated_session(&store, attr.clone()).map_err(domain)?;
     let source = runtime_api::SessionPublicSource::Retained {
         worker_id: worker_runtime::identity::WorkerId::parse(&target.worker_id)
             .ok_or_else(|| Error::Store("Worker identity invalid".into()))?,
@@ -1779,25 +1804,9 @@ pub(super) fn prepare_worker_removal(
         finish_erased_release(&api, &attr)?;
         return Ok(Some(proof));
     }
-    let Some(binding_id) = host.writer_binding_id() else {
-        return Err(Error::RepositoryConflict(
-            "Subject writer evidence is missing; ordinary deletion cannot bypass release".into(),
-        ));
-    };
-    let writer = JournalWriterBinding {
-        subject_id: attr.subject_id.clone(),
-        runtime_id: attr.runtime_id.clone(),
-        worker_id: attr.worker_id.clone(),
-        binding_id: binding_id.into(),
-    };
-    if store.journal_writer_active(&writer).map_err(domain)? {
-        return Err(Error::RepositoryConflict("Subject remains occupied: restore to actual Idle, finish Journal recording, then explicitly release before ordinary deletion".into()));
-    }
-    if store.journal_retention_required(&host).map_err(domain)? {
-        return Err(Error::RepositoryConflict(
-            "Released Subject has unresolved Journal material; retain occupancy and source".into(),
-        ));
-    }
+    // Do not require a live Controller, complete Journal, or prior release here.
+    // Runtime removal is the physical fence; finish_worker_removal revokes the
+    // exact old body only after its successful, matching retention receipt.
     Ok(None)
 }
 
@@ -1886,20 +1895,6 @@ pub(super) fn validate_removal_retention(
         // its retained permanent fence, including recovery after the aggregate is gone.
         return Ok(());
     }
-    let binding_id = host.writer_binding_id().ok_or_else(|| {
-        Error::RepositoryConflict("Subject writer evidence missing during removal recovery".into())
-    })?;
-    let binding = JournalWriterBinding {
-        subject_id: attr.subject_id.clone(),
-        runtime_id: attr.runtime_id.clone(),
-        worker_id: attr.worker_id.clone(),
-        binding_id: binding_id.into(),
-    };
-    if store.journal_writer_active(&binding).map_err(domain)? {
-        return Err(Error::RepositoryConflict(
-            "Prepared removal cannot bypass explicit Subject release".into(),
-        ));
-    }
     let source = runtime_api::SessionPublicSource::Retained {
         worker_id: worker_runtime::identity::WorkerId::parse(&target.worker_id)
             .ok_or_else(|| Error::Store("Worker identity invalid".into()))?,
@@ -1907,35 +1902,138 @@ pub(super) fn validate_removal_retention(
     let runtime = service.runtime.upgrade().ok_or_else(|| {
         Error::Store("Runtime unavailable for source retention confirmation".into())
     })?;
-    if store.journal_retention_required(&host).map_err(domain)? {
-        if prepared.runtime_request.session_disposition
-            != worker_runtime::retention::SessionDisposition::Archive
-            || prepared.runtime_request.archive_id.is_none()
-        {
-            return Err(Error::RepositoryConflict(
-                "unreflected Journal requires a retained original Session archive".into(),
-            ));
+    let retention_required = store.journal_retention_required(&host).map_err(domain)?;
+    if prepared.runtime_request.session_disposition
+        == worker_runtime::retention::SessionDisposition::Purge
+        && prepared.runtime_request.archive_id.is_none()
+        && !retention_required
+        && store
+            .journal_worker_was_released(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
+            .map_err(domain)?
+    {
+        // Compatibility for an already issued, history-complete ordinary Purge
+        // plan. New Subject plans always Archive. Keep the old fingerprint and
+        // disposition; never turn this into an erasure or allow an active writer.
+        // A missing Runtime Worker is NOT success: execute_worker_retention still
+        // has to return the exact persisted receipt before anything can commit.
+        // A pending receipt may outlive the physical aggregate while Runtime's
+        // in-memory catalog still contains the Worker. Pin release is best effort
+        // in this historical branch; exact Runtime retention replay still enforces
+        // pins if the source exists, and requires a receipt if it is already gone.
+        if let Err(error) = retain_source(&runtime, &service.workspace_id, &attr, source, true) {
+            tracing::debug!(%error, "Historical Purge source unavailable; reconcile exact Runtime receipt");
         }
-        if let Err(original) = retain_source(&runtime, &service.workspace_id, &attr, source, false)
-        {
-            // Recovery may already have transferred the physical source before its Backend
-            // catalog commit; authenticate the exact reserved archive, never another Session.
-            let archive = runtime_api::SessionPublicSource::Archived {
-                archive_id: prepared
-                    .runtime_request
-                    .archive_id
-                    .clone()
-                    .expect("checked"),
-            };
-            retain_source(&runtime, &service.workspace_id, &attr, archive, false)
-                .map_err(|_| original)?;
-        }
-    } else {
-        // This stopped/removal-fenced Session has no admitted remainder; purge need not
-        // force a generation. A failed release conservatively blocks ordinary deletion.
-        retain_source(&runtime, &service.workspace_id, &attr, source, true)?;
+        return Ok(());
+    }
+    if prepared.runtime_request.session_disposition
+        != worker_runtime::retention::SessionDisposition::Archive
+        || prepared.runtime_request.archive_id.is_none()
+    {
+        return Err(Error::RepositoryConflict(
+            "Subject removal retains its original Session; explicit erasure is required for Purge"
+                .into(),
+        ));
+    }
+    let release = !retention_required;
+    if let Err(original) = retain_source(&runtime, &service.workspace_id, &attr, source, release) {
+        // A lost reply may follow the physical transfer. Reconcile only the exact
+        // reserved archive and Session, whether or not an admitted remainder exists.
+        let archive = runtime_api::SessionPublicSource::Archived {
+            archive_id: prepared
+                .runtime_request
+                .archive_id
+                .clone()
+                .expect("checked"),
+        };
+        retain_source(&runtime, &service.workspace_id, &attr, archive, release)
+            .map_err(|_| original)?;
     }
     Ok(())
+}
+
+/// A successful Runtime receipt, not catalog liveness, authorizes ending the old
+/// writer. The ordinary removal commit releases occupancy atomically with catalog
+/// deletion. Until then a crash leaves the singleton occupied and the same receipt
+/// can safely repeat this step; no Controller restore or Journal generation is needed.
+pub(super) fn finish_worker_removal<T>(
+    service: &WorkerRemovalService,
+    target: &RuntimeWorkerRef,
+    prepared: &crate::retention::PreparedWorkerRemoval,
+    result: &worker_runtime::retention::WorkerRetentionExecutionResult,
+    commit: impl FnOnce() -> T,
+) -> Result<T> {
+    let Some(attr) = removal_attribution(service, target)? else {
+        return Ok(commit());
+    };
+    let request = &prepared.runtime_request;
+    if prepared.plan.worker != *target
+        || request.workspace_id != service.workspace_id
+        || request.source_runtime_id != target.runtime_id
+        || request.worker_id.to_string() != target.worker_id
+        || !result.source_removed
+        || result.worker_id != request.worker_id
+        || result.operation_id != request.operation_id
+        || result.input_fingerprint != request.input_fingerprint
+        || result.session_disposition != request.session_disposition
+        || result.diagnostics_disposition != request.diagnostics_disposition
+        || result.diagnostics_retained
+            != (request.diagnostics_disposition
+                == worker_runtime::retention::DiagnosticsDisposition::Retain)
+    {
+        return Err(Error::RepositoryConflict(
+            "Subject removal receipt does not match its plan".into(),
+        ));
+    }
+    if request.session_disposition == worker_runtime::retention::SessionDisposition::Archive {
+        let archive = result.archive.as_ref().ok_or_else(|| {
+            Error::RepositoryConflict("Subject removal archive receipt is missing".into())
+        })?;
+        if Some(&archive.archive_id) != request.archive_id.as_ref()
+            || archive.workspace_id != request.workspace_id
+            || archive.source_runtime_id != request.source_runtime_id
+            || archive.source_worker_id != request.worker_id
+            || archive.source_session_id != attr.session_id
+            || archive.operation_id != request.operation_id
+            || archive.input_fingerprint != request.input_fingerprint
+            || archive.policy_id != request.policy_id
+        {
+            return Err(Error::RepositoryConflict(
+                "Subject removal archive identity mismatch".into(),
+            ));
+        }
+    }
+    let api = service.journal_dispatch_api.upgrade().ok_or_else(|| {
+        Error::Store("Workspace API unavailable for Subject removal completion".into())
+    })?;
+    let gate = lifecycle_lock(&api, &attr.subject_id)?;
+    let _guard = gate
+        .lock()
+        .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
+    let store = store(&api)?;
+    let host = JournalHostContext::validated_session(&store, attr.clone()).map_err(domain)?;
+    if store.journal_session_erased(&host).map_err(domain)? {
+        if request.session_disposition == worker_runtime::retention::SessionDisposition::Archive {
+            // Erasure may win after Runtime archive transfer. Do not publish that
+            // archive or skip writer revocation: the same removal retry must take
+            // erased_archive_removal_proof and its physical-erasure commit path.
+            return Err(Error::RepositoryConflict(
+                "Session erased during removal; reconcile the same removal operation".into(),
+            ));
+        }
+        return Ok(commit());
+    }
+    store.release_removed_journal_body(&host).map_err(domain)?;
+    for session in store
+        .subject_session_attributions(&attr.subject_id)
+        .map_err(|e| Error::Store(e.to_string()))?
+        .into_iter()
+        .filter(|a| a.runtime_id == target.runtime_id && a.worker_id == target.worker_id)
+    {
+        reconcile_session_jobs(&api, &session, false)?;
+    }
+    // Keep erasure excluded through the catalog commit: otherwise a tombstone
+    // could win between revocation and publication of the retained archive.
+    Ok(commit())
 }
 
 #[derive(Deserialize)]
@@ -2089,7 +2187,28 @@ pub(super) fn reconcile_unknown(
         .as_ref()
         .ok_or_else(|| Error::InvalidInput("Journal recovery requires a grant".into()))?;
     let store = store(api)?;
-    let host = host(api, &store, grant)?;
+    let attr = store
+        .session_attribution(&grant.session_id)
+        .map_err(|e| Error::Store(e.to_string()))?
+        .filter(|a| a.subject_id == grant.subject_id)
+        .ok_or_else(|| Error::WorkspacePermissionDenied("Journal attribution mismatch".into()))?;
+    let released = store
+        .journal_worker_was_released(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
+        .map_err(domain)?;
+    let host = if released {
+        // Recovery reads immutable evidence, never renews a legacy writer grant.
+        let host = JournalHostContext::validated_session(&store, attr.clone()).map_err(domain)?;
+        if !grant.binding_id.is_empty()
+            && host.writer_binding_id() != Some(grant.binding_id.as_str())
+        {
+            return Err(Error::WorkspacePermissionDenied(
+                "Journal recovery binding mismatch".into(),
+            ));
+        }
+        host
+    } else {
+        host(api, &store, grant)?
+    };
     let erased = store.journal_session_erased(&host).map_err(domain)?;
     if !erased {
         job.load_executable_request()?;
@@ -2097,70 +2216,93 @@ pub(super) fn reconcile_unknown(
             job_id: job.request.job_id.clone(),
             attempt_id: attempt.attempt_id.clone(),
         };
-        let g = if legacy_descriptor(&job.request) {
-            // Only reconcile already-saved legacy receipts; never redispatch descriptors.
+        let generation = if released {
             store
-                .prepare_journal_generation(
-                    &host,
-                    &grant.journal_id,
-                    binding,
-                    grant.selected_ranges.clone(),
-                )
+                .retained_journal_generation(&host, &grant.journal_id, &binding)
                 .map_err(domain)?
+        } else if legacy_descriptor(&job.request) {
+            Some(
+                store
+                    .prepare_journal_generation(
+                        &host,
+                        &grant.journal_id,
+                        binding,
+                        grant.selected_ranges.clone(),
+                    )
+                    .map_err(domain)?,
+            )
         } else {
-            let input = saved_input(&job.request, grant)?;
-            let generation = store
-                .prepare_journal_input(&host, &input, binding)
-                .map_err(domain)?;
-            input.validate_generation(&generation).map_err(domain)?;
-            generation
+            // Preserve active-body recovery: its saved intent can still establish
+            // the original generation fence. A released body must only read it.
+            Some(
+                store
+                    .prepare_journal_input(&host, &saved_input(&job.request, grant)?, binding)
+                    .map_err(domain)?,
+            )
         };
-        let ctx = JournalJobContext::validated_recovery(&store, &host, &g.id, g.job.clone())
-            .map_err(domain)?;
-        match journal::service::finish(&store, &ctx) {
-            Ok(completion) => {
-                let submission = BackendJobResultSubmission {
-                    job_id: job.request.job_id.clone(),
-                    attempt_id: attempt.attempt_id.clone(),
-                    input_digest: attempt.input_digest.clone(),
-                    result: serde_json::to_value(completion)
-                        .map_err(|e| Error::Store(e.to_string()))?,
-                };
-                let current = api.store.reconcile_backend_journal_attempt(
-                    api.workspace_id(),
-                    attempt,
-                    Some(&submission),
-                    &Utc::now().to_rfc3339(),
-                )?;
-                let saved = api
-                    .store
-                    .get_backend_job(api.workspace_id(), &job.request.job_id)?
-                    .ok_or_else(|| Error::Store("reconciled Job missing".into()))?;
-                notification_delivery::deliver_job_result(
-                    api,
-                    &BackendJobResultAcceptance {
-                        job: saved,
-                        attempt: current.clone(),
-                        replayed: false,
-                    },
-                );
-                if current.worker_cleanup_state == Some(BackendJobWorkerCleanupState::Completed) {
-                    drain_after_completion(api, &job.request);
-                    if job.input_disposition == crate::backend_job::JobInputDisposition::Available {
-                        api.store.reclaim_backend_job_input(
-                            api.workspace_id(),
-                            &job.request.job_id,
-                            &job.input_digest,
-                            crate::backend_job::JobInputRetirementReason::Completed,
-                        )?;
-                    }
-                } else {
-                    api.schedule_backend_job_worker_cleanup(&current);
-                }
-                return Ok(());
+        if let Some(g) = generation {
+            if g.selected_ranges != grant.selected_ranges {
+                return Err(Error::WorkspacePermissionDenied(
+                    "Journal recovery selection mismatch".into(),
+                ));
             }
-            Err(JournalError::Conflict(_) | JournalError::PermissionDenied(_)) => {}
-            Err(error) => return Err(domain(error)),
+            if !legacy_descriptor(&job.request) {
+                saved_input(&job.request, grant)?
+                    .validate_generation(&g)
+                    .map_err(domain)?;
+            }
+            let ctx = JournalJobContext::validated_recovery(&store, &host, &g.id, g.job.clone())
+                .map_err(domain)?;
+            match journal::service::finish(&store, &ctx) {
+                Ok(completion) => {
+                    let submission = BackendJobResultSubmission {
+                        job_id: job.request.job_id.clone(),
+                        attempt_id: attempt.attempt_id.clone(),
+                        input_digest: attempt.input_digest.clone(),
+                        result: serde_json::to_value(completion)
+                            .map_err(|e| Error::Store(e.to_string()))?,
+                    };
+                    let current = api.store.reconcile_backend_journal_attempt(
+                        api.workspace_id(),
+                        attempt,
+                        Some(&submission),
+                        &Utc::now().to_rfc3339(),
+                    )?;
+                    let saved = api
+                        .store
+                        .get_backend_job(api.workspace_id(), &job.request.job_id)?
+                        .ok_or_else(|| Error::Store("reconciled Job missing".into()))?;
+                    notification_delivery::deliver_job_result(
+                        api,
+                        &BackendJobResultAcceptance {
+                            job: saved,
+                            attempt: current.clone(),
+                            replayed: false,
+                        },
+                    );
+                    if current.worker_cleanup_state == Some(BackendJobWorkerCleanupState::Completed)
+                    {
+                        if !released {
+                            drain_after_completion(api, &job.request);
+                        }
+                        if job.input_disposition
+                            == crate::backend_job::JobInputDisposition::Available
+                        {
+                            api.store.reclaim_backend_job_input(
+                                api.workspace_id(),
+                                &job.request.job_id,
+                                &job.input_digest,
+                                crate::backend_job::JobInputRetirementReason::Completed,
+                            )?;
+                        }
+                    } else {
+                        api.schedule_backend_job_worker_cleanup(&current);
+                    }
+                    return Ok(());
+                }
+                Err(JournalError::Conflict(_) | JournalError::PermissionDenied(_)) => {}
+                Err(error) => return Err(domain(error)),
+            }
         }
     }
     if attempt.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed) {
@@ -2179,11 +2321,17 @@ pub(super) fn reconcile_unknown(
         false
     };
     if !confirmed_purge {
+        if released {
+            // Source deletion already fenced this generation. An unbound Unknown
+            // still lacks execution-cleanup proof: preserve Unknown, but it no
+            // longer owns the Subject or blocks removal of the original body.
+            return Ok(());
+        }
         return Err(Error::RepositoryConflict(
             "Unknown Journal attempt has no committed stop/Purge fence; not retried".into(),
         ));
     }
-    if !erased {
+    if !erased && !released {
         close(api, &job.request, attempt)?;
     }
     api.store.reconcile_backend_journal_attempt(
@@ -2192,7 +2340,7 @@ pub(super) fn reconcile_unknown(
         None,
         &Utc::now().to_rfc3339(),
     )?;
-    if !erased {
+    if !erased && !released {
         // Resume the same saved body input only after canonical execution/domain fences.
         // dispatch selects its retained intent before it can capture any newer source.
         let attr = store
@@ -2209,6 +2357,10 @@ fn reconcile_session_jobs(
     attr: &crate::subjektiv::SubjectSessionAttribution,
     erased: bool,
 ) -> Result<()> {
+    let released = !erased
+        && store(api)?
+            .journal_worker_was_released(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
+            .map_err(domain)?;
     let mut after: Option<String> = None;
     loop {
         let jobs = api.store.list_backend_journal_jobs(
@@ -2223,6 +2375,29 @@ fn reconcile_session_jobs(
                 .store
                 .get_backend_job_attempt(api.workspace_id(), &job.request.job_id, &id)?
                 .ok_or_else(|| Error::Store("Journal current attempt missing".into()))?;
+            if released {
+                // Writer revocation has already fenced all Journal mutations. End
+                // pending/Unknown attempts without claiming their input was reflected;
+                // saved input, operations and original source remain retained.
+                if !attempt.state.terminal() {
+                    attempt = api.store.finish_backend_job_attempt(
+                        api.workspace_id(),
+                        &job.request.job_id,
+                        &id,
+                        BackendJobAttemptState::Failed,
+                        "journal_body_released",
+                        "Source Worker was removed; unfinished Journal history retained",
+                        &Utc::now().to_rfc3339(),
+                    )?;
+                }
+                api.schedule_backend_job_worker_cleanup(&attempt);
+                if attempt.state == BackendJobAttemptState::Unknown {
+                    // A saved checkpoint may settle success; otherwise retain Unknown
+                    // until canonical Job-worker cleanup has supplied its Purge fence.
+                    reconcile_unknown(api, job, &attempt)?;
+                }
+                continue;
+            }
             if !erased
                 && legacy_descriptor(&job.request)
                 && job.input_disposition == crate::backend_job::JobInputDisposition::Available

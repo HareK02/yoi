@@ -3112,8 +3112,8 @@ impl SqliteWorkspaceStore {
                         },
                     )
                     .optional()?;
-                // Subject occupancy survives removal until an explicit release
-                // proof. It must not resurrect the removed creation reservation:
+                // An unconfirmed legacy removal cannot release Subject occupancy.
+                // Completed removal or explicit release does; never resurrect a reservation:
                 // Runtime callbacks require a live reservation or catalog member.
                 if stored.as_ref().is_some_and(|row| row.6 == "removed") {
                     return Err(Error::RepositoryConflict(format!(
@@ -16223,7 +16223,7 @@ fn current_worker_singleton_owner(
                     CASE WHEN substr(owner.singleton_key,1,10)='subjektiv:' AND reservation.state='removed' \
                       AND NOT EXISTS(SELECT 1 FROM subject_worker_releases r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.completed=1) \
                       AND NOT EXISTS(SELECT 1 FROM subject_create_recoveries r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.create_fingerprint=reservation.create_fingerprint AND r.completed=1) \
-                    THEN 'created' ELSE reservation.state END \
+                    AND NOT EXISTS(SELECT 1 FROM worker_removal_operations r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.state='succeeded') THEN 'created' ELSE reservation.state END \
              FROM worker_singleton_owners owner \
              LEFT JOIN worker_create_reservations reservation \
                ON reservation.workspace_id = owner.workspace_id \

@@ -2327,16 +2327,29 @@ impl WorkerRemovalService {
                     ));
                 }
             };
-        match self.worker_projection.publish_ordered(|| {
-            self.store
-                .commit_worker_removal(
-                    &self.workspace_id,
-                    &prepared.plan.operation_id,
-                    &prepared.plan.input_fingerprint,
-                    &result,
-                )
-                .map(|commit| ((), commit.catalog))
-        }) {
+        let commit_result =
+            match subjektiv_journal::finish_worker_removal(self, target, &prepared, &result, || {
+                self.worker_projection.publish_ordered(|| {
+                    self.store
+                        .commit_worker_removal(
+                            &self.workspace_id,
+                            &prepared.plan.operation_id,
+                            &prepared.plan.input_fingerprint,
+                            &result,
+                        )
+                        .map(|commit| ((), commit.catalog))
+                })
+            }) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Ok(worker_remove_error_response(
+                        StatusCode::CONFLICT,
+                        "subject_removal_completion_unconfirmed",
+                        &error.to_string(),
+                    ));
+                }
+            };
+        match commit_result {
             Ok(()) => {
                 subjektiv_journal::after_worker_removal(self, &result);
                 Ok(worker_remove_success_response(target))
@@ -2722,16 +2735,34 @@ impl WorkerRemovalService {
                     ));
                 }
             };
-        match self.worker_projection.publish_ordered(|| {
-            self.store
-                .commit_worker_removal(
-                    &self.workspace_id,
-                    &plan.operation_id,
-                    &plan.input_fingerprint,
-                    &retention_result,
-                )
-                .map(|commit| ((), commit.catalog))
-        }) {
+        let commit_result = match subjektiv_journal::finish_worker_removal(
+            self,
+            target,
+            &prepared,
+            &retention_result,
+            || {
+                self.worker_projection.publish_ordered(|| {
+                    self.store
+                        .commit_worker_removal(
+                            &self.workspace_id,
+                            &plan.operation_id,
+                            &plan.input_fingerprint,
+                            &retention_result,
+                        )
+                        .map(|commit| ((), commit.catalog))
+                })
+            },
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(worker_remove_error_response(
+                    StatusCode::CONFLICT,
+                    "subject_removal_completion_unconfirmed",
+                    &error.to_string(),
+                ));
+            }
+        };
+        match commit_result {
             Ok(()) => {}
             Err(error) => {
                 let _ = self.store.fail_worker_removal(
