@@ -1474,6 +1474,9 @@ async fn consolidation_job_preserves_custom_instruction_and_explicit_tool_policy
     }
 }
 
+#[path = "controller/subject_job_input_supply.rs"]
+mod subject_job_input_supply;
+
 #[tokio::test]
 async fn denied_subject_job_input_supply_stops_before_model_dispatch() {
     for (profile, consolidation, operation) in [

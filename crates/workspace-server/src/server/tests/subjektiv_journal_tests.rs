@@ -683,6 +683,36 @@ fn message(text: &str) -> session_store::LoggedItem {
         content: vec![session_store::LoggedContentPart::Text { text: text.into() }],
     }
 }
+pub(super) async fn model_supply_job_fixture(
+    missing_origin: bool,
+) -> (tempfile::TempDir, WorkspaceApi, BackendJobReservation) {
+    let fixture = if missing_origin {
+        RuntimeFixture::with_history_and_origin(
+            vec![session_store::LoggedHistoryEntry {
+                item: message(SOURCE_SENTINEL),
+                metadata: session_store::LoggedSessionHistoryMetadata {
+                    input_metadata: None,
+                    entry_id: session_store::LoggedSessionHistoryEntryId(
+                        "historical-source".into(),
+                    ),
+                    origin: session_store::LoggedSessionHistoryOrigin::LocalHumanInput,
+                    derivation: None,
+                },
+            }],
+            false,
+        )
+        .await
+    } else {
+        RuntimeFixture::new().await
+    };
+    let reservation = if missing_origin {
+        fixture.reserved
+    } else {
+        fixture.dispatch_input()
+    };
+    (fixture.dir, fixture.api, reservation)
+}
+
 impl RuntimeFixture {
     async fn new() -> Self {
         Self::with_history(vec![session_store::LoggedHistoryEntry {
@@ -697,6 +727,12 @@ impl RuntimeFixture {
         .await
     }
     async fn with_history(history: Vec<session_store::LoggedHistoryEntry>) -> Self {
+        Self::with_history_and_origin(history, true).await
+    }
+    async fn with_history_and_origin(
+        history: Vec<session_store::LoggedHistoryEntry>,
+        frozen_origin: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (api, execution) = test_api_with_recording_backend(dir.path()).await;
         let store = open_subjektiv_store(&api).unwrap();
@@ -789,7 +825,10 @@ impl RuntimeFixture {
         store
             .accept_journal_sources(&host, "bounded captured prefix", &input.selected_ranges)
             .unwrap();
-        let request = subjektiv_journal::recording_request(&host, attr, &id, input).unwrap();
+        let mut request = subjektiv_journal::recording_request(&host, attr, &id, input).unwrap();
+        if !frozen_origin {
+            request.source_worker = None;
+        }
         assert!(
             request.input["capture"]["entries"]
                 .as_array()

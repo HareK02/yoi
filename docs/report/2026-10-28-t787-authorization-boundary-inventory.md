@@ -76,4 +76,12 @@
 - 安定候補でroot `cargo check`、変更crateの通常suite（`server-api`、`tools`、`worker`、`worker-runtime`、`yoi-workspace-server`）、`server-api --features typescript` のsuite、変更crateのrustdoc生成、format・差分・状態契約名検査が成功した。restoreを含むsuiteにはcheckout内 `target/restore-test-environment/` 以下の専用config/data/runtimeを使用した。最初のServer再実行は隔離環境変数不足でpreflight失敗し、設定後の全suite再実行が成功した。preflightを削除して通してはいない。
 - OpenAPIと影響する各OpenAPI closure出力は所有exampleの `--check` で一致した。Webの型検査と変更型を使う関連APIテストが成功した。描画変更はなく、browser/E2E・稼働環境更新は実施していない。通常suiteで元から明示選択のignoredテストを実行済みとは扱わない。
 
+## 初回レビューで確認されたJob入力供給の不足
+
+初回候補の通常suite成功は、凍結Job入力をcompactorへ再供給する経路と、Jobの通常hook後に権限が失効する経路を証明していなかった。正式レビューは実Controllerと捕捉モデルで漏れを再現し、request_changesとした。上記の成功記録をこの境界の成功へ拡張してはならない。
+
+修正では、Job種別・Job ID・入力digestの保持義務を既存の保護入力provenanceに追加し、Host由来の実行bindingとの一致と現行認可を共通供給guardで検査する。保存値はgrantではない。attemptは現在のHost正本で毎回検査し、同じ凍結入力への正当な再試行と別Jobへの付替えを区別する。通常hookは早期診断に留まり、hook後とcompactorの各dispatchを代替しない。
+
+恒久回帰は `worker_job_input_supply_tests.rs`（rewrite/restoreとcompactor継続）、`tests/controller/subject_job_input_supply.rs`（実Controllerと後続hook失効）、`server/tests/subject_job_model_supply_tests.rs`（署名Host・実policy/Job台帳・捕捉モデル）へ追加した。Journal/consolidation双方で許可時の実供給と拒否時のモデル要求0を観測する。origin切断の履歴fixtureは稼働Controllerの停止確認を主張せず、既存のconnected release検証とは分ける。修正前の恒久回帰失敗と修正後の成功、最終suiteの結果はMRで区別して記録する。
+
 件数・生ログ・source識別はMRの検証記録に置く。これらの成功だけで受入条件の網羅、正式承認、統合、Ticketの完了を推論しない。

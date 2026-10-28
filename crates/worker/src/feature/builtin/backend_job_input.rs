@@ -1,4 +1,9 @@
-//! Rechecks frozen Subject Job input before each model request, including restore.
+//! Early rejection of frozen Subject Job input in the normal request hook chain.
+//!
+//! This hook cannot authorize later hook output or compactor requests. The
+//! Worker's retained-input guard independently binds the immutable Job/input
+//! identity and rechecks current Host authority after hooks and at every
+//! compactor dispatch, including restored and rewritten Sessions.
 use std::sync::Arc;
 
 use async_trait::async_trait;

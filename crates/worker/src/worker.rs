@@ -3607,9 +3607,29 @@ enum ProtectedInputKind {
     Journal,
     JournalStartup,
     JournalCompaction,
+    SubjectConsolidationJob,
+    SubjectJournalJob,
 }
 
 impl ProtectedInputKind {
+    fn for_job(binding: &crate::BackendJobExecutionBinding) -> Option<Self> {
+        if binding.subjektiv_consolidation {
+            Some(Self::SubjectConsolidationJob)
+        } else if binding.subjektiv_journal {
+            Some(Self::SubjectJournalJob)
+        } else {
+            None
+        }
+    }
+
+    fn job_operation(self) -> Option<&'static str> {
+        match self {
+            Self::SubjectConsolidationJob => Some("memory.consolidation.supply"),
+            Self::SubjectJournalJob => Some("journal.job.input.supply"),
+            _ => None,
+        }
+    }
+
     fn parse(kind: &str) -> Result<Self, String> {
         match kind {
             "workspace-memory" => Ok(Self::WorkspaceMemory),
@@ -3617,6 +3637,8 @@ impl ProtectedInputKind {
             "journal" => Ok(Self::Journal),
             "journal-startup" => Ok(Self::JournalStartup),
             "journal-compaction" => Ok(Self::JournalCompaction),
+            "subject-consolidation-job" => Ok(Self::SubjectConsolidationJob),
+            "subject-journal-job" => Ok(Self::SubjectJournalJob),
             _ => Err("unknown protected input kind".into()),
         }
     }
@@ -3628,6 +3650,8 @@ impl ProtectedInputKind {
             Self::Journal => "journal",
             Self::JournalStartup => "journal-startup",
             Self::JournalCompaction => "journal-compaction",
+            Self::SubjectConsolidationJob => "subject-consolidation-job",
+            Self::SubjectJournalJob => "subject-journal-job",
         }
     }
 }
@@ -3662,11 +3686,33 @@ impl JournalCompactionRetention {
     }
 }
 
+// Input identity is retained across rewrites, not execution authority. Attempt
+// identity remains a live Host fence; a retry may bind a new attempt for this
+// same immutable Job/input, never a different Job's current Subject permission.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedSubjectJobInput {
+    kind: ProtectedInputKind,
+    job_id: String,
+    input_digest: Option<String>,
+}
+impl ProtectedSubjectJobInput {
+    fn from_binding(binding: &crate::BackendJobExecutionBinding) -> Option<Self> {
+        ProtectedInputKind::for_job(binding).map(|kind| Self {
+            kind,
+            job_id: binding.job_id.clone(),
+            input_digest: binding.input_digest.clone(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProtectedInputProvenance {
     version: u8,
     kinds: std::collections::BTreeSet<ProtectedInputKind>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    subject_jobs: std::collections::BTreeSet<ProtectedSubjectJobInput>,
 }
 
 impl Default for ProtectedInputProvenance {
@@ -3674,6 +3720,7 @@ impl Default for ProtectedInputProvenance {
         Self {
             version: 1,
             kinds: Default::default(),
+            subject_jobs: Default::default(),
         }
     }
 }
@@ -3778,8 +3825,25 @@ impl ProtectedInputProvenance {
                     "unsupported protected input provenance version".into(),
                 ));
             }
+            if saved.kinds.iter().any(|kind| {
+                kind.job_operation().is_some()
+                    && !saved.subject_jobs.iter().any(|job| job.kind == *kind)
+            }) || saved.subject_jobs.iter().any(|job| {
+                job.kind.job_operation().is_none()
+                    || !saved.kinds.contains(&job.kind)
+                    || job.job_id.trim().is_empty()
+                    || job
+                        .input_digest
+                        .as_ref()
+                        .is_some_and(|digest| digest.trim().is_empty())
+            }) {
+                return Err(WorkerError::InvalidState(
+                    "invalid protected Job input provenance".into(),
+                ));
+            }
             found = true;
             provenance.kinds.extend(saved.kinds);
+            provenance.subject_jobs.extend(saved.subject_jobs);
             Ok(())
         };
         for entry in entries {
@@ -3827,6 +3891,9 @@ pub(crate) struct ProtectedInputSupply {
     retained: Arc<Mutex<ProtectedInputProvenance>>,
     prompt_source: Option<Arc<dyn SystemPromptContributionSource>>,
     context_source: Option<Arc<dyn SessionContextSource>>,
+    // Reconstructed only from the immutable Host execution binding, never from
+    // saved provenance. Every use asks the Host for current attempt/origin/policy.
+    subject_job: Option<(ProtectedSubjectJobInput, Arc<dyn WorkspaceClient>)>,
 }
 
 impl ProtectedInputSupply {
@@ -3841,15 +3908,15 @@ impl ProtectedInputSupply {
         &self,
         history: impl IntoIterator<Item = &'a SessionHistoryMetadata>,
     ) -> Result<(), String> {
-        let kinds = {
+        let provenance = {
             let mut retained = self
                 .retained
                 .lock()
                 .expect("protected input provenance poisoned");
             retained.observe_history(history);
-            retained.kinds.clone()
+            retained.clone()
         };
-        self.authorize_kinds(kinds).await
+        self.authorize_retained(provenance).await
     }
 
     pub(crate) async fn authorize_pending<'a>(
@@ -3864,14 +3931,38 @@ impl ProtectedInputSupply {
             .expect("protected input provenance poisoned")
             .clone();
         pending.observe_history(history);
-        self.authorize_kinds(pending.kinds).await
+        self.authorize_retained(pending).await
     }
 
-    async fn authorize_kinds(
-        &self,
-        kinds: std::collections::BTreeSet<ProtectedInputKind>,
-    ) -> Result<(), String> {
-        for kind in kinds {
+    async fn authorize_retained(&self, provenance: ProtectedInputProvenance) -> Result<(), String> {
+        for input in &provenance.subject_jobs {
+            if self.subject_job.as_ref().map(|(bound, _)| bound) != Some(input) {
+                return Err(
+                    "retained protected Job input requires its matching Host Job/input binding"
+                        .into(),
+                );
+            }
+        }
+        for kind in provenance.kinds {
+            if let Some(operation) = kind.job_operation() {
+                let (bound_kind, client) = self.subject_job.as_ref().ok_or_else(|| {
+                    format!(
+                        "retained protected input {} requires its Host Job binding",
+                        kind.as_str()
+                    )
+                })?;
+                if bound_kind.kind != kind || !provenance.subject_jobs.contains(bound_kind) {
+                    return Err(
+                        "retained protected Job input does not match its Host Job binding".into(),
+                    );
+                }
+                client
+                    .authorize_subject_operation(operation)
+                    .map_err(|error| {
+                        format!("protected Job input supply rejected for {operation}: {error}")
+                    })?;
+                continue;
+            }
             let journal = matches!(
                 kind,
                 ProtectedInputKind::Journal
@@ -4830,6 +4921,10 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             retained: self.protected_inputs.clone(),
             prompt_source: self.feature_resident_summary_source.clone(),
             context_source: self.session_context_source.clone(),
+            subject_job: self
+                .backend_job()
+                .and_then(ProtectedSubjectJobInput::from_binding)
+                .map(|input| (input, self.workspace_client_handle())),
         }
     }
 
@@ -4943,9 +5038,21 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         {
             return Err("Backend Job capability requires Backend Workspace API authority");
         }
+        let retained_input = ProtectedSubjectJobInput::from_binding(&binding);
         self.backend_job
             .set(Some(binding))
-            .map_err(|_| "Backend Job capability is already bound")
+            .map_err(|_| "Backend Job capability is already bound")?;
+        // A retention obligation, not a grant. Persist it with every head/rewrite
+        // so removing Feature configuration or the binding cannot expose input.
+        if let Some(input) = retained_input {
+            let mut retained = self
+                .protected_inputs
+                .lock()
+                .expect("protected input provenance poisoned");
+            retained.kinds.insert(input.kind);
+            retained.subject_jobs.insert(input);
+        }
+        Ok(())
     }
 
     /// The Worker's manifest.
@@ -20900,6 +21007,10 @@ permission = "write"
     // Real initial-seed/replay/fork/compaction and Memory source wiring. Only the
     // Host HTTP boundary and provider transport are fixtures; Host policy evaluation
     // itself is covered by workspace-server authorization tests, not asserted here.
+    mod subject_job_input_tests {
+        include!("worker_job_input_supply_tests.rs");
+    }
+
     mod protected_input_tests {
         fn assert_supply_outcome(outcome: Result<WorkerRunResult, WorkerError>, allowed: bool) {
             if allowed {

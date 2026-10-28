@@ -5,6 +5,8 @@
 //! runs a real ProfileRuntimeWorkerFactory/Controller and materialized Workdir;
 //! only its external model stream is scripted. Neither fixture claims OS isolation.
 use super::*;
+#[path = "subject_job_model_supply_tests.rs"]
+mod subject_job_model_supply;
 use agen::tool::{Tool, ToolExecutionContext, ToolOutput};
 use server_api::authorization::{
     PermissionResource, ScopedPermission, SubjectPermissions, SubjectPermissionsUpdate,
