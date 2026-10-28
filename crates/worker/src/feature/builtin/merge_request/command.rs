@@ -104,13 +104,28 @@ impl Command {
     }
 }
 
-/// The single domain dispatch boundary. Backend authorization precedes every data request.
+/// Ordinary Tool output serializes the shared domain value only at this presentation boundary.
 pub(super) fn execute(
     client: Arc<dyn WorkspaceClient>,
     command: Command,
 ) -> Result<ToolOutput, ToolError> {
     let kind = command.kind();
-    let executor = Executor { client, kind };
+    let value = execute_value(client, command)?;
+    Ok(ToolOutput {
+        summary: kind.name().into(),
+        content: Some(value.to_string()),
+        attachments: vec![],
+    })
+}
+
+/// The single domain dispatch boundary. Decode the documented Workspace JSON response once;
+/// native consumers never recover domain references by reparsing a formatted ToolOutput.
+/// Backend authorization precedes every data request.
+pub(super) fn execute_value(
+    client: Arc<dyn WorkspaceClient>,
+    command: Command,
+) -> Result<Value, ToolError> {
+    let executor = Executor { client };
     let ws = executor.client.workspace_id().ok_or_else(|| {
         ToolError::ExecutionFailed("Merge Request operations require Workspace identity".into())
     })?;
@@ -240,16 +255,11 @@ pub(super) fn execute(
     if !res.is_success() {
         return Err(api_error("Merge Request API", &res));
     }
-    Ok(ToolOutput {
-        summary: kind.name().into(),
-        content: Some(res.body),
-        attachments: vec![],
-    })
+    response_value(&res.body)
 }
 
 struct Executor {
     client: Arc<dyn WorkspaceClient>,
-    kind: Kind,
 }
 
 impl Executor {
@@ -267,7 +277,7 @@ impl Executor {
         merge_request_id: &str,
         after: Option<u64>,
         limit: Option<usize>,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<Value, ToolError> {
         self.authorize(
             "merge_request.read",
             PermissionResource::MergeRequest {
@@ -295,10 +305,12 @@ impl Executor {
         if !response.is_success() {
             return Err(api_error("Merge Request API", &response));
         }
-        Ok(ToolOutput {
-            summary: self.kind.name().into(),
-            content: Some(response.body),
-            attachments: vec![],
-        })
+        response_value(&response.body)
     }
+}
+
+fn response_value(body: &str) -> Result<Value, ToolError> {
+    serde_json::from_str(body).map_err(|_| {
+        ToolError::ExecutionFailed("Merge Request API returned invalid JSON after dispatch".into())
+    })
 }

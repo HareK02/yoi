@@ -179,13 +179,26 @@ impl Tool for TrackingTool {
     }
 }
 
-/// Convert an adapter-owned internal command; never invokes Tool execution or its schema.
+/// Preserve the regular Tool presentation for internal callers.
+#[cfg(test)]
 pub(super) async fn execute_native(
     client: Arc<dyn WorkspaceClient>,
     tool_name: &str,
     command: Value,
     ctx: ToolExecutionContext,
 ) -> Option<Result<ToolOutput, ToolError>> {
+    execute_native_value(client, tool_name, command, ctx)
+        .await
+        .map(|result| result.map(|content| tool_output(tool_name, content)))
+}
+
+/// Return the shared domain projection before Tool presentation serialization.
+pub(super) async fn execute_native_value(
+    client: Arc<dyn WorkspaceClient>,
+    tool_name: &str,
+    command: Value,
+    ctx: ToolExecutionContext,
+) -> Option<Result<Value, ToolError>> {
     let parse = |error: serde_json::Error| ToolError::InvalidArgument(error.to_string());
     let command = match tool_name {
         "TicketAssignmentTrackingQuery" => serde_json::from_value(command).map(Command::Query),
@@ -194,7 +207,7 @@ pub(super) async fn execute_native(
         _ => return None,
     };
     Some(match command {
-        Ok(command) => execute_domain(client, command, ctx).await,
+        Ok(command) => execute_value(client, command, ctx).await,
         Err(error) => Err(parse(error)),
     })
 }
@@ -202,8 +215,27 @@ pub(super) async fn execute_native(
 async fn execute_domain(
     client: Arc<dyn WorkspaceClient>,
     command: Command,
-    _ctx: ToolExecutionContext,
+    ctx: ToolExecutionContext,
 ) -> Result<ToolOutput, ToolError> {
+    let name = command.kind().name();
+    execute_value(client, command, ctx)
+        .await
+        .map(|content| tool_output(name, content))
+}
+
+fn tool_output(name: &str, content: Value) -> ToolOutput {
+    ToolOutput {
+        summary: name.into(),
+        content: Some(content.to_string()),
+        attachments: vec![],
+    }
+}
+
+async fn execute_value(
+    client: Arc<dyn WorkspaceClient>,
+    command: Command,
+    _ctx: ToolExecutionContext,
+) -> Result<Value, ToolError> {
     let kind = command.kind();
     let workspace = client
         .workspace_id()
@@ -306,11 +338,7 @@ async fn execute_domain(
             "Backend returned invalid assignment tracking JSON: {error}"
         ))
     })?;
-    Ok(ToolOutput {
-        summary: kind.name().into(),
-        content: Some(content.to_string()),
-        attachments: Vec::new(),
-    })
+    Ok(content)
 }
 
 pub(super) fn definition(
@@ -624,14 +652,32 @@ mod native_command_tests {
             .await
             .unwrap()
             .unwrap();
+            let value = execute_native_value(
+                client.clone(),
+                kind.name(),
+                input.clone(),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                value,
+                serde_json::from_str::<Value>(ordinary.content.as_deref().unwrap()).unwrap()
+            );
             assert_eq!(native.content, ordinary.content);
+            assert_eq!(native.summary, ordinary.summary);
+            assert_eq!(ordinary.summary, kind.name());
+            assert!(native.attachments.is_empty());
+            assert_eq!(client.requests.lock().unwrap().len(), 3);
             {
                 let requests = client.requests.lock().unwrap();
                 assert_eq!(requests[0], requests[1]);
+                assert_eq!(requests[1], requests[2]);
             }
             client.grants.lock().unwrap().clear();
             assert!(
-                execute_native(
+                execute_native_value(
                     client.clone(),
                     kind.name(),
                     input,
@@ -641,9 +687,9 @@ mod native_command_tests {
                 .unwrap()
                 .is_err()
             );
-            assert_eq!(client.requests.lock().unwrap().len(), 2);
+            assert_eq!(client.requests.lock().unwrap().len(), 3);
             assert!(
-                execute_native(
+                execute_native_value(
                     client,
                     "Unknown",
                     Value::Null,

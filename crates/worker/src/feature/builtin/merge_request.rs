@@ -24,7 +24,9 @@
 //!
 //! Read returns the existing bounded thread page, keeping linked Tickets as references. Successful
 //! item-read response hashes are observed; mutations discard observations. Receipts do not fabricate
-//! complete representations or local mutation generations. Open results include the new item path.
+//! complete representations or local mutation generations. Native results separate a typed subject
+//! Entry and explicit related Entries from the bounded domain JSON; the private `result` module
+//! owns that projection boundary.
 //! Item responses are checked against the bound MR; subject mismatches after mutations are not
 //! treated as unexecuted operations. Native omission and explicit nullable unions are distinct;
 //! native input changes do not change ordinary Tool omission/null behavior.
@@ -199,6 +201,7 @@ impl Kind {
 }
 mod command;
 mod native;
+mod result;
 
 #[async_trait]
 impl Tool for MergeRequestTool {
@@ -497,6 +500,7 @@ pub fn mount_workspace_http_merge_request_wip(
         }),
     })?;
     registry.replace_compatibility_tools(&collection_route, claimed_tools)?;
+    registry.publish_result_namespace(namespace_route)?;
     Ok(())
 }
 
@@ -528,33 +532,26 @@ impl WipOperationHandler for MergeRequestCollectionWipHandler {
             .tools
             .get(operation)
             .ok_or_else(merge_request_operation_not_found)?;
-        let output =
+        let namespaces = context.result_namespaces.clone();
+        let response =
             execute_native_merge_request_tool(tool, &self.permissions, arguments, None, context)
                 .await?;
-        let mut response = merge_request_tool_output_json(output)?;
-        match tool.kind {
-            Kind::Open => {
-                let reference = merge_request_reference(&response)
-                    .filter(|reference| is_merge_request_route_reference(reference))
-                    .ok_or_else(|| {
-                        WipOperationError::OutcomeUnknown(
-                            "OpenMergeRequest returned no routable Merge Request identity".into(),
-                        )
-                    })?
-                    .to_string();
-                record_merge_request_observation(&self.observations, &reference, &response, true);
-                if let Some(object) = response.as_object_mut() {
-                    object.insert(
-                        "path".into(),
-                        Value::String(format!("{}/{}", self.collection_route, reference)),
-                    );
-                }
-            }
-            _ => {}
-        }
-        Ok(WipOperationOutput::native(
-            json_to_wip(&response).map_err(WipOperationError::OutcomeUnknown)?,
-        ))
+        let reference = merge_request_reference(&response)
+            .filter(|reference| is_merge_request_route_reference(reference))
+            .ok_or_else(|| {
+                WipOperationError::OutcomeUnknown(
+                    "OpenMergeRequest returned no routable Merge Request identity".into(),
+                )
+            })?
+            .to_string();
+        record_merge_request_observation(&self.observations, &reference, &response, true);
+        Ok(WipOperationOutput::native(result::value(
+            tool.kind,
+            response,
+            &reference,
+            &self.collection_route,
+            namespaces.root("ticket"),
+        )?))
     }
 }
 
@@ -592,6 +589,7 @@ impl WipDynamicItemResolver for MergeRequestItemResolver {
                 tools: self.tools.clone(),
                 permissions: self.permissions.clone(),
                 merge_request_id: item_reference.into(),
+                collection_route: self.collection_route.clone(),
                 observations: Arc::clone(&self.observations),
             }),
         })
@@ -602,6 +600,7 @@ struct MergeRequestItemWipHandler {
     tools: HashMap<String, NativeMergeRequestTool>,
     permissions: Option<ToolPermissionConfig>,
     merge_request_id: String,
+    collection_route: String,
     observations: MergeRequestObservations,
 }
 
@@ -617,7 +616,8 @@ impl WipOperationHandler for MergeRequestItemWipHandler {
             .tools
             .get(operation)
             .ok_or_else(merge_request_operation_not_found)?;
-        let output = execute_native_merge_request_tool(
+        let namespaces = context.result_namespaces.clone();
+        let response = execute_native_merge_request_tool(
             tool,
             &self.permissions,
             arguments,
@@ -625,7 +625,6 @@ impl WipOperationHandler for MergeRequestItemWipHandler {
             context,
         )
         .await?;
-        let response = merge_request_tool_output_json(output)?;
         ensure_merge_request_response_identity(
             &response,
             &self.merge_request_id,
@@ -637,9 +636,13 @@ impl WipOperationHandler for MergeRequestItemWipHandler {
             &response,
             tool.kind.mutating(),
         );
-        Ok(WipOperationOutput::native(
-            json_to_wip(&response).map_err(WipOperationError::OutcomeUnknown)?,
-        ))
+        Ok(WipOperationOutput::native(result::value(
+            tool.kind,
+            response,
+            &self.merge_request_id,
+            &self.collection_route,
+            namespaces.root("ticket"),
+        )?))
     }
 }
 
@@ -649,7 +652,7 @@ async fn execute_native_merge_request_tool(
     arguments: &BTreeMap<String, WipValue>,
     bound_merge_request: Option<&str>,
     _context: WipCallContext,
-) -> Result<ToolOutput, WipOperationError> {
+) -> Result<Value, WipOperationError> {
     if tool.kind == Kind::Review {
         let reviewer = tool.client.reviewer_context().ok_or_else(|| {
             merge_request_protocol_failure(
@@ -666,10 +669,10 @@ async fn execute_native_merge_request_tool(
     }
     let input = native_merge_request_input(tool, arguments, bound_merge_request)?;
     // Legacy Tool permission patterns remain an additional fail-closed ceiling, evaluated on
-    // normalized domain fields. Backend authorization is always performed by command::execute.
+    // normalized domain fields. Backend authorization is always performed by command::execute_value.
     authorize_native_merge_request(permissions, &tool.name, &input)?;
     let command = native::command(tool.kind, input)?;
-    command::execute(tool.client.clone(), command)
+    command::execute_value(tool.client.clone(), command)
         .map_err(|error| map_merge_request_tool_error(error, tool.kind.mutating()))
 }
 
@@ -759,14 +762,6 @@ fn merge_request_http_status(message: &str) -> Option<u16> {
         .next()?
         .parse()
         .ok()
-}
-
-fn merge_request_tool_output_json(output: ToolOutput) -> Result<Value, WipOperationError> {
-    match output.content {
-        Some(content) => serde_json::from_str(&content)
-            .map_err(|error| WipOperationError::OutcomeUnknown(error.to_string())),
-        None => Ok(json!({"summary": output.summary, "ok": true})),
-    }
 }
 
 fn ensure_merge_request_response_identity(
@@ -1363,6 +1358,7 @@ mod tests {
             &input,
             Some("MR-2"),
             WipCallContext {
+                result_namespaces: Default::default(),
                 execution: ToolExecutionContext::direct(),
                 security_context: "reviewer".into(),
             },
@@ -1383,6 +1379,7 @@ mod tests {
             &input,
             Some("MR-1"),
             WipCallContext {
+                result_namespaces: Default::default(),
                 execution: ToolExecutionContext::direct(),
                 security_context: "reviewer".into(),
             },
@@ -1480,14 +1477,24 @@ mod tests {
             ),
             WipOperationError::OutcomeUnknown(_)
         ));
+        let invalid_json = Arc::new(RecordingWorkspaceClient::new(vec![WorkspaceResponse {
+            status: 200,
+            body: "not-json".into(),
+        }]));
+        let error = command::execute_value(
+            invalid_json.clone(),
+            command::Command::Read {
+                merge_request_id: "MR-1".into(),
+                after: None,
+                limit: None,
+            },
+        )
+        .unwrap_err();
         assert!(matches!(
-            merge_request_tool_output_json(ToolOutput {
-                summary: "OpenMergeRequest".into(),
-                content: Some("not-json".into()),
-                attachments: vec![],
-            }),
-            Err(WipOperationError::OutcomeUnknown(_))
+            map_merge_request_tool_error(error, false),
+            WipOperationError::OutcomeUnknown(_)
         ));
+        assert_eq!(invalid_json.requests.lock().unwrap().len(), 1);
         assert!(matches!(
             ensure_merge_request_response_identity(
                 &json!({"merge_request_id": "MR-2"}),
@@ -1665,6 +1672,7 @@ mod tests {
             &BTreeMap::new(),
             Some("MR-1"),
             WipCallContext {
+                result_namespaces: Default::default(),
                 execution: ToolExecutionContext::direct(),
                 security_context: "test".into(),
             },

@@ -26,8 +26,8 @@
 //!
 //! # Bounded responses and observation invalidation
 //!
-//! Query returns bounded snippets and canonical item paths; read returns bounded Backend details.
-//! Objectives and Merge Requests remain references, without expanding their content or native routes.
+//! Query/create/read separate typed subject and relationship Entries from bounded domain data.
+//! The result boundary owns this contract; it does not eagerly expand or observe related Objects.
 //! Successful item-read response hashes feed route validators; canonical/internal aliases share an
 //! observation group. Mutation receipts are not complete representations, so updates discard
 //! observation hashes. Related targets and targets in queue results are also invalidated; no mutation
@@ -44,6 +44,7 @@ mod assignment_public;
 mod assignment_tracking;
 mod native;
 mod notification_diagnostics;
+mod results;
 mod tags;
 
 use crate::feature::contracts::{
@@ -274,6 +275,18 @@ enum WorkspaceTicketReadCommand {
 }
 impl WorkspaceTicketReadTool {
     fn execute_domain(&self, command: WorkspaceTicketReadCommand) -> Result<ToolOutput, ToolError> {
+        let value = self.execute_value(command)?;
+        Ok(ToolOutput {
+            summary: self.kind.name().to_string(),
+            content: Some(
+                serde_json::to_string(&value)
+                    .map_err(|error| ToolError::Internal(error.to_string()))?,
+            ),
+            attachments: Vec::new(),
+        })
+    }
+
+    fn execute_value(&self, command: WorkspaceTicketReadCommand) -> Result<Value, ToolError> {
         let workspace_id = self.client.workspace_id().ok_or_else(|| {
             ToolError::InvalidArgument("Workspace Ticket reads require workspace identity".into())
         })?;
@@ -335,20 +348,15 @@ impl WorkspaceTicketReadTool {
                 "Workspace Ticket API returned invalid JSON: {error}"
             ))
         })?;
-        let content = match self.kind {
-            WorkspaceTicketReadKind::Query => serde_json::to_string(
+        match self.kind {
+            WorkspaceTicketReadKind::Query => serde_json::to_value(
                 &project_ticket_query(response_value).map_err(ToolError::ExecutionFailed)?,
             ),
-            WorkspaceTicketReadKind::Show => serde_json::to_string(
+            WorkspaceTicketReadKind::Show => serde_json::to_value(
                 &project_ticket_detail(response_value).map_err(ToolError::ExecutionFailed)?,
             ),
         }
-        .map_err(|error| ToolError::Internal(error.to_string()))?;
-        Ok(ToolOutput {
-            summary: self.kind.name().to_string(),
-            content: Some(content),
-            attachments: Vec::new(),
-        })
+        .map_err(|error| ToolError::Internal(error.to_string()))
     }
 }
 
@@ -444,6 +452,18 @@ impl WorkspaceTicketDecisionTool {
         &self,
         value: WorkspaceTicketCaseUpdateInput,
     ) -> Result<ToolOutput, ToolError> {
+        let value = self.execute_value(value)?;
+        Ok(ToolOutput {
+            summary: self.kind.name().into(),
+            content: Some(
+                serde_json::to_string(&value)
+                    .map_err(|error| ToolError::Internal(error.to_string()))?,
+            ),
+            attachments: Vec::new(),
+        })
+    }
+
+    fn execute_value(&self, value: WorkspaceTicketCaseUpdateInput) -> Result<Value, ToolError> {
         self.client.workspace_id().ok_or_else(|| {
             ToolError::InvalidArgument("Ticket decisions require Workspace identity".into())
         })?;
@@ -495,14 +515,7 @@ impl WorkspaceTicketDecisionTool {
                     .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
             )
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        Ok(ToolOutput {
-            summary: self.kind.name().into(),
-            content: Some(
-                serde_json::to_string(&ticket)
-                    .map_err(|error| ToolError::Internal(error.to_string()))?,
-            ),
-            attachments: Vec::new(),
-        })
+        serde_json::to_value(ticket).map_err(|error| ToolError::Internal(error.to_string()))
     }
 }
 
@@ -2030,7 +2043,7 @@ pub fn mount_workspace_http_ticket_wip(
         &collection_tools,
         &roots,
         "Search and create authoritative Workspace Tickets",
-        "Search results remain bounded and carry canonical item paths. Operations are exactly the Ticket tools enabled for this Worker.",
+        "Search results remain bounded and separate typed Entries from domain data. Operations are exactly the Ticket tools enabled for this Worker.",
     )?;
     registry.mount(WipProjection {
         route: collection_route.clone(),
@@ -2084,6 +2097,7 @@ pub fn mount_workspace_http_ticket_wip(
         }),
     })?;
     registry.replace_compatibility_tools(&collection_route, claimed_tools)?;
+    registry.publish_result_namespace(namespace_route)?;
     Ok(())
 }
 
@@ -2121,26 +2135,19 @@ impl WipOperationHandler for TicketCollectionWipHandler {
             &self.merge_request_route,
             &self.objective_route,
         )?;
-        let output = execute_native_ticket_tool(tool, &self.permissions, input, context).await?;
-        let mut response = ticket_tool_output_json(output)?;
-        match operation {
-            "query" => add_ticket_paths(&mut response, &self.collection_route),
-            "create" => {
-                record_ticket_observation(&self.observations, None, &response, true);
-                if let Some(reference) = ticket_reference(&response).map(ToOwned::to_owned) {
-                    response.as_object_mut().map(|object| {
-                        object.insert(
-                            "path".into(),
-                            Value::String(format!("{}/{}", self.collection_route, reference)),
-                        )
-                    });
-                }
-            }
-            _ => {}
+        let result_namespaces = context.result_namespaces.clone();
+        let response = execute_native_ticket_tool(tool, &self.permissions, input, context).await?;
+        if operation == "create" {
+            record_ticket_observation(&self.observations, None, &response, true);
         }
-        Ok(WipOperationOutput::native(
-            json_to_wip(&response).map_err(WipOperationError::OutcomeUnknown)?,
-        ))
+        Ok(WipOperationOutput::native(results::project(
+            operation,
+            response,
+            None,
+            &self.collection_route,
+            result_namespaces.root("merge-request").unwrap_or_default(),
+            result_namespaces.root("objective").unwrap_or_default(),
+        )?))
     }
 }
 
@@ -2217,8 +2224,8 @@ impl WipOperationHandler for TicketItemWipHandler {
             &self.merge_request_route,
             &self.objective_route,
         )?;
-        let output = execute_native_ticket_tool(tool, &self.permissions, input, context).await?;
-        let response = ticket_tool_output_json(output)?;
+        let result_namespaces = context.result_namespaces.clone();
+        let response = execute_native_ticket_tool(tool, &self.permissions, input, context).await?;
         // Classification has its own membership CAS and never changes item content.
         if operation != "tags_set" {
             record_ticket_observation(
@@ -2231,9 +2238,14 @@ impl WipOperationHandler for TicketItemWipHandler {
         if tool.projection.mutating && operation != "tags_set" {
             record_affected_ticket_mutations(&self.observations, &self.ticket_reference, &response);
         }
-        Ok(WipOperationOutput::native(
-            json_to_wip(&response).map_err(WipOperationError::OutcomeUnknown)?,
-        ))
+        Ok(WipOperationOutput::native(results::project(
+            operation,
+            response,
+            Some(&self.ticket_reference),
+            &self.collection_route,
+            result_namespaces.root("merge-request").unwrap_or_default(),
+            result_namespaces.root("objective").unwrap_or_default(),
+        )?))
     }
 }
 
@@ -2242,13 +2254,98 @@ async fn execute_native_ticket_tool(
     permissions: &Option<ToolPermissionConfig>,
     input: Value,
     context: WipCallContext,
-) -> Result<ToolOutput, WipOperationError> {
+) -> Result<Value, WipOperationError> {
     authorize_native_ticket(permissions, &tool.name, &input)?;
-    execute_ticket_domain(tool.client.clone(), &tool.name, input, context.execution)
+    if let Some(value) = assignment_public::execute_native_value(
+        tool.client.clone(),
+        &tool.name,
+        input.clone(),
+        context.execution.clone(),
+    )
+    .await
+    {
+        return value.map_err(map_ticket_tool_error);
+    }
+    if let Some(value) = assignment_tracking::execute_native_value(
+        tool.client.clone(),
+        &tool.name,
+        input.clone(),
+        context.execution.clone(),
+    )
+    .await
+    {
+        return value.map_err(map_ticket_tool_error);
+    }
+    if let Some(value) = notification_diagnostics::execute_native_value(
+        tool.client.clone(),
+        &tool.name,
+        input.clone(),
+        context.execution.clone(),
+    )
+    .await
+    {
+        return value.map_err(map_ticket_tool_error);
+    }
+    // Classification values contain no independently published object references.
+    if let Some(output) = tags::execute_native(
+        tool.client.clone(),
+        &tool.name,
+        input.clone(),
+        context.execution.clone(),
+    )
+    .await
+    {
+        return ticket_tool_output_json(output.map_err(map_ticket_tool_error)?);
+    }
+    let value = match tool.name.as_str() {
+        "QueryTicket" | "ShowTicket" => {
+            let (kind, command) = if tool.name == "QueryTicket" {
+                (
+                    WorkspaceTicketReadKind::Query,
+                    WorkspaceTicketReadCommand::Query(serde_json::from_value(input).map_err(
+                        |error| {
+                            map_ticket_tool_error(ToolError::InvalidArgument(error.to_string()))
+                        },
+                    )?),
+                )
+            } else {
+                (
+                    WorkspaceTicketReadKind::Show,
+                    WorkspaceTicketReadCommand::Show(serde_json::from_value(input).map_err(
+                        |error| {
+                            map_ticket_tool_error(ToolError::InvalidArgument(error.to_string()))
+                        },
+                    )?),
+                )
+            };
+            WorkspaceTicketReadTool {
+                client: tool.client.clone(),
+                kind,
+            }
+            .execute_value(command)
+            .map_err(map_ticket_tool_error)?
+        }
+        "TicketCaseUpdate" => WorkspaceTicketDecisionTool {
+            client: tool.client.clone(),
+            kind: WorkspaceTicketDecisionKind::CaseUpdate,
+        }
+        .execute_value(serde_json::from_value(input).map_err(|error| {
+            map_ticket_tool_error(ToolError::InvalidArgument(error.to_string()))
+        })?)
+        .map_err(map_ticket_tool_error)?,
+        _ => ticket::tool::execute_ticket_command_value(
+            TicketToolBackend::new(WorkspaceHttpTicketBackend::new(tool.client.clone())),
+            &tool.name,
+            input,
+            context.execution,
+        )
         .await
-        .map_err(map_ticket_tool_error)
+        .map_err(map_ticket_tool_error)?,
+    };
+    Ok(value)
 }
 
+#[cfg(test)]
 async fn execute_ticket_domain(
     client: Arc<dyn WorkspaceClient>,
     name: &str,
@@ -2438,29 +2535,6 @@ fn ticket_tool_output_json(output: ToolOutput) -> Result<Value, WipOperationErro
     }
 }
 
-fn add_ticket_paths(response: &mut Value, collection_route: &str) {
-    let Some(tickets) = response.get_mut("tickets").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for ticket in tickets {
-        let Some(reference) = ticket
-            .get("ticket")
-            .or_else(|| ticket.get("id"))
-            .and_then(Value::as_str)
-            .filter(|reference| is_canonical_ticket_resource_key(reference))
-            .map(ToOwned::to_owned)
-        else {
-            continue;
-        };
-        if let Some(object) = ticket.as_object_mut() {
-            object.insert(
-                "path".into(),
-                Value::String(format!("{collection_route}/{reference}")),
-            );
-        }
-    }
-}
-
 fn ticket_reference(response: &Value) -> Option<&str> {
     response
         .get("ticket")
@@ -2604,7 +2678,14 @@ fn ticket_operation_declaration(
     tool: &NativeTicketTool,
     roots: &crate::feature::builtin::native_contract::ReferenceRoots<'_>,
 ) -> Result<OperationDeclaration, WipMountError> {
-    Ok(native::contract(tool.projection.operation).declaration(roots))
+    let mut declaration = native::contract(tool.projection.operation).declaration(roots);
+    if let Some(returns) = results::declaration(
+        tool.projection.operation,
+        tool.projection.surface == NativeTicketSurface::Item,
+    ) {
+        declaration.returns = returns;
+    }
+    Ok(declaration)
 }
 
 fn protocol_failure(code: ProtocolErrorCode, message: impl Into<String>) -> WipOperationError {
@@ -2770,6 +2851,7 @@ mod tests {
                 &None,
                 decision_input(),
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: String::new(),
                 },
@@ -3229,6 +3311,7 @@ mod tests {
                 &None,
                 decision_input(),
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "self-reported-coder".into(),
                 },
@@ -3255,6 +3338,7 @@ mod tests {
             &permissions,
             decision_input(),
             WipCallContext {
+                result_namespaces: Default::default(),
                 execution: ToolExecutionContext::direct(),
                 security_context: "author".into(),
             },
@@ -3346,6 +3430,7 @@ mod tests {
                 "case_update",
                 &arguments,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "coder".into(),
                 },
@@ -4456,6 +4541,7 @@ mod tests {
                                     json_to_wip(&json!({"title":"Create"})).unwrap(),
                                 )]),
                                 WipCallContext {
+                                    result_namespaces: Default::default(),
                                     execution: ToolExecutionContext::direct(),
                                     security_context: "test".into(),
                                 },
@@ -4873,6 +4959,7 @@ mod tests {
                                     json_to_wip(&json!({"title":"Authorized create"})).unwrap(),
                                 )]),
                                 WipCallContext {
+                                    result_namespaces: Default::default(),
                                     execution: ToolExecutionContext::direct(),
                                     security_context: "test".into(),
                                 },
@@ -5204,6 +5291,7 @@ mod tests {
                 "read",
                 &BTreeMap::new(),
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "test".into(),
                 },

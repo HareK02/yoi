@@ -703,6 +703,7 @@ async fn oversized_images_and_unknown_arguments_fail_before_binary_transfer() {
 
 fn native_context() -> crate::wip::WipCallContext {
     crate::wip::WipCallContext {
+        result_namespaces: Default::default(),
         execution: ToolExecutionContext::direct(),
         security_context: "drive-test".into(),
     }

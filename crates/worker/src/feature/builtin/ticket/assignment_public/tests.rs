@@ -779,6 +779,7 @@ async fn implementation_result_wip_and_native_dispatch_preserve_trusted_call_con
                 "implementation_result",
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::new(call_id, "wip", 3),
                     security_context: "worker".into(),
                 },
@@ -803,6 +804,7 @@ async fn implementation_result_wip_and_native_dispatch_preserve_trusted_call_con
                 "implementation_result",
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::new("", "wip", 0),
                     security_context: "worker".into(),
                 },
@@ -827,6 +829,7 @@ async fn implementation_result_wip_and_native_dispatch_preserve_trusted_call_con
                     "implementation_result",
                     &forged,
                     WipCallContext {
+                        result_namespaces: Default::default(),
                         execution: ToolExecutionContext::new("call-c", "wip", 0),
                         security_context: "worker".into(),
                     },
@@ -868,6 +871,7 @@ async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inp
                 operation,
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker".into(),
                 },
@@ -883,6 +887,7 @@ async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inp
                     operation,
                     &forged,
                     WipCallContext {
+                        result_namespaces: Default::default(),
                         execution: ToolExecutionContext::direct(),
                         security_context: "worker".into()
                     }
@@ -919,6 +924,7 @@ async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inp
                 "assignment_answer",
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker".into()
                 }

@@ -156,6 +156,9 @@ pub enum WipMountError {
 pub struct WipCallContext {
     pub execution: ToolExecutionContext,
     pub security_context: String,
+    /// Host-supplied completed composition, overwritten at dispatch. Direct handler calls default
+    /// to no cross-domain publication; caller-provided coordinates cannot publish an Object.
+    pub result_namespaces: WipResultNamespaces,
 }
 
 /// Successful operation value. Native attachments and compatibility ToolOutputs
@@ -501,6 +504,22 @@ impl WipOperationHandler for OperationDispatchHandler {
     }
 }
 
+/// Optional result-navigation coordinates from one completed native mount composition.
+///
+/// The Host builds a fresh immutable snapshot from the final registry, not a namespace reservation
+/// or an intermediate factory state. Registry checkpoint clones own their registration markers by
+/// value; no handler captures a shared mutable publication ledger. Rebuilding a Host cannot freeze
+/// another registry's context. These coordinates carry no observations, existence or permissions;
+/// current target visibility and authorization remain the provider's read/dispatch responsibility.
+#[derive(Debug, Clone, Default)]
+pub struct WipResultNamespaces(Arc<BTreeMap<String, String>>);
+
+impl WipResultNamespaces {
+    pub fn root(&self, owner: &str) -> Option<&str> {
+        self.0.get(owner).map(String::as_str)
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct WipMountRegistry {
     mounts: BTreeMap<String, MountedProjection>,
@@ -509,6 +528,7 @@ pub struct WipMountRegistry {
     subtree_mounts: Vec<WipSubtreeMount>,
     dynamic_operation_contributions: BTreeMap<String, Vec<MountedDynamicOperationContribution>>,
     namespaces: BTreeMap<String, String>,
+    result_namespace_routes: BTreeSet<String>,
     replaced_compatibility_capabilities: BTreeMap<String, String>,
 }
 
@@ -579,6 +599,50 @@ impl WipMountRegistry {
             .filter(|(_, provider)| provider.as_str() == owner);
         let (root, _) = roots.next()?;
         roots.next().is_none().then_some(root.as_str())
+    }
+
+    /// Complete a native collection/item provider's result-reference registration only after
+    /// all of its installation steps succeed. This marker is registry-owned checkpoint data,
+    /// not authority, and is rechecked against final mounts when a Host is built.
+    pub(crate) fn publish_result_namespace(
+        &mut self,
+        namespace: &WipNamespaceRoute,
+    ) -> Result<(), WipMountError> {
+        let root = namespace.root();
+        if !self.result_namespace_is_mounted(root) {
+            return Err(WipMountError::InvalidProjection {
+                route: root.into(),
+                message:
+                    "result references require a visible native collection and dynamic item mount"
+                        .into(),
+            });
+        }
+        self.result_namespace_routes.insert(root.into());
+        Ok(())
+    }
+
+    fn result_namespace_is_mounted(&self, root: &str) -> bool {
+        self.mounts.get(root).is_some_and(|mount| {
+            mount.projection.kind == WipProjectionKind::Native
+                && mount.projection.handler.is_visible()
+        }) && self
+            .dynamic_mounts
+            .iter()
+            .any(|mount| mount.collection_route == root)
+    }
+
+    fn result_namespace_snapshot(&self) -> WipResultNamespaces {
+        let roots = self
+            .result_namespace_routes
+            .iter()
+            .filter_map(|root| {
+                let owner = self.namespaces.get(root)?;
+                (self.namespace_root(owner) == Some(root.as_str())
+                    && self.result_namespace_is_mounted(root))
+                .then(|| (owner.clone(), root.clone()))
+            })
+            .collect();
+        WipResultNamespaces(Arc::new(roots))
     }
 
     pub fn mount(
@@ -1254,6 +1318,7 @@ fn validate_projection(projection: &WipProjection) -> Result<(), WipMountError> 
 struct WipHost {
     registry: WipMountRegistry,
     generation: Vec<u8>,
+    result_namespaces: WipResultNamespaces,
 }
 
 impl WipHost {
@@ -1263,9 +1328,11 @@ impl WipHost {
             digest.update(route.as_bytes());
             digest.update([0]);
         }
+        let result_namespaces = registry.result_namespace_snapshot();
         Self {
             registry,
             generation: digest.finalize().to_vec(),
+            result_namespaces,
         }
     }
 
@@ -1989,6 +2056,10 @@ impl WipHost {
                     error.to_string(),
                 ))
             })?;
+        let mut context = context;
+        // Publication is Host-owned. Never trust a caller's fabricated result coordinates or
+        // reuse a snapshot captured by a handler before composition/rollback finished.
+        context.result_namespaces = self.result_namespaces.clone();
         projection
             .handler
             .call(&request.operation, &request.arguments, context)
@@ -2588,6 +2659,7 @@ impl WipRuntime {
                 }
             };
         let context = WipCallContext {
+            result_namespaces: Default::default(),
             execution,
             security_context: self.security_context.as_str().to_string(),
         };
@@ -3588,6 +3660,7 @@ mod tests {
             arguments: BTreeMap::new(),
         };
         let context = || WipCallContext {
+            result_namespaces: Default::default(),
             execution: ToolExecutionContext::direct(),
             security_context: "worker-a".into(),
         };
@@ -3706,6 +3779,7 @@ mod tests {
 
     fn direct_wip_context() -> WipCallContext {
         WipCallContext {
+            result_namespaces: Default::default(),
             execution: ToolExecutionContext::direct(),
             security_context: "worker-a".into(),
         }
@@ -5779,6 +5853,7 @@ mod tests {
             .call(
                 request.clone(),
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker-a".into(),
                 },
@@ -5798,6 +5873,7 @@ mod tests {
             .call(
                 request.clone(),
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker-a".into(),
                 },
@@ -5818,6 +5894,7 @@ mod tests {
             .call(
                 request.clone(),
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker-a".into(),
                 },
@@ -5837,6 +5914,7 @@ mod tests {
             .call(
                 request,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker-a".into(),
                 },
@@ -5984,6 +6062,7 @@ mod tests {
                     )]),
                 },
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker-a".into(),
                 },
@@ -6112,6 +6191,7 @@ mod tests {
                 arguments: BTreeMap::new(),
             },
             WipCallContext {
+                result_namespaces: Default::default(),
                 execution: ToolExecutionContext::direct(),
                 security_context: "worker-a".into(),
             },

@@ -335,6 +335,7 @@ async fn classification_wip_uses_normal_permissions_and_route_bound_ticket_ident
         &permissions,
         input,
         WipCallContext {
+            result_namespaces: Default::default(),
             execution: ToolExecutionContext::direct(),
             security_context: "worker".into(),
         },
@@ -380,6 +381,7 @@ async fn classification_wip_uses_normal_permissions_and_route_bound_ticket_ident
                 "tags_set",
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker".into(),
                 },
@@ -408,6 +410,7 @@ async fn classification_wip_uses_normal_permissions_and_route_bound_ticket_ident
                 "tags_set",
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker".into()
                 }

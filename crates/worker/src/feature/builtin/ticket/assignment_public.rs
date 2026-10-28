@@ -263,13 +263,26 @@ impl Tool for PublicAssignmentTool {
     }
 }
 
-/// Convert an adapter-owned internal command; never invokes Tool execution or its schema.
+/// Preserve the regular Tool presentation for internal callers.
+#[cfg(test)]
 pub(super) async fn execute_native(
     client: Arc<dyn WorkspaceClient>,
     tool_name: &str,
     command: Value,
     ctx: ToolExecutionContext,
 ) -> Option<Result<ToolOutput, ToolError>> {
+    execute_native_value(client, tool_name, command, ctx)
+        .await
+        .map(|result| result.map(|content| tool_output(tool_name, content)))
+}
+
+/// Return the shared domain projection before Tool presentation serialization.
+pub(super) async fn execute_native_value(
+    client: Arc<dyn WorkspaceClient>,
+    tool_name: &str,
+    command: Value,
+    ctx: ToolExecutionContext,
+) -> Option<Result<Value, ToolError>> {
     let parse = |error: serde_json::Error| ToolError::InvalidArgument(error.to_string());
     let command = match tool_name {
         "TicketOrchestratorAssign" => serde_json::from_value(command).map(Command::Assign),
@@ -286,7 +299,7 @@ pub(super) async fn execute_native(
         _ => return None,
     };
     Some(match command {
-        Ok(command) => execute_domain(client, command, ctx).await,
+        Ok(command) => execute_value(client, command, ctx).await,
         Err(error) => Err(parse(error)),
     })
 }
@@ -296,6 +309,25 @@ async fn execute_domain(
     command: Command,
     ctx: ToolExecutionContext,
 ) -> Result<ToolOutput, ToolError> {
+    let name = command.kind().name();
+    execute_value(client, command, ctx)
+        .await
+        .map(|content| tool_output(name, content))
+}
+
+fn tool_output(name: &str, content: Value) -> ToolOutput {
+    ToolOutput {
+        summary: name.into(),
+        content: Some(content.to_string()),
+        attachments: vec![],
+    }
+}
+
+async fn execute_value(
+    client: Arc<dyn WorkspaceClient>,
+    command: Command,
+    ctx: ToolExecutionContext,
+) -> Result<Value, ToolError> {
     let kind = command.kind();
     client
         .workspace_id()
@@ -518,11 +550,7 @@ async fn execute_domain(
         ),
     }
     .map_err(|error| ToolError::Internal(error.to_string()))?;
-    Ok(ToolOutput {
-        summary: kind.name().into(),
-        content: Some(content.to_string()),
-        attachments: vec![],
-    })
+    Ok(content)
 }
 
 pub(super) fn definition(
@@ -549,7 +577,10 @@ mod native_command_tests {
 
     #[tokio::test]
     async fn internal_commands_share_exact_authorization_requests_and_host_retry_identity() {
-        for (kind, input, response) in super::tests::cases() {
+        for (kind, input, mut response) in super::tests::cases() {
+            if matches!(kind, PublicAssignmentKind::Diagnostics) {
+                response["backend_private_field"] = json!("must be redacted");
+            }
             let operation = match kind {
                 PublicAssignmentKind::Assign => "ticket.assignment.assign",
                 PublicAssignmentKind::Clear => "ticket.assignment.clear",
@@ -577,9 +608,24 @@ mod native_command_tests {
                 .await
                 .unwrap()
                 .unwrap();
+            let value =
+                execute_native_value(client.clone(), kind.name(), input.clone(), ctx.clone())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                value,
+                serde_json::from_str::<Value>(ordinary.content.as_deref().unwrap()).unwrap()
+            );
+            assert!(value.get("backend_private_field").is_none());
             assert_eq!(native.content, ordinary.content);
+            assert_eq!(native.summary, ordinary.summary);
+            assert_eq!(ordinary.summary, kind.name());
+            assert!(native.attachments.is_empty());
+            assert_eq!(client.requests.lock().unwrap().len(), 3);
             {
                 let requests = client.requests.lock().unwrap();
+                assert_eq!(requests[1], requests[2]);
                 assert_eq!(
                     requests[0],
                     requests[1],
@@ -598,21 +644,21 @@ mod native_command_tests {
             let mut other = input.clone();
             other["ticket"] = json!("T-other");
             assert!(
-                execute_native(client.clone(), kind.name(), other, ctx.clone())
+                execute_native_value(client.clone(), kind.name(), other, ctx.clone())
                     .await
                     .unwrap()
                     .is_err()
             );
             client.grants.lock().unwrap().clear();
             assert!(
-                execute_native(client.clone(), kind.name(), input, ctx)
+                execute_native_value(client.clone(), kind.name(), input, ctx)
                     .await
                     .unwrap()
                     .is_err()
             );
-            assert_eq!(client.requests.lock().unwrap().len(), 2);
+            assert_eq!(client.requests.lock().unwrap().len(), 3);
             assert!(
-                execute_native(
+                execute_native_value(
                     client.clone(),
                     "Unknown",
                     Value::Null,

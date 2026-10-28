@@ -424,6 +424,7 @@ async fn checkout_wip_provider_validator_rejects_same_content_inode_substitution
             "write",
             &BTreeMap::from([("content".into(), Value::String("bad".into()))]),
             WipCallContext {
+                result_namespaces: Default::default(),
                 execution: Default::default(),
                 security_context: "checkout-test-worker".into(),
             },
@@ -966,6 +967,7 @@ async fn checkout_list_permission_cannot_be_bypassed_with_glob_or_command_identi
             "list",
             &BTreeMap::new(),
             WipCallContext {
+                result_namespaces: Default::default(),
                 execution: Default::default(),
                 security_context: "fixture".into(),
             },
@@ -1030,6 +1032,7 @@ async fn common_scope_rejects_wrong_namespace_scope_ref_and_old_target_authority
             .call(
                 forged,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: Default::default(),
                     security_context: "fixture".into(),
                 },
@@ -1041,13 +1044,13 @@ async fn common_scope_rejects_wrong_namespace_scope_ref_and_old_target_authority
     }
     let forged = request(p.interface.clone(), Some("old".into()));
     assert!(
-        matches!(r.host.call(forged, WipCallContext { execution:Default::default(),security_context:"fixture".into() }).await, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::InterfaceMismatch)
+        matches!(r.host.call(forged, WipCallContext { result_namespaces: Default::default(), execution:Default::default(),security_context:"fixture".into() }).await, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::InterfaceMismatch)
     );
     router.detach(&main).await.unwrap();
     router.attach(main, session(&dir, true)).unwrap();
     let forged = request(p.interface.clone(), None);
     assert!(
-        matches!(r.host.call(forged, WipCallContext { execution:Default::default(),security_context:"fixture".into() }).await, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::ValidatorMismatch)
+        matches!(r.host.call(forged, WipCallContext { result_namespaces: Default::default(), execution:Default::default(),security_context:"fixture".into() }).await, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::ValidatorMismatch)
     );
 }
 
@@ -1073,6 +1076,7 @@ fn observed_common_request(
 }
 fn file_context() -> WipCallContext {
     WipCallContext {
+        result_namespaces: Default::default(),
         execution: Default::default(),
         security_context: "file-contract-test".into(),
     }

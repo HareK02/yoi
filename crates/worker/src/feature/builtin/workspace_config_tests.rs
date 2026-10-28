@@ -133,6 +133,7 @@ fn invocation(key: &str, access: Option<&str>) -> FeatureInvocation {
 }
 fn context() -> WipCallContext {
     WipCallContext {
+        result_namespaces: Default::default(),
         execution: ToolExecutionContext::direct(),
         security_context: "test-worker".into(),
     }

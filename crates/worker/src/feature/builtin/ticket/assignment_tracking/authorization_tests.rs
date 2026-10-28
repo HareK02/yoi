@@ -87,17 +87,17 @@ async fn tracking_operations_authorize_exact_ticket_before_dispatch_and_recheck_
         (
             TrackingToolKind::Query,
             "ticket.assignment.query",
-            json!({"ticket":"T-A"}),
+            json!({"ticket":"T-1"}),
         ),
         (
             TrackingToolKind::History,
             "ticket.assignment.history",
-            json!({"ticket":"T-A","assignment_id":"a"}),
+            json!({"ticket":"T-1","assignment_id":"a"}),
         ),
         (
             TrackingToolKind::Update,
             "ticket.assignment.update",
-            json!({"ticket":"T-A","assignment_id":"a","expected_last_event_id":"before","operation_key":"report","tracking":{"status":"done","waiting_reason":null,"progress":null,"next_action":null,"result":"Returned options"}}),
+            json!({"ticket":"T-1","assignment_id":"a","expected_last_event_id":"before","operation_key":"report","tracking":{"status":"done","waiting_reason":null,"progress":null,"next_action":null,"result":"Returned options"}}),
         ),
     ] {
         let client = AuthorizedClient::new(json!({"assignment_id":"a","last_event_id":"after"}));
@@ -110,7 +110,7 @@ async fn tracking_operations_authorize_exact_ticket_before_dispatch_and_recheck_
                 .contains("HTTP status 403")
         );
         assert!(client.requests.lock().unwrap().is_empty());
-        client.grant(operation, ticket("T-A"));
+        client.grant(operation, ticket("T-1"));
         let output = tool
             .execute(&input.to_string(), ToolExecutionContext::direct())
             .await
@@ -121,7 +121,7 @@ async fn tracking_operations_authorize_exact_ticket_before_dispatch_and_recheck_
         );
         assert_eq!(client.requests.lock().unwrap().len(), 1);
         let mut other = input.clone();
-        other["ticket"] = json!("T-B");
+        other["ticket"] = json!("T-2");
         assert!(
             tool.execute(&other.to_string(), ToolExecutionContext::direct())
                 .await
@@ -137,8 +137,8 @@ async fn tracking_operations_authorize_exact_ticket_before_dispatch_and_recheck_
         let auth = client.authorizations.lock().unwrap();
         assert_eq!(auth.len(), 4);
         assert!(auth.iter().all(|request| request.operation == operation));
-        assert_eq!(auth[0].resource, ticket("T-A"));
-        assert_eq!(auth[2].resource, ticket("T-B"));
+        assert_eq!(auth[0].resource, ticket("T-1"));
+        assert_eq!(auth[2].resource, ticket("T-2"));
         drop(auth);
         let tools = native_ticket_tools(client.clone(), TicketFeatureAccess::workflow()).unwrap();
         let handler = TicketItemWipHandler {
@@ -149,7 +149,7 @@ async fn tracking_operations_authorize_exact_ticket_before_dispatch_and_recheck_
                     .collect(),
             ),
             permissions: None,
-            ticket_reference: "T-A".into(),
+            ticket_reference: "T-1".into(),
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),
             objective_route: "/objectives".into(),
@@ -198,6 +198,7 @@ async fn tracking_operations_authorize_exact_ticket_before_dispatch_and_recheck_
                     projection.operation,
                     &args,
                     WipCallContext {
+                        result_namespaces: Default::default(),
                         execution: ToolExecutionContext::direct(),
                         security_context: "worker".into()
                     }
@@ -209,12 +210,13 @@ async fn tracking_operations_authorize_exact_ticket_before_dispatch_and_recheck_
             }))
         ));
         assert_eq!(client.requests.lock().unwrap().len(), 1);
-        client.grant(operation, ticket("T-A"));
+        client.grant(operation, ticket("T-1"));
         handler
             .call(
                 projection.operation,
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker".into(),
                 },

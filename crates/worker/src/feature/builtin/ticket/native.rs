@@ -9,11 +9,11 @@
 //! The contract tree generates both the public declaration and closed input conversion. The
 //! converted command is private transport to shared domain execution, never a second public API.
 //! Backend validation owns string bounds, conditional business requirements, exact observations,
-//! authorization and replay. Native type rejection precedes that boundary. Results deliberately
-//! retain their bounded domain JSON: typed result traversal belongs to the separate result seam.
+//! authorization and replay. Native type rejection precedes that boundary. The result projection
+//! separates typed navigation from bounded domain JSON, independently of these input contracts.
 //!
 //! For example, Inspect the collection and its Interface, then invoke `query` with
-//! `{"filter":{"states":["open"]},"page":{"limit":10}}`. Inspect a returned item path and
+//! `{"filter":{"states":["open"]},"page":{"limit":10}}`. Inspect a returned typed item Entry and
 //! its Interface before `read` with `{"page":{"limit":5}}`, or `comment` with
 //! `{"body":"Confirmed requirement"}`. A relation target is an Entry, not a Tool Ticket ID.
 //! v2 replaces v1 native arguments; refresh Object/Interface observations, do not replay mutations.

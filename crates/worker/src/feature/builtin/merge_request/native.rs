@@ -198,7 +198,9 @@ impl ReferenceRoots {
 }
 
 pub(super) fn declaration(contract: &Contract, roots: &ReferenceRoots) -> OperationDeclaration {
-    contract.declaration(&roots.contract_roots())
+    let mut declaration = contract.declaration(&roots.contract_roots());
+    declaration.returns = result::declaration();
+    declaration
 }
 
 pub(super) fn convert(

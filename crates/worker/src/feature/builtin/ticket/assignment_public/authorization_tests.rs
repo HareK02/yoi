@@ -65,6 +65,7 @@ async fn public_operations_require_exact_ticket_grants_on_tool_and_wip() {
                 projection.operation,
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker".into(),
                 },
@@ -79,6 +80,7 @@ async fn public_operations_require_exact_ticket_grants_on_tool_and_wip() {
                     projection.operation,
                     &args,
                     WipCallContext {
+                        result_namespaces: Default::default(),
                         execution: ToolExecutionContext::direct(),
                         security_context: "worker".into()
                     }

@@ -282,6 +282,7 @@ fn deadline_provider(router: Arc<WorkdirSessionRouter>) -> Arc<Provider> {
 
 fn context() -> WipCallContext {
     WipCallContext {
+        result_namespaces: Default::default(),
         execution: Default::default(),
         security_context: "checkout-race-tests".into(),
     }
