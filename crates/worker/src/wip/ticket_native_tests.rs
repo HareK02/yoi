@@ -916,6 +916,60 @@ fn result_namespaces_follow_committed_registry_rollback_and_independent_host_bui
     );
 }
 
+// Production Feature installer + Objective composition + final WIP Host snapshot.
+// Only Workspace transport is scripted; registration must perform no requests.
+#[test]
+fn feature_install_publication_snapshot_preserves_host_roots_and_rolls_back_new_markers() {
+    use crate::feature::{
+        FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule,
+        FeatureRegistryBuilder,
+    };
+    struct LateFailure;
+    impl FeatureModule for LateFailure {
+        fn descriptor(&self) -> FeatureDescriptor {
+            FeatureDescriptor::builtin("late-failure", "Late failure")
+        }
+        fn install(&self, _: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
+            Err(FeatureInstallError::InvalidDescriptor("late failure".into()))
+        }
+    }
+    for fail in [false, true] {
+        let client = Arc::new(ScriptedWorkspaceClient::new([]));
+        let mut mounts = WipMountRegistry::new();
+        let ticket = mounts.allocate_namespace("ticket", "cases").unwrap();
+        crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
+            &mut mounts,
+            client.clone(),
+            crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
+            None,
+            &ticket,
+        )
+        .unwrap();
+        let before = WipHost::new(mounts.clone());
+        let objective = mounts.allocate_namespace("objective", "goals").unwrap();
+        let mut features = FeatureRegistryBuilder::new();
+        crate::feature::builtin::objective::composition::compose(
+            &mut features, true, client.clone(), Some((objective, None)),
+        )
+        .unwrap();
+        if fail {
+            features.add_module(LateFailure);
+        }
+        let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+        let report = features.install_into_engine_with_wip(
+            &mut engine, &mut crate::hook::HookRegistryBuilder::default(), Some(&mut mounts),
+        );
+        assert_eq!(report.has_errors(), fail);
+        let after = WipHost::new(mounts);
+        assert_eq!(after.result_namespaces.root("ticket"), Some("/cases"));
+        assert_eq!(after.result_namespaces.root("objective"), (!fail).then_some("/goals"));
+        assert_eq!(before.result_namespaces.root("objective"), None);
+        assert_eq!(before.result_namespaces.root("ticket"), Some("/cases"));
+        assert_eq!(after.observe("/goals", 1).is_ok(), !fail);
+        assert!(client.requests.lock().unwrap().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn host_overwrites_forged_result_context_and_omits_unpublished_cross_domain_entries() {
     let mut detail = ticket_result_detail("T-42");
