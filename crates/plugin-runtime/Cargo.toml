@@ -1,0 +1,25 @@
+[package]
+name = "yoi-plugin-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+manifest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+jsonschema = { version = "0.33.0", default-features = false }
+wasmtime = { version = "=38.0.4", default-features = false, features = ["async", "component-model", "cranelift", "runtime", "std", "threads"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+wit-component = { version = "0.244.0", features = ["dummy-module"] }
+wit-parser = "0.244.0"
+wasmprinter = "0.244.0"
+wat = "1"
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
