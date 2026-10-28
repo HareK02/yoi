@@ -18,14 +18,17 @@ use agen::Item;
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use session_store::LogEntry;
+use serde::Deserialize;
 
-use super::manage_worker::{WORKER_CONTROL_SERVICE_ID, WorkerControlService};
+use crate::feature::contracts::{
+    WORKER_CONTROL_SERVICE_ID, WORKER_CONTROL_SERVICE_VERSION, WorkerControlService,
+    WorkerObservationError, WorkerObservationProvider, WorkerObservationSubject,
+    WorkerObservationSubjectRef, WorkerSessionCapture,
+};
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureInstructionContribution,
     FeatureInstructionDeclaration, FeatureInstructionId, FeatureModule, ServiceId,
-    ServiceRequirement, ToolContribution, ToolDeclaration,
+    ServiceRequirement, ServiceVersionReq, ToolContribution, ToolDeclaration,
 };
 use crate::session_capture::{
     ReadDetail, ReadOptions, ReadSelector, ReferenceKind, SearchOptions, SessionCapture,
@@ -47,69 +50,6 @@ fn observation_instruction() -> FeatureInstructionDeclaration {
         "Worker session observation authority and privacy policy",
     )
     .expect("static worker-observation instruction declaration is valid")
-}
-
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum WorkerObservationSubjectRef {
-    RuntimeWorker {
-        runtime_id: String,
-        worker_id: String,
-    },
-    SubWorker {
-        name: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerObservationSubject {
-    pub subject: WorkerObservationSubjectRef,
-    pub display_name: String,
-    pub relation: String,
-    pub status: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkerSessionCapture {
-    pub segment_id: String,
-    pub session: protocol::SessionSnapshot,
-}
-
-impl WorkerSessionCapture {
-    pub fn from_log_entries(
-        segment_id: impl Into<String>,
-        log_entries: &[LogEntry],
-    ) -> Result<Self, String> {
-        Ok(Self {
-            segment_id: segment_id.into(),
-            session: session_store::public_snapshot::project_current_session_snapshot(log_entries),
-        })
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum WorkerObservationError {
-    #[error("worker session was not found or is not accessible")]
-    NotFound,
-    #[error("worker session observation failed: {0}")]
-    Unavailable(String),
-}
-
-#[async_trait]
-pub trait WorkerObservationProvider: Send + Sync {
-    /// Returns only subjects already authorized for the current Worker.
-    async fn list_worker_sessions(
-        &self,
-    ) -> Result<Vec<WorkerObservationSubject>, WorkerObservationError>;
-
-    /// Reauthorizes and captures the latest committed session for one subject.
-    /// Unauthorized and missing subjects must both return `NotFound`.
-    async fn capture_worker_session(
-        &self,
-        subject: &WorkerObservationSubjectRef,
-    ) -> Result<WorkerSessionCapture, WorkerObservationError>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,7 +230,7 @@ impl FeatureModule for WorkerObservationFeature {
             .with_service_requirement(ServiceRequirement::required(
                 ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
                 "Worker observation extends the known-Worker control authority",
-            ))
+            ).with_version(ServiceVersionReq::exact(WORKER_CONTROL_SERVICE_VERSION)))
             .with_instruction(observation_instruction())
             .with_tool(ToolDeclaration::new(
                 "ViewSessionOverview",

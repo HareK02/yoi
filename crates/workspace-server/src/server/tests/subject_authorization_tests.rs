@@ -1015,7 +1015,7 @@ async fn ticket_worker_host_with_service(
 ) -> (
     worker::Worker<UnusedModel, session_store::FsStore>,
     bool,
-    Option<Arc<dyn worker::feature::builtin::ticket::TicketService>>,
+    Option<Arc<dyn worker::feature::contracts::TicketService>>,
 ) {
     let manifest = worker::WorkerManifest::from_toml(
         r#"
@@ -1060,9 +1060,9 @@ async fn ticket_worker_host_with_service(
         Some(
             report
                 .services
-                .service::<dyn worker::feature::builtin::ticket::TicketService>(
+                .service::<dyn worker::feature::contracts::TicketService>(
                     &worker::feature::ServiceId::builtin(
-                        worker::feature::builtin::ticket::TICKET_SERVICE_ID,
+                        worker::feature::contracts::TICKET_SERVICE_ID,
                     ),
                 )
                 .unwrap(),

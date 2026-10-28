@@ -46,6 +46,10 @@ mod native;
 mod notification_diagnostics;
 mod tags;
 
+use crate::feature::contracts::{
+    TICKET_SERVICE_ID, TICKET_SERVICE_VERSION, TicketHandoff, TicketService,
+};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -539,29 +543,6 @@ const FEATURE_NAME: &str = "Ticket tools";
 const FEATURE_DESCRIPTION: &str = "Intent-led Ticket reads and authorized decisions through the Workspace API; no universal MR/approval gate, and no Backend judgment of natural-language satisfaction.";
 const TICKET_WORKFLOW_INSTRUCTION_ID: &str = "ticket.workflow";
 const TICKET_WORKFLOW_PROMPT_REF: &str = "common.tickets";
-pub const TICKET_SERVICE_ID: &str = "ticket.authority";
-const TICKET_SERVICE_VERSION: &str = "1";
-
-pub trait TicketService: Send + Sync {
-    fn ticket_handoff(&self, ticket_ref: &str) -> Result<TicketHandoff, TicketError>;
-
-    /// Typed creation without a synthetic Tool context. The default keeps legacy
-    /// handoff-only fixture implementations fail-closed; production installs
-    /// provide creation through the shared authorized backend dispatch.
-    fn create(&self, _input: NewTicket) -> TicketResult<TicketRef> {
-        Err(TicketError::Conflict(
-            "Ticket creation service is unavailable".into(),
-        ))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TicketHandoff {
-    pub id: String,
-    pub resource_key: String,
-    pub workflow_state: TicketState,
-}
-
 fn is_canonical_ticket_resource_key(resource_key: &str) -> bool {
     resource_key.strip_prefix("T-").is_some_and(|sequence| {
         !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())

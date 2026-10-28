@@ -514,6 +514,11 @@ impl ServiceRequirement {
         }
     }
 
+    pub fn with_version(mut self, version: ServiceVersionReq) -> Self {
+        self.version = version;
+        self
+    }
+
     pub fn optional(id: ServiceId, reason: impl Into<String>) -> Self {
         Self {
             id,
@@ -2372,6 +2377,7 @@ pub use invocation::{
     FeatureInvocationHandlerError, FeatureInvocationRegistry, InvocationContributionRegistrar,
 };
 pub mod builtin;
+pub mod contracts;
 pub mod mcp;
 pub(crate) mod session;
 

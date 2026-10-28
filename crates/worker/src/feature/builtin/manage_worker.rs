@@ -14,6 +14,12 @@ use server_api::{
     CreateWorkspaceWorkerTicketAssignmentRequest,
 };
 
+use crate::feature::contracts::{
+    WORKER_CONTROL_SERVICE_ID, WORKER_CONTROL_SERVICE_VERSION, WORKER_LIFECYCLE_SERVICE_ID,
+    WORKER_LIFECYCLE_SERVICE_VERSION, WorkerControlInputKind, WorkerControlService,
+    WorkerControlStopKind, WorkerControlSubject, WorkerLifecycleService,
+    WorkerLifecycleSpawnRequest, WorkerLifecycleWorkdirAttachment, WorkerObservationSubjectRef,
+};
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule,
     ServiceDeclaration, ServiceId, ToolContribution, ToolDeclaration,
@@ -25,77 +31,7 @@ const FEATURE_ID: &str = "worker";
 const FEATURE_NAME: &str = "Worker";
 const FEATURE_DESCRIPTION: &str =
     "Workspace-authority tools for managing Workdir-bound Backend/Runtime Worker sessions.";
-pub const WORKER_LIFECYCLE_SERVICE_ID: &str = "worker.lifecycle";
-pub const WORKER_CONTROL_SERVICE_ID: &str = "worker.control";
-const WORKER_LIFECYCLE_SERVICE_VERSION: &str = "1";
 const INITIAL_WORKDIR_ALIAS: &str = "workdir";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkerControlSubject {
-    RuntimeWorker {
-        runtime_id: String,
-        worker_id: String,
-    },
-    SubWorker {
-        name: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerControlInputKind {
-    User,
-    Notify,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerControlStopKind {
-    Cancel,
-    Stop,
-}
-
-#[async_trait]
-pub trait WorkerControlService: Send + Sync {
-    fn workspace_id(&self) -> &str;
-    async fn list_workers(&self) -> Result<WorkspaceResponse, WorkspaceClientError>;
-    async fn send_input(
-        &self,
-        subject: WorkerControlSubject,
-        content: String,
-        kind: WorkerControlInputKind,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
-    async fn stop_worker(
-        &self,
-        subject: WorkerControlSubject,
-        kind: WorkerControlStopKind,
-        reason: Option<String>,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
-    async fn spawn_worker(
-        &self,
-        request: WorkerLifecycleSpawnRequest,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
-    async fn restore_worker(
-        &self,
-        runtime_id: String,
-        worker_id: String,
-        request: server_api::WorkerRestoreRequest,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-        let _ = (runtime_id, worker_id, request);
-        Err(WorkspaceClientError::Unavailable(
-            "Runtime Worker restore is unavailable".to_string(),
-        ))
-    }
-    fn remove_runtime_worker(
-        &self,
-        runtime_id: &str,
-        worker_id: &str,
-        reason: &str,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
-    async fn ensure_permission(
-        &self,
-        subject: &super::worker_observation::WorkerObservationSubjectRef,
-        permission: &str,
-    ) -> Result<(), WorkspaceClientError>;
-}
 
 struct WorkspaceWorkerControlService {
     client: Arc<dyn WorkspaceClient>,
@@ -296,9 +232,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     ));
                 }
                 self.ensure_permission(
-                    &super::worker_observation::WorkerObservationSubjectRef::SubWorker {
-                        name: name.clone(),
-                    },
+                    &WorkerObservationSubjectRef::SubWorker { name: name.clone() },
                     "send_input",
                 )
                 .await?;
@@ -377,9 +311,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     ));
                 }
                 self.ensure_permission(
-                    &super::worker_observation::WorkerObservationSubjectRef::SubWorker {
-                        name: name.clone(),
-                    },
+                    &WorkerObservationSubjectRef::SubWorker { name: name.clone() },
                     "stop",
                 )
                 .await?;
@@ -456,11 +388,11 @@ impl WorkerControlService for WorkspaceWorkerControlService {
 
     async fn ensure_permission(
         &self,
-        subject: &super::worker_observation::WorkerObservationSubjectRef,
+        subject: &WorkerObservationSubjectRef,
         permission: &str,
     ) -> Result<(), WorkspaceClientError> {
         match subject {
-            super::worker_observation::WorkerObservationSubjectRef::SubWorker { name } => {
+            WorkerObservationSubjectRef::SubWorker { name } => {
                 let known = self
                     .registry
                     .as_ref()
@@ -474,7 +406,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     ))
                 }
             }
-            super::worker_observation::WorkerObservationSubjectRef::RuntimeWorker {
+            WorkerObservationSubjectRef::RuntimeWorker {
                 runtime_id,
                 worker_id,
             } => {
@@ -531,43 +463,6 @@ impl WorkerControlService for WorkspaceWorkerControlService {
             }
         }
     }
-}
-
-#[async_trait]
-pub trait WorkerLifecycleService: Send + Sync {
-    async fn spawn(
-        &self,
-        request: WorkerLifecycleSpawnRequest,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkerLifecycleWorkdirAttachment {
-    /// Stable Worker-local routing alias preserved into the canonical create request.
-    pub alias: String,
-    /// Workspace-authoritative Workdir id preserved into the canonical create request.
-    pub working_directory_id: String,
-    /// Optional normalized initial cwd relative to this Workdir.
-    pub relative_cwd: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkerLifecycleSpawnRequest {
-    /// Observed delegation required for Orchestrator Ticket starts.
-    pub orchestrator_assignment_id: Option<String>,
-
-    pub runtime_id: String,
-    /// Ordered alias-keyed selections forwarded as canonical Workdir attachments.
-    pub workdir_attachments: Vec<WorkerLifecycleWorkdirAttachment>,
-    pub profile: String,
-    pub singleton_key: Option<String>,
-    pub ticket_id: Option<String>,
-    /// Required for ordinary and Ticket spawn; exact retries reuse this ID and full input.
-    pub operation_id: Option<String>,
-    /// Explicit requested authority. Profile selection alone grants nothing.
-    pub execution_grant: Option<server_api::authorization::WorkerDelegationRequest>,
-    pub display_name: String,
-    pub initial_submit: Vec<Segment>,
 }
 
 struct WorkspaceWorkerLifecycleService {
@@ -702,7 +597,7 @@ impl FeatureModule for SubWorkerControlFeature {
             )
             .with_provided_service(ServiceDeclaration::new(
                 ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
-                WORKER_LIFECYCLE_SERVICE_VERSION,
+                WORKER_CONTROL_SERVICE_VERSION,
                 "Parent-owned SubWorker discovery and control operations",
             ));
         for operation in SUB_WORKER_CONTROL_OPERATIONS {
@@ -721,7 +616,7 @@ impl FeatureModule for SubWorkerControlFeature {
         context.services().provide(
             ServiceDeclaration::new(
                 ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
-                WORKER_LIFECYCLE_SERVICE_VERSION,
+                WORKER_CONTROL_SERVICE_VERSION,
                 "Parent-owned SubWorker discovery and control operations",
             ),
             control.clone(),
@@ -755,7 +650,7 @@ impl FeatureModule for ManageWorkerFeature {
             ))
             .with_provided_service(ServiceDeclaration::new(
                 ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
-                WORKER_LIFECYCLE_SERVICE_VERSION,
+                WORKER_CONTROL_SERVICE_VERSION,
                 "Known-Worker discovery and permission-fenced control operations",
             ));
         for operation in WorkerOperation::ALL {
@@ -790,7 +685,7 @@ impl FeatureModule for ManageWorkerFeature {
         context.services().provide(
             ServiceDeclaration::new(
                 ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
-                WORKER_LIFECYCLE_SERVICE_VERSION,
+                WORKER_CONTROL_SERVICE_VERSION,
                 "Known-Worker discovery and permission-fenced control operations",
             ),
             self.control.clone(),
@@ -1570,7 +1465,7 @@ mod tests {
 
         async fn ensure_permission(
             &self,
-            _subject: &crate::feature::builtin::WorkerObservationSubjectRef,
+            _subject: &crate::feature::contracts::WorkerObservationSubjectRef,
             _permission: &str,
         ) -> Result<(), WorkspaceClientError> {
             Ok(())
@@ -1942,7 +1837,7 @@ mod tests {
         });
         let permission_error = control
             .ensure_permission(
-                &crate::feature::builtin::WorkerObservationSubjectRef::RuntimeWorker {
+                &crate::feature::contracts::WorkerObservationSubjectRef::RuntimeWorker {
                     runtime_id: "runtime-1".to_string(),
                     worker_id: "worker-1".to_string(),
                 },

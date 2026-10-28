@@ -144,9 +144,11 @@ use workdir::{
 use worker::WorkerController;
 use worker::feature::builtin::manage_workdir::WorkspaceAttachedWorkdirSession;
 use worker::feature::builtin::{
-    CompositeWorkerObservationProvider, WorkerObservationError, WorkerObservationProvider,
-    WorkerObservationSubject, WorkerObservationSubjectRef, WorkerSessionCapture,
-    WorkspaceClientWorkerObservationProvider,
+    CompositeWorkerObservationProvider, WorkspaceClientWorkerObservationProvider,
+};
+use worker::feature::contracts::{
+    WorkerObservationError, WorkerObservationProvider, WorkerObservationSubject,
+    WorkerObservationSubjectRef, WorkerSessionCapture,
 };
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{WorkerProtocolSessionStreams, live_log_entry_event};

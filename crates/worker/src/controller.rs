@@ -2083,7 +2083,7 @@ where
         }
 
         let mut observation_providers: Vec<
-            Arc<dyn crate::feature::builtin::worker_observation::WorkerObservationProvider>,
+            Arc<dyn crate::feature::contracts::WorkerObservationProvider>,
         > = Vec::new();
 
         // Worker-orchestration tools derive child filesystem authority from the

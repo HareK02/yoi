@@ -53,8 +53,9 @@ use crate::compact::telemetry::{
 };
 use crate::compact::usage_tracker::{UsageTracker, persist_pending_usage};
 use crate::feature::background::{BackgroundTaskRewriteGuard, FeatureBackgroundTaskRegistry};
+use crate::feature::builtin::TaskFeature;
 use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
-use crate::feature::builtin::{TaskFeature, WorkerObservationProvider};
+use crate::feature::contracts::WorkerObservationProvider;
 use crate::feature::session::{
     CommittedRunExit, CommittedSessionCapture, CommittedSessionCaptureHandle, FeatureSessionError,
     SessionExtensionHandle,

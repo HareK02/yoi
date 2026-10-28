@@ -64,3 +64,4 @@ dotenv = "0.15.0"
 futures = { workspace = true }
 serial_test = "3.4.0"
 tempfile = { workspace = true }
+syn = { version = "2", features = ["full", "visit"] }

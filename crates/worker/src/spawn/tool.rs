@@ -1528,16 +1528,16 @@ enabled = false
             crate::feature::builtin::worker_observation::SpawnedSubWorkerObservationProvider::new(
                 registry.clone(),
             );
-        let observed_child =
-            crate::feature::builtin::worker_observation::WorkerObservationSubjectRef::SubWorker {
-                name: "reviewer-child".to_string(),
-            };
-        let first_capture = crate::feature::builtin::worker_observation::WorkerObservationProvider::capture_worker_session(
-            &observation,
-            &observed_child,
-        )
-        .await
-        .unwrap();
+        let observed_child = crate::feature::contracts::WorkerObservationSubjectRef::SubWorker {
+            name: "reviewer-child".to_string(),
+        };
+        let first_capture =
+            crate::feature::contracts::WorkerObservationProvider::capture_worker_session(
+                &observation,
+                &observed_child,
+            )
+            .await
+            .unwrap();
         assert!(
             serde_json::to_string(&first_capture.session)
                 .unwrap()
@@ -1554,12 +1554,13 @@ enabled = false
             crate::internal_worker::InternalWorkerSessionStatus::Idle
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        let latest_capture = crate::feature::builtin::worker_observation::WorkerObservationProvider::capture_worker_session(
-            &observation,
-            &observed_child,
-        )
-        .await
-        .unwrap();
+        let latest_capture =
+            crate::feature::contracts::WorkerObservationProvider::capture_worker_session(
+                &observation,
+                &observed_child,
+            )
+            .await
+            .unwrap();
         assert!(latest_capture.session.entries.len() > first_capture.session.entries.len());
 
         fail_requests.store(true, Ordering::SeqCst);

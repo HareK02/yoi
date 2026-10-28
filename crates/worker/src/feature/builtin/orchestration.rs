@@ -9,14 +9,14 @@ use protocol::Segment;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::manage_worker::{
-    WORKER_LIFECYCLE_SERVICE_ID, WorkerLifecycleService, WorkerLifecycleSpawnRequest,
+use crate::feature::contracts::{
+    TICKET_SERVICE_ID, TICKET_SERVICE_VERSION, TicketService, WORKER_LIFECYCLE_SERVICE_ID,
+    WORKER_LIFECYCLE_SERVICE_VERSION, WorkerLifecycleService, WorkerLifecycleSpawnRequest,
     WorkerLifecycleWorkdirAttachment,
 };
-use super::ticket::{TICKET_SERVICE_ID, TicketService};
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule, ServiceId,
-    ServiceRequirement, ToolContribution, ToolDeclaration,
+    ServiceRequirement, ServiceVersionReq, ToolContribution, ToolDeclaration,
 };
 
 const FEATURE_ID: &str = "orchestration";
@@ -34,14 +34,20 @@ impl FeatureModule for OrchestrationFeature {
     fn descriptor(&self) -> FeatureDescriptor {
         FeatureDescriptor::builtin(FEATURE_ID, "Orchestration")
             .with_description("Semantic Ticket orchestration operations.")
-            .with_service_requirement(ServiceRequirement::required(
-                ServiceId::builtin(TICKET_SERVICE_ID),
-                "SpawnTicketWorker requires current typed Ticket authority",
-            ))
-            .with_service_requirement(ServiceRequirement::required(
-                ServiceId::builtin(WORKER_LIFECYCLE_SERVICE_ID),
-                "SpawnTicketWorker requires Workspace Worker lifecycle authority",
-            ))
+            .with_service_requirement(
+                ServiceRequirement::required(
+                    ServiceId::builtin(TICKET_SERVICE_ID),
+                    "SpawnTicketWorker requires current typed Ticket authority",
+                )
+                .with_version(ServiceVersionReq::exact(TICKET_SERVICE_VERSION)),
+            )
+            .with_service_requirement(
+                ServiceRequirement::required(
+                    ServiceId::builtin(WORKER_LIFECYCLE_SERVICE_ID),
+                    "SpawnTicketWorker requires Workspace Worker lifecycle authority",
+                )
+                .with_version(ServiceVersionReq::exact(WORKER_LIFECYCLE_SERVICE_VERSION)),
+            )
             .with_tool(ToolDeclaration::new(TOOL_NAME, TOOL_DESCRIPTION))
     }
 
@@ -275,7 +281,7 @@ mod tests {
     use ticket::{TicketError, TicketState};
 
     use super::*;
-    use crate::feature::builtin::ticket::TicketHandoff;
+    use crate::feature::contracts::TicketHandoff;
     use crate::worker::{WorkspaceClientError, WorkspaceResponse};
 
     struct FixedTicketService(TicketState);

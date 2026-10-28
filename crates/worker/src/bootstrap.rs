@@ -311,7 +311,7 @@ pub struct RestoredControllerBindings {
     pub backend_job: Option<crate::BackendJobExecutionBinding>,
     pub workdir_sessions: std::sync::Arc<workdir::WorkdirSessionRouter>,
     pub observation_provider:
-        Option<std::sync::Arc<dyn crate::feature::builtin::WorkerObservationProvider>>,
+        Option<std::sync::Arc<dyn crate::feature::contracts::WorkerObservationProvider>>,
     pub subjektiv_attached: bool,
 }
 
