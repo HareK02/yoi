@@ -1,5 +1,16 @@
 //! Host-owned Repository, Workdir and Worker attachment Objects.
 //! Inventory is resolved from Workspace authority on demand, not a second catalog.
+//!
+//! Result Records distinguish Entry coordinates from identity/selector strings. An Entry's wire
+//! value is a string; only its declared type makes it navigable. Provider metadata (capabilities,
+//! nullable selectors, occupancy and removal outcomes) stays JSON, not a hidden reference catalog.
+//! A Workdir source's config mapping is not a live entrance: only a current Attachment publishes one.
+//!
+//! Coordinates never acquire destinations or grant content access. Inspect/Invoke recheck current
+//! provider authority and observation validators, including connection generations. Post-attach
+//! lookup is separate from mutation success; rediscover unavailable references, never repeat attach.
+
+mod result;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -78,6 +89,7 @@ struct Provider {
     catalog: bool,
     manage: bool,
     config_content: bool,
+    checkout_content: bool,
 }
 
 /// Register Object ownership once, then contribute independent management operations.
@@ -94,9 +106,9 @@ pub fn mount_workspace_workdir_wip(
         permissions,
         catalog,
         manage,
+        checkout_content: registry.has_subtree("/checkouts"),
         config_content: registry
-            .routes()
-            .any(|route| route == crate::feature::builtin::workspace_config::CONTENT_ROOT),
+            .has_subtree(crate::feature::builtin::workspace_config::CONTENT_ROOT),
     };
     for domain in [Domain::Repository, Domain::Workdir, Domain::Attachment] {
         let namespace =
@@ -421,46 +433,100 @@ impl Provider {
             if let Some(id) = raw.get("working_directory_id").and_then(Json::as_str) {
                 result.insert("workdir_path".into(), json!(item_path(Domain::Workdir, id)));
             }
-            // Content references are resolved from current Backend authority,
-            // never inferred from the alias or an OS session. An old lifetime
-            // cannot refer to a replacement connection at the same root.
-            if self.config_content
-                && raw.get("alias").and_then(Json::as_str)
-                    == Some(crate::feature::builtin::workspace_config::ATTACHMENT_ALIAS)
-                && let Some(current) =
-                    crate::feature::builtin::workspace_config::backend::WorkspaceConfigBackend::new(
-                        self.backend.client.clone(),
-                    )
-                    .current()?
-                && current.connection_id == id
-                && raw.get("working_directory_id").and_then(Json::as_str)
-                    == Some(current.working_directory_id.as_str())
-                && raw.get("alias").and_then(Json::as_str) == Some(current.alias.as_str())
+            self.content_reference(raw, &mut result)?;
+        }
+        result.insert("path".into(), json!(item_path(domain, id)));
+        Ok(Json::Object(result))
+    }
+    fn content_reference(
+        &self,
+        raw: &Json,
+        result: &mut serde_json::Map<String, Json>,
+    ) -> Result<(), WipOperationError> {
+        let alias = raw.get("alias").and_then(Json::as_str);
+        let id = raw.get("connection_id").and_then(Json::as_str);
+        let workdir = raw.get("working_directory_id").and_then(Json::as_str);
+        let state = if alias == Some(crate::feature::builtin::workspace_config::ATTACHMENT_ALIAS) {
+            if !self.config_content {
+                "unpublished"
+            } else if let Some(current) =
+                crate::feature::builtin::workspace_config::backend::WorkspaceConfigBackend::new(
+                    self.backend.client.clone(),
+                )
+                .current()?
+                && Some(current.connection_id.as_str()) == id
+                && Some(current.working_directory_id.as_str()) == workdir
+                && Some(current.alias.as_str()) == alias
             {
                 result.insert("content_path".into(), json!(current.content_path));
                 result.insert("name".into(), json!(current.name));
                 result.insert("purpose".into(), json!(current.purpose));
                 result.insert("access".into(), json!(current.access));
+                "available"
+            } else {
+                "disconnected"
             }
-            if !result.contains_key("content_path")
-                && let Some(alias) = raw.get("alias").and_then(Json::as_str)
-                && let Ok(selected) = self.backend.session_router.resolve(Some(alias))
-                && raw.get("working_directory_id").and_then(Json::as_str)
-                    == Some(selected.session.workdir().id().as_str())
-                && selected
-                    .session
-                    .capabilities()
-                    .supports(workdir::WorkdirSessionCapability::Read)
+        } else if !self.checkout_content {
+            "unpublished"
+        } else if let Some(alias) = alias
+            && let Ok(selected) = self.backend.session_router.resolve(Some(alias))
+            && workdir == Some(selected.session.workdir().id().as_str())
+        {
+            if selected
+                .session
+                .capabilities()
+                .supports(workdir::WorkdirSessionCapability::Read)
             {
+                // Alias and Workdir identity alone do not identify a connection lifetime.
+                // Refuse an entrance when the Backend no longer recognizes this exact link.
+                if !self
+                    .backend
+                    .client
+                    .authorize_workdir_attachment_operation("workdir.attachment.read", alias, id)
+                    .is_ok_and(|current| Some(current.as_str()) == id)
+                {
+                    result.insert("content_state".into(), json!("unavailable"));
+                    return Ok(());
+                }
                 result.insert(
                     "checkout_path".into(),
                     json!(crate::checkout::checkout_root(alias)),
                 );
-                result.insert("checkout_slug".into(), json!(encode_identity(alias)));
+                "available"
+            } else {
+                "unsupported"
             }
+        } else {
+            "disconnected"
+        };
+        result.insert("content_state".into(), json!(state));
+        Ok(())
+    }
+
+    fn attached_reference(&self, alias: &str, workdir: &str) -> Option<Json> {
+        if !self.catalog {
+            return None;
         }
-        result.insert("path".into(), json!(item_path(domain, id)));
-        Ok(Json::Object(result))
+        // Resolve only the selected alias through current authority, never scan all pages.
+        // Attach has no response connection ID: this is a separate current observation,
+        // not proof that the connection cannot change before later Inspect.
+        let connection = self
+            .backend
+            .client
+            .authorize_workdir_attachment_operation("workdir.attachment.read", alias, None)
+            .ok()?;
+        self.authorize(
+            "WorkdirAttachmentRead",
+            &self.read_input(Domain::Attachment, &connection),
+        )
+        .ok()?;
+        let raw = self.raw_item(Domain::Attachment, &connection).ok()?;
+        if raw.get("alias").and_then(Json::as_str) != Some(alias)
+            || raw.get("working_directory_id").and_then(Json::as_str) != Some(workdir)
+        {
+            return None;
+        }
+        self.projected(Domain::Attachment, &raw).ok()
     }
 }
 
@@ -848,18 +914,12 @@ impl WipOperationHandler for ItemHandler {
                     let mut result = raw;
                     result["workdir_path"] = json!(item_path(Domain::Workdir, &self.id));
                     result["attachments_path"] = json!(ATTACHMENTS);
-                    if let Some(alias) = input.get("alias").and_then(Json::as_str)
-                        && self
-                            .provider
-                            .backend
-                            .session_router
-                            .resolve(Some(alias))
-                            .is_ok()
-                    {
-                        result["checkout_path"] = json!(crate::checkout::checkout_root(alias));
-                        result["checkout_slug"] = json!(encode_identity(alias));
-                    }
-                    // Backend attachment list supplies the durable lifetime identity.
+                    result["attachment"] = input
+                        .get("alias")
+                        .and_then(Json::as_str)
+                        .and_then(|alias| self.provider.attached_reference(alias, &self.id))
+                        .map(|value| json!({"$case":"available", "value":value}))
+                        .unwrap_or_else(|| json!({"$case":"unavailable"}));
                     result
                 } else {
                     raw
@@ -1043,6 +1103,7 @@ fn operation(
     name: &str,
     summary: &str,
     parameters: Vec<ParameterDeclaration>,
+    returns: TypeExpr,
 ) -> OperationDeclaration {
     OperationDeclaration {
         name: name.into(),
@@ -1053,7 +1114,7 @@ fn operation(
         parameters,
         returns: ReturnDeclaration {
             documentation: None,
-            r#type: TypeExpr::Json,
+            r#type: returns,
         },
     }
 }
@@ -1081,15 +1142,17 @@ fn collection_descriptor(domain: Domain, management: bool) -> InterfaceDescripto
                     parameter("runtime_id", false, TypeExpr::String),
                     parameter("display_name", false, TypeExpr::String),
                 ],
+                result::created(domain),
             )]
         } else {
             vec![operation(
                 "list",
-                "List a bounded page of visible Objects with item paths",
+                "List a bounded page of visible Objects with typed Entries",
                 vec![
                     parameter("limit", false, TypeExpr::Integer),
                     parameter("cursor", false, TypeExpr::String),
                 ],
+                result::page(domain),
             )]
         },
     )
@@ -1105,14 +1168,21 @@ fn item_descriptor(domain: Domain, management: bool) -> InterfaceDescriptor {
                         "attach",
                         ATTACH_DESCRIPTION,
                         vec![parameter("alias", true, TypeExpr::String)],
+                        result::attached(),
                     ),
                     operation(
                         "delete",
                         DELETE_DESCRIPTION,
                         vec![parameter("reason", true, TypeExpr::String)],
+                        TypeExpr::Json,
                     ),
                 ],
-                Domain::Attachment => vec![operation("detach", DETACH_DESCRIPTION, vec![])],
+                Domain::Attachment => vec![operation(
+                    "detach",
+                    DETACH_DESCRIPTION,
+                    vec![],
+                    TypeExpr::Json,
+                )],
                 Domain::Repository => vec![],
             }
         } else {
@@ -1120,6 +1190,7 @@ fn item_descriptor(domain: Domain, management: bool) -> InterfaceDescriptor {
                 "read",
                 "Read this Object through current Workspace authority",
                 vec![],
+                result::item(domain),
             )]
         },
     )
@@ -1146,7 +1217,7 @@ pub(crate) mod tests {
             Vec<server_api::authorization::BoundOperationAuthorizationRequest>,
         pub(crate) authorization_denied: bool,
         pub(crate) denied: bool,
-        config_current: Option<Json>,
+        pub(crate) config_current: Option<Json>,
         generation: usize,
     }
     impl Default for CatalogClient {
@@ -1447,6 +1518,69 @@ pub(crate) mod tests {
         assert!(!projected.to_string().contains("SECRET"));
     }
 
+    #[tokio::test]
+    async fn physical_entrance_requires_publication_session_capability_and_exact_connection() {
+        let client = Arc::new(CatalogClient::default());
+        let raw = json!({"alias":"checkout", "connection_id":"current", "working_directory_id":"wd", "capabilities":{"bits":63}});
+        client.state.lock().unwrap().attachments.push(raw.clone());
+        let mut p = provider(client.clone(), true, true, None);
+        let project = |p: &Provider, raw: &Json| p.projected(Domain::Attachment, raw).ok().unwrap();
+        assert_eq!(project(&p, &raw)["content_state"], "unpublished");
+        p.checkout_content = true;
+        assert_eq!(project(&p, &raw)["content_state"], "disconnected");
+        let alias = workdir::WorkdirAttachmentAlias::new("checkout").unwrap();
+        p.backend
+            .session_router
+            .attach(
+                alias.clone(),
+                WorkspaceAttachedWorkdirSession::handle_for_workdir_with_capabilities(
+                    client.clone(),
+                    "checkout",
+                    "wd",
+                    WorkdirSessionCapabilities::EMPTY,
+                ),
+            )
+            .unwrap();
+        assert_eq!(project(&p, &raw)["content_state"], "unsupported");
+        p.backend.session_router.detach(&alias).await.unwrap();
+        p.backend
+            .session_router
+            .attach(
+                alias,
+                WorkspaceAttachedWorkdirSession::handle_for_workdir(client, "checkout", "wd"),
+            )
+            .unwrap();
+        assert_eq!(project(&p, &raw)["content_state"], "available");
+        let mut old = raw.clone();
+        old["connection_id"] = json!("old");
+        let old = project(&p, &old);
+        assert_eq!(old["content_state"], "unavailable");
+        assert!(old.get("checkout_path").is_none());
+    }
+
+    #[test]
+    fn result_contract_validates_entry_coordinates_without_guessing_plain_strings() {
+        let p = provider(Arc::new(CatalogClient::default()), true, true, None);
+        let descriptor = item_descriptor(Domain::Repository, false);
+        let mut raw = json!({"repository_key":"key", "display_name":"not an Entry /?", "default_selector":"refs/heads/feature"});
+        let projected = p.projected(Domain::Repository, &raw).ok().unwrap();
+        descriptor
+            .validate_result("read", &json_to_wip(&projected).unwrap())
+            .unwrap();
+        let mut bad = projected;
+        bad["path"] = json!("not-an-absolute-entry");
+        assert!(
+            descriptor
+                .validate_result("read", &json_to_wip(&bad).unwrap())
+                .is_err()
+        );
+        raw["repository_key"] = json!("repo/name");
+        let projected = p.projected(Domain::Repository, &raw).ok().unwrap();
+        descriptor
+            .validate_result("read", &json_to_wip(&projected).unwrap())
+            .unwrap();
+    }
+
     fn provider(
         client: Arc<CatalogClient>,
         catalog: bool,
@@ -1458,6 +1592,7 @@ pub(crate) mod tests {
             catalog,
             manage,
             config_content: false,
+            checkout_content: false,
             permissions,
         }
     }
@@ -1833,6 +1968,7 @@ mod lifetime_tests {
             catalog: true,
             manage: true,
             config_content: false,
+            checkout_content: false,
         };
         let handler = CollectionHandler {
             provider: p.clone(),
@@ -1930,6 +2066,7 @@ mod logical_capability_tests {
             catalog: true,
             manage: true,
             config_content: false,
+            checkout_content: false,
             permissions: None,
         };
         let item = ItemHandler {
