@@ -10,6 +10,13 @@
 //! the normal Engine tool path, hooks are installed through
 //! [`crate::hook::HookRegistryBuilder`], and provider output is represented as
 //! ordinary feature reports/diagnostics instead of a separate authority layer.
+//!
+//! Native WIP contributions use a Host-supplied staging registry. Descriptor
+//! preflight and the existing module/scope rollback cover their publication
+//! metadata together with Tools, instructions, hooks, and services. Snapshotting
+//! mount metadata clones live handles, not permission decisions or Client
+//! observations. This is install rollback, not runtime lease/revocation; final
+//! WIP aggregation and namespace allocation remain Host-owned.
 
 use std::any::{Any, type_name};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -620,6 +627,9 @@ pub struct FeatureDescriptor {
     pub tools: Vec<ToolDeclaration>,
     pub hooks: Vec<HookDeclaration>,
     pub instructions: Vec<FeatureInstructionDeclaration>,
+    /// Named native WIP contributions staged with the rest of the install scope.
+    #[serde(default)]
+    pub wip_mounts: Vec<String>,
     pub background_tasks: Vec<BackgroundTaskDeclaration>,
     pub provides_services: Vec<ServiceDeclaration>,
     pub requires_services: Vec<ServiceRequirement>,
@@ -640,6 +650,7 @@ impl FeatureDescriptor {
             tools: Vec::new(),
             hooks: Vec::new(),
             instructions: Vec::new(),
+            wip_mounts: Vec::new(),
             background_tasks: Vec::new(),
             provides_services: Vec::new(),
             requires_services: Vec::new(),
@@ -660,6 +671,11 @@ impl FeatureDescriptor {
 
     pub fn with_hook(mut self, hook: HookDeclaration) -> Self {
         self.hooks.push(hook);
+        self
+    }
+
+    pub fn with_wip_mount(mut self, name: impl Into<String>) -> Self {
+        self.wip_mounts.push(name.into());
         self
     }
 
@@ -746,6 +762,7 @@ pub enum FeatureContributionKind {
     Tool,
     Hook,
     Instruction,
+    WipMount,
     BackgroundTask,
     Service,
     ProtocolProvider,
@@ -770,6 +787,8 @@ pub struct FeatureInstallReport {
     pub runtime: FeatureRuntimeKind,
     pub installed: bool,
     pub installed_tools: Vec<String>,
+    #[serde(default)]
+    pub installed_wip_mounts: Vec<String>,
     pub installed_hooks: Vec<HookDeclaration>,
     pub installed_instructions: Vec<FeatureInstructionDeclaration>,
     pub declared_background_tasks: Vec<BackgroundTaskDeclaration>,
@@ -788,6 +807,7 @@ impl FeatureInstallReport {
             runtime: descriptor.runtime.clone(),
             installed: false,
             installed_tools: Vec::new(),
+            installed_wip_mounts: Vec::new(),
             installed_hooks: Vec::new(),
             installed_instructions: Vec::new(),
             declared_background_tasks: Vec::new(),
@@ -803,6 +823,7 @@ impl FeatureInstallReport {
     fn clear_installed_contributions(&mut self) {
         self.installed = false;
         self.installed_tools.clear();
+        self.installed_wip_mounts.clear();
         self.installed_hooks.clear();
         self.installed_instructions.clear();
         self.declared_background_tasks.clear();
@@ -829,6 +850,7 @@ struct FeatureContributionDeclarations {
     tools: HashSet<String>,
     hooks: HashSet<(String, FeatureHookPoint)>,
     instructions: HashSet<FeatureInstructionId>,
+    wip_mounts: HashSet<String>,
     background_tasks: HashSet<String>,
     provided_services: HashSet<(ServiceId, String)>,
     required_services: HashSet<ServiceId>,
@@ -874,6 +896,7 @@ impl FeatureContributionDeclarations {
                 .iter()
                 .map(|provider| provider.id.clone())
                 .collect(),
+            wip_mounts: descriptor.wip_mounts.iter().cloned().collect(),
             chat_invocations: descriptor.chat_invocations.clone(),
         }
     }
@@ -1304,6 +1327,53 @@ impl FeatureInstructionRegistrar<'_> {
     }
 }
 
+/// Native projection registrar. Mounts mutate only a Host-supplied staging
+/// registry; module or scope failure restores its previous publication exactly.
+/// Namespace allocation stays with trusted composition, not the consumer.
+pub struct FeatureWipRegistrar<'a> {
+    feature_id: &'a FeatureId,
+    declarations: &'a FeatureContributionDeclarations,
+    registry: Option<&'a mut crate::wip::WipMountRegistry>,
+    report: &'a mut FeatureInstallReport,
+}
+
+impl FeatureWipRegistrar<'_> {
+    pub fn register(
+        &mut self,
+        name: &str,
+        mount: impl FnOnce(&mut crate::wip::WipMountRegistry) -> Result<(), crate::wip::WipMountError>,
+    ) -> Result<(), FeatureInstallError> {
+        if !self.declarations.wip_mounts.contains(name) {
+            return Err(reject_undeclared_contribution(
+                self.feature_id,
+                self.report,
+                FeatureContributionKind::WipMount,
+                name,
+            ));
+        }
+        if self
+            .report
+            .installed_wip_mounts
+            .iter()
+            .any(|installed| installed == name)
+        {
+            return Err(FeatureInstallError::InvalidDescriptor(format!(
+                "duplicate WIP contribution: {name}"
+            )));
+        }
+        let registry = self.registry.as_deref_mut().ok_or_else(|| {
+            FeatureInstallError::InvalidDescriptor(format!(
+                "WIP contribution {name} requires a Host mount registry"
+            ))
+        })?;
+        mount(registry).map_err(|error| {
+            FeatureInstallError::InvalidDescriptor(format!("mount {name}: {error}"))
+        })?;
+        self.report.installed_wip_mounts.push(name.to_owned());
+        Ok(())
+    }
+}
+
 /// Registrar for executable, Worker-managed background task contributions.
 pub struct BackgroundTaskRegistrar<'a> {
     feature_id: &'a FeatureId,
@@ -1548,6 +1618,7 @@ pub struct FeatureInstallContext<'a> {
     feature_id: &'a FeatureId,
     declarations: &'a FeatureContributionDeclarations,
     pending_tools: &'a mut Vec<ToolDefinition>,
+    wip_mounts: Option<&'a mut crate::wip::WipMountRegistry>,
     installed_tool_names: &'a mut HashMap<String, FeatureId>,
     hook_builder: &'a mut HookRegistryBuilder,
     background_task_builder: &'a mut FeatureBackgroundTaskRegistryBuilder,
@@ -1559,6 +1630,15 @@ pub struct FeatureInstallContext<'a> {
 impl FeatureInstallContext<'_> {
     pub fn feature_id(&self) -> &FeatureId {
         self.feature_id
+    }
+
+    pub fn wip(&mut self) -> FeatureWipRegistrar<'_> {
+        FeatureWipRegistrar {
+            feature_id: self.feature_id,
+            declarations: self.declarations,
+            registry: self.wip_mounts.as_deref_mut(),
+            report: self.report,
+        }
     }
 
     pub fn tools(&mut self) -> ToolContributionRegistrar<'_> {
@@ -2034,10 +2114,20 @@ impl FeatureRegistryBuilder {
     }
 
     /// Install modules into the existing Engine tool path and hook builder.
+    #[cfg(test)]
     pub(crate) fn install_into_engine<C: LlmClient, A: Send + Sync>(
         self,
         worker: &mut Engine<C, Mutable, A>,
         hook_builder: &mut HookRegistryBuilder,
+    ) -> FeatureRegistryInstallReport {
+        self.install_into_engine_with_wip(worker, hook_builder, None)
+    }
+
+    pub(crate) fn install_into_engine_with_wip<C: LlmClient, A: Send + Sync>(
+        self,
+        worker: &mut Engine<C, Mutable, A>,
+        hook_builder: &mut HookRegistryBuilder,
+        wip_mounts: Option<&mut crate::wip::WipMountRegistry>,
     ) -> FeatureRegistryInstallReport {
         let mut pending_tools = Vec::new();
         worker.tool_server_handle().flush_pending();
@@ -2051,6 +2141,7 @@ impl FeatureRegistryBuilder {
             &mut pending_tools,
             hook_builder,
             registered_tool_names,
+            wip_mounts,
         );
         if !report.has_errors() {
             worker.register_tools(pending_tools);
@@ -2064,7 +2155,7 @@ impl FeatureRegistryBuilder {
         pending_tools: &mut Vec<ToolDefinition>,
         hook_builder: &mut HookRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
-        self.install_into_pending_with_registered(pending_tools, hook_builder, HashMap::new())
+        self.install_into_pending_with_registered(pending_tools, hook_builder, HashMap::new(), None)
     }
 
     fn install_into_pending_with_registered(
@@ -2072,6 +2163,7 @@ impl FeatureRegistryBuilder {
         pending_tools: &mut Vec<ToolDefinition>,
         hook_builder: &mut HookRegistryBuilder,
         mut installed_tool_names: HashMap<String, FeatureId>,
+        mut wip_mounts: Option<&mut crate::wip::WipMountRegistry>,
     ) -> FeatureRegistryInstallReport {
         if self.installation == FeatureInstallation::Activate
             && let Some(error) = self
@@ -2149,6 +2241,7 @@ impl FeatureRegistryBuilder {
         let mut reports = Vec::with_capacity(plan.ordered_indices.len());
         let install_hook_checkpoint = hook_builder.checkpoint();
         let install_tool_checkpoint = pending_tools.len();
+        let install_wip_checkpoint = wip_mounts.as_deref().cloned();
         let mut modules = self.modules.into_iter().map(Some).collect::<Vec<_>>();
         let ordered_modules = plan
             .ordered_indices
@@ -2171,6 +2264,7 @@ impl FeatureRegistryBuilder {
             let service_checkpoint = service_registry.clone();
             let invocation_checkpoint = invocation_registry.clone();
             let tool_checkpoint = pending_tools.len();
+            let wip_checkpoint = wip_mounts.as_deref().cloned();
             let installed_tool_checkpoint = installed_tool_names.clone();
 
             let mut required_service_failed = false;
@@ -2213,6 +2307,7 @@ impl FeatureRegistryBuilder {
                     feature_id: &descriptor.id,
                     declarations: &declarations,
                     pending_tools,
+                    wip_mounts: wip_mounts.as_deref_mut(),
                     installed_tool_names: &mut installed_tool_names,
                     hook_builder,
                     background_task_builder: &mut background_task_builder,
@@ -2231,6 +2326,11 @@ impl FeatureRegistryBuilder {
                     service_registry = service_checkpoint.clone();
                     invocation_registry = invocation_checkpoint.clone();
                     pending_tools.truncate(tool_checkpoint);
+                    if let (Some(registry), Some(checkpoint)) =
+                        (wip_mounts.as_deref_mut(), &wip_checkpoint)
+                    {
+                        *registry = checkpoint.clone();
+                    }
                     installed_tool_names = installed_tool_checkpoint.clone();
                     report.clear_installed_contributions();
                     report
@@ -2239,6 +2339,13 @@ impl FeatureRegistryBuilder {
                 }
             }
             if report.installed {
+                for name in &descriptor.wip_mounts {
+                    if !report.installed_wip_mounts.contains(name) {
+                        report.diagnostics.push(FeatureDiagnostic::error(format!(
+                            "declared WIP contribution {name} was not installed"
+                        )));
+                    }
+                }
                 for hook in &descriptor.hooks {
                     if !report.installed_hooks.contains(hook) {
                         report.diagnostics.push(FeatureDiagnostic::error(format!(
@@ -2273,6 +2380,11 @@ impl FeatureRegistryBuilder {
                     service_registry = service_checkpoint.clone();
                     invocation_registry = invocation_checkpoint.clone();
                     pending_tools.truncate(tool_checkpoint);
+                    if let (Some(registry), Some(checkpoint)) =
+                        (wip_mounts.as_deref_mut(), &wip_checkpoint)
+                    {
+                        *registry = checkpoint.clone();
+                    }
                     installed_tool_names = installed_tool_checkpoint.clone();
                     report.clear_installed_contributions();
                     report.clear_installed_contributions();
@@ -2290,6 +2402,11 @@ impl FeatureRegistryBuilder {
         if failed {
             hook_builder.rollback_to(install_hook_checkpoint);
             pending_tools.truncate(install_tool_checkpoint);
+            if let (Some(registry), Some(checkpoint)) =
+                (wip_mounts.as_deref_mut(), install_wip_checkpoint)
+            {
+                *registry = checkpoint;
+            }
             for report in &mut reports {
                 if report.installed {
                     report.clear_installed_contributions();
@@ -3778,5 +3895,9 @@ mod tests {
             vec!["TaskCreate", "TaskList", "TaskGet", "TaskUpdate"]
         );
         assert!(report.reports[0].installed);
+    }
+
+    mod composition_tests {
+        include!("feature/composition_tests.rs");
     }
 }

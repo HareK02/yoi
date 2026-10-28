@@ -22,7 +22,6 @@ use crate::shutdown_after_idle::{
     take_shutdown_request_after_status,
 };
 use crate::spawn::registry::{PreparedSpawnedWorkerRegistryLoad, SpawnedWorkerRegistry};
-use crate::spawn::tool::sub_worker_spawn_tool;
 use crate::worker::{
     PendingSubmissionHandle, SystemItemCommitter, Worker, WorkerError, WorkerRunResult,
 };
@@ -1427,10 +1426,9 @@ fn validate_memory_lifecycle_targets(
     Ok(())
 }
 
-/// Register the builtin file-manipulation tools, optional memory tools,
-/// and the Worker-orchestration tools (SubWorkerSpawn + comm) on the Worker's
-/// Engine. Returns the WorkdirSession handle used to attach a `WorkerFsView` to
-/// the shared state.
+/// Compose Worker Features with Host-owned live bindings and install their
+/// staged contributions. Remaining direct registrations are Worker-lifetime
+/// infrastructure (paste/Workdir) and the image/web migration follow-ups.
 pub(crate) async fn register_worker_tools<C, St>(
     worker: &mut Worker<C, St>,
 
@@ -1463,7 +1461,6 @@ where
     let task_feature = worker.task_feature();
     let web_config = worker.manifest().web.clone();
     let mcp_config = worker.manifest().mcp.clone();
-    let spawner_name = worker.manifest().worker.name.clone();
     let spawner_manifest = worker.manifest().clone();
     let spawner_workspace_context = worker.workspace_context_handle();
     let pending_submissions = worker.pending_submission_handle();
@@ -1900,10 +1897,6 @@ where
         }
     }
 
-    if feature_config.sub_worker.enabled {
-        worker.register_worker_orchestration_instruction();
-    }
-
     let host_worker_observation_provider = worker.worker_observation_provider();
     let wip_permissions = worker.manifest().permissions.clone();
     let mut wip_mount_registry = crate::wip::WipMountRegistry::new();
@@ -1973,7 +1966,6 @@ where
     }
     {
         let workspace_client = worker.workspace_client_handle();
-        let engine = worker.engine_mut();
 
         // Allocate cross-domain input reference coordinates before mounting either provider.
         // Allocation is not publication or authorization; current handlers still check both.
@@ -2050,66 +2042,29 @@ where
             })?;
         }
 
-        // Objective tools expose scoped project Objective reads and mutations through
-        // the Backend Workspace API. Workers must not guess local `.yoi/objectives`
-        // paths or read/edit Objective files directly.
-        if feature_config.objective.enabled {
-            if workspace_client.is_available() && workspace_client.workspace_id().is_some() {
-                for definition in crate::feature::builtin::objective::workspace_http_objective_tools(
-                    workspace_client.clone(),
-                ) {
-                    engine.register_tool(definition);
-                }
-                if let Some(namespace_route) = &objective_namespace {
-                    crate::feature::builtin::objective::mount_workspace_http_objective_wip(
-                        &mut wip_mount_registry,
-                        workspace_client.clone(),
-                        wip_permissions.clone(),
-                        &namespace_route,
-                    )
-                    .map_err(|error| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("mount Objective WIP projection: {error}"),
-                        )
-                    })?;
-                }
-            } else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "objective tools require Backend Workspace API authority",
-                ));
-            }
-        }
+        crate::feature::builtin::objective::composition::compose(
+            &mut feature_registry,
+            feature_config.objective.enabled,
+            workspace_client,
+            objective_namespace.map(|route| (route, wip_permissions.clone())),
+        )?;
 
         let mut observation_providers: Vec<
             Arc<dyn crate::feature::builtin::worker_observation::WorkerObservationProvider>,
         > = Vec::new();
 
-        // Worker-orchestration tools derive child filesystem authority from the
-        // active provider-backed Workdir session. The tool remains registered
-        // without one so invocation fails deterministically until the parent
-        // attaches a Workdir.
-        if feature_config.sub_worker.enabled {
-            let spawner_workspace_root = local_workspace_root
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("/"));
-            engine.register_tool(sub_worker_spawn_tool(
-                spawner_name.clone(),
-                spawner_workspace_context,
-                parent_notifications,
-                runtime_base.clone(),
-                spawner_workspace_root,
-                workdir_tool_broker,
-                spawned_registry.clone(),
-                spawner_manifest,
-                prompts,
-            ));
-            observation_providers.push(Arc::new(
-                crate::feature::builtin::worker_observation::SpawnedSubWorkerObservationProvider::new(
-                    spawned_registry,
-                ),
-            ));
+        if let Some(provider) = crate::feature::builtin::sub_worker::compose(
+            &mut feature_registry,
+            spawner_manifest,
+            spawner_workspace_context,
+            parent_notifications,
+            runtime_base,
+            local_workspace_root,
+            workdir_tool_broker,
+            spawned_registry,
+            prompts,
+        ) {
+            observation_providers.push(provider);
         }
         if let Some(provider) = host_worker_observation_provider {
             observation_providers.push(provider);
@@ -2126,7 +2081,8 @@ where
             );
         }
     }
-    let feature_install_report = worker.install_features(feature_registry);
+    let feature_install_report =
+        worker.install_features_with_wip(feature_registry, Some(&mut wip_mount_registry));
     if feature_install_report.has_errors() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

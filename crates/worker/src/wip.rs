@@ -313,6 +313,7 @@ pub trait WipDynamicItemResolver: Send + Sync {
     }
 }
 
+#[derive(Clone)]
 pub struct WipDynamicMount {
     pub collection_route: String,
     pub capability: String,
@@ -378,6 +379,7 @@ pub trait WipSubtreeProvider: Send + Sync {
     async fn children(&self, path: &str) -> Result<Vec<String>, ProtocolError>;
 }
 
+#[derive(Clone)]
 pub struct WipSubtreeMount {
     pub root: String,
     pub provider: Arc<dyn WipSubtreeProvider>,
@@ -395,6 +397,7 @@ pub struct WipDynamicOperationContribution {
     pub resolver: Arc<dyn WipDynamicOperationResolver>,
 }
 
+#[derive(Clone)]
 struct MountedDynamicOperationContribution {
     contributor: String,
     operations: Vec<String>,
@@ -412,6 +415,7 @@ impl WipNamespaceRoute {
     }
 }
 
+#[derive(Clone)]
 struct MountedProjection {
     projection: WipProjection,
     operation_handlers: BTreeMap<String, (String, Arc<dyn WipOperationHandler>)>,
@@ -497,7 +501,7 @@ impl WipOperationHandler for OperationDispatchHandler {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct WipMountRegistry {
     mounts: BTreeMap<String, MountedProjection>,
     additional_interfaces: BTreeMap<String, Vec<WipProjection>>,

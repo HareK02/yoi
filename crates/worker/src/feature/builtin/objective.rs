@@ -17,6 +17,8 @@
 //! logic. Query/detail uses canonical references and bounded bodies/events, omitting internal
 //! storage IDs from output.
 
+pub(crate) mod composition;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 #[cfg(test)]
