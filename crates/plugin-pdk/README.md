@@ -1,9 +1,5 @@
 # plugin-pdk
 
-Guest-side JSON/WIT helpers for offline Component Model packages. Without depending on host/runtime crates, it converts Tool and Service inputs/outputs and bounds Tool output size. Using the PDK or validating a package does not authorize installation or execution in a Worker.
+Guest-side Rust helpers for the versioned Component Model Tool contract. [`ToolContext`] decodes only non-secret invocation data; [`ToolOutput`] rejects oversized data and separates structured output from presentation text. [`export_component_tool!`] adapts generated WIT bindings and preserves the result's error arm.
 
-## Main entry points
-
-- [`run_json_tool`] and [`export_component_tool!`] — typed Tool input/output boundary
-- [`ToolOutput`] and [`ToolError`] — bounded output and errors
-- [`ServiceOutput`] and [`export_plugin_instance!`] — instance output contracts
+Host authorization, schema validation, effect receipts and execution belong to the Host, not this crate. The PDK does not import WASI, implement a Host, or provide Service/event/Workdir/WebSocket stubs. Old v1 packages require an explicit v2 rebuild rather than a compatibility adapter.

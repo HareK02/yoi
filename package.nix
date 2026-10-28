@@ -44,7 +44,7 @@ rustPlatform.buildRustPackage rec {
   };
 
   # All four WIP SDK crates resolve from crates.io 0.2.0 via Cargo.lock checksums.
-  cargoHash = "sha256-L1RR+zdcVxMGvEonGxERgcvzjxzXro4n2j2syBeR/m0=";
+  cargoHash = "sha256-cLDfqFu6H9YjaL5EpTs5NE2GzkeS0qYcj5Ys/6U5u40=";
 
   depsExtraArgs = {
     # Older fetchCargoVendor utilities used crates.io's API download endpoint,

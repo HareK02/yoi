@@ -8,10 +8,14 @@
 //!
 //! Archives use a restricted stored-ZIP subset. Unsafe paths, links, unsupported
 //! entries, size/count limit violations, and inconsistent headers are rejected;
-//! the file set is digested in order. Directory inputs also reject internal links
-//! and undergo the same validation, so distribution formats share the package
+//! the file set is digested in order. Canonical ZIP32 output stores files in
+//! path order with fixed metadata, CRC32, no compression, extras or comments.
+//! Directory inputs also reject internal links and undergo the same validation,
+//! so distribution formats share the package
 //! contract. Component Model metadata is required; legacy core-Wasm runtime
-//! declarations are rejected. Validation covers the offline format, not safety
+//! declarations are rejected. Tool schemas use the offline 2020-12 subset in
+//! [`schema`]; non-secret config uses closed static DCDL syntax, never JSON Schema.
+//! Validation covers the offline format, not safety
 //! established by running components.
 
 use serde::{Deserialize, Serialize};
@@ -19,14 +23,17 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-const SUPPORTED_PLUGIN_API_VERSION: u32 = 1;
+pub const SUPPORTED_PLUGIN_API_VERSION: u32 = 2;
+
+pub mod component;
+pub mod schema;
 const ZIP_EOCD: u32 = 0x0605_4b50;
 const ZIP_CENTRAL_DIRECTORY: u32 = 0x0201_4b50;
 const ZIP_LOCAL_FILE: u32 = 0x0403_4b50;
-const ZIP_FLAG_ENCRYPTED: u16 = 0x0001;
+
 const ZIP_COMPRESSION_STORED: u16 = 0;
 const ZIP_UNIX_SYMLINK_TYPE: u32 = 0o120000;
 const ZIP_UNIX_FILE_TYPE_MASK: u32 = 0o170000;
@@ -40,9 +47,17 @@ pub struct PluginTemplateResource {
 /// Embedded starter template for Rust Component Model Tool Plugins.
 ///
 /// The template is data only: it performs no filesystem/network operations and
-/// grants no authority. Future authoring CLI commands can materialize these
-/// files into a chosen destination after applying their own overwrite policy.
+/// grants no authority. Authoring commands materialize these files only into an
+/// explicitly chosen empty destination.
 pub const RUST_COMPONENT_TOOL_TEMPLATE: &[PluginTemplateResource] = &[
+    PluginTemplateResource {
+        path: "wit/yoi-plugin-v2.wit",
+        contents: include_str!("../../../resources/plugin/wit/yoi-plugin-v2.wit"),
+    },
+    PluginTemplateResource {
+        path: "wit/deps/yoi-host/yoi-host-v2.wit",
+        contents: include_str!("../../../resources/plugin/wit/deps/yoi-host/yoi-host-v2.wit"),
+    },
     PluginTemplateResource {
         path: "Cargo.toml",
         contents: include_str!(
@@ -62,237 +77,87 @@ pub const RUST_COMPONENT_TOOL_TEMPLATE: &[PluginTemplateResource] = &[
         ),
     },
     PluginTemplateResource {
-        path: "plugin.component.wasm",
-        contents: include_str!(
-            "../../../resources/plugin/templates/rust-component-tool/plugin.component.wasm"
-        ),
-    },
-    PluginTemplateResource {
         path: "README.md",
         contents: include_str!("../../../resources/plugin/templates/rust-component-tool/README.md"),
     },
 ];
 
-/// Embedded starter template for Rust Component Model instance Plugins.
-pub const RUST_COMPONENT_INSTANCE_TEMPLATE: &[PluginTemplateResource] = &[
+/// HTTPS authoring imports typed resources; it does not implement Host networking.
+pub const RUST_COMPONENT_HTTPS_TOOL_TEMPLATE: &[PluginTemplateResource] = &[
+    PluginTemplateResource {
+        path: "wit/yoi-plugin-v2.wit",
+        contents: include_str!("../../../resources/plugin/wit/yoi-plugin-v2.wit"),
+    },
+    PluginTemplateResource {
+        path: "wit/deps/yoi-host/yoi-host-v2.wit",
+        contents: include_str!("../../../resources/plugin/wit/deps/yoi-host/yoi-host-v2.wit"),
+    },
     PluginTemplateResource {
         path: "Cargo.toml",
         contents: include_str!(
-            "../../../resources/plugin/templates/rust-component-instance/Cargo.toml"
+            "../../../resources/plugin/templates/rust-component-https/Cargo.toml"
         ),
     },
     PluginTemplateResource {
         path: "src/lib.rs",
         contents: include_str!(
-            "../../../resources/plugin/templates/rust-component-instance/src/lib.rs"
+            "../../../resources/plugin/templates/rust-component-https/src/lib.rs"
         ),
     },
     PluginTemplateResource {
         path: "plugin.toml",
         contents: include_str!(
-            "../../../resources/plugin/templates/rust-component-instance/plugin.toml"
-        ),
-    },
-    PluginTemplateResource {
-        path: "plugin.component.wasm",
-        contents: include_str!(
-            "../../../resources/plugin/templates/rust-component-instance/plugin.component.wasm"
+            "../../../resources/plugin/templates/rust-component-https/plugin.toml"
         ),
     },
     PluginTemplateResource {
         path: "README.md",
         contents: include_str!(
-            "../../../resources/plugin/templates/rust-component-instance/README.md"
+            "../../../resources/plugin/templates/rust-component-https/README.md"
         ),
     },
 ];
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PluginPermission {
-    Surface { surface: PluginSurface },
-    Tool { name: String },
-    ToolNamespace { namespace: String },
-    Service { name: String },
-    Ingress { name: String },
-    ExternalWrite,
-    HostApi { api: PluginHostApi },
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PluginRequestGrant {
-    /// Exact URL scheme allowed by this target, for example `https` or `http`; `*` is broad.
-    pub scheme: String,
-    /// Exact request host allowed by this target. `*` is broad and must be surfaced in diagnostics.
-    pub host: String,
-    /// Optional exact port. `None` means the scheme default or any explicit port for that host.
-    pub port: Option<u16>,
-    /// Uppercase HTTP methods allowed for this target, for example `GET` or `POST`.
-    pub methods: Vec<String>,
-    /// Optional path prefixes allowed for this target. Empty means any absolute path on the host.
-    pub path_prefixes: Vec<String>,
-}
-
-impl PluginRequestGrant {
-    pub fn label(&self) -> String {
-        let scheme = if self.scheme.trim().is_empty() {
-            "<no-scheme>"
-        } else {
-            self.scheme.as_str()
-        };
-        let host = if self.host.trim().is_empty() {
-            "<no-host>"
-        } else {
-            self.host.as_str()
-        };
-        let port = self.port.map(|port| format!(":{port}")).unwrap_or_default();
-        let methods = if self.methods.is_empty() {
-            "<no-methods>".to_string()
-        } else {
-            self.methods.join(",")
-        };
-        let paths = if self.path_prefixes.is_empty() {
-            "*".to_string()
-        } else {
-            self.path_prefixes.join(",")
-        };
-        let broad = if self.is_broad() {
-            " [broad-request]"
-        } else {
-            ""
-        };
-        format!("{scheme}://{host}{port} {methods} {paths}{broad}")
-    }
-
-    pub fn is_broad(&self) -> bool {
-        self.scheme.trim() == "*" || self.host.trim() == "*" || self.path_prefixes.is_empty()
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PluginWebSocketGrant {
-    /// Exact URL scheme allowed by this WebSocket target: `wss` or `ws`; `*` is broad.
-    pub scheme: String,
-    /// Exact WebSocket host allowed by this target. `*` is broad and must be surfaced in diagnostics.
-    pub host: String,
-    /// Optional exact port. `None` means the scheme default or any explicit port for that host.
-    pub port: Option<u16>,
-    /// Optional path prefixes allowed for this target. Empty means any absolute path on the host.
-    pub path_prefixes: Vec<String>,
-}
-
-impl PluginWebSocketGrant {
-    pub fn label(&self) -> String {
-        let scheme = if self.scheme.trim().is_empty() {
-            "<no-scheme>"
-        } else {
-            self.scheme.as_str()
-        };
-        let host = if self.host.trim().is_empty() {
-            "<no-host>"
-        } else {
-            self.host.as_str()
-        };
-        let port = self.port.map(|port| format!(":{port}")).unwrap_or_default();
-        let paths = if self.path_prefixes.is_empty() {
-            "*".to_string()
-        } else {
-            self.path_prefixes.join(",")
-        };
-        let broad = if self.is_broad() {
-            " [broad-websocket]"
-        } else {
-            ""
-        };
-        format!("{scheme}://{host}{port} {paths}{broad}")
-    }
-
-    pub fn is_broad(&self) -> bool {
-        self.scheme.trim() == "*" || self.host.trim() == "*" || self.path_prefixes.is_empty()
-    }
-}
-
-impl PluginPermission {
-    pub fn label(&self) -> String {
-        match self {
-            Self::Surface { surface } => format!("surfaces.{surface}"),
-            Self::Tool { name } => format!("tool.{name}"),
-            Self::ToolNamespace { namespace } => format!("tool_namespace.{namespace}"),
-            Self::Service { name } => format!("service.{name}"),
-            Self::Ingress { name } => format!("ingress.{name}"),
-            Self::ExternalWrite => "external_write".to_string(),
-            Self::HostApi { api } => format!("host_api.{api}"),
-        }
-    }
-
-    pub fn surface(surface: PluginSurface) -> Self {
-        Self::Surface { surface }
-    }
-
-    pub fn tool(name: impl Into<String>) -> Self {
-        Self::Tool { name: name.into() }
-    }
-
-    pub fn tool_namespace(namespace: impl Into<String>) -> Self {
-        Self::ToolNamespace {
-            namespace: namespace.into(),
-        }
-    }
-
-    pub fn service(name: impl Into<String>) -> Self {
-        Self::Service { name: name.into() }
-    }
-
-    pub fn ingress(name: impl Into<String>) -> Self {
-        Self::Ingress { name: name.into() }
-    }
-
-    pub fn host_api(api: PluginHostApi) -> Self {
-        Self::HostApi { api }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginHostApi {
-    Request,
-    #[serde(rename = "websocket")]
-    WebSocket,
-    Fs,
-}
-
-impl fmt::Display for PluginHostApi {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Request => f.write_str("request"),
-            Self::WebSocket => f.write_str("websocket"),
-            Self::Fs => f.write_str("fs"),
-        }
-    }
-}
-
+/// The only supported v2 surface; future surfaces are not success stubs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginSurface {
-    Hook,
     Tool,
-    Service,
-    Ingress,
-    Wasm,
 }
 
 impl fmt::Display for PluginSurface {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PluginSurface::Hook => f.write_str("hook"),
-            PluginSurface::Tool => f.write_str("tool"),
-            PluginSurface::Service => f.write_str("service"),
-            PluginSurface::Ingress => f.write_str("ingress"),
-            PluginSurface::Wasm => f.write_str("wasm"),
-        }
+        f.write_str("tool")
     }
+}
+
+/// Capability requests are metadata, never effective grants.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginRequestedGrant {
+    Logging,
+    Https { slot: String },
+}
+
+/// A slot requests HTTPS protocol bounds, not credentials or concrete bindings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginConnectionSlot {
+    pub name: String,
+    pub methods: Vec<PluginHttpMethod>,
+    pub path_prefixes: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum PluginHttpMethod {
+    Get,
+    Head,
+    Post,
+    Put,
+    Patch,
+    Delete,
+    Options,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -366,82 +231,38 @@ pub struct PluginPackageManifest {
     pub name: String,
     pub version: String,
     pub description: Option<String>,
-    #[serde(default)]
     pub surfaces: Vec<PluginSurface>,
-    #[serde(default)]
-    pub runtime: Option<PluginRuntimeManifest>,
-    #[serde(default)]
-    pub hooks: Vec<PluginHookManifest>,
-    #[serde(default)]
+    pub runtime: PluginRuntimeManifest,
     pub tools: Vec<PluginToolManifest>,
+    /// Closed static DCDL type expression, not JSON Schema or guest code.
+    pub config_schema: String,
     #[serde(default)]
-    pub services: Vec<PluginServiceManifest>,
+    pub connections: Vec<PluginConnectionSlot>,
     #[serde(default)]
-    pub ingresses: Vec<PluginIngressManifest>,
-    /// Permission declarations stored in the offline package. They grant no authority
-    /// and are not consumed by the current Worker runtime.
-    #[serde(default)]
-    pub permissions: Vec<PluginPermission>,
-    /// URL target metadata retained in the offline package for a future installer.
-    #[serde(default)]
-    pub request: Vec<PluginRequestGrant>,
-    /// WebSocket target metadata retained in the offline package for a future installer.
-    #[serde(default)]
-    pub websocket: Vec<PluginWebSocketGrant>,
+    pub requested_grants: Vec<PluginRequestedGrant>,
 }
 
 impl PluginPackageManifest {
     pub fn declared_surfaces(&self) -> BTreeSet<PluginSurface> {
-        let mut surfaces: BTreeSet<_> = self.surfaces.iter().copied().collect();
-        if !self.hooks.is_empty() {
-            surfaces.insert(PluginSurface::Hook);
-        }
-        if !self.tools.is_empty() {
-            surfaces.insert(PluginSurface::Tool);
-        }
-        if !self.services.is_empty() {
-            surfaces.insert(PluginSurface::Service);
-        }
-        if !self.ingresses.is_empty() {
-            surfaces.insert(PluginSurface::Ingress);
-        }
-        if self.runtime.is_some() {
-            surfaces.insert(PluginSurface::Wasm);
-        }
-        surfaces
+        self.surfaces.iter().copied().collect()
     }
 }
 
-const LEGACY_PLUGIN_RUNTIME_WASM_KIND: &str = "wasm";
-const LEGACY_PLUGIN_RUNTIME_WASM_ABI: &str = "yoi-plugin-wasm-1";
-/// Component Model declaration kind accepted in offline packages.
-///
-/// Validates component paths and corresponding worlds; rejects legacy core-Wasm
-/// declarations. This constant implies neither runtime registration nor verified
-/// component execution.
 pub const PLUGIN_RUNTIME_COMPONENT_KIND: &str = "wasm-component";
-pub const PLUGIN_COMPONENT_TOOL_WORLD: &str = "yoi:plugin/tool@1.0.0";
-pub const PLUGIN_COMPONENT_INSTANCE_WORLD: &str = "yoi:plugin/instance@1.0.0";
+pub const PLUGIN_COMPONENT_TOOL_WORLD: &str = "yoi:plugin/tool-plugin@2.0.0";
+pub const PLUGIN_COMPONENT_HTTPS_TOOL_WORLD: &str = "yoi:plugin/https-tool-plugin@2.0.0";
+pub const PLUGIN_COMPONENT_LOGGED_TOOL_WORLD: &str = "yoi:plugin/logged-tool-plugin@2.0.0";
+pub const PLUGIN_COMPONENT_HTTPS_LOGGED_TOOL_WORLD: &str =
+    "yoi:plugin/https-logged-tool-plugin@2.0.0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginRuntimeManifest {
     pub kind: String,
-    #[serde(default)]
-    pub entry: Option<String>,
-    #[serde(default)]
-    pub abi: Option<String>,
-    #[serde(default)]
-    pub component: Option<String>,
-    #[serde(default)]
-    pub world: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PluginHookManifest {
-    pub id: String,
-    pub file: String,
+    pub component: String,
+    pub world: String,
+    /// Exact imports, including type interfaces, without semver ranges.
+    pub required_imports: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,38 +271,11 @@ pub struct PluginToolManifest {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-    /// Declares possible external side effects for a future installer. This flag
-    /// grants no authority and is not consumed by the current Worker runtime.
+    pub output_schema: serde_json::Value,
+    #[serde(default)]
+    pub error_codes: Vec<String>,
     #[serde(default)]
     pub external_write: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PluginServiceManifest {
-    pub name: String,
-    pub description: String,
-    #[serde(default)]
-    pub lifecycle: String,
-    #[serde(default)]
-    pub status_schema: Option<serde_json::Value>,
-    #[serde(default)]
-    pub side_effects: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PluginIngressManifest {
-    pub name: String,
-    pub description: String,
-    #[serde(default)]
-    pub event_kinds: Vec<String>,
-    #[serde(default)]
-    pub input_schema: Option<serde_json::Value>,
-    #[serde(default)]
-    pub sources: Vec<String>,
-    #[serde(default)]
-    pub side_effects: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -510,7 +304,8 @@ pub struct InspectedPluginPackage {
     pub identity: SourceQualifiedPluginId,
     pub input_path: PathBuf,
     pub package_label: String,
-    pub digest: String,
+    pub package_digest: String,
+    pub component: component::ComponentMetadata,
     pub manifest: PluginPackageManifest,
     pub entries: BTreeSet<String>,
 }
@@ -524,12 +319,26 @@ pub struct InspectedPluginPackage {
 pub struct MaterializedPluginPackage {
     pub package: InspectedPluginPackage,
     pub files: BTreeMap<String, Vec<u8>>,
+    /// Digest and size of canonical archive bytes, not the upload ZIP.
+    pub artifact_digest: String,
+    pub artifact_size: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PackedPluginPackage {
     pub output_path: PathBuf,
     pub package: InspectedPluginPackage,
+    pub artifact_digest: String,
+    pub artifact_size: u64,
+}
+
+/// Immutable candidate bytes to publish once; fetch must return these exact bytes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanonicalPluginArtifact {
+    pub bytes: Vec<u8>,
+    pub package_digest: String,
+    pub artifact_digest: String,
+    pub artifact_size: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -636,7 +445,7 @@ pub fn read_plugin_package_file(
         .with_source(source)
         .with_package(label));
     }
-    let bytes = fs::read(path).map_err(|error| {
+    let bytes = read_bounded_file(path, limits.max_package_size_bytes).map_err(|error| {
         PluginDiagnostic::new(
             PluginDiagnosticKind::Io,
             PluginDiagnosticPhase::Inspection,
@@ -701,12 +510,100 @@ pub fn write_plugin_package_file(
     output_path: &Path,
     limits: &PluginPackageLimits,
 ) -> Result<PackedPluginPackage, PluginDiagnostic> {
-    write_stored_zip_file(output_path, &materialized.files, limits)?;
+    let artifact = pack_plugin_package(materialized, limits)?;
+    if let Some(parent) = output_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|_| {
+            malformed_zip(
+                "output",
+                materialized.package.source(),
+                "cannot create output directory",
+            )
+        })?;
+    }
+    fs::write(output_path, &artifact.bytes).map_err(|_| {
+        malformed_zip(
+            "output",
+            materialized.package.source(),
+            "cannot write package",
+        )
+    })?;
     let package = read_plugin_package_file(output_path, materialized.package.source(), limits)?;
     Ok(PackedPluginPackage {
         output_path: output_path.to_path_buf(),
         package: package.package,
+        artifact_digest: artifact.artifact_digest,
+        artifact_size: artifact.artifact_size,
     })
+}
+
+/// Shared Server installer/authoring canonicalization. Revalidates mutable file data.
+pub fn pack_plugin_package(
+    materialized: &MaterializedPluginPackage,
+    limits: &PluginPackageLimits,
+) -> Result<CanonicalPluginArtifact, PluginDiagnostic> {
+    let bytes = canonical_archive_bytes(&materialized.files, limits)?;
+    let checked = read_plugin_package_bytes(&bytes, materialized.package.source(), limits)?;
+    Ok(CanonicalPluginArtifact {
+        package_digest: checked.package.package_digest,
+        artifact_size: bytes.len() as u64,
+        artifact_digest: artifact_digest(&bytes),
+        bytes,
+    })
+}
+
+/// Offline upload inspection; accepts bounded stored ZIP and returns canonical metadata.
+pub fn read_plugin_package_bytes(
+    bytes: &[u8],
+    source: PluginSourceKind,
+    limits: &PluginPackageLimits,
+) -> Result<MaterializedPluginPackage, PluginDiagnostic> {
+    materialize_archive(
+        Path::new("explicit.yoi-plugin"),
+        "explicit.yoi-plugin",
+        source,
+        bytes,
+        limits,
+    )
+}
+
+/// Runtime/cache verification of exact canonical bytes and both independent digests.
+/// This function confers no access, admission or execution authority.
+pub fn verify_plugin_artifact(
+    bytes: &[u8],
+    expected_package_digest: &str,
+    expected_artifact_digest: &str,
+    expected_size: u64,
+    limits: &PluginPackageLimits,
+) -> Result<MaterializedPluginPackage, PluginDiagnostic> {
+    if bytes.len() as u64 > limits.max_package_size_bytes {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Bounds,
+            PluginDiagnosticPhase::Inspection,
+            "artifact exceeds size limit",
+        ));
+    }
+    if expected_size != bytes.len() as u64 || artifact_digest(bytes) != expected_artifact_digest {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Digest,
+            PluginDiagnosticPhase::Inspection,
+            "artifact digest/size mismatch",
+        ));
+    }
+    let package = read_plugin_package_bytes(bytes, PluginSourceKind::Explicit, limits)?;
+    if package.package.package_digest != expected_package_digest
+        || canonical_archive_bytes(&package.files, limits)? != bytes
+    {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Digest,
+            PluginDiagnosticPhase::Inspection,
+            "package digest mismatch or noncanonical artifact",
+        ));
+    }
+    Ok(package)
+}
+
+fn artifact_digest(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex_lower(&Sha256::digest(bytes)))
 }
 
 impl InspectedPluginPackage {
@@ -722,6 +619,13 @@ fn materialize_archive(
     bytes: &[u8],
     limits: &PluginPackageLimits,
 ) -> Result<MaterializedPluginPackage, PluginDiagnostic> {
+    if bytes.len() as u64 > limits.max_package_size_bytes {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Bounds,
+            PluginDiagnosticPhase::Inspection,
+            "archive exceeds size limit",
+        ));
+    }
     let archive = parse_stored_zip(bytes, label, source, limits)?;
     materialize_files(path, label.to_string(), source, archive.files, limits)
 }
@@ -772,18 +676,25 @@ fn materialize_files(
         .with_source(source)
         .with_package(label.clone())
     })?;
-    validate_manifest(&manifest, &archive, &label, source)?;
+    let component = validate_manifest(&manifest, &archive, &label, source)?;
     let digest = deterministic_digest(&archive.files);
     let identity = SourceQualifiedPluginId::new(source, manifest.id.clone());
     let package = InspectedPluginPackage {
         identity,
         input_path: path.to_path_buf(),
         package_label: label,
-        digest,
+        package_digest: digest,
+        component,
         manifest,
         entries: archive.files.keys().cloned().collect(),
     };
-    Ok(MaterializedPluginPackage { package, files })
+    let canonical = canonical_archive_bytes(&files, limits)?;
+    Ok(MaterializedPluginPackage {
+        package,
+        files,
+        artifact_digest: artifact_digest(&canonical),
+        artifact_size: canonical.len() as u64,
+    })
 }
 
 fn collect_directory_files(
@@ -807,8 +718,9 @@ fn collect_directory_files(
             .with_source(source)
             .with_package(label.to_string())
         })?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .collect::<Vec<_>>();
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| malformed_zip(label, source, "cannot read directory entry"))?;
     entries.sort();
 
     for path in entries {
@@ -893,7 +805,7 @@ fn collect_directory_files(
                 .with_source(source)
                 .with_package(label.to_string())
             })?;
-        let content = fs::read(&path).map_err(|error| {
+        let content = read_bounded_file(&path, limits.max_file_size_bytes).map_err(|error| {
             PluginDiagnostic::new(
                 PluginDiagnosticKind::Io,
                 PluginDiagnosticPhase::Inspection,
@@ -932,16 +844,41 @@ fn collect_directory_files(
     Ok(())
 }
 
-fn write_stored_zip_file(
-    output_path: &Path,
+fn canonical_archive_bytes(
     files: &BTreeMap<String, Vec<u8>>,
     limits: &PluginPackageLimits,
-) -> Result<(), PluginDiagnostic> {
+) -> Result<Vec<u8>, PluginDiagnostic> {
     if files.len() > limits.max_entries_per_package {
         return Err(PluginDiagnostic::new(
             PluginDiagnosticKind::Bounds,
             PluginDiagnosticPhase::Inspection,
             "plugin package contains more entries than the configured bound",
+        ));
+    }
+    let expanded = files
+        .values()
+        .try_fold(0u64, |sum, v| sum.checked_add(v.len() as u64));
+    if files.len() > u16::MAX as usize
+        || expanded
+            .is_none_or(|n| n > limits.max_expanded_size_bytes || n > limits.max_package_size_bytes)
+    {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Bounds,
+            PluginDiagnosticPhase::Inspection,
+            "archive exceeds count/expanded bounds",
+        ));
+    }
+    let archive_size = files.iter().try_fold(22u64, |total, (name, content)| {
+        total
+            .checked_add(76)?
+            .checked_add((name.len() as u64).checked_mul(2)?)?
+            .checked_add(content.len() as u64)
+    });
+    if archive_size.is_none_or(|n| n > limits.max_package_size_bytes || n > u32::MAX as u64) {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Bounds,
+            PluginDiagnosticPhase::Inspection,
+            "archive exceeds ZIP32/package bounds",
         ));
     }
     let mut bytes = Vec::new();
@@ -961,6 +898,17 @@ fn write_stored_zip_file(
                 "plugin package entry exceeds the configured per-file bound",
             ));
         }
+        if name.len() > u16::MAX as usize
+            || content.len() > u32::MAX as usize
+            || bytes.len() > u32::MAX as usize
+        {
+            return Err(PluginDiagnostic::new(
+                PluginDiagnosticKind::Bounds,
+                PluginDiagnosticPhase::Inspection,
+                "ZIP32 bounds exceeded",
+            ));
+        }
+        let crc = crc32fast::hash(content);
         let local_offset = bytes.len() as u32;
         write_u32_vec(&mut bytes, ZIP_LOCAL_FILE);
         write_u16_vec(&mut bytes, 20);
@@ -968,7 +916,7 @@ fn write_stored_zip_file(
         write_u16_vec(&mut bytes, ZIP_COMPRESSION_STORED);
         write_u16_vec(&mut bytes, 0);
         write_u16_vec(&mut bytes, 0);
-        write_u32_vec(&mut bytes, 0);
+        write_u32_vec(&mut bytes, crc);
         write_u32_vec(&mut bytes, content.len() as u32);
         write_u32_vec(&mut bytes, content.len() as u32);
         write_u16_vec(&mut bytes, name.len() as u16);
@@ -983,7 +931,7 @@ fn write_stored_zip_file(
         write_u16_vec(&mut central, ZIP_COMPRESSION_STORED);
         write_u16_vec(&mut central, 0);
         write_u16_vec(&mut central, 0);
-        write_u32_vec(&mut central, 0);
+        write_u32_vec(&mut central, crc);
         write_u32_vec(&mut central, content.len() as u32);
         write_u32_vec(&mut central, content.len() as u32);
         write_u16_vec(&mut central, name.len() as u16);
@@ -1012,32 +960,7 @@ fn write_stored_zip_file(
             "plugin package exceeds the configured package size bound",
         ));
     }
-    if let Some(parent) = output_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|error| {
-            PluginDiagnostic::new(
-                PluginDiagnosticKind::Io,
-                PluginDiagnosticPhase::Inspection,
-                format!(
-                    "plugin package output directory could not be created: {}",
-                    safe_io_error(&error)
-                ),
-            )
-        })?;
-    }
-    fs::write(output_path, bytes).map_err(|error| {
-        PluginDiagnostic::new(
-            PluginDiagnosticKind::Io,
-            PluginDiagnosticPhase::Inspection,
-            format!(
-                "plugin package output could not be written: {}",
-                safe_io_error(&error)
-            ),
-        )
-    })?;
-    Ok(())
+    Ok(bytes)
 }
 
 fn write_u16_vec(out: &mut Vec<u8>, value: u16) {
@@ -1053,154 +976,151 @@ fn validate_manifest(
     archive: &StoredArchive,
     label: &str,
     source: PluginSourceKind,
-) -> Result<(), PluginDiagnostic> {
+) -> Result<component::ComponentMetadata, PluginDiagnostic> {
+    let reject = |kind, message: String| {
+        PluginDiagnostic::new(kind, PluginDiagnosticPhase::Manifest, message)
+            .with_source(source)
+            .with_package(label)
+            .with_identity(SourceQualifiedPluginId::new(source, &manifest.id))
+    };
     if manifest.schema_version != SUPPORTED_PLUGIN_API_VERSION {
-        return Err(PluginDiagnostic::new(
+        return Err(reject(
             PluginDiagnosticKind::Api,
-            PluginDiagnosticPhase::Manifest,
-            "plugin schema/API version is unsupported",
-        )
-        .with_source(source)
-        .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-        .with_package(label));
+            "unsupported schema: v2 rebuild required".into(),
+        ));
     }
-    if !is_safe_id(&manifest.id) {
-        return Err(PluginDiagnostic::new(
+    if !is_safe_id(&manifest.id)
+        || manifest.name.trim().is_empty()
+        || manifest.version.trim().is_empty()
+    {
+        return Err(reject(
             PluginDiagnosticKind::Malformed,
-            PluginDiagnosticPhase::Manifest,
-            "plugin manifest id is not a safe local id",
-        )
-        .with_source(source)
-        .with_package(label));
+            "safe id, name and version are required".into(),
+        ));
     }
-    if manifest.name.trim().is_empty() || manifest.version.trim().is_empty() {
-        return Err(PluginDiagnostic::new(
-            PluginDiagnosticKind::Malformed,
-            PluginDiagnosticPhase::Manifest,
-            "plugin manifest name and version are required",
-        )
-        .with_source(source)
-        .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-        .with_package(label));
-    }
-    if let Some(runtime) = &manifest.runtime {
-        match runtime.kind.as_str() {
-            LEGACY_PLUGIN_RUNTIME_WASM_KIND => {
-                return Err(PluginDiagnostic::new(
-                    PluginDiagnosticKind::Api,
-                    PluginDiagnosticPhase::Manifest,
-                    format!(
-                        "legacy raw wasm plugin runtime `{LEGACY_PLUGIN_RUNTIME_WASM_KIND}` / `{}` is retired; use `{PLUGIN_RUNTIME_COMPONENT_KIND}`",
-                        runtime
-                            .abi
-                            .as_deref()
-                            .unwrap_or(LEGACY_PLUGIN_RUNTIME_WASM_ABI)
-                    ),
-                )
-                .with_source(source)
-                .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-                .with_package(label));
-            }
-            PLUGIN_RUNTIME_COMPONENT_KIND => {
-                if runtime.abi.is_some() || runtime.entry.is_some() {
-                    return Err(PluginDiagnostic::new(
-                        PluginDiagnosticKind::Malformed,
-                        PluginDiagnosticPhase::Manifest,
-                        "plugin component runtime must not declare raw WASM ABI metadata",
-                    )
-                    .with_source(source)
-                    .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-                    .with_package(label));
-                }
-                if !matches!(
-                    runtime.world.as_deref(),
-                    Some(PLUGIN_COMPONENT_TOOL_WORLD) | Some(PLUGIN_COMPONENT_INSTANCE_WORLD)
-                ) {
-                    return Err(PluginDiagnostic::new(
-                        PluginDiagnosticKind::Api,
-                        PluginDiagnosticPhase::Manifest,
-                        "plugin component world is unsupported",
-                    )
-                    .with_source(source)
-                    .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-                    .with_package(label));
-                }
-                let Some(component) = runtime.component.as_deref() else {
-                    return Err(PluginDiagnostic::new(
-                        PluginDiagnosticKind::Missing,
-                        PluginDiagnosticPhase::Manifest,
-                        "plugin component runtime artifact is required",
-                    )
-                    .with_source(source)
-                    .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-                    .with_package(label));
-                };
-                validate_manifest_path(component, archive, label, source, &manifest.id)?;
-            }
-            _ => {
-                return Err(PluginDiagnostic::new(
-                    PluginDiagnosticKind::Api,
-                    PluginDiagnosticPhase::Manifest,
-                    "plugin runtime kind is unsupported",
-                )
-                .with_source(source)
-                .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-                .with_package(label));
-            }
-        }
-    }
-    let instance_capable = manifest.runtime.as_ref().is_some_and(|runtime| {
-        runtime.kind == PLUGIN_RUNTIME_COMPONENT_KIND
-            && runtime.world.as_deref() == Some(PLUGIN_COMPONENT_INSTANCE_WORLD)
-    });
-    if (!manifest.services.is_empty() || !manifest.ingresses.is_empty()) && !instance_capable {
-        return Err(PluginDiagnostic::new(
+    if manifest.surfaces != [PluginSurface::Tool] || manifest.tools.is_empty() {
+        return Err(reject(
             PluginDiagnosticKind::Surface,
-            PluginDiagnosticPhase::Manifest,
-            "plugin service/ingress declarations require the yoi:plugin/instance@1.0.0 component world",
+            "only nonempty Tool packages are supported".into(),
+        ));
+    }
+    let runtime = &manifest.runtime;
+    if runtime.kind != PLUGIN_RUNTIME_COMPONENT_KIND {
+        return Err(reject(
+            PluginDiagnosticKind::Api,
+            "only wasm-component v2 is supported".into(),
+        ));
+    }
+    validate_manifest_path(&runtime.component, archive, label, source, &manifest.id)?;
+    schema::validate_config_schema(&manifest.config_schema).map_err(|e| {
+        reject(
+            PluginDiagnosticKind::Malformed,
+            format!("invalid config schema: {e}"),
         )
-        .with_source(source)
-        .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-        .with_package(label));
-    }
-    for service in &manifest.services {
-        if !is_safe_id(&service.name) {
-            return Err(PluginDiagnostic::new(
+    })?;
+    let mut names = BTreeSet::new();
+    for tool in &manifest.tools {
+        if !is_safe_id(&tool.name)
+            || tool.description.trim().is_empty()
+            || !names.insert(&tool.name)
+        {
+            return Err(reject(
+                PluginDiagnosticKind::Duplicate,
+                "Tool names must be safe, unique and described".into(),
+            ));
+        }
+        for value in [&tool.input_schema, &tool.output_schema] {
+            schema::validate_tool_schema(value).map_err(|e| {
+                reject(
+                    PluginDiagnosticKind::Malformed,
+                    format!("invalid Tool schema: {e}"),
+                )
+            })?;
+        }
+        let errors: BTreeSet<_> = tool.error_codes.iter().collect();
+        if errors.len() != tool.error_codes.len() || tool.error_codes.iter().any(|v| !is_safe_id(v))
+        {
+            return Err(reject(
                 PluginDiagnosticKind::Malformed,
-                PluginDiagnosticPhase::Manifest,
-                "plugin service name is not safe",
-            )
-            .with_source(source)
-            .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-            .with_package(label));
+                "business error codes must be safe and unique".into(),
+            ));
         }
     }
-    for ingress in &manifest.ingresses {
-        if !is_safe_id(&ingress.name) {
-            return Err(PluginDiagnostic::new(
+    let mut slots = BTreeSet::new();
+    for slot in &manifest.connections {
+        if !is_safe_id(&slot.name)
+            || !slots.insert(&slot.name)
+            || slot.methods.is_empty()
+            || slot.methods.iter().collect::<BTreeSet<_>>().len() != slot.methods.len()
+            || slot.path_prefixes.is_empty()
+            || slot
+                .path_prefixes
+                .iter()
+                .any(|p| !valid_http_path_prefix(p))
+            || slot.path_prefixes.iter().collect::<BTreeSet<_>>().len() != slot.path_prefixes.len()
+        {
+            return Err(reject(
                 PluginDiagnosticKind::Malformed,
-                PluginDiagnosticPhase::Manifest,
-                "plugin ingress name is not safe",
-            )
-            .with_source(source)
-            .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-            .with_package(label));
+                "invalid or duplicate HTTPS slot/request bounds".into(),
+            ));
         }
     }
-    for hook in &manifest.hooks {
-        if !is_safe_id(&hook.id) {
-            return Err(PluginDiagnostic::new(
-                PluginDiagnosticKind::Malformed,
-                PluginDiagnosticPhase::Manifest,
-                "plugin hook id is not safe",
-            )
-            .with_source(source)
-            .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-            .with_package(label));
+    let mut requested_slots = BTreeSet::new();
+    let mut logging = false;
+    for grant in &manifest.requested_grants {
+        match grant {
+            PluginRequestedGrant::Logging if !logging => logging = true,
+            PluginRequestedGrant::Https { slot }
+                if slots.contains(slot) && requested_slots.insert(slot) => {}
+            _ => {
+                return Err(reject(
+                    PluginDiagnosticKind::Malformed,
+                    "undeclared or duplicate requested grant".into(),
+                ));
+            }
         }
-        validate_manifest_path(&hook.file, archive, label, source, &manifest.id)?;
     }
-    Ok(())
+    if slots != requested_slots {
+        return Err(reject(
+            PluginDiagnosticKind::Malformed,
+            "each connection slot requires an HTTPS grant request".into(),
+        ));
+    }
+    let http = runtime
+        .required_imports
+        .iter()
+        .any(|v| v == "yoi:host/http@2.0.0");
+    let connections = runtime
+        .required_imports
+        .iter()
+        .any(|v| v == "yoi:host/connections@2.0.0");
+    let logs = runtime
+        .required_imports
+        .iter()
+        .any(|v| v == "yoi:host/logging@2.0.0");
+    if http != !slots.is_empty() || http != connections || logging != logs {
+        return Err(reject(
+            PluginDiagnosticKind::Api,
+            "Host imports and requested grants/slots disagree".into(),
+        ));
+    }
+    component::validate_component(
+        &archive.files[&runtime.component],
+        &runtime.world,
+        &runtime.required_imports,
+    )
+    .map_err(|e| reject(PluginDiagnosticKind::Api, format!("Component ABI: {e}")))
+}
+
+fn valid_http_path_prefix(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.bytes().any(|b| {
+            b.is_ascii_control()
+                || b.is_ascii_whitespace()
+                || matches!(b, b'?' | b'#' | b'\\' | b'%' | b':')
+        })
+        && !path.split('/').any(|v| matches!(v, "." | ".."))
 }
 
 fn validate_manifest_path(
@@ -1241,6 +1161,7 @@ struct StoredArchive {
 #[derive(Clone, Debug)]
 struct CentralDirectoryEntry {
     name: String,
+    crc: u32,
     compressed_size: u32,
     uncompressed_size: u32,
     local_header_offset: u32,
@@ -1272,6 +1193,17 @@ fn parse_stored_zip(
     let central_offset = read_u32(eocd, 16)
         .ok_or_else(|| malformed_zip(label, source, "zip end record is truncated"))?
         as usize;
+    let comment_len = read_u16(eocd, 20).unwrap_or(u16::MAX) as usize;
+    if eocd_offset.checked_add(22 + comment_len) != Some(bytes.len())
+        || read_u16(eocd, 8) != Some(entry_count as u16)
+        || central_offset.checked_add(central_size) != Some(eocd_offset)
+    {
+        return Err(malformed_zip(
+            label,
+            source,
+            "inconsistent ZIP directory/end bounds",
+        ));
+    }
     if disk_number != 0 || central_disk != 0 {
         return Err(malformed_zip(
             label,
@@ -1364,7 +1296,15 @@ fn parse_stored_zip(
             .ok_or_else(|| {
                 malformed_zip(label, source, "zip central directory entry is too large")
             })?;
+        if cursor > eocd_offset || read_u16(bytes, name_start - 12) != Some(0) {
+            return Err(malformed_zip(
+                label,
+                source,
+                "ZIP directory entry outside bounds or multi-disk entry",
+            ));
+        }
         entries.push(CentralDirectoryEntry {
+            crc: read_u32(bytes, name_start - 30).unwrap(),
             name,
             compressed_size,
             uncompressed_size,
@@ -1375,15 +1315,15 @@ fn parse_stored_zip(
         });
     }
 
+    if cursor != eocd_offset {
+        return Err(malformed_zip(label, source, "ZIP directory size mismatch"));
+    }
     let mut files = BTreeMap::new();
     let mut expanded_size = 0u64;
+    let mut ranges = Vec::new();
     for entry in entries {
-        if entry.flags & ZIP_FLAG_ENCRYPTED != 0 {
-            return Err(malformed_zip(
-                label,
-                source,
-                "encrypted zip packages are unsupported",
-            ));
+        if entry.flags & !0x0800 != 0 {
+            return Err(malformed_zip(label, source, "unsupported ZIP flags"));
         }
         if is_zip_symlink(entry.external_attributes) {
             return Err(PluginDiagnostic::new(
@@ -1425,7 +1365,19 @@ fn parse_stored_zip(
             .with_source(source)
             .with_package(label));
         }
-        let data = read_stored_entry(bytes, &entry, label, source)?;
+        let (data, end) = read_stored_entry(bytes, &entry, label, source)?;
+        if end > central_offset
+            || ranges
+                .iter()
+                .any(|&(start, stop)| (entry.local_header_offset as usize) < stop && end > start)
+        {
+            return Err(malformed_zip(
+                label,
+                source,
+                "overlapping ZIP entries or directory data",
+            ));
+        }
+        ranges.push((entry.local_header_offset as usize, end));
         if data.len() != entry.uncompressed_size as usize
             || data.len() != entry.compressed_size as usize
         {
@@ -1454,7 +1406,7 @@ fn read_stored_entry(
     entry: &CentralDirectoryEntry,
     label: &str,
     source: PluginSourceKind,
-) -> Result<Vec<u8>, PluginDiagnostic> {
+) -> Result<(Vec<u8>, usize), PluginDiagnostic> {
     let cursor = entry.local_header_offset as usize;
     if read_u32(bytes, cursor) != Some(ZIP_LOCAL_FILE) {
         return Err(malformed_zip(
@@ -1473,7 +1425,14 @@ fn read_stored_entry(
     let extra_len = read_u16(bytes, cursor + 28)
         .ok_or_else(|| malformed_zip(label, source, "zip local file header is truncated"))?
         as usize;
-    if local_flags != entry.flags || local_method != entry.compression_method {
+    let name_start = cursor + 30;
+    if bytes.get(name_start..name_start.saturating_add(name_len)) != Some(entry.name.as_bytes())
+        || read_u32(bytes, cursor + 14) != Some(entry.crc)
+        || read_u32(bytes, cursor + 18) != Some(entry.compressed_size)
+        || read_u32(bytes, cursor + 22) != Some(entry.uncompressed_size)
+        || local_flags != entry.flags
+        || local_method != entry.compression_method
+    {
         return Err(malformed_zip(
             label,
             source,
@@ -1495,7 +1454,11 @@ fn read_stored_entry(
             "zip entry data points outside the package",
         ));
     }
-    Ok(bytes[data_start..data_end].to_vec())
+    let data = &bytes[data_start..data_end];
+    if crc32fast::hash(data) != entry.crc {
+        return Err(malformed_zip(label, source, "ZIP CRC mismatch"));
+    }
+    Ok((data.to_vec(), data_end))
 }
 
 fn find_eocd(bytes: &[u8]) -> Option<usize> {
@@ -1596,6 +1559,17 @@ fn package_label(path: &Path) -> String {
         .to_string()
 }
 
+fn read_bounded_file(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(max.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(io::Error::from(io::ErrorKind::InvalidData));
+    }
+    Ok(bytes)
+}
+
 fn safe_io_error(error: &io::Error) -> &'static str {
     match error.kind() {
         io::ErrorKind::NotFound => "not found",
@@ -1644,14 +1618,72 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn materialize_template(root: &Path) {
-        for resource in RUST_COMPONENT_TOOL_TEMPLATE {
-            let path = root.join(resource.path);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).unwrap();
-            }
-            fs::write(path, resource.contents).unwrap();
-        }
+    fn fixture_files() -> BTreeMap<String, Vec<u8>> {
+        let mut resolve = wit_parser::Resolve::default();
+        resolve
+            .push_str(
+                "host.wit",
+                include_str!("../../../resources/plugin/wit/deps/yoi-host/yoi-host-v2.wit"),
+            )
+            .unwrap();
+        let package = resolve
+            .push_str(
+                "plugin.wit",
+                include_str!("../../../resources/plugin/wit/yoi-plugin-v2.wit"),
+            )
+            .unwrap();
+        let world = resolve
+            .select_world(&[package], Some("tool-plugin"))
+            .unwrap();
+        let mut module =
+            wit_component::dummy_module(&resolve, world, wit_parser::ManglingAndAbi::Standard32);
+        wit_component::embed_component_metadata(
+            &mut module,
+            &resolve,
+            world,
+            wit_component::StringEncoding::UTF8,
+        )
+        .unwrap();
+        let component = wit_component::ComponentEncoder::default()
+            .module(&module)
+            .unwrap()
+            .validate(true)
+            .encode()
+            .unwrap();
+        let manifest = r#"
+schema_version = 2
+id = "example.pure"
+name = "Pure"
+version = "0.1.0"
+surfaces = ["tool"]
+config_schema = "{}"
+[runtime]
+kind = "wasm-component"
+component = "plugin.component.wasm"
+world = "yoi:plugin/tool-plugin@2.0.0"
+required_imports = []
+[[tools]]
+name = "echo"
+description = "Echo input"
+input_schema = { type = "object", additionalProperties = false }
+output_schema = { type = "object", additionalProperties = false }
+"#;
+        BTreeMap::from([
+            ("plugin.toml".into(), manifest.as_bytes().to_vec()),
+            ("plugin.component.wasm".into(), component),
+        ])
+    }
+
+    fn inspect(
+        files: BTreeMap<String, Vec<u8>>,
+    ) -> Result<MaterializedPluginPackage, PluginDiagnostic> {
+        materialize_files(
+            Path::new("fixture"),
+            "fixture".into(),
+            PluginSourceKind::Explicit,
+            files,
+            &PluginPackageLimits::default(),
+        )
     }
 
     #[test]
@@ -1662,17 +1694,233 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(ambient.parent().unwrap()).unwrap();
         fs::write(&ambient, b"malformed ambient package").unwrap();
-        materialize_template(&source);
-
+        for (name, content) in fixture_files() {
+            fs::write(source.join(name), content).unwrap();
+        }
         let limits = PluginPackageLimits::default();
         let package = read_plugin_directory(&source, PluginSourceKind::Explicit, &limits).unwrap();
         let output = dir.path().join("explicit.yoi-plugin");
-        write_plugin_package_file(&package, &output, &limits).unwrap();
+        let packed = write_plugin_package_file(&package, &output, &limits).unwrap();
         let reread =
             read_plugin_package_file(&output, PluginSourceKind::Explicit, &limits).unwrap();
-
         assert_eq!(reread.package.identity.source, PluginSourceKind::Explicit);
-        assert_eq!(reread.package.digest, package.package.digest);
+        assert_eq!(
+            reread.package.package_digest,
+            package.package.package_digest
+        );
+        assert_eq!(reread.artifact_digest, packed.artifact_digest);
+        assert_eq!(reread.artifact_size, fs::metadata(output).unwrap().len());
+    }
+
+    #[test]
+    fn canonical_pack_is_reproducible_and_digests_have_distinct_meanings() {
+        let package = inspect(fixture_files()).unwrap();
+        let limits = PluginPackageLimits::default();
+        let a = pack_plugin_package(&package, &limits).unwrap();
+        let b = pack_plugin_package(&package, &limits).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.package_digest, deterministic_digest(&package.files));
+        assert_eq!(a.artifact_digest, artifact_digest(&a.bytes));
+        assert_ne!(a.package_digest, a.artifact_digest);
+        verify_plugin_artifact(
+            &a.bytes,
+            &a.package_digest,
+            &a.artifact_digest,
+            a.artifact_size,
+            &limits,
+        )
+        .unwrap();
+        let mut noncanonical = a.bytes.clone();
+        // A ZIP comment changes transport bytes, not the logical file set.
+        let end = noncanonical.len();
+        noncanonical[end - 2..].copy_from_slice(&4u16.to_le_bytes());
+        noncanonical.extend_from_slice(b"note");
+        let uploaded =
+            read_plugin_package_bytes(&noncanonical, PluginSourceKind::Explicit, &limits).unwrap();
+        assert_eq!(uploaded.package.package_digest, a.package_digest);
+        assert_eq!(pack_plugin_package(&uploaded, &limits).unwrap(), a);
+        assert!(
+            verify_plugin_artifact(
+                &noncanonical,
+                &a.package_digest,
+                &artifact_digest(&noncanonical),
+                noncanonical.len() as u64,
+                &limits
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn artifact_verification_rejects_each_digest_size_and_changed_bytes() {
+        let artifact = pack_plugin_package(
+            &inspect(fixture_files()).unwrap(),
+            &PluginPackageLimits::default(),
+        )
+        .unwrap();
+        for (package, transport, size) in [
+            (
+                "sha256:wrong",
+                artifact.artifact_digest.as_str(),
+                artifact.artifact_size,
+            ),
+            (
+                artifact.package_digest.as_str(),
+                "sha256:wrong",
+                artifact.artifact_size,
+            ),
+            (
+                artifact.package_digest.as_str(),
+                artifact.artifact_digest.as_str(),
+                artifact.artifact_size + 1,
+            ),
+        ] {
+            assert_eq!(
+                verify_plugin_artifact(
+                    &artifact.bytes,
+                    package,
+                    transport,
+                    size,
+                    &PluginPackageLimits::default()
+                )
+                .unwrap_err()
+                .kind,
+                PluginDiagnosticKind::Digest
+            );
+        }
+        let mut bytes = artifact.bytes.clone();
+        bytes[40] ^= 1;
+        assert!(
+            verify_plugin_artifact(
+                &bytes,
+                &artifact.package_digest,
+                &artifact.artifact_digest,
+                artifact.artifact_size,
+                &PluginPackageLimits::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn version_surface_schema_slot_and_component_mismatches_are_rejected() {
+        let base = fixture_files();
+        let text = String::from_utf8(base["plugin.toml"].clone()).unwrap();
+        for (from, to) in [
+            ("schema_version = 2", "schema_version = 1"),
+            ("schema_version = 2", "schema_version = 999"),
+            ("surfaces = [\"tool\"]", "surfaces = [\"service\"]"),
+            ("tool-plugin@2.0.0", "tool-plugin@2.0.1"),
+            ("tool-plugin@2.0.0", "https-tool-plugin@2.0.0"),
+            ("type = \"object\"", "type = \"nonexistent\""),
+            (
+                "config_schema = \"{}\"",
+                "config_schema = \"{ ...String }\"",
+            ),
+            (
+                "required_imports = []",
+                "required_imports = [\"yoi:host/http@2.0.0\"]",
+            ),
+        ] {
+            let mut files = base.clone();
+            let changed = text.replace(from, to);
+            assert_ne!(changed, text);
+            files.insert("plugin.toml".into(), changed.into_bytes());
+            assert!(inspect(files).is_err(), "mutation {from} -> {to}");
+        }
+        for extra in [
+            "\n[[connections]]\nname = \"api\"\nmethods = [\"GET\"]\npath_prefixes = [\"/\"]",
+            "\n[[requested_grants]]\nkind = \"https\"\nslot = \"missing\"",
+            "\n[[requested_grants]]\nkind = \"logging\"",
+        ] {
+            let mut files = base.clone();
+            files.insert("plugin.toml".into(), format!("{text}{extra}").into_bytes());
+            assert!(inspect(files).is_err());
+        }
+        let mut files = base;
+        files.insert("plugin.component.wasm".into(), b"not a component".to_vec());
+        assert!(inspect(files).is_err());
+    }
+
+    #[test]
+    fn stored_archive_rejects_traversal_duplicates_corruption_and_size_bounds() {
+        let limits = PluginPackageLimits::default();
+        let mut files = fixture_files();
+        files.insert("../escape".into(), vec![]);
+        assert_eq!(
+            canonical_archive_bytes(&files, &limits).unwrap_err().kind,
+            PluginDiagnosticKind::Traversal
+        );
+        // Equal-length paths let both local and central names be changed coherently.
+        let bytes = canonical_archive_bytes(
+            &BTreeMap::from([("aa".into(), vec![1]), ("bb".into(), vec![2])]),
+            &limits,
+        )
+        .unwrap();
+        for (name, replacement, kind) in [
+            (b"bb", b"aa", PluginDiagnosticKind::Duplicate),
+            (b"bb", b"..", PluginDiagnosticKind::Traversal),
+        ] {
+            let mut mutated = bytes.clone();
+            for index in 0..mutated.len() - 1 {
+                if &mutated[index..index + 2] == name {
+                    mutated[index..index + 2].copy_from_slice(replacement);
+                }
+            }
+            assert_eq!(
+                parse_stored_zip(&mutated, "fixture", PluginSourceKind::Explicit, &limits)
+                    .unwrap_err()
+                    .kind,
+                kind
+            );
+        }
+        let mut corrupt = bytes.clone();
+        corrupt[32] ^= 1;
+        assert!(
+            parse_stored_zip(&corrupt, "fixture", PluginSourceKind::Explicit, &limits).is_err()
+        );
+        for small in [
+            PluginPackageLimits {
+                max_package_size_bytes: 1,
+                ..limits.clone()
+            },
+            PluginPackageLimits {
+                max_entries_per_package: 1,
+                ..limits.clone()
+            },
+            PluginPackageLimits {
+                max_file_size_bytes: 0,
+                ..limits.clone()
+            },
+            PluginPackageLimits {
+                max_expanded_size_bytes: 1,
+                ..limits.clone()
+            },
+        ] {
+            assert!(read_plugin_package_bytes(&bytes, PluginSourceKind::Explicit, &small).is_err());
+        }
+    }
+
+    #[test]
+    fn pack_revalidates_mutated_files_and_directory_rejects_symlinks() {
+        let mut package = inspect(fixture_files()).unwrap();
+        package.files.insert("plugin.component.wasm".into(), vec![]);
+        assert!(pack_plugin_package(&package, &PluginPackageLimits::default()).is_err());
+        #[cfg(unix)]
+        {
+            let dir = tempdir().unwrap();
+            std::os::unix::fs::symlink("outside", dir.path().join("link")).unwrap();
+            assert_eq!(
+                read_plugin_directory(
+                    dir.path(),
+                    PluginSourceKind::Explicit,
+                    &PluginPackageLimits::default()
+                )
+                .unwrap_err()
+                .kind,
+                PluginDiagnosticKind::Traversal
+            );
+        }
     }
 
     #[test]
