@@ -1149,6 +1149,11 @@ impl WipMountRegistry {
         Ok(())
     }
 
+    /// Exact registration only; this does not observe content or establish current authority.
+    pub(crate) fn has_subtree(&self, root: &str) -> bool {
+        self.subtree_mounts.iter().any(|mount| mount.root == root)
+    }
+
     pub fn routes(&self) -> impl Iterator<Item = &str> {
         self.mounts.keys().map(String::as_str)
     }
@@ -7269,3 +7274,7 @@ mod tests {
 
 #[cfg(test)]
 mod bash_output_tests;
+
+#[cfg(test)]
+#[path = "feature/builtin/manage_workdir/wip/model_tests.rs"]
+mod workdir_model_tests;
