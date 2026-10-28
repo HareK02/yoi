@@ -116,6 +116,7 @@ impl HostOperationContext {
                 "Host operation context belongs to another storage scope".into(),
             ));
         }
+        Self::require_subject(store, &self.subject_id)?;
         Ok(())
     }
 

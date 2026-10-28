@@ -105,6 +105,7 @@ pub(super) fn check_session_host(
             "different storage scope".into(),
         ));
     }
+    crate::require_subject_in_connection(tx, &host.subject_id)?;
     let attr = host
         .attribution
         .as_ref()
@@ -134,6 +135,7 @@ pub(super) fn check_host(
             "different storage scope".into(),
         ));
     }
+    crate::require_subject_in_connection(tx, &host.subject_id)?;
     if write {
         let state: String = tx.query_row(
             "SELECT state FROM subjects WHERE subject_id=?1",

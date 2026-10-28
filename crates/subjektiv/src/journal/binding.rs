@@ -39,6 +39,7 @@ fn denied() -> JournalError {
 }
 
 pub(super) fn check_writer(tx: &Connection, host: &JournalHostContext) -> JournalResult<()> {
+    crate::require_subject_in_connection(tx, &host.subject_id)?;
     let attr = host.attribution.as_ref().ok_or_else(denied)?;
     let binding = host.writer_binding_id.as_ref().ok_or_else(denied)?;
     if !tx.query_row("SELECT EXISTS(SELECT 1 FROM journal_writer_bindings b JOIN journal_session_bindings s ON s.binding_id=b.binding_id WHERE b.binding_id=?1 AND b.subject_id=?2 AND b.runtime_id=?3 AND b.worker_id=?4 AND b.active=1 AND s.session_id=?5)", params![binding,host.subject_id,attr.runtime_id,attr.worker_id,attr.session_id], |r| r.get::<_,bool>(0))? {
@@ -63,6 +64,7 @@ impl SubjektivStore {
         binding: &JournalWriterBinding,
     ) -> JournalResult<Option<String>> {
         self.database.try_with_connection(|tx| {
+            crate::require_subject_in_connection(tx, &binding.subject_id)?;
             Ok(tx.query_row("SELECT j.source_session_id FROM journals j JOIN journal_session_bindings s ON s.session_id=j.source_session_id WHERE j.subject_id=?1 AND s.binding_id=(SELECT binding_id FROM journal_writer_bindings WHERE subject_id=?1 AND active=0 ORDER BY rowid DESC LIMIT 1) ORDER BY j.updated_at DESC,j.id DESC LIMIT 1", [&binding.subject_id], |r| r.get(0)).optional()?)
         })
     }
@@ -77,6 +79,7 @@ impl SubjektivStore {
         worker: &str,
     ) -> JournalResult<bool> {
         self.database.try_with_connection(|tx| {
+            crate::require_subject_in_connection(tx, subject)?;
             Ok(tx.query_row(
                 "SELECT NOT EXISTS(SELECT 1 FROM journal_writer_bindings
                    WHERE subject_id=?1 AND runtime_id=?2 AND worker_id=?3)
@@ -95,12 +98,14 @@ impl SubjektivStore {
         worker: &str,
     ) -> JournalResult<bool> {
         self.database.try_with_connection(|tx| {
+            crate::require_subject_in_connection(tx, subject)?;
             Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM journal_writer_bindings WHERE subject_id=?1 AND runtime_id=?2 AND worker_id=?3 AND active=0)", params![subject,runtime,worker], |r| r.get(0))?)
         })
     }
 
     pub fn journal_writer_active(&self, binding: &JournalWriterBinding) -> JournalResult<bool> {
         self.database.try_with_connection(|tx| {
+            crate::require_subject_in_connection(tx, &binding.subject_id)?;
             Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM journal_writer_bindings WHERE binding_id=?1 AND subject_id=?2 AND runtime_id=?3 AND worker_id=?4 AND active=1)", params![binding.binding_id,binding.subject_id,binding.runtime_id,binding.worker_id], |r| r.get(0))?)
         })
     }
@@ -111,6 +116,7 @@ impl SubjektivStore {
         session: &str,
     ) -> JournalResult<bool> {
         self.database.try_with_connection(|tx| {
+            crate::require_subject_in_connection(tx, &binding.subject_id)?;
             Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM journal_session_bindings WHERE binding_id=?1 AND session_id=?2)", params![binding.binding_id,session], |r| r.get(0))?)
         })
     }
@@ -135,6 +141,8 @@ impl SubjektivStore {
             }
         }
         self.database.try_transaction(|tx| {
+            crate::require_subject_in_connection(tx, subject)?;
+            crate::deletion::require_live_worker(tx, runtime, worker)?;
             let state: Option<String> = tx.query_row("SELECT state FROM subjects WHERE subject_id=?1", [subject], |r| r.get(0)).optional()?;
             if state.as_deref() != Some("active") { return Err(JournalError::PermissionDenied("Subject is absent or retired".into())); }
             let current: Option<JournalWriterBinding> = tx.query_row("SELECT subject_id,runtime_id,worker_id,binding_id FROM journal_writer_bindings WHERE subject_id=?1 AND active=1", [subject], |r| Ok(JournalWriterBinding { subject_id:r.get(0)?,runtime_id:r.get(1)?,worker_id:r.get(2)?,binding_id:r.get(3)? })).optional()?;
@@ -200,6 +208,7 @@ impl SubjektivStore {
     /// It never fixes an open entry or declares the represented work complete.
     pub fn release_journal_writer(&self, binding: &JournalWriterBinding) -> JournalResult<()> {
         self.database.try_transaction(|tx| {
+            crate::require_subject_in_connection(tx, &binding.subject_id)?;
             let active: Option<bool> = tx.query_row("SELECT active FROM journal_writer_bindings WHERE binding_id=?1 AND subject_id=?2 AND runtime_id=?3 AND worker_id=?4",params![binding.binding_id,binding.subject_id,binding.runtime_id,binding.worker_id],|r|r.get(0)).optional()?;
             let Some(active) = active else { return Err(denied()); };
             if !active { return Ok(()); }

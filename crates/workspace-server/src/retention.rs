@@ -333,6 +333,15 @@ impl SqliteWorkspaceStore {
                     return Err(StoreError::InvalidInput(if other{"cross-workspace".into()}else{"worker-missing".into()}));
                 }
             };
+            if crate::store::subject_deletion_worker_kind(&tx, &req.workspace_id, &req.worker)?.is_some() {
+                let prior = tx.prepare("SELECT plan_id FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state IN ('executing','failed')")?
+                    .query_map(params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id],|r|r.get::<_,String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                for id in prior {
+                    let prior=load_plan(&tx,&id)?.ok_or_else(||StoreError::Store("removal plan disappeared".into()))?;
+                    require_current_subject_deletion_plan(&tx,&prior)?;
+                }
+            }
             let mut blockers=Vec::new();
             if worker.retention_state=="pinned" { blockers.push(WorkerRemovalBlocker::Hold); }
             if let Some((assignment_id,ticket_id))=tx.query_row("SELECT a.assignment_id,a.ticket_id FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3",params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()? {
@@ -363,6 +372,7 @@ impl SqliteWorkspaceStore {
             let mut plan=load_plan(&tx,plan_id)?.ok_or_else(||StoreError::InvalidInput(format!("stale:{plan_id}:plan missing")))?;
             if plan.workspace_id!=workspace_id{return Err(StoreError::InvalidInput("cross-workspace".into()));}
             if plan.input_fingerprint!=fp{return Err(StoreError::InvalidInput(format!("fingerprint:{}",plan.operation_id)));}
+            require_current_subject_deletion_plan(&tx, &plan)?;
             if plan.state==WorkerRemovalPlanState::Succeeded{tx.commit()?;return Ok(plan);}
             if plan.state==WorkerRemovalPlanState::Blocked {
                 return Err(StoreError::InvalidInput(format!("blocked:{}",serde_json::to_string(&plan.blockers).unwrap())));
@@ -420,6 +430,8 @@ impl SqliteWorkspaceStore {
                 WorkerRetentionError::Invalid("Worker id must be a canonical UUIDv7".to_string())
             })?;
         let removed_at = plan.created_at.clone();
+        self.with_conn(|conn| require_current_subject_deletion_plan(conn, &plan))
+            .map_err(map_error)?;
         let prior_failure_category = plan.failure_category.clone();
         Ok(PreparedWorkerRemoval {
             runtime_request: WorkerRetentionExecutionRequest {
@@ -459,8 +471,8 @@ impl SqliteWorkspaceStore {
                        WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3
                      )
                    )
-                 ORDER BY CASE state WHEN 'succeeded' THEN 0 ELSE 1 END,
-                          created_at DESC LIMIT 1",
+                 ORDER BY CASE WHEN EXISTS(SELECT 1 FROM subject_deletion_workers d WHERE d.workspace_id=worker_removal_operations.workspace_id AND d.runtime_id=worker_removal_operations.runtime_id AND d.worker_id=worker_removal_operations.worker_id AND d.prior_removal_operation_id=worker_removal_operations.operation_id) THEN 0 WHEN state='succeeded' THEN 1 ELSE 2 END,
+                          created_at DESC,operation_id DESC LIMIT 1",
                 params![workspace_id, worker.runtime_id, worker.worker_id],
                 |row| row.get::<_, String>(0),
             )
@@ -474,6 +486,8 @@ impl SqliteWorkspaceStore {
         let Some(plan) = plan else {
             return Ok(None);
         };
+        self.with_conn(|conn| require_current_subject_deletion_plan(conn, &plan))
+            .map_err(map_error)?;
         let prior_failure_category = plan.failure_category.clone();
         let worker_id = plan
             .worker
@@ -659,6 +673,7 @@ impl SqliteWorkspaceStore {
             let mut plan=load_plan_op(&tx,operation_id)?.ok_or_else(||StoreError::InvalidInput("operation missing".into()))?;
             if plan.workspace_id!=workspace_id{return Err(StoreError::InvalidInput("cross-workspace".into()));}
             if plan.input_fingerprint!=fp||result.input_fingerprint!=fp||result.operation_id!=operation_id{return Err(StoreError::InvalidInput(format!("fingerprint:{operation_id}")));}
+            require_current_subject_deletion_plan(&tx, &plan)?;
             if plan.state==WorkerRemovalPlanState::Succeeded{
                 // Repair projection fences left by the pre-atomic implementation and
                 // return a replayable change for a broadcast missed after commit.
@@ -1024,6 +1039,49 @@ fn load_removal_policy(
     let Some(mut policy) = load_policy(c, w)? else {
         return Ok(None);
     };
+    // Snapshot authority outranks normal policy and Journal cleanup policy. Body
+    // and delegated Sessions must never inherit the ephemeral Job exception.
+    if let Some(is_job) = crate::store::subject_deletion_worker_kind(c, w, worker)? {
+        let update = WorkerRetentionPolicyUpdate {
+            policy_id: if is_job {
+                "subject-deletion-job-v1"
+            } else {
+                "subject-deletion-conversation-v1"
+            }
+            .into(),
+            session_disposition: if is_job {
+                SessionDisposition::Purge
+            } else {
+                SessionDisposition::Archive
+            },
+            metadata_disposition: MetadataDisposition::Tombstone,
+            archive_retention: ArchiveRetention::Forever,
+            // Runtime calls diagnostic archiving Retain, not Archive. Preserve
+            // the Workspace's duration, or thirty days when it normally purges.
+            diagnostics_disposition: if is_job {
+                DiagnosticsDisposition::Purge
+            } else {
+                DiagnosticsDisposition::Retain
+            },
+            diagnostics_retention_seconds: if is_job {
+                None
+            } else {
+                Some(
+                    policy
+                        .diagnostics_retention_seconds
+                        .unwrap_or(30 * 24 * 60 * 60),
+                )
+            },
+        };
+        policy.policy_id = update.policy_id.clone();
+        policy.policy_digest = worker_retention_policy_digest(&update);
+        policy.session_disposition = update.session_disposition;
+        policy.metadata_disposition = update.metadata_disposition;
+        policy.archive_retention = update.archive_retention;
+        policy.diagnostics_disposition = update.diagnostics_disposition;
+        policy.diagnostics_retention_seconds = update.diagnostics_retention_seconds;
+        return Ok(Some(policy));
+    }
     if erased_journal || crate::store::terminal_journal_job_worker(c, w, worker)? {
         let update = WorkerRetentionPolicyUpdate {
             policy_id: if erased_journal {
@@ -1047,6 +1105,39 @@ fn load_removal_policy(
     }
     Ok(Some(policy))
 }
+fn require_current_subject_deletion_plan(
+    c: &Connection,
+    plan: &WorkerRemovalPlan,
+) -> crate::Result<()> {
+    if plan.state == WorkerRemovalPlanState::Succeeded
+        && crate::store::subject_deletion_prior_removal_matches(
+            c,
+            &plan.workspace_id,
+            &plan.worker,
+            &plan.operation_id,
+        )?
+    {
+        // An exact successful receipt pinned before Subject deletion owns its
+        // independent original/archive lifecycle. Never retarget its policy.
+        return Ok(());
+    }
+    if crate::store::subject_deletion_worker_kind(c, &plan.workspace_id, &plan.worker)?.is_some() {
+        let current = load_removal_policy(c, &plan.workspace_id, &plan.worker, false)?
+            .ok_or_else(|| StoreError::InvalidInput("Subject deletion policy missing".into()))?;
+        if plan.session_disposition != current.session_disposition
+            || plan.metadata_disposition != current.metadata_disposition
+            || plan.archive_retention != current.archive_retention
+            || plan.diagnostics_disposition != current.diagnostics_disposition
+        {
+            return Err(stale_error(
+                plan,
+                "Subject deletion retention differs from saved plan; reconcile canonical Runtime removal before retry",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn load_policy(c: &Connection, w: &str) -> crate::Result<Option<WorkerRetentionPolicy>> {
     c.query_row(
         "SELECT p.policy_id,p.policy_digest,r.session_disposition,r.metadata_disposition,
@@ -2735,5 +2826,79 @@ mod tests {
             Some("workdir_attachment_release_failed")
         );
         assert_eq!(recovered.plan.state, WorkerRemovalPlanState::Failed);
+    }
+
+    #[test]
+    fn subject_deletion_snapshot_overrides_policy_without_changing_normal_removal() {
+        let store = setup();
+        let ordinary = store.plan_worker_removal(&req(), &inv()).unwrap();
+        store
+            .prepare_subject_deletion("w", "subject", "delete", &[req().worker.clone()])
+            .unwrap();
+        let body = store.plan_worker_removal(&req(), &inv()).unwrap();
+        assert_eq!(body.session_disposition, SessionDisposition::Archive);
+        assert_eq!(body.archive_retention, ArchiveRetention::Forever);
+        assert_eq!(body.metadata_disposition, MetadataDisposition::Tombstone);
+        assert_eq!(body.diagnostics_disposition, DiagnosticsDisposition::Retain);
+        assert!(body.diagnostics_retention_seconds.is_some());
+        assert_ne!(body.policy_id, ordinary.policy_id);
+        // A saved plan that would discard diagnostics cannot silently stand in
+        // for the Subject conversation archive plan.
+        assert!(matches!(
+            store.begin_worker_removal("w", &ordinary.plan_id, &ordinary.input_fingerprint),
+            Err(WorkerRetentionError::StalePlan { .. })
+        ));
+        let ordinary_store = setup();
+        assert_eq!(
+            ordinary_store
+                .plan_worker_removal(&req(), &inv())
+                .unwrap()
+                .policy_id,
+            ordinary.policy_id
+        );
+    }
+
+    #[test]
+    fn subject_deletion_job_purge_rejects_recovery_of_old_executing_archive() {
+        let store = setup();
+        let old = store.plan_worker_removal(&req(), &inv()).unwrap();
+        store
+            .prepare_worker_removal_execution("w", &old.plan_id, &old.input_fingerprint)
+            .unwrap();
+        store
+            .prepare_subject_deletion("w", "subject", "delete", &[req().worker.clone()])
+            .unwrap();
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE subject_deletion_workers SET is_job=1 WHERE workspace_id='w'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            store.recover_worker_removal_execution("w", &req().worker),
+            Err(WorkerRetentionError::StalePlan { .. })
+        ));
+        assert!(matches!(
+            store.plan_worker_removal(&req(), &inv()),
+            Err(WorkerRetentionError::StalePlan { .. })
+        ));
+        let fresh = store
+            .with_conn(|c| load_removal_policy(c, "w", &req().worker, false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.session_disposition, SessionDisposition::Purge);
+        assert_eq!(fresh.diagnostics_disposition, DiagnosticsDisposition::Purge);
+        assert_eq!(fresh.metadata_disposition, MetadataDisposition::Tombstone);
+        assert_eq!(
+            store
+                .with_conn(|c| load_plan(c, &old.plan_id))
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkerRemovalPlanState::Executing
+        );
     }
 }

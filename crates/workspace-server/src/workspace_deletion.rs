@@ -94,6 +94,12 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "workdir_registry",
     "workdir_removal_operations",
     "worker_control_grants",
+    // Snapshot children precede their fence parent and canonical Worker removal
+    // receipts (subject_deletion_workers.prior_removal_operation_id).
+    "subject_deletion_allocations",
+    "subject_deletion_jobs",
+    "subject_deletion_workers",
+    "subject_deletions",
     "subject_worker_releases",
     "subject_create_recoveries",
     "worker_create_reservations",
@@ -1274,6 +1280,134 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn workspace_purge_removes_subject_deletion_snapshots_and_preserves_other_workspace() {
+        let (store, owner, workspace_id) = setup();
+        let tables = [
+            "subject_deletion_allocations",
+            "subject_deletion_jobs",
+            "subject_deletion_workers",
+            "subject_deletions",
+            "worker_removal_operations",
+        ];
+        // Check the explicit FK ordering as well as execution (the purge defers FKs).
+        let position = |table| {
+            WORKSPACE_DELETION_PURGE_TABLES
+                .iter()
+                .position(|name| *name == table)
+                .unwrap()
+        };
+        for child in &tables[..3] {
+            assert!(position(*child) < position("subject_deletions"));
+        }
+        assert!(position("subject_deletion_workers") < position("worker_removal_operations"));
+        for workspace in ["workspace-a", "workspace-b"] {
+            store.with_conn(|conn| {
+                conn.execute("INSERT INTO worker_removal_operations(
+                    operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,
+                    worker_updated_at,policy_id,policy_digest,session_disposition,metadata_disposition,
+                    archive_retention_kind,diagnostics_disposition,blockers_json,state,reason,created_at,updated_at)
+                    VALUES(?1,?1,'fingerprint',?1,'runtime','worker','1','policy','digest',
+                        'purge','purge','forever','purge','[]','succeeded','removed','1','1')", [workspace])?;
+                conn.execute("INSERT INTO subject_deletions(workspace_id,subject_id,operation_id,completed,jobs_erased)
+                    VALUES(?1,'subject','subject-delete',1,1)", [workspace])?;
+                conn.execute("INSERT INTO subject_deletion_workers(workspace_id,subject_id,runtime_id,worker_id,is_job,prior_removal_operation_id,originals_absent)
+                    VALUES(?1,'subject','runtime','worker',1,?1,1)", [workspace])?;
+                conn.execute("INSERT INTO subject_deletion_jobs VALUES(?1,'subject','job')", [workspace])?;
+                conn.execute("INSERT INTO subject_deletion_allocations VALUES(?1,'subject','allocation')", [workspace])?;
+                Ok(())
+            }).unwrap();
+        }
+        let rows = |workspace: &str| {
+            store
+                .with_conn(|conn| {
+                    tables
+                        .iter()
+                        .map(|table| {
+                            let mut statement = conn
+                                .prepare(&format!("SELECT * FROM {table} WHERE workspace_id=?1"))?;
+                            let count = statement.column_count();
+                            Ok(statement
+                                .query_map([workspace], |row| {
+                                    (0..count)
+                                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                                        .collect::<rusqlite::Result<Vec<_>>>()
+                                })?
+                                .collect::<rusqlite::Result<Vec<_>>>()?)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .unwrap()
+        };
+        let before = rows("workspace-a");
+        let other = rows("workspace-b");
+        assert!(before.iter().all(|table| table.len() == 1));
+        let preflight = store
+            .workspace_deletion_preflight(&owner, &workspace_id)
+            .unwrap();
+        let operation = store
+            .reserve_workspace_deletion(
+                &owner,
+                &workspace_id,
+                &WorkspaceDeletionRequest {
+                    operation_id: "purge-subject-snapshots".into(),
+                    expected_workspace_updated_at: preflight.expected_workspace_updated_at,
+                    confirmation: "Alpha".into(),
+                },
+            )
+            .unwrap()
+            .operation;
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER reject_subject_snapshot_purge BEFORE DELETE ON workspaces
+                BEGIN SELECT RAISE(ABORT,'injected purge failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .finalize_workspace_deletion(&operation.operation_id)
+                .is_err()
+        );
+        assert_eq!(
+            rows("workspace-a"),
+            before,
+            "rollback restores snapshots and canonical receipt"
+        );
+        assert_eq!(rows("workspace-b"), other);
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER reject_subject_snapshot_purge")?;
+                Ok(())
+            })
+            .unwrap();
+        let completed = store
+            .finalize_workspace_deletion(&operation.operation_id)
+            .unwrap();
+        assert_eq!(completed.state, WorkspaceDeletionState::Succeeded);
+        assert!(rows("workspace-a").iter().all(|table| table.is_empty()));
+        assert_eq!(rows("workspace-b"), other);
+        assert_eq!(
+            store
+                .finalize_workspace_deletion(&operation.operation_id)
+                .unwrap(),
+            completed
+        );
+        store
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

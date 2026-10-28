@@ -2102,7 +2102,11 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     {
         return Some("workers:input");
     }
-    if path == "/v1/subject-create-recovery" && *method == Method::POST {
+    if matches!(
+        path,
+        "/v1/subject-create-recovery" | "/v1/subject-delete-worker"
+    ) && *method == Method::POST
+    {
         return Some("workers:delete");
     }
     if path.ends_with("/stop")
@@ -3332,6 +3336,18 @@ mod tests {
     struct AcceptingBackend;
 
     impl WorkerExecutionBackend for AcceptingBackend {
+        fn preflight_subject_delete_worker(
+            &self,
+            _request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn subject_delete_worker(
+            &self,
+            _request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> Result<(), String> {
+            Ok(())
+        }
         fn recover_subject_create(
             &self,
             _request: &runtime_api::SubjectCreateRecoveryRequest,

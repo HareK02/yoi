@@ -29,6 +29,8 @@ import type {
   SubjektivResidentSurfaceAvailability,
   SubjektivResidentSurfaceResponse,
   SubjektivResidentSurfaceSnapshot,
+  SubjektivSubjectDeleteRequest,
+  SubjektivSubjectDeleteResponse,
   SubjektivSubjectBehaviorUpdateRequest,
   SubjektivSubjectCreateRequest,
   SubjektivSubjectListResponse,
@@ -155,6 +157,70 @@ function validateSubjectBehavior(behaviorMd: string): void {
       "validation",
       "Subject behavior contains an unsupported control character.",
     );
+  }
+}
+
+export class SubjektivSubjectDeleteError extends Error {
+  constructor(
+    readonly kind: "rejected" | "unknown_outcome",
+    message: string,
+    readonly status: number | null = null,
+  ) {
+    super(message);
+    this.name = "SubjektivSubjectDeleteError";
+  }
+}
+
+export function parseSubjektivSubjectDeleteResponse(
+  value: unknown,
+  subjectId: string,
+  operationId: string,
+): SubjektivSubjectDeleteResponse {
+  const record = strictRecord(value, ["subject_id", "operation_id", "completed"], "Subject deletion");
+  const response = {
+    subject_id: requiredIdentifier(record, "subject_id"),
+    operation_id: requiredIdentifier(record, "operation_id"),
+    completed: requiredBoolean(record, "completed"),
+  };
+  if (response.subject_id !== subjectId || response.operation_id !== operationId) {
+    invalid("Subject deletion response does not match the request");
+  }
+  return response;
+}
+
+/** HTTP success can confirm only the deletion fence. Every retry retains this request. */
+export async function deleteSubjektivSubject(
+  fetchFn: typeof fetch,
+  workspaceId: string,
+  subjectId: string,
+  request: SubjektivSubjectDeleteRequest,
+): Promise<SubjektivSubjectDeleteResponse> {
+  identifier(request.operation_id, "operation_id");
+  let response: Response;
+  try {
+    response = await fetchFn(workspaceApiPath(workspaceId, `/subjektiv/subjects/${encodeURIComponent(subjectId)}`), {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operation_id: request.operation_id }),
+    });
+  } catch {
+    throw new SubjektivSubjectDeleteError("unknown_outcome", "The deletion outcome is unknown. Retry the same request.");
+  }
+  if (!response.ok) {
+    throw new SubjektivSubjectDeleteError(
+      response.status >= 500 ? "unknown_outcome" : "rejected",
+      await subjektivSubjectCreateErrorMessage(response),
+      response.status,
+    );
+  }
+  try {
+    return parseSubjektivSubjectDeleteResponse(
+      await readBoundedJson(response, MEMORY_API_LIMITS.maxResponseBytes),
+      subjectId,
+      request.operation_id,
+    );
+  } catch {
+    throw new SubjektivSubjectDeleteError("unknown_outcome", "The deletion response could not be confirmed. Retry the same request.");
   }
 }
 

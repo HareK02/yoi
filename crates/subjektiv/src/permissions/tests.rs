@@ -315,7 +315,7 @@ fn redelegation_requires_current_source_and_explicit_retained_parent_ceiling() {
         store.worker_execution_grant("runtime", "child").unwrap(),
         Some(child)
     );
-    store.retire_subject(&subject).unwrap();
+    crate::tests::legacy_retired_fixture(&store, &subject).unwrap();
     stale.source_change_id = revoked.change_id;
     assert!(store.bind_worker_execution_grant(&stale).is_err());
 }
@@ -582,7 +582,7 @@ fn subject_grant_listing_is_scoped_retained_ordered_and_fails_on_overflow() {
             &update("revoke", Some(&source.change_id), Vec::new()),
         )
         .unwrap();
-    store.retire_subject(&subject).unwrap();
+    crate::tests::legacy_retired_fixture(&store, &subject).unwrap();
     let listed = store
         .list_subject_worker_execution_grants(&subject)
         .unwrap();
@@ -653,4 +653,52 @@ fn failed_schema_migration_rolls_back_new_tables_and_preserves_old_data() {
         assert!(!created);
         Ok(())
     }).unwrap();
+}
+
+#[test]
+fn deletion_fences_source_and_child_grant_replays_and_never_falls_back_after_purge() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
+    let subject = store.create_subject(role()).unwrap().id;
+    let replacement = update("allow", None, vec![permission("file.read", ".", true)]);
+    let source = store
+        .set_subject_permissions(&subject, &replacement)
+        .unwrap();
+    let child = grant(&subject, &source.change_id, "child");
+    store.bind_worker_execution_grant(&child).unwrap();
+    store.begin_subject_deletion(&subject, "delete").unwrap();
+    assert!(store.subject_permissions(&subject).is_err());
+    assert!(
+        store
+            .set_subject_permissions(&subject, &replacement)
+            .is_err()
+    );
+    assert!(store.bind_worker_execution_grant(&child).is_err());
+    assert!(store.worker_execution_grant("runtime", "child").is_err());
+    assert!(store.worker_subject_deleted("runtime", "body").unwrap());
+    assert!(store.worker_subject_deleted("runtime", "child").unwrap());
+    assert_eq!(store.deletion_subject_workers(&subject).unwrap().len(), 2);
+    store.finish_subject_deletion(&subject, "delete").unwrap();
+    assert!(store.worker_execution_grant("runtime", "child").is_err());
+    assert!(store.worker_execution_grant("runtime", "body").is_err());
+    assert!(
+        store
+            .worker_execution_grant("runtime", "unrelated")
+            .unwrap()
+            .is_none()
+    );
+    let fresh = store.create_subject(role()).unwrap().id;
+    assert!(store.subject_permissions(&fresh).unwrap().is_none());
+    assert!(
+        store
+            .record_session_attribution(
+                SubjectSessionAttribution::new(&fresh, "runtime", "child", "new-session").unwrap()
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .claim_journal_writer(&fresh, "runtime", "body")
+            .is_err()
+    );
 }

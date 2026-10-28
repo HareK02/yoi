@@ -43,7 +43,8 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 #[path = "test_support.rs"]
 pub mod test_support;
 
-pub(crate) const SCHEMA_VERSION: u32 = 14;
+pub(crate) const SCHEMA_VERSION: u32 = 15;
+const RESTORE_REPAIR_SCHEMA_VERSION: u32 = 14;
 const RESTORE_DECISION_SCHEMA_VERSION: u32 = 13;
 const RESTORE_ADMISSION_SCHEMA_VERSION: u32 = 12;
 // Frozen source schemas: do not move their meaning when adding a migration.
@@ -560,6 +561,22 @@ impl FsRuntimeStore {
         self.root.join(RUNTIME_FILE)
     }
 
+    pub(crate) fn worker_originals_absent(
+        &self,
+        worker_id: WorkerId,
+    ) -> Result<bool, RuntimeError> {
+        let path = self.worker_dir(&worker_id);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(source) => Err(RuntimeError::StoreIo {
+                operation: "confirm Subject Worker original absence",
+                path,
+                source,
+            }),
+        }
+    }
+
     fn worker_dir(&self, worker_id: &WorkerId) -> PathBuf {
         self.root.join(WORKERS_DIR).join(worker_id.to_string())
     }
@@ -659,6 +676,8 @@ pub(crate) struct OpenedFsRuntimeStore {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PersistedRuntimeState {
+    pub(crate) subject_delete_worker_fences:
+        BTreeMap<WorkerId, crate::runtime::SubjectDeleteWorkerFence>,
     pub(crate) subject_create_recovery_fences:
         BTreeMap<WorkerId, crate::runtime::SubjectCreateRecoveryFence>,
     pub(crate) subject_releases: Vec<(
@@ -876,11 +895,12 @@ fn plan_runtime_store_migration(
             | SOURCE_SCHEMA_VERSION
             | RESTORE_ADMISSION_SCHEMA_VERSION
             | RESTORE_DECISION_SCHEMA_VERSION
+            | RESTORE_REPAIR_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, {RESTORE_REPAIR_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -1216,6 +1236,7 @@ fn migrate_worker_record(
             | SOURCE_SCHEMA_VERSION
             | RESTORE_ADMISSION_SCHEMA_VERSION
             | RESTORE_DECISION_SCHEMA_VERSION
+            | RESTORE_REPAIR_SCHEMA_VERSION
     ) {
         // Admission identity survives migration. Older pending records did not
         // distinguish a committed decision from preparation or failed cleanup.
@@ -1229,10 +1250,12 @@ fn migrate_worker_record(
                 "Worker schema does not match Runtime migration source".into(),
             ));
         }
-        if source_schema_version != RESTORE_DECISION_SCHEMA_VERSION {
+        if source_schema_version < RESTORE_DECISION_SCHEMA_VERSION {
             migrate_restore_commit_fact(&mut identity_document, identity_path)?;
         }
-        migrate_restore_repair_fact(&mut identity_document, identity_path)?;
+        if source_schema_version < RESTORE_REPAIR_SCHEMA_VERSION {
+            migrate_restore_repair_fact(&mut identity_document, identity_path)?;
+        }
         identity_document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
         let aggregate: WorkerAggregateRecord = serde_json::from_value(identity_document)
             .map_err(|error| runtime_store_corrupt(identity_path, error.to_string()))?;
@@ -1691,6 +1714,9 @@ fn migrate_runtime_document(
         "schema_version".to_string(),
         serde_json::Value::from(SCHEMA_VERSION),
     );
+    object
+        .entry("subject_delete_worker_fences")
+        .or_insert_with(|| serde_json::json!({}));
     // Intermediate schema-11 writers may already have saved irreversible fences.
     // Default only a missing field; malformed or existing fences must not be erased.
     object
@@ -1698,7 +1724,10 @@ fn migrate_runtime_document(
         .or_insert_with(|| serde_json::json!({}));
     if !matches!(
         source_schema_version,
-        SOURCE_SCHEMA_VERSION | RESTORE_ADMISSION_SCHEMA_VERSION | RESTORE_DECISION_SCHEMA_VERSION
+        SOURCE_SCHEMA_VERSION
+            | RESTORE_ADMISSION_SCHEMA_VERSION
+            | RESTORE_DECISION_SCHEMA_VERSION
+            | RESTORE_REPAIR_SCHEMA_VERSION
     ) {
         object.remove("workers");
         // This legacy cache is not Runtime lifecycle or restore authority. Bundles
@@ -2249,6 +2278,7 @@ fn migrate_runtime_store_in_place(
                 SOURCE_SCHEMA_VERSION
                     | RESTORE_ADMISSION_SCHEMA_VERSION
                     | RESTORE_DECISION_SCHEMA_VERSION
+                    | RESTORE_REPAIR_SCHEMA_VERSION
             )
         {
             atomic_write_json(
@@ -2288,6 +2318,7 @@ fn migrate_runtime_store_in_place(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RuntimeSnapshot {
+    subject_delete_worker_fences: BTreeMap<WorkerId, crate::runtime::SubjectDeleteWorkerFence>,
     #[serde(default)]
     subject_create_recovery_fences: BTreeMap<WorkerId, crate::runtime::SubjectCreateRecoveryFence>,
     #[serde(default)]
@@ -2326,6 +2357,7 @@ fn record_worker_load_diagnostic(
 impl RuntimeSnapshot {
     fn from_persisted(state: &PersistedRuntimeState) -> Self {
         Self {
+            subject_delete_worker_fences: state.subject_delete_worker_fences.clone(),
             subject_create_recovery_fences: state.subject_create_recovery_fences.clone(),
             subject_releases: state.subject_releases.clone(),
             schema_version: SCHEMA_VERSION,
@@ -2349,6 +2381,33 @@ impl RuntimeSnapshot {
                     self.schema_version, SCHEMA_VERSION
                 ),
             });
+        }
+        for (worker_id, fence) in &self.subject_delete_worker_fences {
+            let request = &fence.request;
+            let response_matches = fence.response.as_ref().is_none_or(|response| {
+                response.worker_id == request.worker_id
+                    && response.workspace_id == request.workspace_id
+                    && response.create_fingerprint == request.create_fingerprint
+                    && response.operation_id == request.operation_id
+            });
+            if *worker_id != request.worker_id
+                || request.workspace_id.trim().is_empty()
+                || request.create_fingerprint.trim().is_empty()
+                || request.create_fingerprint.len() > 512
+                || request.operation_id.trim().is_empty()
+                || request.operation_id.len() > 512
+                || self
+                    .workspace_owners
+                    .get(&request.workspace_id)
+                    .is_none_or(|owner| owner.trim().is_empty())
+                || !response_matches
+            {
+                return Err(RuntimeError::StoreCorrupt {
+                    operation: "read Subject delete Worker fence",
+                    path: path.to_path_buf(),
+                    message: "invalid deletion identity, receipt or Workspace owner".into(),
+                });
+            }
         }
         for (worker_id, fence) in &self.subject_create_recovery_fences {
             let request = &fence.request;
@@ -2392,6 +2451,7 @@ impl RuntimeSnapshot {
         workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
     ) -> PersistedRuntimeState {
         PersistedRuntimeState {
+            subject_delete_worker_fences: self.subject_delete_worker_fences,
             subject_create_recovery_fences: self.subject_create_recovery_fences,
             subject_releases: self.subject_releases,
             display_name: self.display_name,
@@ -3218,8 +3278,7 @@ mod tests {
             assert_eq!(fs::read(&worker_path).unwrap(), worker_before);
             // The direct reader still rejects a previous schema: migration is
             // explicit, not permissive deserialization of a newer format.
-            let snapshot: RuntimeSnapshot = serde_json::from_value(runtime.clone()).unwrap();
-            assert!(snapshot.validate(&runtime_path).is_err());
+            assert!(serde_json::from_value::<RuntimeSnapshot>(runtime.clone()).is_err());
 
             let opened = FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap();
             let state = opened.state.as_ref().unwrap();
@@ -3231,6 +3290,7 @@ mod tests {
                 expected_worker
             );
             runtime["schema_version"] = serde_json::json!(SCHEMA_VERSION);
+            runtime["subject_delete_worker_fences"] = serde_json::json!({});
             if fence_state == "absent" {
                 runtime["subject_create_recovery_fences"] = serde_json::json!({});
             }
@@ -4071,6 +4131,8 @@ mod tests {
             MAX_WORKER_RECORD_BYTES + 1
         );
     }
+
+    include!("subject_delete_store_tests.rs");
 
     fn canonical_worker_store() -> (
         tempfile::TempDir,

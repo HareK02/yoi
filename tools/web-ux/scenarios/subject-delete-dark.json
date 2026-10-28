@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "id": "subject-delete-dark",
+  "title": "Subject deletion confirmation and retry",
+  "baseUrl": "http://127.0.0.1:15287",
+  "colorScheme": "dark",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Authenticated owner (synthetic HTTP)",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "routes": [
+    {
+      "id": "subject",
+      "label": "Subject detail",
+      "path": "/w/memory-review/memory/pending-subject",
+      "goal": "Review the Subject before irreversible deletion.",
+      "dataState": "Active Subject, no current Worker; owner permissions from Backend projection.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".subject-overview"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Subject detail"
+        },
+        {
+          "id": "confirmation",
+          "label": "Irreversible deletion scope and confirmation",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".subject-delete-open"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "[data-delete-state=confirming]"
+          }
+        },
+        {
+          "id": "pending",
+          "label": "Fence saved; erasure unconfirmed",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".delete-confirm input"
+            },
+            {
+              "action": "click",
+              "selector": ".subject-deletion button[type=submit]"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "[data-delete-state=pending]"
+          }
+        },
+        {
+          "id": "completed",
+          "label": "Deletion confirmed",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".subject-delete-retry"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "[data-delete-state=completed]"
+          }
+        }
+      ]
+    },
+    {
+      "id": "legacy",
+      "label": "Legacy ended Subject",
+      "path": "/w/memory-review/memory/legacy-subject",
+      "goal": "Delete a legacy ended Subject without reactivating it.",
+      "dataState": "Saved retired wire state, owner.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".subject-delete-open"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Legacy ended Subject"
+        },
+        {
+          "id": "confirmation",
+          "label": "Delete legacy Subject",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".subject-delete-open"
+            }
+          ],
+          "ready": {
+            "kind": "selector",
+            "selector": "[data-delete-state=confirming]"
+          }
+        }
+      ]
+    },
+    {
+      "id": "non-owner",
+      "label": "Nonowner Subject view",
+      "path": "/w/memory-review/memory/legacy-subject?persona=reader",
+      "goal": "Read Subject without presenting unauthorized deletion.",
+      "dataState": "Backend delete_subjects=false; no deletion controls.",
+      "ready": {
+        "kind": "selector",
+        "selector": ".subject-overview"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Nonowner details"
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "subject-delete-fixture",
+      "command": "deno",
+      "cwd": "..",
+      "args": [
+        "run",
+        "-A",
+        "../../web/workspace/test/subject-delete-browser/fixture-server.ts",
+        "15287",
+        "../../web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15287/health"
+    }
+  ]
+}

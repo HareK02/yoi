@@ -52,6 +52,10 @@ export type WorkspacePermissionSummary = {
   manage_secrets: boolean;
   manage_runtimes: boolean;
   delete_workspace: boolean;
+  /**
+   * Explicit Subject deletion authority for the current authenticated actor.
+   */
+  delete_subjects: boolean;
 };
 
 export type WorkspaceDeletionState =

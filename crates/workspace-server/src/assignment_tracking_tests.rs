@@ -478,7 +478,8 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                     (101, "Durable explicit Subject body release".into()),
                     (102, "Durable failed Subject creation recovery".into()),
                     (103, "Passkey metadata and atomic addition results".into()),
-                    (104, "Converge Passkey results and Job input retention".into())
+                    (104, "Converge Passkey results and Job input retention".into()),
+                    (105, "Durable Subject deletion snapshots and Job admission fences".into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {

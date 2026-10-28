@@ -1158,3 +1158,69 @@ fn failed_link_migration_rolls_back_ddl_and_preserves_existing_data_for_retry() 
     assert_eq!(linked(&f.links(&selector, true).sources[0]).1, entry);
     assert_eq!(f.snapshot(), before);
 }
+
+#[test]
+fn subject_deletion_denies_all_memory_journal_context_and_reconcile_entry_points() {
+    let f = Fixture::new();
+    let staged = f.stage("candidate", &[0]);
+    let selector = f.apply(&staged);
+    let entry = f.fixed("entry", 0, vec![]);
+    f.links(&selector, true);
+    f.store()
+        .begin_subject_deletion(&f.host.subject_id, "delete")
+        .unwrap();
+    for request in [
+        MemoryJournalRequest::Links {
+            selector: selector.clone(),
+        },
+        MemoryJournalRequest::Reconcile {
+            selector: selector.clone(),
+        },
+        MemoryJournalRequest::LinksPage {
+            selector: selector.clone(),
+            source_offset: 0,
+            limit: 1,
+        },
+        MemoryJournalRequest::ReconcilePage {
+            selector: selector.clone(),
+            source_offset: 0,
+            limit: 1,
+        },
+        MemoryJournalRequest::Read {
+            selector,
+            source_index: 0,
+            journal_id: f.journal_id.clone(),
+            entry_id: entry.clone(),
+            expected_token: None,
+            byte_offset: 0,
+            max_bytes: 8,
+        },
+        MemoryJournalRequest::Related {
+            journal_id: f.journal_id.clone(),
+            entry_id: entry,
+            after: None,
+            limit: 1,
+        },
+    ] {
+        assert!(matches!(
+            f.store().execute_memory_journal(&f.host, request),
+            Err(JournalError::Subject(
+                crate::SubjektivError::SubjectNotFound(_)
+            ))
+        ));
+    }
+    f.store()
+        .finish_subject_deletion(&f.host.subject_id, "delete")
+        .unwrap();
+    f.store()
+        .database
+        .try_with_connection::<_, JournalError>(|c| {
+            assert_eq!(
+                c.query_row("SELECT COUNT(*) FROM memory_journal_links", [], |r| r
+                    .get::<_, i64>(0))?,
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+}

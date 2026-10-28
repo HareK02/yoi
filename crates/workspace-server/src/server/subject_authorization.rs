@@ -149,6 +149,13 @@ pub(super) fn worker_permissions(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> ApiResult<Option<Vec<ScopedPermission>>> {
+    if subjektiv_deletion::deleting_worker(api, worker)?
+        || open_subjektiv_store(api)?
+            .worker_subject_deleted(&worker.runtime_id, &worker.worker_id)
+            .map_err(subjektiv_store_error)?
+    {
+        return Err(denied("Worker belonged to an explicitly deleted Subject"));
+    }
     if let Some(grant) = live_child_grant(api, worker)? {
         return Ok(Some(grant.permissions));
     }
@@ -226,6 +233,8 @@ pub(super) fn prepare_delegation(
     singleton_key: Option<&str>,
     subject_connection: bool,
 ) -> ApiResult<Option<WorkerExecutionGrant>> {
+    // A deleted grant must never become an ordinary non-Subject delegation source.
+    worker_permissions(api, source)?;
     let child = live_child_grant(api, source)?;
     let body = if child.is_none() {
         current_body_subject(api, source)?

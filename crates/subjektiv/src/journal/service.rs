@@ -469,6 +469,11 @@ fn execute_inner(
             Ok::<_, JournalError>(())
         })?;
     }
+    // Also check empty source reads and Initial snapshot responses (no delivery write).
+    store.database.try_with_connection(|tx| {
+        super::store::job(store, tx, context, false)?;
+        Ok::<_, JournalError>(())
+    })?;
     Ok(response)
 }
 

@@ -1757,3 +1757,5 @@ WHEN (OLD.runtime_id != NEW.runtime_id OR OLD.worker_id != NEW.worker_id OR OLD.
     WHERE workspace_id = OLD.workspace_id AND runtime_id = OLD.runtime_id
       AND worker_id = OLD.worker_id)
 BEGIN SELECT RAISE(ABORT, 'Worker has unfinished Ticket work'); END;
+
+-- Subject deletion schema is composed by store.rs.

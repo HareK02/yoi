@@ -1292,6 +1292,13 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         })
     }
 
+    fn subject_delete_worker(
+        &self,
+        _request: runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<runtime_api::SubjectDeleteWorkerResponse, String> {
+        Err("Subject deletion fencing is unavailable on this Runtime".into())
+    }
+
     fn recover_subject_create(
         &self,
         _request: runtime_api::SubjectCreateRecoveryRequest,
@@ -2267,6 +2274,21 @@ impl RuntimeRegistry {
                 },
             )?);
         runtime.worker_session_attachment(workspace_id, &worker_ref, session_id, attachment_id)
+    }
+
+    pub fn subject_delete_worker(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<runtime_api::SubjectDeleteWorkerResponse, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .subject_delete_worker(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "subject_delete_worker_unproven".into(),
+                message,
+            })
     }
 
     pub fn recover_subject_create(
@@ -3367,6 +3389,19 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             })
     }
 
+    fn subject_delete_worker(
+        &self,
+        request: runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<runtime_api::SubjectDeleteWorkerResponse, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err("Subject deletion Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        self.runtime
+            .subject_delete_worker_scoped(&scope, request)
+            .map_err(|e| e.to_string())
+    }
+
     fn recover_subject_create(
         &self,
         request: runtime_api::SubjectCreateRecoveryRequest,
@@ -4255,7 +4290,10 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
     }
     if path.contains("/retention/")
         || (path.starts_with("/v1/workers/") && method == "DELETE")
-        || (path == "/v1/subject-create-recovery" && method == "POST")
+        || (matches!(
+            path,
+            "/v1/subject-create-recovery" | "/v1/subject-delete-worker"
+        ) && method == "POST")
     {
         return "workers:delete";
     }
@@ -5654,6 +5692,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 message: diagnostic.message,
             }
         })
+    }
+
+    fn subject_delete_worker(
+        &self,
+        request: runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<runtime_api::SubjectDeleteWorkerResponse, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.subject_delete_worker(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
     }
 
     fn recover_subject_create(
@@ -8505,6 +8555,57 @@ mod tests {
             workspace_runtime_operation("POST", SSH_HOST_KEY_PROBE_PATH),
             SSH_HOST_KEY_PROBE_OPERATION
         );
+    }
+
+    #[test]
+    fn remote_subject_delete_uses_generated_exact_identity_transport() {
+        assert_eq!(
+            workspace_runtime_operation("POST", "/v1/subject-delete-worker"),
+            "workers:delete"
+        );
+        let request = runtime_api::SubjectDeleteWorkerRequest {
+            workspace_id: "workspace-test".into(),
+            worker_id: EmbeddedWorkerId::now_v7(),
+            create_fingerprint: "sha256:reserved-create".into(),
+            operation_id: "delete-worker-1".into(),
+        };
+        let response = runtime_api::SubjectDeleteWorkerResponse {
+            originals_absent: true,
+            workspace_id: request.workspace_id.clone(),
+            worker_id: request.worker_id,
+            create_fingerprint: request.create_fingerprint.clone(),
+            operation_id: request.operation_id.clone(),
+        };
+        // Only remote transport is substituted; actual Controller shutdown and
+        // signed admission are covered by worker-runtime's independent suites.
+        let (base_url, server) = serve_mock_http(vec![mock_response(
+            "POST",
+            "/v1/subject-delete-worker",
+            true,
+            200,
+            serde_json::to_string(&response).unwrap(),
+        )]);
+        let registry = RuntimeRegistry::new(Vec::new());
+        registry.register(
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig::new(
+                    "remote:delete",
+                    "Deletion transport fixture",
+                    base_url,
+                    Some("secret-token".into()),
+                ),
+                "workspace-test".into(),
+                "http://127.0.0.1:8787".into(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            registry
+                .subject_delete_worker("remote:delete", request)
+                .unwrap(),
+            response
+        );
+        server.join().unwrap();
     }
 
     #[test]

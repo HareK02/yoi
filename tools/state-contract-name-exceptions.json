@@ -33,6 +33,14 @@
     ]
   },
   {
+    "path": "crates/subjektiv/src/deletion/tests.rs",
+    "kind": "saved_data",
+    "reason": "schema 6の固定保存Subject行を投入し、最新migrationが旧retiredとarchive原文を黙って消去・再活性化せず、明示削除だけで消去する検証に必要な旧SQL列名。現行writerや競合制御には使わない。",
+    "lines": [
+      { "sha256": "defca5951b3d48785514b25912044fa3fc252659311b09a31fa2e64af2a19049", "count": 1 }
+    ]
+  },
+  {
     "path": "crates/subjektiv/src/journal/memory_links/tests.rs",
     "kind": "saved_data",
     "reason": "最古対応v1 schemaの保存済Subject JSONとSQLをそのまま作成し、最新migrationが元出典を保持する検証に必要な固定綴り。現行writerや状態判断には使わない。",

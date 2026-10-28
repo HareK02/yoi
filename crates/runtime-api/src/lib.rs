@@ -1193,8 +1193,40 @@ pub struct SubjectCreateRecoveryResponse {
     pub operation_id: String,
 }
 
+/// Host requests this only after durably fencing the Subject in Backend authority.
+/// Permanently exclude the Worker from creation and restoration, and confirm actual
+/// execution shutdown. This does not delete Worker or Session records.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectDeleteWorkerRequest {
+    pub workspace_id: String,
+    pub worker_id: WorkerId,
+    pub create_fingerprint: String,
+    pub operation_id: String,
+}
+
+/// Durable admission exclusion plus confirmed execution shutdown/absence. Errors,
+/// timeouts and lost responses are unknown outcomes; retry the same full request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectDeleteWorkerResponse {
+    pub workspace_id: String,
+    pub worker_id: WorkerId,
+    pub create_fingerprint: String,
+    pub operation_id: String,
+    /// The canonical live Worker/Session/diagnostic aggregate is physically absent
+    /// under the permanent creation fence. False is not a deletion receipt.
+    pub originals_absent: bool,
+}
+
 #[api(reqwest, axum)]
 pub trait RuntimeApi {
+    #[post("/v1/subject-delete-worker", status = 200, error_status = 400)]
+    async fn subject_delete_worker(
+        &self,
+        #[body] request: SubjectDeleteWorkerRequest,
+    ) -> Result<SubjectDeleteWorkerResponse, RuntimeApiError>;
+
     #[post("/v1/subject-create-recovery", status = 200, error_status = 400)]
     async fn recover_subject_create(
         &self,
@@ -1755,6 +1787,19 @@ mod tests {
         ) -> Result<SessionMaterialPinResponse, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn subject_delete_worker(
+            &self,
+            request: SubjectDeleteWorkerRequest,
+        ) -> Result<SubjectDeleteWorkerResponse, RuntimeApiError> {
+            Ok(SubjectDeleteWorkerResponse {
+                originals_absent: true,
+                workspace_id: request.workspace_id,
+                worker_id: request.worker_id,
+                create_fingerprint: request.create_fingerprint,
+                operation_id: request.operation_id,
+            })
+        }
+
         async fn recover_subject_create(
             &self,
             request: SubjectCreateRecoveryRequest,
@@ -1934,6 +1979,19 @@ mod tests {
         assert_eq!(response.create_fingerprint, recovery.create_fingerprint);
         assert_eq!(response.operation_id, recovery.operation_id);
 
+        let deletion = SubjectDeleteWorkerRequest {
+            workspace_id: "workspace-a".into(),
+            worker_id: WorkerId::now_v7(),
+            create_fingerprint: "deleted-create".into(),
+            operation_id: "delete-1".into(),
+        };
+        let receipt = client
+            .subject_delete_worker(deletion.clone())
+            .await
+            .unwrap();
+        let mut expected = serde_json::to_value(deletion).unwrap();
+        expected["originals_absent"] = true.into();
+        assert_eq!(serde_json::to_value(receipt).unwrap(), expected);
         let summary = client.runtime_summary().await.unwrap();
         assert_eq!(summary.runtime.display_name.as_deref(), Some("round-trip"));
         let workers = client

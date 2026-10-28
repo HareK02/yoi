@@ -1,3 +1,5 @@
+mod subject_delete;
+pub(crate) use subject_delete::SubjectDeleteWorkerFence;
 #[cfg(feature = "restore-checkpoints")]
 mod restore_checkpoint;
 mod restore_continuation;
@@ -5645,6 +5647,7 @@ struct RuntimeState {
     // Ephemeral write barrier, not authority: only canonical reread + sync can
     // release it. Prevents another mutation from persisting an older projection.
     unreconciled_worker_writes: std::collections::BTreeSet<WorkerId>,
+    subject_delete_worker_fences: BTreeMap<WorkerId, SubjectDeleteWorkerFence>,
     subject_create_recovery_fences: BTreeMap<WorkerId, SubjectCreateRecoveryFence>,
     subject_release_operations: BTreeMap<
         (WorkerId, String),
@@ -5686,6 +5689,7 @@ impl RuntimeState {
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
             unreconciled_worker_writes: Default::default(),
+            subject_delete_worker_fences: BTreeMap::new(),
             subject_create_recovery_fences: BTreeMap::new(),
             subject_release_operations: BTreeMap::new(),
             workdir_operations: BTreeMap::new(),
@@ -5722,6 +5726,7 @@ impl RuntimeState {
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
             unreconciled_worker_writes: Default::default(),
+            subject_delete_worker_fences: BTreeMap::new(),
             subject_create_recovery_fences: BTreeMap::new(),
             subject_release_operations: BTreeMap::new(),
             workdir_operations: BTreeMap::new(),
@@ -5773,6 +5778,7 @@ impl RuntimeState {
             next_diagnostic_id,
             workers,
             unreconciled_worker_writes: Default::default(),
+            subject_delete_worker_fences: persisted.subject_delete_worker_fences,
             subject_create_recovery_fences: persisted.subject_create_recovery_fences,
             subject_release_operations: persisted
                 .subject_releases
@@ -5804,6 +5810,7 @@ impl RuntimeState {
     #[cfg(feature = "fs-store")]
     fn persisted_state(&self) -> PersistedRuntimeState {
         PersistedRuntimeState {
+            subject_delete_worker_fences: self.subject_delete_worker_fences.clone(),
             subject_create_recovery_fences: self.subject_create_recovery_fences.clone(),
             subject_releases: self.subject_release_operations.values().cloned().collect(),
             display_name: self.display_name.clone(),
@@ -6027,7 +6034,9 @@ impl RuntimeState {
     }
 
     fn ensure_subject_create_not_fenced(&self, worker_id: WorkerId) -> Result<(), RuntimeError> {
-        if self.subject_create_recovery_fences.contains_key(&worker_id) {
+        if self.subject_create_recovery_fences.contains_key(&worker_id)
+            || self.subject_delete_worker_fences.contains_key(&worker_id)
+        {
             return Err(RuntimeError::InvalidRequest(
                 "Subject create identity is irreversibly fenced".into(),
             ));
@@ -6040,6 +6049,14 @@ impl RuntimeState {
         worker: &WorkerRef,
         allow_disconnected: bool,
     ) -> Result<(), RuntimeError> {
+        if allow_disconnected
+            && self
+                .subject_delete_worker_fences
+                .get(&worker.worker_id)
+                .is_some_and(|fence| fence.response.is_some())
+        {
+            return Ok(());
+        }
         self.ensure_subject_create_not_fenced(worker.worker_id)?;
         use runtime_api::SubjectReleaseState as State;
         if self
@@ -6110,6 +6127,13 @@ impl RuntimeState {
     }
 
     fn forget_workspace_owner_if_unused(&mut self, workspace_id: &str) -> bool {
+        if self
+            .subject_delete_worker_fences
+            .values()
+            .any(|fence| fence.request.workspace_id == workspace_id)
+        {
+            return false;
+        }
         if self
             .subject_create_recovery_fences
             .values()
@@ -8767,6 +8791,8 @@ mod tests {
 
     #[derive(Default)]
     struct TestExecutionBackend {
+        deletion_confirmed: AtomicBool,
+        deletion_checks: std::sync::atomic::AtomicUsize,
         recovery_absent: AtomicBool,
         recovery_checks: std::sync::atomic::AtomicUsize,
         spawn_result: Mutex<Option<WorkerExecutionSpawnResult>>,
@@ -8848,6 +8874,23 @@ mod tests {
     }
 
     impl WorkerExecutionBackend for TestExecutionBackend {
+        fn preflight_subject_delete_worker(
+            &self,
+            _request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn subject_delete_worker(
+            &self,
+            _request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> Result<(), String> {
+            self.deletion_checks.fetch_add(1, Ordering::SeqCst);
+            if self.deletion_confirmed.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("shutdown is unconfirmed".into())
+            }
+        }
         fn recover_subject_create(
             &self,
             _request: &runtime_api::SubjectCreateRecoveryRequest,
@@ -14074,7 +14117,7 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains(
-            "unsupported Runtime store schema version 2; expected 6, 7, 8, 9, 10, 11, 12, 13, or 14"
+            "unsupported Runtime store schema version 2; expected 6, 7, 8, 9, 10, 11, 12, 13, 14, or 15"
         ));
 
         let _ = std::fs::remove_dir_all(root);
@@ -14258,6 +14301,8 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
+
+    include!("runtime/subject_delete_tests.rs");
 
     #[cfg(feature = "fs-store")]
     #[test]

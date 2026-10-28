@@ -215,7 +215,8 @@ impl StoppedWorkerTemplate {
         snapshot
             .validate(&root.join(RUNTIME_FILE))
             .map_err(|_| reject("unsupported Runtime schema"))?;
-        if !snapshot.subject_create_recovery_fences.is_empty()
+        if !snapshot.subject_delete_worker_fences.is_empty()
+            || !snapshot.subject_create_recovery_fences.is_empty()
             || !snapshot.subject_releases.is_empty()
         {
             return Err(reject("source has lifecycle operations"));
@@ -427,6 +428,7 @@ impl StoppedWorkerTemplate {
             )?;
             self.validate_session(&session)?;
             store.write_runtime_snapshot(&PersistedRuntimeState {
+                subject_delete_worker_fences: BTreeMap::new(),
                 subject_create_recovery_fences: BTreeMap::new(),
                 subject_releases: Vec::new(),
                 // Match normal store initialization: this is catalog availability,

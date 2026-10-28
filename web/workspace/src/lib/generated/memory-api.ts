@@ -118,6 +118,14 @@ export type SubjektivSubjectCreateRequest = {
   behavior_md?: string;
 };
 
+export type SubjektivSubjectDeleteRequest = { operation_id: string };
+
+export type SubjektivSubjectDeleteResponse = {
+  subject_id: string;
+  operation_id: string;
+  completed: boolean;
+};
+
 export type SubjektivSubjectBehaviorUpdateRequest = {
   expected_behavior_md: string;
   behavior_md: string;

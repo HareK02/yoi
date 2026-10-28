@@ -444,6 +444,28 @@ fn job_result_facts(
 
 pub(super) fn deliver_job_result(api: &WorkspaceApi, acceptance: &BackendJobResultAcceptance) {
     use crate::store::JobNotificationFacts;
+    // A recovered/captured result is not delivery authority. Serialize even the
+    // Runtime send with deletion, so no prepared bytes escape after its fence.
+    let subject = subjektiv_deletion::job_subject(&acceptance.job.request);
+    let gate = match subject
+        .map(|subject| subjektiv_journal::lifecycle_lock(api, subject))
+        .transpose()
+    {
+        Ok(gate) => gate,
+        Err(error) => {
+            tracing::warn!(%error, "Subject Job notification gate unavailable");
+            return;
+        }
+    };
+    let _guard = match gate.as_ref().map(|gate| gate.lock()).transpose() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    if let Some(subject) = subject
+        && subjektiv_deletion::require_available(api, subject).is_err()
+    {
+        return;
+    }
     let Some(_permit) = api.notification_delivery_lifecycle.begin() else {
         return;
     };

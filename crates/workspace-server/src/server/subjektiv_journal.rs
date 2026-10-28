@@ -446,6 +446,7 @@ pub(super) fn bind_host_session(
 /// Runs under the same Subject gate as final revoke/singleton release. A failed create or
 /// legacy removal may have released its Backend reservation but cannot hide a durable writer.
 pub(super) fn check_start_allowed(api: &WorkspaceApi, subject: &str) -> Result<()> {
+    subjektiv_deletion::require_available(api, subject)?;
     let store = store(api)?;
     let key = crate::subjektiv::subject_worker_singleton_key(subject)
         .map_err(|e| Error::InvalidInput(e.to_string()))?;
@@ -1747,6 +1748,13 @@ pub(super) fn prepare_worker_removal(
     runtime: &RuntimeRegistry,
     target: &RuntimeWorkerRef,
 ) -> Result<Option<crate::retention::ErasedJournalSession>> {
+    if let Some(api) = service.journal_dispatch_api.upgrade()
+        && subjektiv_deletion::deleting_worker(&api, target)?
+    {
+        // Full Subject deletion has a permanent domain fence. It deliberately drops
+        // Journal continuity, but retains source originals through its archive policy.
+        return Ok(None);
+    }
     let Some(attr) = removal_attribution(service, target)? else {
         if service
             .store
@@ -1809,6 +1817,13 @@ pub(super) fn erased_archive_removal_proof(
     target: &RuntimeWorkerRef,
     prepared: &crate::retention::PreparedWorkerRemoval,
 ) -> Result<Option<crate::retention::RuntimeJournalErasureAck>> {
+    if let Some(api) = service.journal_dispatch_api.upgrade()
+        && subjektiv_deletion::deleting_worker(&api, target)?
+    {
+        // Resume the exact canonical retention request after full Subject fencing.
+        // Subject deletion retains originals; it is not per-Session source erasure.
+        return Ok(None);
+    }
     let Some(attr) = removal_attribution(service, target)? else {
         return Ok(None);
     };
@@ -1852,6 +1867,13 @@ pub(super) fn validate_removal_retention(
     target: &RuntimeWorkerRef,
     prepared: &crate::retention::PreparedWorkerRemoval,
 ) -> Result<()> {
+    if let Some(api) = service.journal_dispatch_api.upgrade()
+        && subjektiv_deletion::deleting_worker(&api, target)?
+    {
+        // The plan-local retention policy and canonical Runtime receipt remain required.
+        // Neither unfinished Journals nor a stopped old Controller are deletion blockers.
+        return Ok(());
+    }
     let Some(attr) = removal_attribution(service, target)? else {
         if service
             .store
@@ -2066,6 +2088,9 @@ pub(super) fn session_erased(api: &WorkspaceApi, request: &BackendJobRequest) ->
     let Some(grant) = &request.grants.subjektiv_journal else {
         return Ok(false);
     };
+    if subjektiv_deletion::pending(api, &grant.subject_id)? {
+        return Ok(true);
+    }
     let store = store(api)?;
     store
         .journal_session_erased(&host(api, &store, grant)?)

@@ -28,6 +28,7 @@ use subjektiv::api::*;
 mod backend_job_profile;
 mod external_operation_audit;
 mod subject_authorization;
+mod subjektiv_deletion;
 mod subjektiv_job;
 mod subjektiv_journal;
 mod subjektiv_journal_browser;
@@ -4577,6 +4578,12 @@ impl WorkspaceApi {
             .run(move || recover_workdir_removals(&workdir_recovery_api))
             .await?;
         recover_runtime_removals(&api).await;
+        let deletion_api = api.clone();
+        let deletion_runtime = tokio::runtime::Handle::current();
+        api.host_executors
+            .host()?
+            .run(move || deletion_runtime.block_on(subjektiv_deletion::recover(&deletion_api)))
+            .await?;
         api.host_executors
             .host()?
             .run(move || {
@@ -4604,9 +4611,23 @@ impl WorkspaceApi {
     ) -> Result<BackendJobReservation> {
         self.resolve_backend_job_profile(request)?;
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let reservation =
+        let reservation = {
+            let gate = subjektiv_deletion::job_subject(request)
+                .map(|subject| subjektiv_journal::lifecycle_lock(self, subject))
+                .transpose()?;
+            let _guard = gate
+                .as_ref()
+                .map(|gate| {
+                    gate.lock()
+                        .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))
+                })
+                .transpose()?;
+            if let Some(subject) = subjektiv_deletion::job_subject(request) {
+                subjektiv_deletion::require_available(self, subject)?;
+            }
             self.store
-                .reserve_backend_job(&self.config.workspace_id, request, &now)?;
+                .reserve_backend_job(&self.config.workspace_id, request, &now)?
+        };
         let result = self.dispatch_backend_job_reservation(reservation);
         if result.is_err() {
             self.drain_reserved_backend_jobs();
@@ -4621,9 +4642,27 @@ impl WorkspaceApi {
     /// immutable request.
     pub fn retry_backend_job(&self, job_id: &str) -> Result<BackendJobReservation> {
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let reservation =
+        let reservation = {
+            let current = self
+                .store
+                .get_backend_job(self.workspace_id(), job_id)?
+                .ok_or_else(|| Error::InvalidInput("unknown Backend Job".into()))?;
+            let gate = subjektiv_deletion::job_subject(&current.request)
+                .map(|subject| subjektiv_journal::lifecycle_lock(self, subject))
+                .transpose()?;
+            let _guard = gate
+                .as_ref()
+                .map(|gate| {
+                    gate.lock()
+                        .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))
+                })
+                .transpose()?;
+            if let Some(subject) = subjektiv_deletion::job_subject(&current.request) {
+                subjektiv_deletion::require_available(self, subject)?;
+            }
             self.store
-                .reserve_backend_job_retry(&self.config.workspace_id, job_id, &now)?;
+                .reserve_backend_job_retry(&self.config.workspace_id, job_id, &now)?
+        };
         let result = self.dispatch_backend_job_reservation(reservation);
         if result.is_err() {
             self.drain_reserved_backend_jobs();
@@ -4637,13 +4676,8 @@ impl WorkspaceApi {
     ) -> Result<BackendJobReservation> {
         // Reread even a terminal/stale reservation before deciding whether it can
         // dispatch or replay: an explicit erasure may have retired its saved input.
-        let journal_gate = reservation
-            .job
-            .request
-            .grants
-            .subjektiv_journal
-            .as_ref()
-            .map(|grant| subjektiv_journal::lifecycle_lock(self, &grant.subject_id))
+        let journal_gate = subjektiv_deletion::job_subject(&reservation.job.request)
+            .map(|subject| subjektiv_journal::lifecycle_lock(self, subject))
             .transpose()?;
         let _journal_guard = journal_gate
             .as_ref()
@@ -4652,6 +4686,9 @@ impl WorkspaceApi {
                     .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))
             })
             .transpose()?;
+        if let Some(subject) = subjektiv_deletion::job_subject(&reservation.job.request) {
+            subjektiv_deletion::require_available(self, subject)?;
+        }
         let current_job = self
             .store
             .get_backend_job(&self.config.workspace_id, &reservation.job.request.job_id)?
@@ -5571,6 +5608,27 @@ impl WorkspaceApi {
         source_worker: &RuntimeWorkerRef,
         submission: &BackendJobResultSubmission,
     ) -> Result<BackendJobResultAcceptance> {
+        let result_job = self
+            .store
+            .get_backend_job(self.workspace_id(), &submission.job_id)?;
+        let subject_gate = result_job
+            .as_ref()
+            .and_then(|job| subjektiv_deletion::job_subject(&job.request))
+            .map(|subject| subjektiv_journal::lifecycle_lock(self, subject))
+            .transpose()?;
+        let subject_guard = subject_gate
+            .as_ref()
+            .map(|gate| {
+                gate.lock()
+                    .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))
+            })
+            .transpose()?;
+        if let Some(subject) = result_job
+            .as_ref()
+            .and_then(|job| subjektiv_deletion::job_subject(&job.request))
+        {
+            subjektiv_deletion::require_available(self, subject)?;
+        }
         let accepted_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let mut verified_submission = submission.clone();
         if let Some(job) = self
@@ -5696,6 +5754,7 @@ impl WorkspaceApi {
             &verified_submission,
             &accepted_at,
         )?;
+        drop(subject_guard);
         if let Some(job) = self
             .store
             .get_backend_job(&self.config.workspace_id, &submission.job_id)?
@@ -5899,15 +5958,21 @@ impl WorkspaceApi {
                     .map(|assignment| assignment.operation_id.clone())
             })
             .unwrap_or_else(|| format!("manual:{}", WorkerId::now_v7()));
-        let subject = singleton_key
+        let body_subject = singleton_key
             .as_deref()
             .and_then(|key| key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX));
-        if let Some(subject) = subject
+        if let Some(subject) = body_subject
             && let Err(error) = subjektiv_journal::recover_failed_subject_create(self, subject)
         {
             let diagnostics = cleanup_spawn_created_workdirs(self, &spawned_workdir_ids);
             return Err(ApiError::with_diagnostics(error, diagnostics));
         }
+        let subject = body_subject.or_else(|| {
+            request
+                .resolved_execution_grant
+                .as_ref()
+                .map(|grant| grant.subject_id.as_str())
+        });
         let subject_gate = subject
             .map(|s| subjektiv_journal::lifecycle_lock(self, s))
             .transpose()?;
@@ -5919,6 +5984,9 @@ impl WorkspaceApi {
             })
             .transpose()?;
         if let Some(subject) = subject {
+            subjektiv_deletion::require_available(self, subject)?;
+        }
+        if let Some(subject) = body_subject {
             subjektiv_journal::check_start_allowed(self, subject)?;
         }
         let reservation = match self.config_store.reserve_worker_create(
@@ -5943,11 +6011,11 @@ impl WorkspaceApi {
                 return Err(ApiError::with_diagnostics(error, diagnostics));
             }
         };
-        drop(subject_guard);
         let worker_id = reservation.worker_id;
         if let Some(grant) = request.resolved_execution_grant.as_ref() {
             subject_authorization::bind_reserved_grant(self, grant, &worker_id.to_string())?;
         }
+        drop(subject_guard);
         // A completed exact-source allocation is historical acceptance, not a new
         // launch. Source/grant authorization and the full fingerprint were checked
         // above. Do not reserve its already-linked attachments again, redispatch
@@ -7458,7 +7526,7 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::subjektiv_memory_changes(
             service.clone(),
         ))
-        .merge(server_api::server_api_axum::subjektiv_subject_retire(
+        .merge(server_api::server_api_axum::subjektiv_subject_delete(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::subjektiv_stage_candidate(
@@ -9724,22 +9792,25 @@ impl server_api::ServerApi for ServerApiContractService {
         .map_err(ApiError::into_repository_api_error)
     }
 
-    async fn subjektiv_subject_retire(
+    async fn subjektiv_subject_delete(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         subject_id: String,
-    ) -> std::result::Result<server_api::SubjektivSubjectResponse, server_api::RepositoryApiError>
-    {
-        scoped_retire_subjektiv_subject(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedSubjektivSubjectPath {
-                workspace_id,
-                subject_id,
-            }),
-        )
-        .await
-        .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        request: server_api::SubjektivSubjectDeleteRequest,
+    ) -> std::result::Result<
+        server_api::SubjektivSubjectDeleteResponse,
+        server_api::RepositoryApiError,
+    > {
+        let api = self.workspace_api()?.clone();
+        let actor = subject_authorization::administration_actor(&context)
+            .map_err(ApiError::into_repository_api_error)?;
+        require_workspace_owner(&api, &workspace_id, actor, "Subject deletion")
+            .await
+            .map_err(ApiError::into_repository_api_error)?;
+        subjektiv_deletion::delete(api, workspace_id, subject_id, request)
+            .await
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn subjektiv_stage_candidate(
@@ -22674,7 +22745,9 @@ fn subjektiv_subject_response(
         memory_fingerprint,
         state: match subject.state {
             crate::subjektiv::SubjectState::Active => server_api::SubjektivSubjectState::Active,
-            crate::subjektiv::SubjectState::Retired => server_api::SubjektivSubjectState::Retired,
+            crate::subjektiv::SubjectState::LegacyRetired => {
+                server_api::SubjektivSubjectState::LegacyRetired
+            }
         },
         created_at: subject.created_at,
         updated_at: subject.updated_at,
@@ -22958,24 +23031,6 @@ async fn scoped_list_subjektiv_memory_changes(
                     cursor: query.cursor,
                 },
             )?))
-        })
-        .await
-}
-
-async fn scoped_retire_subjektiv_subject(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedSubjektivSubjectPath>,
-) -> ApiResult<Json<server_api::SubjektivSubjectResponse>> {
-    api.host_executors
-        .host()?
-        .run(move || {
-            validate_workspace_scope(&api, &path.workspace_id)?;
-            let subject = open_subjektiv_store(&api)?
-                .retire_subject(&path.subject_id)
-                .map_err(subjektiv_store_error)?;
-            // Retirement deliberately does not stop or remove the current Worker. The
-            // Worker lease and subject lifecycle are independent authorities.
-            Ok(Json(subjektiv_subject_response(&api, subject)?))
         })
         .await
 }
@@ -24564,6 +24619,7 @@ fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
             Error::WorkspacePermissionDenied(error.to_string())
         }
         crate::subjektiv::SubjektivError::SubjectPermissionsConflict(_)
+        | crate::subjektiv::SubjektivError::SubjectDeletionConflict(_)
         | crate::subjektiv::SubjektivError::PermissionOperationConflict(_)
         | crate::subjektiv::SubjektivError::WorkerExecutionGrantConflict(_) => {
             Error::RepositoryConflict(error.to_string())
@@ -31543,6 +31599,7 @@ async fn workspace_response(
             manage_secrets: is_owner,
             manage_runtimes: is_owner,
             delete_workspace: is_owner,
+            delete_subjects: is_owner,
         },
         extension_points: WorkspaceExtensionPoints {
             store: "sqlite".to_string(),
@@ -37777,6 +37834,7 @@ mod tests {
     mod restore_workdir_tests;
     mod restored_parent_control_tests;
     mod subject_authorization_tests;
+    mod subject_deletion_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod subjektiv_journal_tests;
@@ -46241,7 +46299,13 @@ mod tests {
         let retired = store
             .create_subject(crate::subjektiv::SubjectRole::new("retired").unwrap())
             .unwrap();
-        store.retire_subject(&retired.id).unwrap();
+        // Frozen lifecycle fixture: migration preserves old inactive Subjects; there is
+        // intentionally no public operation that creates this historical state anymore.
+        api.feature_storage.open(&api.subjektiv_registration).unwrap()
+            .try_transaction::<_, feature_storage::FeatureStorageError>(|tx| {
+                tx.execute("UPDATE subjects SET state='retired', record_json=json_set(record_json,'$.state','retired') WHERE subject_id=?1", [&retired.id])?;
+                Ok(())
+            }).unwrap();
 
         let request = |subject_id: Option<&str>, profile: &str, singleton_key: Option<&str>| {
             CreateWorkspaceWorkerRequest {
@@ -48843,6 +48907,7 @@ mod tests {
         >,
         materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
+        subject_delete_failure: std::sync::Mutex<Option<String>>,
         recovery_failure: std::sync::Mutex<Option<String>>,
         recovery_requests: std::sync::Mutex<Vec<runtime_api::SubjectCreateRecoveryRequest>>,
         recovery_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -48887,6 +48952,7 @@ mod tests {
                     std::env::temp_dir().join(unique),
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
+                subject_delete_failure: std::sync::Mutex::new(None),
                 recovery_failure: std::sync::Mutex::new(None),
                 recovery_requests: std::sync::Mutex::new(Vec::new()),
                 recovery_hook: std::sync::Mutex::new(None),
@@ -49240,6 +49306,24 @@ mod tests {
                 .unwrap()
                 .get(worker_ref)
                 .map(|execution| execution.snapshot())
+        }
+
+        fn preflight_subject_delete_worker(
+            &self,
+            _request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> std::result::Result<(), String> {
+            Ok(())
+        }
+
+        fn subject_delete_worker(
+            &self,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> std::result::Result<(), String> {
+            if let Some(message) = self.subject_delete_failure.lock().unwrap().clone() {
+                return Err(message);
+            }
+            self.stop_worker(&worker_runtime::identity::WorkerRef::new(request.worker_id));
+            Ok(())
         }
 
         fn stop_worker(

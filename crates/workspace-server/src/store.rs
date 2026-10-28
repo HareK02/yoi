@@ -92,6 +92,13 @@ use crate::backend_job::{
 use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
+#[path = "subject_deletion_store.rs"]
+mod subject_deletion_store;
+pub(crate) use subject_deletion_store::{
+    prior_removal_matches as subject_deletion_prior_removal_matches,
+    worker_kind as subject_deletion_worker_kind,
+};
+
 #[path = "activation.rs"]
 mod activation;
 pub use activation::ActivationCodeIssue;
@@ -119,7 +126,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 104;
+const LATEST_SCHEMA_VERSION: i64 = 105;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -446,6 +453,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 104,
         name: "Converge Passkey results and Job input retention",
         apply: migrate_schema_103_variants_to_v104,
+    },
+    Migration {
+        version: 105,
+        name: "Durable Subject deletion snapshots and Job admission fences",
+        apply: subject_deletion_store::migrate,
     },
 ];
 
@@ -3000,6 +3012,7 @@ impl SqliteWorkspaceStore {
         validate_workspace_memory_settings_record(current_memory_settings, workspace_id)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            subject_deletion_store::require_worker_admission(&tx, workspace_id, allocation_key, singleton_key)?;
             let fixed_worker_id = prepare(&tx)?;
             let existing = tx
                 .query_row(
@@ -7455,6 +7468,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         let deadline = backend_job_deadline(now, request.limits.timeout_seconds)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, request)?;
             if let Some(job) = read_backend_job(&tx, workspace_id, &request.job_id)? {
                 if job.intent_fingerprint != fingerprint {
                     return Err(Error::InvalidInput(format!(
@@ -7532,7 +7546,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 return Ok(job);
             }
             if reason == JobInputRetirementReason::Completed {
-                job.load_executable_request()?;
+                subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
+            job.load_executable_request()?;
                 let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, &attempt_id(job_id, job.current_attempt))?
                     .ok_or_else(|| Error::Store("Backend Job current attempt missing".into()))?;
                 if job.state != BackendJobState::Completed || attempt.state != BackendJobAttemptState::Completed
@@ -7562,6 +7577,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let mut job = read_backend_job(&tx, workspace_id, job_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             job.load_executable_request()?;
             let previous_id = attempt_id(job_id, job.current_attempt);
             let previous = read_backend_job_attempt(&tx, workspace_id, job_id, &previous_id)?
@@ -7701,6 +7717,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let job = read_backend_job(&tx, workspace_id, job_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             job.load_executable_request()?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
@@ -7764,6 +7781,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let job = read_backend_job(&tx, workspace_id, job_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             job.load_executable_request()?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
@@ -7827,6 +7845,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let job = read_backend_job(&tx, workspace_id, job_id)?.ok_or_else(|| Error::InvalidInput("Backend Job missing".into()))?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             job.load_executable_request()?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| {
@@ -7880,6 +7899,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{}`", submission.job_id)))?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, &submission.job_id, &submission.attempt_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{}`", submission.attempt_id)))?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             let (digest, result_json) = result_digest(&submission.result, job.request.limits.max_result_bytes)?;
             if submission.input_digest != job.input_digest
                 || attempt.input_digest != submission.input_digest
@@ -7908,6 +7928,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 tx.commit()?;
                 return Ok(BackendJobResultAcceptance { job, attempt, replayed: true });
             }
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             job.load_executable_request()?;
             if attempt.state != BackendJobAttemptState::Dispatched || job.state != BackendJobState::Pending {
                 return Err(Error::InvalidInput(
@@ -7972,6 +7993,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let job = read_backend_job(&tx, workspace_id, &expected.job_id)?.ok_or_else(|| Error::InvalidInput("Journal Job missing".into()))?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, &expected.job_id, &expected.attempt_id)?.ok_or_else(|| Error::InvalidInput("Journal attempt missing".into()))?;
             // Full snapshot CAS includes Worker, tracked Run, input and cleanup evidence.
             if &attempt != expected || job.current_attempt != attempt.attempt
@@ -8277,6 +8299,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<(BackendJobDeliveryRecord, bool)> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let deleted:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM subject_deletion_jobs WHERE workspace_id=?1 AND job_id=?2)",params![workspace_id,job_id],|r|r.get(0))?;
+            if deleted {return Err(Error::RepositoryConflict("subject_deleted: Job delivery fenced".into()));}
             if let Some(existing) = read_backend_job_delivery(&tx, workspace_id, delivery_id)? {
                 if existing.job_id != job_id || existing.target != *target {
                     return Err(Error::InvalidInput(
@@ -15545,6 +15569,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     notification_routing::jobs::install(conn)?;
     notification_routing::install_business_events(conn)?;
     notification_routing::upgrade_result_reports(conn)?;
+    subject_deletion_store::install_notification_erasure(conn)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!(
             "fresh Workspace Ticket schema verification failed: {error}"
@@ -15583,10 +15608,17 @@ fn create_workspace_schema_structure_from_sql(
     CREATE UNIQUE INDEX worker_restore_intent_pending_domain ON worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key) WHERE settled=0;")?;
 
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
-    conn.execute_batch(&schema_sql.replace(
-        "-- Ticket-owned assignment schema is composed by store.rs.",
-        ticket::TICKET_ASSIGNMENT_SCHEMA_SQL,
-    ))?;
+    conn.execute_batch(
+        &schema_sql
+            .replace(
+                "-- Ticket-owned assignment schema is composed by store.rs.",
+                ticket::TICKET_ASSIGNMENT_SCHEMA_SQL,
+            )
+            .replace(
+                "-- Subject deletion schema is composed by store.rs.",
+                include_str!("subject_deletion_schema.sql"),
+            ),
+    )?;
     let composed_sql = r#"
         ALTER TABLE typed_tickets RENAME TO typed_tickets_legacy_v66;
         CREATE TABLE typed_tickets (
@@ -15808,6 +15840,9 @@ fn verify_workspace_resource_constraints(conn: &Connection) -> Result<()> {
     }
     if current_schema_version(conn)? >= 96 {
         notification_routing::jobs::verify(conn)?;
+    }
+    if current_schema_version(conn)? >= 105 {
+        subject_deletion_store::verify(conn)?;
     }
     Ok(())
 }
@@ -16223,6 +16258,8 @@ fn current_worker_singleton_owner(
                     CASE WHEN substr(owner.singleton_key,1,10)='subjektiv:' AND reservation.state='removed' \
                       AND NOT EXISTS(SELECT 1 FROM subject_worker_releases r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.completed=1) \
                       AND NOT EXISTS(SELECT 1 FROM subject_create_recoveries r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.create_fingerprint=reservation.create_fingerprint AND r.completed=1) \
+                      AND NOT EXISTS(SELECT 1 FROM worker_removal_operations r JOIN subject_deletion_workers d ON d.workspace_id=r.workspace_id AND d.runtime_id=r.runtime_id AND d.worker_id=r.worker_id WHERE r.workspace_id=owner.workspace_id AND r.runtime_id=owner.runtime_id AND r.worker_id=owner.worker_id AND r.state='succeeded' AND owner.singleton_key='subjektiv:'||d.subject_id AND (d.prior_removal_operation_id=r.operation_id OR (d.prior_removal_operation_id IS NULL AND d.is_job=0 AND r.session_disposition='archive' AND r.archive_retention_kind='forever' AND r.metadata_disposition='tombstone'))) \
+                      AND NOT EXISTS(SELECT 1 FROM subject_deletion_workers d WHERE d.workspace_id=owner.workspace_id AND d.runtime_id=owner.runtime_id AND d.worker_id=owner.worker_id AND owner.singleton_key='subjektiv:'||d.subject_id AND d.originals_absent=1) \
                     THEN 'created' ELSE reservation.state END \
              FROM worker_singleton_owners owner \
              LEFT JOIN worker_create_reservations reservation \
@@ -19265,6 +19302,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:102, name:"Durable failed Subject creation recovery".into()},
                 WorkspaceSchemaMigrationStep {version:103, name:"Passkey metadata and atomic addition results".into()},
                 WorkspaceSchemaMigrationStep {version:104, name:"Converge Passkey results and Job input retention".into()},
+                WorkspaceSchemaMigrationStep {version:105, name:"Durable Subject deletion snapshots and Job admission fences".into()},
             ]
         );
 
@@ -19379,6 +19417,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (102, "Durable failed Subject creation recovery".to_string()),
 (103, "Passkey metadata and atomic addition results".to_string()),
 (104, "Converge Passkey results and Job input retention".to_string()),
+(105, "Durable Subject deletion snapshots and Job admission fences".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -22664,7 +22703,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (101, "Durable explicit Subject body release".into()),
                          (102, "Durable failed Subject creation recovery".into()),
                          (103, "Passkey metadata and atomic addition results".into()),
-                         (104, "Converge Passkey results and Job input retention".into())]);
+                         (104, "Converge Passkey results and Job input retention".into()),
+                         (105, "Durable Subject deletion snapshots and Job admission fences".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
@@ -26857,12 +26897,19 @@ INSERT INTO worker_registry (
             .reserve_backend_job("resource-workspace", &original, RESOURCE_JOB_NOW)
             .unwrap();
         store.with_conn(|conn| {
+            // This fixture deliberately reconstructs schema 102 from fresh.
+            // Remove the newer Subject fence composition, not just its receipt.
+            let triggers=conn.prepare("SELECT name,tbl_name FROM sqlite_schema WHERE type='trigger' AND tbl_name LIKE 'notification_%' AND name NOT LIKE 'subject_deleted_%' AND sql LIKE '%subject_deletion_jobs%'")?
+                .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            for (name,table) in triggers {conn.execute_batch(&format!("DROP TRIGGER {name}; CREATE TRIGGER {name} BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'Notification evidence is immutable'); END;"))?;}
+            for name in ["subject_deleted_job_insert","subject_deleted_job_result","subject_deleted_attempt_insert","subject_deleted_attempt_result","subject_deleted_worker_reservation","subject_deleted_notification_source","subject_deleted_notification_payload","subject_deleted_notification_send","subject_deletion_worker_prior_insert","subject_deletion_worker_identity_immutable"] {conn.execute_batch(&format!("DROP TRIGGER {name}"))?;}
+            conn.execute_batch("DROP TABLE subject_deletion_allocations; DROP TABLE subject_deletion_jobs; DROP TABLE subject_deletion_workers; DROP TABLE subject_deletions;")?;
             conn.execute_batch("DROP TRIGGER backend_job_input_retirement; DROP TRIGGER backend_job_identity_immutable;
                 ALTER TABLE backend_jobs DROP COLUMN input_disposition;
                 DROP TRIGGER passkey_metadata_insert;
                 DROP TABLE passkey_addition_receipts;
                 DROP TABLE passkey_metadata;
-                UPDATE __yoi_schema_migrations SET version=102 WHERE version=104;
+                UPDATE __yoi_schema_migrations SET version=102 WHERE version=105;
                 CREATE TRIGGER backend_job_input_retirement BEFORE UPDATE ON backend_job_attempts BEGIN SELECT RAISE(ABORT,'collision'); END;")?; Ok(())
         }).unwrap();
         drop(store);

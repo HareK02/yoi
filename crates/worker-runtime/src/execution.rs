@@ -727,6 +727,23 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Err("execution backend cannot confirm Subject create execution absence".into())
     }
 
+    /// Read-only exact execution identity check before Runtime persists exclusion.
+    fn preflight_subject_delete_worker(
+        &self,
+        _request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        Err("execution backend cannot validate Subject Worker identity".into())
+    }
+
+    /// Runtime has durably fenced admission. Confirm shutdown and discard all
+    /// execution candidates under the backend Worker lock; uncertainty must fail.
+    fn subject_delete_worker(
+        &self,
+        _request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        Err("execution backend cannot confirm Subject Worker shutdown".into())
+    }
+
     /// Must reserve the actual Controller, not infer Idle from a catalog snapshot.
     fn subject_release(
         &self,
@@ -1067,6 +1084,20 @@ impl WorkerExecutionBackendRef {
         request: &runtime_api::SubjectCreateRecoveryRequest,
     ) -> Result<(), String> {
         self.backend.recover_subject_create(request)
+    }
+
+    pub(crate) fn preflight_subject_delete_worker(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        self.backend.preflight_subject_delete_worker(request)
+    }
+
+    pub(crate) fn subject_delete_worker(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        self.backend.subject_delete_worker(request)
     }
 
     pub(crate) fn subject_release(

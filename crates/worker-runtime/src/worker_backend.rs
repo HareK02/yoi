@@ -3415,6 +3415,14 @@ struct SubjectControllerReservation {
     state: runtime_api::SubjectReleaseState,
 }
 
+// Admission identity is retained even when execution publication or stop settlement
+// failed. Runtime owns durable exclusion; this guards the adapter's delayed calls.
+struct WorkerAdmission {
+    workspace_id: Option<String>,
+    create_fingerprint: String,
+    deletion: Option<runtime_api::SubjectDeleteWorkerRequest>,
+}
+
 /// Worker execution backend backed by real worker crate Workers.
 pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
     #[cfg(test)]
@@ -3438,6 +3446,7 @@ pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
         >,
     >,
     worker_locks: Mutex<HashMap<WorkerRef, Arc<Mutex<()>>>>,
+    admissions: Mutex<HashMap<WorkerRef, WorkerAdmission>>,
     spawn_restore_timeout: Duration,
     subject_reservations: Mutex<HashMap<(WorkerRef, String), SubjectControllerReservation>>,
     shutdown_admission_timeout: Duration,
@@ -3464,10 +3473,90 @@ where
             pending_restores: Mutex::new(HashMap::new()),
             completed_restore_failures: Mutex::new(HashMap::new()),
             worker_locks: Mutex::new(HashMap::new()),
+            admissions: Mutex::new(HashMap::new()),
             spawn_restore_timeout: SPAWN_RESTORE_TASK_TIMEOUT,
             subject_reservations: Mutex::new(HashMap::new()),
             shutdown_admission_timeout: Duration::from_secs(5),
         })
+    }
+
+    // Caller holds the adapter Worker lock.
+    fn admit_worker(
+        &self,
+        worker: &WorkerRef,
+        workspace: Option<&str>,
+        fingerprint: &str,
+    ) -> Result<(), String> {
+        let mut admissions = self
+            .admissions
+            .lock()
+            .map_err(|_| "worker admission lock poisoned")?;
+        if let Some(saved) = admissions.get(worker) {
+            if saved.deletion.is_some() {
+                return Err("Subject Worker permanently excluded".into());
+            }
+            if saved.workspace_id.as_deref() != workspace || saved.create_fingerprint != fingerprint
+            {
+                return Err("Worker admission identity mismatch".into());
+            }
+        } else {
+            admissions.insert(
+                worker.clone(),
+                WorkerAdmission {
+                    workspace_id: workspace.map(str::to_string),
+                    create_fingerprint: fingerprint.into(),
+                    deletion: None,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_subject_delete_identity(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        let admissions = self
+            .admissions
+            .lock()
+            .map_err(|_| "worker admission lock poisoned")?;
+        if let Some(saved) = admissions.get(&WorkerRef::new(request.worker_id)) {
+            if saved.workspace_id.as_deref() != Some(request.workspace_id.as_str())
+                || saved.create_fingerprint != request.create_fingerprint
+                || saved
+                    .deletion
+                    .as_ref()
+                    .is_some_and(|saved| saved != request)
+            {
+                return Err("Subject delete execution identity mismatch".into());
+            }
+        }
+        if let Some(pending) = self.pending_restore(&WorkerRef::new(request.worker_id))? {
+            if pending
+                .request
+                .workspace_scope
+                .as_ref()
+                .map(|scope| scope.workspace_id.as_str())
+                != Some(request.workspace_id.as_str())
+                || pending.request.request.create_fingerprint != request.create_fingerprint
+            {
+                return Err("Subject delete pending execution identity mismatch".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_not_subject_deleted(&self, worker: &WorkerRef) -> Result<(), String> {
+        if self
+            .admissions
+            .lock()
+            .map_err(|_| "worker admission lock poisoned")?
+            .get(worker)
+            .is_some_and(|admission| admission.deletion.is_some())
+        {
+            return Err("Subject Worker permanently excluded".into());
+        }
+        Ok(())
     }
 
     pub fn with_backend_id(mut self, backend_id: impl Into<String>) -> Self {
@@ -4739,6 +4828,58 @@ where
         &self.backend_id
     }
 
+    fn preflight_subject_delete_worker(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        let worker = WorkerRef::new(request.worker_id);
+        let lock = self.worker_lock(&worker)?;
+        let _operation = lock.lock().map_err(|_| "worker operation lock poisoned")?;
+        self.validate_subject_delete_identity(request)
+    }
+
+    fn subject_delete_worker(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        let worker = WorkerRef::new(request.worker_id);
+        let lock = self.worker_lock(&worker)?;
+        let _operation = lock.lock().map_err(|_| "worker operation lock poisoned")?;
+        self.validate_subject_delete_identity(request)?;
+        self.admissions
+            .lock()
+            .map_err(|_| "worker admission lock poisoned")?
+            .insert(
+                worker.clone(),
+                WorkerAdmission {
+                    workspace_id: Some(request.workspace_id.clone()),
+                    create_fingerprint: request.create_fingerprint.clone(),
+                    deletion: Some(request.clone()),
+                },
+            );
+        let result = self.stop_worker_under_lock(&worker);
+        if !result.is_accepted() {
+            return Err(result.message_or_default());
+        }
+        // A live Controller and failed unpublished candidates can coexist. The
+        // ordinary stop's live branch joins the Controller; also reconcile any
+        // factory-owned cache/artifacts before issuing deletion proof.
+        let factory = self.factory.clone();
+        let stopped = worker.clone();
+        self.run_cancellable_on_adapter_runtime(RUNTIME_TASK_TIMEOUT, async move {
+            factory.reconcile_stopped_worker(&stopped).await
+        })?;
+        self.subject_reservations
+            .lock()
+            .map_err(|_| "Subject reservations poisoned")?
+            .retain(|(saved, _), _| saved != &worker);
+        self.completed_restore_failures
+            .lock()
+            .map_err(|_| "completed restores poisoned")?
+            .remove(&worker);
+        Ok(())
+    }
+
     fn recover_subject_create(
         &self,
         request: &runtime_api::SubjectCreateRecoveryRequest,
@@ -5178,6 +5319,19 @@ where
                 ));
             }
         };
+        if let Err(message) = self.admit_worker(
+            &request.worker_ref,
+            request
+                .workspace_scope
+                .as_ref()
+                .map(|scope| scope.workspace_id.as_str()),
+            &request.request.create_fingerprint,
+        ) {
+            return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Spawn,
+                message,
+            ));
+        }
         match self.pending_restore(&request.worker_ref) {
             Ok(None) => {}
             Ok(Some(_)) => {
@@ -5405,6 +5559,10 @@ where
                 ));
             }
         };
+        self.ensure_not_subject_deleted(&request.worker_ref)
+            .map_err(|message| {
+                WorkerExecutionResult::rejected(WorkerExecutionOperation::Restore, message)
+            })?;
         if self
             .pending_restore(&request.worker_ref)
             .map_err(|message| {
@@ -5499,6 +5657,19 @@ where
                 ));
             }
         };
+        if let Err(message) = self.admit_worker(
+            &request.worker_ref,
+            request
+                .workspace_scope
+                .as_ref()
+                .map(|scope| scope.workspace_id.as_str()),
+            &request.request.create_fingerprint,
+        ) {
+            return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Restore,
+                message,
+            ));
+        }
         if let Some(result) =
             self.completed_restore_failure(request.operation_id, &request.worker_ref)
         {
@@ -6182,6 +6353,7 @@ where
                 return Err(message);
             }
         };
+        self.ensure_not_subject_deleted(worker_ref)?;
         if let Some(pending) = self.pending_restore(worker_ref)? {
             if pending.request.operation_id != operation_id {
                 return Err("restored Worker operation identity does not match".into());
@@ -6819,6 +6991,10 @@ mod tests {
         Store, WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore,
     };
     use worker::PreparedWorker;
+
+    include!("subject_delete_backend_tests.rs");
+    #[cfg(feature = "fs-store")]
+    include!("subject_delete_create_tests.rs");
 
     // Both candidate and failure suites need the same guarded, checkout-owned
     // temporary root, independently of Runtime's optional filesystem catalog.

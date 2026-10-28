@@ -63,6 +63,10 @@ impl JournalInput {
         // below operates on this value only, never by making another live capture request.
         let budget = job::MAX_JOB_INPUT_BYTES.saturating_sub(envelope);
         input.capture = capture_once(journal.process_order, journal.process_byte, budget)?;
+        // Capture runs outside SQLite; a delayed callback cannot deliver deleted content.
+        store
+            .database
+            .try_with_connection(|tx| super::store::check_host(store, tx, host, true))?;
         input.selected_ranges = capture_ranges(&input.capture)?;
         if input.selected_ranges.is_empty() {
             return Ok(input);

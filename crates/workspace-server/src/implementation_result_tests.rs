@@ -367,14 +367,54 @@ async fn implementation_result_rejects_forged_evidence_and_rolls_back_without_no
         .unwrap();
 }
 
-#[tokio::test]
-async fn implementation_result_v97_to_v98_preserves_legacy_bytes_receipts_and_notification_evidence() {
-    let (dir, store) = tracking_store_fixture().await;
-    tracking_store_assign(&store, "delegation", "assign");
-    let worker = routing_worker_assign(&store, "implementation").worker;
-    // Reconstruct schema97 from a fresh current-schema fixture, including its historical capture.
-    store.with_conn(|conn| {
-        conn.execute_batch("DROP TRIGGER notification_mr_event;
+// Preserve seeded assignment evidence while rebuilding the actual pre-business
+// capture composition. Changing only a receipt leaves schema105 admission fences
+// and erasure guards in an otherwise legacy fixture.
+fn reconstruct_implementation_schema96(conn: &Connection) -> Result<()> {
+    assert_eq!(current_schema_version(conn)?, 105);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("retained96.db");
+    prepare_retained_schema(&path, 96);
+    let retained = Connection::open(path)?;
+    for trigger in [
+        "notification_sources_no_delete",
+        "notification_decisions_no_delete",
+        "notification_requests_no_delete",
+        "notification_acknowledgements_no_delete",
+        "notification_failures_no_delete",
+        "notification_job_targets_no_delete",
+        "notification_job_legacy_no_delete",
+        "notification_source_preparation_failures_no_delete",
+    ] {
+        let definition: String = retained.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+            [trigger],
+            |row| row.get(0),
+        )?;
+        conn.execute_batch(&format!("DROP TRIGGER {trigger}; {definition};"))?;
+    }
+    for trigger in [
+        "subject_deleted_job_insert",
+        "subject_deleted_job_result",
+        "subject_deleted_attempt_insert",
+        "subject_deleted_attempt_result",
+        "subject_deleted_worker_reservation",
+        "subject_deleted_notification_source",
+        "subject_deleted_notification_payload",
+        "subject_deleted_notification_send",
+    ] {
+        conn.execute_batch(&format!("DROP TRIGGER {trigger};"))?;
+    }
+    // Children before parents; dropping the tables also drops snapshot guards.
+    conn.execute_batch(
+        "DROP TABLE subject_deletion_allocations;
+        DROP TABLE subject_deletion_jobs;
+        DROP TABLE subject_deletion_workers;
+        DROP TABLE subject_deletions;
+        UPDATE __yoi_schema_migrations SET version=104 WHERE version=105;",
+    )?;
+    conn.execute_batch(
+        "DROP TRIGGER notification_mr_event;
             DROP TRIGGER notification_mr_source;
             DROP TRIGGER notification_implementation_result;
             DROP TRIGGER IF EXISTS implementation_delegation_capture;
@@ -396,7 +436,43 @@ async fn implementation_result_v97_to_v98_preserves_legacy_bytes_receipts_and_no
             UPDATE __yoi_schema_migrations SET version=99 WHERE version=100;
             DROP TABLE hosting_administrators; DROP TABLE hosting_settings;
             UPDATE __yoi_schema_migrations SET version=98 WHERE version=99;
-            UPDATE __yoi_schema_migrations SET version=96 WHERE version=98;")?;
+            UPDATE __yoi_schema_migrations SET version=96 WHERE version=98;",
+    )?;
+    assert_eq!(current_schema_version(conn)?, 96);
+    assert_eq!(conn.query_row(
+        "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'subject_delet%' OR sql LIKE '%subject_deletion%'",
+        [], |row| row.get::<_, i64>(0),
+    )?, 0);
+    for table in [
+        "notification_sources",
+        "notification_decisions",
+        "notification_requests",
+        "notification_acknowledgements",
+        "notification_failures",
+        "notification_job_targets",
+        "notification_job_legacy_receipts",
+        "notification_source_preparation_failures",
+        "backend_jobs",
+        "backend_job_attempts",
+        "worker_create_reservations",
+    ] {
+        assert_eq!(
+            state_contract_schema_signature(conn, table),
+            state_contract_schema_signature(&retained, table),
+            "schema96 {table}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn implementation_result_v97_to_v98_preserves_legacy_bytes_receipts_and_notification_evidence() {
+    let (dir, store) = tracking_store_fixture().await;
+    tracking_store_assign(&store, "delegation", "assign");
+    let worker = routing_worker_assign(&store, "implementation").worker;
+    // Reconstruct schema97 from a fresh current-schema fixture, including its historical capture.
+    store.with_conn(|conn| {
+        reconstruct_implementation_schema96(conn)?;
         migrate_business_notifications_v96_to_v97(conn)?;
         assert_eq!(current_schema_version(conn)?, 97);
         Ok(())
@@ -522,24 +598,7 @@ async fn mr_notification_upgrade_recovers_events_not_comments_and_retains_unknow
     store.with_conn(|conn| {
         conn.execute("INSERT INTO ticket_assignment_operation_fences VALUES('w','operation-known-implementation','delegation','r','worker','workspace-orchestrator','tracking-binding',?1)",[serde_json::to_string(&tracking_store_source()).unwrap()])?;
         // Reconstruct the prior composition before its new business capture existed.
-        conn.execute_batch("DROP TRIGGER notification_mr_event; DROP TRIGGER notification_mr_source; DROP TRIGGER notification_implementation_result; DROP TRIGGER IF EXISTS implementation_delegation_capture;
-            DROP TABLE ticket_implementation_results; DROP TABLE ticket_implementation_delegations; DROP TABLE merge_request_source_observations;
-            DROP TRIGGER passkey_metadata_insert;
-            DROP TABLE passkey_addition_receipts;
-            DROP TABLE passkey_metadata;
-            DROP TRIGGER backend_job_input_retirement;
-            DROP TRIGGER backend_job_identity_immutable;
-            ALTER TABLE backend_jobs DROP COLUMN input_disposition;
-            UPDATE __yoi_schema_migrations SET version=102 WHERE version=104;
-            DROP TABLE subject_create_recoveries;
-            UPDATE __yoi_schema_migrations SET version=101 WHERE version=102;
-            DROP TABLE subject_worker_releases;
-            UPDATE __yoi_schema_migrations SET version=100 WHERE version=101;
-            DROP TABLE user_activations;
-            UPDATE __yoi_schema_migrations SET version=99 WHERE version=100;
-            DROP TABLE hosting_administrators; DROP TABLE hosting_settings;
-            UPDATE __yoi_schema_migrations SET version=98 WHERE version=99;
-            UPDATE __yoi_schema_migrations SET version=96 WHERE version=98;")?;
+        reconstruct_implementation_schema96(conn)?;
         conn.execute_batch("INSERT INTO merge_requests VALUES('w','historical-mr','main','open','refs/heads/work','refs/heads/main','3','3');
             INSERT INTO merge_request_ticket_relations VALUES('w','historical-mr','tracking','implements','3');
             INSERT INTO merge_request_thread_events VALUES('w','historical-mr','approved-event',1,'review','{\"subject_ref\":\"source-a\",\"decision\":\"approve\"}',NULL,'3');
@@ -691,24 +750,7 @@ async fn mr_event_actors_preserve_self_suppression_in_capture_and_backfill() {
         ];
         store.with_conn(|conn| {
             if historical {
-                conn.execute_batch("DROP TRIGGER notification_mr_event; DROP TRIGGER notification_mr_source; DROP TRIGGER notification_implementation_result; DROP TRIGGER IF EXISTS implementation_delegation_capture;
-                    DROP TABLE ticket_implementation_results; DROP TABLE ticket_implementation_delegations; DROP TABLE merge_request_source_observations;
-                    DROP TRIGGER passkey_metadata_insert;
-            DROP TABLE passkey_addition_receipts;
-            DROP TABLE passkey_metadata;
-            DROP TRIGGER backend_job_input_retirement;
-            DROP TRIGGER backend_job_identity_immutable;
-            ALTER TABLE backend_jobs DROP COLUMN input_disposition;
-            UPDATE __yoi_schema_migrations SET version=102 WHERE version=104;
-            DROP TABLE subject_create_recoveries;
-            UPDATE __yoi_schema_migrations SET version=101 WHERE version=102;
-            DROP TABLE subject_worker_releases;
-            UPDATE __yoi_schema_migrations SET version=100 WHERE version=101;
-            DROP TABLE user_activations;
-            UPDATE __yoi_schema_migrations SET version=99 WHERE version=100;
-            DROP TABLE hosting_administrators; DROP TABLE hosting_settings;
-            UPDATE __yoi_schema_migrations SET version=98 WHERE version=99;
-            UPDATE __yoi_schema_migrations SET version=96 WHERE version=98;")?;
+                reconstruct_implementation_schema96(conn)?;
             }
             conn.execute_batch("INSERT INTO merge_requests VALUES('w','actor-mr','main','open','work','main','3','3');
                 INSERT INTO merge_request_ticket_relations VALUES('w','actor-mr','tracking','implements','3');")?;

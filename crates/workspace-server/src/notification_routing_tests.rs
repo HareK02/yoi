@@ -849,7 +849,16 @@ async fn notification_routing_fresh_and_upgraded_schema_and_guards_match() {
     let snapshot = |conn: &Connection| -> Vec<(String, String)> {
         conn.prepare("SELECT name,sql FROM sqlite_schema WHERE name LIKE 'notification_%' OR name LIKE 'ticket_assignment_content%' OR name IN ('ticket_assignment_title_input','ticket_assignment_initial_post_input') ORDER BY name").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap()
     };
-    let upgraded = snapshot(&conn);
+    assert_eq!(current_schema_version(&conn).unwrap(), 98);
+    drop(conn);
+    // Compare the complete current composition, not upgraded98 against fresh105.
+    let upgraded_store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+    let upgraded = upgraded_store
+        .with_conn(|conn| {
+            assert_eq!(current_schema_version(conn)?, 105);
+            Ok(snapshot(conn))
+        })
+        .unwrap();
     let (fresh_directory, fresh) = tracking_store_fixture().await;
     fresh
         .with_conn(|conn| {

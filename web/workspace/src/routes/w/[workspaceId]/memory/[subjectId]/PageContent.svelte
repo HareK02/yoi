@@ -6,6 +6,7 @@
   // 実行中Workerの履歴へ反映済みであることの証明には使わない。診断値は詳細へ分離する。
   import { untrack } from 'svelte';
   import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
+  import SubjectDelete from '#lib/workspace/memory/SubjectDelete.svelte';
   import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';
   import {
     SubjektivSubjectCreateError,
@@ -26,6 +27,7 @@
   let behaviorSaving = $state(false);
   let behaviorError = $state<string | null>(null);
   let behaviorSaveConfirmed = $state(false);
+  let deletionStarted = $state(false);
 
   let routeGeneration = 0;
   let subjectWorkspaceId = untrack(() => data.workspaceId);
@@ -49,6 +51,7 @@
       behaviorSaving = false;
       behaviorError = null;
       behaviorSaveConfirmed = false;
+      deletionStarted = false;
     });
   });
 
@@ -149,7 +152,7 @@
   }
 
   function subjectStateLabel(state: 'active' | 'retired'): string {
-    return state === 'active' ? 'Available' : 'Retired';
+    return state === 'active' ? 'Available' : 'Legacy ended Subject';
   }
 </script>
 
@@ -167,9 +170,16 @@
       <h1 id="subject-heading">{subject?.role ?? data.subjectId}</h1>
       <code class="subject-id" title={data.subjectId}>{data.subjectId}</code>
     </div>
-    <span class="read-only-label">Behavior editable</span>
+    {#if !deletionStarted}<span class="read-only-label">Behavior editable</span>{/if}
   </header>
 
+  {#if data.workspace.permissions.delete_subjects}
+    {#key JSON.stringify([data.workspaceId, data.subjectId])}
+      <SubjectDelete workspaceId={data.workspaceId} subjectId={data.subjectId} {subject} onstarted={() => { deletionStarted = true; }} />
+    {/key}
+  {/if}
+
+  {#if !deletionStarted}
   <nav aria-label="Subjectの記録"><a href={workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}/journal`)}>Journal · 最近の出来事とSessionを探す →</a></nav>
 
   {#if subject}
@@ -388,6 +398,7 @@
       <div class="memory-state" role="status"><p>Current Memory data is unavailable.</p></div>
     {/if}
   </section>
+  {/if}
 </section>
 
 <style>

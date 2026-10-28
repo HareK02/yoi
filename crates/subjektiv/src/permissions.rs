@@ -94,6 +94,10 @@ impl SubjektivStore {
     pub fn bind_worker_execution_grant(&self, grant: &WorkerExecutionGrant) -> Result<()> {
         validate_grant(self.scope_id(), grant)?;
         self.database.try_transaction(|tx| {
+            require_subject(tx, &grant.subject_id)?;
+            for (runtime, worker) in [(&grant.runtime_id, &grant.worker_id), (&grant.origin_runtime_id, &grant.origin_worker_id)] {
+                if tx.query_row("SELECT EXISTS(SELECT 1 FROM subject_deleted_workers WHERE runtime_id=?1 AND worker_id=?2)", params![runtime,worker], |r|r.get::<_,bool>(0))? { return Err(denied("Worker belongs to a deleted Subject")); }
+            }
             if let Some(existing) = grant_in_connection(tx, &grant.runtime_id, &grant.worker_id)? {
                 return if existing == *grant { Ok(()) } else {
                     Err(SubjektivError::WorkerExecutionGrantConflict(format!("{}/{}", grant.runtime_id, grant.worker_id)))
@@ -184,9 +188,12 @@ fn grant_in_connection(
     runtime: &str,
     worker: &str,
 ) -> Result<Option<WorkerExecutionGrant>> {
+    // Absence must never become non-Subject fallback authority after purge.
+    deletion::require_live_worker(connection, runtime, worker)?;
+
     let raw: Option<String> = connection
         .query_row(
-            "SELECT record_json FROM worker_execution_grants WHERE runtime_id=?1 AND worker_id=?2",
+            "SELECT record_json FROM worker_execution_grants WHERE runtime_id=?1 AND worker_id=?2 AND NOT EXISTS(SELECT 1 FROM subject_deletions d WHERE d.subject_id=worker_execution_grants.subject_id)",
             params![runtime, worker],
             |row| row.get(0),
         )

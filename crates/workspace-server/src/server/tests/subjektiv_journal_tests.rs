@@ -1143,6 +1143,8 @@ async fn unknown_partial_waits_for_durable_purge_fence_and_retains_sources_when_
             &Utc::now().to_rfc3339(),
         )
         .unwrap();
+    // Discard only the original delivery, before recovery can automatically retry.
+    f.execution.take_inputs();
     f.api.recover_backend_job_worker_cleanups().unwrap();
     wait_for_backend_job_worker_cleanup(
         &f.api,
@@ -1151,23 +1153,64 @@ async fn unknown_partial_waits_for_durable_purge_fence_and_retains_sources_when_
         BackendJobWorkerCleanupState::Completed,
     )
     .await;
-    // Cleanup commits before domain reconciliation; wait for its authoritative outcome.
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // Cleanup commits before domain reconciliation. Job Failed is only transient:
+    // reconcile_unknown fences this attempt, then automatically reserves/queues its
+    // retry. Observe the immutable attempt outcome and the delivered new generation,
+    // not the Job's transient state; a manual retry would race the automatic one.
+    let reconciliation = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let job = f
-                .api
-                .store
-                .get_backend_job(TEST_WORKSPACE_ID, &f.request.job_id)
-                .unwrap()
-                .unwrap();
-            if job.state == BackendJobState::Failed {
-                break;
+            let original = f.api.store.get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &f.request.job_id,
+                &dispatched.attempt.attempt_id,
+            ).unwrap().unwrap();
+            if original.state == BackendJobAttemptState::Failed {
+                assert_eq!(original.failure_category.as_deref(), Some("journal_attempt_fenced"));
+                assert_eq!(original.worker_cleanup_state, Some(BackendJobWorkerCleanupState::Completed));
+                assert!(original.worker_cleanup_completed_at.is_some());
+                if let Some(generation) = f.store.active_journal_generation(&f.host, &f.id).unwrap()
+                    && generation.job.attempt_id != original.attempt_id
+                    && let Some(retry) = f.api.store.get_backend_job_attempt(
+                        TEST_WORKSPACE_ID,
+                        &f.request.job_id,
+                        &generation.job.attempt_id,
+                    ).unwrap()
+                    && retry.state == BackendJobAttemptState::Dispatched
+                    && let Some(resumed) = &retry.worker
+                    // Worker binding precedes input delivery/attestation. ReadState
+                    // succeeds only once the new generation's delivery is attested.
+                    && subjektiv_journal::execute(&f.api, resumed, JournalJobRequest::ReadState).is_ok()
+                {
+                    break (original, retry, generation);
+                }
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    assert!(
+        reconciliation.is_ok(),
+        "post-cleanup reconciliation timed out: job={:?}, original_attempt={:?}, active_generation={:?}",
+        f.api
+            .store
+            .get_backend_job(TEST_WORKSPACE_ID, &f.request.job_id)
+            .unwrap(),
+        f.api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &f.request.job_id,
+                &dispatched.attempt.attempt_id
+            )
+            .unwrap(),
+        f.store.active_journal_generation(&f.host, &f.id).unwrap(),
+    );
+    let (fenced, retry, generation) = reconciliation.unwrap();
+    assert_eq!(fenced.worker, dispatched.attempt.worker);
+    assert_eq!(retry.attempt, dispatched.attempt.attempt + 1);
+    assert_eq!(generation.job.job_id, f.request.job_id);
+    assert_eq!(generation.job.attempt_id, retry.attempt_id);
+    assert_eq!(retry.input_digest, f.request.input_digest().unwrap());
     f.assert_purged(worker);
     assert!(f.store.journal_retention_required(&f.host).unwrap());
     assert_eq!(
@@ -1187,25 +1230,25 @@ async fn unknown_partial_waits_for_durable_purge_fence_and_retains_sources_when_
         1,
         "source pin survives failed/partial Job cleanup"
     );
-    f.execution.take_inputs();
-    let retry = f
+    let job = f
         .api
         .store
-        .reserve_backend_job_retry(
-            TEST_WORKSPACE_ID,
-            &f.request.job_id,
-            &Utc::now().to_rfc3339(),
-        )
+        .get_backend_job(TEST_WORKSPACE_ID, &f.request.job_id)
+        .unwrap()
         .unwrap();
-    assert_eq!(retry.job.request.input, f.request.input);
-    assert_eq!(retry.job.input_digest, f.request.input_digest().unwrap());
-    let retry = f.api.dispatch_backend_job_reservation(retry).unwrap();
-    let resumed = retry.attempt.worker.as_ref().unwrap();
+    assert_eq!(job.state, BackendJobState::Pending);
+    assert_eq!(job.current_attempt, retry.attempt);
+    assert_eq!(
+        job.load_executable_request().unwrap().input,
+        f.request.input
+    );
+    assert_eq!(job.input_digest, f.request.input_digest().unwrap());
+    let resumed = retry.worker.as_ref().unwrap();
     let delivered = f.execution.take_inputs();
     assert_eq!(delivered.len(), 1);
     assert_eq!(
         delivered[0].1,
-        f.request.worker_input(&retry.attempt.attempt_id).unwrap()
+        f.request.worker_input(&retry.attempt_id).unwrap()
     );
     assert_eq!(
         f.store

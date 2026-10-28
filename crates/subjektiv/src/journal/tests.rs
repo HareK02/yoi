@@ -349,7 +349,7 @@ mod input_delivery {
             open_action("must not save"),
             f.ranges.clone(),
         );
-        f.store().retire_subject(&f.host.subject_id).unwrap();
+        crate::tests::legacy_retired_fixture(f.store(), &f.host.subject_id).unwrap();
         f.reopen();
         assert!(matches!(
             service::attest_input_delivery(f.store(), &ctx, &digest(), &f.ranges),
@@ -1210,6 +1210,21 @@ mod snapshot_inputs {
             service::finish(f.store(), &recovery).unwrap(),
             saved_completion
         );
+        // Deletion, unlike writer release, invalidates even exact saved input/completion replay.
+        f.store()
+            .begin_subject_deletion(&host.subject_id, "delete")
+            .unwrap();
+        subject_deleted(
+            f.store()
+                .prepare_journal_input(&host, &input, generation.job.clone()),
+        );
+        subject_deleted(service::finish(f.store(), &recovery));
+        subject_deleted(JournalJobContext::validated_recovery(
+            f.store(),
+            &host,
+            &generation.id,
+            generation.job.clone(),
+        ));
     }
 
     #[test]
@@ -2833,7 +2848,7 @@ fn job_service_source_reads_are_generation_bound_and_stop_at_supplied_byte_end()
 #[test]
 fn explicit_erasure_remains_available_for_retired_subject_without_reopening_recording() {
     let f = Fixture::new();
-    f.store().retire_subject(&f.host.subject_id).unwrap();
+    crate::tests::legacy_retired_fixture(f.store(), &f.host.subject_id).unwrap();
     assert!(f.store().journal_retention_required(&f.host).unwrap());
     f.store()
         .erase_journal_session(&f.host, "erase-retired")
@@ -4086,10 +4101,7 @@ fn retired_subject_keeps_reader_access_but_rejects_existing_write_context() {
         },
         vec![],
     );
-    fixture
-        .store()
-        .retire_subject(&fixture.host.subject_id)
-        .unwrap();
+    crate::tests::legacy_retired_fixture(fixture.store(), &fixture.host.subject_id).unwrap();
     assert!(matches!(
         fixture.store().execute_journal(&ctx, late),
         Err(JournalError::PermissionDenied(_))
@@ -5744,4 +5756,312 @@ fn late_gap_admission_and_partial_updates_reject_stale_source_page_cursors() {
             .list_journal_sources(&host, &id, Some(&cursor.to_string()), 1),
         Err(JournalError::InvalidInput(_))
     ));
+}
+
+fn subject_deleted<T: std::fmt::Debug>(result: JournalResult<T>) {
+    assert!(
+        matches!(
+            result,
+            Err(JournalError::Subject(
+                crate::SubjektivError::SubjectNotFound(_)
+            ))
+        ),
+        "unexpected result: {result:?}"
+    );
+}
+
+#[test]
+fn subject_deletion_fence_denies_all_journal_read_write_binding_and_recovery_paths() {
+    use transport::{
+        JournalJobRequest as Request, JournalSnapshot, JournalTextRead, JournalTextTarget,
+    };
+    let mut f = Fixture::new();
+    let (generation, ctx) = f.generation("delete-job", f.ranges.clone());
+    let operation = f.operation(
+        "saved",
+        open_action("private body"),
+        vec![f.ranges[0].clone()],
+    );
+    let receipt = f.store().execute_journal(&ctx, operation.clone()).unwrap();
+    let entry = receipt.entry_id.unwrap();
+    let reader = JournalHostContext::validated_reader(f.store(), &f.host.subject_id).unwrap();
+    let writer = f
+        .store()
+        .claim_journal_writer(&f.host.subject_id, "runtime", "worker")
+        .unwrap();
+    let digest = format!("sha256:{}", "a".repeat(64));
+    service::attest_input_delivery(f.store(), &ctx, &digest, &f.ranges).unwrap();
+    f.store().database.try_transaction::<_, JournalError>(|tx| {
+        tx.execute("INSERT INTO journal_generation_deliveries(generation_id,source_order,ranges_json) VALUES(?1,0,'[]')", [&generation.id])?;
+        Ok(())
+    }).unwrap();
+    f.store().database.try_transaction::<_, JournalError>(|tx| {
+        tx.execute("INSERT INTO legacy_record_archive(source_table,row_position,row_json) VALUES('subjects',0,?1)", [serde_json::json!({"subject_id":f.host.subject_id,"record_json":"archived private body"}).to_string()])?;
+        Ok(())
+    }).unwrap();
+    f.store()
+        .begin_subject_deletion(&f.host.subject_id, "delete")
+        .unwrap();
+    // Exercise actual SQL owner resolution for *every* indirect content table,
+    // not only table-name inventory. Fence errors must precede PK/immutable/FK errors.
+    f.store()
+        .database
+        .try_with_connection::<_, JournalError>(|tx| {
+            for (table, field, new_owner) in [
+                ("journal_sources", "journal_id", "other-journal"),
+                ("journal_operations", "journal_id", "other-journal"),
+                ("journal_generations", "journal_id", "other-journal"),
+                ("journal_session_bindings", "binding_id", "other-binding"),
+                (
+                    "journal_generation_deliveries",
+                    "generation_id",
+                    "other-generation",
+                ),
+                (
+                    "journal_generation_input_deliveries",
+                    "generation_id",
+                    "other-generation",
+                ),
+                (
+                    "legacy_record_archive",
+                    "row_json",
+                    "{\"subject_id\":\"other-subject\"}",
+                ),
+            ] {
+                assert!(
+                    tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))?
+                        > 0,
+                    "{table}"
+                );
+                let insert = tx
+                    .execute(&format!("INSERT INTO {table} SELECT * FROM {table}"), [])
+                    .unwrap_err();
+                assert!(
+                    insert.to_string().contains("Subject deletion has begun"),
+                    "{table}: {insert}"
+                );
+                let update = tx
+                    .execute(&format!("UPDATE {table} SET {field}=?1"), [new_owner])
+                    .unwrap_err();
+                assert!(
+                    update.to_string().contains("Subject deletion has begun"),
+                    "{table}: {update}"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    macro_rules! denied { ($($result:expr),+ $(,)?) => { $(subject_deleted($result);)+ }; }
+    for host in [&f.host, &reader] {
+        denied!(
+            f.store().list_journals(host, None, 1),
+            f.store().read_journal(host, &f.journal_id),
+            f.store().list_journal_entries(host, &f.journal_id, None, 1),
+            f.store().read_journal_text(
+                host,
+                &f.journal_id,
+                Some(&entry),
+                JournalTextField::Body,
+                None,
+                0,
+                8
+            ),
+            f.store().read_journal_source(host, &f.journal_id, 0),
+            f.store().list_journal_sources(host, &f.journal_id, None, 1),
+            f.store()
+                .query_journal_operation(host, &f.journal_id, "saved"),
+            f.store()
+                .read_journal_operation_status(host, &f.journal_id, "saved"),
+            f.store()
+                .read_journal_operation_coverage(host, &f.journal_id, "saved", 0, 1),
+            f.store()
+                .list_journal_operations(host, &f.journal_id, None, 1),
+            f.store().journal_entry_summary(host, &f.journal_id, &entry),
+            f.store()
+                .journal_correction_targets(host, &f.journal_id, &entry),
+            f.store()
+                .browse_journal_entries(host, None, None, None, None, 1),
+            f.store()
+                .journal_has_unreflected_sources(host, &f.journal_id),
+            f.store().journal_startup_snapshot(host, None),
+        );
+    }
+    denied!(
+        f.store().journal_compaction_snapshot(&f.host),
+        f.store().journal_session_erased(&f.host),
+        f.store().journal_for_session(&f.host),
+        f.store().journal_retention_required(&f.host),
+        f.store().erase_journal_session(&f.host, "erase"),
+        f.store().release_erased_journal_body(&f.host),
+        f.store().journal_predecessor_session(&writer),
+        f.store()
+            .journal_body_is_unpublished(&f.host.subject_id, "runtime", "worker"),
+        f.store()
+            .journal_worker_was_released(&f.host.subject_id, "runtime", "worker"),
+        f.store().journal_writer_active(&writer),
+        f.store()
+            .journal_session_writer_matches(&writer, "source-session"),
+        f.store()
+            .claim_journal_writer(&f.host.subject_id, "runtime", "worker"),
+        f.store()
+            .bind_journal_session(&writer, f.host.attribution.clone().unwrap()),
+        f.store().release_journal_writer(&writer),
+        f.store().accept_journal_sources(&f.host, "late", &f.ranges),
+        f.store()
+            .mark_journal_sources_unavailable(&f.host, &f.journal_id, &f.ranges),
+        f.store()
+            .mark_journal_sources_available(&f.host, &f.journal_id, &f.ranges),
+        f.store().active_journal_generation(&f.host, &f.journal_id),
+        f.store().prepare_journal_generation(
+            &f.host,
+            &f.journal_id,
+            generation.job.clone(),
+            f.ranges.clone()
+        ),
+        f.store()
+            .close_journal_generation(&f.host, &generation.id, &generation.job),
+        f.store().read_journal_generation(&f.host, &generation.id),
+        f.store().journal_resume_state(&f.host, &f.journal_id),
+        f.store().execute_journal(&ctx, operation.clone()),
+        JournalJobContext::validated_recovery(
+            f.store(),
+            &f.host,
+            &generation.id,
+            generation.job.clone()
+        ),
+        service::attest_input_delivery(f.store(), &ctx, &digest, &f.ranges),
+        service::finish(f.store(), &ctx),
+        service::execute_snapshot(f.store(), &ctx, &digest, Request::ReadState),
+        service::execute_snapshot(
+            f.store(),
+            &ctx,
+            &digest,
+            Request::QueryOperation {
+                request_id: "saved".into()
+            }
+        ),
+        service::execute_snapshot(
+            f.store(),
+            &ctx,
+            &digest,
+            Request::ReadText {
+                read: JournalTextRead {
+                    target: JournalTextTarget::Position {
+                        snapshot: JournalSnapshot::Initial
+                    },
+                    offset: 0,
+                    limit: 8,
+                    content_token: None
+                }
+            }
+        ),
+    );
+    // Failed purge and restart must not revive any cached context or exact receipt.
+    f.sql("CREATE TRIGGER injected_subject_purge_failure BEFORE DELETE ON subjects BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(
+        f.store()
+            .finish_subject_deletion(&f.host.subject_id, "delete")
+            .is_err()
+    );
+    f.reopen();
+    subject_deleted(f.store().execute_journal(&ctx, operation));
+    f.sql("DROP TRIGGER injected_subject_purge_failure;")
+        .unwrap();
+    f.store()
+        .finish_subject_deletion(&f.host.subject_id, "delete")
+        .unwrap();
+    f.store()
+        .database
+        .try_with_connection::<_, JournalError>(|tx| {
+            for table in [
+                "journals",
+                "journal_entries",
+                "journal_corrections",
+                "journal_sources",
+                "journal_generations",
+                "journal_operations",
+                "journal_generation_deliveries",
+                "journal_generation_input_deliveries",
+                "journal_writer_bindings",
+                "journal_session_bindings",
+            ] {
+                assert_eq!(
+                    tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))?,
+                    0,
+                    "{table}"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn subject_deletion_during_capture_rejects_even_empty_delayed_input() {
+    use session_store::capture::CaptureDto;
+    let f = Fixture::new();
+    let result = recording::JournalInput::build(f.store(), &f.host, &f.journal_id, |_, _, _| {
+        f.store()
+            .begin_subject_deletion(&f.host.subject_id, "delete")?;
+        Ok(CaptureDto {
+            version: 1,
+            session_id: "source-session".into(),
+            segment_id: "segment".into(),
+            view_entry_count: 0,
+            entries: vec![],
+        })
+    });
+    subject_deleted(result);
+}
+
+#[test]
+fn subject_deletion_during_source_callback_cannot_return_or_attest_cached_material() {
+    use transport::{JournalJobRequest as Request, JournalTextRead, JournalTextTarget};
+    let f = Fixture::new();
+    let (_, ctx) = f.generation("delayed-source", f.ranges.clone());
+    let result = service::execute_bounded(
+        f.store(),
+        &ctx,
+        Request::ReadText {
+            read: JournalTextRead {
+                target: JournalTextTarget::Source {
+                    pointer: f.ranges[0].source.pointer.clone(),
+                },
+                offset: 0,
+                limit: 8,
+                content_token: None,
+            },
+        },
+        |source, start, _| {
+            f.store()
+                .begin_subject_deletion(&f.host.subject_id, "delete")?;
+            Ok(recording::JournalMaterial {
+                range: JournalSourceRange {
+                    source: source.clone(),
+                    bytes: JournalByteRange {
+                        start,
+                        end: start + 8,
+                    },
+                },
+                text: "private!".into(),
+            })
+        },
+    );
+    subject_deleted(result);
+    f.store()
+        .database
+        .try_with_connection::<_, JournalError>(|tx| {
+            assert_eq!(
+                tx.query_row(
+                    "SELECT COUNT(*) FROM journal_generation_deliveries",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
 }

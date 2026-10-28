@@ -97,7 +97,7 @@ fn runtime_fixture(root: &Path, schema: u32) -> (WorkerId, SessionId, SegmentId)
             "schema_version": schema, "display_name": "retained Runtime",
             "backend": "fs_store", "status": "running", "next_diagnostic_id": 1,
             "config_bundles": {}, "workspace_owners": {"workspace-a": "owner-a"},
-            "diagnostics": [], "subject_releases": [],
+            "diagnostics": [], "subject_releases": [], "subject_delete_worker_fences": {},
             "subject_create_recovery_fences": {fenced_worker.to_string(): {
                 "request": {"workspace_id": "workspace-a", "worker_id": fenced_worker,
                     "create_fingerprint": "retained-create", "operation_id": "retained-recovery"},

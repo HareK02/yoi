@@ -38,7 +38,7 @@
   }
 
   function subjectStateLabel(state: SubjektivSubjectResponse['state']): string {
-    return state === 'active' ? 'Available' : 'Retired';
+    return state === 'active' ? 'Available' : 'Legacy ended Subject';
   }
 
   async function openCreateForm(): Promise<void> {

@@ -338,6 +338,8 @@ impl_openapi_schema!(
     MemoryConsolidationResponse,
     SubjektivSubjectCreateRequest,
     SubjektivSubjectBehaviorUpdateRequest,
+    SubjektivSubjectDeleteRequest,
+    SubjektivSubjectDeleteResponse,
     SubjektivSubjectListQuery,
     SubjektivSubjectListResponse,
     SubjektivSubjectResponse,
@@ -1527,19 +1529,21 @@ pub trait ServerApi {
         #[path] memory_id: String,
         #[query] query: SubjektivMemoryChangesQuery,
     ) -> Result<SubjektivMemoryListChangesResponse, RepositoryApiError>;
-    #[post(
-        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/retire",
+    #[delete(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
         bearer_auth = true,
         browser_auth = true,
     )]
-    async fn subjektiv_subject_retire(
+    async fn subjektiv_subject_delete(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] subject_id: String,
-    ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
+        #[body] request: SubjektivSubjectDeleteRequest,
+    ) -> Result<SubjektivSubjectDeleteResponse, RepositoryApiError>;
     #[post(
         "/api/w/{workspace_id}/subjektiv/staging",
         status = 200,
@@ -4955,6 +4959,8 @@ pub struct WorkspacePermissionSummary {
     pub manage_secrets: bool,
     pub manage_runtimes: bool,
     pub delete_workspace: bool,
+    /// Explicit Subject deletion authority for the current authenticated actor.
+    pub delete_subjects: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -5350,7 +5356,25 @@ pub struct MemoryConsolidationResponse {
 #[serde(rename_all = "snake_case")]
 pub enum SubjektivSubjectState {
     Active,
-    Retired,
+    /// Saved compatibility only; not a current lifecycle operation.
+    #[serde(rename = "retired")]
+    LegacyRetired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSubjectDeleteRequest {
+    /// Stable identity retained for every retry, including unknown outcomes.
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSubjectDeleteResponse {
+    pub subject_id: String,
+    pub operation_id: String,
+    /// False confirms the deletion fence, not external stop or erasure completion.
+    pub completed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -10950,6 +10974,10 @@ pub fn memory_api_typescript() -> String {
 
 export type SubjektivSubjectCreateRequest = { role: string, behavior_md?: string, };
 
+export type SubjektivSubjectDeleteRequest = { operation_id: string, };
+
+export type SubjektivSubjectDeleteResponse = { subject_id: string, operation_id: string, completed: boolean, };
+
 export type SubjektivSubjectBehaviorUpdateRequest = { expected_behavior_md: string, behavior_md: string, };
 
 export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, state: SubjektivSubjectState, memory_fingerprint: string, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
@@ -13483,7 +13511,8 @@ mod tests {
                 "manage_repositories": true,
                 "manage_secrets": true,
                 "manage_runtimes": true,
-                "delete_workspace": true
+                "delete_workspace": true,
+                "delete_subjects": true
             },
             "extension_points": {
                 "store": "sqlite",
