@@ -8,6 +8,40 @@ import {
   waitFor,
 } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
+import type { WorkspaceResponse } from "#lib/generated/legacy-server-api.ts";
+
+// SubjectPage inherits this validated projection from the Workspace layout.
+// No deletion grant is implied by these behavior/Memory read fixtures.
+function memoryWorkspace(workspaceId = "workspace-1"): WorkspaceResponse {
+  const extension = { status: "ready", note: "fixture", diagnostics: [] };
+  return {
+    workspace_id: workspaceId,
+    display_name: "Memory fixture",
+    record_authority: "fixture",
+    schema_version: 1,
+    auth: {
+      Passkey: {
+        rp_id: "127.0.0.1",
+        origin: "http://127.0.0.1",
+        public_base_url: "http://127.0.0.1",
+        cookie_name: "fixture",
+      },
+    },
+    permissions: {
+      manage_repositories: false,
+      manage_secrets: false,
+      manage_runtimes: false,
+      delete_workspace: false,
+      delete_subjects: false,
+    },
+    extension_points: {
+      store: "fixture",
+      event_stream: extension,
+      host_worker_bridge: extension,
+      companion_console: extension,
+    },
+  };
+}
 
 const { gotoMock } = vi.hoisted(() => ({
   gotoMock: vi.fn(async () => {}),
@@ -240,6 +274,7 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
   render(SubjectPage, {
     data: {
       workspaceId: "workspace-1",
+      workspace: memoryWorkspace(),
       subjectId: "subject-1",
       cursor: "memory-current",
       subject: result({
@@ -334,6 +369,7 @@ test("edits and clears user-managed behavior with CAS while distinguishing save 
   render(SubjectPage, {
     data: {
       workspaceId: "workspace-1",
+      workspace: memoryWorkspace(),
       subjectId: "subject-1",
       subject: result(subject()),
       surface: result({
@@ -378,15 +414,34 @@ test("edits and clears user-managed behavior with CAS while distinguishing save 
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
   const secondBody =
     (fetchMock.mock.calls[1] as unknown as [string, RequestInit])[1].body;
-  expect(secondBody).toBe('{"expected_behavior_md":"Ask before irreversible actions.","behavior_md":""}');
+  expect(secondBody).toBe(
+    '{"expected_behavior_md":"Ask before irreversible actions.","behavior_md":""}',
+  );
   await waitFor(() =>
     expect(screen.getByText("No behavior is set.")).not.toBeNull()
   );
 });
 
+test.each([false, true])(
+  "Subject deletion visibility follows the inherited explicit grant: %s",
+  (allowed) => {
+    const data = subjectPageData();
+    data.workspace.permissions.delete_subjects = allowed;
+    render(SubjectPage, { data } as never);
+    expect(
+      screen.queryByRole("heading", { name: "Delete Subject" }) !==
+        null,
+    ).toBe(allowed);
+    // Behavior editability is not deletion authority.
+    expect(screen.getByRole("button", { name: "Edit" })).not
+      .toBeNull();
+  },
+);
+
 function subjectPageData(record = subject(), workspaceId = "workspace-1") {
   return {
     workspaceId,
+    workspace: memoryWorkspace(workspaceId),
     subjectId: record.id,
     subject: result(record),
     surface: result({
@@ -405,12 +460,20 @@ test("same-identity refresh updates Subject projection without rebasing an activ
   const view = render(SubjectPage, { data: subjectPageData() } as never);
   await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
   const textarea = screen.getByRole("textbox", { name: "Subject behavior" });
-  await fireEvent.input(textarea, { target: { value: "Unsaved behavior draft" } });
+  await fireEvent.input(textarea, {
+    target: { value: "Unsaved behavior draft" },
+  });
 
-  const refreshed = { ...subject(), role: "Refreshed role", behavior_md: "Changed on server." };
+  const refreshed = {
+    ...subject(),
+    role: "Refreshed role",
+    behavior_md: "Changed on server.",
+  };
   await view.rerender({ data: subjectPageData(refreshed) } as never);
-  expect(screen.getByRole("heading", { name: "Refreshed role", level: 1 })).not.toBeNull();
-  expect(screen.getByRole("textbox", { name: "Subject behavior" })).toHaveProperty("value", "Unsaved behavior draft");
+  expect(screen.getByRole("heading", { name: "Refreshed role", level: 1 })).not
+    .toBeNull();
+  expect(screen.getByRole("textbox", { name: "Subject behavior" }))
+    .toHaveProperty("value", "Unsaved behavior draft");
   await fireEvent.click(screen.getByRole("button", { name: "Save behavior" }));
   await waitFor(() => expect(screen.getByRole("alert")).not.toBeNull());
   expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
@@ -418,36 +481,71 @@ test("same-identity refresh updates Subject projection without rebasing an activ
     behavior_md: "Unsaved behavior draft",
   });
 
-  await view.rerender({ data: subjectPageData({ ...refreshed, behavior_md: "Changed again." }) } as never);
+  await view.rerender(
+    {
+      data: subjectPageData({ ...refreshed, behavior_md: "Changed again." }),
+    } as never,
+  );
   expect(screen.getByRole("alert")).not.toBeNull();
   expect(textarea).toHaveProperty("value", "Unsaved behavior draft");
   await fireEvent.click(screen.getByRole("button", { name: "Save behavior" }));
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-  expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)).expected_behavior_md).toBe("Prefer explicit evidence.");
-  await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toHaveProperty("disabled", false));
+  expect(
+    JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)).expected_behavior_md,
+  ).toBe("Prefer explicit evidence.");
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveProperty(
+      "disabled",
+      false,
+    )
+  );
   await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-  expect(screen.getByRole("article", { name: "User-managed Subject behavior" }).textContent).toContain("Changed again.");
+  expect(
+    screen.getByRole("article", { name: "User-managed Subject behavior" })
+      .textContent,
+  ).toContain("Changed again.");
   await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-  expect(screen.getByRole("textbox", { name: "Subject behavior" })).toHaveProperty("value", "Changed again.");
+  expect(screen.getByRole("textbox", { name: "Subject behavior" }))
+    .toHaveProperty("value", "Changed again.");
 });
 
 test("same-identity refresh keeps an in-flight behavior save fenced and accepts its result", async () => {
   let resolveRequest!: (response: Response) => void;
-  const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { resolveRequest = resolve; }));
+  const fetchMock = vi.fn(() =>
+    new Promise<Response>((resolve) => {
+      resolveRequest = resolve;
+    })
+  );
   vi.stubGlobal("fetch", fetchMock);
   const view = render(SubjectPage, { data: subjectPageData() } as never);
   await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-  await fireEvent.input(screen.getByRole("textbox", { name: "Subject behavior" }), {
-    target: { value: "Saved draft" },
-  });
+  await fireEvent.input(
+    screen.getByRole("textbox", { name: "Subject behavior" }),
+    {
+      target: { value: "Saved draft" },
+    },
+  );
   await fireEvent.click(screen.getByRole("button", { name: "Save behavior" }));
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-  await view.rerender({ data: subjectPageData({ ...subject(), behavior_md: "Refreshed text" }) } as never);
-  expect(screen.getByRole("button", { name: "Saving…" })).toHaveProperty("disabled", true);
-  expect(screen.getByRole("textbox", { name: "Subject behavior" })).toHaveProperty("value", "Saved draft");
+  await view.rerender(
+    {
+      data: subjectPageData({ ...subject(), behavior_md: "Refreshed text" }),
+    } as never,
+  );
+  expect(screen.getByRole("button", { name: "Saving…" })).toHaveProperty(
+    "disabled",
+    true,
+  );
+  expect(screen.getByRole("textbox", { name: "Subject behavior" }))
+    .toHaveProperty("value", "Saved draft");
   resolveRequest(Response.json({ ...subject(), behavior_md: "Saved draft" }));
-  await waitFor(() => expect(screen.getByText(/storage confirmed/)).not.toBeNull());
-  expect(screen.getByRole("article", { name: "User-managed Subject behavior" }).textContent).toContain("Saved draft");
+  await waitFor(() =>
+    expect(screen.getByText(/storage confirmed/)).not.toBeNull()
+  );
+  expect(
+    screen.getByRole("article", { name: "User-managed Subject behavior" })
+      .textContent,
+  ).toContain("Saved draft");
 });
 
 test.each([
@@ -635,27 +733,39 @@ test("a refreshed loader snapshot fences old saves even after returning to the s
   ).toBeNull();
 });
 
-test.each([409, 503])("behavior save rejection %s preserves the draft and observed CAS text", async (status) => {
-  const fetchMock = vi.fn(async () => Response.json({ message: "save rejected" }, { status }));
-  vi.stubGlobal("fetch", fetchMock);
-  render(SubjectPage, { data: subjectPageData() } as never);
-  await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
-  const textarea = screen.getByRole("textbox", { name: "Subject behavior" });
-  await fireEvent.input(textarea, { target: { value: "  Unsaved\nbehavior.\n" } });
-  await fireEvent.click(screen.getByRole("button", { name: "Save behavior" }));
-  await waitFor(() => expect(screen.getByRole("alert")).not.toBeNull());
-  expect(textarea).toHaveProperty("value", "  Unsaved\nbehavior.\n");
-  expect(screen.queryByText(/storage confirmed/)).toBeNull();
-  expect(fetchMock).toHaveBeenCalledTimes(1);
-  expect(fetchMock.mock.calls[0]).toEqual([
-    "/api/w/workspace-1/subjektiv/subjects/subject-1/behavior",
-    {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ expected_behavior_md: "Prefer explicit evidence.", behavior_md: "  Unsaved\nbehavior.\n" }),
-    },
-  ]);
-});
+test.each([409, 503])(
+  "behavior save rejection %s preserves the draft and observed CAS text",
+  async (status) => {
+    const fetchMock = vi.fn(async () =>
+      Response.json({ message: "save rejected" }, { status })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    render(SubjectPage, { data: subjectPageData() } as never);
+    await fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const textarea = screen.getByRole("textbox", { name: "Subject behavior" });
+    await fireEvent.input(textarea, {
+      target: { value: "  Unsaved\nbehavior.\n" },
+    });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Save behavior" }),
+    );
+    await waitFor(() => expect(screen.getByRole("alert")).not.toBeNull());
+    expect(textarea).toHaveProperty("value", "  Unsaved\nbehavior.\n");
+    expect(screen.queryByText(/storage confirmed/)).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "/api/w/workspace-1/subjektiv/subjects/subject-1/behavior",
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expected_behavior_md: "Prefer explicit evidence.",
+          behavior_md: "  Unsaved\nbehavior.\n",
+        }),
+      },
+    ]);
+  },
+);
 
 test("candidate-only Subjects show no committed Memories, not an inferred candidate count", () => {
   // The store regression candidate_decisions_reject_conflicts_and_roll_back_partial_writes
@@ -664,6 +774,7 @@ test("candidate-only Subjects show no committed Memories, not an inferred candid
   render(SubjectPage, {
     data: {
       workspaceId: "workspace-1",
+      workspace: memoryWorkspace(),
       subjectId: "subject-1",
       cursor: null,
       subject: result({ ...subject(), memory_fingerprint: "fingerprint-0" }),
@@ -747,6 +858,7 @@ test.each(["ready", "ungenerated", "stale", "failed"] as const)(
 test("distinguishes ready-empty, stale, failed, unavailable, and request error surfaces", async () => {
   const base = {
     workspaceId: "workspace-1",
+    workspace: memoryWorkspace(),
     subjectId: "subject-1",
     subject: result(subject()),
     memories: result({ items: [], has_more: false }),
@@ -832,6 +944,7 @@ test("renders committed Memory detail, provenance, derivation, and immutable cha
   render(MemoryDetailPage, {
     data: {
       workspaceId: "workspace-1",
+      workspace: memoryWorkspace(),
       subjectId: "subject-1",
       memoryId: "memory-1",
       changeCursor: "a/current",
@@ -872,7 +985,10 @@ test("renders committed Memory detail, provenance, derivation, and immutable cha
           source_refs_total: 1,
           source_refs_truncated: false,
         }],
-        derived_from: [{ memory_id: "memory-parent", change_id: "parent/source & context" }],
+        derived_from: [{
+          memory_id: "memory-parent",
+          change_id: "parent/source & context",
+        }],
         evidence_has_more: true,
         evidence_next_cursor: "evidence/next",
       }),
@@ -912,23 +1028,39 @@ test("renders committed Memory detail, provenance, derivation, and immutable cha
   expect(screen.getByText("Historical change")).not.toBeNull();
   expect(screen.getByRole("navigation", { name: "Change history pages" }))
     .not.toBeNull();
-  const historicalLink = screen.getByRole("link", { name: /Memory change z\/earlier/ });
+  const historicalLink = screen.getByRole("link", {
+    name: /Memory change z\/earlier/,
+  });
   expect(historicalLink.getAttribute("aria-current")).toBe("page");
-  expect(historicalLink.getAttribute("href")).toBe("/w/workspace-1/memory/subject-1/memory-1?change_id=z%2Fearlier%20%26%20context");
-  const currentLink = screen.getByRole("link", { name: /Memory change a\/current/ });
+  expect(historicalLink.getAttribute("href")).toBe(
+    "/w/workspace-1/memory/subject-1/memory-1?change_id=z%2Fearlier%20%26%20context",
+  );
+  const currentLink = screen.getByRole("link", {
+    name: /Memory change a\/current/,
+  });
   expect(currentLink.getAttribute("aria-current")).toBeNull();
   expect(currentLink.textContent).toContain("Current");
-  expect(screen.getByRole("link", { name: /memory-parent/ }).getAttribute("href")).toBe("/w/workspace-1/memory/subject-1/memory-parent?change_id=parent%2Fsource%20%26%20context");
-  const bodyHref = screen.getByRole("link", { name: "View next body segment" }).getAttribute("href");
+  expect(
+    screen.getByRole("link", { name: /memory-parent/ }).getAttribute("href"),
+  ).toBe(
+    "/w/workspace-1/memory/subject-1/memory-parent?change_id=parent%2Fsource%20%26%20context",
+  );
+  const bodyHref = screen.getByRole("link", { name: "View next body segment" })
+    .getAttribute("href");
   const bodyQuery = new URL(bodyHref!, "https://example.com").searchParams;
   expect(bodyQuery.get("change_id")).toBe("z/earlier & context");
   expect(bodyQuery.get("offset")).toBe("2");
   expect(bodyQuery.get("byte_offset")).toBe("0");
-  const evidenceHref = screen.getByRole("link", { name: "View next evidence page" }).getAttribute("href");
-  const evidenceQuery = new URL(evidenceHref!, "https://example.com").searchParams;
+  const evidenceHref = screen.getByRole("link", {
+    name: "View next evidence page",
+  }).getAttribute("href");
+  const evidenceQuery =
+    new URL(evidenceHref!, "https://example.com").searchParams;
   expect(evidenceQuery.get("change_id")).toBe("z/earlier & context");
   expect(evidenceQuery.get("evidence_cursor")).toBe("evidence/next");
-  const nextHref = screen.getByRole("link", { name: /Next page/ }).getAttribute("href");
+  const nextHref = screen.getByRole("link", { name: /Next page/ }).getAttribute(
+    "href",
+  );
   const nextQuery = new URL(nextHref!, "https://example.com").searchParams;
   expect(nextQuery.get("change_cursor")).toBe("change-next");
   expect(nextQuery.get("change_id")).toBe("z/earlier & context");
