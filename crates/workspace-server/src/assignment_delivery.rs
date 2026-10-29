@@ -141,16 +141,23 @@ pub(super) fn list_in_tx(
     conn: &Connection,
     workspace_id: &str,
     limit: usize,
+    subject_id: Option<&str>,
 ) -> Result<Vec<TicketAssignmentDelivery>> {
     if !(1..=100).contains(&limit) {
         return Err(Error::InvalidInput("Delivery limit must be 1..100".into()));
     }
-    notification_routing::pending_sources(conn, workspace_id, "orchestrator", limit)?
-        .into_iter()
-        .map(|(ticket, assignment, input, id)| {
-            delivery(conn, workspace_id, ticket, assignment, input, id)
-        })
-        .collect()
+    notification_routing::pending_sources_for_subject(
+        conn,
+        workspace_id,
+        "orchestrator",
+        limit,
+        subject_id,
+    )?
+    .into_iter()
+    .map(|(ticket, assignment, input, id)| {
+        delivery(conn, workspace_id, ticket, assignment, input, id)
+    })
+    .collect()
 }
 fn delivery(
     conn: &Connection,

@@ -2262,6 +2262,13 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         limit: usize,
     ) -> Result<Vec<TicketAssignmentDelivery>>;
+    /// Recipient-scoped scan; other Subjects cannot consume this batch or its offer order.
+    fn list_pending_subject_ticket_assignment_deliveries(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TicketAssignmentDelivery>>;
     /// Frozen payload/request identity for exact response-loss retry.
     fn reserve_ticket_assignment_delivery(
         &self,
@@ -9455,7 +9462,21 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         }
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let result = assignment_delivery::list_in_tx(&tx, workspace_id, limit)?;
+            let result = assignment_delivery::list_in_tx(&tx, workspace_id, limit, None)?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+    fn list_pending_subject_ticket_assignment_deliveries(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TicketAssignmentDelivery>> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let result =
+                assignment_delivery::list_in_tx(&tx, workspace_id, limit, Some(subject_id))?;
             tx.commit()?;
             Ok(result)
         })

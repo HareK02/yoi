@@ -22572,10 +22572,15 @@ fn check_orchestrator_assignment_attention(
     state: &Arc<Mutex<OrchestratorAttentionState>>,
     pending: Option<OrchestratorAttentionDelivery>,
 ) {
-    let inputs = match api
-        .store
-        .list_pending_ticket_assignment_deliveries(&api.config.workspace_id, 20)
-    {
+    let subject_id = match current_assignment_subject_source(api, worker) {
+        Ok(subject_id) => subject_id,
+        Err(_) => return,
+    };
+    let inputs = match api.store.list_pending_subject_ticket_assignment_deliveries(
+        &api.config.workspace_id,
+        &subject_id,
+        20,
+    ) {
         Ok(inputs) => inputs,
         Err(error) => {
             tracing::warn!(%error, "assignment notification scan failed");
@@ -59336,6 +59341,9 @@ mod tests {
 
     include!("server_assignment_test_support.rs");
     include!("server_assignment_attention_tests.rs");
+    mod subject_notification_recovery_tests {
+        include!("server_subject_notification_recovery_tests.rs");
+    }
 
     #[tokio::test]
     async fn runtime_worker_create_rejects_reserved_singleton_key_squatting_and_authority_forgery()

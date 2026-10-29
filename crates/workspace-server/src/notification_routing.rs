@@ -773,17 +773,32 @@ pub(super) fn pending_sources(
     role: &str,
     limit: usize,
 ) -> Result<Vec<(String, String, String, String)>> {
+    pending_sources_for_subject(conn, workspace, role, limit, None)
+}
+
+// Scope before LIMIT and offer-order mutation: one Subject must not consume
+// another Subject's batch while the Host resolves their current bodies separately.
+pub(super) fn pending_sources_for_subject(
+    conn: &Connection,
+    workspace: &str,
+    role: &str,
+    limit: usize,
+    subject_id: Option<&str>,
+) -> Result<Vec<(String, String, String, String)>> {
     route_pending(conn, workspace)?;
-    let mut stmt=conn.prepare("SELECT s.ticket_id,s.assignment_id,s.input_event_id,d.delivery_id FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.workspace_id=?1 AND s.role=?2 AND d.disposition='deliver' AND NOT EXISTS(SELECT 1 FROM ticket_assignment_delivery_acknowledgements a WHERE a.workspace_id=?1 AND a.delivery_id=d.delivery_id) AND NOT EXISTS(SELECT 1 FROM notification_acknowledgements a WHERE a.workspace_id=?1 AND a.delivery_id=d.delivery_id) ORDER BY d.last_offered,s.sequence LIMIT ?3")?;
+    let mut stmt=conn.prepare("SELECT s.ticket_id,s.assignment_id,s.input_event_id,d.delivery_id FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.workspace_id=?1 AND s.role=?2 AND d.disposition='deliver' AND (?4 IS NULL OR EXISTS(SELECT 1 FROM ticket_worker_assignments a WHERE a.workspace_id=s.workspace_id AND a.ticket_id=s.ticket_id AND a.assignment_id=s.assignment_id AND a.role=s.role AND a.principal_kind='subject' AND a.principal_id=?4)) AND NOT EXISTS(SELECT 1 FROM ticket_assignment_delivery_acknowledgements a WHERE a.workspace_id=?1 AND a.delivery_id=d.delivery_id) AND NOT EXISTS(SELECT 1 FROM notification_acknowledgements a WHERE a.workspace_id=?1 AND a.delivery_id=d.delivery_id) ORDER BY d.last_offered,s.sequence LIMIT ?3")?;
     let candidates = stmt
-        .query_map(params![workspace, role, limit.clamp(1, 100) as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?
+        .query_map(
+            params![workspace, role, limit.clamp(1, 100) as i64, subject_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let tick: i64 = conn.query_row(
         "SELECT COALESCE(MAX(last_offered),0)+1 FROM notification_decisions WHERE workspace_id=?1",
