@@ -27,6 +27,8 @@ export type Lane = "execution" | "delegation";
 const MAX_BYTES = 1_048_576;
 const fields = {
   workspace: ["workspace_id"],
+  worker_operation: ["workspace_id"],
+  plugin_installation: ["workspace_id", "installation_id"],
   ticket: ["workspace_id", "ticket_id"],
   objective: ["workspace_id", "objective_id"],
   merge_request: ["workspace_id", "merge_request_id"],
@@ -195,6 +197,8 @@ export function policyDiff(
 export function resourceLabel(resource: PermissionResource): string {
   const labels: Record<string, string> = {
     workspace: "Current workspace",
+    worker_operation: "Worker operation use (target control grant required)",
+    plugin_installation: "Plugin installation",
     subject: "Subject",
     ticket: "Ticket",
     objective: "Objective",
@@ -277,6 +281,7 @@ export function resourceFields(kind: PermissionResource["kind"]): string[] {
   );
 }
 export const fieldLabel: Record<string, string> = {
+  installation_id: "Plugin installation identifier",
   ticket_id: "Ticket identifier",
   objective_id: "Objective identifier",
   merge_request_id: "Merge request identifier",

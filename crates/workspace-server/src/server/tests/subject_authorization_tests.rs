@@ -11,14 +11,14 @@ mod chat_delegation_connected;
 mod chat_tests;
 #[path = "subject_job_model_supply_tests.rs"]
 mod subject_job_model_supply;
+#[path = "subject_permission_management_tests.rs"]
+mod subject_permission_management;
 #[path = "ticket_worker_messaging_connected_tests.rs"]
 mod ticket_worker_messaging_connected;
 #[path = "worker_messaging_connected_tests.rs"]
 mod worker_messaging_connected;
 #[path = "worker_operation_authorization_tests.rs"]
 mod worker_operation_authorization;
-#[path = "subject_permission_management_tests.rs"]
-mod subject_permission_management;
 use agen::tool::{Tool, ToolExecutionContext, ToolOutput};
 use server_api::authorization::{
     PermissionResource, ScopedPermission, SubjectPermissions, SubjectPermissionsUpdate,

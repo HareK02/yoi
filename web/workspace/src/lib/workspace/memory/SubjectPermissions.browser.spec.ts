@@ -46,7 +46,11 @@ afterEach(() => {
   vi.unstubAllGlobals();
   sessionStorage.clear();
 });
-function harness(initial: Policy | null = null, canManage = true) {
+function harness(
+  initial: Policy | null = null,
+  canManage = true,
+  operations = ops,
+) {
   let policy = initial;
   const requests: PolicyUpdate[] = [];
   const fetch = vi.fn(async (_path: string, init?: RequestInit) => {
@@ -63,7 +67,7 @@ function harness(initial: Policy | null = null, canManage = true) {
     return Response.json({
       permissions: policy,
       can_manage: canManage,
-      operations: ops,
+      operations,
     });
   });
   vi.stubGlobal("fetch", fetch);
@@ -261,4 +265,31 @@ test("deleted Subject is refused with no success indication", async () => {
   );
   expect(screen.queryByRole("combobox")).toBeNull();
   expect(h.requests).toHaveLength(0);
+});
+test("current Worker operation use saves in both lanes without a target editor", async () => {
+  const available = ops.map((o) =>
+    o.operation === "worker.messaging"
+      ? {
+        ...o,
+        resource_kinds: ["worker_operation"],
+        availability: { kind: "available" },
+      }
+      : o
+  );
+  const h = harness(null, true, available);
+  render(SubjectPermissions, props);
+  await add("execution", "worker.messaging");
+  await add("delegation", "worker.messaging");
+  expect(screen.queryByRole("textbox", { name: "Worker identifier" }))
+    .toBeNull();
+  expect(screen.queryByRole("textbox", { name: "Runtime identifier" }))
+    .toBeNull();
+  await confirmSave();
+  await screen.findByText("Saved and re-read from the current policy.");
+  const permission = {
+    operation: "worker.messaging",
+    resource: { kind: "worker_operation", workspace_id: "w" },
+  };
+  expect(h.requests[0].execution).toEqual([permission]);
+  expect(h.requests[0].delegation).toEqual([permission]);
 });

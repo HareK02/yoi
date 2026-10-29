@@ -147,3 +147,38 @@ Deno.test("read permission projection uses the existing scoped endpoint and no f
       view.operations.length === 0,
   );
 });
+
+Deno.test("Worker operation editor binds operation use without a target and preserves installed Plugin scopes", () => {
+  const resource = makeResource("worker_operation", "w", "s", {}, false);
+  assert(
+    JSON.stringify(resource) ===
+      JSON.stringify({ kind: "worker_operation", workspace_id: "w" }),
+  );
+  const view = parseView({
+    permissions: {
+      change_id: "saved",
+      execution: [{ operation: "worker.messaging", resource }],
+      delegation: [],
+    },
+    can_manage: true,
+    operations: [{
+      operation: "worker.messaging",
+      label: "Message Workers",
+      description: "Directional target grants remain separate",
+      resource_kinds: ["worker_operation"],
+      availability: { kind: "available" },
+    }],
+  });
+  assert(
+    view.operations[0].available &&
+      view.permissions?.execution[0].resource.kind === "worker_operation",
+  );
+  const installed = makeResource("plugin_installation", "w", "s", {
+    installation_id: "installed",
+  }, false);
+  assert(
+    installed.kind === "plugin_installation" &&
+      installed.workspace_id === "w" &&
+      installed.installation_id === "installed",
+  );
+});

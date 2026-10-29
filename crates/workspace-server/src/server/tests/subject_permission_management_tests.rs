@@ -71,8 +71,7 @@ fn update(screen: &Value, operation: &str, execution: Value, delegation: Value) 
 }
 
 #[tokio::test]
-async fn management_read_exposes_capability_and_catalog_without_enabling_pending_worker_operations()
-{
+async fn management_read_exposes_operation_use_without_duplicate_worker_target_grants() {
     let f = ManagementFixture::new().await;
     let screen = f.read().await;
     assert!(screen["permissions"].is_null());
@@ -95,13 +94,7 @@ async fn management_read_exposes_capability_and_catalog_without_enabling_pending
         .iter()
         .find(|entry| entry["operation"] == "worker.messaging")
         .unwrap();
-    assert_eq!(messaging["availability"]["kind"], "unavailable");
-    assert!(
-        !messaging["availability"]["reason"]
-            .as_str()
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(messaging["availability"]["kind"], "available");
     for name in [
         "worker.messaging",
         "worker.send_input",
@@ -116,13 +109,13 @@ async fn management_read_exposes_capability_and_catalog_without_enabling_pending
             .find(|entry| entry["operation"] == name)
             .unwrap();
         assert_eq!(
-            operation["availability"]["kind"], "unavailable",
-            "pending Worker contracts: {operation}"
+            operation["availability"]["kind"], "available",
+            "implemented Worker contracts: {operation}"
         );
         assert_eq!(
             operation["resource_kinds"],
-            json!([]),
-            "do not offer duplicate target control grants"
+            json!(["worker_operation"]),
+            "operation use must not offer duplicate target control grants"
         );
     }
 }

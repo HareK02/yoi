@@ -115,5 +115,28 @@ fn catalog_wire_has_no_worker_target_editors_and_no_implicit_feature_grants() {
         .iter()
         .find(|d| d["operation"] == "worker.messaging")
         .unwrap();
-    assert_eq!(messaging["availability"]["kind"], "unavailable");
+    assert_eq!(messaging["availability"]["kind"], "available");
+    assert_eq!(messaging["resource_kinds"], json!(["worker_operation"]));
+}
+
+#[test]
+fn managed_worker_operations_accept_only_current_operation_use_in_each_lane() {
+    for name in [
+        "worker.messaging",
+        "worker.send_input",
+        "worker.cancel",
+        "worker.stop",
+        "worker.restore",
+        "worker.remove",
+        "worker.observe",
+    ] {
+        let p = permission(name, json!({"kind":"worker_operation","workspace_id":"w"}));
+        assert!(
+            validate_managed_subject_permissions(None, &update(vec![p.clone()], vec![p])).is_ok()
+        );
+    }
+    for name in ["worker.notify", "worker.result", "worker.future"] {
+        let p = permission(name, json!({"kind":"worker_operation","workspace_id":"w"}));
+        assert!(validate_managed_subject_permissions(None, &update(vec![p], vec![])).is_err());
+    }
 }

@@ -247,7 +247,7 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
             (
                 "worker.create",
                 "Create background Workers",
-                "Use existing Profile-resolved Worker creation with explicit execution grants. Control and reply without duplicate target permissions await T-803.",
+                "Use Profile-resolved Worker creation with explicit execution grants. Directional Backend grants separately control the created Worker and its message-only reply.",
             ),
             (
                 "drive.capabilities",
@@ -342,12 +342,12 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
             (
                 "ticket.assignment.assign",
                 "Delegate Ticket",
-                "Delegate to an authorized Orchestrator principal; does not start a Worker. Subject assignment awaits T-778.",
+                "Assign to an authorized Subject; current body, Ticket targets and execution grants are checked separately. Assignment does not start a Worker.",
             ),
             (
                 "ticket.assignment.clear",
                 "Release Ticket delegation",
-                "Release the observed current Orchestrator delegation; does not stop Workers.",
+                "Release the observed current Subject assignment; does not stop Workers.",
             ),
             (
                 "ticket.assignment.update",
@@ -817,6 +817,21 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
             ),
         ],
     );
+    add(
+        K::Subject,
+        &[
+            (
+                "chat.read",
+                "Read Subject conversations",
+                "Read conversations belonging to the current Subject body; membership and current ownership remain required.",
+            ),
+            (
+                "chat.send",
+                "Send Subject message",
+                "Explicitly publish to a permitted conversation as the current Subject body. Background Worker messaging does not grant publication.",
+            ),
+        ],
+    );
     // The same exact operation may target either independent Memory domain. This
     // adds accepted kinds, never cross-kind containment or a second descriptor.
     for descriptor in &mut catalog {
@@ -843,9 +858,8 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
         resource_kinds: vec![K::Workspace, K::Ticket, K::MergeRequest, K::Job],
         availability: PermissionOperationAvailability::Available,
     });
-    // T-803 owns operation-only control and name migration. No Worker resource
-    // kinds are offered here: adding a per-target setting would duplicate Backend
-    // control grants and dropping an old target would widen authority.
+    // Operation use is Workspace-bound but never grants a target. Legacy Worker
+    // scopes stay exact; management does not convert or discard their limits.
     for (operation, label) in [
         ("worker.messaging", "Message Workers"),
         ("worker.send_input", "Submit to Worker"),
@@ -858,8 +872,8 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
         catalog.push(PermissionOperationDescriptor {
             operation: operation.into(), label: label.into(),
             description: "Operation use permission and directional Backend target control grants are separate. Acceptance does not prove processing or success; lifecycle state conditions still apply.".into(),
-            resource_kinds: vec![],
-            availability: PermissionOperationAvailability::Unavailable { reason: "T-803 connection pending: current control still requires target-specific Worker permissions and uses worker.notify/worker.result. Existing restricted entries are preserved without conversion.".into() },
+            resource_kinds: vec![K::WorkerOperation],
+            availability: PermissionOperationAvailability::Available,
         });
     }
     for (operation, label) in [
