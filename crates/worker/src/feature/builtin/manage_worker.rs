@@ -403,46 +403,26 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                         "Runtime Worker control is not enabled for this Worker".to_string(),
                     ));
                 }
-                self.authorize_runtime_operation(&format!("worker.{permission}"))?;
+                let operation = if permission == "notify" {
+                    "worker.messaging".to_owned()
+                } else {
+                    format!("worker.{permission}")
+                };
+                self.authorize_runtime_operation(&operation)?;
                 let response = self.client.execute_server_operation(
-                    crate::worker::WorkspaceServerOperation::WorkerControlList,
+                    crate::worker::WorkspaceServerOperation::WorkerControlAuthorize {
+                        runtime_id: runtime_id.clone(),
+                        worker_id: worker_id.clone(),
+                        permission: permission.into(),
+                    },
                 )?;
-                if !response.is_success() {
-                    return Err(WorkspaceClientError::Request(format!(
-                        "Workspace control request returned {}: {}",
-                        response.status, response.body
-                    )));
-                }
-                let body: serde_json::Value =
-                    serde_json::from_str(&response.body).map_err(|error| {
-                        WorkspaceClientError::Request(format!(
-                            "invalid Workspace control response: {error}"
-                        ))
-                    })?;
-                let granted = body
-                    .get("items")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .any(|item| {
-                        item.get("subject")
-                            .and_then(|value| value.get("runtime_id"))
-                            == Some(&serde_json::Value::String(runtime_id.clone()))
-                            && item.get("subject").and_then(|value| value.get("worker_id"))
-                                == Some(&serde_json::Value::String(worker_id.clone()))
-                            && item
-                                .get("permissions")
-                                .and_then(serde_json::Value::as_array)
-                                .is_some_and(|permissions| {
-                                    permissions.iter().any(|candidate| candidate == permission)
-                                })
-                    });
-                if granted {
+                if response.is_success() {
                     Ok(())
                 } else {
-                    Err(WorkspaceClientError::Request(
-                        "unknown Worker or permission not granted".to_string(),
-                    ))
+                    Err(WorkspaceClientError::Request(format!(
+                        "Worker target permission check returned {}: {}",
+                        response.status, response.body
+                    )))
                 }
             }
         }

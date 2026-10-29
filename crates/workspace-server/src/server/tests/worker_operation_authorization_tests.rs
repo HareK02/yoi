@@ -239,6 +239,14 @@ async fn worker_tool_host(
     root: &Path,
     client: Arc<dyn WorkspaceClient>,
 ) -> worker::Worker<UnusedModel, session_store::FsStore> {
+    worker_tool_host_with_observation(root, client, None).await
+}
+
+async fn worker_tool_host_with_observation(
+    root: &Path,
+    client: Arc<dyn WorkspaceClient>,
+    observation: Option<Arc<dyn worker::feature::contracts::WorkerObservationProvider>>,
+) -> worker::Worker<UnusedModel, session_store::FsStore> {
     let manifest = worker::WorkerManifest::from_toml(
         r#"
         [worker]
@@ -273,10 +281,14 @@ async fn worker_tool_host(
     )
     .await
     .unwrap();
-    let report = host.install_features(
-        worker::feature::FeatureRegistryBuilder::new()
-            .with_module(manage_worker_feature(client, None, true)),
-    );
+    let mut features = worker::feature::FeatureRegistryBuilder::new()
+        .with_module(manage_worker_feature(client, None, true));
+    if let Some(provider) = observation {
+        features = features.with_module(
+            worker::feature::builtin::worker_observation::WorkerObservationFeature::new(provider),
+        );
+    }
+    let report = host.install_features(features);
     assert!(
         !report.has_errors(),
         "Worker Feature must install without granting operation use"
@@ -330,6 +342,151 @@ fn tool_arguments(name: &str, target: &RuntimeWorkerRef) -> Value {
         _ => {}
     }
     args
+}
+
+// Only the protected Session read is substituted here. Installed observation /
+// control Features and signed Host / Backend target checks remain production code.
+struct CountedObservation(std::sync::atomic::AtomicUsize);
+#[async_trait::async_trait]
+impl worker::feature::contracts::WorkerObservationProvider for CountedObservation {
+    async fn list_worker_sessions(
+        &self,
+    ) -> std::result::Result<
+        Vec<worker::feature::contracts::WorkerObservationSubject>,
+        worker::feature::contracts::WorkerObservationError,
+    > {
+        panic!("known-target capture must not discover the collection")
+    }
+    async fn capture_worker_session(
+        &self,
+        _: &worker::feature::contracts::WorkerObservationSubjectRef,
+    ) -> std::result::Result<
+        worker::feature::contracts::WorkerSessionCapture,
+        worker::feature::contracts::WorkerObservationError,
+    > {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(worker::feature::contracts::WorkerSessionCapture {
+            segment_id: "target-session".into(),
+            session: protocol::SessionSnapshot {
+                pending_submissions: Default::default(),
+                entries: vec![protocol::SessionSnapshotEntry {
+                    use_policy: None,
+                    entry_id: "observed-entry".into(),
+                    timestamp: 1,
+                    provenance: protocol::SessionEntryProvenance::LegacyUnknown,
+                    derived_from: vec![],
+                    data: protocol::SessionSnapshotEntryData::Message {
+                        role: protocol::SessionMessageRole::User,
+                        content: vec![protocol::SessionContentPart::Text {
+                            text: "observed input".into(),
+                        }],
+                    },
+                }],
+            },
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn installed_observation_needs_only_observe_and_target_grant_not_collection_discovery() {
+    let f = OperationFixture::new().await;
+    f.assign(vec![workspace_permission("worker.create")], vec![])
+        .await;
+    let target = f.child("observed-target", vec![]).await;
+    f.assign(vec![operation_permission("worker.observe")], vec![])
+        .await;
+    let provider = Arc::new(CountedObservation(std::sync::atomic::AtomicUsize::new(0)));
+    let client = f.client(&f.source);
+    let host = worker_tool_host_with_observation(
+        &f._dir.path().join("observation-tools"),
+        client.clone(),
+        Some(provider.clone()),
+    )
+    .await;
+    assert!(
+        execute_tool_result(&host, "WorkerList", json!({})).is_err(),
+        "observe never grants collection discovery"
+    );
+    let overview = execute_tool(
+        &host,
+        "ViewSessionOverview",
+        json!({"subject":subject_value(&target)}),
+    )
+    .await;
+    let entry_ref = overview["entries"][0]["entry_ref"].as_str().unwrap();
+    let tools = [
+        (
+            "ViewSessionOverview",
+            json!({"subject":subject_value(&target)}),
+        ),
+        (
+            "SearchSessionEntries",
+            json!({"subject":subject_value(&target), "query":"observed"}),
+        ),
+        (
+            "ReadSessionEntry",
+            json!({"subject":subject_value(&target), "entry_ref":entry_ref}),
+        ),
+    ];
+    client.requests.lock().unwrap().clear();
+    for (name, input) in &tools {
+        execute_tool(&host, name, input.clone()).await;
+    }
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert!(
+        client
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, path)| !path.ends_with("/worker-control/workers")),
+        "known-target public observation must not invoke WorkerList"
+    );
+    let grant = f
+        .api
+        .store
+        .get_active_worker_control_grant(TEST_WORKSPACE_ID, &f.source, &target)
+        .unwrap()
+        .unwrap();
+    for missing in ["operation", "target", "revoked"] {
+        match missing {
+            "operation" => {
+                f.assign(vec![], vec![]).await;
+            }
+            "target" => {
+                f.assign(vec![operation_permission("worker.observe")], vec![])
+                    .await;
+                f.api
+                    .store
+                    .revoke_worker_control_grant(
+                        TEST_WORKSPACE_ID,
+                        &grant.grant_id,
+                        &now_registry_timestamp(),
+                    )
+                    .unwrap();
+            }
+            "revoked" => {}
+            _ => unreachable!(),
+        }
+        for (name, input) in &tools {
+            let mut input = input.clone();
+            if missing == "target" {
+                input["subject"]["worker_id"] = json!("unknown-target");
+            }
+            let error = execute_tool_result(&host, name, input)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("not found or is not accessible"),
+                "{missing} {name}: {error}"
+            );
+        }
+        assert_eq!(
+            provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "denied {missing} must not read or supply protected Session data"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

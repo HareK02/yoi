@@ -2753,7 +2753,9 @@ impl ConnectedWorkerHarness {
                     let errors = captured_errors.clone();
                     async move {
                         let response = next.run(request).await;
-                        if response.status().is_success() {
+                        if !response.status().is_client_error()
+                            && !response.status().is_server_error()
+                        {
                             return response;
                         }
                         let (parts, body) = response.into_parts();

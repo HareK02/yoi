@@ -1781,6 +1781,21 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
     ) -> Result<WorkerControlListResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/permissions/{permission}",
+        status = 204,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        openapi = false,
+    )]
+    async fn worker_control_authorize(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] worker_id: String,
+        #[path] permission: String,
+    ) -> Result<(), RepositoryApiError>;
     #[post(
         "/api/w/{workspace_id}/worker-control/workers",
         status = 200,
@@ -14911,6 +14926,7 @@ mod openapi_artifact_tests {
             "merge_request_review_submit",
             "merge_request_reviewer_child_register",
             "runtime_resource_fetch",
+            "worker_control_authorize",
             "worker_control_cancel",
             "worker_control_input",
             "worker_control_list",

@@ -7808,6 +7808,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::worker_control_list(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::worker_control_authorize(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::worker_control_spawn(
             service.clone(),
         ))
@@ -10293,6 +10296,46 @@ impl server_api::ServerApi for ServerApiContractService {
         .await
         .map_err(ApiError::into_repository_api_error)?;
         Ok(response)
+    }
+
+    async fn worker_control_authorize(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+        permission: String,
+    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+        let api = self.workspace_api()?.clone();
+        let headers = current_worker_contract_headers(&context)?;
+        api.host_executors
+            .host()
+            .map_err(|error| ApiError::from(error).into_repository_api_error())?
+            .run(move || -> ApiResult<()> {
+                validate_workspace_scope(&api, &workspace_id)?;
+                let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
+                if !matches!(
+                    permission.as_str(),
+                    "observe" | "notify" | "send_input" | "cancel" | "stop" | "restore" | "remove"
+                ) {
+                    return Err(
+                        Error::InvalidInput("unknown Worker control permission".into()).into(),
+                    );
+                }
+                // This is a current, target-only preflight for providers that read
+                // locally. It discloses no registry/session data and issues no
+                // reusable receipt. Actual Backend effects still recheck authority.
+                authorize_known_worker_permission(
+                    &api,
+                    &workspace_id,
+                    &RuntimeWorkerRef::new(source.runtime_id, source.worker_id),
+                    &RuntimeWorkerRef::new(runtime_id, worker_id),
+                    &permission,
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
     }
 
     async fn worker_control_spawn(

@@ -139,11 +139,21 @@ impl agen::llm_client::LlmClient for MessagingModel {
                 .expect("child public reply result");
                 done()
             } else if let Some(child) = result(&request, "roundtrip-spawn") {
-                call(
-                    "roundtrip-ping",
-                    "WorkerNotify",
-                    json!({"subject":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]},"content":PING}),
-                )
+                if result(&request, "roundtrip-observe").is_some() {
+                    call(
+                        "roundtrip-ping",
+                        "WorkerNotify",
+                        json!({"subject":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]},"content":PING}),
+                    )
+                } else {
+                    // The origin has observe, not worker.list. A known target must
+                    // remain readable without collection discovery authority.
+                    call(
+                        "roundtrip-observe",
+                        "ViewSessionOverview",
+                        json!({"subject":{"kind":"runtime_worker","runtime_id":child["runtime_id"],"worker_id":child["worker_id"]}}),
+                    )
+                }
             } else {
                 let call_id = if let Some(repair) = &self.repair {
                     if let Some((is_error, summary)) =
@@ -373,6 +383,7 @@ async fn connected_roundtrip(explicit_workdir: bool, repair: bool) {
         collection("worker.create"),
         operation("worker.messaging"),
         operation("worker.stop"),
+        operation("worker.observe"),
     ]);
     let (status, assigned) = response(api, human_request(&harness.owner,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),Some(json!({"operation_id":"public-messaging-policy","expected_change_id":null,"execution":execution,"delegation":permissions.lock().unwrap().clone()})))).await;
     assert_eq!(status, StatusCode::OK, "{assigned}");
@@ -582,7 +593,12 @@ async fn connected_roundtrip(explicit_workdir: bool, repair: bool) {
         .contains("MUST_NOT_ACCEPT_REVOKED_CONTROL")
     );
     let calls = harness.authorizations.lock().unwrap();
-    for op in ["worker.create", "worker.messaging", "worker.stop"] {
+    for op in [
+        "worker.create",
+        "worker.messaging",
+        "worker.stop",
+        "worker.observe",
+    ] {
         assert!(
             calls
                 .iter()
