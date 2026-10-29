@@ -27,9 +27,14 @@ mod subject_assignment_migration_tests {
             conn.execute_batch("DELETE FROM __yoi_schema_migrations;
                 INSERT INTO __yoi_schema_migrations(version,name) VALUES(106,'workspace schema baseline');").unwrap();
         }
-        seed_workspace(&conn);
+        seed_legacy_evidence(&conn);
+        (directory, path, conn)
+    }
+
+    fn seed_legacy_evidence(conn: &Connection) {
+        seed_workspace(conn);
         for status in ["waiting", "inprogress", "done", "unknown", "released"] {
-            seed_ticket(&conn, status);
+            seed_ticket(conn, status);
             conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at)
                 VALUES('w',?1,?1,'orchestrator','workspace_agent','workspace-orchestrator','original actor','original time')",[status]).unwrap();
             if status == "unknown" {
@@ -72,14 +77,16 @@ mod subject_assignment_migration_tests {
             VALUES('w','waiting','implementation','worker','worker','r','worker','original assigner','original time');
             INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,role,assignment_id,principal_kind,runtime_id,worker_id,updated_at)
             VALUES('w','waiting','worker','implementation','worker','r','worker','original time');
-            INSERT INTO ticket_implementation_delegations VALUES('w','implementation','waiting');
+            INSERT INTO notification_assignment_targets VALUES('w','accepted-delivery','r','worker','workspace-orchestrator','old-binding');").unwrap();
+        if table_exists(conn, "ticket_implementation_results").unwrap() {
+            conn.execute_batch("            INSERT INTO ticket_implementation_delegations VALUES('w','implementation','waiting');
             INSERT INTO ticket_implementation_results VALUES('w','waiting','result-op','saved-result','r','worker','{ \"body\" : \"original result\", \"kind\" : \"result\" }','result time');
             INSERT INTO notification_decisions(source_sequence,workspace_id,delivery_id,disposition,reason,purpose)
             SELECT sequence,'w','saved-notification','deliver','original reason','attention' FROM notification_sources WHERE input_event_id='implementation-result:saved-result';
             INSERT INTO notification_requests VALUES('w','saved-notification','original common request','{ \"target\" : \"old body\" }');
             INSERT INTO notification_acknowledgements VALUES('w','saved-notification','{ \"accepted\" : \"old body\" }');
-            INSERT INTO notification_failures(workspace_id,delivery_id,code,recorded_at) VALUES('w','saved-notification','old-unknown-outcome','original time');
-            INSERT INTO notification_assignment_targets VALUES('w','accepted-delivery','r','worker','workspace-orchestrator','old-binding');").unwrap();
+            INSERT INTO notification_failures(workspace_id,delivery_id,code,recorded_at) VALUES('w','saved-notification','old-unknown-outcome','original time');").unwrap();
+        }
         // A live body candidate and the old singleton exist simultaneously. A
         // migration must not infer stable-agent responsibility from either one.
         conn.execute_batch("INSERT INTO worker_singleton_owners(workspace_id,singleton_key,runtime_id,worker_id,generation,created_at,updated_at)
@@ -88,7 +95,6 @@ mod subject_assignment_migration_tests {
             VALUES('w','r','body','Body','normal','1','2');
             INSERT INTO worker_singleton_owners(workspace_id,singleton_key,runtime_id,worker_id,generation,created_at,updated_at)
             VALUES('w','subjektiv:tempting-subject','r','body',1,'1','2');").unwrap();
-        (directory, path, conn)
     }
 
     fn seed_workspace(conn: &Connection) {
@@ -407,9 +413,7 @@ mod subject_assignment_migration_tests {
                     };
                     assert_eq!(workspace_parents(new)?, 0, "fresh standalone-first preimage: {table}");
                     assert_eq!(workspace_parents(&conn)?, if table=="ticket_current_worker_assignments" {0} else {1}, "retained Workspace preimage: {table}");
-                    let contract = |db: &Connection| state_contract_schema_signature(db,table).into_iter()
-                        .filter(|row| !row.first().is_some_and(|name| name=="workspaces"))
-                        .collect::<Vec<_>>();
+                    let contract = |db: &Connection| state_contract_schema_signature(db,table);
                     assert_eq!(contract(&conn),contract(new),"{table}");
                     for db in [&conn,new] {
                         let ddl:String=db.query_row("SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",[table],|row|row.get(0))?;
@@ -838,5 +842,546 @@ mod subject_assignment_migration_tests {
         verify(&conn).unwrap();
         assert_eq!(conn.query_row("SELECT request_fingerprint FROM ticket_assignment_operations WHERE operation_id='cached-subject'", [], |row| row.get::<_, String>(0)).unwrap(), "cached fingerprint");
         assert_subject_contract(&conn);
+    }
+
+    mod subject_assignment_final_tail {
+        use super::*;
+        use crate::plugin_plan::{
+            self, PlanPinState, PluginPlanCreateReceipt, WorkerPluginExecutionPlan,
+            WorkerPluginPlanInput,
+        };
+
+        const PLAN_NAME: &str = "Immutable Worker Plugin plans and retained pins";
+        const SUBJECT_NAME: &str =
+            "Subject Ticket responsibility and current-body notification routing";
+        type Rows = Vec<Vec<rusqlite::types::Value>>;
+
+        fn raw(path: &Path) -> Connection {
+            let conn = Connection::open(path).unwrap();
+            configure_sqlite(&conn).unwrap();
+            conn
+        }
+
+        fn retained(version: i64) -> (tempfile::TempDir, std::path::PathBuf, Connection) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tail.db");
+            prepare_retained_schema(&path, version);
+            let conn = raw(&path);
+            seed_legacy_evidence(&conn);
+            assert_component13(&conn);
+            assert!(!table_exists(&conn, "plugin_execution_plans").unwrap());
+            assert_eq!(
+                table_exists(&conn, "plugin_installations").unwrap(),
+                version >= 106
+            );
+            (dir, path, conn)
+        }
+
+        // Explicit data dependencies only. Real 107 DDL is installed by the frozen
+        // migration, not copied from a latest store or relabelled after downgrade.
+        async fn populated107() -> (
+            tempfile::TempDir,
+            std::path::PathBuf,
+            Connection,
+            Vec<(String, PluginPlanCreateReceipt, PlanPinState)>,
+        ) {
+            let (dir, path, conn) = retained(106);
+            migrate_plugin_plans_v106_to_v107(&conn).unwrap();
+            let (_donor_dir, donor, receipts) =
+                SqliteWorkspaceStore::plugin_plan_migration_donor().await;
+            for table in [
+                "accounts",
+                "workspaces",
+                "workspace_config_trees",
+                "workspace_config_entries",
+                "workspace_config_tree_history",
+                "plugin_installations",
+                "plugin_artifacts",
+                "plugin_uploads",
+                "plugin_operations",
+                "plugin_execution_plans",
+                "plugin_references",
+            ] {
+                let columns = conn
+                    .prepare(&format!("PRAGMA table_info({table})"))
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                let names = columns.join(",");
+                let rows = donor
+                    .with_conn(|source| {
+                        Ok(fixture_query_rows(
+                            source,
+                            &format!("SELECT {names} FROM {table} ORDER BY rowid"),
+                        ))
+                    })
+                    .unwrap();
+                for row in rows {
+                    conn.execute(
+                        &format!(
+                            "INSERT INTO {table} ({names}) VALUES ({})",
+                            vec!["?"; columns.len()].join(",")
+                        ),
+                        rusqlite::params_from_iter(row),
+                    )
+                    .unwrap();
+                }
+            }
+            assert_eq!(
+                workspace_schema_migration_history(&conn).unwrap().last(),
+                Some(&(107, PLAN_NAME.into()))
+            );
+            assert_pre_subject(&conn, 107);
+            crate::plugin_catalog::verify(&conn).unwrap();
+            plugin_plan::verify_plan_schema(&conn).unwrap();
+            for (_, receipt, state) in &receipts {
+                let loaded = plugin_plan::plugin_plan_load(&conn, "a", &receipt.plan_id).unwrap();
+                assert_eq!(loaded.plan, receipt.plan);
+                assert_eq!(loaded.pin_state, *state);
+            }
+            assert_health(&conn);
+            drop(conn);
+            let conn = raw(&path);
+            (dir, path, conn, receipts)
+        }
+
+        fn assert_pre_subject(conn: &Connection, version: i64) {
+            assert_eq!(current_schema_version(conn).unwrap(), version);
+            assert_component13(conn);
+            assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_schema WHERE name LIKE 'ticket_subject_%' OR name LIKE 'ticket_legacy_orchestrator_%'", [], |r|r.get::<_,i64>(0)).unwrap(), 0);
+            let kinds: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE name='ticket_worker_assignments'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                kinds.contains("CHECK(principal_kind IN ('user', 'worker', 'workspace_agent'))")
+            );
+            assert!(!kinds.contains("'subject'"));
+            let capture: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE name='notification_assignment_change'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(!capture.contains("'subject'"));
+        }
+
+        fn assert_health(conn: &Connection) {
+            assert_eq!(
+                fixture_query_rows(conn, "PRAGMA integrity_check"),
+                vec![vec![rusqlite::types::Value::Text("ok".into())]]
+            );
+            assert!(fixture_query_rows(conn, "PRAGMA foreign_key_check").is_empty());
+            assert_closed_schema_writes(conn);
+        }
+
+        fn host_history(conn: &Connection) -> Rows {
+            fixture_query_rows(
+                conn,
+                "SELECT rowid,* FROM __yoi_schema_migrations ORDER BY version",
+            )
+        }
+
+        // Save the exact source columns, including rowids and original JSON bytes.
+        // Only the owning diagnostic enrichment and two append-only ledgers are
+        // excluded from the success oracle; failures compare ALL data and schema.
+        fn data(conn: &Connection, preserved: bool) -> Vec<(String, Rows)> {
+            let tables = conn
+                .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            tables
+                .into_iter()
+                .filter(|table| !preserved || !table.contains("schema_migrations"))
+                .map(|table| {
+                    let columns = conn
+                        .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+                        .unwrap()
+                        .query_map([], |r| r.get::<_, String>(1))
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap()
+                        .into_iter()
+                        .filter(|column| {
+                            !(preserved
+                                && table == "ticket_worker_assignments"
+                                && column == "tracking_migration_diagnostic")
+                        })
+                        .map(|column| format!("\"{column}\""))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    // Later historical migrations may introduce a new sequence.
+                    // Existing append identities, particularly notification sources,
+                    // must not move; allow only newly introduced sequence names.
+                    let sequence_filter = if preserved && table == "sqlite_sequence" {
+                        let names = conn
+                            .prepare("SELECT quote(name) FROM sqlite_sequence ORDER BY name")
+                            .unwrap()
+                            .query_map([], |r| r.get::<_, String>(0))
+                            .unwrap()
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .unwrap();
+                        if names.is_empty() {
+                            " WHERE 0".into()
+                        } else {
+                            format!(" WHERE name IN ({})", names.join(","))
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let query = format!(
+                        "SELECT rowid,{columns} FROM \"{table}\"{sequence_filter} ORDER BY rowid"
+                    );
+                    let rows = fixture_query_rows(conn, &query);
+                    (query, rows)
+                })
+                .collect()
+        }
+
+        fn assert_data(conn: &Connection, before: &[(String, Rows)]) {
+            for (query, rows) in before {
+                assert_eq!(&fixture_query_rows(conn, query), rows, "{query}");
+            }
+        }
+
+        fn snapshot(conn: &Connection) -> (i64, Rows, Vec<(String, Rows)>) {
+            (cookie(conn), schema(conn), data(conn, false))
+        }
+
+        fn assert_final(conn: &Connection, version: i64, host: &Rows, component: &Rows) {
+            let history = host_history(conn);
+            assert_eq!(&history[..host.len()], host);
+            let expected = expected_tail(version);
+            assert_eq!(
+                workspace_schema_migration_history(conn)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|(v, _)| *v > version)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(history.len(), host.len() + expected.len());
+            assert_component14_append(conn, component);
+            crate::plugin_catalog::verify(conn).unwrap();
+            plugin_plan::verify_plan_schema(conn).unwrap();
+            verify(conn).unwrap();
+            assert_health(conn);
+            // Reuse the owner's real constraint probe, rolled back so it is not
+            // confused with migration writes or preserved notification evidence.
+            let tx = conn.unchecked_transaction().unwrap();
+            assert_subject_contract(&tx);
+            tx.rollback().unwrap();
+            for status in ["waiting", "inprogress", "done", "unknown", "released"] {
+                let actual: String = conn.query_row("SELECT tracking_migration_diagnostic FROM ticket_worker_assignments WHERE assignment_id=?1", [status], |r|r.get(0)).unwrap();
+                assert_eq!(
+                    actual,
+                    if status == "unknown" {
+                        format!("Existing ambiguity\n{LEGACY_DIAGNOSTIC}")
+                    } else {
+                        LEGACY_DIAGNOSTIC.into()
+                    }
+                );
+            }
+        }
+
+        fn expected_tail(version: i64) -> Vec<(i64, String)> {
+            match version {
+                96 => vec![
+                    (
+                        97,
+                        "MR notifications and authenticated implementation results".into(),
+                    ),
+                    (98, "Assignment-independent implementation reports".into()),
+                    (
+                        99,
+                        "Explicit hosting administrators and self-registration policy".into(),
+                    ),
+                    (
+                        100,
+                        "Provisional users and scoped passkey activation".into(),
+                    ),
+                    (101, "Durable explicit Subject body release".into()),
+                    (102, "Durable failed Subject creation recovery".into()),
+                    (103, "Passkey metadata and atomic addition results".into()),
+                    (
+                        104,
+                        "Converge Passkey results and Job input retention".into(),
+                    ),
+                    (
+                        105,
+                        "Durable Subject deletion snapshots and Job admission fences".into(),
+                    ),
+                    (106, crate::plugin_catalog::MIGRATION_NAME.into()),
+                    (107, PLAN_NAME.into()),
+                    (108, SUBJECT_NAME.into()),
+                ],
+                106 => vec![(107, PLAN_NAME.into()), (108, SUBJECT_NAME.into())],
+                107 => vec![(108, SUBJECT_NAME.into())],
+                _ => panic!("unsupported fixture origin"),
+            }
+        }
+
+        fn plan_steps(version: i64) -> Vec<WorkspaceSchemaMigrationStep> {
+            expected_tail(version)
+                .into_iter()
+                .map(|(version, name)| WorkspaceSchemaMigrationStep { version, name })
+                .collect()
+        }
+
+        #[test]
+        fn retained96_and106_preflight_apply_and_reopen_preserve_original_evidence() {
+            for version in [96, 106] {
+                let (_dir, path, conn) = retained(version);
+                assert_pre_subject(&conn, version);
+                let before = snapshot(&conn);
+                let rows = data(&conn, true);
+                let host = host_history(&conn);
+                let component = component_history(&conn);
+                let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
+                assert_eq!(plan.current_schema_version, version);
+                assert_eq!(plan.migrations, plan_steps(version));
+                assert_eq!(
+                    snapshot(&conn),
+                    before,
+                    "read-only preflight changed source"
+                );
+                drop(conn);
+                assert_eq!(SqliteWorkspaceStore::migrate_database(&path).unwrap(), plan);
+                let conn = raw(&path);
+                assert_data(&conn, &rows);
+                assert_final(&conn, version, &host, &component);
+                let final_snapshot = snapshot(&conn);
+                drop(conn);
+                drop(SqliteWorkspaceStore::open_for_test(&path).unwrap());
+                let conn = raw(&path);
+                assert_eq!(snapshot(&conn), final_snapshot);
+                assert!(
+                    SqliteWorkspaceStore::migration_plan(&path)
+                        .unwrap()
+                        .migrations
+                        .is_empty()
+                );
+            }
+        }
+
+        fn plugin_schema(conn: &Connection) -> Rows {
+            fixture_query_rows(
+                conn,
+                "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema WHERE tbl_name LIKE 'plugin_%' ORDER BY type,name",
+            )
+        }
+
+        #[tokio::test]
+        async fn applied107_only108_preserves_canonical_plans_pins_and_released_replay() {
+            let (_dir, path, conn, receipts) = populated107().await;
+            let before = snapshot(&conn);
+            let rows = data(&conn, true);
+            let plans = plugin_schema(&conn);
+            let contracts = principal_table_contracts(&conn);
+            let host = host_history(&conn);
+            let component = component_history(&conn);
+            let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
+            assert_eq!(plan.current_schema_version, 107);
+            assert_eq!(
+                plan.migrations,
+                vec![WorkspaceSchemaMigrationStep {
+                    version: 108,
+                    name: SUBJECT_NAME.into()
+                }]
+            );
+            assert_eq!(snapshot(&conn), before);
+            drop(conn);
+            SqliteWorkspaceStore::migrate_database(&path).unwrap();
+            let conn = raw(&path);
+            assert_data(&conn, &rows);
+            assert_final(&conn, 107, &host, &component);
+            assert_eq!(plugin_schema(&conn), plans);
+            assert_eq!(principal_table_contracts(&conn), contracts);
+            let final_snapshot = snapshot(&conn);
+            drop(conn);
+            let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+            let conn = raw(&path);
+            assert_eq!(snapshot(&conn), final_snapshot);
+            for (key, receipt, state) in receipts {
+                let saved = store.plugin_plan_load("a", &receipt.plan_id).unwrap();
+                assert_eq!(saved.plan, receipt.plan);
+                assert_eq!(saved.fingerprint, receipt.fingerprint);
+                assert_eq!(saved.pin_state, state);
+                assert_eq!(
+                    store
+                        .plugin_plan_create("actor", &key, &receipt.plan)
+                        .unwrap(),
+                    receipt
+                );
+                if state == PlanPinState::Released {
+                    assert_eq!(
+                        conn.query_row(
+                            "SELECT count(*) FROM plugin_references WHERE owner=?1",
+                            [&receipt.plan_id],
+                            |r| r.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                        0
+                    );
+                }
+                let changed = WorkerPluginExecutionPlan::canonicalize(WorkerPluginPlanInput {
+                    workspace_id: "a".into(),
+                    config: receipt.plan.config().clone(),
+                    profile: receipt.plan.profile().clone(),
+                    execution: crate::plugin_plan::HostExecutionIdentity {
+                        worker_id: "changed-worker".into(),
+                        ..receipt.plan.execution().clone()
+                    },
+                    plugins: receipt.plan.plugins().to_vec(),
+                })
+                .unwrap();
+                assert!(matches!(
+                    store.plugin_plan_create("actor", &key, &changed),
+                    Err(Error::PluginCatalog(
+                        crate::plugin_catalog::PluginCatalogError::Conflict
+                    ))
+                ));
+            }
+            assert_data(&conn, &rows);
+        }
+
+        fn interrupt108(conn: &Connection) {
+            conn.execute_batch("CREATE TRIGGER interrupt_subject_tail BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=108 BEGIN SELECT RAISE(ABORT,'subject tail marker failure'); END;").unwrap();
+        }
+
+        #[tokio::test]
+        async fn marker108_failure_rolls_back_all_subject_changes_retains107_and_raw_retries() {
+            let (_dir, path, conn, _receipts) = populated107().await;
+            interrupt108(&conn);
+            let before = snapshot(&conn);
+            let host = host_history(&conn);
+            let component = component_history(&conn);
+            assert!(SqliteWorkspaceStore::migration_plan(&path).is_err());
+            assert_eq!(snapshot(&conn), before);
+            let error = apply_migrations(&conn).unwrap_err();
+            assert!(
+                error.to_string().contains("subject tail marker failure"),
+                "{error}"
+            );
+            assert_eq!(snapshot(&conn), before);
+            assert_pre_subject(&conn, 107);
+            assert_health(&conn);
+            drop(conn);
+            let conn = raw(&path);
+            assert_eq!(snapshot(&conn), before);
+            conn.execute_batch("DROP TRIGGER interrupt_subject_tail")
+                .unwrap();
+            assert_eq!(
+                SqliteWorkspaceStore::migration_plan(&path)
+                    .unwrap()
+                    .migrations,
+                plan_steps(107)
+            );
+            apply_migrations(&conn).unwrap();
+            assert_final(&conn, 107, &host, &component);
+        }
+
+        #[test]
+        fn real106_commits107_before108_failure_but_dryrun_never_changes_source() {
+            let (_dir, path, conn) = retained(106);
+            interrupt108(&conn);
+            let before = snapshot(&conn);
+            let host = host_history(&conn);
+            let component = component_history(&conn);
+            let capture = fixture_query_rows(
+                &conn,
+                "SELECT name,sql FROM sqlite_schema WHERE name LIKE 'notification_%' AND type='trigger' ORDER BY name",
+            );
+            assert!(SqliteWorkspaceStore::migration_plan(&path).is_err());
+            assert_eq!(snapshot(&conn), before);
+            assert!(SqliteWorkspaceStore::migrate_database(&path).is_err());
+            assert_eq!(snapshot(&conn), before);
+            assert!(
+                apply_migrations(&conn)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("subject tail marker failure")
+            );
+            assert_pre_subject(&conn, 107);
+            assert!(table_exists(&conn, "plugin_execution_plans").unwrap());
+            plugin_plan::verify_plan_schema(&conn).unwrap();
+            let history = host_history(&conn);
+            assert_eq!(&history[..host.len()], &host);
+            assert_eq!(history.len(), host.len() + 1);
+            assert_eq!(
+                workspace_schema_migration_history(&conn).unwrap().last(),
+                Some(&(107, PLAN_NAME.into()))
+            );
+            assert_eq!(component_history(&conn), component);
+            assert_eq!(
+                fixture_query_rows(
+                    &conn,
+                    "SELECT name,sql FROM sqlite_schema WHERE name LIKE 'notification_%' AND type='trigger' ORDER BY name"
+                ),
+                capture
+            );
+            assert_health(&conn);
+            let failed = snapshot(&conn);
+            drop(conn);
+            let conn = raw(&path);
+            assert_eq!(snapshot(&conn), failed);
+            conn.execute_batch("DROP TRIGGER interrupt_subject_tail")
+                .unwrap();
+            assert_eq!(
+                SqliteWorkspaceStore::migration_plan(&path)
+                    .unwrap()
+                    .migrations,
+                plan_steps(107)
+            );
+            apply_migrations(&conn).unwrap();
+            assert_final(&conn, 106, &host, &component);
+        }
+
+        #[tokio::test]
+        async fn preexisting_plan_or_catalog_drift_refuses108_without_repair() {
+            for trigger in ["plugin_plan_snapshot_immutable", "plugin_reference_live"] {
+                let (_dir, path, conn, _receipts) = populated107().await;
+                conn.execute_batch(&format!("DROP TRIGGER {trigger}"))
+                    .unwrap();
+                let before = snapshot(&conn);
+                assert!(SqliteWorkspaceStore::migration_plan(&path).is_err());
+                assert_eq!(snapshot(&conn), before);
+                assert!(apply_migrations(&conn).is_err());
+                assert_eq!(snapshot(&conn), before);
+                assert_pre_subject(&conn, 107);
+                drop(conn);
+                assert!(SqliteWorkspaceStore::open_for_test(&path).is_err());
+                assert_eq!(snapshot(&raw(&path)), before);
+            }
+        }
+
+        #[tokio::test]
+        async fn current_missing_host_guard_or_plan_drift_reopen_refuses_without_repair() {
+            for trigger in [
+                "ticket_legacy_orchestrator_delivery_no_insert",
+                "ticket_legacy_orchestrator_start_no_insert",
+                "plugin_plan_snapshot_immutable",
+            ] {
+                let (_dir, path, conn, _receipts) = populated107().await;
+                apply_migrations(&conn).unwrap();
+                conn.execute_batch(&format!("DROP TRIGGER {trigger}"))
+                    .unwrap();
+                let before = snapshot(&conn);
+                drop(conn);
+                assert!(SqliteWorkspaceStore::open_for_test(&path).is_err());
+                let conn = raw(&path);
+                assert_eq!(snapshot(&conn), before);
+                assert_health(&conn);
+            }
+        }
     }
 }

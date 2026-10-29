@@ -1,8 +1,11 @@
 // Included in store::tests so both paths use the real retained migration chain.
 fn state_contract_schema_signature(conn: &Connection, table: &str) -> Vec<Vec<String>> {
+    // Retained host generations alone add this exact Workspace-parent FK to
+    // the three principal tables. All other FKs (including composite owner FKs)
+    // remain in the signature; do not discard foreign-key contracts wholesale.
     let queries = [
         "SELECT name, type, CAST(\"notnull\" AS TEXT), COALESCE(dflt_value, '<NULL>'), CAST(pk AS TEXT) FROM pragma_table_info(?1) ORDER BY name",
-        "SELECT \"table\", \"from\", \"to\", on_update, on_delete, match, CAST(seq AS TEXT) FROM pragma_foreign_key_list(?1) ORDER BY \"table\", \"from\", \"to\", seq",
+        "SELECT \"table\", \"from\", \"to\", on_update, on_delete, match, CAST(seq AS TEXT) FROM pragma_foreign_key_list(?1) WHERE NOT (?1 IN ('ticket_worker_assignments','ticket_current_worker_assignments','ticket_assignment_operations') AND \"table\"='workspaces' AND \"from\"='workspace_id' AND \"to\"='workspace_id' AND on_update='NO ACTION' AND on_delete='CASCADE' AND match='NONE' AND seq=0) ORDER BY \"table\", \"from\", \"to\", seq",
         "SELECT CAST(i.\"unique\" AS TEXT), CAST(i.partial AS TEXT), (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info(i.name) ORDER BY seqno)) FROM pragma_index_list(?1) AS i ORDER BY 1, 2, 3",
         "SELECT name, sql FROM sqlite_schema WHERE type='trigger' AND tbl_name=?1 ORDER BY name",
     ];
@@ -52,8 +55,16 @@ fn fresh_and_upgraded_state_contract_schemas_enforce_the_same_constraints() {
         "typed_ticket_case_history",
         "typed_ticket_legacy_workflow_snapshot",
         "ticket_current_worker_assignments",
+        "ticket_worker_assignments",
+        "ticket_assignment_operations",
         "ticket_assignment_work_releases",
         "artifacts",
+        "plugin_installations",
+        "plugin_artifacts",
+        "plugin_uploads",
+        "plugin_operations",
+        "plugin_references",
+        "plugin_execution_plans",
         "workspace_config_trees",
         "workspace_config_tree_history",
         "workspace_memory_settings",

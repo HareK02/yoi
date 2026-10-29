@@ -1,0 +1,31 @@
+let
+    PluginEnablement = {
+        installation_id = String;
+        expected_last_operation = String;
+        package_digest = String;
+        artifact_digest = String;
+        tools = [...String];
+        logging = Bool default false;
+        connections = { ...String } default {};
+        config = { ...Unknown } default {};
+    };
+in {
+    plugins = {
+        enabled = { ...PluginEnablement } default {};
+        bindings = { ...{
+            origin = String;
+            network = String default "public_internet";
+            methods = [...String];
+            path_prefixes = [...String];
+            request_headers = [...String] default [];
+            response_headers = [...String] default [];
+            secret_ref = String default "";
+            limits = {
+                timeout_ms = Int;
+                max_request_bytes = Int;
+                max_response_bytes = Int;
+                max_header_bytes = Int;
+            };
+        } } default {};
+    } default {};
+}

@@ -908,6 +908,18 @@ async fn cancelled_feature_shutdown_keeps_sql_close_owned_without_blocking_contr
         released,
     };
     observed(waiting).await.unwrap(); // actual SQL transaction owns the Feature connection
+    // Force close to be queued before the sole DB worker can start it. Pending
+    // admission alone must not be mistaken for an available second queue slot.
+    let (started, running) = oneshot::channel();
+    let (start_close, held) = mpsc::channel();
+    fixture
+        .executor
+        .dispatch(move || {
+            let _ = started.send(());
+            let _ = held.recv_timeout(WATCHDOG);
+        })
+        .unwrap();
+    observed(running).await.unwrap();
     let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut close = Box::pin(crate::db_executor::with_operation_lifetime(
         Arc::new(CountJobLifetime(leases.clone())),
@@ -917,6 +929,30 @@ async fn cancelled_feature_shutdown_keeps_sql_close_owned_without_blocking_contr
         futures::poll!(&mut close).is_pending(),
         "Feature connection close must not wait on Tokio"
     );
+    assert!(matches!(
+        fixture.executor.dispatch(|| {}),
+        Err(Error::DbCapacityExceeded)
+    ));
+    start_close.send(()).unwrap();
+    let fenced = observed(async {
+        loop {
+            match fixture
+                .api
+                .feature_storage
+                .open(&fixture.api.subjektiv_registration)
+            {
+                Err(crate::FeatureStorageError::ShuttingDown) => break,
+                Ok(_) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected Feature admission failure: {error}"),
+            }
+        }
+    });
+    tokio::select! {
+        _ = fenced => {},
+        result = &mut close => panic!("close completed while its connection is held: {result:?}"),
+    }
+    // Observing the real shutdown fence proves close was dequeued and started;
+    // only now can the one waiting slot be filled deterministically.
     runtime_progress_while_locked(&lock).await;
     assert_eq!(
         observed(fixture.host_executor.run(|| Ok::<_, Error>("control")))

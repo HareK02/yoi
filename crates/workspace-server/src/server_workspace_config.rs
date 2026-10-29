@@ -595,7 +595,10 @@ pub(super) async fn commit(
     if candidate.base_digest != state.snapshot.digest
         || candidate.base_toolchain_fingerprint != state.contract.fingerprint
         || candidate.base_projection_digest != state.projection_digest
-        || candidate.contract.schema_bundle.fingerprint != schema_fingerprint
+        || crate::plugin_settings::base_schema_bundle(&candidate.contract.schema_bundle)
+            .map_err(pre_error)?
+            .fingerprint
+            != schema_fingerprint
     {
         return Err(fail(409, "stale_validator"));
     }

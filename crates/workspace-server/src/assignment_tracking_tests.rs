@@ -510,6 +510,10 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                     (106, crate::plugin_catalog::MIGRATION_NAME.into()),
                     (
                         107,
+                        "Immutable Worker Plugin plans and retained pins".into()
+                    ),
+                    (
+                        108,
                         "Subject Ticket responsibility and current-body notification routing"
                             .into()
                     )

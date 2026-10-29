@@ -129,7 +129,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 107;
+const LATEST_SCHEMA_VERSION: i64 = 108;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -469,8 +469,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 107,
+        name: "Immutable Worker Plugin plans and retained pins",
+        apply: migrate_plugin_plans_v106_to_v107,
+    },
+    Migration {
+        version: 108,
         name: "Subject Ticket responsibility and current-body notification routing",
-        apply: migrate_subject_assignments_v106_to_v107,
+        apply: migrate_subject_assignments_v107_to_v108,
     },
 ];
 
@@ -15823,17 +15828,23 @@ fn migrate_hosting_policy_v98_to_v99(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate_subject_assignments_v106_to_v107(conn: &Connection) -> Result<()> {
-    if current_schema_version(conn)? != 106 {
+fn migrate_subject_assignments_v107_to_v108(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 107 {
         return Err(Error::Store(
-            "Subject assignment migration requires schema 106".into(),
+            "Subject assignment migration requires schema 107".into(),
         ));
     }
+    // Refuse preexisting drift before the new tail can commit any changes.
+    // Migration 107 and its historical identity remain frozen.
+    verify_schema_history(conn, 107)?;
+    crate::plugin_catalog::verify(conn)?;
+    crate::plugin_plan::verify_plan_schema(conn)?;
     let tx = conn.unchecked_transaction()?;
     subject_assignment_migration::install(&tx)?;
     notification_routing::install_subject_recipients(&tx)?;
+    subject_assignment_migration::verify(&tx)?;
     tx.execute(
-        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(107,?1)",
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(108,?1)",
         ["Subject Ticket responsibility and current-body notification routing"],
     )?;
     tx.commit()?;
@@ -15858,12 +15869,26 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     })
 }
 
+fn migrate_plugin_plans_v106_to_v107(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 106 {
+        return Err(Error::Store(
+            "Plugin plan migration requires schema 106".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
+    tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES(107,'Immutable Worker Plugin plans and retained pins')", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
 // Fresh composition uses the posts contract. Retained fixtures pass frozen host
 // and component DDL to the shared cross-domain constraint composition below.
 fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure_from_sql(conn, include_str!("latest_schema.sql"), true)?;
     conn.execute_batch(include_str!("activation_schema.sql"))?;
     conn.execute_batch(include_str!("passkey_results_schema.sql"))?;
+    conn.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
     Ok(())
 }
 
@@ -16905,6 +16930,7 @@ fn apply_migrations_with_secret_source(
 
     verify_schema_history(conn, LATEST_SCHEMA_VERSION)?;
     crate::plugin_catalog::verify(conn)?;
+    crate::plugin_plan::verify_plan_schema(conn)?;
     subject_assignment_migration::verify(conn)?;
     verify_workspace_runtime_binding_schema(conn)?;
     verify_workspace_runtime_verification_schema(conn)?;
@@ -19601,7 +19627,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:104, name:"Converge Passkey results and Job input retention".into()},
                 WorkspaceSchemaMigrationStep {version:105, name:"Durable Subject deletion snapshots and Job admission fences".into()},
                 WorkspaceSchemaMigrationStep {version:106, name:crate::plugin_catalog::MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:107, name:"Subject Ticket responsibility and current-body notification routing".into()},
+                WorkspaceSchemaMigrationStep {version:107, name:"Immutable Worker Plugin plans and retained pins".into()},
+                WorkspaceSchemaMigrationStep {version:108, name:"Subject Ticket responsibility and current-body notification routing".into()},
             ]
         );
 
@@ -19718,7 +19745,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (104, "Converge Passkey results and Job input retention".to_string()),
 (105, "Durable Subject deletion snapshots and Job admission fences".to_string()),
 (106, crate::plugin_catalog::MIGRATION_NAME.to_string()),
-(107, "Subject Ticket responsibility and current-body notification routing".to_string()),
+(107, "Immutable Worker Plugin plans and retained pins".to_string()),
+(108, "Subject Ticket responsibility and current-body notification routing".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -23007,7 +23035,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (104, "Converge Passkey results and Job input retention".into()),
                          (105, "Durable Subject deletion snapshots and Job admission fences".into()),
                          (106, crate::plugin_catalog::MIGRATION_NAME.into()),
-                         (107, "Subject Ticket responsibility and current-body notification routing".into())]);
+                         (107, "Immutable Worker Plugin plans and retained pins".into()),
+                         (108, "Subject Ticket responsibility and current-body notification routing".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
@@ -28551,3 +28580,7 @@ mod frozen_runtime_binding_tests;
 #[cfg(test)]
 #[path = "plugin_catalog/migration_tests.rs"]
 mod plugin_catalog_migration_tests;
+
+#[cfg(test)]
+#[path = "plugin_plan/migration_tests.rs"]
+mod plugin_plan_migration_tests;

@@ -7,6 +7,12 @@ export function apply_changes(changes: any): any;
 
 export function changes_between(base: any, candidate: any): any;
 
+/**
+ * Complete after converting the editor's UTF-16 offset to the shared analyzer's UTF-8 byte offset.
+ *
+ * Convert the returned start position back to UTF-16 so non-ASCII characters do not
+ * misalign editor and analyzer positions. Reject offsets that cannot map to a character boundary.
+ */
 export function complete_current(entrypoint: string, source: string, utf16_offset: number, explicit: boolean): any;
 
 export function compose_schema_bundle(contributions: any): any;
@@ -21,6 +27,12 @@ export function format_source(source: string): string;
 
 export function set_schema_bundle(schema_bundle: any): void;
 
+/**
+ * Retain the browser's edit candidate as a snapshot.
+ *
+ * Deserialization uses shared digest validation but neither saves to nor authorizes the Backend.
+ * Keep the schema bundle in separate state to distinguish sources from evaluation conditions.
+ */
 export function set_snapshot(snapshot: any): void;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
