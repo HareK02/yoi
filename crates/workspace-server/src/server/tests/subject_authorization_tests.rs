@@ -7,6 +7,10 @@
 use super::*;
 #[path = "subject_job_model_supply_tests.rs"]
 mod subject_job_model_supply;
+#[path = "worker_messaging_connected_tests.rs"]
+mod worker_messaging_connected;
+#[path = "worker_operation_authorization_tests.rs"]
+mod worker_operation_authorization;
 use agen::tool::{Tool, ToolExecutionContext, ToolOutput};
 use server_api::authorization::{
     PermissionResource, ScopedPermission, SubjectPermissions, SubjectPermissionsUpdate,
@@ -568,7 +572,7 @@ fn concrete_resource_permissions(f: &Fixture) -> Vec<ScopedPermission> {
             },
         ),
         (
-            "worker.observe",
+            "subworker.observe",
             PermissionResource::SubWorker {
                 runtime_id: f.source.runtime_id.clone(),
                 worker_id: f.source.worker_id.clone(),
@@ -2602,208 +2606,261 @@ impl Drop for ConnectedRuntimeServer {
     }
 }
 
+const CONNECTED_RUNTIME: &str = "connected-subject-authorization";
+
+/// Shared signed Backend/Runtime connection. Only the supplied model is replaced;
+/// temporary roots, request authentication and Controller/tool dispatch stay real.
+struct ConnectedWorkerHarness {
+    api: WorkspaceApi,
+    runtime: worker_runtime::Runtime,
+    factory: worker_runtime::worker_backend::ProfileRuntimeWorkerFactory,
+    identity: RuntimeIdentityMaterial,
+    backend_url: String,
+    owner: String,
+    materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
+    authorizations: Arc<Mutex<Vec<(Value, StatusCode)>>>,
+    runtime_errors: Arc<Mutex<Vec<String>>>,
+    _backend_server: AuthorizationCallbackServer,
+    _runtime_server: ConnectedRuntimeServer,
+    _dir: tempfile::TempDir,
+}
+impl ConnectedWorkerHarness {
+    async fn start<M: agen::llm_client::LlmClient + Clone + 'static>(model: M) -> Self {
+        const RUNTIME: &str = CONNECTED_RUNTIME;
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", backend_listener.local_addr().unwrap());
+        let runtime_url = format!("http://{}", runtime_listener.local_addr().unwrap());
+        let identity = RuntimeIdentityMaterial::generate(RUNTIME).unwrap();
+        let runtime_root = dir.path().join("connected-runtime");
+        let materializer = worker_runtime::working_directory::RuntimeGitMaterializer::new(
+            dir.path().join("connected-workdirs"),
+        );
+        let factory = worker_runtime::worker_backend::ProfileRuntimeWorkerFactory::new(
+            dir.path().join("connected-profiles"),
+        )
+        .with_remote_worker_mutation_identity(identity.clone())
+        .with_workspace_request_client(
+            worker_runtime::workspace_request::RuntimeWorkspaceRequestClient::new(
+                TEST_WORKSPACE_ID,
+                &backend_url,
+                RUNTIME,
+            )
+            .with_runtime_request_source(&identity, &backend_url),
+        )
+        .with_runtime_store_dir(&runtime_root)
+        .with_spawn_model_client_factory(move || Box::new(model.clone()));
+        let execution =
+            worker_runtime::worker_backend::WorkerRuntimeExecutionBackend::new(factory.clone())
+                .unwrap()
+                .with_working_directory_materializer(materializer.clone());
+        let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
+            worker_runtime::fs_store::FsRuntimeStoreOptions {
+                root: runtime_root,
+                runtime_id: RUNTIME.into(),
+                display_name: None,
+            },
+            Arc::new(execution),
+        )
+        .unwrap();
+
+        let mut config = test_server_config(dir.path());
+        config.backend_base_url = Some(backend_url.clone());
+        // The embedded Runtime is unused. Both source and child below execute on the
+        // connected real Runtime above, not on this existing Host fixture backend.
+        let control = Arc::new(test_control_store(&config));
+        seed_test_registered_workspace(control.as_ref(), &config)
+            .await
+            .unwrap();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            control,
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
+        let now = now_registry_timestamp();
+        api.store
+            .upsert_workspace_runtime_binding_record(
+                WorkspaceRuntimeBinding {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    runtime_id: RUNTIME.into(),
+                    display_name: RUNTIME.into(),
+                    base_url: runtime_url.clone(),
+                    public_key: identity.public_key.clone(),
+                    public_key_fingerprint: String::new(),
+                    binding_id: "connected-authorization-binding".into(),
+                    authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
+                    created_at: now.clone(),
+                    updated_at: now,
+                    revoked_at: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let binding = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, RUNTIME)
+            .await
+            .unwrap()
+            .unwrap();
+        // Repository materialization and Worker startup must authenticate as this
+        // Workspace, not the Runtime HTTP local-token fallback's `local` Workspace.
+        let workspace_identity = api
+            .signing_identities
+            .provision_existing(TEST_WORKSPACE_ID, &test_owner_actor().account_id)
+            .unwrap();
+        let verifier = worker_runtime::workspace_issuer::WorkspaceCapabilityVerifier::new(
+            vec![
+                worker_runtime::workspace_issuer::WorkspaceIssuerTrustRecord {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    backend_url: backend_url.clone(),
+                    key_id: workspace_identity.key_id.clone(),
+                    algorithm: workspace_identity.algorithm.clone(),
+                    public_key: workspace_identity.public_key.clone().unwrap(),
+                    public_key_fingerprint: workspace_identity
+                        .public_key_fingerprint
+                        .clone()
+                        .unwrap(),
+                    trust_id: "connected-authorization-workspace-trust".into(),
+                    state: worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Active,
+                    registered_at_unix: 1,
+                    updated_at_unix: 1,
+                },
+            ],
+            Arc::new(
+                worker_runtime::workspace_issuer::InMemoryWorkspaceClaimReplayProtection::default(),
+            ),
+        )
+        .unwrap();
+        let runtime_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_errors = runtime_errors.clone();
+        let runtime_server = ConnectedRuntimeServer::start(
+            runtime_listener,
+            worker_runtime::http_server::runtime_http_router_with_workspace_auth(
+                runtime.clone(),
+                None,
+                worker_runtime::http_server::WorkspaceRuntimeHttpAuth {
+                    verifier,
+                    runtime_id: RUNTIME.into(),
+                },
+            )
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let errors = captured_errors.clone();
+                    async move {
+                        let response = next.run(request).await;
+                        if response.status().is_success() {
+                            return response;
+                        }
+                        let (parts, body) = response.into_parts();
+                        let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
+                        let body: Value = serde_json::from_slice(&bytes).unwrap();
+                        errors.lock().unwrap().push(
+                            body["error"]["message"]
+                                .as_str()
+                                .unwrap_or("unknown fixture error")
+                                .to_owned(),
+                        );
+                        Response::from_parts(parts, Body::from(bytes))
+                    }
+                },
+            )),
+        );
+        api.runtime.register_or_replace(
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig {
+                    runtime_id: RUNTIME.into(),
+                    workspace_id: Some(TEST_WORKSPACE_ID.into()),
+                    display_name: RUNTIME.into(),
+                    base_url: runtime_url,
+                    bearer_token: None,
+                    workspace_authorization: Some(
+                        crate::hosts::WorkspaceRuntimeAuthorization::new(
+                            api.store.clone(),
+                            api.signing_identities.clone(),
+                            backend_url.clone(),
+                            binding,
+                        ),
+                    ),
+                    strict_public_egress: false,
+                    cached_worker_creation_available: true,
+                    cached_os: "linux".into(),
+                    cached_arch: "x86_64".into(),
+                    cached_status: "active".into(),
+                    timeout: std::time::Duration::from_secs(30),
+                },
+                TEST_WORKSPACE_ID.to_string(),
+                backend_url.clone(),
+            )
+            .unwrap(),
+        );
+        seed_test_delivery_binding(&api);
+
+        let authorizations = Arc::new(Mutex::new(Vec::<(Value, StatusCode)>::new()));
+        let observed = authorizations.clone();
+        let app = build_router(api.clone()).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let observed = observed.clone();
+                async move {
+                    if request.uri().path() != authorization_path() {
+                        return next.run(request).await;
+                    }
+                    let (parts, body) = request.into_parts();
+                    let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
+                    let permission: Value = serde_json::from_slice(&bytes).unwrap();
+                    let response = next
+                        .run(Request::from_parts(parts, Body::from(bytes)))
+                        .await;
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((permission, response.status()));
+                    response
+                }
+            },
+        ));
+        let backend_server = AuthorizationCallbackServer::start(backend_listener, app);
+        let owner =
+            seed_test_workspace_owner_token(api.store.as_ref(), "connected-authorization-owner")
+                .await;
+
+        Self {
+            api,
+            runtime,
+            factory,
+            identity,
+            backend_url,
+            owner,
+            materializer,
+            authorizations,
+            runtime_errors,
+            _backend_server: backend_server,
+            _runtime_server: runtime_server,
+            _dir: dir,
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_read_but_not_write()
 {
     use worker_runtime::working_directory::WorkingDirectoryMaterializer;
 
-    const RUNTIME: &str = "connected-subject-authorization";
-    let dir = tempfile::tempdir().unwrap();
-    init_clean_git_workspace(dir.path());
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let backend_url = format!("http://{}", backend_listener.local_addr().unwrap());
-    let runtime_url = format!("http://{}", runtime_listener.local_addr().unwrap());
-    let identity = RuntimeIdentityMaterial::generate(RUNTIME).unwrap();
-    let runtime_root = dir.path().join("connected-runtime");
-    let materializer = worker_runtime::working_directory::RuntimeGitMaterializer::new(
-        dir.path().join("connected-workdirs"),
-    );
+    const RUNTIME: &str = CONNECTED_RUNTIME;
     let (completed, mut completion) = tokio::sync::mpsc::channel(4);
-    let model = ConnectedAuthorizationModel { completed };
-    let factory = worker_runtime::worker_backend::ProfileRuntimeWorkerFactory::new(
-        dir.path().join("connected-profiles"),
-    )
-    .with_remote_worker_mutation_identity(identity.clone())
-    .with_workspace_request_client(
-        worker_runtime::workspace_request::RuntimeWorkspaceRequestClient::new(
-            TEST_WORKSPACE_ID,
-            &backend_url,
-            RUNTIME,
-        )
-        .with_runtime_request_source(&identity, &backend_url),
-    )
-    .with_runtime_store_dir(&runtime_root)
-    .with_spawn_model_client_factory(move || Box::new(model.clone()));
-    let execution = worker_runtime::worker_backend::WorkerRuntimeExecutionBackend::new(factory)
-        .unwrap()
-        .with_working_directory_materializer(materializer.clone());
-    let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
-        worker_runtime::fs_store::FsRuntimeStoreOptions {
-            root: runtime_root,
-            runtime_id: RUNTIME.into(),
-            display_name: None,
-        },
-        Arc::new(execution),
-    )
-    .unwrap();
-
-    let mut config = test_server_config(dir.path());
-    config.backend_base_url = Some(backend_url.clone());
-    // The embedded Runtime is unused. Both source and child below execute on the
-    // connected real Runtime above, not on this existing Host fixture backend.
-    let control = Arc::new(test_control_store(&config));
-    seed_test_registered_workspace(control.as_ref(), &config)
-        .await
-        .unwrap();
-    let api = WorkspaceApi::new_with_execution_backend(
-        config,
-        control,
-        Arc::new(DeterministicExecutionBackend::default()),
-    )
-    .await
-    .unwrap();
-    let now = now_registry_timestamp();
-    api.store
-        .upsert_workspace_runtime_binding_record(
-            WorkspaceRuntimeBinding {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                runtime_id: RUNTIME.into(),
-                display_name: RUNTIME.into(),
-                base_url: runtime_url.clone(),
-                public_key: identity.public_key.clone(),
-                public_key_fingerprint: String::new(),
-                binding_id: "connected-authorization-binding".into(),
-                authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
-                created_at: now.clone(),
-                updated_at: now,
-                revoked_at: None,
-            },
-            false,
-        )
-        .await
-        .unwrap();
-    let binding = api
-        .store
-        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, RUNTIME)
-        .await
-        .unwrap()
-        .unwrap();
-    // Repository materialization and Worker startup must authenticate as this
-    // Workspace, not the Runtime HTTP local-token fallback's `local` Workspace.
-    let workspace_identity = api
-        .signing_identities
-        .provision_existing(TEST_WORKSPACE_ID, &test_owner_actor().account_id)
-        .unwrap();
-    let verifier = worker_runtime::workspace_issuer::WorkspaceCapabilityVerifier::new(
-        vec![
-            worker_runtime::workspace_issuer::WorkspaceIssuerTrustRecord {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                backend_url: backend_url.clone(),
-                key_id: workspace_identity.key_id.clone(),
-                algorithm: workspace_identity.algorithm.clone(),
-                public_key: workspace_identity.public_key.clone().unwrap(),
-                public_key_fingerprint: workspace_identity.public_key_fingerprint.clone().unwrap(),
-                trust_id: "connected-authorization-workspace-trust".into(),
-                state: worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Active,
-                registered_at_unix: 1,
-                updated_at_unix: 1,
-            },
-        ],
-        Arc::new(
-            worker_runtime::workspace_issuer::InMemoryWorkspaceClaimReplayProtection::default(),
-        ),
-    )
-    .unwrap();
-    let runtime_errors = Arc::new(Mutex::new(Vec::<String>::new()));
-    let captured_errors = runtime_errors.clone();
-    let _runtime_server = ConnectedRuntimeServer::start(
-        runtime_listener,
-        worker_runtime::http_server::runtime_http_router_with_workspace_auth(
-            runtime.clone(),
-            None,
-            worker_runtime::http_server::WorkspaceRuntimeHttpAuth {
-                verifier,
-                runtime_id: RUNTIME.into(),
-            },
-        )
-        .layer(axum::middleware::from_fn(
-            move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let errors = captured_errors.clone();
-                async move {
-                    let response = next.run(request).await;
-                    if response.status().is_success() {
-                        return response;
-                    }
-                    let (parts, body) = response.into_parts();
-                    let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
-                    let body: Value = serde_json::from_slice(&bytes).unwrap();
-                    errors.lock().unwrap().push(
-                        body["error"]["message"]
-                            .as_str()
-                            .unwrap_or("unknown fixture error")
-                            .to_owned(),
-                    );
-                    Response::from_parts(parts, Body::from(bytes))
-                }
-            },
-        )),
-    );
-    api.runtime.register_or_replace(
-        RemoteWorkerRuntime::new(
-            RemoteRuntimeConfig {
-                runtime_id: RUNTIME.into(),
-                workspace_id: Some(TEST_WORKSPACE_ID.into()),
-                display_name: RUNTIME.into(),
-                base_url: runtime_url,
-                bearer_token: None,
-                workspace_authorization: Some(crate::hosts::WorkspaceRuntimeAuthorization::new(
-                    api.store.clone(),
-                    api.signing_identities.clone(),
-                    backend_url.clone(),
-                    binding,
-                )),
-                strict_public_egress: false,
-                cached_worker_creation_available: true,
-                cached_os: "linux".into(),
-                cached_arch: "x86_64".into(),
-                cached_status: "active".into(),
-                timeout: std::time::Duration::from_secs(30),
-            },
-            TEST_WORKSPACE_ID.to_string(),
-            backend_url.clone(),
-        )
-        .unwrap(),
-    );
-    install_subject_profiles(&api, "workspace_write");
-    seed_test_delivery_binding(&api);
-
-    let authorizations = Arc::new(Mutex::new(Vec::<(Value, StatusCode)>::new()));
-    let observed = authorizations.clone();
-    let app = build_router(api.clone()).layer(axum::middleware::from_fn(
-        move |request: axum::extract::Request, next: axum::middleware::Next| {
-            let observed = observed.clone();
-            async move {
-                if request.uri().path() != authorization_path() {
-                    return next.run(request).await;
-                }
-                let (parts, body) = request.into_parts();
-                let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
-                let permission: Value = serde_json::from_slice(&bytes).unwrap();
-                let response = next
-                    .run(Request::from_parts(parts, Body::from(bytes)))
-                    .await;
-                observed
-                    .lock()
-                    .unwrap()
-                    .push((permission, response.status()));
-                response
-            }
-        },
-    ));
-    let _backend_server = AuthorizationCallbackServer::start(backend_listener, app);
-    let owner =
-        seed_test_workspace_owner_token(api.store.as_ref(), "connected-authorization-owner").await;
+    let harness = ConnectedWorkerHarness::start(ConnectedAuthorizationModel { completed }).await;
+    let api = &harness.api;
+    let identity = &harness.identity;
+    let backend_url = &harness.backend_url;
+    let owner = &harness.owner;
+    let materializer = &harness.materializer;
+    let authorizations = &harness.authorizations;
+    let runtime_errors = &harness.runtime_errors;
+    install_subject_profiles(api, "workspace_write");
     let (status, created_workdir) = response(&api, human_request(&owner, "POST",
         &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
         Some(json!({"runtime_id":RUNTIME, "repository_key":"test-repository", "selector":"HEAD", "operation_id":"connected-authorization-workdir"})))).await;

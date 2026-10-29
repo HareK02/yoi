@@ -2066,6 +2066,7 @@ struct WorkerRemovalService {
     journal_storage: crate::WorkspaceFeatureStorage,
     journal_registration: crate::RegisteredFeature,
     journal_dispatch_api: Weak<WorkspaceApi>,
+    worker_authority: subject_authorization::WorkerAuthorityView,
     store: Arc<dyn ControlPlaneStore>,
     host_executors: HostExecutors,
     runtime: Weak<RuntimeRegistry>,
@@ -2080,6 +2081,7 @@ impl WorkerRemovalService {
     fn new(api: &WorkspaceApi) -> Self {
         Self {
             workspace_id: api.config.workspace_id.clone(),
+            worker_authority: subject_authorization::WorkerAuthorityView::from(api),
             journal_storage: api.feature_storage.clone(),
             journal_registration: api.subjektiv_registration.clone(),
             journal_dispatch_api: api
@@ -2402,23 +2404,14 @@ impl WorkerRemovalService {
             ));
         }
         let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
-        let grant = self
-            .store
-            .get_active_worker_control_grant(&self.workspace_id, &controller, &target)
-            .map_err(|_| "Worker control grant authority is unavailable".to_string())?
-            .filter(|grant| {
-                grant
-                    .permissions
-                    .iter()
-                    .any(|permission| permission == "remove")
-            });
-        let Some(grant) = grant else {
-            return Ok(worker_remove_error_response(
-                StatusCode::NOT_FOUND,
-                "unknown_worker",
-                "The target Worker is not known to the current Worker",
-            ));
-        };
+        let grant =
+            match self
+                .worker_authority
+                .authorize_control_permission(&controller, &target, "remove")
+            {
+                Ok(grant) => grant,
+                Err(error) => return Ok(worker_control_denied_response(error)),
+            };
         let control_lock = {
             let mut locks = self
                 .worker_control_locks
@@ -2430,17 +2423,15 @@ impl WorkerRemovalService {
                 .clone()
         };
         let _control_guard = control_lock.lock().await;
-        let still_granted = self
-            .store
-            .get_active_worker_control_grant(&self.workspace_id, &controller, &target)
-            .map_err(|_| "Worker control grant authority is unavailable".to_string())?
-            .is_some_and(|current| {
-                current.grant_id == grant.grant_id
-                    && current
-                        .permissions
-                        .iter()
-                        .any(|permission| permission == "remove")
-            });
+        let current =
+            match self
+                .worker_authority
+                .authorize_control_permission(&controller, &target, "remove")
+            {
+                Ok(grant) => grant,
+                Err(error) => return Ok(worker_control_denied_response(error)),
+            };
+        let still_granted = current.grant_id == grant.grant_id;
         if !still_granted {
             return Ok(worker_remove_error_response(
                 StatusCode::NOT_FOUND,
@@ -26423,6 +26414,16 @@ async fn list_known_workers(
             validate_workspace_scope(&api, &path.workspace_id)?;
             let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
             let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
+            subject_authorization::authorize(
+                &api,
+                &controller,
+                &server_api::authorization::OperationAuthorizationRequest {
+                    operation: "worker.list".into(),
+                    resource: server_api::authorization::PermissionResource::Workspace {
+                        workspace_id: path.workspace_id.clone(),
+                    },
+                },
+            )?;
             let limit = api.config.max_records.clamp(1, 500);
             let grants = api.store.list_active_worker_control_grants(
                 &path.workspace_id,
@@ -26545,6 +26546,15 @@ async fn spawn_known_worker_authenticated_on_host(
         context,
     )
     .await?;
+    // Creation has now committed the real registry row. Keep reply-grant failure
+    // outside spawn compensation so an exact operation replay repairs only the
+    // missing grant, without a second Worker or repeated initial Submit.
+    subject_authorization::persist_reply_grant(
+        &api,
+        &controller,
+        &RuntimeWorkerRef::new(&response.0.runtime_id, &response.0.worker_id),
+        &scoped_worker_control_operation_id(&controller, &operation_id),
+    )?;
     if let Err(error) = api
         .store
         .create_worker_control_grant(&WorkerControlGrantRecord {
@@ -26589,6 +26599,26 @@ fn worker_control_lock(api: &WorkspaceApi, grant_id: &str) -> Arc<tokio::sync::M
     )
 }
 
+fn worker_control_denied_response(error: Error) -> worker::WorkspaceResponse {
+    // Keep removal's existing opaque target-grant refusal; operation-policy
+    // refusals remain distinct and do not impersonate an unknown target.
+    if matches!(&error, Error::UnknownWorker { .. })
+        || matches!(&error, Error::InvalidInput(message)
+            if message.starts_with("worker control permission "))
+    {
+        return worker_remove_error_response(
+            StatusCode::NOT_FOUND,
+            "unknown_worker",
+            "The target Worker is not known to the current Worker",
+        );
+    }
+    worker_remove_error_response(
+        api_error_status(&error),
+        "worker_control_denied",
+        &error.to_string(),
+    )
+}
+
 fn authorize_known_worker_permission(
     api: &WorkspaceApi,
     workspace_id: &str,
@@ -26596,54 +26626,13 @@ fn authorize_known_worker_permission(
     subject: &RuntimeWorkerRef,
     permission: &str,
 ) -> Result<WorkerControlGrantRecord> {
-    // Child result return is deliberately narrower than control or public chat
-    // posting. The execution grant names only this origin Worker and only notify.
-    if permission == "notify" {
-        if let Some(permissions) = subject_authorization::worker_permissions(api, controller)
-            .map_err(|error| error.error)?
-        {
-            let requested = server_api::authorization::ScopedPermission {
-                operation: "worker.result".into(),
-                resource: server_api::authorization::PermissionResource::Worker {
-                    runtime_id: subject.runtime_id.clone(),
-                    worker_id: subject.worker_id.clone(),
-                },
-            };
-            if permissions.iter().any(|granted| granted.covers(&requested)) {
-                return Ok(WorkerControlGrantRecord {
-                    workspace_id: workspace_id.into(),
-                    grant_id: format!(
-                        "execution-result:{}/{}",
-                        controller.runtime_id, controller.worker_id
-                    ),
-                    controller: controller.clone(),
-                    subject: subject.clone(),
-                    relation: "result_return".into(),
-                    origin: "execution_grant".into(),
-                    permissions: vec!["notify".into()],
-                    operation_id: "execution-result".into(),
-                    created_at: String::new(),
-                    revoked_at: None,
-                });
-            }
-        }
+    if workspace_id != api.workspace_id() {
+        return Err(Error::WorkspacePermissionDenied(
+            "resource belongs to another Workspace".into(),
+        ));
     }
-    let grant = api
-        .store
-        .get_active_worker_control_grant(workspace_id, controller, subject)?
-        .ok_or_else(|| Error::UnknownWorker {
-            worker: subject.clone(),
-        })?;
-    if !grant
-        .permissions
-        .iter()
-        .any(|candidate| candidate == permission)
-    {
-        return Err(Error::InvalidInput(format!(
-            "worker control permission `{permission}` was not granted"
-        )));
-    }
-    Ok(grant)
+    subject_authorization::WorkerAuthorityView::from(api)
+        .authorize_control_permission(controller, subject, permission)
 }
 
 async fn send_known_worker_input(
@@ -26762,6 +26751,16 @@ async fn scoped_list_worker_observation_sessions(
             validate_workspace_scope(&api, &path.workspace_id)?;
             let source = authenticate_worker_mutation_source(&api, &path.workspace_id, &headers)?;
             let controller = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
+            subject_authorization::authorize(
+                &api,
+                &controller,
+                &server_api::authorization::OperationAuthorizationRequest {
+                    operation: "worker.observe.list".into(),
+                    resource: server_api::authorization::PermissionResource::Workspace {
+                        workspace_id: path.workspace_id.clone(),
+                    },
+                },
+            )?;
             let sessions = api
                 .store
                 .list_active_worker_control_grants(&path.workspace_id, &controller, 100)?
@@ -26773,6 +26772,14 @@ async fn scoped_list_worker_observation_sessions(
                         .any(|permission| permission == "observe")
                 })
                 .filter_map(|grant| {
+                    authorize_known_worker_permission(
+                        &api,
+                        &path.workspace_id,
+                        &controller,
+                        &grant.subject,
+                        "observe",
+                    )
+                    .ok()?;
                     let worker = api.runtime.worker(&grant.subject).ok()?;
                     if matches!(
                         worker.state.as_str(),

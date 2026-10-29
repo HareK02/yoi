@@ -7338,6 +7338,24 @@
           },
           {
             "additionalProperties": false,
+            "description": "Authorizes operation use, not a target Worker or a Workspace collection.\nThe Worker Feature must still enforce its directional target control grant.",
+            "properties": {
+              "kind": {
+                "const": "worker_operation",
+                "type": "string"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
             "properties": {
               "kind": {
                 "const": "worker",
@@ -10515,6 +10533,7 @@
       },
       "ScopedPermission": {
         "additionalProperties": false,
+        "description": "Stored scopes retain their original resources and exact operation names.\n\nA legacy Worker read adapter may use [`canonical_worker_operation`] to project\noperation use, but must retain the original target separately for the Worker\nFeature's control-grant check, including direction, revocation and delegation\nlimits. Replacing an old Worker resource with WorkerOperation and discarding\nthat target would broaden authority. Neither validation nor `covers` performs\nthat conversion.",
         "properties": {
           "operation": {
             "type": "string"
@@ -19062,7 +19081,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:eca6e2cd9309ecf9fe73dcb044d82a5549950d66e93cd33157b2b2b3fa8ea82f"
+    "x-yoi-source-digest": "sha256:24c38dc5714a966e6adde9ea8483ccc9e02cb6a0c2f01f776548155d1a488b00"
   },
   "openapi": "3.1.0",
   "paths": {
