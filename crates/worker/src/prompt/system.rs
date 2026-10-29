@@ -606,7 +606,7 @@ mod tests {
                 "only `open`",
                 "stable tag IDs, not display names",
                 "no ready step or separate Queue is required",
-                "Orchestrator's self-reported handling",
+                "assigned Subject's self-reported handling",
                 "Answers during waiting or ongoing handling continue the same assignment row",
                 "explicit reissue creates a new row/assignment_id",
                 "Respect an explicit user approval condition",
@@ -684,9 +684,9 @@ mod tests {
         )));
         for (policy, name, input) in [
             (
-                "Use `TicketOrchestratorAssign` for explicit initial delegation or reissue",
+                "Use `TicketOrchestratorAssign` for explicit initial assignment, reassignment or reissue to the selected Subject principal",
                 "TicketOrchestratorAssign",
-                serde_json::json!({"ticket":"T-743","principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"},"expected_assignment_id":null,"operation_id":"delegate-research"}),
+                serde_json::json!({"ticket":"T-743","principal":{"kind":"subject","subject_id":"subject-a"},"expected_assignment_id":null,"operation_id":"delegate-research"}),
             ),
             (
                 "research returned to a human can be `open` + handling `done`",

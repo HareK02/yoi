@@ -2602,208 +2602,324 @@ impl Drop for ConnectedRuntimeServer {
     }
 }
 
+#[tokio::test]
+async fn delegated_subject_child_cannot_downgrade_ticket_start_to_manual_by_omitting_assignment() {
+    let f = Fixture::new().await;
+    let create = ScopedPermission {
+        operation: "worker.create".into(),
+        resource: PermissionResource::Workspace {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+        },
+    };
+    f.assign(vec![create.clone()], vec![create.clone()]).await;
+    let mut request = f.child_request("ticket-initiation-source", vec![create.clone()]);
+    request["execution_grant"]["redelegation"] = json!([create]);
+    let (status, created) = f.spawn(&f.source, request).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let child = RuntimeWorkerRef::new(
+        created["runtime_id"].as_str().unwrap(),
+        created["worker_id"].as_str().unwrap(),
+    );
+    // The child's ordinary redelegation remains valid: body ownership is a
+    // Ticket-initiation condition, not a blanket ban on general Worker creation.
+    let (status, ordinary) = f
+        .spawn(&child, f.child_request("ordinary-grandchild", vec![]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ordinary}");
+
+    let ticket = browser_ticket_backend(&f.api)
+        .unwrap()
+        .create(NewTicket::new("Another Subject's Ticket"))
+        .unwrap();
+    assign_test_orchestrator(&f.api, &ticket.id);
+    let spawns = f.runtime.spawn_requests().len();
+    let mut request = f.child_request("child-ticket-control", vec![]);
+    request["ticket_assignment"] = json!({
+        "ticket_id": ticket.id, "operation_id":"child-ticket-start-without-assignment",
+    });
+    let (status, denied) = f.spawn(&child, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    assert!(
+        denied["message"].as_str().unwrap().contains("Subject body"),
+        "{denied}"
+    );
+    assert_eq!(f.runtime.spawn_requests().len(), spawns);
+    assert!(
+        f.api
+            .store
+            .get_ticket_assignment_operation(
+                TEST_WORKSPACE_ID,
+                "child-ticket-start-without-assignment",
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Shared real HTTP Backend/Runtime fixture. Only the injected model is scripted;
+/// Workdir materialization, Profile Controllers and tool dispatch are production.
+struct ConnectedAuthorizationFixture {
+    _runtime_server: ConnectedRuntimeServer,
+    _backend_server: AuthorizationCallbackServer,
+    api: WorkspaceApi,
+    identity: RuntimeIdentityMaterial,
+    backend_url: String,
+    materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
+    runtime_errors: Arc<Mutex<Vec<String>>>,
+    authorizations: Arc<Mutex<Vec<(Value, StatusCode)>>>,
+    owner: String,
+    _dir: tempfile::TempDir,
+}
+impl ConnectedAuthorizationFixture {
+    const RUNTIME: &'static str = "connected-subject-authorization";
+
+    async fn new<M: agen::llm_client::LlmClient + Clone + 'static>(model: M) -> Self {
+        let runtime_id = Self::RUNTIME;
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", backend_listener.local_addr().unwrap());
+        let runtime_url = format!("http://{}", runtime_listener.local_addr().unwrap());
+        let identity = RuntimeIdentityMaterial::generate(runtime_id).unwrap();
+        let runtime_root = dir.path().join("connected-runtime");
+        let materializer = worker_runtime::working_directory::RuntimeGitMaterializer::new(
+            dir.path().join("connected-workdirs"),
+        );
+        let factory = worker_runtime::worker_backend::ProfileRuntimeWorkerFactory::new(
+            dir.path().join("connected-profiles"),
+        )
+        .with_remote_worker_mutation_identity(identity.clone())
+        .with_workspace_request_client(
+            worker_runtime::workspace_request::RuntimeWorkspaceRequestClient::new(
+                TEST_WORKSPACE_ID,
+                &backend_url,
+                runtime_id,
+            )
+            .with_runtime_request_source(&identity, &backend_url),
+        )
+        .with_runtime_store_dir(&runtime_root)
+        .with_spawn_model_client_factory(move || Box::new(model.clone()));
+        let execution = worker_runtime::worker_backend::WorkerRuntimeExecutionBackend::new(factory)
+            .unwrap()
+            .with_working_directory_materializer(materializer.clone());
+        let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
+            worker_runtime::fs_store::FsRuntimeStoreOptions {
+                root: runtime_root,
+                runtime_id: runtime_id.into(),
+                display_name: None,
+            },
+            Arc::new(execution),
+        )
+        .unwrap();
+
+        let mut config = test_server_config(dir.path());
+        config.backend_base_url = Some(backend_url.clone());
+        // The embedded Runtime is unused. Both source and child below execute on the
+        // connected real Runtime above, not on this existing Host fixture backend.
+        let control = Arc::new(test_control_store(&config));
+        seed_test_registered_workspace(control.as_ref(), &config)
+            .await
+            .unwrap();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            control,
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
+        let now = now_registry_timestamp();
+        api.store
+            .upsert_workspace_runtime_binding_record(
+                WorkspaceRuntimeBinding {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    runtime_id: runtime_id.into(),
+                    display_name: runtime_id.into(),
+                    base_url: runtime_url.clone(),
+                    public_key: identity.public_key.clone(),
+                    public_key_fingerprint: String::new(),
+                    binding_id: "connected-authorization-binding".into(),
+                    authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
+                    created_at: now.clone(),
+                    updated_at: now,
+                    revoked_at: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let binding = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, runtime_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Repository materialization and Worker startup must authenticate as this
+        // Workspace, not the Runtime HTTP local-token fallback's `local` Workspace.
+        let workspace_identity = api
+            .signing_identities
+            .provision_existing(TEST_WORKSPACE_ID, &test_owner_actor().account_id)
+            .unwrap();
+        let verifier = worker_runtime::workspace_issuer::WorkspaceCapabilityVerifier::new(
+            vec![
+                worker_runtime::workspace_issuer::WorkspaceIssuerTrustRecord {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    backend_url: backend_url.clone(),
+                    key_id: workspace_identity.key_id.clone(),
+                    algorithm: workspace_identity.algorithm.clone(),
+                    public_key: workspace_identity.public_key.clone().unwrap(),
+                    public_key_fingerprint: workspace_identity
+                        .public_key_fingerprint
+                        .clone()
+                        .unwrap(),
+                    trust_id: "connected-authorization-workspace-trust".into(),
+                    state: worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Active,
+                    registered_at_unix: 1,
+                    updated_at_unix: 1,
+                },
+            ],
+            Arc::new(
+                worker_runtime::workspace_issuer::InMemoryWorkspaceClaimReplayProtection::default(),
+            ),
+        )
+        .unwrap();
+        let runtime_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_errors = runtime_errors.clone();
+        let runtime_server = ConnectedRuntimeServer::start(
+            runtime_listener,
+            worker_runtime::http_server::runtime_http_router_with_workspace_auth(
+                runtime.clone(),
+                None,
+                worker_runtime::http_server::WorkspaceRuntimeHttpAuth {
+                    verifier,
+                    runtime_id: runtime_id.into(),
+                },
+            )
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let errors = captured_errors.clone();
+                    async move {
+                        let response = next.run(request).await;
+                        if response.status().is_success() {
+                            return response;
+                        }
+                        let (parts, body) = response.into_parts();
+                        let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
+                        let body: Value = serde_json::from_slice(&bytes).unwrap();
+                        errors.lock().unwrap().push(
+                            body["error"]["message"]
+                                .as_str()
+                                .unwrap_or("unknown fixture error")
+                                .to_owned(),
+                        );
+                        Response::from_parts(parts, Body::from(bytes))
+                    }
+                },
+            )),
+        );
+        api.runtime.register_or_replace(
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig {
+                    runtime_id: runtime_id.into(),
+                    workspace_id: Some(TEST_WORKSPACE_ID.into()),
+                    display_name: runtime_id.into(),
+                    base_url: runtime_url,
+                    bearer_token: None,
+                    workspace_authorization: Some(
+                        crate::hosts::WorkspaceRuntimeAuthorization::new(
+                            api.store.clone(),
+                            api.signing_identities.clone(),
+                            backend_url.clone(),
+                            binding,
+                        ),
+                    ),
+                    strict_public_egress: false,
+                    cached_worker_creation_available: true,
+                    cached_os: "linux".into(),
+                    cached_arch: "x86_64".into(),
+                    cached_status: "active".into(),
+                    timeout: std::time::Duration::from_secs(30),
+                },
+                TEST_WORKSPACE_ID.to_string(),
+                backend_url.clone(),
+            )
+            .unwrap(),
+        );
+        install_subject_profiles(&api, "workspace_write");
+        seed_test_delivery_binding(&api);
+
+        let authorizations = Arc::new(Mutex::new(Vec::<(Value, StatusCode)>::new()));
+        let observed = authorizations.clone();
+        let app = build_router(api.clone()).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let observed = observed.clone();
+                async move {
+                    if request.uri().path() != authorization_path() {
+                        return next.run(request).await;
+                    }
+                    let (parts, body) = request.into_parts();
+                    let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
+                    let permission: Value = serde_json::from_slice(&bytes).unwrap();
+                    let response = next
+                        .run(Request::from_parts(parts, Body::from(bytes)))
+                        .await;
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((permission, response.status()));
+                    response
+                }
+            },
+        ));
+        let backend_server = AuthorizationCallbackServer::start(backend_listener, app);
+        let owner =
+            seed_test_workspace_owner_token(api.store.as_ref(), "connected-authorization-owner")
+                .await;
+        Self {
+            api,
+            identity,
+            backend_url,
+            materializer,
+            runtime_errors,
+            authorizations,
+            owner,
+            _runtime_server: runtime_server,
+            _backend_server: backend_server,
+            _dir: dir,
+        }
+    }
+
+    async fn human(&self, method: reqwest::Method, path: &str, body: Value) -> (StatusCode, Value) {
+        let response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap()
+            .request(method, format!("{}{path}", self.backend_url))
+            .bearer_auth(&self.owner)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+        (status, response.json().await.unwrap())
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_read_but_not_write()
 {
     use worker_runtime::working_directory::WorkingDirectoryMaterializer;
 
-    const RUNTIME: &str = "connected-subject-authorization";
-    let dir = tempfile::tempdir().unwrap();
-    init_clean_git_workspace(dir.path());
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let backend_url = format!("http://{}", backend_listener.local_addr().unwrap());
-    let runtime_url = format!("http://{}", runtime_listener.local_addr().unwrap());
-    let identity = RuntimeIdentityMaterial::generate(RUNTIME).unwrap();
-    let runtime_root = dir.path().join("connected-runtime");
-    let materializer = worker_runtime::working_directory::RuntimeGitMaterializer::new(
-        dir.path().join("connected-workdirs"),
-    );
+    const RUNTIME: &str = ConnectedAuthorizationFixture::RUNTIME;
     let (completed, mut completion) = tokio::sync::mpsc::channel(4);
-    let model = ConnectedAuthorizationModel { completed };
-    let factory = worker_runtime::worker_backend::ProfileRuntimeWorkerFactory::new(
-        dir.path().join("connected-profiles"),
-    )
-    .with_remote_worker_mutation_identity(identity.clone())
-    .with_workspace_request_client(
-        worker_runtime::workspace_request::RuntimeWorkspaceRequestClient::new(
-            TEST_WORKSPACE_ID,
-            &backend_url,
-            RUNTIME,
-        )
-        .with_runtime_request_source(&identity, &backend_url),
-    )
-    .with_runtime_store_dir(&runtime_root)
-    .with_spawn_model_client_factory(move || Box::new(model.clone()));
-    let execution = worker_runtime::worker_backend::WorkerRuntimeExecutionBackend::new(factory)
-        .unwrap()
-        .with_working_directory_materializer(materializer.clone());
-    let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
-        worker_runtime::fs_store::FsRuntimeStoreOptions {
-            root: runtime_root,
-            runtime_id: RUNTIME.into(),
-            display_name: None,
-        },
-        Arc::new(execution),
-    )
-    .unwrap();
-
-    let mut config = test_server_config(dir.path());
-    config.backend_base_url = Some(backend_url.clone());
-    // The embedded Runtime is unused. Both source and child below execute on the
-    // connected real Runtime above, not on this existing Host fixture backend.
-    let control = Arc::new(test_control_store(&config));
-    seed_test_registered_workspace(control.as_ref(), &config)
-        .await
-        .unwrap();
-    let api = WorkspaceApi::new_with_execution_backend(
-        config,
-        control,
-        Arc::new(DeterministicExecutionBackend::default()),
-    )
-    .await
-    .unwrap();
-    let now = now_registry_timestamp();
-    api.store
-        .upsert_workspace_runtime_binding_record(
-            WorkspaceRuntimeBinding {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                runtime_id: RUNTIME.into(),
-                display_name: RUNTIME.into(),
-                base_url: runtime_url.clone(),
-                public_key: identity.public_key.clone(),
-                public_key_fingerprint: String::new(),
-                binding_id: "connected-authorization-binding".into(),
-                authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
-                created_at: now.clone(),
-                updated_at: now,
-                revoked_at: None,
-            },
-            false,
-        )
-        .await
-        .unwrap();
-    let binding = api
-        .store
-        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, RUNTIME)
-        .await
-        .unwrap()
-        .unwrap();
-    // Repository materialization and Worker startup must authenticate as this
-    // Workspace, not the Runtime HTTP local-token fallback's `local` Workspace.
-    let workspace_identity = api
-        .signing_identities
-        .provision_existing(TEST_WORKSPACE_ID, &test_owner_actor().account_id)
-        .unwrap();
-    let verifier = worker_runtime::workspace_issuer::WorkspaceCapabilityVerifier::new(
-        vec![
-            worker_runtime::workspace_issuer::WorkspaceIssuerTrustRecord {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                backend_url: backend_url.clone(),
-                key_id: workspace_identity.key_id.clone(),
-                algorithm: workspace_identity.algorithm.clone(),
-                public_key: workspace_identity.public_key.clone().unwrap(),
-                public_key_fingerprint: workspace_identity.public_key_fingerprint.clone().unwrap(),
-                trust_id: "connected-authorization-workspace-trust".into(),
-                state: worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Active,
-                registered_at_unix: 1,
-                updated_at_unix: 1,
-            },
-        ],
-        Arc::new(
-            worker_runtime::workspace_issuer::InMemoryWorkspaceClaimReplayProtection::default(),
-        ),
-    )
-    .unwrap();
-    let runtime_errors = Arc::new(Mutex::new(Vec::<String>::new()));
-    let captured_errors = runtime_errors.clone();
-    let _runtime_server = ConnectedRuntimeServer::start(
-        runtime_listener,
-        worker_runtime::http_server::runtime_http_router_with_workspace_auth(
-            runtime.clone(),
-            None,
-            worker_runtime::http_server::WorkspaceRuntimeHttpAuth {
-                verifier,
-                runtime_id: RUNTIME.into(),
-            },
-        )
-        .layer(axum::middleware::from_fn(
-            move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let errors = captured_errors.clone();
-                async move {
-                    let response = next.run(request).await;
-                    if response.status().is_success() {
-                        return response;
-                    }
-                    let (parts, body) = response.into_parts();
-                    let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
-                    let body: Value = serde_json::from_slice(&bytes).unwrap();
-                    errors.lock().unwrap().push(
-                        body["error"]["message"]
-                            .as_str()
-                            .unwrap_or("unknown fixture error")
-                            .to_owned(),
-                    );
-                    Response::from_parts(parts, Body::from(bytes))
-                }
-            },
-        )),
-    );
-    api.runtime.register_or_replace(
-        RemoteWorkerRuntime::new(
-            RemoteRuntimeConfig {
-                runtime_id: RUNTIME.into(),
-                workspace_id: Some(TEST_WORKSPACE_ID.into()),
-                display_name: RUNTIME.into(),
-                base_url: runtime_url,
-                bearer_token: None,
-                workspace_authorization: Some(crate::hosts::WorkspaceRuntimeAuthorization::new(
-                    api.store.clone(),
-                    api.signing_identities.clone(),
-                    backend_url.clone(),
-                    binding,
-                )),
-                strict_public_egress: false,
-                cached_worker_creation_available: true,
-                cached_os: "linux".into(),
-                cached_arch: "x86_64".into(),
-                cached_status: "active".into(),
-                timeout: std::time::Duration::from_secs(30),
-            },
-            TEST_WORKSPACE_ID.to_string(),
-            backend_url.clone(),
-        )
-        .unwrap(),
-    );
-    install_subject_profiles(&api, "workspace_write");
-    seed_test_delivery_binding(&api);
-
-    let authorizations = Arc::new(Mutex::new(Vec::<(Value, StatusCode)>::new()));
-    let observed = authorizations.clone();
-    let app = build_router(api.clone()).layer(axum::middleware::from_fn(
-        move |request: axum::extract::Request, next: axum::middleware::Next| {
-            let observed = observed.clone();
-            async move {
-                if request.uri().path() != authorization_path() {
-                    return next.run(request).await;
-                }
-                let (parts, body) = request.into_parts();
-                let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
-                let permission: Value = serde_json::from_slice(&bytes).unwrap();
-                let response = next
-                    .run(Request::from_parts(parts, Body::from(bytes)))
-                    .await;
-                observed
-                    .lock()
-                    .unwrap()
-                    .push((permission, response.status()));
-                response
-            }
-        },
-    ));
-    let _backend_server = AuthorizationCallbackServer::start(backend_listener, app);
-    let owner =
-        seed_test_workspace_owner_token(api.store.as_ref(), "connected-authorization-owner").await;
+    let f = ConnectedAuthorizationFixture::new(ConnectedAuthorizationModel { completed }).await;
+    let api = &f.api;
+    let backend_url = &f.backend_url;
+    let identity = &f.identity;
+    let materializer = &f.materializer;
+    let runtime_errors = &f.runtime_errors;
+    let authorizations = &f.authorizations;
+    let owner = &f.owner;
     let (status, created_workdir) = response(&api, human_request(&owner, "POST",
         &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
         Some(json!({"runtime_id":RUNTIME, "repository_key":"test-repository", "selector":"HEAD", "operation_id":"connected-authorization-workdir"})))).await;
@@ -3020,6 +3136,517 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
             .unwrap()
             .is_empty(),
         "generic Profile delegation requires no Ticket"
+    );
+}
+
+/// Deterministic external-model substitute, not an LLM evaluation. Each real
+/// Controller reads before joining the barrier, so serialized child execution
+/// cannot pass. File IO and result persistence always use production tools.
+#[derive(Clone)]
+struct ConcurrentTicketAuthorizationModel {
+    overlap: Arc<tokio::sync::Barrier>,
+    completed: tokio::sync::mpsc::Sender<(String, Vec<(String, bool, String)>)>,
+}
+
+#[async_trait::async_trait]
+impl agen::llm_client::LlmClient for ConcurrentTicketAuthorizationModel {
+    async fn stream(
+        &self,
+        request: agen::llm_client::Request,
+    ) -> std::result::Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = std::result::Result<
+                            agen::llm_client::event::Event,
+                            agen::llm_client::error::ClientError,
+                        >,
+                    > + Send,
+            >,
+        >,
+        agen::llm_client::error::ClientError,
+    > {
+        use agen::llm_client::{
+            event::{Event, StopReason},
+            types::{ContentPart, Item},
+        };
+        let input = request.items.iter().find_map(|item| {
+            let Item::Message { content, .. } = item else {
+                return None;
+            };
+            content.iter().find_map(|part| {
+                let ContentPart::Text { text } = part else {
+                    return None;
+                };
+                text.strip_prefix("connected-ticket-case:")
+                    .map(|json| serde_json::from_str::<Value>(json).unwrap())
+            })
+        });
+        let end = || {
+            vec![
+                Event::text_block_start(0),
+                Event::text_delta(0, "scripted turn finished"),
+                Event::text_block_stop(0, Some(StopReason::EndTurn)),
+            ]
+        };
+        let Some(input) = input else {
+            // Bodies may receive normal lifecycle/notification input. That must
+            // never run the child script or count as a concurrent child turn.
+            return Ok(Box::pin(futures::stream::iter(end().into_iter().map(Ok))));
+        };
+        let ticket = input["ticket"].as_str().unwrap();
+        let expected = input["content"].as_str().unwrap();
+        let results: Vec<_> = request
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::ToolResult {
+                    call_id,
+                    is_error,
+                    content,
+                    summary,
+                    ..
+                } if call_id.starts_with("parallel-") => Some((
+                    call_id.clone(),
+                    *is_error,
+                    format!("{summary}; {content:?}"),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            results.iter().all(|(_, error, _)| !error),
+            "real child tool failed: {results:?}"
+        );
+        let has = |id: &str| results.iter().any(|(call, _, _)| call == id);
+        let events = if has("parallel-report") {
+            self.completed.try_send((ticket.into(), results)).unwrap();
+            end()
+        } else {
+            let (id, name, arguments) = if has("parallel-reread") {
+                assert!(
+                    results
+                        .iter()
+                        .find(|(id, _, _)| id == "parallel-reread")
+                        .unwrap()
+                        .2
+                        .contains(expected),
+                    "result must follow the real post-write Read: {results:?}"
+                );
+                (
+                    "parallel-report",
+                    "TicketImplementationResult",
+                    json!({"ticket":ticket, "kind":"result",
+                    "body":format!("Verified README.md contains {expected}"), "merge_request":null}),
+                )
+            } else if has("parallel-write") {
+                (
+                    "parallel-reread",
+                    "Read",
+                    json!({"target_workdir":"workdir", "file_path":"README.md"}),
+                )
+            } else if has("parallel-read") {
+                assert!(
+                    results[0].2.contains("clean"),
+                    "actual initial read: {results:?}"
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(30), self.overlap.wait())
+                    .await
+                    .expect("both real child turns must overlap after their initial Read");
+                (
+                    "parallel-write",
+                    "Write",
+                    json!({"target_workdir":"workdir", "file_path":"README.md", "content":expected}),
+                )
+            } else {
+                (
+                    "parallel-read",
+                    "Read",
+                    json!({"target_workdir":"workdir", "file_path":"README.md"}),
+                )
+            };
+            assert!(
+                request.tools.iter().any(|tool| tool.name == name),
+                "Profile must expose {name}"
+            );
+            vec![
+                Event::tool_use_start(0, id, name),
+                Event::tool_input_delta(0, arguments.to_string()),
+                Event::tool_use_stop(0),
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+    }
+
+    fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separate_branches() {
+    use worker_runtime::working_directory::WorkingDirectoryMaterializer;
+
+    struct Case {
+        subject: String,
+        ticket: String,
+        branch: String,
+        workdir: String,
+        root: PathBuf,
+        source: RuntimeWorkerRef,
+        delegation: String,
+        content: String,
+        permissions: Vec<ScopedPermission>,
+        change: String,
+        request: Value,
+    }
+    let (completed, mut completion) = tokio::sync::mpsc::channel(2);
+    let f = ConnectedAuthorizationFixture::new(ConcurrentTicketAuthorizationModel {
+        overlap: Arc::new(tokio::sync::Barrier::new(2)),
+        completed,
+    })
+    .await;
+    let api = &f.api;
+    let subjects = open_subjektiv_store(api).unwrap();
+    let mut cases = Vec::new();
+    for label in ["alpha", "beta"] {
+        let branch = format!("subject-{label}-work");
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(f._dir.path())
+                .args(["branch", &branch])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (status, created) = f.human(reqwest::Method::POST,
+            &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
+            json!({"runtime_id":ConnectedAuthorizationFixture::RUNTIME, "repository_key":"test-repository",
+                "selector":branch, "operation_id":format!("parallel-{label}-workdir")})).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let workdir = created["item"]["working_directory_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let root = f
+            .materializer
+            .bind_working_directory(&workdir, None)
+            .unwrap()
+            .root()
+            .to_path_buf();
+        // Runtime materialization intentionally checks out detached. Establish
+        // each working branch as fixture setup before either child starts; the
+        // real Controller tools below must mutate these separate checkouts.
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["switch", "-c", &branch])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "clean\n"
+        );
+        let subject = subjects
+            .create_subject(
+                crate::subjektiv::SubjectRole::new(format!("parallel-{label}")).unwrap(),
+            )
+            .unwrap()
+            .id;
+        let mut input = NewTicket::new(format!("Connected {label} work"));
+        set_test_ticket_target(&mut input, "test-repository", &branch);
+        let ticket = browser_ticket_backend(api).unwrap().create(input).unwrap();
+        let ticket_permission = |operation: &str| ScopedPermission {
+            operation: operation.into(),
+            resource: PermissionResource::Ticket {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                ticket_id: ticket.id.clone(),
+            },
+        };
+        // No workspace-wide delegation grant: exactly this file in this Workdir
+        // and read/result operations on this Ticket. The body stays Workdirless.
+        let permissions: Vec<_> = ["filesystem.read", "filesystem.write"]
+            .into_iter()
+            .map(|operation| ScopedPermission {
+                operation: operation.into(),
+                resource: PermissionResource::Workdir {
+                    working_directory_id: workdir.clone(),
+                    path: "README.md".into(),
+                    recursive: false,
+                },
+            })
+            .chain([
+                ticket_permission("ticket.read"),
+                ticket_permission("ticket.implementation_result.write"),
+            ])
+            .collect();
+        let mut execution: Vec<_> = [
+            "session.record",
+            "memory.resident.read",
+            "memory.resident.supply",
+            "journal.startup.read",
+            "journal.startup.supply",
+        ]
+        .into_iter()
+        .map(|operation| subject_permission(&subject, operation))
+        .collect();
+        execution.push(ticket_permission("ticket.assignment.assign"));
+        let (status, policy) = f
+            .human(
+                reqwest::Method::POST,
+                &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
+                json!({"operation_id":format!("parallel-{label}-policy"), "expected_change_id":null,
+                "execution":execution, "delegation":permissions}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{policy}");
+        let policy = subjects.subject_permissions(&subject).unwrap().unwrap();
+        assert_eq!(policy.delegation, permissions);
+        let (status, source) = f.human(reqwest::Method::POST,
+            &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
+            json!({"runtime_id":ConnectedAuthorizationFixture::RUNTIME, "display_name":format!("{label} read-only body"),
+                "profile":"project:authority-source", "initial_submit":[], "workdir_attachments":[],
+                "feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "connect: {source}; Runtime: {:?}",
+            f.runtime_errors.lock().unwrap()
+        );
+        let source = RuntimeWorkerRef::new(
+            source["runtime_id"].as_str().unwrap(),
+            source["worker_id"].as_str().unwrap(),
+        );
+        assert!(
+            api.store
+                .list_worker_workdir_links(TEST_WORKSPACE_ID, &source)
+                .unwrap()
+                .is_empty()
+        );
+        let lease = api
+            .store
+            .require_current_worker_singleton_owner(TEST_WORKSPACE_ID, &source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lease.key,
+            crate::subjektiv::subject_worker_singleton_key(&subject).unwrap()
+        );
+        let (status, assigned) = f.human(reqwest::Method::PUT,
+            &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/orchestrator", ticket.id),
+            json!({"operation_id":format!("parallel-{label}-assign"), "expected_assignment_id":null,
+                "principal":{"kind":"subject", "subject_id":subject}})).await;
+        assert_eq!(status, StatusCode::OK, "{assigned}");
+        assert_eq!(assigned["assignment"]["principal"]["subject_id"], subject);
+        let delegation = assigned["assignment"]["assignment_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let content = format!("connected {label} result");
+        let request = json!({"runtime_id":ConnectedAuthorizationFixture::RUNTIME,
+            "display_name":format!("{label} delegated Ticket editor"), "profile":"project:authority-editor",
+            "ticket_assignment":{"ticket_id":ticket.id, "operation_id":format!("parallel-{label}-start"),
+                "orchestrator_assignment_id":delegation},
+            "initial_submit":[{"kind":"text", "content":format!("connected-ticket-case:{}", json!({"ticket":ticket.id,"content":content}))}],
+            "workdir_attachments":[{"alias":"workdir", "working_directory_id":workdir}],
+            "feature_connections":{}, "control_operation_id":format!("parallel-{label}-control"),
+            "execution_grant":{"permissions":permissions, "redelegation":[]}});
+        cases.push(Case {
+            subject,
+            ticket: ticket.id,
+            branch,
+            workdir,
+            root,
+            source,
+            delegation,
+            content,
+            permissions,
+            change: policy.change_id,
+            request,
+        });
+    }
+    assert_ne!(cases[0].subject, cases[1].subject);
+    assert_ne!(cases[0].ticket, cases[1].ticket);
+    assert_ne!(cases[0].branch, cases[1].branch);
+    assert_ne!(cases[0].workdir, cases[1].workdir);
+    assert_ne!(cases[0].root, cases[1].root);
+    assert_ne!(cases[0].source, cases[1].source);
+    assert!(
+        api.store
+            .current_worker_singleton_owner(
+                TEST_WORKSPACE_ID,
+                crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY
+            )
+            .unwrap()
+            .is_none()
+    );
+
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers");
+    let (alpha, beta) = tokio::join!(
+        connected_authorization_post(
+            &f.backend_url,
+            &f.identity,
+            &cases[0].source,
+            &path,
+            &cases[0].request
+        ),
+        connected_authorization_post(
+            &f.backend_url,
+            &f.identity,
+            &cases[1].source,
+            &path,
+            &cases[1].request
+        ),
+    );
+    let mut children = Vec::new();
+    for (case, (status, child)) in cases.iter().zip([alpha, beta]) {
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "signed Ticket spawn: {child}; Runtime: {:?}",
+            f.runtime_errors.lock().unwrap()
+        );
+        let child = RuntimeWorkerRef::new(
+            child["runtime_id"].as_str().unwrap(),
+            child["worker_id"].as_str().unwrap(),
+        );
+        let grant = subjects
+            .worker_execution_grant(&child.runtime_id, &child.worker_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.subject_id, case.subject);
+        assert_eq!(grant.origin_worker_id, case.source.worker_id);
+        assert_eq!(grant.source_change_id, case.change);
+        assert_eq!(grant.permissions, case.permissions);
+        assert!(grant.redelegation.is_empty());
+        assert!(
+            api.store
+                .require_current_worker_singleton_owner(TEST_WORKSPACE_ID, &child)
+                .unwrap()
+                .is_none()
+        );
+        let assigned = api
+            .store
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &case.ticket)
+            .unwrap()
+            .unwrap();
+        assert_eq!(assigned.worker, child);
+        let links = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &child)
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].workdir_id, case.workdir);
+        children.push(child);
+    }
+    assert_ne!(children[0], children[1]);
+    let mut completions = std::collections::BTreeMap::new();
+    for _ in 0..2 {
+        let (ticket, results) =
+            tokio::time::timeout(std::time::Duration::from_secs(45), completion.recv())
+                .await
+                .expect("both barrier-overlapped Controllers must finish")
+                .expect("model completion");
+        assert_eq!(
+            results.len(),
+            4,
+            "Read, Write, Read, persisted result: {results:?}"
+        );
+        assert!(
+            completions.insert(ticket, results).is_none(),
+            "each Ticket completes once"
+        );
+    }
+    let saved = api.config_store.with_conn(|conn| {
+        let mut statement = conn.prepare("SELECT ticket_id, worker_id, result_id FROM ticket_implementation_results WHERE workspace_id=?1 ORDER BY ticket_id")?;
+        Ok(statement.query_map([TEST_WORKSPACE_ID], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?)))?
+            .collect::<std::result::Result<Vec<_>,_>>()?)
+    }).unwrap();
+    assert_eq!(saved.len(), 2);
+    assert_ne!(saved[0].2, saved[1].2);
+    for (i, case) in cases.iter().enumerate() {
+        assert!(completions.contains_key(&case.ticket));
+        assert_eq!(
+            fs::read_to_string(case.root.join("README.md")).unwrap(),
+            case.content
+        );
+        let branch = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&case.root)
+            .args(["branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert!(branch.status.success());
+        assert_eq!(
+            String::from_utf8(branch.stdout).unwrap().trim(),
+            case.branch
+        );
+        let row = saved.iter().find(|row| row.0 == case.ticket).unwrap();
+        assert_eq!(row.1, children[i].worker_id);
+        let receipt = api
+            .config_store
+            .implementation_result(TEST_WORKSPACE_ID, &case.ticket, &row.2)
+            .unwrap();
+        assert_eq!(
+            receipt.request.body,
+            format!("Verified README.md contains {}", case.content)
+        );
+        assert!(
+            api.config_store
+                .implementation_result(TEST_WORKSPACE_ID, &cases[1 - i].ticket, &row.2)
+                .is_err(),
+            "the other Ticket cannot read this result"
+        );
+        let current = api
+            .store
+            .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, &case.ticket)
+            .unwrap()
+            .remove(0);
+        assert_eq!(current.assignment_id, case.delegation);
+        assert_eq!(
+            current.principal,
+            ticket::TicketAssignmentPrincipalSnapshot::Subject {
+                subject_id: case.subject.clone()
+            }
+        );
+        assert_eq!(
+            current.tracking.unwrap().status,
+            ticket::TicketAssignmentTrackingStatus::Waiting,
+            "child result is not a Subject self-report"
+        );
+        assert_eq!(
+            api.authority.ticket(&case.ticket).unwrap().state,
+            server_api::BrowserTicketState::Open
+        );
+        // Live Host policy also rejects crossing the other Subject's Workdir.
+        let mut other = case.permissions[0].clone();
+        other.resource = PermissionResource::Workdir {
+            working_directory_id: cases[1 - i].workdir.clone(),
+            path: "README.md".into(),
+            recursive: false,
+        };
+        let (status, body) = connected_authorization_post(
+            &f.backend_url,
+            &f.identity,
+            &children[i],
+            &authorization_path(),
+            &serde_json::to_value(other).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "cross-Subject Workdir: {body}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(f._dir.path().join("README.md")).unwrap(),
+        "clean\n",
+        "distinct runtime Workdirs must not mutate the repository source"
     );
 }
 

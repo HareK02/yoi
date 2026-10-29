@@ -578,6 +578,10 @@ function parseTicketAssignmentPrincipal(
 ): TicketAssignmentPrincipal {
   const item = object(value, label);
   const kind = string(item.kind, `${label}.kind`);
+  if (kind === "subject") {
+    exact(item, ["subject_id", "kind"], label);
+    return { kind, subject_id: string(item.subject_id, `${label}.subject_id`) };
+  }
   if (kind === "user") {
     exact(item, ["account_id", "kind"], label);
     return { kind, account_id: string(item.account_id, `${label}.account_id`) };

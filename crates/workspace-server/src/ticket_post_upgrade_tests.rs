@@ -83,7 +83,7 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
         assert_eq!(stored_fixture_rows(conn,"typed_ticket_event_references"),old_references);
         let markers = stored_fixture_rows(conn,"ticket_schema_migrations");
         assert_eq!(&markers[..old_markers.len()],old_markers.as_slice());
-        assert_eq!(markers.len(),old_markers.len()+2);
+        assert_eq!(markers.len(),old_markers.len()+3);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM typed_ticket_content_changes",[],|r|r.get::<_,i64>(0))?,0,"migration does not invent content change facts");
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM ticket_assignment_content_inputs",[],|r|r.get::<_,i64>(0))?,0,"migration does not turn historical edits into new inputs");
         let initial: (String,Option<String>,Option<String>,String,String) = conn.query_row("SELECT e.body,t.created_by,e.author,e.kind,e.event_ref FROM typed_tickets t JOIN typed_ticket_events e USING(workspace_id,ticket_id) WHERE t.ticket_id='authored' AND e.event_index=-1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;

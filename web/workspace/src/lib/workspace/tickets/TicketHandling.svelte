@@ -2,11 +2,14 @@
   import { onDestroy, onMount } from "svelte";
   import BevelLine from "#lib/workspace/ui/BevelLine.svelte";
   import type { TicketDetail, TicketAssignmentTrackingProjection, TicketAssignmentTrackingHistoryPage, TicketAssignmentsPage, TicketAssignmentPrincipalSnapshot } from "#lib/generated/ticket-api.ts";
-  import type { WorkspaceOrchestratorStatus } from "./ticket-panel.ts";
+  import { assignmentPrincipalLabel } from "./ticket-panel.ts";
+  import type { SubjektivSubjectResponse } from "#lib/generated/memory-api.ts";
+  import { parseSubjektivSubjectListResponse, MEMORY_API_LOAD_POLICY } from "#lib/workspace/memory/api.ts";
+  import { workspaceApiPath } from "#lib/workspace/api/http.ts";
   import { workspaceApiJson, workspaceApiJsonWithBody, formatDate } from "#lib/workspace/api/http.ts";
   import { parseTicketRoleAssignmentMutationResponse, TICKET_BROWSER_API_MAX_RESPONSE_BYTES } from "#lib/workspace/api/ticket-browser.ts";
   import { assignmentOperation, answerOperation, parseAnswerReceipt, parseAssignmentsPage, operationError, parseTracking, parseTrackingHistory, trackingPath, type ObservedOperation } from "#lib/workspace/api/ticket-operations.ts";
-  let { workspaceId, ticket, orchestrator, refresh }: { workspaceId: string; ticket: TicketDetail; orchestrator: WorkspaceOrchestratorStatus | null; refresh: () => Promise<void> } = $props();
+  let { workspaceId, ticket, refresh }: { workspaceId: string; ticket: TicketDetail; refresh: () => Promise<void> } = $props();
   const current = $derived(ticket.assignment_tracking.find((row) => row.current && row.role === "orchestrator"));
   let busy = $state(false);
   let pending = $state<ObservedOperation | null>(null);
@@ -16,15 +19,30 @@
   let assignments = $state<TicketAssignmentsPage | null>(null);
   let assignmentPageBusy = $state(false);
   let answer = $state("");
-  let principalKind = $state<"workspace_agent" | "user" | "worker">("workspace_agent");
-  let accountId = $state("");
-  let runtimeId = $state("");
-  let workerId = $state("");
-  const principalReady = $derived(principalKind === "workspace_agent" || (principalKind === "user" ? !!accountId.trim() : !!runtimeId.trim() && !!workerId.trim()));
-  function selectedPrincipal(): TicketAssignmentPrincipalSnapshot {
-    if (principalKind === "user") return { kind: "user", account_id: accountId.trim() };
-    if (principalKind === "worker") return { kind: "worker", runtime_id: runtimeId.trim(), worker_id: workerId.trim() };
-    return { kind: "workspace_agent", agent_key: "workspace-orchestrator" };
+  let subjectId = $state("");
+  let subjects = $state<SubjektivSubjectResponse[]>([]);
+  let subjectsBusy = $state(false);
+  let subjectsError = $state<string | null>(null);
+  let subjectsCursor = $state<string | null>(null);
+  const principalReady = $derived(subjects.some((subject) => subject.id === subjectId && subject.state === "active"));
+  function selectedPrincipal(): Extract<TicketAssignmentPrincipalSnapshot, { kind: "subject" }> | undefined {
+    return principalReady ? { kind: "subject", subject_id: subjectId } : undefined;
+  }
+  async function readSubjects(more = false) {
+    if (subjectsBusy) return;
+    subjectsBusy = true; subjectsError = null;
+    const query = new URLSearchParams({ limit: "100" });
+    if (more && subjectsCursor) query.set("cursor", subjectsCursor);
+    try {
+      const page = await workspaceApiJson(workspaceApiPath(workspaceId, "/subjektiv/subjects") + "?" + query, parseSubjektivSubjectListResponse, MEMORY_API_LOAD_POLICY.maxResponseBytes);
+      if (!alive) return;
+      subjects = more ? [...new Map([...subjects, ...page.items].map((subject) => [subject.id, subject])).values()] : page.items;
+      subjectsCursor = page.next_cursor ?? null;
+      // 再依頼の初期候補は観測済みの担当だけ。任意の先頭Subjectへは割り当てない。
+      const observedPrincipal = current?.principal;
+      if (!subjectId && observedPrincipal?.kind === "subject" && subjects.some((subject) => subject.id === observedPrincipal.subject_id && subject.state === "active")) subjectId = observedPrincipal.subject_id;
+    } catch (cause) { if (alive) subjectsError = operationError(cause); }
+    finally { subjectsBusy = false; }
   }
   let historyId = $state("");
   let retained = $state<TicketAssignmentTrackingProjection | null>(null);
@@ -97,11 +115,12 @@
     if (!current || pending || !answer.trim()) return;
     void run(answerOperation(workspaceId, ticket.id, current, answer, crypto.randomUUID()), "answer");
   }
-  onMount(() => { void readAssignments(); });
+  onMount(() => { void readAssignments(); if (ticket.action_eligibility.can_assign_orchestrator) void readSubjects(); });
 </script>
 <section class="ticket-detail-section ticket-handling">
-  <div class="ticket-section-heading"><h2>Orchestrator handling</h2><a href={`/w/${encodeURIComponent(workspaceId)}/orchestrator`}>All handling</a></div>
+  <div class="ticket-section-heading"><h2>Subject handling</h2><a href={`/w/${encodeURIComponent(workspaceId)}/orchestrator`}>All handling</a></div>
   {#if current}
+    <p>{assignmentPrincipalLabel(current.principal)}</p>
     <p><strong>Self-reported handling: {current.tracking?.status ?? "unknown"}</strong></p>
     {#if current.tracking}
       <dl>
@@ -115,10 +134,9 @@
     {#if current.migration_diagnostic}<p class="workspace-callout">{current.migration_diagnostic}</p>{/if}
     {#if current.tracking?.status === "done"}<p>This handling was returned. Ticket {ticket.state} is unchanged.</p>{/if}
     <details class="ticket-assignment-details"><summary>Assignment details</summary>
-    <p>Principal: {current.principal.kind === "workspace_agent" ? current.principal.agent_key : current.principal.kind === "worker" ? `${current.principal.runtime_id}/${current.principal.worker_id}` : current.principal.account_id}</p>
     <p>Assignment <code>{current.assignment_id}</code> · assigned by {current.assigned_by} · {formatDate(current.assigned_at)}</p>
     </details>
-  {:else}<p class="workspace-empty-copy">No current Orchestrator assignment.</p>{/if}
+  {:else}<p class="workspace-empty-copy">No current Subject assignment.</p>{/if}
   {#if error}<p class="workspace-callout is-error" role="alert">{error}</p>{/if}
   {#if savedNotice}<p role="status">{savedNotice}</p>{/if}
   {#if pending}
@@ -128,26 +146,31 @@
   {/if}
   {#if ticket.state === "closed" && ticket.action_eligibility.can_assign_orchestrator}<p class="workspace-empty-copy">A delegation can be saved, but this closed case does not admit new work. Reopening the case is a separate decision and does not itself reissue handling.</p>{/if}
   {#if ticket.action_eligibility.can_assign_orchestrator}
-    <details class="assignment-principal"><summary>Choose responsibility principal</summary>
+    <details class="assignment-principal"><summary>Choose responsible Subject</summary>
       <fieldset class="ticket-control-form" disabled={busy || pending !== null}>
-        <label>Principal kind<select bind:value={principalKind}><option value="workspace_agent">Workspace Orchestrator agent</option><option value="user">User account</option><option value="worker">Worker principal</option></select></label>
-        {#if principalKind === "user"}<label>Account identity<input bind:value={accountId} maxlength="1024" /></label>{/if}
-        {#if principalKind === "worker"}<label>Runtime identity<input bind:value={runtimeId} maxlength="1024" /></label><label>Worker identity<input bind:value={workerId} maxlength="1024" /></label>{/if}
+        <label>Subject<select bind:value={subjectId} disabled={subjectsBusy}>
+          <option value="">Select a Subject…</option>
+          {#each subjects as subject (subject.id)}<option value={subject.id} disabled={subject.state !== "active"}>{subject.role} · {subject.id}{subject.state !== "active" ? " (retired)" : ""}</option>{/each}
+        </select></label>
       </fieldset>
-      <p>Backend validates the selected principal. Responsibility does not choose or start a concrete Worker.</p>
+      {#if subjectsBusy}<p role="status">Loading Subjects…</p>{/if}
+      {#if subjectsError}<p class="workspace-callout is-error" role="alert">Subjects: {subjectsError}</p><button class="workspace-secondary-button" disabled={subjectsBusy} onclick={() => void readSubjects()}>Retry Subjects</button>{/if}
+      {#if subjectsCursor}<button class="workspace-secondary-button" disabled={subjectsBusy} onclick={() => void readSubjects(true)}>More Subjects</button>{/if}
+      {#if !subjectsBusy && !subjectsError && !subjects.length}<p>No Subjects available. Create or configure a Subject in <a href={`/w/${encodeURIComponent(workspaceId)}/memory`}>Memory</a>.</p>{/if}
+      <p>Backend validates the Subject and current permissions. Assignment does not grant permissions or select or start a concrete Worker.</p>
     </details>
   {/if}
   <div class="handling-actions">
     {#if ticket.action_eligibility.can_assign_orchestrator}
       {#if !current || current.tracking?.status === "done"}
-        <button class="workspace-primary-button" disabled={busy || pending !== null || !principalReady} onclick={() => delegate()}>{busy ? "Saving…" : current ? "Request again (new assignment)" : "Request Orchestrator"}</button>
+        <button class="workspace-primary-button" disabled={busy || pending !== null || !principalReady} onclick={() => delegate()}>{busy ? "Saving…" : current ? "Request again (new assignment)" : "Assign Subject"}</button>
       {:else}
         <details><summary>Replace this delegation</summary><p>A replacement starts a new assignment even for the same principal. The previous result and release history remain.</p><button class="workspace-secondary-button" disabled={busy || pending !== null || !principalReady} onclick={() => { if (confirm("Replace this delegation with a new assignment to the selected principal?")) delegate(); }}>Replace assignment</button></details>
       {/if}
     {/if}
     {#if ticket.action_eligibility.can_unassign_orchestrator}<button class="workspace-danger-button" disabled={busy || pending !== null} onclick={() => { if (confirm("Release responsibility? This does not stop any running Worker.")) delegate(true); }}>Release assignment</button>{/if}
   </div>
-  {#if ticket.state === "open" && current?.last_event_id && current.tracking && current.tracking.status !== "done"}
+  {#if ticket.state === "open" && current?.last_event_id && current.tracking && current.tracking.status !== "done" && current.principal.kind === "subject"}
     <form class="ticket-control-form ticket-answer" onsubmit={submitAnswer}>
       <label>Answer / continue this handling<textarea bind:value={answer} rows="3" required disabled={busy || pending !== null}></textarea></label>
       <button class="workspace-secondary-button" disabled={busy || pending !== null || !answer.trim()}>Send answer to this assignment</button>
@@ -169,10 +192,15 @@
   </details>
 </section>
 <BevelLine decorative />
-<details class="ticket-detail-section ticket-orchestrator-worker">
-  <summary>Orchestrator Worker</summary>
-  {#if orchestrator?.worker}<p>{orchestrator.worker.runtime_id}/{orchestrator.worker.worker_id} · actual state: <strong>{orchestrator.worker.state}</strong> · {orchestrator.online ? "online" : "offline"}</p><a href={`/w/${encodeURIComponent(workspaceId)}/workers/${encodeURIComponent(orchestrator.worker.worker_id)}?runtimeId=${encodeURIComponent(orchestrator.worker.runtime_id)}`}>Open Worker</a>{:else}<p>Worker observation unavailable. This does not change handling status.</p>{/if}
-</details>
+{#if current?.principal.kind === "subject"}
+  <details class="ticket-detail-section ticket-subject-worker">
+    <summary>Subject and current Worker</summary>
+    <p>Assignment follows the Subject across Worker replacement. Worker availability does not change handling status.</p>
+    <a href={`/w/${encodeURIComponent(workspaceId)}/memory/${encodeURIComponent(current.principal.subject_id)}`}>Open responsible Subject and current Worker</a>
+  </details>
+{:else if current}
+  <p class="workspace-callout">Legacy assignment retained for audit only. Select a Subject to create a new assignment; old receipts do not authorize new work.</p>
+{/if}
 <style>
   .assignment-principal fieldset { min-width: 0; margin: var(--space-3, 0.75rem) 0 0; padding: 0; border: 0; }
   dl { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-1); }

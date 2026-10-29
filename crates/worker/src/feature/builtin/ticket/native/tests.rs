@@ -198,12 +198,32 @@ fn native_entry_inputs_use_allocated_namespace_and_never_subject_argument_ids() 
 
 #[test]
 fn assignment_principal_and_cas_are_declared_compounds_not_opaque_json() {
-    let value = json!({"principal":{"$case":"worker","value":{"runtime_id":"r","worker_id":"w"}},"observed":{"assignment_id":{"$case":"null"}},"operation_id":"assign-1"});
+    let value = json!({"principal":{"$case":"subject","value":{"subject_id":"subject-a"}},"observed":{"assignment_id":{"$case":"null"}},"operation_id":"assign-1"});
     let command = converted("orchestrator_assign", value.clone(), Some("T-42"));
     assert_eq!(
         command,
-        json!({"ticket":"T-42","principal":{"kind":"worker","runtime_id":"r","worker_id":"w"},"expected_assignment_id":null,"operation_id":"assign-1"})
+        json!({"ticket":"T-42","principal":{"kind":"subject","subject_id":"subject-a"},"expected_assignment_id":null,"operation_id":"assign-1"})
     );
+    for legacy in [
+        json!({"$case":"worker","value":{"runtime_id":"r","worker_id":"w"}}),
+        json!({"$case":"user","value":{"account_id":"a"}}),
+        json!({"$case":"workspace_agent","value":{"agent_key":"workspace-orchestrator"}}),
+    ] {
+        let mut assignment = value.clone();
+        assignment["principal"] = legacy;
+        assert!(
+            input(
+                "orchestrator_assign",
+                &arguments(assignment),
+                Some("T-42"),
+                Some("ticket"),
+                "/cases",
+                "/changes",
+                "/goals"
+            )
+            .is_err()
+        );
+    }
     for invalid in [
         {
             let mut v = value.clone();

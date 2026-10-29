@@ -179,8 +179,11 @@ fn policy(
         return ("suppress", R::NoRecipient);
     }
     let supported = if role == "orchestrator" {
-        facts.principal_kind.as_deref() == Some("workspace_agent")
-            && facts.principal_id.as_deref() == Some("workspace-orchestrator")
+        facts.principal_kind.as_deref() == Some("subject")
+            && facts
+                .principal_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty())
     } else {
         role == "worker" && facts.principal_kind.as_deref() == Some("worker")
     };
@@ -230,6 +233,56 @@ fn policy(
 }
 
 const FACTS_SQL: &str = "json_object('principal_kind',a.principal_kind,'principal_id',a.principal_id,'runtime_id',COALESCE(a.runtime_id,(SELECT runtime_id FROM worker_singleton_owners WHERE workspace_id=a.workspace_id AND singleton_key=a.principal_id AND a.principal_kind='workspace_agent')),'worker_id',COALESCE(a.worker_id,(SELECT worker_id FROM worker_singleton_owners WHERE workspace_id=a.workspace_id AND singleton_key=a.principal_id AND a.principal_kind='workspace_agent')),'status',json_extract(a.tracking_json,'$.status'),'case_state',t.workflow_state,'released',json(CASE WHEN EXISTS(SELECT 1 FROM ticket_assignment_work_releases r WHERE r.workspace_id=a.workspace_id AND r.assignment_id=a.assignment_id) THEN 'true' ELSE 'false' END))";
+
+// FACTS_SQL above is retained verbatim for applied schema95/97/98 migrations.
+// Current capture resolves the existing Subject singleton owner, never a second registry.
+fn subject_facts_sql() -> String {
+    let prefix = crate::subjektiv::SUBJECT_WORKER_SINGLETON_PREFIX.replace('\'', "''");
+    let owner = |column: &str| {
+        format!(
+            "CASE WHEN a.principal_kind='subject' THEN (SELECT {column} FROM worker_singleton_owners WHERE workspace_id=a.workspace_id AND singleton_key='{prefix}' || a.principal_id) ELSE a.{column} END"
+        )
+    };
+    format!(
+        "json_object('principal_kind',a.principal_kind,'principal_id',a.principal_id,'runtime_id',{},'worker_id',{},'status',json_extract(a.tracking_json,'$.status'),'case_state',t.workflow_state,'released',json(CASE WHEN EXISTS(SELECT 1 FROM ticket_assignment_work_releases r WHERE r.workspace_id=a.workspace_id AND r.assignment_id=a.assignment_id) THEN 'true' ELSE 'false' END))",
+        owner("runtime_id"),
+        owner("worker_id")
+    )
+}
+
+/// Additive upgrade of future capture only. Old recipient snapshots and receipts remain
+/// evidence; an unresolved legacy principal is not mapped to an arbitrary Subject.
+/// The caller owns the Workspace schema transaction and runs this after assignment migration.
+pub(super) fn install_subject_recipients(conn: &Connection) -> Result<()> {
+    let facts = subject_facts_sql();
+    for trigger in [
+        "notification_ticket_event",
+        "notification_assignment_history",
+        "notification_assignment_change",
+        "notification_assignment_release",
+        "notification_content_input",
+        "notification_unassigned_content",
+        "notification_mr_event",
+        "notification_mr_source",
+        "notification_implementation_result",
+    ] {
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+            [trigger],
+            |row| row.get(0),
+        )?;
+        if !sql.contains(FACTS_SQL) {
+            return Err(Error::Store(format!(
+                "Notification capture {trigger} does not match the prior schema"
+            )));
+        }
+        conn.execute_batch(&format!(
+            "DROP TRIGGER {trigger}; {}",
+            sql.replace(FACTS_SQL, &facts)
+        ))?;
+    }
+    Ok(())
+}
 
 fn capture(input: &str, kind: &str, actor: &str, event_index: &str) -> String {
     format!("INSERT OR IGNORE INTO notification_sources(workspace_id,ticket_id,input_event_id,role,assignment_id,kind,actor,event_index,facts_json)
@@ -694,7 +747,8 @@ pub(super) fn require_current(
     assignment: &str,
     role: &str,
 ) -> Result<()> {
-    let facts:Option<String>=conn.query_row(&format!("SELECT {FACTS_SQL} FROM ticket_current_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.assignment_id=c.assignment_id JOIN typed_tickets t ON t.workspace_id=a.workspace_id AND t.ticket_id=a.ticket_id WHERE c.workspace_id=?1 AND c.ticket_id=?2 AND c.assignment_id=?3 AND c.role=?4"),params![workspace,ticket,assignment,role],|r|r.get(0)).optional()?;
+    let facts_sql = subject_facts_sql();
+    let facts:Option<String>=conn.query_row(&format!("SELECT {facts_sql} FROM ticket_current_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.assignment_id=c.assignment_id JOIN typed_tickets t ON t.workspace_id=a.workspace_id AND t.ticket_id=a.ticket_id WHERE c.workspace_id=?1 AND c.ticket_id=?2 AND c.assignment_id=?3 AND c.role=?4"),params![workspace,ticket,assignment,role],|r|r.get(0)).optional()?;
     if let Some(facts) = facts {
         let facts: Facts = decode(&facts)?;
         if policy(
@@ -819,6 +873,13 @@ fn worker_guard(
     }
     Ok(())
 }
+fn worker_acknowledged(conn: &Connection, workspace: &str, id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM notification_acknowledgements WHERE workspace_id=?1 AND delivery_id=?2)",
+        params![workspace, id], |row| row.get(0),
+    )?)
+}
+
 pub(super) fn prepare_worker(
     store: &SqliteWorkspaceStore,
     workspace: &str,
@@ -833,6 +894,7 @@ pub(super) fn prepare_worker(
     }
     store.with_conn_mut(|conn| {let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         worker_guard(&tx,workspace,id,target)?;
+        if worker_acknowledged(&tx,workspace,id)? { return Err(Error::TicketAssignmentConflict("Worker notification already has Runtime acceptance; new send admission is closed".into())); }
         let saved:Option<(String,String)>=tx.query_row("SELECT content,target_json FROM notification_requests WHERE workspace_id=?1 AND delivery_id=?2",params![workspace,id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         let result=if let Some((saved,binding))=saved {
             if binding!=json(target)? { return Err(Error::TicketAssignmentConflict("Prepared notification target binding changed".into())); }
@@ -841,6 +903,31 @@ pub(super) fn prepare_worker(
         tx.commit()?;Ok(result)
     })
 }
+/// Authorize a new Runtime send, not a historical receipt read. The Host must
+/// additionally check live recipient policy before supply and immediately before
+/// I/O. An ACK closes admission without erasing the pinned request or receipt.
+pub(super) fn admit_worker_send(
+    store: &SqliteWorkspaceStore,
+    workspace: &str,
+    id: &str,
+    target: &TicketWorkerNotificationTarget,
+) -> Result<Option<String>> {
+    store.with_conn_mut(|conn| {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        worker_guard(&tx, workspace, id, target)?;
+        let (content, saved_target): (String, String) = tx.query_row(
+            "SELECT content,target_json FROM notification_requests WHERE workspace_id=?1 AND delivery_id=?2",
+            params![workspace, id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?.ok_or_else(|| Error::TicketAssignmentConflict("Worker notification send requires a persisted request".into()))?;
+        if saved_target != json(target)? {
+            return Err(Error::TicketAssignmentConflict("Worker notification send target differs from prepared request".into()));
+        }
+        let content = if worker_acknowledged(&tx, workspace, id)? { None } else { Some(content) };
+        tx.commit()?;
+        Ok(content)
+    })
+}
+
 pub(super) fn ack_worker(
     store: &SqliteWorkspaceStore,
     workspace: &str,
@@ -866,8 +953,8 @@ mod tests {
     #[test]
     fn notification_routing_policy_distinguishes_requests_attention_results_and_suppression() {
         let mut facts = Facts {
-            principal_kind: Some("workspace_agent".into()),
-            principal_id: Some("workspace-orchestrator".into()),
+            principal_kind: Some("subject".into()),
+            principal_id: Some("subject-a".into()),
             runtime_id: None,
             worker_id: None,
             status: Some("waiting".into()),

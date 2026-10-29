@@ -145,13 +145,13 @@ impl PublicAssignmentKind {
 pub(super) fn description(name: &str) -> &'static str {
     match name {
         "TicketOrchestratorAssign" => {
-            "Explicitly delegate or reissue this Ticket to a target Orchestrator principal using the existing role-assignment API. Query current assignment first; provide observed expected_assignment_id (explicit null only when unassigned), target principal and stable operation_id. Assign persists initial waiting without ready/Queue. Explicit reissue after done creates a new row even for the same principal and preserves the old result. Exact retry keeps the same operation_id and full input; never automatically generate a new key after conflict or unknown outcome. Reread and reconcile stale responsibility. Saved Assign and notification failure are separate outcomes, not a reason to reassign. Backend authenticates the actor and validates role/principal; target principal is not an authority claim. This does not start/stop Workers, close the case, or authorize review/merge."
+            "Explicitly delegate or reissue this Ticket to a target Subject principal using the existing role-assignment API. Query current assignment first; provide observed expected_assignment_id (explicit null only when unassigned), target principal and stable operation_id. Assign persists initial waiting without ready/Queue. Explicit reissue after done creates a new row even for the same principal and preserves the old result. Exact retry keeps the same operation_id and full input; never automatically generate a new key after conflict or unknown outcome. Reread and reconcile stale responsibility. Saved Assign and notification failure are separate outcomes, not a reason to reassign. Backend authenticates the actor and validates role/principal; target principal is not an authority claim. This does not start/stop Workers, close the case, or authorize review/merge."
         }
         "TicketOrchestratorClear" => {
-            "Release the observed current Orchestrator delegation using assignment_id and stable operation_id. Query first; exact retry retains the same full input/key, stale conflict requires rereading, and unknown outcome is not automatic success/failure or a new operation. Preserve last handling/result and release history; do not turn release into done, Worker stop, work transfer or resource cleanup. Done/closed do not require clear. Actor authority is authenticated by Backend, never supplied by the model."
+            "Release the observed current Subject delegation using assignment_id and stable operation_id. Query first; exact retry retains the same full input/key, stale conflict requires rereading, and unknown outcome is not automatic success/failure or a new operation. Preserve last handling/result and release history; do not turn release into done, Worker stop, work transfer or resource cleanup. Done/closed do not require clear. Actor authority is authenticated by Backend, never supplied by the model."
         }
         "TicketAssignmentsQuery" => {
-            "Read a bounded page of retained Orchestrator assignment identities for this Ticket, role/principal, handling and independent release/replacement history. Use after_assignment_id from the returned next_assignment_id, limit 1..100. Historical done/results are not new work or execution authority. Use current tracking query before a new mutation; a replay receipt is not a fresh observation."
+            "Read a bounded page of retained Subject assignment identities for this Ticket, role/principal, handling and independent release/replacement history. Use after_assignment_id from the returned next_assignment_id, limit 1..100. Historical done/results are not new work or execution authority. Use current tracking query before a new mutation; a replay receipt is not a fresh observation."
         }
         "TicketAssignmentDiagnostics" => {
             "Read bounded sanitized existing delivery/acceptance/start evidence for an assignment_id, with independent after_input_event_id and after_start_operation_id cursors (limit 1..100). Saved delegation, notification persistence, Runtime acceptance and actual processing are distinct; absent acknowledgement may mean unknown outcome, not failed Assign. History/unknown are not pending work. No rendered content or binding credentials are exposed. Never infer or update self-reported handling from these diagnostics, Worker liveness or MR state."
@@ -343,19 +343,8 @@ async fn execute_value(
             identity("operation_id", &input.operation_id)?;
             optional_identity("expected_assignment_id", &input.expected_assignment_id)?;
             match &input.principal {
-                server_api::TicketAssignmentPrincipal::User { account_id } => {
-                    identity("account_id", account_id)?
-                }
-                server_api::TicketAssignmentPrincipal::Worker {
-                    runtime_id,
-                    worker_id,
-                } => {
-                    identity("runtime_id", runtime_id)?;
-                    identity("worker_id", worker_id)?;
-                }
-                server_api::TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
-                    identity("agent_key", agent_key)?
-                }
+                server_api::TicketAssignmentPrincipal::Subject { subject_id } => identity("subject_id", subject_id)?,
+                _ => return Err(ToolError::InvalidArgument("New Ticket responsibility requires an explicit Subject principal; legacy principals are audit-only".into())),
             }
             WorkspaceServerOperation::TicketAssignmentSet {
                 ticket_id: input.ticket,

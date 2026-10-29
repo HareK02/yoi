@@ -12334,6 +12334,23 @@
           {
             "additionalProperties": false,
             "properties": {
+              "kind": {
+                "const": "subject",
+                "type": "string"
+              },
+              "subject_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "subject_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
               "account_id": {
                 "type": "string"
               },
@@ -12391,6 +12408,22 @@
       "TicketAssignmentPrincipalSnapshot": {
         "description": "Immutable principal as stored at Assign, not live Worker availability.",
         "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "subject",
+                "type": "string"
+              },
+              "subject_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "subject_id"
+            ],
+            "type": "object"
+          },
           {
             "properties": {
               "account_id": {
@@ -19062,7 +19095,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:eca6e2cd9309ecf9fe73dcb044d82a5549950d66e93cd33157b2b2b3fa8ea82f"
+    "x-yoi-source-digest": "sha256:f2ecdab70235cce3230dfc84579f5d7e7b69884308bb1286337d071aa337fc38"
   },
   "openapi": "3.1.0",
   "paths": {

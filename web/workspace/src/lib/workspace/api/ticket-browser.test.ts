@@ -8,6 +8,7 @@ import { fixturePost } from "../home/dashboard.test-fixtures.ts";
 import {
   TICKET_BROWSER_API_LOAD_POLICY,
   parseTicketEvent,
+  parseAssignmentTrackingProjection,
   parseMergeRequestDetailResponse,
   parseMergeRequestListResponse,
   parseObjectiveListResponse,
@@ -861,4 +862,46 @@ Deno.test("case decoders reject legacy current states and malformed closure judg
     () => parseTicketDetail({ ...fixture, closure_operation_key: 1 }),
     "closure_operation_key must be a string",
   );
+});
+
+Deno.test("Subject assignment projection preserves identity and legacy audit without singleton normalization", () => {
+  const base = {
+    workspace_id: "w",
+    ticket_id: "t",
+    assignment_id: "a",
+    role: "orchestrator",
+    assigned_by: "Mika",
+    assigned_at: "2026-01-01T00:00:00Z",
+    current: true,
+    tracking: { status: "waiting" },
+    last_event_id: "e",
+  };
+  for (
+    const principal of [
+      { kind: "subject", subject_id: "subject-a" },
+      { kind: "subject", subject_id: "subject-b" },
+      { kind: "user", account_id: "alice" },
+      { kind: "worker", runtime_id: "r", worker_id: "w" },
+      { kind: "workspace_agent", agent_key: "workspace-orchestrator" },
+    ]
+  ) {
+    assertEquals(
+      parseAssignmentTrackingProjection({ ...base, principal }, "assignment")
+        .principal,
+      principal,
+    );
+  }
+  for (
+    const principal of [
+      { kind: "subject" },
+      { kind: "subject", subject_id: 3 },
+      { kind: "subject", subject_id: "a", worker_id: "w" },
+    ]
+  ) {
+    assertThrows(
+      () =>
+        parseAssignmentTrackingProjection({ ...base, principal }, "assignment"),
+      "assignment.principal",
+    );
+  }
 });

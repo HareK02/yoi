@@ -3,7 +3,6 @@ import {
   parseTicketQueryResponse,
   TICKET_BROWSER_API_LOAD_POLICY,
 } from "#lib/workspace/api/ticket-browser.ts";
-import { parseBrowserWorkspaceOrchestratorResponse } from "#lib/workspace/api/workers.ts";
 import {
   HANDLING_STATES,
   readTicketFilters,
@@ -17,7 +16,7 @@ export const load = deferPage(async ({ fetch, params, url }: Parameters<PageLoad
   const workspaceId = params.workspaceId;
   const filters = {
     ...readTicketFilters(url.searchParams),
-    principal: "orchestrator" as const,
+
     tagIds: [],
     closureReason: "all" as const,
     closureText: "",
@@ -33,8 +32,7 @@ export const load = deferPage(async ({ fetch, params, url }: Parameters<PageLoad
     null,
     handling,
   );
-  const [tickets, orchestrator] = await Promise.all([
-    loadJson(
+  const tickets = await loadJson(
       fetch,
       workspaceApiPath(workspaceId, "/tickets/query"),
       {
@@ -44,13 +42,7 @@ export const load = deferPage(async ({ fetch, params, url }: Parameters<PageLoad
       },
       parseTicketQueryResponse,
       TICKET_BROWSER_API_LOAD_POLICY,
-    ),
-    loadJson(
-      fetch,
-      workspaceApiPath(workspaceId, "/orchestrator"),
-      undefined,
-      parseBrowserWorkspaceOrchestratorResponse,
-    ),
-  ]);
-  return { workspaceId, filters, handling, tickets, orchestrator };
+    );
+
+  return { workspaceId, filters, handling, tickets };
 });

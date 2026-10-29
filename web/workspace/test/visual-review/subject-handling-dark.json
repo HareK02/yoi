@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "id": "subject-handling",
+  "title": "Ticket Subject responsibility, separate from Worker execution",
+  "baseUrl": "http://127.0.0.1:15371",
+  "colorScheme": "dark",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "member",
+      "label": "Synthetic authenticated member, not settings owner",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "routes": [
+    {
+      "id": "principal",
+      "label": "Choose responsibility",
+      "path": "/w/tickets/tickets/T-2",
+      "goal": "Inspect handling and choose responsible Subject",
+      "dataState": "Open and waiting with current assignment, no current body Worker",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-handling"
+      },
+      "capturePoints": [
+        {
+          "id": "choice",
+          "label": "Observed assignment and choice",
+          "interaction": [
+            {
+              "action": "click",
+              "selector": ".assignment-principal summary"
+            }
+          ],
+          "fullPage": true
+        }
+      ]
+    },
+    {
+      "id": "legacy",
+      "path": "/w/tickets-legacy/tickets/T-2",
+      "goal": "Inspect retained legacy assignment audit",
+      "dataState": "Legacy assignment; requires explicit Subject reissue",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-handling"
+      },
+      "capturePoints": [
+        {
+          "id": "audit",
+          "label": "Legacy audit and no implicit startup",
+          "fullPage": true
+        }
+      ],
+      "label": "Inspect retained legacy assignment audit"
+    },
+    {
+      "id": "handling",
+      "path": "/w/tickets/orchestrator",
+      "goal": "Inspect handling across Subjects",
+      "dataState": "Multiple Ticket cases and self-reported handling",
+      "ready": {
+        "kind": "selector",
+        "selector": ".orchestrator-assignments"
+      },
+      "capturePoints": [
+        {
+          "id": "list",
+          "label": "Responsibility list",
+          "fullPage": true
+        }
+      ],
+      "label": "Inspect handling across Subjects"
+    },
+    {
+      "id": "cases",
+      "path": "/w/tickets/tickets",
+      "goal": "Find Ticket cases without singleton startup",
+      "dataState": "Ticket cases including open and closed",
+      "ready": {
+        "kind": "selector",
+        "selector": ".ticket-panel-page"
+      },
+      "capturePoints": [
+        {
+          "id": "list",
+          "label": "Ticket case list",
+          "fullPage": true
+        }
+      ],
+      "label": "Find Ticket cases without singleton startup"
+    }
+  ],
+  "processes": [
+    {
+      "id": "ticket-fixture",
+      "command": "deno",
+      "cwd": "../../../../tools/web-ux",
+      "args": [
+        "run",
+        "--allow-net",
+        "--allow-read",
+        "browser-tests/ticket_fixture_server.ts",
+        "15372",
+        "../../web/workspace/build"
+      ],
+      "readyUrl": "http://127.0.0.1:15372/health"
+    },
+    {
+      "id": "subject-fixture-proxy",
+      "command": "deno",
+      "cwd": "../..",
+      "args": [
+        "run",
+        "--allow-net",
+        "test/visual-review/subject-handling-fixture-server.ts",
+        "15371",
+        "http://127.0.0.1:15372"
+      ],
+      "readyUrl": "http://127.0.0.1:15371/health"
+    }
+  ]
+}

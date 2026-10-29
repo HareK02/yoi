@@ -1049,8 +1049,8 @@ mod tests {
                             ticket_id: initial.meta.id.clone(),
                             assignment_id: assignment_id.clone(),
                             role: crate::store::TicketAssignmentRole::Orchestrator,
-                            principal: crate::store::TicketAssignmentPrincipal::WorkspaceAgent {
-                                agent_key: "workspace-orchestrator".into(),
+                            principal: crate::store::TicketAssignmentPrincipal::Subject {
+                                subject_id: "deletion-fixture-subject".into(),
                             },
                             assigned_by: "owner".into(),
                             assigned_at: "2026-01-01T00:00:00Z".into(),
@@ -1094,7 +1094,7 @@ mod tests {
                                 actor: "orchestrator".into(),
                                 runtime_id: "fixture-runtime".into(),
                                 worker_id: "fixture-worker".into(),
-                                agent_key: "workspace-orchestrator".into(),
+                                subject_id: "deletion-fixture-subject".into(),
                                 authentication_binding_id: "fixture-binding".into(),
                             },
                         )?;

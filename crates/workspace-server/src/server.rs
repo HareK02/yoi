@@ -4597,9 +4597,7 @@ impl WorkspaceApi {
                 notification_delivery::recover_job_notifications(&api);
                 api.recover_backend_jobs()?;
                 subjektiv_journal::recover(&api)?;
-                if let Some(orchestrator) = find_online_workspace_orchestrator(&api) {
-                    dispatch_orchestrator_assignment_attention(&api, &orchestrator.worker);
-                }
+                recover_ticket_notifications(&api);
                 Ok(api)
             })
             .await
@@ -6119,6 +6117,48 @@ impl WorkspaceApi {
                 reservation_id.clone(),
                 *capabilities,
             ));
+        }
+        if let Some(assignment) = request.ticket_assignment.as_ref() {
+            let dispatch_authority = (|| -> ApiResult<()> {
+                let mut current = request.clone();
+                self.validate_worker_spawn_repository_scope(runtime_id, &mut current)?;
+                for (pinned, live) in request
+                    .resolved_workdir_attachments
+                    .iter()
+                    .zip(&current.resolved_workdir_attachments)
+                {
+                    if pinned.capabilities.intersection(live.capabilities) != pinned.capabilities {
+                        return Err(Error::WorkspacePermissionDenied(
+                            "Ticket target or Workdir authority narrowed before Runtime dispatch"
+                                .into(),
+                        )
+                        .into());
+                    }
+                }
+                validate_ticket_start_dispatch(self, assignment)?;
+                if request.resolved_execution_grant.is_some()
+                    && subject_authorization::worker_permissions(self, &reserved_worker)?.is_none()
+                {
+                    return Err(Error::WorkspacePermissionDenied(
+                        "Ticket execution grant disappeared before Runtime dispatch".into(),
+                    )
+                    .into());
+                }
+                Ok(())
+            })();
+            if let Err(error) = dispatch_authority {
+                let diagnostics = compensate_failed_workspace_worker_create(
+                    self,
+                    runtime_id,
+                    worker_id,
+                    &reservation_fingerprint,
+                    "ticket_start_authority",
+                    None,
+                    &compensation_context,
+                    &reserved_attachments,
+                );
+                return Err(ApiError::with_diagnostics(error.error, diagnostics));
+            }
         }
         *dispatched = true;
         let mut result = match self
@@ -12461,7 +12501,7 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn ticket_assignments_page(
         &self,
-        _context: server_api::ServerRequestContext,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         ticket_id: String,
         query: server_api::TicketAssignmentsQuery,
@@ -12477,6 +12517,14 @@ impl server_api::ServerApi for ServerApiContractService {
                 let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)
                     .map_err(ApiError::from)
                     .map_err(ApiError::into_repository_api_error)?;
+                authorize_ticket_assignment_operation(
+                    &api,
+                    &contract_request_headers(&context)?,
+                    &context,
+                    &ticket_id,
+                    "ticket.assignment.query",
+                )
+                .map_err(ApiError::into_repository_api_error)?;
                 api.store
                     .page_ticket_assignments(
                         &workspace_id,
@@ -12503,7 +12551,7 @@ impl server_api::ServerApi for ServerApiContractService {
     }
     async fn ticket_assignment_diagnostics(
         &self,
-        _context: server_api::ServerRequestContext,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         ticket_id: String,
         query: server_api::TicketAssignmentDiagnosticsQuery,
@@ -12521,6 +12569,14 @@ impl server_api::ServerApi for ServerApiContractService {
                 let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)
                     .map_err(ApiError::from)
                     .map_err(ApiError::into_repository_api_error)?;
+                authorize_ticket_assignment_operation(
+                    &api,
+                    &contract_request_headers(&context)?,
+                    &context,
+                    &ticket_id,
+                    "ticket.assignment.diagnostics",
+                )
+                .map_err(ApiError::into_repository_api_error)?;
                 api.store
                     .page_ticket_assignment_diagnostics(
                         &workspace_id,
@@ -12571,6 +12627,14 @@ impl server_api::ServerApi for ServerApiContractService {
                 let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)
                     .map_err(ApiError::from)
                     .map_err(ApiError::into_repository_api_error)?;
+                authorize_ticket_assignment_operation(
+                    &api,
+                    &contract_request_headers(&context)?,
+                    &context,
+                    &ticket_id,
+                    "ticket.assignment.answer",
+                )
+                .map_err(ApiError::into_repository_api_error)?;
                 let (actor, source) = authenticated_assignment_source(
                     &api,
                     &contract_request_headers(&context)?,
@@ -12628,6 +12692,14 @@ impl server_api::ServerApi for ServerApiContractService {
                     validate_workspace_scope(&api, &workspace_id)?;
                     let ticket =
                         resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
+                    authorize_ticket_assignment_operation(
+                        &api,
+                        &contract_request_headers(&context)
+                            .map_err(|e| Error::InvalidInput(e.message))?,
+                        &context,
+                        &ticket,
+                        "ticket.implementation_result.write",
+                    )?;
                     let source = context.runtime_source.as_ref().ok_or_else(|| {
                         Error::WorkspacePermissionDenied(
                             "Implementation results require an authenticated Runtime Worker".into(),
@@ -12674,7 +12746,7 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn ticket_implementation_result_get(
         &self,
-        _context: server_api::ServerRequestContext,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         ticket_id: String,
         result_id: String,
@@ -12690,6 +12762,14 @@ impl server_api::ServerApi for ServerApiContractService {
                     validate_workspace_scope(&api, &workspace_id)?;
                     let ticket =
                         resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)?;
+                    authorize_ticket_assignment_operation(
+                        &api,
+                        &contract_request_headers(&context)
+                            .map_err(|e| Error::InvalidInput(e.message))?,
+                        &context,
+                        &ticket,
+                        "ticket.implementation_result.read",
+                    )?;
                     Ok(api.config_store.implementation_result(
                         &workspace_id,
                         &ticket,
@@ -12705,7 +12785,7 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn ticket_assignment_tracking_get(
         &self,
-        _context: server_api::ServerRequestContext,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         ticket_id: String,
         query: server_api::TicketAssignmentTrackingQuery,
@@ -12721,6 +12801,14 @@ impl server_api::ServerApi for ServerApiContractService {
                 let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)
                     .map_err(ApiError::from)
                     .map_err(ApiError::into_repository_api_error)?;
+                authorize_ticket_assignment_operation(
+                    &api,
+                    &contract_request_headers(&context)?,
+                    &context,
+                    &ticket_id,
+                    "ticket.assignment.query",
+                )
+                .map_err(ApiError::into_repository_api_error)?;
                 let values = if let Some(assignment_id) = query.assignment_id {
                     api.store
                         .get_ticket_assignment_tracking(&workspace_id, &ticket_id, &assignment_id)
@@ -12759,7 +12847,7 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn ticket_assignment_tracking_history(
         &self,
-        _context: server_api::ServerRequestContext,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         ticket_id: String,
         query: server_api::TicketAssignmentTrackingHistoryQuery,
@@ -12767,6 +12855,14 @@ impl server_api::ServerApi for ServerApiContractService {
         server_api::TicketAssignmentTrackingHistoryPage,
         server_api::RepositoryApiError,
     > {
+        authorize_ticket_assignment_http_read(
+            self.workspace_api()?,
+            &context,
+            &workspace_id,
+            &ticket_id,
+            "ticket.assignment.history",
+        )
+        .await?;
         let Json(value) = scoped_ticket_assignment_tracking_history(
             State(self.workspace_api()?.clone()),
             AxumPath((workspace_id, ticket_id)),
@@ -15676,6 +15772,9 @@ fn project_ticket_role_assignment_record(
             runtime_id,
             worker_id,
         },
+        TicketAssignmentPrincipal::Subject { subject_id } => {
+            server_api::TicketAssignmentPrincipal::Subject { subject_id }
+        }
         TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
             server_api::TicketAssignmentPrincipal::WorkspaceAgent { agent_key }
         }
@@ -15709,8 +15808,11 @@ fn internal_ticket_assignment_principal(
             runtime_id,
             worker_id,
         }),
-        server_api::TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
-            Ok(TicketAssignmentPrincipal::WorkspaceAgent { agent_key })
+        server_api::TicketAssignmentPrincipal::Subject { subject_id } => {
+            Ok(TicketAssignmentPrincipal::Subject { subject_id })
+        }
+        server_api::TicketAssignmentPrincipal::WorkspaceAgent { .. } => {
+            Err(Error::TicketAssignmentConflict("Legacy Workspace-agent principals are audit-only; select a Subject".into()).into())
         }
     }
 }
@@ -16308,6 +16410,94 @@ async fn scoped_set_ticket_assignment(
     apply_set_ticket_assignment(state, path, request, "workspace-web".into(), None).await
 }
 
+async fn authorize_ticket_assignment_http_read(
+    api: &WorkspaceApi,
+    context: &server_api::ServerRequestContext,
+    workspace_id: &str,
+    ticket_id: &str,
+    operation: &'static str,
+) -> std::result::Result<(), server_api::RepositoryApiError> {
+    let api = api.clone();
+    let context = context.clone();
+    let workspace_id = workspace_id.to_owned();
+    let ticket_id = ticket_id.to_owned();
+    api.host_executors
+        .host()?
+        .run(move || {
+            validate_workspace_scope(&api, &workspace_id)
+                .map_err(ApiError::from)
+                .map_err(ApiError::into_repository_api_error)?;
+            let ticket_id = resolve_workspace_ticket_reference(&api, &workspace_id, &ticket_id)
+                .map_err(ApiError::from)
+                .map_err(ApiError::into_repository_api_error)?;
+            authorize_ticket_assignment_operation(
+                &api,
+                &contract_request_headers(&context)?,
+                &context,
+                &ticket_id,
+                operation,
+            )
+            .map_err(ApiError::into_repository_api_error)
+        })
+        .await
+}
+
+fn authorize_ticket_assignment_operation(
+    api: &WorkspaceApi,
+    headers: &HeaderMap,
+    context: &server_api::ServerRequestContext,
+    ticket_id: &str,
+    operation: &str,
+) -> ApiResult<()> {
+    if let Some(worker) = authenticated_ticket_worker_source(headers, context)? {
+        let granted = subject_authorization::authorize_scope(
+            api,
+            &worker,
+            &server_api::authorization::OperationAuthorizationRequest {
+                operation: operation.into(),
+                resource: server_api::authorization::PermissionResource::Ticket {
+                    workspace_id: api.workspace_id().into(),
+                    ticket_id: ticket_id.into(),
+                },
+            },
+        )?;
+        if granted.is_none()
+            && matches!(
+                operation,
+                "ticket.assignment.assign" | "ticket.assignment.clear" | "ticket.assignment.answer"
+            )
+        {
+            return Err(Error::WorkspacePermissionDenied("Assignment authoring requires an explicit operation grant; a legacy role or authenticated Worker alone is not authority".into()).into());
+        }
+    }
+    Ok(())
+}
+
+fn current_assignment_subject_source(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> Result<String> {
+    let lease = api
+        .store
+        .require_current_worker_singleton_owner(api.workspace_id(), worker)?
+        .ok_or_else(|| {
+            Error::WorkspacePermissionDenied(
+                "Assignment self-report requires current Subject body ownership".into(),
+            )
+        })?;
+    let subject_id = lease
+        .key
+        .strip_prefix(SUBJEKTIV_SINGLETON_PREFIX)
+        .filter(|id| !id.is_empty() && *id != "workspace-orchestrator")
+        .ok_or_else(|| {
+            Error::WorkspacePermissionDenied(
+                "Assignment self-report requires Subject body, not a background or legacy Worker"
+                    .into(),
+            )
+        })?;
+    Ok(subject_id.into())
+}
+
 fn authenticated_assignment_source(
     api: &WorkspaceApi,
     headers: &HeaderMap,
@@ -16317,12 +16507,14 @@ fn authenticated_assignment_source(
     crate::store::TicketOrchestratorAssignmentSourceContext,
 )> {
     if let Some(source) = authenticated_ticket_worker_source(headers, context)? {
-        if !find_workspace_orchestrator(api).is_some_and(|worker| worker.worker == source) {
-            return Err(Error::WorkspacePermissionDenied(
-                "Ticket assignment mutations require the registered current Workspace Orchestrator"
-                    .into(),
-            ));
-        }
+        let lease = api
+            .store
+            .require_current_worker_singleton_owner(api.workspace_id(), &source)?;
+        let subject_id = lease
+            .as_ref()
+            .and_then(|lease| lease.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX))
+            .unwrap_or_default()
+            .to_owned();
         let authentication_binding_id = context
             .runtime_source
             .as_ref()
@@ -16339,7 +16531,7 @@ fn authenticated_assignment_source(
             crate::store::TicketOrchestratorAssignmentSourceContext::Runtime {
                 runtime_id: source.runtime_id,
                 worker_id: source.worker_id,
-                agent_key: "workspace-orchestrator".into(),
+                agent_key: subject_id,
                 authentication_binding_id,
             },
         ));
@@ -16368,12 +16560,31 @@ async fn scoped_set_ticket_assignment_with_context(
     request: Json<server_api::SetTicketRoleAssignmentRequest>,
 ) -> ApiResult<Json<server_api::TicketRoleAssignmentMutationResponse>> {
     validate_workspace_scope(&api, &path.0.0)?;
+    let ticket_reference = path.0.1.clone();
     let source_api = api.clone();
     let context = context.clone();
     let (author, source) = api
         .host_executors
         .host()?
-        .run(move || authenticated_assignment_source(&source_api, &headers, &context))
+        .run(move || -> ApiResult<_> {
+            let ticket_id = resolve_workspace_ticket_reference(
+                &source_api,
+                source_api.workspace_id(),
+                &ticket_reference,
+            )?;
+            authorize_ticket_assignment_operation(
+                &source_api,
+                &headers,
+                &context,
+                &ticket_id,
+                "ticket.assignment.assign",
+            )?;
+            Ok(authenticated_assignment_source(
+                &source_api,
+                &headers,
+                &context,
+            )?)
+        })
         .await?;
     apply_set_ticket_assignment(State(api), path, request, author, Some(source)).await
 }
@@ -16403,6 +16614,9 @@ async fn apply_set_ticket_assignment(
                 .map(|value| require_ticket_assignment_value("expected_assignment_id", value))
                 .transpose()?;
             let principal = internal_ticket_assignment_principal(request.principal)?;
+            if let TicketAssignmentPrincipal::Subject { subject_id } = &principal {
+                require_subjektiv_subject(&open_subjektiv_store(api)?, subject_id)?;
+            }
             let assigned_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
             let record = TicketRoleAssignmentRecord {
                 workspace_id: workspace_id.clone(),
@@ -16472,6 +16686,7 @@ async fn apply_set_ticket_assignment(
                 .into());
             }
             let delegation = ticket_start_delegation(
+                &api,
                 source.as_ref(),
                 request.orchestrator_assignment_id.as_deref(),
             )?;
@@ -16522,12 +16737,31 @@ async fn scoped_clear_ticket_assignment_with_context(
     query: Query<server_api::ClearTicketRoleAssignmentQuery>,
 ) -> ApiResult<Json<server_api::TicketRoleAssignmentMutationResponse>> {
     validate_workspace_scope(&api, &path.0.0)?;
+    let ticket_reference = path.0.1.clone();
     let source_api = api.clone();
     let context = context.clone();
     let (author, source) = api
         .host_executors
         .host()?
-        .run(move || authenticated_assignment_source(&source_api, &headers, &context))
+        .run(move || -> ApiResult<_> {
+            let ticket_id = resolve_workspace_ticket_reference(
+                &source_api,
+                source_api.workspace_id(),
+                &ticket_reference,
+            )?;
+            authorize_ticket_assignment_operation(
+                &source_api,
+                &headers,
+                &context,
+                &ticket_id,
+                "ticket.assignment.clear",
+            )?;
+            Ok(authenticated_assignment_source(
+                &source_api,
+                &headers,
+                &context,
+            )?)
+        })
         .await?;
     apply_clear_ticket_assignment(State(api), path, query, author, Some(source)).await
 }
@@ -16709,17 +16943,38 @@ async fn cancel_ticket_worker(
 type TicketStartDelegation = (String, ticket::TicketAssignmentTrackingSourceContext);
 
 fn ticket_start_delegation(
+    api: &WorkspaceApi,
     source: Option<&crate::store::TicketOrchestratorAssignmentSourceContext>,
     observed_assignment_id: Option<&str>,
 ) -> Result<Option<TicketStartDelegation>> {
     use crate::store::TicketOrchestratorAssignmentSourceContext;
+    if let Some(TicketOrchestratorAssignmentSourceContext::Runtime {
+        runtime_id,
+        worker_id,
+        agent_key,
+        ..
+    }) = source
+    {
+        if agent_key.is_empty()
+            && subject_authorization::worker_permissions(
+                api,
+                &RuntimeWorkerRef::new(runtime_id, worker_id),
+            )
+            .map_err(|error| error.error)?
+            .is_some()
+        {
+            return Err(Error::WorkspacePermissionDenied(
+                "Ticket execution initiation requires the current assigned Subject body; a delegated Worker cannot impersonate it".into(),
+            ));
+        }
+    }
     match source {
         Some(TicketOrchestratorAssignmentSourceContext::Runtime {
             runtime_id,
             worker_id,
             agent_key,
             authentication_binding_id,
-        }) => {
+        }) if !agent_key.is_empty() => {
             let assignment_id = observed_assignment_id.filter(|id| !id.trim().is_empty())
                 .ok_or_else(|| Error::TicketAssignmentConflict("Orchestrator Ticket start requires the observed orchestrator_assignment_id".into()))?;
             if assignment_id.len() > 1024 || assignment_id.chars().any(char::is_control) {
@@ -16733,7 +16988,7 @@ fn ticket_start_delegation(
                     actor: format!("worker:{runtime_id}/{worker_id}"),
                     runtime_id: runtime_id.clone(),
                     worker_id: worker_id.clone(),
-                    agent_key: agent_key.clone(),
+                    subject_id: agent_key.clone(),
                     authentication_binding_id: authentication_binding_id.clone(),
                 },
             )))
@@ -16752,24 +17007,28 @@ fn ticket_spawn_delegation(
     observed_assignment_id: Option<&str>,
 ) -> Result<Option<TicketStartDelegation>> {
     if let Some(context) = context {
-        // Generic authenticated Worker/manual starts are not implicit delegation.
-        // Only the registered Orchestrator starts under its observed assignment.
+        // Subject-connected children cannot impersonate their body or fall through
+        // to manual initiation by omitting the observed responsibility. Generic
+        // non-Subject Workers retain the existing manual start contract.
         let worker = authenticated_ticket_worker_source(headers, context)?;
         if let Some(worker) = worker.as_ref() {
             api.store
                 .require_current_worker_singleton_owner(&api.config.workspace_id, worker)?;
-            if find_workspace_orchestrator(api).is_some_and(|current| current.worker == *worker) {
+            if subject_authorization::worker_permissions(api, worker)
+                .map_err(|error| error.error)?
+                .is_some()
+            {
                 let (_, source) = authenticated_assignment_source(api, headers, context)?;
-                return ticket_start_delegation(Some(&source), observed_assignment_id);
+                return ticket_start_delegation(api, Some(&source), observed_assignment_id);
             }
         }
-        ticket_start_delegation(None, observed_assignment_id)
+        ticket_start_delegation(api, None, observed_assignment_id)
     } else {
         // Only direct test adapters omit middleware context. Production routes
         // must preserve the binding that actually authenticated the request.
         #[cfg(test)]
         {
-            ticket_start_delegation(None, observed_assignment_id)
+            ticket_start_delegation(api, None, observed_assignment_id)
         }
         #[cfg(not(test))]
         {
@@ -16778,6 +17037,44 @@ fn ticket_spawn_delegation(
             ))
         }
     }
+}
+
+fn authorize_ticket_start_source(
+    api: &WorkspaceApi,
+    ticket_id: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<()> {
+    subject_authorization::authorize(
+        api,
+        worker,
+        &server_api::authorization::OperationAuthorizationRequest {
+            operation: "ticket.assignment.assign".into(),
+            resource: server_api::authorization::PermissionResource::Ticket {
+                workspace_id: api.workspace_id().into(),
+                ticket_id: ticket_id.into(),
+            },
+        },
+    )
+    .map_err(|error| error.error)
+}
+
+fn validate_ticket_start_dispatch(
+    api: &WorkspaceApi,
+    assignment: &WorkerTicketAssignmentRequest,
+) -> Result<()> {
+    // A saved startup reservation is not a live operation grant. Recheck at the
+    // actual Runtime boundary, after materialization and attachment reservation.
+    if let Some(observed) = assignment.orchestrator_assignment_id.as_deref() {
+        let body =
+            assigned_subject_body(api, &assignment.ticket_id, observed)?.ok_or_else(|| {
+                Error::WorkspacePermissionDenied(
+                    "Ticket responsibility has no current Subject body".into(),
+                )
+            })?;
+        authorize_ticket_start_source(api, &assignment.ticket_id, &body)?;
+    }
+    api.store
+        .validate_ticket_assignment_operation_fence(api.workspace_id(), &assignment.operation_id)
 }
 
 fn reserve_ticket_start(
@@ -16791,6 +17088,11 @@ fn reserve_ticket_start(
     delegation: Option<&TicketStartDelegation>,
 ) -> Result<bool> {
     if let Some((assignment_id, source)) = delegation {
+        authorize_ticket_start_source(
+            api,
+            ticket_id,
+            &RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id),
+        )?;
         api.store
             .reserve_ticket_assignment_operation_for_orchestrator(
                 &api.config.workspace_id,
@@ -19636,7 +19938,7 @@ async fn scoped_complete_merge_request(
             let workspace_id = parse_workspace_id(&workspace_id)?;
             require_workspace_access(&workspace_id, &api)?;
             let source = authenticate_worker_mutation_source(&api, &workspace_id, &headers)?;
-            require_online_workspace_orchestrator_source(&api, &source)?;
+            require_merge_request_completion_grant(&api, &source, &merge_request_id)?;
             let store = merge_request_store(&api, &workspace_id)?;
             let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
             let ticket_id = merge_request_ticket_id(&mr)?;
@@ -19761,14 +20063,14 @@ async fn scoped_ticket_assignment_tracking_update_with_context(
                         "Tracking is self-reported by a verified Runtime Worker".into(),
                     )
                 })?;
-            // Tracking authority is retained responsibility plus the registered singleton,
-            // NOT Ticket openness, active work, Worker state or a model-supplied role.
-            if !find_workspace_orchestrator(&api).is_some_and(|worker| worker.worker == source) {
-                return Err(Error::WorkspacePermissionDenied(
-                    "Tracking updates require the registered current Workspace Orchestrator".into(),
-                )
-                .into());
-            }
+            authorize_ticket_assignment_operation(
+                &api,
+                &headers,
+                context,
+                &ticket_id,
+                "ticket.assignment.update",
+            )?;
+            let subject_id = current_assignment_subject_source(&api, &source)?;
             let authentication_binding_id = context
                 .runtime_source
                 .as_ref()
@@ -19783,7 +20085,7 @@ async fn scoped_ticket_assignment_tracking_update_with_context(
                 actor: format!("worker:{}/{}", source.runtime_id, source.worker_id),
                 runtime_id: source.runtime_id,
                 worker_id: source.worker_id,
-                agent_key: "workspace-orchestrator".into(),
+                subject_id,
                 authentication_binding_id,
             };
             // The Ticket-owned mutation checks current assignment/CAS and exact replay in
@@ -20276,15 +20578,13 @@ fn active_orchestrator_assignment(
         Some(assignment)
             if matches!(
                 assignment.principal,
-                TicketAssignmentPrincipal::WorkspaceAgent { ref agent_key }
-                    if agent_key == "workspace-orchestrator"
+                TicketAssignmentPrincipal::Subject { .. }
             ) =>
         {
             Ok(Some(assignment))
         }
         Some(_) => Err(Error::TicketAssignmentConflict(
-            "Orchestrator role must reference the registered workspace-orchestrator principal"
-                .to_string(),
+            "Legacy assignment has no resolved Subject identity".to_string(),
         )),
         None => Ok(None),
     }
@@ -20302,23 +20602,22 @@ fn worker_ticket_source_context(
             .ok()
             .flatten()
     });
-    let orchestrator = find_workspace_orchestrator(api);
     let is_current_assignment = assignment
         .as_ref()
         .is_some_and(|assignment| &assignment.worker == source);
-    let is_orchestrator = active_orchestrator_assignment(
-        api,
-        workspace_id,
-        ticket
-            .map(|ticket| ticket.meta.id.as_str())
-            .unwrap_or_default(),
-    )
-    .ok()
-    .flatten()
-    .is_some()
-        && orchestrator
-            .as_ref()
-            .is_some_and(|worker| worker.worker == *source);
+    let is_orchestrator = ticket
+        .and_then(|ticket| {
+            active_orchestrator_assignment(api, workspace_id, &ticket.meta.id)
+                .ok()
+                .flatten()
+        })
+        .and_then(|assignment| {
+            assigned_subject_body(api, &assignment.ticket_id, &assignment.assignment_id)
+                .ok()
+                .flatten()
+        })
+        .as_ref()
+        == Some(source);
     let actor_role = worker_source_actor_role(is_current_assignment, is_orchestrator);
     WorkerTicketSourceContext {
         worker: source.clone(),
@@ -22113,24 +22412,13 @@ fn maybe_dispatch_orchestrator_turn_end(
     {
         return;
     }
-    let Some(orchestrator) = find_workspace_orchestrator(api) else {
+    let worker = RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, worker_id);
+    if current_assignment_subject_source(api, &worker).is_err() {
         return;
-    };
-    if orchestrator.worker.runtime_id == EMBEDDED_WORKER_RUNTIME_ID
-        && orchestrator.worker.worker_id == worker_id
-    {
-        // Idle can be a reentrant consequence of this very Runtime send. It is
-        // not evidence of a new input and must not retry a failed send forever.
-        // Concurrent committed-input notifications independently defer a check.
-        with_orchestrator_attention_reservation(
-            api,
-            &orchestrator.worker,
-            false,
-            |state, pending| {
-                check_orchestrator_assignment_attention(api, &orchestrator.worker, state, pending);
-            },
-        );
     }
+    with_orchestrator_attention_reservation(api, &worker, false, |state, pending| {
+        check_orchestrator_assignment_attention(api, &worker, state, pending);
+    });
 }
 
 fn enqueue_orchestrator_assignment_attention(
@@ -22197,13 +22485,69 @@ fn with_orchestrator_attention_reservation(
     }
 }
 
+fn assigned_subject_body(
+    api: &WorkspaceApi,
+    ticket_id: &str,
+    assignment_id: &str,
+) -> Result<Option<RuntimeWorkerRef>> {
+    let Some(assignment) = api.store.get_current_ticket_role_assignment(
+        api.workspace_id(),
+        ticket_id,
+        TicketAssignmentRole::Orchestrator,
+    )?
+    else {
+        return Ok(None);
+    };
+    if assignment.assignment_id != assignment_id {
+        return Ok(None);
+    }
+    let TicketAssignmentPrincipal::Subject { subject_id } = assignment.principal else {
+        return Ok(None);
+    };
+    let key = crate::subjektiv::subject_worker_singleton_key(&subject_id)
+        .map_err(|e| Error::InvalidInput(e.to_string()))?;
+    Ok(api
+        .store
+        .current_worker_singleton_owner(api.workspace_id(), &key)?
+        .map(|lease| lease.worker))
+}
+
+fn authorize_assignment_delivery(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    ticket_id: &str,
+) -> Result<()> {
+    for operation in ["ticket.read", "ticket.assignment.query"] {
+        subject_authorization::authorize(
+            api,
+            worker,
+            &server_api::authorization::OperationAuthorizationRequest {
+                operation: operation.into(),
+                resource: server_api::authorization::PermissionResource::Ticket {
+                    workspace_id: api.workspace_id().into(),
+                    ticket_id: ticket_id.into(),
+                },
+            },
+        )
+        .map_err(|error| error.error)?;
+    }
+    Ok(())
+}
+
 fn orchestrator_delivery_target(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> Result<ticket::TicketAssignmentTrackingSourceContext> {
-    if !find_online_workspace_orchestrator(api).is_some_and(|current| current.worker == *worker) {
+    let subject_id = current_assignment_subject_source(api, worker)?;
+    let summary = api
+        .runtime
+        .worker(worker)
+        .map_err(|error| error.into_error())?;
+    if summary.workspace.workspace_id.as_deref() != Some(api.workspace_id())
+        || !matches!(summary.state.as_str(), "idle" | "running" | "paused")
+    {
         return Err(Error::WorkspacePermissionDenied(
-            "Delivery target is not the current registered Orchestrator".into(),
+            "Assignment target is not an online Subject body in this Workspace".into(),
         ));
     }
     let binding = api
@@ -22217,7 +22561,7 @@ fn orchestrator_delivery_target(
         actor: "backend:assignment-delivery".into(),
         runtime_id: worker.runtime_id.clone(),
         worker_id: worker.worker_id.clone(),
-        agent_key: "workspace-orchestrator".into(),
+        subject_id,
         authentication_binding_id: binding.binding_id,
     })
 }
@@ -22238,6 +22582,16 @@ fn check_orchestrator_assignment_attention(
             return;
         }
     };
+    let inputs = inputs
+        .into_iter()
+        .filter(|input| {
+            assigned_subject_body(api, &input.ticket_id, &input.assignment_id)
+                .ok()
+                .flatten()
+                .as_ref()
+                == Some(worker)
+        })
+        .collect::<Vec<_>>();
     let target = match orchestrator_delivery_target(api, worker) {
         Ok(target) => target,
         Err(_) => {
@@ -22266,6 +22620,10 @@ fn check_orchestrator_assignment_attention(
             continue;
         }
         let key = assignment_delivery_key(&input);
+        if authorize_assignment_delivery(api, worker, &input.ticket_id).is_err() {
+            record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
+            continue;
+        }
         let input = match api.store.reserve_ticket_assignment_delivery(
             &api.config.workspace_id,
             &input.assignment_id,
@@ -22319,6 +22677,10 @@ fn check_orchestrator_assignment_attention(
                 continue;
             }
         };
+        if authorize_assignment_delivery(api, worker, &input.ticket_id).is_err() {
+            record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
+            continue;
+        }
         let ticket = match api.authority.ticket(&input.ticket_id) {
             Ok(ticket) => ticket,
             Err(_) => {
@@ -22353,6 +22715,10 @@ fn check_orchestrator_assignment_attention(
                 continue;
             }
         };
+        if authorize_assignment_delivery(api, worker, &input.ticket_id).is_err() {
+            record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
+            continue;
+        }
         let content = match api.store.prepare_ticket_assignment_delivery_content(
             &api.config.workspace_id,
             &input.delivery_id,
@@ -22390,6 +22756,10 @@ fn send_orchestrator_attention(
         if api.notification_delivery_lifecycle.stopped() {
             return;
         }
+        if authorize_assignment_delivery(api, worker, &delivery.input.ticket_id).is_err() {
+            record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
+            return;
+        }
         let target = match orchestrator_delivery_target(api, worker) {
             Ok(target) => target,
             Err(_) => {
@@ -22401,30 +22771,40 @@ fn send_orchestrator_attention(
                 return;
             }
         };
-        if let Err(error) = api.store.reserve_ticket_assignment_delivery(
+        let content = match api.store.admit_ticket_assignment_delivery_send(
             &api.config.workspace_id,
-            &delivery.input.assignment_id,
-            &delivery.input.input_event_id,
+            &delivery.input.delivery_id,
             &target,
         ) {
-            record_notification_failure(
-                api,
-                &key,
-                match error {
-                    Error::TicketAssignmentConflict(_) => {
-                        NotificationFailureCode::AssignmentChanged
-                    }
-                    _ => NotificationFailureCode::PreparationFailed,
-                },
-            );
-            state.lock().unwrap_or_else(|p| p.into_inner()).pending = None;
+            Ok(Some(content)) => content,
+            Ok(None) => {
+                state.lock().unwrap_or_else(|p| p.into_inner()).pending = None;
+                return;
+            }
+            Err(error) => {
+                record_notification_failure(
+                    api,
+                    &key,
+                    match error {
+                        Error::TicketAssignmentConflict(_) => {
+                            NotificationFailureCode::AssignmentChanged
+                        }
+                        _ => NotificationFailureCode::PreparationFailed,
+                    },
+                );
+                state.lock().unwrap_or_else(|p| p.into_inner()).pending = None;
+                return;
+            }
+        };
+        if authorize_assignment_delivery(api, worker, &delivery.input.ticket_id).is_err() {
+            record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
             return;
         }
         let result = api.runtime.send_input(
             worker,
             WorkerInputRequest {
                 kind: WorkerInputKind::Notify,
-                content: delivery.content.clone(),
+                content,
                 submission_request_id: Some(delivery.request_id.clone()),
                 segments: None,
             },
@@ -22500,19 +22880,25 @@ fn orchestrator_queue_attention_context(
     Ok(worker::OrchestratorQueueAttentionContext::new(tickets))
 }
 
-fn require_online_workspace_orchestrator_source(
+fn require_merge_request_completion_grant(
     api: &WorkspaceApi,
     source: &WorkerMutationSource,
+    merge_request_id: &str,
 ) -> Result<()> {
-    let orchestrator = find_online_workspace_orchestrator(api).ok_or_else(|| {
-        Error::TicketAssignmentConflict(
-            "Workspace has no current online Workspace Orchestrator".into(),
-        )
-    })?;
-    if orchestrator.worker != *source {
-        return Err(Error::TicketAssignmentConflict(
-            "Merge Request completion requires the current online Workspace Orchestrator".into(),
-        ));
+    let granted = subject_authorization::authorize_scope(
+        api,
+        source,
+        &server_api::authorization::OperationAuthorizationRequest {
+            operation: "merge_request.complete".into(),
+            resource: server_api::authorization::PermissionResource::MergeRequest {
+                workspace_id: api.workspace_id().into(),
+                merge_request_id: merge_request_id.into(),
+            },
+        },
+    )
+    .map_err(|error| error.error)?;
+    if granted.is_none() {
+        return Err(Error::WorkspacePermissionDenied("Merge Request completion requires an explicit operation grant; legacy role names are not authority".into()));
     }
     Ok(())
 }
@@ -33197,13 +33583,15 @@ async fn create_workspace_worker_authenticated_on_host(
     } else {
         result
     };
-    Ok(Json(record_browser_worker_spawn(
-        &api,
-        runtime_id,
-        display_name,
-        result,
-        assignment.as_ref(),
-    )?))
+    let response =
+        record_browser_worker_spawn(&api, runtime_id, display_name, result, assignment.as_ref())?;
+    if resolved_subjektiv_attached {
+        dispatch_orchestrator_assignment_attention(
+            &api,
+            &RuntimeWorkerRef::new(&response.runtime_id, &response.worker_id),
+        );
+    }
+    Ok(Json(response))
 }
 
 fn restore_reused_subject_worker(
@@ -33765,6 +34153,11 @@ fn resume_internal_worker_restore_intent(
             worker,
             &request_id,
         )?;
+    }
+    if result.state == server_api::WorkerRestoreState::Accepted
+        && current_assignment_subject_source(api, worker).is_ok()
+    {
+        dispatch_orchestrator_assignment_attention(api, worker);
     }
     Ok(result)
 }
@@ -44325,67 +44718,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_request_completion_authority_requires_current_online_orchestrator() {
+    async fn merge_request_completion_requires_live_resource_grant_not_legacy_role() {
+        use server_api::authorization::{
+            PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
+        };
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let workspace_id = api.config.workspace_id.clone();
-        let Json(generic) = create_workspace_worker(
-            State(api.clone()),
-            HeaderMap::new(),
-            Json(CreateWorkspaceWorkerRequest {
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                display_name: "Generic Worker".to_string(),
-                singleton_key: None,
-                profile: Some("builtin:coder".to_string()),
-                ticket_assignment: None,
-                initial_submit: Vec::new(),
-                workdir_attachments: Vec::new(),
-                feature_connections: Default::default(),
-                control_operation_id: None,
-                execution_grant: None,
-            }),
-        )
-        .await
-        .unwrap();
-
-        let generic_ref = RuntimeWorkerRef::new(&generic.runtime_id, &generic.worker_id);
-        assert!(matches!(
-            require_online_workspace_orchestrator_source(&api, &generic_ref),
-            Err(Error::TicketAssignmentConflict(_))
-        ));
-
         let Json(started) = scoped_start_workspace_orchestrator(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
-                workspace_id: workspace_id.clone(),
+                workspace_id: api.workspace_id().into(),
             }),
         )
         .await
         .unwrap();
-        let orchestrator = started.worker.unwrap();
-        let orchestrator = RuntimeWorkerRef::new(&orchestrator.runtime_id, &orchestrator.worker_id);
-        require_online_workspace_orchestrator_source(&api, &orchestrator).unwrap();
+        let legacy = started.worker.unwrap();
+        let legacy = RuntimeWorkerRef::new(legacy.runtime_id, legacy.worker_id);
         assert!(matches!(
-            require_online_workspace_orchestrator_source(&api, &generic_ref),
-            Err(Error::TicketAssignmentConflict(_))
+            require_merge_request_completion_grant(&api, &legacy, "mr-completion"),
+            Err(Error::WorkspacePermissionDenied(_))
         ));
-
-        api.runtime
-            .stop_worker(
-                &orchestrator,
-                WorkerLifecycleRequest {
-                    reason: Some("completion authority regression test".into()),
-                    ticket_assignment: None,
+        let subject_id = ensure_test_assignment_subject(&api);
+        let body = create_test_assignment_body(&api, EMBEDDED_WORKER_RUNTIME_ID, &subject_id).await;
+        assert!(require_merge_request_completion_grant(&api, &body, "mr-completion").is_err());
+        let store = open_subjektiv_store(&api).unwrap();
+        let policy = store
+            .set_subject_permissions(
+                &subject_id,
+                &SubjectPermissionsUpdate {
+                    operation_id: "completion-grant".into(),
+                    expected_change_id: None,
+                    execution: vec![ScopedPermission {
+                        operation: "merge_request.complete".into(),
+                        resource: PermissionResource::MergeRequest {
+                            workspace_id: api.workspace_id().into(),
+                            merge_request_id: "mr-completion".into(),
+                        },
+                    }],
+                    delegation: vec![],
                 },
             )
             .unwrap();
-        assert!(find_workspace_orchestrator(&api).is_some());
-        assert!(find_online_workspace_orchestrator(&api).is_none());
-        assert!(matches!(
-            require_online_workspace_orchestrator_source(&api, &orchestrator),
-            Err(Error::TicketAssignmentConflict(_))
-        ));
+        require_merge_request_completion_grant(&api, &body, "mr-completion").unwrap();
+        assert!(require_merge_request_completion_grant(&api, &body, "other-mr").is_err());
+        store
+            .set_subject_permissions(
+                &subject_id,
+                &SubjectPermissionsUpdate {
+                    operation_id: "completion-revoke".into(),
+                    expected_change_id: Some(policy.change_id),
+                    execution: vec![],
+                    delegation: vec![],
+                },
+            )
+            .unwrap();
+        assert!(require_merge_request_completion_grant(&api, &body, "mr-completion").is_err());
     }
 
     #[tokio::test]
@@ -48852,7 +49240,8 @@ mod tests {
             .unwrap();
         assert!(find_workspace_orchestrator(&api).is_none());
         assert!(
-            require_online_workspace_orchestrator_source(&api, &forged_internal.worker).is_err()
+            require_merge_request_completion_grant(&api, &forged_internal.worker, "mr-completion")
+                .is_err()
         );
         let stopped = api
             .runtime
@@ -49672,6 +50061,12 @@ mod tests {
     // The receiver belongs to one mock execution, not to a Runtime WorkerRecord.
     // Bound protocol senders become terminal when Stop drops this execution.
     struct DeterministicWorkerExecution {
+        subject_release: std::sync::Mutex<
+            Option<(
+                runtime_api::SubjectReleaseRequest,
+                runtime_api::SubjectReleaseState,
+            )>,
+        >,
         dispatch_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
         context: worker_runtime::execution::WorkerExecutionContext,
         state: std::sync::Mutex<protocol::WorkerStateSnapshot>,
@@ -49692,6 +50087,7 @@ mod tests {
             let (method_tx, method_rx) = tokio::sync::mpsc::channel(32);
             let (events, _) = tokio::sync::broadcast::channel(32);
             Self {
+                subject_release: std::sync::Mutex::new(None),
                 dispatch_hook: std::sync::Mutex::new(None),
                 context,
                 state: std::sync::Mutex::new(protocol::WorkerStateSnapshot::initial()),
@@ -49718,6 +50114,16 @@ mod tests {
         > {
             if let Some(hook) = self.dispatch_hook.lock().unwrap().take() {
                 hook();
+            }
+            let release = self.subject_release.lock().unwrap();
+            if release.as_ref().is_some_and(|(_, state)| {
+                matches!(
+                    state,
+                    runtime_api::SubjectReleaseState::Reserved
+                        | runtime_api::SubjectReleaseState::Disconnected
+                )
+            }) {
+                return Err(Self::unavailable());
             }
             // Drive the actual mock receiver synchronously; no method is routed
             // through a WorkerRef lookup after a protocol connection is attached.
@@ -49790,6 +50196,7 @@ mod tests {
     }
 
     struct DeterministicExecutionBackend {
+        assignment_release_enabled: std::sync::atomic::AtomicBool,
         contexts: std::sync::Mutex<
             std::collections::HashMap<
                 worker_runtime::identity::WorkerRef,
@@ -49838,6 +50245,7 @@ mod tests {
                     .as_nanos()
             );
             Self {
+                assignment_release_enabled: std::sync::atomic::AtomicBool::new(false),
                 contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
                 materializer: worker_runtime::working_directory::RuntimeGitMaterializer::new(
                     std::env::temp_dir().join(unique),
@@ -50199,6 +50607,13 @@ mod tests {
                 .map(|execution| execution.snapshot())
         }
 
+        fn subject_release(
+            &self,
+            request: &runtime_api::SubjectReleaseRequest,
+        ) -> std::result::Result<runtime_api::SubjectReleaseResponse, String> {
+            self.release_assignment_controller(request)
+        }
+
         fn preflight_subject_delete_worker(
             &self,
             _request: &runtime_api::SubjectDeleteWorkerRequest,
@@ -50497,6 +50912,31 @@ mod tests {
 
     fn spawn_ticket_check_source(api: &WorkspaceApi, name: &str) -> RuntimeWorkerRef {
         seed_test_delivery_binding(api);
+        let config_state = api
+            .config_store
+            .load_workspace_config(api.workspace_id())
+            .unwrap()
+            .unwrap();
+        let projection = crate::profile_settings::project_profiles_from_workspace_config(
+            api.workspace_id(),
+            &config_state,
+        )
+        .unwrap();
+        let prompts = api
+            .prompt_projection_cache
+            .resolve(api.workspace_id(), &config_state)
+            .unwrap();
+        let bundle =
+            crate::profile_settings::build_virtual_profile_config_bundle_with_prompt_projection(
+                &projection,
+                &config_state,
+                api.workspace_id(),
+                &api.config.workspace_created_at,
+                "builtin:companion",
+                prompts.as_ref(),
+            )
+            .unwrap()
+            .unwrap();
         api.spawn_workspace_worker(
             EMBEDDED_WORKER_RUNTIME_ID,
             WorkerSpawnRequest {
@@ -50512,7 +50952,7 @@ mod tests {
                 workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachment_requests: Vec::new(),
                 resolved_workdir_attachments: Vec::new(),
-                resolved_config_bundle: None,
+                resolved_config_bundle: Some(bundle),
                 resolved_worker_observation_enabled: false,
                 resolved_worker_observation_grants: Vec::new(),
                 resolved_workspace_api: None,
@@ -56658,14 +57098,7 @@ mod tests {
             );
             headers
         };
-        let Json(started) = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-        )
-        .await
-        .unwrap();
+        let started = start_attention_test_orchestrator(&api).await;
         let orchestrator = started.worker.unwrap();
         let orchestrator = RuntimeWorkerRef::new(&orchestrator.runtime_id, &orchestrator.worker_id);
         execution.take_inputs();
@@ -57008,14 +57441,7 @@ mod tests {
         assign_test_orchestrator(&api, &ticket.id);
         let old_coder = seed_live_test_coder_assignment(&api, &ticket.id, "old-coder").await;
         let old_orchestrator_id = format!("orchestrator-{}", ticket.id);
-        let Json(started) = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-        )
-        .await
-        .unwrap();
+        let started = start_attention_test_orchestrator(&api).await;
         let orchestrator = started.worker.unwrap();
         let orchestrator = RuntimeWorkerRef::new(orchestrator.runtime_id, orchestrator.worker_id);
         merge_request_store(&api, TEST_WORKSPACE_ID)
@@ -57216,8 +57642,8 @@ mod tests {
                 orchestrator_assignment_id: None,
                 workdir_bindings: Vec::new(),
                 operation_id: "fresh-orchestrator-cycle".to_string(),
-                principal: server_api::TicketAssignmentPrincipal::WorkspaceAgent {
-                    agent_key: "workspace-orchestrator".to_string(),
+                principal: server_api::TicketAssignmentPrincipal::Subject {
+                    subject_id: ensure_test_assignment_subject(&api),
                 },
                 expected_assignment_id: None,
             }),
@@ -57800,8 +58226,8 @@ mod tests {
             orchestrator_assignment_id: None,
             workdir_bindings: Vec::new(),
             operation_id: "same-role-operation".to_string(),
-            principal: server_api::TicketAssignmentPrincipal::WorkspaceAgent {
-                agent_key: "workspace-orchestrator".to_string(),
+            principal: server_api::TicketAssignmentPrincipal::Subject {
+                subject_id: ensure_test_assignment_subject(&api),
             },
             expected_assignment_id: None,
         };
@@ -57816,9 +58242,10 @@ mod tests {
         let Json(first) = scoped_set_ticket_assignment(State(api.clone()), path(), Json(request()))
             .await
             .unwrap();
-        let Json(replay) = scoped_set_ticket_assignment(State(api), path(), Json(request()))
-            .await
-            .unwrap();
+        let Json(replay) =
+            scoped_set_ticket_assignment(State(api.clone()), path(), Json(request()))
+                .await
+                .unwrap();
         assert_eq!(replay.assignment, first.assignment);
     }
 
@@ -57857,8 +58284,8 @@ mod tests {
                 orchestrator_assignment_id: None,
                 workdir_bindings: Vec::new(),
                 operation_id: "invalid-workspace-agent-coder".to_string(),
-                principal: server_api::TicketAssignmentPrincipal::WorkspaceAgent {
-                    agent_key: "workspace-orchestrator".to_string(),
+                principal: server_api::TicketAssignmentPrincipal::Subject {
+                    subject_id: ensure_test_assignment_subject(&api),
                 },
                 expected_assignment_id: None,
             }),
@@ -58732,17 +59159,10 @@ mod tests {
             .unwrap()
             .worker
             .unwrap();
-        let orchestrator = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0
-        .worker
-        .expect("Workspace Orchestrator should be available");
+        let orchestrator = start_attention_test_orchestrator(&api)
+            .await
+            .worker
+            .expect("assigned Subject body should be available");
         let orchestrator = RuntimeWorkerRef::new(&orchestrator.runtime_id, &orchestrator.worker_id);
         let _ = execution.take_inputs();
         let backend = browser_ticket_backend(&api).unwrap();
@@ -58914,6 +59334,7 @@ mod tests {
         assert_eq!(attempts[0].0.worker_id.to_string(), orchestrator.worker_id);
     }
 
+    include!("server_assignment_test_support.rs");
     include!("server_assignment_attention_tests.rs");
 
     #[tokio::test]
@@ -60243,6 +60664,8 @@ mod tests {
     }
 
     fn assign_test_orchestrator(api: &WorkspaceApi, ticket_id: &str) {
+        let subject_id = ensure_test_assignment_subject(api);
+        grant_test_assignment_ticket(api, &subject_id, ticket_id);
         api.store
             .set_current_ticket_role_assignment(
                 &TicketRoleAssignmentRecord {
@@ -60250,9 +60673,7 @@ mod tests {
                     ticket_id: ticket_id.to_string(),
                     assignment_id: format!("orchestrator-{ticket_id}"),
                     role: TicketAssignmentRole::Orchestrator,
-                    principal: TicketAssignmentPrincipal::WorkspaceAgent {
-                        agent_key: "workspace-orchestrator".to_string(),
-                    },
+                    principal: TicketAssignmentPrincipal::Subject { subject_id },
                     assigned_by: "test-user".to_string(),
                     assigned_at: "2026-09-01T00:00:00Z".to_string(),
                 },

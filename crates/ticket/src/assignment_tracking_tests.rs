@@ -25,11 +25,20 @@ fn seed_ticket(conn: &Connection, workspace: &str, ticket: &str) {
 }
 
 fn assign(conn: &Connection, id: &str, event: &str) {
+    assign_principal(conn, id, event, "subject", "subject-a");
+}
+
+// Historical schema fixture only: never infer an authority fallback from DB shape.
+fn assign_legacy(conn: &Connection, id: &str, event: &str) {
+    assign_principal(conn, id, event, "workspace_agent", "workspace-orchestrator");
+}
+
+fn assign_principal(conn: &Connection, id: &str, event: &str, kind: &str, principal: &str) {
     let previous: Option<String> = conn.query_row("SELECT assignment_id FROM ticket_current_worker_assignments WHERE workspace_id='w' AND ticket_id='t' AND role='orchestrator'",[],|r|r.get(0)).optional().unwrap();
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-    conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES ('w','t',?1,'orchestrator','workspace_agent','workspace-orchestrator','author','2026-10-10T00:00:00Z')",[id]).unwrap();
+    conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES ('w','t',?1,'orchestrator',?2,?3,'author','2026-10-10T00:00:00Z')",params![id,kind,principal]).unwrap();
     conn.execute("DELETE FROM ticket_current_worker_assignments WHERE workspace_id='w' AND ticket_id='t' AND role='orchestrator'",[]).unwrap();
-    conn.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,updated_at) VALUES ('w','t',?1,'orchestrator','workspace_agent','workspace-orchestrator','now')",[id]).unwrap();
+    conn.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,updated_at) VALUES ('w','t',?1,'orchestrator',?2,?3,'now')",params![id,kind,principal]).unwrap();
     conn.execute("INSERT INTO ticket_worker_assignment_events(workspace_id,ticket_id,role,event_id,action,assignment_id,previous_assignment_id,actor,created_at,operation_id) VALUES ('w','t','orchestrator',?2,?4,?1,?3,'author','now',?2)",params![id,event,previous,if previous.is_some(){"reassigned"}else{"assigned"}]).unwrap();
     conn.execute_batch("COMMIT").unwrap();
 }
@@ -39,7 +48,7 @@ fn source() -> TicketAssignmentTrackingSourceContext {
         actor: "orchestrator".into(),
         runtime_id: "runtime".into(),
         worker_id: "worker".into(),
-        agent_key: "workspace-orchestrator".into(),
+        subject_id: "subject-a".into(),
         authentication_binding_id: "binding".into(),
     }
 }
@@ -92,7 +101,7 @@ fn assignment_initializes_waiting_and_audit_atomically() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].event_id, "assigned-a");
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-    conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES ('w','t','rolled-back','orchestrator','workspace_agent','workspace-orchestrator','author','now')",[]).unwrap();
+    conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES ('w','t','rolled-back','orchestrator','subject','subject-a','author','now')",[]).unwrap();
     conn.execute_batch("ROLLBACK").unwrap();
     assert!(
         sqlite_ticket_assignment_tracking(&conn, "w", "t", "rolled-back")
@@ -222,13 +231,13 @@ fn tracking_cas_and_receipts_bind_full_payload_and_authenticated_source() {
             1 => sender.runtime_id = "other".into(),
             2 => sender.worker_id = "replacement".into(),
             3 => sender.authentication_binding_id = "replacement-binding".into(),
-            _ => sender.agent_key = "other-agent".into(),
+            _ => sender.subject_id = "subject-b".into(),
         };
         assert!(apply(&conn, &input, &sender).is_err());
     }
     let mut other = source();
     other.worker_id = "replacement".into();
-    // Backend authenticated the replacement as the current stable agent. A new
+    // Backend authenticated the replacement as the current Subject body. A new
     // operation can proceed on the same assignment without starting a new row.
     let next = update(
         "a",
@@ -323,7 +332,7 @@ fn legacy(original: &str, fenced: bool, later_case: bool, reassigned: bool) -> C
     conn.execute_batch("CREATE TABLE ticket_schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL); INSERT INTO ticket_schema_migrations VALUES(10,'ticket schema baseline','original-time');").unwrap();
     install_assignment_core(&conn).unwrap();
     seed_ticket(&conn, "w", "t");
-    assign(&conn, "a", "assigned-a");
+    assign_legacy(&conn, "a", "assigned-a");
     let snapshot = TicketLegacyWorkflowSnapshot {
         workflow_state: original.into(),
         workflow_state_explicit: true,
@@ -347,7 +356,7 @@ fn legacy(original: &str, fenced: bool, later_case: bool, reassigned: bool) -> C
         conn.execute("INSERT INTO typed_ticket_case_history VALUES('w','t',0,'closed-later','case-fingerprint','{}')",[]).unwrap();
     }
     if reassigned {
-        assign(&conn, "b", "assigned-b");
+        assign_legacy(&conn, "b", "assigned-b");
     }
     conn
 }
@@ -408,7 +417,7 @@ fn migration_preserves_original_records_and_only_reconciles_current_fenced_deleg
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
-            13
+            14
         );
         let value = sqlite_ticket_assignment_tracking(&conn, "w", "t", "a")
             .unwrap()
@@ -459,8 +468,8 @@ fn migration_preserves_original_records_and_only_reconciles_current_fenced_deleg
 fn tracking_schema_rejects_drift_and_duplicate_current_singleton_roles() {
     let conn = db();
     assign(&conn, "a", "assigned-a");
-    conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES('w','t','b','orchestrator','workspace_agent','workspace-orchestrator','author','now')",[]).unwrap();
-    assert!(conn.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,updated_at) VALUES('w','t','b','orchestrator','workspace_agent','workspace-orchestrator','now')",[]).is_err());
+    conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES('w','t','b','orchestrator','subject','subject-a','author','now')",[]).unwrap();
+    assert!(conn.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,updated_at) VALUES('w','t','b','orchestrator','subject','subject-a','now')",[]).is_err());
     conn.execute_batch("DROP TRIGGER typed_ticket_assignment_tracking_history_no_update; CREATE TRIGGER typed_ticket_assignment_tracking_history_no_update BEFORE UPDATE ON typed_ticket_assignment_tracking_history BEGIN SELECT 1; END;").unwrap();
     assert!(
         verify_sqlite_ticket_schema(&conn)
@@ -493,7 +502,7 @@ fn standalone_assignment_identity_audit_and_terminal_receipts_are_immutable_but_
  {
     let conn = db();
     assign(&conn, "a", "assigned-a");
-    conn.execute("INSERT INTO ticket_assignment_operations(workspace_id,operation_id,action,ticket_id,role,principal_kind,principal_id,assignment_id,created_at,request_fingerprint) VALUES('w','assigned-op','assign','t','orchestrator','workspace_agent','workspace-orchestrator','a','original-time','original-fingerprint')",[]).unwrap();
+    conn.execute("INSERT INTO ticket_assignment_operations(workspace_id,operation_id,action,ticket_id,role,principal_kind,principal_id,assignment_id,created_at,request_fingerprint) VALUES('w','assigned-op','assign','t','orchestrator','subject','subject-a','a','original-time','original-fingerprint')",[]).unwrap();
     for sql in [
         "UPDATE ticket_worker_assignments SET assignment_id='changed' WHERE assignment_id='a'",
         "UPDATE ticket_worker_assignments SET assigned_by='forged' WHERE assignment_id='a'",
@@ -518,7 +527,7 @@ fn standalone_assignment_identity_audit_and_terminal_receipts_are_immutable_but_
     // current row, even in a standalone Ticket store without host constraints.
     conn.execute("DELETE FROM ticket_current_worker_assignments", [])
         .unwrap();
-    assert!(conn.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,updated_at) VALUES('w','t','a','orchestrator','workspace_agent','different-agent','now')",[]).is_err());
+    assert!(conn.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,updated_at) VALUES('w','t','a','orchestrator','subject','subject-b','now')",[]).is_err());
     conn.execute("INSERT INTO ticket_assignment_operations(workspace_id,operation_id,action,ticket_id,role,principal_kind,runtime_id,worker_id,created_at,request_fingerprint,claim_state) VALUES('w','pending','assign','t','worker','worker','runtime','pending-worker','claim-time','claim-fingerprint','pending')",[]).unwrap();
     conn.execute("UPDATE ticket_assignment_operations SET worker_id='resolved-worker',binding_recovery_json='{}' WHERE operation_id='pending'",[]).unwrap();
     conn.execute("UPDATE ticket_assignment_operations SET claim_state='failed',failure_reason='Admission failed' WHERE operation_id='pending'",[]).unwrap();
@@ -573,7 +582,7 @@ fn release_projection_preserves_actor_time_reason_and_optional_legacy_tracking()
         TicketAssignmentTrackingStatus::Waiting
     );
     assert!(conn.execute("UPDATE ticket_worker_assignments SET tracking_json='{\"status\":\"done\"}' WHERE assignment_id='b'",[]).is_err());
-    assert!(conn.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,updated_at) VALUES('w','t','b','orchestrator','workspace_agent','workspace-orchestrator','now')",[]).is_err());
+    assert!(conn.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,updated_at) VALUES('w','t','b','orchestrator','subject','subject-a','now')",[]).is_err());
     let legacy = legacy("done", true, false, false);
     migrate_sqlite_ticket_schema(&legacy).unwrap();
     legacy
@@ -694,15 +703,15 @@ fn standalone_assignment_constraints_reject_cross_ticket_principals_or_orphan_au
     let conn = db();
     assign(&conn, "a", "assigned-a");
     for sql in [
-        "INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES('other','t','cross-workspace','orchestrator','workspace_agent','workspace-orchestrator','author','now')",
+        "INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES('other','t','cross-workspace','orchestrator','subject','subject-a','author','now')",
         "INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES('w','t','bad-orchestrator','orchestrator','user','user','author','now')",
         "INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,runtime_id,worker_id,assigned_by,assigned_at) VALUES('w','t','bad-owner','owner','worker','r','worker','author','now')",
-        "INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES('w','t','bad-worker','worker','workspace_agent','workspace-orchestrator','author','now')",
+        "INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES('w','t','bad-worker','worker','subject','subject-a','author','now')",
         "INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,assigned_by,assigned_at) VALUES('w','t','missing-worker-identity','worker','worker','author','now')",
         "INSERT INTO ticket_worker_assignment_events(workspace_id,ticket_id,role,event_id,action,assignment_id,actor,created_at) VALUES('other','t','orchestrator','cross-audit','assigned','a','author','now')",
         "INSERT INTO ticket_worker_assignment_events(workspace_id,ticket_id,role,event_id,action,assignment_id,actor,created_at) VALUES('w','missing','orchestrator','cross-ticket-audit','assigned','a','author','now')",
         "INSERT INTO ticket_assignment_operations(workspace_id,operation_id,action,ticket_id,created_at) VALUES('other','orphan-operation','assign','t','now')",
-        "INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at,tracking_json) VALUES('w','t','bad-status','orchestrator','workspace_agent','workspace-orchestrator','author','now','{\"status\":\"running\"}')",
+        "INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at,tracking_json) VALUES('w','t','bad-status','orchestrator','subject','subject-a','author','now','{\"status\":\"running\"}')",
     ] {
         assert!(conn.execute(sql, []).is_err(), "reject {sql}");
     }
@@ -849,4 +858,270 @@ fn assignment_answer_rejects_unbounded_body_and_malformed_identities_without_app
         .unwrap(),
         0
     );
+}
+
+// Frozen component13 composition, not a latest-schema fixture relabelled as old.
+fn legacy_v13() -> Connection {
+    let conn = legacy("no-snapshot", false, false, false);
+    migrate_assignment_tracking(&conn).unwrap();
+    conn.execute_batch(include_str!("post_migration.sql"))
+        .unwrap();
+    conn.execute_batch(include_str!("content_changes.sql"))
+        .unwrap();
+    conn.execute_batch(
+        "INSERT INTO ticket_schema_migrations VALUES
+        (11,'Ticket-owned assignment tracking','v11-time'),
+        (12,'Canonical Ticket posts','v12-time'),
+        (13,'Ticket content change facts','v13-time');",
+    )
+    .unwrap();
+    conn
+}
+
+#[test]
+fn subject_migration_preserves_legacy_audit_and_receipts_without_inventing_subject_authority() {
+    let conn = legacy_v13();
+    let tracking = r#"{"status":"done","waiting_reason":null,"progress":null,"next_action":null,"result":"Historical result"}"#;
+    let old_source = r#"{"actor":"old-actor","runtime_id":"old-runtime","worker_id":"old-worker","agent_key":"workspace-orchestrator","authentication_binding_id":"old-binding"}"#;
+    conn.execute("UPDATE ticket_worker_assignments SET tracking_json=?1,last_tracking_event_id='old-event',tracking_updated_at='old-time' WHERE assignment_id='a'",[tracking]).unwrap();
+    conn.execute("INSERT INTO typed_ticket_assignment_tracking_history VALUES('w','t','a','old-event','old-op',?1,?2,'old-time')",params![tracking,old_source]).unwrap();
+    let before = sqlite_ticket_assignment_tracking(&conn, "w", "t", "a")
+        .unwrap()
+        .unwrap();
+    let history = sqlite_ticket_assignment_tracking_history(&conn, "w", "t", "a").unwrap();
+    // Pre-Subject saved results remain byte-identical and are not new requests.
+    let mut old_input = update(
+        "a",
+        "assigned-a",
+        "old-op",
+        TicketAssignmentTrackingStatus::Done,
+    );
+    old_input.tracking = before.tracking.clone().unwrap();
+    conn.execute(
+        "INSERT INTO typed_ticket_assignment_tracking_operations VALUES('w','old-op','t',?1,?2,?3)",
+        params![
+            serde_json::to_string(&("t", &old_input)).unwrap(),
+            old_source,
+            serde_json::to_string(&before).unwrap()
+        ],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO ticket_assignment_operations(workspace_id,operation_id,action,ticket_id,role,principal_kind,principal_id,assignment_id,created_at,request_fingerprint) VALUES('w','legacy-assign','assign','t','orchestrator','workspace_agent','workspace-orchestrator','a','old-time','old-fingerprint')",[]).unwrap();
+    let receipts = |db: &Connection| -> (String, String) {
+        db.query_row("SELECT source_context_json,result_json FROM typed_ticket_assignment_tracking_operations WHERE operation_key='old-op'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap()
+    };
+    let saved_receipt = receipts(&conn);
+    migrate_sqlite_ticket_schema(&conn).unwrap();
+    let after = sqlite_ticket_assignment_tracking(&conn, "w", "t", "a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.principal,
+        TicketAssignmentPrincipalSnapshot::WorkspaceAgent {
+            agent_key: "workspace-orchestrator".into()
+        }
+    );
+    assert_eq!(after.tracking, before.tracking);
+    assert_eq!(after.last_event_id, before.last_event_id);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert!(after.current);
+    assert!(
+        after
+            .migration_diagnostic
+            .as_ref()
+            .unwrap()
+            .contains("nonoperational")
+    );
+    assert_eq!(
+        sqlite_ticket_assignment_tracking_history(&conn, "w", "t", "a").unwrap(),
+        history
+    );
+    assert_eq!(
+        history.last().unwrap().source_context["agent_key"],
+        "workspace-orchestrator"
+    );
+    assert_eq!(receipts(&conn), saved_receipt);
+    assert_eq!(conn.query_row("SELECT principal_kind FROM ticket_assignment_operations WHERE operation_id='legacy-assign'",[],|r|r.get::<_,String>(0)).unwrap(),"workspace_agent");
+    // Neither a random Subject nor spelling the old singleton as a Subject owns it.
+    for subject in ["subject-a", "workspace-orchestrator"] {
+        let mut sender = source();
+        sender.actor = "old-actor".into();
+        sender.runtime_id = "old-runtime".into();
+        sender.worker_id = "old-worker".into();
+        sender.authentication_binding_id = "old-binding".into();
+        sender.subject_id = subject.into();
+        assert!(
+            apply(
+                &conn,
+                &update(
+                    "a",
+                    "old-event",
+                    "new-op",
+                    TicketAssignmentTrackingStatus::Inprogress
+                ),
+                &sender
+            )
+            .is_err()
+        );
+        // Exact historical input and concrete sender still cannot reinterpret
+        // old agent_key JSON as a new Subject-authenticated receipt.
+        assert!(apply(&conn, &old_input, &sender).is_err());
+    }
+    for sql in [
+        "UPDATE ticket_worker_assignments SET tracking_updated_at='new-time' WHERE assignment_id='a'",
+        "INSERT INTO typed_ticket_assignment_tracking_history VALUES('w','t','a','new-event','new-op','{\"status\":\"done\"}','{}','now')",
+        "INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES('w','t','legacy-new','orchestrator','workspace_agent','workspace-orchestrator','actor','now')",
+    ] {
+        assert!(conn.execute(sql, []).is_err(), "reject {sql}");
+    }
+    migrate_sqlite_ticket_schema(&conn).unwrap();
+    assert_eq!(
+        sqlite_ticket_assignment_tracking(&conn, "w", "t", "a")
+            .unwrap()
+            .unwrap(),
+        after
+    );
+    // Explicit reissue is a new Subject identity, not a conversion of old audit.
+    assign(&conn, "subject-reissue", "subject-reissue-event");
+    apply(
+        &conn,
+        &update(
+            "subject-reissue",
+            "subject-reissue-event",
+            "subject-update",
+            TicketAssignmentTrackingStatus::Done,
+        ),
+        &source(),
+    )
+    .unwrap();
+    assert_eq!(receipts(&conn), saved_receipt);
+    assert!(
+        !sqlite_ticket_assignment_tracking(&conn, "w", "t", "a")
+            .unwrap()
+            .unwrap()
+            .current
+    );
+    let wire = serde_json::to_value(source()).unwrap();
+    assert_eq!(wire["subject_id"], "subject-a");
+    assert!(wire.get("agent_key").is_none());
+    // Old serialized principal snapshots and audit JSON are still readable as old types.
+    let old: TicketAssignmentTrackingProjection = serde_json::from_str(&saved_receipt.1).unwrap();
+    assert_eq!(old.principal, before.principal);
+}
+
+#[test]
+fn subject_owner_is_required_for_new_operations_and_worker_replacement_is_not_reassignment() {
+    let conn = db();
+    assign(&conn, "a", "assigned-a");
+    let input = update(
+        "a",
+        "assigned-a",
+        "fresh",
+        TicketAssignmentTrackingStatus::Inprogress,
+    );
+    let mut wrong_subject = source();
+    wrong_subject.subject_id = "subject-b".into();
+    assert!(apply(&conn, &input, &wrong_subject).is_err());
+    let projection = sqlite_ticket_assignment_tracking(&conn, "w", "t", "a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        projection.principal,
+        TicketAssignmentPrincipalSnapshot::Subject {
+            subject_id: "subject-a".into()
+        }
+    );
+    let mut replacement = source();
+    replacement.worker_id = "new-body".into();
+    replacement.authentication_binding_id = "new-binding".into();
+    let result = apply(&conn, &input, &replacement).unwrap();
+    assert_eq!(result.assignment_id, "a");
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM typed_ticket_assignment_tracking_operations",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn failed_subject_migration_rolls_back_schema_and_receipt_but_preserves_host_transaction() {
+    let conn = legacy_v13();
+    let original: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name='ticket_worker_assignments'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute_batch("CREATE TRIGGER host_reject_subject_migration BEFORE UPDATE OF tracking_migration_diagnostic ON ticket_worker_assignments BEGIN SELECT RAISE(ABORT,'simulated failure after CHECK widening'); END;").unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE; CREATE TABLE host_pending(value TEXT); INSERT INTO host_pending VALUES('keep');").unwrap();
+    assert!(migrate_sqlite_ticket_schema_in_transaction(&conn).is_err());
+    assert!(!conn.is_autocommit());
+    assert_eq!(
+        conn.query_row("SELECT value FROM host_pending", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "keep"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT MAX(version) FROM ticket_schema_migrations",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        13
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT sql FROM sqlite_schema WHERE name='ticket_worker_assignments'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        original
+    );
+    assert!(
+        !conn
+            .pragma_query_value(None, "writable_schema", |r| r.get::<_, bool>(0))
+            .unwrap()
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name='ticket_subject_current_insert'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    conn.execute_batch("DROP TRIGGER host_reject_subject_migration;")
+        .unwrap();
+    migrate_sqlite_ticket_schema_in_transaction(&conn).unwrap();
+    conn.execute_batch("COMMIT").unwrap();
+    verify_sqlite_ticket_schema(&conn).unwrap();
+}
+
+#[test]
+fn subject_generation_is_ledger_selected_and_never_repaired_by_a_marker_trigger() {
+    let conn = legacy_v13();
+    conn.execute_batch("CREATE TRIGGER ticket_subject_current_insert BEFORE INSERT ON ticket_current_worker_assignments BEGIN SELECT 1; END;").unwrap();
+    assert!(migrate_sqlite_ticket_schema(&conn).is_err());
+    assert_eq!(
+        conn.query_row(
+            "SELECT MAX(version) FROM ticket_schema_migrations",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        13
+    );
+    let conn = db();
+    conn.execute_batch("DROP TRIGGER ticket_subject_current_insert; CREATE TRIGGER ticket_subject_current_insert BEFORE INSERT ON ticket_current_worker_assignments BEGIN SELECT 1; END;").unwrap();
+    assert!(verify_sqlite_ticket_schema(&conn).is_err());
+    assert!(migrate_sqlite_ticket_schema(&conn).is_err());
 }

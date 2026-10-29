@@ -1,6 +1,6 @@
 import "./default.dcdl" // {
     slug = "ticket-worker";
-    description = "General intent-led Ticket work with optional result recording and authorized conclusion decisions.";
+    description = "Intent-led Ticket work with bounded result reporting and authorized conclusion decisions; the Worker is not the durable Subject assignee.";
     engine = {
         instruction = "role.ticket_worker";
     };

@@ -211,6 +211,10 @@ fn page_sql(
         if let Some(principal) = &query.assigned_principal {
             use ticket::TicketAssignmentPrincipalSnapshot::*;
             terms.push(match principal {
+                Subject { subject_id } => format!(
+                    "a.principal_kind='subject' AND a.principal_id={}",
+                    bind(subject_id.clone())
+                ),
                 WorkspaceAgent { agent_key } => format!(
                     "a.principal_kind='workspace_agent' AND a.principal_id={}",
                     bind(agent_key.clone())
@@ -342,6 +346,7 @@ fn enrich_page(
     let mut statement = conn.prepare(&format!("SELECT a.ticket_id,json_object(
         'workspace_id',a.workspace_id,'ticket_id',a.ticket_id,'assignment_id',a.assignment_id,'role',a.role,
         'principal',json(CASE a.principal_kind
+          WHEN 'subject' THEN json_object('kind','subject','subject_id',a.principal_id)
           WHEN 'workspace_agent' THEN json_object('kind','workspace_agent','agent_key',a.principal_id)
           WHEN 'user' THEN json_object('kind','user','account_id',a.principal_id)
           WHEN 'worker' THEN json_object('kind','worker','runtime_id',a.runtime_id,'worker_id',a.worker_id) END),

@@ -118,6 +118,8 @@ pub use notification_routing::{
 mod assignment_tracking;
 #[path = "implementation_result.rs"]
 mod implementation_result;
+#[path = "subject_assignment_migration.rs"]
+mod subject_assignment_migration;
 pub use assignment_delivery::TicketAssignmentDelivery;
 pub use assignment_tracking::TicketOrchestratorAssignmentSourceContext;
 pub use ticket::{
@@ -127,7 +129,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 106;
+const LATEST_SCHEMA_VERSION: i64 = 107;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -464,6 +466,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 106,
         name: crate::plugin_catalog::MIGRATION_NAME,
         apply: crate::plugin_catalog::migrate,
+    },
+    Migration {
+        version: 107,
+        name: "Subject Ticket responsibility and current-body notification routing",
+        apply: migrate_subject_assignments_v106_to_v107,
     },
 ];
 
@@ -964,6 +971,9 @@ impl TicketAssignmentRole {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TicketAssignmentPrincipal {
+    Subject {
+        subject_id: String,
+    },
     User {
         account_id: String,
     },
@@ -979,6 +989,7 @@ pub enum TicketAssignmentPrincipal {
 impl TicketAssignmentPrincipal {
     fn kind(&self) -> &'static str {
         match self {
+            Self::Subject { .. } => "subject",
             Self::User { .. } => "user",
             Self::Worker { .. } => "worker",
             Self::WorkspaceAgent { .. } => "workspace_agent",
@@ -2267,6 +2278,14 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         content: &str,
         source: &TicketAssignmentTrackingSourceContext,
     ) -> Result<String>;
+    /// Recheck the current target and ACK immediately before sending pinned bytes.
+    /// None means a positive ACK is already saved, not an unknown acceptance.
+    fn admit_ticket_assignment_delivery_send(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<Option<String>>;
     fn ack_ticket_assignment_delivery(
         &self,
         workspace_id: &str,
@@ -2297,6 +2316,12 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         content: &str,
         target: &TicketWorkerNotificationTarget,
     ) -> Result<String>;
+    fn admit_ticket_worker_notification_send(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<Option<String>>;
     fn ack_ticket_worker_notification(
         &self,
         workspace_id: &str,
@@ -9359,6 +9384,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<String> {
         notification_routing::prepare_worker(self, workspace_id, delivery_id, content, target)
     }
+    fn admit_ticket_worker_notification_send(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<Option<String>> {
+        notification_routing::admit_worker_send(self, workspace_id, delivery_id, target)
+    }
     fn ack_ticket_worker_notification(
         &self,
         workspace_id: &str,
@@ -9444,6 +9477,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         source: &TicketAssignmentTrackingSourceContext,
     ) -> Result<String> {
         assignment_delivery::prepare_content(self, workspace_id, delivery_id, content, source)
+    }
+    fn admit_ticket_assignment_delivery_send(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<Option<String>> {
+        assignment_delivery::admit_send(self, workspace_id, delivery_id, source)
     }
     fn ack_ticket_assignment_delivery(
         &self,
@@ -9840,7 +9881,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 runtime_id,
                 worker_id,
             } => (None, Some(runtime_id.as_str()), Some(worker_id.as_str())),
-            TicketAssignmentPrincipal::WorkspaceAgent { .. } => {
+            TicketAssignmentPrincipal::WorkspaceAgent { .. }
+            | TicketAssignmentPrincipal::Subject { .. } => {
                 return Err(Error::TicketAssignmentConflict(
                     "Workspace agent principal cannot occupy the Worker role".to_string(),
                 ));
@@ -13258,7 +13300,7 @@ impl SqliteWorkspaceStore {
                 )));
             }
             if let Some((assignment_id,source))=fence {
-                assignment_tracking::require_runtime_source(&tx,workspace_id,&source.runtime_id,&source.worker_id,&source.agent_key,&source.authentication_binding_id)?;
+                assignment_tracking::require_runtime_source(&tx,workspace_id,&source.runtime_id,&source.worker_id,&source.subject_id,&source.authentication_binding_id)?;
                 assignment_delivery::require_current(&tx,workspace_id,ticket_id,assignment_id)?;
             }
             let worker = worker_id.map(|id| RuntimeWorkerRef::new(runtime_id, id));
@@ -13382,6 +13424,9 @@ impl SqliteWorkspaceStore {
                 runtime_id,
                 worker_id,
             } => (None, Some(runtime_id.as_str()), Some(worker_id.as_str())),
+            TicketAssignmentPrincipal::Subject { subject_id } => {
+                (Some(subject_id.as_str()), None, None)
+            }
             TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
                 (Some(agent_key.as_str()), None, None)
             }
@@ -13588,6 +13633,9 @@ fn read_ticket_role_assignment_record(
             runtime_id: runtime_id.ok_or_else(|| rusqlite::Error::InvalidQuery)?,
             worker_id: worker_id.ok_or_else(|| rusqlite::Error::InvalidQuery)?,
         },
+        "subject" => TicketAssignmentPrincipal::Subject {
+            subject_id: principal_id.ok_or_else(|| rusqlite::Error::InvalidQuery)?,
+        },
         "workspace_agent" => TicketAssignmentPrincipal::WorkspaceAgent {
             agent_key: principal_id.ok_or_else(|| rusqlite::Error::InvalidQuery)?,
         },
@@ -13656,8 +13704,8 @@ fn validate_ticket_assignment_role_principal(
     let valid = match role {
         TicketAssignmentRole::Orchestrator => matches!(
             principal,
-            TicketAssignmentPrincipal::WorkspaceAgent { agent_key }
-                if agent_key == "workspace-orchestrator"
+            TicketAssignmentPrincipal::Subject { subject_id }
+                if !subject_id.trim().is_empty() && subject_id.len() <= 1024 && !subject_id.chars().any(char::is_control)
         ),
         TicketAssignmentRole::Worker => {
             matches!(principal, TicketAssignmentPrincipal::Worker { .. })
@@ -13760,6 +13808,9 @@ fn clear_current_ticket_role_assignment_with_source_in_tx(
             runtime_id,
             worker_id,
         } => (None, Some(runtime_id.as_str()), Some(worker_id.as_str())),
+        TicketAssignmentPrincipal::Subject { subject_id } => {
+            (Some(subject_id.as_str()), None, None)
+        }
         TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
             (Some(agent_key.as_str()), None, None)
         }
@@ -15361,8 +15412,13 @@ fn migrate_ticket_cases_v90_to_v91(conn: &Connection) -> Result<()> {
     // closure reasons and immutable case history. It opens its own transaction.
     // Leave the Workspace marker at 90 until our composed constraints commit;
     // a failed second phase is resumable through the idempotent domain migrator.
-    ticket::migrate_sqlite_ticket_schema(conn)
-        .map_err(|error| Error::Store(format!("Ticket case migration failed: {error}")))?;
+    let component = conn.unchecked_transaction()?;
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &component,
+        ticket::HistoricalTicketSchemaTarget::Cases10,
+    )
+    .map_err(|error| Error::Store(format!("Ticket case migration failed: {error}")))?;
+    component.commit()?;
     let invalid: i64 = conn.query_row(
         "SELECT COUNT(*) FROM typed_tickets WHERE workflow_state NOT IN ('open', 'closed')",
         [],
@@ -15408,8 +15464,11 @@ fn migrate_ticket_tracking_v91_to_v92(conn: &Connection) -> Result<()> {
         ));
     }
     let tx = conn.unchecked_transaction()?;
-    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
-        .map_err(|error| Error::Store(error.to_string()))?;
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &tx,
+        ticket::HistoricalTicketSchemaTarget::Tracking11,
+    )
+    .map_err(|error| Error::Store(error.to_string()))?;
     tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES (92, 'Ticket-owned assignment tracking')", [])?;
     verify_workspace_resource_constraints(&tx)?;
     tx.commit()?;
@@ -15436,8 +15495,11 @@ fn migrate_ticket_posts_v93_to_v94(conn: &Connection) -> Result<()> {
         ));
     }
     let tx = conn.unchecked_transaction()?;
-    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
-        .map_err(|error| Error::Store(format!("Ticket posts migration failed: {error}")))?;
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &tx,
+        ticket::HistoricalTicketSchemaTarget::Posts12,
+    )
+    .map_err(|error| Error::Store(format!("Ticket posts migration failed: {error}")))?;
     assignment_delivery::install_post_inputs(&tx)?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations(version,name) VALUES(94,'Canonical Ticket posts')",
@@ -15464,8 +15526,11 @@ fn migrate_notification_routing_v94_to_v95(conn: &Connection) -> Result<()> {
         ));
     }
     let tx = conn.unchecked_transaction()?;
-    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
-        .map_err(|e| Error::Store(format!("Ticket content facts migration failed: {e}")))?;
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &tx,
+        ticket::HistoricalTicketSchemaTarget::Content13,
+    )
+    .map_err(|e| Error::Store(format!("Ticket content facts migration failed: {e}")))?;
     notification_routing::install(&tx)?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations(version,name) VALUES(95,?1)",
@@ -15737,6 +15802,23 @@ fn migrate_hosting_policy_v98_to_v99(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_subject_assignments_v106_to_v107(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 106 {
+        return Err(Error::Store(
+            "Subject assignment migration requires schema 106".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    subject_assignment_migration::install(&tx)?;
+    notification_routing::install_subject_recipients(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(107,?1)",
+        ["Subject Ticket responsibility and current-body notification routing"],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure(conn)?;
     assignment_delivery::install(conn)?;
@@ -15746,6 +15828,8 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     notification_routing::install_business_events(conn)?;
     notification_routing::upgrade_result_reports(conn)?;
     subject_deletion_store::install_notification_erasure(conn)?;
+    subject_assignment_migration::install(conn)?;
+    notification_routing::install_subject_recipients(conn)?;
     ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
         Error::Store(format!(
             "fresh Workspace Ticket schema verification failed: {error}"
@@ -16800,6 +16884,7 @@ fn apply_migrations_with_secret_source(
 
     verify_schema_history(conn, LATEST_SCHEMA_VERSION)?;
     crate::plugin_catalog::verify(conn)?;
+    subject_assignment_migration::verify(conn)?;
     verify_workspace_runtime_binding_schema(conn)?;
     verify_workspace_runtime_verification_schema(conn)?;
     verify_workspace_deletion_schema(conn)?;
@@ -16836,6 +16921,7 @@ mod test_support;
 mod tests {
     include!("assignment_tracking_tests.rs");
     include!("assignment_delivery_tests.rs");
+    include!("subject_assignment_migration_tests.rs");
     include!("notification_routing_tests.rs");
     include!("notification_diagnostics_tests.rs");
     include!("job_notification_tests.rs");
@@ -19494,6 +19580,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:104, name:"Converge Passkey results and Job input retention".into()},
                 WorkspaceSchemaMigrationStep {version:105, name:"Durable Subject deletion snapshots and Job admission fences".into()},
                 WorkspaceSchemaMigrationStep {version:106, name:crate::plugin_catalog::MIGRATION_NAME.into()},
+                WorkspaceSchemaMigrationStep {version:107, name:"Subject Ticket responsibility and current-body notification routing".into()},
             ]
         );
 
@@ -19610,6 +19697,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (104, "Converge Passkey results and Job input retention".to_string()),
 (105, "Durable Subject deletion snapshots and Job admission fences".to_string()),
 (106, crate::plugin_catalog::MIGRATION_NAME.to_string()),
+(107, "Subject Ticket responsibility and current-body notification routing".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -22897,7 +22985,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (103, "Passkey metadata and atomic addition results".into()),
                          (104, "Converge Passkey results and Job input retention".into()),
                          (105, "Durable Subject deletion snapshots and Job admission fences".into()),
-                         (106, crate::plugin_catalog::MIGRATION_NAME.into())]);
+                         (106, crate::plugin_catalog::MIGRATION_NAME.into()),
+                         (107, "Subject Ticket responsibility and current-body notification routing".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
@@ -23628,8 +23717,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let first = manual_worker_assignment("first", "first-assignment");
         let orchestrator = TicketRoleAssignmentRecord {
             role: TicketAssignmentRole::Orchestrator,
-            principal: TicketAssignmentPrincipal::WorkspaceAgent {
-                agent_key: "workspace-orchestrator".into(),
+            principal: TicketAssignmentPrincipal::Subject {
+                subject_id: "fixture-subject".into(),
             },
             ..first.clone()
         };
@@ -24713,8 +24802,8 @@ INSERT INTO worker_registry (
             ticket_id: ticket.id.clone(),
             assignment_id: "orchestrator-1".to_string(),
             role: TicketAssignmentRole::Orchestrator,
-            principal: TicketAssignmentPrincipal::WorkspaceAgent {
-                agent_key: "workspace-orchestrator".to_string(),
+            principal: TicketAssignmentPrincipal::Subject {
+                subject_id: "fixture-subject".to_string(),
             },
             assigned_by: "user".to_string(),
             assigned_at: "2026-09-01T00:00:00Z".to_string(),
@@ -27083,32 +27172,54 @@ INSERT INTO worker_registry (
         use crate::backend_job::{JobInputDisposition, JobInputRetirementReason};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("migration.sqlite");
-        let store = SqliteWorkspaceStore::open_api_fixture(&path).unwrap();
+        // Build the actual retained boundary, never latest DDL relabelled as 102.
+        prepare_retained_schema(&path, 102);
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        // Obtain a canonical pending Job through the current API, then copy only
+        // columns that existed at the retained boundary into the historical file.
+        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
         seed_resource_job_workspace(&store).await;
         let original = resource_job_request("upgrade", "subject", "candidate");
         let before = store
             .reserve_backend_job("resource-workspace", &original, RESOURCE_JOB_NOW)
             .unwrap();
-        store.with_conn(|conn| {
-            // This fixture deliberately reconstructs schema 102 from fresh.
-            conn.execute_batch("DROP TABLE plugin_references; DROP TABLE plugin_artifacts; DROP TABLE plugin_installations; DROP TABLE plugin_uploads; DROP TABLE plugin_operations;")?;
-            // Remove the newer Subject fence composition, not just its receipt.
-            let triggers=conn.prepare("SELECT name,tbl_name FROM sqlite_schema WHERE type='trigger' AND tbl_name LIKE 'notification_%' AND name NOT LIKE 'subject_deleted_%' AND sql LIKE '%subject_deletion_jobs%'")?
-                .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            for (name,table) in triggers {conn.execute_batch(&format!("DROP TRIGGER {name}; CREATE TRIGGER {name} BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'Notification evidence is immutable'); END;"))?;}
-            for name in ["subject_deleted_job_insert","subject_deleted_job_result","subject_deleted_attempt_insert","subject_deleted_attempt_result","subject_deleted_worker_reservation","subject_deleted_notification_source","subject_deleted_notification_payload","subject_deleted_notification_send","subject_deletion_worker_prior_insert","subject_deletion_worker_identity_immutable"] {conn.execute_batch(&format!("DROP TRIGGER {name}"))?;}
-            conn.execute_batch("DROP TABLE subject_deletion_removals; DROP TABLE subject_deletion_allocations; DROP TABLE subject_deletion_jobs; DROP TABLE subject_deletion_workers; DROP TABLE subject_deletions;")?;
-            conn.execute_batch("DROP TRIGGER backend_job_input_retirement; DROP TRIGGER backend_job_identity_immutable;
-                ALTER TABLE backend_jobs DROP COLUMN input_disposition;
-                DROP TRIGGER passkey_metadata_insert;
-                DROP TABLE passkey_addition_receipts;
-                DROP TABLE passkey_metadata;
-                UPDATE __yoi_schema_migrations SET version=102 WHERE version=106;
-                CREATE TRIGGER backend_job_input_retirement BEFORE UPDATE ON backend_job_attempts BEGIN SELECT RAISE(ABORT,'collision'); END;")?; Ok(())
-        }).unwrap();
+        for table in [
+            "accounts",
+            "workspaces",
+            "backend_jobs",
+            "backend_job_attempts",
+        ] {
+            let columns = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let names = columns.join(",");
+            let rows = store
+                .with_conn(|source| {
+                    Ok(fixture_query_rows(
+                        source,
+                        &format!("SELECT {names} FROM {table}"),
+                    ))
+                })
+                .unwrap();
+            let placeholders = vec!["?"; columns.len()].join(",");
+            for row in rows {
+                conn.execute(
+                    &format!("INSERT INTO {table} ({names}) VALUES ({placeholders})"),
+                    rusqlite::params_from_iter(row),
+                )
+                .unwrap();
+            }
+        }
         drop(store);
-        let conn = Connection::open(&path).unwrap();
-        configure_sqlite(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 102);
+        verify_schema_history(&conn, 102).unwrap();
+        assert!(!column_exists(&conn, "backend_jobs", "input_disposition").unwrap());
+        conn.execute_batch("CREATE TRIGGER backend_job_input_retirement BEFORE UPDATE ON backend_job_attempts BEGIN SELECT RAISE(ABORT,'collision'); END;").unwrap();
         assert!(migrate_job_input_retention_v102_to_v103(&conn).is_err());
         assert_eq!(current_schema_version(&conn).unwrap(), 102);
         assert!(!column_exists(&conn, "backend_jobs", "input_disposition").unwrap());

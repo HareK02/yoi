@@ -1,7 +1,7 @@
 import type {
   TicketAssignmentPrincipalSnapshot,
-  TicketClosureReason,
   TicketBrowseQueryRequest,
+  TicketClosureReason,
   WorkspaceTag,
 } from "../../generated/ticket-api.ts";
 
@@ -77,6 +77,13 @@ function tagId(value: string, tags: readonly WorkspaceTag[]): string {
 }
 
 function principal(value: string): TicketAssignmentPrincipalSnapshot {
+  if (value.startsWith("subject:")) {
+    const subject_id = value.slice("subject:".length);
+    if (!subject_id.trim()) {
+      throw new Error("Enter a Subject identity after subject:");
+    }
+    return { kind: "subject", subject_id };
+  }
   if (value === "orchestrator") {
     return { kind: "workspace_agent", agent_key: "workspace-orchestrator" };
   }
@@ -90,7 +97,7 @@ function principal(value: string): TicketAssignmentPrincipalSnapshot {
     }
   }
   throw new Error(
-    "Invalid assignee: value; use orchestrator, user/<account-id>, or worker/<runtime-id>/<worker-id>.",
+    "Invalid assignee: value; use subject:<subject-id>. Audit-only legacy filters: orchestrator, user/<account-id>, or worker/<runtime-id>/<worker-id>.",
   );
 }
 

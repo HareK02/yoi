@@ -154,6 +154,23 @@ fn fixed_worker_target(
     })
 }
 
+fn authorize_worker_attention(
+    api: &WorkspaceApi,
+    input: &TicketWorkerNotification,
+) -> ApiResult<()> {
+    subject_authorization::authorize(
+        api,
+        &input.worker,
+        &server_api::authorization::OperationAuthorizationRequest {
+            operation: "ticket.read".into(),
+            resource: server_api::authorization::PermissionResource::Ticket {
+                workspace_id: api.workspace_id().into(),
+                ticket_id: input.ticket_id.clone(),
+            },
+        },
+    )
+}
+
 pub(super) fn dispatch_ticket_worker_notifications(api: &WorkspaceApi) {
     let Some(_permit) = api.notification_delivery_lifecycle.begin() else {
         return;
@@ -182,6 +199,10 @@ pub(super) fn dispatch_ticket_worker_notifications(api: &WorkspaceApi) {
                 continue;
             }
         };
+        if authorize_worker_attention(api, &input).is_err() {
+            record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
+            continue;
+        }
         let resource_key = match api.store.resource_key(
             &api.config.workspace_id,
             WorkspaceResourceKind::Ticket,
@@ -199,13 +220,17 @@ pub(super) fn dispatch_ticket_worker_notifications(api: &WorkspaceApi) {
             "Ticket {resource_key} has committed activity (input {}). Reread the current Ticket and assignment before acting. This notification does not grant or extend execution authority.",
             input.input_event_id,
         );
-        let content = match api.store.prepare_ticket_worker_notification_content(
+        if authorize_worker_attention(api, &input).is_err() {
+            record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
+            continue;
+        }
+        match api.store.prepare_ticket_worker_notification_content(
             &api.config.workspace_id,
             &input.delivery_id,
             &content,
             &target,
         ) {
-            Ok(content) => content,
+            Ok(_) => (),
             Err(error) => {
                 let code = match error {
                     Error::TicketAssignmentConflict(_) => {
@@ -217,6 +242,22 @@ pub(super) fn dispatch_ticket_worker_notifications(api: &WorkspaceApi) {
                 continue;
             }
         };
+        let content = match api.store.admit_ticket_worker_notification_send(
+            api.workspace_id(),
+            &input.delivery_id,
+            &target,
+        ) {
+            Ok(Some(content)) => content,
+            Ok(None) => continue,
+            Err(_) => {
+                record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
+                continue;
+            }
+        };
+        if authorize_worker_attention(api, &input).is_err() {
+            record_notification_failure(api, &key, NotificationFailureCode::PreparationFailed);
+            continue;
+        }
         let result = api.runtime.send_input(
             &input.worker,
             WorkerInputRequest {
@@ -274,26 +315,35 @@ pub(super) fn recover_ticket_notifications(api: &WorkspaceApi) {
     };
     recover_job_notifications(api);
     dispatch_ticket_worker_notifications(api);
-    if let Some(orchestrator) = find_workspace_orchestrator(api) {
-        dispatch_orchestrator_assignment_attention(api, &orchestrator.worker);
-    } else {
-        // Still reconcile committed sources and explain target absence even when
-        // there is no Runtime Worker. Do not start or restore one as a side effect.
-        match api
-            .store
-            .list_pending_ticket_assignment_deliveries(&api.config.workspace_id, 20)
-        {
-            Ok(inputs) => {
-                for input in inputs {
-                    record_notification_failure(
-                        api,
-                        &assignment_delivery_key(&input),
-                        NotificationFailureCode::TargetUnavailable,
-                    );
-                }
-            }
-            Err(error) => tracing::warn!(%error, "assignment notification scan failed"),
+    // Resolve each current assignment independently. A missing body is not an implicit restore.
+    let inputs = match api
+        .store
+        .list_pending_ticket_assignment_deliveries(api.workspace_id(), 100)
+    {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            tracing::warn!(%error, "assignment notification scan failed");
+            return;
         }
+    };
+    let mut recipients = std::collections::BTreeSet::new();
+    for input in inputs {
+        match assigned_subject_body(api, &input.ticket_id, &input.assignment_id) {
+            Ok(Some(worker)) => {
+                recipients.insert((worker.runtime_id, worker.worker_id));
+            }
+            _ => record_notification_failure(
+                api,
+                &assignment_delivery_key(&input),
+                NotificationFailureCode::TargetUnavailable,
+            ),
+        }
+    }
+    for (runtime_id, worker_id) in recipients {
+        dispatch_orchestrator_assignment_attention(
+            api,
+            &RuntimeWorkerRef::new(runtime_id, worker_id),
+        );
     }
 }
 

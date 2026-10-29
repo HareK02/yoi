@@ -8092,6 +8092,9 @@ pub struct TicketAssignmentSummary {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[cfg_attr(feature = "typescript", ts(tag = "kind", rename_all = "snake_case"))]
 pub enum TicketAssignmentPrincipal {
+    Subject {
+        subject_id: String,
+    },
     User {
         account_id: String,
     },

@@ -27,7 +27,11 @@ fn plugin_catalog_migration_matches_fresh_schema_from_oldest_retained_and_105() 
             assert_eq!(catalog_schema(c),canonical);
             let after=workspace_schema_migration_history(c)?;
             assert!(after.starts_with(&before));
-            assert_eq!(after.last().unwrap(),&(106,crate::plugin_catalog::MIGRATION_NAME.into()));
+            // Plugin catalog remains migration 106 even when startup applies later steps.
+            assert_eq!(after.iter().filter(|(version, _)| *version == 106).cloned().collect::<Vec<_>>(),
+                vec![(106, crate::plugin_catalog::MIGRATION_NAME.into())]);
+            assert_eq!(after.last().unwrap(), &(107, "Subject Ticket responsibility and current-body notification routing".into()));
+            assert_eq!(current_schema_version(c)?, LATEST_SCHEMA_VERSION);
             assert_eq!(c.query_row("SELECT display_name FROM workspaces WHERE workspace_id='plugin-workspace'",[],|r|r.get::<_,String>(0))?,"Plugins");
             assert_eq!(c.query_row("SELECT count(*) FROM pragma_foreign_key_check",[],|r|r.get::<_,i64>(0))?,0);
             assert!(c.execute("INSERT INTO plugin_installations VALUES('absent','i','alias','p','operation',0)",[]).is_err());
@@ -57,7 +61,14 @@ fn plugin_catalog_migration_marker_failure_rolls_back_then_retries_without_chang
     let migrated = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     migrated
         .with_conn(|c| {
-            assert_eq!(current_schema_version(c)?, 106);
+            assert_eq!(current_schema_version(c)?, LATEST_SCHEMA_VERSION);
+            let mut expected = before.clone();
+            expected.push((106, crate::plugin_catalog::MIGRATION_NAME.into()));
+            expected.push((
+                107,
+                "Subject Ticket responsibility and current-body notification routing".into(),
+            ));
+            assert_eq!(workspace_schema_migration_history(c)?, expected);
             crate::plugin_catalog::verify(c)?;
             Ok(())
         })

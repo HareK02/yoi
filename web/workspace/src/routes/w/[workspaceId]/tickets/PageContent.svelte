@@ -9,7 +9,6 @@
     workspaceApiJsonWithBody,
     workspaceApiPath,
   } from "#lib/workspace/api/http.ts";
-  import { parseBrowserWorkspaceOrchestratorResponse } from "#lib/workspace/api/workers.ts";
   import { loadWorkspaceRepositoryList } from "#lib/workspace/api/repositories.ts";
   import type { RepositoryListResponse } from "#lib/generated/repository-api.ts";
   import {
@@ -27,7 +26,6 @@
   import { ticketHref } from "#lib/workspace/resource-links.ts";
   import {
     currentOrchestratorAssignment, assignmentPrincipalLabel, handlingLabel, closureReasonLabel,
-    type WorkspaceOrchestratorStatus,
   } from "#lib/workspace/tickets/ticket-panel.ts";
   import type { PageData as RouteData } from "./$types";
   import type { ResolvedPageData } from "#lib/workspace/navigation/deferred.ts";
@@ -56,9 +54,6 @@
       searchBusy = false;
       pageBusy = false;
       navigationError = null;
-      orchestrator = { data: null, error: null };
-      orchestratorLoading = true;
-      orchestratorStarting = false;
       repositoryResponse = { data: null, error: null };
       repositoriesLoading = false;
       creatingTicket = false;
@@ -67,13 +62,9 @@
       createTitle = "";
       createBody = "";
       createTargets = [];
-      void loadOrchestrator(currentData, generation);
     });
     return () => { ++routeGeneration; };
   });
-  let orchestrator = $state<ApiResult<WorkspaceOrchestratorStatus>>({ data: null, error: null });
-  let orchestratorLoading = $state(true);
-  let orchestratorStarting = $state(false);
   let creatingTicket = $state(false);
   let createBusy = $state(false);
   let createError = $state<string | null>(null);
@@ -98,16 +89,6 @@
   });
   function isCurrent(observedData: PageData, generation: number): boolean {
     return data === observedData && routeGeneration === generation;
-  }
-
-  async function loadOrchestrator(observedData: PageData, generation: number): Promise<void> {
-    const result = await loadJson(
-      fetch, workspaceApiPath(observedData.workspaceId, "/orchestrator"), undefined,
-      parseBrowserWorkspaceOrchestratorResponse,
-    );
-    if (!isCurrent(observedData, generation)) return;
-    orchestrator = result;
-    orchestratorLoading = false;
   }
 
   async function loadRepositories(): Promise<void> {
@@ -242,22 +223,6 @@
     }
   }
 
-  async function startOrchestrator() {
-    if (orchestratorLoading || orchestratorStarting || orchestrator.data?.online) return;
-    const observedData = data;
-    const generation = routeGeneration;
-    orchestratorStarting = true;
-    const result = await loadJson<WorkspaceOrchestratorStatus>(
-      fetch,
-      workspaceApiPath(observedData.workspaceId, "/orchestrator"),
-      { method: "POST" },
-      parseBrowserWorkspaceOrchestratorResponse,
-    );
-    if (!isCurrent(observedData, generation)) return;
-    orchestrator = result;
-    orchestratorStarting = false;
-  }
-
   function prettyDate(value?: string | null): string {
     if (!value) return "—";
     const date = new Date(value);
@@ -280,23 +245,7 @@
         type="button"
         onclick={toggleCreate}
       >{creatingTicket ? "Cancel" : "Add Ticket"}</button>
-      <div class="orchestrator-status" data-online={orchestrator.data?.online} aria-busy={orchestratorLoading}>
-        <span class="orchestrator-status-dot"></span>
-        <div>
-          <strong>Orchestrator</strong>
-          <span>{orchestratorLoading ? "Checking…" : orchestrator.data ? orchestrator.data.online ? "Online" : "Offline" : "Unavailable"}</span>
-        </div>
-        {#if orchestrator.data && !orchestrator.data.online}
-          <button
-            class="workspace-secondary-button"
-            type="button"
-            disabled={orchestratorStarting}
-            onclick={startOrchestrator}
-          >
-            {orchestratorStarting ? "Starting…" : "Start Orchestrator"}
-          </button>
-        {/if}
-      </div>
+
     </div>
   </header>
 
@@ -347,11 +296,6 @@
     </form>
   {/if}
 
-  {#if orchestrator.error}
-    <p class="workspace-callout is-error">
-      Orchestrator status: {orchestrator.error}
-    </p>
-  {/if}
 
   <form class="ticket-query-form" onsubmit={searchTickets} aria-label="Search tickets">
     <input name="q" type="search" aria-label="Search tickets" bind:value={searchText}
@@ -364,11 +308,11 @@
     <details class="ticket-search-help">
       <summary>Search syntax</summary>
       <p>Combine text with <code>state:open</code> or <code>state:closed</code>. Omit state to search both.</p>
-      <p><code>tag:"UI bug"</code> · <code>assignee:orchestrator</code> · <code>reason:completed</code></p>
+      <p><code>tag:"UI bug"</code> · <code>assignee:subject:SUBJECT_ID</code> · <code>reason:completed</code></p>
       <p>Other principals: <code>assignee:user/account-id</code> or <code>assignee:worker/runtime-id/worker-id</code>.
         Custom close reason: <code>reason:"Superseded plan"</code>.</p>
     </details>
-    <a href={'/w/' + encodeURIComponent(data.workspaceId) + '/orchestrator'}>Orchestrator handling</a>
+    <a href={'/w/' + encodeURIComponent(data.workspaceId) + '/orchestrator'}>Subject handling</a>
   </div>
   {#if navigationError}<p class="workspace-callout is-error" role="alert">{navigationError}</p>{/if}
 
