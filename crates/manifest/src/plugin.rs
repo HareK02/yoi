@@ -602,6 +602,29 @@ pub fn verify_plugin_artifact(
     Ok(package)
 }
 
+/// Static schema identity shared by catalog publication and Runtime verification.
+/// Derivation belongs with the package contract so consumers cannot invent a
+/// different schema hash or namespace while agreeing on archive bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginConfigSchemaIdentity {
+    pub identity: String,
+    pub version: String,
+    pub digest: String,
+    pub namespace: String,
+}
+
+pub fn plugin_config_schema_identity(
+    manifest: &PluginPackageManifest,
+) -> PluginConfigSchemaIdentity {
+    let digest = artifact_digest(manifest.config_schema.as_bytes());
+    PluginConfigSchemaIdentity {
+        identity: format!("{}/config", manifest.id),
+        version: manifest.version.clone(),
+        namespace: format!("{}/config/{}/{}", manifest.id, manifest.version, digest),
+        digest,
+    }
+}
+
 fn artifact_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", hex_lower(&Sha256::digest(bytes)))
 }

@@ -182,3 +182,37 @@ pub struct PluginOperationResponse {
     pub kind: PluginOperationKind,
     pub installation: PluginInstallation,
 }
+
+/// Namespace a byte cache by the authenticated Server origin and signing key.
+/// This is not a package hash or an authorization decision. Hosts derive the
+/// bundle from their current registered authority, never from a delivery reply.
+pub fn plugin_server_authority_identity(bundle: &crate::WorkspacePublicIdentityBundle) -> String {
+    serde_json::to_string(&(
+        bundle.backend_url.trim_end_matches('/'),
+        &bundle.public_key_fingerprint,
+    ))
+    .expect("string tuple is serializable")
+}
+
+/// A selection within a persisted plan, never digest-only retrieval authority.
+/// Workspace and Worker identities come from authenticated Host context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginArtifactDeliveryRequest {
+    pub plan_id: String,
+    pub plan_fingerprint: String,
+    pub installation_id: String,
+    pub artifact_digest: String,
+}
+
+/// Fresh owner observation for one exact selection. Cache only bytes, not this
+/// observation or the Workspace's configuration, grants or installation state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginArtifactDeliveryMetadata {
+    pub workspace_id: String,
+    pub request: PluginArtifactDeliveryRequest,
+    pub artifact: PluginArtifact,
+}
