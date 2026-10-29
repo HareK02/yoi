@@ -1012,18 +1012,23 @@ mod plugin_controller_tests {
             .unwrap();
         finish(&mut connection, protocol::RunResult::Cancelled).await;
         peer.closed().await;
-        let cancelled: bool = f
-            .api
-            .config_store
-            .with_conn(|conn| {
-                Ok(conn.query_row(
-            "SELECT cancelled FROM plugin_invocations WHERE workspace_id=?1 AND invocation_id=?2",
-            rusqlite::params![TEST_WORKSPACE_ID, effect.0], |row| row.get(0))?)
-            })
-            .unwrap();
+        // The Controller bounds cancellation acknowledgement. If the owner call
+        // misses that deadline, cancellation is unknown, not confirmed. In both
+        // cases the already-admitted effect must remain consumed and may never
+        // expose a successful response or be re-keyed on restore.
+        let (state, response, error): (String, Option<u16>, Option<String>) = f.api.config_store.with_conn(|conn| {
+            Ok(conn.query_row("SELECT state,response_status,error_json FROM plugin_effect_receipts WHERE workspace_id=?1 AND invocation_id=?2 AND effect_key='status-v1'",
+                rusqlite::params![TEST_WORKSPACE_ID, effect.0], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?)
+        }).unwrap();
+        assert!(matches!(state.as_str(), "pending" | "completed"));
         assert!(
-            cancelled,
-            "Controller cancellation must reach the durable Host owner"
+            response.is_none(),
+            "cancelled submission must not publish an HTTPS success"
+        );
+        let error: server_api::PluginHostError = serde_json::from_str(&error.unwrap()).unwrap();
+        assert_eq!(
+            error.effect,
+            server_api::PluginEffectObservation::Indeterminate
         );
         assert_eq!(
             f.requests.lock().unwrap().len(),

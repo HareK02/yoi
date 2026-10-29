@@ -520,7 +520,7 @@ async fn backend_control_grant_does_not_replace_exact_operation_use_permission()
         wrong_workspace,
     ] {
         permissions.push(workspace_permission("worker.create"));
-        f.assign(permissions, vec![]).await;
+        f.seed_saved_policy(permissions, vec![]);
         assert_backend_denied(&f, &f.source, &target, Some(StatusCode::FORBIDDEN)).await;
     }
     f.assign(vec![operation_permission("worker.messaging")], vec![])
@@ -604,7 +604,7 @@ async fn saved_targeted_message_permissions_preserve_target_direction_and_reject
         let target = f.child("saved-target", vec![]).await;
         let other = f.child("saved-other-target", vec![]).await;
         let saved = target_permission(legacy, &target);
-        let policy = f.assign(vec![saved.clone()], vec![]).await;
+        let policy = f.seed_saved_policy(vec![saved.clone()], vec![]);
         assert_eq!(
             policy.execution,
             vec![saved.clone()],
