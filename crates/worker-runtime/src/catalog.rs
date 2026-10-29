@@ -284,8 +284,9 @@ pub struct CreateWorkerRequest {
     pub workdir_attachment_requests: Vec<WorkingDirectoryAttachmentRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workdir_attachments: Vec<WorkingDirectoryAttachmentClaim>,
-    /// Backend-only feature enablement. Grants still define local Runtime peers;
-    /// the Workspace provider reauthorizes its dynamic set per operation.
+    /// Backend-only enablement of the optional Runtime-local peer provider.
+    /// Scoped Backend observation is composed by the Worker Feature, independently
+    /// of this saved flag, and rechecks operation use plus current target control.
     #[serde(default, skip_serializing_if = "is_false")]
     pub worker_observation_enabled: bool,
     /// Backend-authored, bounded peer session grants. Runtime revalidates each

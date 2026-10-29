@@ -7,6 +7,10 @@
 use super::*;
 #[path = "subject_job_model_supply_tests.rs"]
 mod subject_job_model_supply;
+#[path = "worker_messaging_connected_tests.rs"]
+mod worker_messaging_connected;
+#[path = "worker_operation_authorization_tests.rs"]
+mod worker_operation_authorization;
 use agen::tool::{Tool, ToolExecutionContext, ToolOutput};
 use server_api::authorization::{
     PermissionResource, ScopedPermission, SubjectPermissions, SubjectPermissionsUpdate,
@@ -568,7 +572,7 @@ fn concrete_resource_permissions(f: &Fixture) -> Vec<ScopedPermission> {
             },
         ),
         (
-            "worker.observe",
+            "subworker.observe",
             PermissionResource::SubWorker {
                 runtime_id: f.source.runtime_id.clone(),
                 worker_id: f.source.worker_id.clone(),
@@ -2656,32 +2660,61 @@ async fn delegated_subject_child_cannot_downgrade_ticket_start_to_manual_by_omit
     );
 }
 
-/// Shared real HTTP Backend/Runtime fixture. Only the injected model is scripted;
-/// Workdir materialization, Profile Controllers and tool dispatch are production.
-struct ConnectedAuthorizationFixture {
-    _runtime_server: ConnectedRuntimeServer,
-    _backend_server: AuthorizationCallbackServer,
+const CONNECTED_RUNTIME: &str = "connected-subject-authorization";
+
+/// Shared signed Backend/Runtime connection. Only the supplied model is replaced;
+/// temporary roots, request authentication and Controller/tool dispatch stay real.
+struct ConnectedWorkerHarness {
     api: WorkspaceApi,
+    runtime: worker_runtime::Runtime,
+    factory: worker_runtime::worker_backend::ProfileRuntimeWorkerFactory,
     identity: RuntimeIdentityMaterial,
     backend_url: String,
-    materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
-    runtime_errors: Arc<Mutex<Vec<String>>>,
-    authorizations: Arc<Mutex<Vec<(Value, StatusCode)>>>,
     owner: String,
+    materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
+    authorizations: Arc<Mutex<Vec<(Value, StatusCode)>>>,
+    runtime_errors: Arc<Mutex<Vec<String>>>,
+    _backend_server: AuthorizationCallbackServer,
+    _runtime_server: ConnectedRuntimeServer,
     _dir: tempfile::TempDir,
 }
-impl ConnectedAuthorizationFixture {
-    const RUNTIME: &'static str = "connected-subject-authorization";
+impl ConnectedWorkerHarness {
+    async fn human(&self, method: reqwest::Method, path: &str, body: Value) -> (StatusCode, Value) {
+        let response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap()
+            .request(method.clone(), format!("{}{path}", self.backend_url))
+            .bearer_auth(&self.owner)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+        let bytes = response.bytes().await.unwrap();
+        let body = if status == StatusCode::NO_CONTENT {
+            assert!(bytes.is_empty(), "{method} {path}: HTTP204 must be empty");
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                panic!(
+                    "{method} {path}: HTTP{status}, invalid JSON: {error}; body={:?}",
+                    String::from_utf8_lossy(&bytes)
+                )
+            })
+        };
+        (status, body)
+    }
 
-    async fn new<M: agen::llm_client::LlmClient + Clone + 'static>(model: M) -> Self {
-        let runtime_id = Self::RUNTIME;
+    async fn start<M: agen::llm_client::LlmClient + Clone + 'static>(model: M) -> Self {
+        const RUNTIME: &str = CONNECTED_RUNTIME;
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_url = format!("http://{}", backend_listener.local_addr().unwrap());
         let runtime_url = format!("http://{}", runtime_listener.local_addr().unwrap());
-        let identity = RuntimeIdentityMaterial::generate(runtime_id).unwrap();
+        let identity = RuntimeIdentityMaterial::generate(RUNTIME).unwrap();
         let runtime_root = dir.path().join("connected-runtime");
         let materializer = worker_runtime::working_directory::RuntimeGitMaterializer::new(
             dir.path().join("connected-workdirs"),
@@ -2694,19 +2727,20 @@ impl ConnectedAuthorizationFixture {
             worker_runtime::workspace_request::RuntimeWorkspaceRequestClient::new(
                 TEST_WORKSPACE_ID,
                 &backend_url,
-                runtime_id,
+                RUNTIME,
             )
             .with_runtime_request_source(&identity, &backend_url),
         )
         .with_runtime_store_dir(&runtime_root)
         .with_spawn_model_client_factory(move || Box::new(model.clone()));
-        let execution = worker_runtime::worker_backend::WorkerRuntimeExecutionBackend::new(factory)
-            .unwrap()
-            .with_working_directory_materializer(materializer.clone());
+        let execution =
+            worker_runtime::worker_backend::WorkerRuntimeExecutionBackend::new(factory.clone())
+                .unwrap()
+                .with_working_directory_materializer(materializer.clone());
         let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
             worker_runtime::fs_store::FsRuntimeStoreOptions {
                 root: runtime_root,
-                runtime_id: runtime_id.into(),
+                runtime_id: RUNTIME.into(),
                 display_name: None,
             },
             Arc::new(execution),
@@ -2733,8 +2767,8 @@ impl ConnectedAuthorizationFixture {
             .upsert_workspace_runtime_binding_record(
                 WorkspaceRuntimeBinding {
                     workspace_id: TEST_WORKSPACE_ID.into(),
-                    runtime_id: runtime_id.into(),
-                    display_name: runtime_id.into(),
+                    runtime_id: RUNTIME.into(),
+                    display_name: RUNTIME.into(),
                     base_url: runtime_url.clone(),
                     public_key: identity.public_key.clone(),
                     public_key_fingerprint: String::new(),
@@ -2750,7 +2784,7 @@ impl ConnectedAuthorizationFixture {
             .unwrap();
         let binding = api
             .store
-            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, runtime_id)
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, RUNTIME)
             .await
             .unwrap()
             .unwrap();
@@ -2792,7 +2826,7 @@ impl ConnectedAuthorizationFixture {
                 None,
                 worker_runtime::http_server::WorkspaceRuntimeHttpAuth {
                     verifier,
-                    runtime_id: runtime_id.into(),
+                    runtime_id: RUNTIME.into(),
                 },
             )
             .layer(axum::middleware::from_fn(
@@ -2800,7 +2834,9 @@ impl ConnectedAuthorizationFixture {
                     let errors = captured_errors.clone();
                     async move {
                         let response = next.run(request).await;
-                        if response.status().is_success() {
+                        if !response.status().is_client_error()
+                            && !response.status().is_server_error()
+                        {
                             return response;
                         }
                         let (parts, body) = response.into_parts();
@@ -2820,9 +2856,9 @@ impl ConnectedAuthorizationFixture {
         api.runtime.register_or_replace(
             RemoteWorkerRuntime::new(
                 RemoteRuntimeConfig {
-                    runtime_id: runtime_id.into(),
+                    runtime_id: RUNTIME.into(),
                     workspace_id: Some(TEST_WORKSPACE_ID.into()),
-                    display_name: runtime_id.into(),
+                    display_name: RUNTIME.into(),
                     base_url: runtime_url,
                     bearer_token: None,
                     workspace_authorization: Some(
@@ -2845,7 +2881,6 @@ impl ConnectedAuthorizationFixture {
             )
             .unwrap(),
         );
-        install_subject_profiles(&api, "workspace_write");
         seed_test_delivery_binding(&api);
 
         let authorizations = Arc::new(Mutex::new(Vec::<(Value, StatusCode)>::new()));
@@ -2875,33 +2910,21 @@ impl ConnectedAuthorizationFixture {
         let owner =
             seed_test_workspace_owner_token(api.store.as_ref(), "connected-authorization-owner")
                 .await;
+
         Self {
             api,
+            runtime,
+            factory,
             identity,
             backend_url,
-            materializer,
-            runtime_errors,
-            authorizations,
             owner,
-            _runtime_server: runtime_server,
+            materializer,
+            authorizations,
+            runtime_errors,
             _backend_server: backend_server,
+            _runtime_server: runtime_server,
             _dir: dir,
         }
-    }
-
-    async fn human(&self, method: reqwest::Method, path: &str, body: Value) -> (StatusCode, Value) {
-        let response = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap()
-            .request(method, format!("{}{path}", self.backend_url))
-            .bearer_auth(&self.owner)
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
-        let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
-        (status, response.json().await.unwrap())
     }
 }
 
@@ -2910,16 +2933,17 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
 {
     use worker_runtime::working_directory::WorkingDirectoryMaterializer;
 
-    const RUNTIME: &str = ConnectedAuthorizationFixture::RUNTIME;
+    const RUNTIME: &str = CONNECTED_RUNTIME;
     let (completed, mut completion) = tokio::sync::mpsc::channel(4);
-    let f = ConnectedAuthorizationFixture::new(ConnectedAuthorizationModel { completed }).await;
-    let api = &f.api;
-    let backend_url = &f.backend_url;
-    let identity = &f.identity;
-    let materializer = &f.materializer;
-    let runtime_errors = &f.runtime_errors;
-    let authorizations = &f.authorizations;
-    let owner = &f.owner;
+    let harness = ConnectedWorkerHarness::start(ConnectedAuthorizationModel { completed }).await;
+    let api = &harness.api;
+    let identity = &harness.identity;
+    let backend_url = &harness.backend_url;
+    let owner = &harness.owner;
+    let materializer = &harness.materializer;
+    let authorizations = &harness.authorizations;
+    let runtime_errors = &harness.runtime_errors;
+    install_subject_profiles(api, "workspace_write");
     let (status, created_workdir) = response(&api, human_request(&owner, "POST",
         &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
         Some(json!({"runtime_id":RUNTIME, "repository_key":"test-repository", "selector":"HEAD", "operation_id":"connected-authorization-workdir"})))).await;
@@ -3301,12 +3325,13 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
         request: Value,
     }
     let (completed, mut completion) = tokio::sync::mpsc::channel(2);
-    let f = ConnectedAuthorizationFixture::new(ConcurrentTicketAuthorizationModel {
+    let f = ConnectedWorkerHarness::start(ConcurrentTicketAuthorizationModel {
         overlap: Arc::new(tokio::sync::Barrier::new(2)),
         completed,
     })
     .await;
     let api = &f.api;
+    install_subject_profiles(api, "workspace_write");
     let subjects = open_subjektiv_store(api).unwrap();
     let mut cases = Vec::new();
     for label in ["alpha", "beta"] {
@@ -3320,10 +3345,14 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
                 .unwrap()
                 .success()
         );
-        let (status, created) = f.human(reqwest::Method::POST,
-            &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
-            json!({"runtime_id":ConnectedAuthorizationFixture::RUNTIME, "repository_key":"test-repository",
-                "selector":branch, "operation_id":format!("parallel-{label}-workdir")})).await;
+        let (status, created) = f
+            .human(
+                reqwest::Method::POST,
+                &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
+                json!({"runtime_id":CONNECTED_RUNTIME, "repository_key":"test-repository",
+                "selector":branch, "operation_id":format!("parallel-{label}-workdir")}),
+            )
+            .await;
         assert_eq!(status, StatusCode::CREATED, "{created}");
         let workdir = created["item"]["working_directory_id"]
             .as_str()
@@ -3395,6 +3424,12 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
         .map(|operation| subject_permission(&subject, operation))
         .collect();
         execution.push(ticket_permission("ticket.assignment.assign"));
+        execution.push(ScopedPermission {
+            operation: "worker.create".into(),
+            resource: PermissionResource::Workspace {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            },
+        });
         let (status, policy) = f
             .human(
                 reqwest::Method::POST,
@@ -3408,7 +3443,7 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
         assert_eq!(policy.delegation, permissions);
         let (status, source) = f.human(reqwest::Method::POST,
             &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
-            json!({"runtime_id":ConnectedAuthorizationFixture::RUNTIME, "display_name":format!("{label} read-only body"),
+            json!({"runtime_id":CONNECTED_RUNTIME, "display_name":format!("{label} read-only body"),
                 "profile":"project:authority-source", "initial_submit":[], "workdir_attachments":[],
                 "feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
         assert_eq!(
@@ -3447,7 +3482,7 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
             .unwrap()
             .to_owned();
         let content = format!("connected {label} result");
-        let request = json!({"runtime_id":ConnectedAuthorizationFixture::RUNTIME,
+        let request = json!({"runtime_id":CONNECTED_RUNTIME,
             "display_name":format!("{label} delegated Ticket editor"), "profile":"project:authority-editor",
             "ticket_assignment":{"ticket_id":ticket.id, "operation_id":format!("parallel-{label}-start"),
                 "orchestrator_assignment_id":delegation},

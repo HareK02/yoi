@@ -125,14 +125,10 @@ impl WorkerObservationProvider for WorkspaceClientWorkerObservationProvider {
             )
         })?;
         match subject {
-            WorkerObservationSubjectRef::RuntimeWorker {
-                runtime_id,
-                worker_id,
-            } => self.client.authorize_operation(
+            WorkerObservationSubjectRef::RuntimeWorker { .. } => self.client.authorize_operation(
                 "worker.observe",
-                &server_api::authorization::PermissionResource::Worker {
-                    runtime_id: runtime_id.clone(),
-                    worker_id: worker_id.clone(),
+                &server_api::authorization::PermissionResource::WorkerOperation {
+                    workspace_id: _workspace_id.into(),
                 },
             ),
             WorkerObservationSubjectRef::SubWorker { name } => self
