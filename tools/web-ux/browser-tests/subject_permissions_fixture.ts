@@ -1,7 +1,6 @@
 /**
- * Synthetic HTTP state for T-802 browser UX only. NOT the real Backend,
- * authentication, authorization, operation catalog, or cancellation implementation.
- * Keep real Backend integration evidence separate from these browser fixtures.
+ * Browser UXだけの合成HTTP状態。実Backend、認証、認可、操作catalog、取消の実装ではない。
+ * 実Backendの結合証拠は、このbrowser fixtureと分けて保持する。
  */
 export const permissionFixtureSubjects = [
   ["permissions-empty", "New Subject — permissions not configured"],
@@ -31,7 +30,7 @@ export const fixtureLegacyPermission: FixturePermission = {
   operation: "worker.notify",
   resource: { kind: "worker", runtime_id: "legacy-runtime", worker_id: "legacy-recipient" },
 };
-// Deliberately a small synthetic catalog, not a copy/second authority for production.
+// 小さな合成catalogに限定する。製品catalogの複製や第二正本ではない。
 export const fixturePermissionOperations: {
   operation: string;
   label: string;
@@ -105,8 +104,8 @@ export function createSubjectPermissionsFixture() {
   return async (request: Request): Promise<Response | null> => {
     const url = new URL(request.url);
     if (url.pathname === "/api/auth/whoami") {
-      // Exercise the real Web's admission gate with a synthetic HTTP session projection.
-      // No cookies/tokens or real Backend session are created or bypassed.
+      // 合成HTTP session projectionで実Webの画面入場判定を通す。
+      // 実Backendのsessionやcookie/tokenは作成・迂回しない。
       return json({
         actor: {
           user_id: "synthetic-owner",
@@ -156,7 +155,7 @@ export function createSubjectPermissionsFixture() {
       requests.push({ subject_id: id, request: payload, outcome: "conflict" });
       return error("Policy changed in another browser; reload and review", 409);
     }
-    // Reject only the combinations used by this fixture. This is NOT Backend validation evidence.
+    // fixtureで使う組合せだけを拒否する。Backend検証の証拠にはしない。
     for (const p of [...payload.execution, ...payload.delegation]) {
       const legacy = JSON.stringify(p) === JSON.stringify(fixtureLegacyPermission) &&
         id === "permissions-legacy";

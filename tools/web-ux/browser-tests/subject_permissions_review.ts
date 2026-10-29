@@ -1,5 +1,5 @@
 #!/usr/bin/env -S deno run -A
-/** Actual built Web + synthetic HTTP. No real Backend auth/Worker success claim. */
+/** 実Web buildを合成HTTPで操作する。実Backend認証やWorker動作の証拠ではない。 */
 import { assert, assertEquals } from "@std/assert";
 import { dirname, fromFileUrl, join, resolve } from "@std/path";
 import { chromium, type Page } from "playwright";
@@ -11,7 +11,7 @@ const root = resolve(dirname(fromFileUrl(import.meta.url)), "../../..");
 const buildRoot = resolve(Deno.args[0] ?? join(root, "web/workspace/build"));
 const runId = Deno.args[1] ?? `after-${new Date().toISOString().replaceAll(/[:.]/g, "-")}`;
 if (!/^[a-zA-Z0-9._-]+$/.test(runId)) throw new Error("run id must be a safe filename");
-// Fail fast; the parent owns building Web. Never replace it with a synthetic shell.
+// Web buildは親の責務。欠落時は即失敗させ、合成shellで代替しない。
 for (const name of ["index.html", "_app/immutable"]) {
   await Deno.stat(join(buildRoot, name)).catch(() => {
     throw new Error(`Actual Web build missing: ${join(buildRoot, name)}; parent must supply it.`);
@@ -19,7 +19,7 @@ for (const name of ["index.html", "_app/immutable"]) {
 }
 const output = join(root, "target/web-ux/t-802", runId);
 await Deno.mkdir(dirname(output), { recursive: true });
-await Deno.mkdir(output); // A repeated run ID must not overwrite prior evidence.
+await Deno.mkdir(output); // 同じrun IDで既存の証拠を上書きしない。
 const sourceCommit = await new Deno.Command("git", {
   args: ["rev-parse", "HEAD"],
   cwd: root,
@@ -113,12 +113,12 @@ function observe(page: Page) {
   });
 }
 async function capturePoint(page: Page, id: string, expectedErrors: string[] = []) {
-  // Show the decision being captured, without changing product CSS or layout.
+  // 製品CSSやlayoutを変えず、確認対象の判断が見える位置へ移動する。
   if (id.includes("preview")) await page.locator(".diff").scrollIntoViewIfNeeded();
   else if (/saved|re-read|unknown|recovered|conflict/.test(id)) {
     await page.locator(".permissions > header").scrollIntoViewIfNeeded();
   }
-  // Always retain the image first, even when an overflow assertion will fail.
+  // overflow検査が失敗する場合も、先に画像を保存して根拠を残す。
   const image = join(output, `${id}.png`);
   const snapshot = join(output, `${id}.aria.txt`);
   await page.screenshot({ path: image });
@@ -169,7 +169,7 @@ async function capturePoint(page: Page, id: string, expectedErrors: string[] = [
     imageSha256: await sha256File(image),
     accessibilitySnapshot: snapshot,
     expectedErrors,
-    // Per-page errors are cumulative so reload does not erase recovery evidence.
+    // 再読込みで復旧の証拠を消さないよう、pageごとにerrorを累積する。
     errors: [...diagnostics.get(page) ?? []],
     errorSummary: {
       observed: errorCounts.get(page) ?? 0,
@@ -206,7 +206,7 @@ async function add(
 ) {
   await page.getByRole("combobox", { name: "Permission scope", exact: true }).selectOption(lane);
   await page.getByRole("combobox", { name: "Operation", exact: true }).selectOption(operation);
-  // Exercise the actual name/description/resource input UI, not internal JSON entry.
+  // 内部JSON入力ではなく、実UIの名称・説明・資源入力を操作する。
   await page.getByText(
     operation === "ticket.read"
       ? "Read the selected ticket. Does not allow editing or closing it."
@@ -267,7 +267,7 @@ try {
       try {
         const page = await context.newPage();
         observe(page);
-        // Enter through the ordinary Subject detail navigation.
+        // 通常のSubject詳細から管理導線へ進む。
         await page.goto(`${base}/w/memory-review/memory/permissions-empty`);
         await page.locator(".subject-overview").waitFor();
         await page.locator('main a[href$="/permissions"]').click();
@@ -282,7 +282,7 @@ try {
           `${prefix}-operation-description-resource-input`,
         );
         await add(page, "delegation", "ticket.comment", "T-802");
-        // Use named lane scopes so one grant cannot silently appear in both lanes.
+        // 名前付きlaneで検査し、一つのgrantが両方へ黙って追加されないことを確認する。
         assertEquals(
           await page.locator('.lane[aria-label="Direct operations"]').getByText("Read ticket", {
             exact: true,
@@ -310,7 +310,7 @@ try {
         await page.locator("[data-permission-state=ready]").waitFor();
         await capturePoint(page, `${prefix}-re-read`);
 
-        // Real browser transport loss AFTER the synthetic HTTP fixture accepts the POST.
+        // 合成HTTP fixtureがPOSTを受け付けた後、実browserで応答を消失させる。
         await add(page, "execution", "ticket.comment", "T-803");
         let lost = false;
         await page.route("**/subjektiv/subjects/permissions-empty/permissions", async (route) => {
@@ -323,7 +323,7 @@ try {
         });
         await save(page, "unknown");
         assert(lost);
-        // Fault injection is one-shot; restore ordinary browser networking before evidence capture.
+        // 障害注入は一度だけとし、撮影前に通常のbrowser通信へ戻す。
         await page.unroute("**/subjektiv/subjects/permissions-empty/permissions");
         await capturePoint(page, `${prefix}-unknown`, [
           "Intentional POST response loss after synthetic save",
@@ -343,7 +343,7 @@ try {
           "Intentional earlier POST response loss",
         ]);
 
-        // Two browser pages observe the same synthetic change identity before either save.
+        // 二つのbrowser画面で同じ合成change identityを観測してから保存する。
         const other = await context.newPage();
         observe(other);
         await open(page, base, "permissions-edit");
@@ -397,7 +397,7 @@ try {
         await capturePoint(page, `${prefix}-legacy-preserved`, [
           "Intentional earlier service unavailable GET",
         ]);
-        // Revoke a supported direct permission; this fixture proves UI intent, not real cancellation.
+        // 直接操作の失効を確認する。ここで証明するのはUIの入力であり、実取消ではない。
         await page.getByRole("button", {
           name: "Remove Read ticket from direct operations",
           exact: true,

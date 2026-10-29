@@ -15,11 +15,11 @@ if (
   throw new Error("usage: server.ts <port> <build-root> [section-count: 3..100]");
 }
 
-// Opt-in keeps the existing Memory scenarios and their pagination unchanged.
+// 既存Memory scenarioとpaginationを変えないよう、明示選択時だけ有効にする。
 const permissionsMode = Deno.args[3] === "permissions";
 if (permissionsMode) {
-  // Permission evidence must serve a parent-supplied actual production build.
-  // Do not make /health succeed for a missing build or substitute fixture HTML.
+  // 権限の証拠は親から渡された実製品buildを使って採取する。
+  // build欠落時に/healthを成功させたり、fixture HTMLで代替したりしない。
   await Deno.stat(join(buildRoot, "index.html"));
   await Deno.stat(join(buildRoot, "_app/immutable"));
 }

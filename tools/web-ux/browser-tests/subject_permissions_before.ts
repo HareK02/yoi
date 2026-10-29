@@ -1,5 +1,5 @@
 #!/usr/bin/env -S deno run -A
-/** Capture the actual built Subject detail before UI changes; never builds Web. */
+/** 変更前の実Web buildでSubject詳細を撮影する。Web自体はbuildしない。 */
 import { dirname, fromFileUrl, join, resolve } from "@std/path";
 import { capture } from "../src/capture.ts";
 import type { Scenario } from "../src/types.ts";
@@ -10,7 +10,7 @@ const outputRoot = join(repositoryRoot, "target/web-ux/t-802");
 const buildRoot = resolve(Deno.args[0] ?? join(repositoryRoot, "web/workspace/build"));
 const runPrefix = Deno.args[1] ?? `before-${new Date().toISOString().replaceAll(/[:.]/g, "-")}`;
 if (!/^[a-zA-Z0-9._-]+$/.test(runPrefix)) throw new Error("run id must be a safe filename");
-// Preflight is mandatory. A missing build must not be replaced by fixture HTML.
+// Preflightは必須。buildの欠落をfixture HTMLで代替しない。
 for (const filename of ["index.html", "_app/immutable"]) {
   await Deno.stat(join(buildRoot, filename)).catch(() => {
     throw new Error(
