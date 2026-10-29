@@ -68,6 +68,72 @@ fn assert_publication(
 }
 
 #[tokio::test]
+async fn async_chat_profile_prunes_execution_tools_without_granting_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+    let resolved = manifest::ProfileResolver::new()
+        .with_workspace_base(temp.path())
+        .resolve(
+            &manifest::ProfileSelector::source_named(
+                manifest::ProfileRegistrySource::Builtin,
+                "async-chat",
+            ),
+            manifest::ProfileResolveOptions::with_worker_name("chat-composition"),
+        )
+        .unwrap();
+    let mut manifest = resolved.manifest;
+    // This case isolates registration restrictions from independently tested
+    // Subject startup Memory/Journal authorization and chat Host requirements.
+    manifest.feature.subjektiv.profile.enabled = false;
+    let (_, store) = feature_restore_fixture(&temp);
+    let client = Arc::new(FeatureAdmissionClient::default());
+    let controller = bootstrap(&temp, manifest, store, Some(client.clone()))
+        .prepare()
+        .await
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let names = controller.handle.shared_state.greeting().tools;
+    for forbidden in [
+        "Read",
+        "Write",
+        "Edit",
+        "Glob",
+        "Grep",
+        "Bash",
+        "SubWorkerSpawn",
+        "WebFetch",
+        "WebSearch",
+        "SpawnTicketWorker",
+        "JobRun",
+    ] {
+        assert!(
+            !names.iter().any(|name| name == forbidden),
+            "chat body exposed {forbidden}: {names:?}"
+        );
+    }
+    for required in [
+        "WorkerSpawn",
+        "WorkerNotify",
+        "WorkerStop",
+        "WorkerList",
+        "QueryObjective",
+        "ShowTicket",
+    ] {
+        assert!(
+            names.iter().any(|name| name == required),
+            "chat body lacks {required}: {names:?}"
+        );
+    }
+    assert!(
+        client.requests.lock().unwrap().is_empty(),
+        "Profile activation must not issue authority or read protected content"
+    );
+    stop_body_publication_controller(controller).await;
+}
+
+#[tokio::test]
 async fn objective_and_sub_worker_saved_composition_survives_create_and_restore_matrix() {
     for mode in [manifest::WorkerMode::Tools, manifest::WorkerMode::Wip] {
         for workspace in [false, true] {

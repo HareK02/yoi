@@ -7,6 +7,10 @@ pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, WebSocketOperation};
 pub mod authorization;
+mod chat;
+pub use chat::*;
+mod chat_transport;
+pub use chat_transport::*;
 mod drive;
 mod notification;
 mod plugin;
@@ -210,6 +214,16 @@ macro_rules! impl_openapi_schema {
 }
 
 impl_openapi_schema!(
+    ChatCreateConversationRequest,
+    ChatConversation,
+    ChatUserMessageRequest,
+    ChatSendMessageRequest,
+    ChatMessagePageQuery,
+    ChatMessagePage,
+    ChatMessage,
+    ChatReceiveResponse,
+    ChatWorkerRequest,
+    ChatWorkerResponse,
     PluginInstallRequest,
     PluginAddArtifactRequest,
     PluginRevokeRequest,
@@ -1598,6 +1612,44 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: SubjektivRecordSessionRequest,
     ) -> Result<SubjektivRecordSessionResponse, RepositoryApiError>;
+    #[post("/api/w/{workspace_id}/chat/conversations", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn chat_create_conversation(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: ChatCreateConversationRequest,
+    ) -> Result<ChatConversation, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/chat/conversations/{conversation_id}/messages", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn chat_messages(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] conversation_id: String,
+        #[query] query: ChatMessagePageQuery,
+    ) -> Result<ChatMessagePage, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/chat/conversations/{conversation_id}/messages", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn chat_receive(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] conversation_id: String,
+        #[body] request: ChatUserMessageRequest,
+    ) -> Result<ChatReceiveResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/subjektiv/chat/worker", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    async fn chat_worker_operation(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: ChatWorkerRequest,
+    ) -> Result<ChatWorkerResponse, RepositoryApiError>;
+
     #[post(
         "/api/w/{workspace_id}/subjektiv/memory",
         operation_id = "subjektiv_memory_backend",
@@ -9486,6 +9538,9 @@ pub struct RuntimeWorkerInputRequest {
     #[serde(default)]
     pub kind: Option<String>,
     pub content: String,
+    /// Stable Notify identity. Non-Notify unary input does not share this replay contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segments: Option<Vec<protocol::Segment>>,
 }
@@ -14921,6 +14976,7 @@ mod openapi_artifact_tests {
             "worker_observation_sessions",
             "subjektiv_stage_candidate",
             "subjektiv_record_session",
+            "chat_worker_operation",
             "subjektiv_memory_backend",
             "subjektiv_session_backend",
             "subjektiv_memory_consolidation",

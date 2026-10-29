@@ -810,6 +810,7 @@ async fn real_attention_worker_start_restore(lose_response: bool) {
         .send_input(
             &worker,
             WorkerInputRequest {
+                source: None,
                 kind: WorkerInputKind::Notify,
                 content: first.content.clone(),
                 submission_request_id: Some(first_id.clone()),

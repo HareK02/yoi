@@ -1,0 +1,70 @@
+{
+    slug = "async-chat";
+    description = "Explicitly connected Subject chat and asynchronous Worker delegation.";
+    # Omitted scope and delegation_scope resolve to no filesystem authority.
+    model = { ref = "codex-oauth/gpt-6.1-sol"; };
+    engine = { instruction = "role.async_chat"; reasoning = "high"; };
+    session = { record_event_trace = true; };
+
+    feature = {
+        drive = { enabled = false; };
+        task = { enabled = false; };
+        memory = { enabled = false; staging_tools = false; };
+        subjektiv = {
+            enabled = true;
+            chat = { enabled = true; };
+            consolidation_tools = false;
+            extraction = { enabled = false; };
+        };
+        web = { enabled = false; };
+        image = { enabled = false; };
+        sub_worker = { enabled = false; };
+        flow = { enabled = false; };
+        worker = { enabled = true; direct_spawn = true; };
+        workspace_worker_discovery = { enabled = false; };
+        objective = { enabled = true; };
+        manage_workdir = { enabled = false; };
+        workdir_catalog = { enabled = false; };
+        workspace_config = { enabled = false; };
+        ticket = { enabled = true; authoring = false; thread = false; intake = false; workflow = false; };
+        merge_request = { show = false; open = false; review = false; readiness_check = false; complete = false; };
+        orchestration = { enabled = false; };
+    };
+    web = { enabled = false; };
+
+    # Tool availability is not a Subject grant; the Host checks current authority.
+    permissions = {
+        default_action = "deny";
+        rule = [
+            { tool = "ConversationRead"; pattern = "*"; action = "allow"; },
+            { tool = "ConversationSend"; pattern = "*"; action = "allow"; },
+            { tool = "WorkerList"; pattern = "*"; action = "allow"; },
+            { tool = "WorkerSpawn"; pattern = "*"; action = "allow"; },
+            { tool = "WorkerSendInput"; pattern = "*"; action = "allow"; },
+            { tool = "WorkerNotify"; pattern = "*"; action = "allow"; },
+            { tool = "WorkerCancel"; pattern = "*"; action = "allow"; },
+            { tool = "WorkerStop"; pattern = "*"; action = "allow"; },
+            { tool = "WorkerRestore"; pattern = "*"; action = "allow"; },
+            { tool = "ViewSessionOverview"; pattern = "*"; action = "allow"; },
+            { tool = "SearchSessionEntries"; pattern = "*"; action = "allow"; },
+            { tool = "ReadSessionEntry"; pattern = "*"; action = "allow"; },
+            { tool = "SubjektivSessionList"; pattern = "*"; action = "allow"; },
+            { tool = "SubjektivSessionSearch"; pattern = "*"; action = "allow"; },
+            { tool = "SubjektivSessionRead"; pattern = "*"; action = "allow"; },
+            { tool = "SubjektivMemoryQuery"; pattern = "*"; action = "allow"; },
+            { tool = "SubjektivMemoryRead"; pattern = "*"; action = "allow"; },
+            { tool = "SubjektivMemoryListChanges"; pattern = "*"; action = "allow"; },
+            { tool = "QueryObjective"; pattern = "*"; action = "allow"; },
+            { tool = "ShowObjective"; pattern = "*"; action = "allow"; },
+            { tool = "QueryTicket"; pattern = "*"; action = "allow"; },
+            { tool = "ShowTicket"; pattern = "*"; action = "allow"; },
+            { tool = "WorkspaceTagList"; pattern = "*"; action = "allow"; },
+            { tool = "TicketAssignmentTrackingQuery"; pattern = "*"; action = "allow"; },
+            { tool = "TicketAssignmentTrackingHistory"; pattern = "*"; action = "allow"; },
+            { tool = "TicketAssignmentsQuery"; pattern = "*"; action = "allow"; },
+            { tool = "TicketAssignmentDiagnostics"; pattern = "*"; action = "allow"; },
+            { tool = "TicketImplementationResultQuery"; pattern = "*"; action = "allow"; },
+            { tool = "NotificationDiagnostics"; pattern = "*"; action = "allow"; },
+        ];
+    };
+}

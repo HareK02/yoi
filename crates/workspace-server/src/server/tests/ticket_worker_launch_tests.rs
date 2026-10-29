@@ -856,6 +856,7 @@ async fn generic_ticket_worker_unknown_input_outcome_preserves_assignment_and_la
         .input(
             &WorkerOperationContext::Backend,
             WorkerInputRequest {
+                source: None,
                 kind: WorkerInputKind::User,
                 content: "Continue Ticket research".into(),
                 submission_request_id: Some("unknown-worker-submit".into()),

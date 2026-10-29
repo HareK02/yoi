@@ -295,6 +295,8 @@ pub struct SubjektivFeatureConfigPartial {
     #[serde(default)]
     pub consolidation_tools: Option<bool>,
     #[serde(default)]
+    pub chat: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
     pub extraction: Option<MemoryExtractionProfileConfigPartial>,
 }
 
@@ -303,6 +305,7 @@ impl SubjektivFeatureConfigPartial {
         Self {
             enabled: other.enabled.or(self.enabled),
             consolidation_tools: other.consolidation_tools.or(self.consolidation_tools),
+            chat: merge_option(self.chat, other.chat, FeatureFlagConfigPartial::merge),
             extraction: merge_option(
                 self.extraction,
                 other.extraction,
@@ -554,6 +557,7 @@ impl From<SubjektivFeatureConfigPartial> for ResolvedSubjektivFeatureConfig {
             profile: SubjektivFeatureProfileConfig {
                 enabled: value.enabled.unwrap_or_default(),
                 consolidation_tools: value.consolidation_tools.unwrap_or_default(),
+                chat: value.chat.map(FeatureFlagConfig::from).unwrap_or_default(),
                 extraction: MemoryExtractionProfileConfig {
                     enabled: extraction.enabled.unwrap_or(true),
                     model: extraction.model,
@@ -574,6 +578,7 @@ impl From<ResolvedSubjektivFeatureConfig> for SubjektivFeatureConfigPartial {
         Self {
             enabled: Some(value.profile.enabled),
             consolidation_tools: Some(value.profile.consolidation_tools),
+            chat: Some(value.profile.chat.into()),
             extraction: Some(MemoryExtractionProfileConfigPartial {
                 enabled: Some(value.profile.extraction.enabled),
                 model: value.profile.extraction.model,
@@ -2986,6 +2991,83 @@ worker_max_turns = 7
         let encoded = serde_json::to_value(SubjektivFeatureConfigPartial::from(resolved)).unwrap();
         assert!(encoded.get("subject_id").is_none());
         assert_eq!(encoded["enabled"], true);
+    }
+
+    #[test]
+    fn subjektiv_chat_requires_explicit_opt_in_and_roundtrips() {
+        for subject in [
+            "",
+            "[feature.subjektiv]\nenabled = true\n",
+            "[feature.subjektiv.chat]\n",
+        ] {
+            let config = WorkerManifestConfig::from_toml(subject).unwrap();
+            let feature = FeatureConfig::from(config.feature);
+            assert!(!feature.subjektiv.profile.chat.enabled);
+        }
+        assert!(
+            !ResolvedSubjektivFeatureConfig::default()
+                .profile
+                .chat
+                .enabled
+        );
+        let legacy: ResolvedSubjektivFeatureConfig = serde_json::from_value(serde_json::json!({
+            "profile": { "enabled": true }
+        }))
+        .unwrap();
+        assert!(!legacy.profile.chat.enabled);
+
+        for enabled in [true, false] {
+            let config = WorkerManifestConfig::from_toml(&format!(
+                "[feature.subjektiv]\nenabled = true\n[feature.subjektiv.chat]\nenabled = {enabled}\n"
+            )).unwrap();
+            let resolved = FeatureConfig::from(config.feature).subjektiv;
+            let json = serde_json::to_value(&resolved).unwrap();
+            assert_eq!(json["profile"]["chat"]["enabled"], enabled);
+            assert_eq!(
+                serde_json::from_value::<ResolvedSubjektivFeatureConfig>(json).unwrap(),
+                resolved
+            );
+            assert!(resolved.workspace_settings.is_none());
+            assert!(!resolved.execution_enabled());
+            let partial = SubjektivFeatureConfigPartial::from(resolved.clone());
+            let toml = toml::to_string(&partial).unwrap();
+            assert_eq!(
+                ResolvedSubjektivFeatureConfig::from(
+                    toml::from_str::<SubjektivFeatureConfigPartial>(&toml).unwrap()
+                ),
+                resolved
+            );
+        }
+    }
+
+    #[test]
+    fn subjektiv_chat_merge_preserves_omissions_and_honors_explicit_disable() {
+        let base = WorkerManifestConfig::from_toml(
+            "[feature.subjektiv]\nenabled = true\n[feature.subjektiv.chat]\nenabled = true\n[feature.subjektiv.extraction]\nthreshold = 321\n"
+        ).unwrap();
+        for overlay in [
+            "",
+            "[feature.subjektiv]\nconsolidation_tools = false\n",
+            "[feature.subjektiv.chat]\n",
+        ] {
+            let merged = base
+                .clone()
+                .merge(WorkerManifestConfig::from_toml(overlay).unwrap());
+            let feature = FeatureConfig::from(merged.feature);
+            assert!(feature.subjektiv.profile.chat.enabled);
+            assert_eq!(feature.subjektiv.profile.extraction.threshold, Some(321));
+        }
+        for enabled in [false, true] {
+            let overlay = WorkerManifestConfig::from_toml(&format!(
+                "[feature.subjektiv.chat]\nenabled = {enabled}\n"
+            ))
+            .unwrap();
+            let merged = base.clone().merge(overlay);
+            let feature = FeatureConfig::from(merged.feature);
+            assert_eq!(feature.subjektiv.profile.chat.enabled, enabled);
+            assert!(feature.subjektiv.profile.enabled);
+            assert_eq!(feature.subjektiv.profile.extraction.threshold, Some(321));
+        }
     }
 
     #[test]

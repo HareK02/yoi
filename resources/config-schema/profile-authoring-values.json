@@ -112,5 +112,15 @@
       "/feature/memory/profile/extraction/reasoning": "high",
       "/feature/subjektiv/profile/extraction/reasoning": "medium"
     }
+  },
+  {
+    "name": "subjektiv_chat_opt_in",
+    "profile": { "feature": { "subjektiv": { "enabled": true, "chat": { "enabled": true } } } },
+    "manifest_expect": { "/feature/subjektiv/profile/chat/enabled": true }
+  },
+  {
+    "name": "subjektiv_without_chat_is_not_opted_in",
+    "profile": { "feature": { "subjektiv": { "enabled": true } } },
+    "manifest_expect": { "/feature/subjektiv/profile/chat/enabled": false }
   }
 ]

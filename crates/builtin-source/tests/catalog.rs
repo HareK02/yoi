@@ -39,3 +39,22 @@ fn catalog_import_metadata_has_no_cycles() {
         visit(resource.path, &mut BTreeSet::new());
     }
 }
+
+#[test]
+fn async_chat_is_public_and_does_not_inherit_broader_profile_defaults() {
+    let catalog = builtin_profile_catalog_snapshot();
+    let path = &catalog.entrypoints["builtin:async-chat"];
+    let resource = BUILTIN_PROFILE_RESOURCES
+        .iter()
+        .find(|resource| resource.path == path)
+        .unwrap();
+    assert_eq!(resource.selector, Some("builtin:async-chat"));
+    assert!(!resource.description.is_empty());
+    assert!(resource.imports.is_empty());
+    assert!(
+        !catalog
+            .imports
+            .keys()
+            .any(|request| request.starts_with(&format!("{path}\0")))
+    );
+}

@@ -90,14 +90,26 @@ mod restore_candidate {
     }
 
     async fn notify(handle: &WorkerHandle) {
+        notify_from_source(handle, None).await;
+    }
+
+    async fn notify_from_source(
+        handle: &WorkerHandle,
+        source: Option<protocol::AuthenticatedInputSource>,
+    ) {
         let mut events = handle.subscribe();
-        handle
-            .send(Method::Notify {
+        let method = match source {
+            Some(source) => Method::NotifyTracked {
                 notification_request_id: NOTICE.into(),
                 message: NOTICE.into(),
-            })
-            .await
-            .unwrap();
+                source,
+            },
+            None => Method::Notify {
+                notification_request_id: NOTICE.into(),
+                message: NOTICE.into(),
+            },
+        };
+        handle.send(method).await.unwrap();
         receive_matching(&mut events, "notification acceptance", |event| {
             matches!(event, Event::NotificationAccepted { notification_request_id }
                 if notification_request_id == NOTICE)
@@ -169,6 +181,13 @@ mod restore_candidate {
         }
 
         fn with_seed(no_model: bool) -> Self {
+            Self::with_seed_source(no_model, None)
+        }
+
+        fn with_seed_source(
+            no_model: bool,
+            notice_source: Option<protocol::AuthenticatedInputSource>,
+        ) -> Self {
             let root = restore_failure_tempdir();
             let model = if no_model {
                 MockClient::new(Vec::new())
@@ -339,7 +358,7 @@ mod restore_candidate {
                                 disposition: protocol::SubmissionDisposition::Queued, ..
                             }));
                             receipts.push(serde_json::to_value(receipt).unwrap());
-                            if id == FIRST { notify(&handle).await; }
+                            if id == FIRST { notify_from_source(&handle, notice_source.clone()).await; }
                         }
                         assert_eq!(pending(&handle).await.submissions.len(), 2);
                         shutdown_profile_controller(seed.0.take().unwrap()).await;
@@ -1305,6 +1324,104 @@ mod restore_candidate {
             assert_eq!(failure.stage, stage);
             assert_eq!(failure.cleanup, RuntimeRestoreCleanup::Confirmed);
         }
+    }
+
+    #[test]
+    #[serial_test::serial(worker_allocation)]
+    fn notify_source_and_lost_ack_receipt_survive_stopped_delivery_and_explicit_restore() {
+        let source = protocol::AuthenticatedInputSource::Account {
+            account_id: "saved-chat-account".into(),
+        };
+        let fixture = Fixture::with_seed_source(false, Some(source.clone()));
+        let mut retry = WorkerInput::notify(NOTICE);
+        retry.source = Some(source.clone());
+        retry.submission_request_id = Some(NOTICE.into());
+        let before = fixture.canonical_files();
+        // A direct notify is not a stopped-Worker mailbox or implicit Restore.
+        assert!(
+            !fixture
+                .backend
+                .dispatch_input(&fixture.request.worker_ref, retry.clone())
+                .is_accepted()
+        );
+        assert!(fixture.backend.workers.lock().unwrap().is_empty());
+        assert_eq!(fixture.canonical_files(), before);
+        let checkpoint = queue_checkpoint(&fixture.entries());
+        assert_eq!(
+            checkpoint["notification_receipts"][0]["source_namespace"],
+            source.namespace()
+        );
+        fixture.prepare();
+        fixture
+            .backend
+            .activate_restored_worker(fixture.request.operation_id, &fixture.request.worker_ref)
+            .unwrap();
+        let handle = fixture.backend.workers.lock().unwrap()[&fixture.request.worker_ref]
+            .handle
+            .clone();
+        fixture
+            .backend
+            .run_on_adapter_runtime(async move {
+                finished(&handle, SECOND).await;
+                Ok(())
+            })
+            .unwrap();
+        // The seed Controller accepted durably before shutdown; its caller lost
+        // that receipt. Replay through the concrete adapter must not append or run.
+        let committed = fixture.canonical_files();
+        let calls = fixture.model.call_count.load(Ordering::SeqCst);
+        let accepted = fixture
+            .backend
+            .dispatch_input(&fixture.request.worker_ref, retry.clone());
+        assert!(accepted.is_accepted(), "{accepted:?}");
+        assert_eq!(
+            accepted.notification.unwrap().notification_request_id,
+            NOTICE
+        );
+        let mut conflict = retry;
+        conflict.content = "different-body".into();
+        let rejected = fixture
+            .backend
+            .dispatch_input(&fixture.request.worker_ref, conflict);
+        assert_eq!(
+            rejected.outcome,
+            crate::execution::WorkerExecutionOutcome::Rejected
+        );
+        assert_eq!(fixture.canonical_files(), committed);
+        assert_eq!(fixture.model.call_count.load(Ordering::SeqCst), calls);
+        let history = session_store::collect_state(&fixture.entries()).annotated_history;
+        let notices = history
+            .iter()
+            .filter(|entry| match &entry.item {
+                LoggedItem::Message { content, .. } => content.iter().any(|part| {
+                    matches!(part,
+                LoggedContentPart::Text { text } if text.contains(NOTICE))
+                }),
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].metadata.origin,
+            LoggedSessionHistoryOrigin::HumanInput {
+                account_id: "saved-chat-account".into()
+            }
+        );
+        let requests = fixture.model.captured.lock().unwrap();
+        assert_eq!(
+            serde_json::to_string(&requests[0].items)
+                .unwrap()
+                .matches(NOTICE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            serde_json::to_string(&requests[2].items)
+                .unwrap()
+                .matches(NOTICE)
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -787,6 +787,7 @@ pub enum WorkspaceServerOperation {
     WorkerObservationCapture(server_api::WorkerObservationSubjectRef),
     SubjektivStageCandidate(server_api::SubjektivStageCandidateRequest),
     SubjektivRecordSession(server_api::SubjektivRecordSessionRequest),
+    ChatWorker(server_api::ChatWorkerRequest),
     SubjektivMemory(server_api::SubjektivMemoryBackendRequest),
     SubjektivSession(server_api::SubjektivSessionBackendRequest),
 }
@@ -1009,6 +1010,9 @@ fn workspace_server_operation_request(
         }
         WorkspaceServerOperation::SubjektivRecordSession(request) => {
             workspace_server_json_request(format!("{base}/subjektiv/sessions"), &request)
+        }
+        WorkspaceServerOperation::ChatWorker(request) => {
+            workspace_server_json_request(format!("{base}/subjektiv/chat/worker"), &request)
         }
         WorkspaceServerOperation::SubjektivMemory(request) => {
             workspace_server_json_request(format!("{base}/subjektiv/memory"), &request)
@@ -12895,6 +12899,19 @@ mod build_summary_prompt_tests {
                 {
                     1
                 }
+                LogEntry::Extension {
+                    domain, payload, ..
+                } if domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN
+                    && payload["pending_notifications"]
+                        .as_array()
+                        .is_some_and(|messages| {
+                            messages
+                                .iter()
+                                .any(|message| message["message"] == "persist-failure")
+                        }) =>
+                {
+                    6
+                }
                 LogEntry::AnnotatedSystemItem { entry, .. }
                     if input_schema(entry) == Some("feature:invocation-result") =>
                 {
@@ -18272,6 +18289,112 @@ permission = "write"
             )
             .unwrap();
         assert_eq!(committed.annotation.origin, provenance);
+    }
+
+    #[test]
+    fn notification_admission_save_failure_leaves_no_receipt_and_same_request_can_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = PendingSubmissionHandle::for_test(temp.path());
+        let handle = PendingSubmissionHandle {
+            state: original.state.clone(),
+            writer: LogWriterHandle {
+                store: FailRunTerminalStore {
+                    inner: original.writer.store.clone(),
+                    fail_run_terminal: Arc::new(AtomicBool::new(false)),
+                    invocation_failure: Arc::new(AtomicUsize::new(6)),
+                },
+                state: original.writer.state.clone(),
+                sink: original.writer.sink.clone(),
+                in_flight: None,
+            },
+        };
+        assert!(
+            handle
+                .accept_notification("stable-request".into(), "persist-failure".into())
+                .is_err()
+        );
+        assert_eq!(handle.snapshot().notification_count, 0);
+        assert!(original.persisted_entries_for_test().is_empty());
+        assert!(
+            handle
+                .state
+                .lock()
+                .unwrap()
+                .notification_receipts
+                .is_empty()
+        );
+        assert!(
+            handle
+                .accept_notification("stable-request".into(), "persist-failure".into())
+                .unwrap()
+        );
+        assert!(
+            !handle
+                .accept_notification("stable-request".into(), "persist-failure".into())
+                .unwrap()
+        );
+        let saved = original.persisted_entries_for_test();
+        let LogEntry::Extension { payload, .. } = saved.last().unwrap() else {
+            panic!("saved admission");
+        };
+        let state: PendingActivationState = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(state.pending_notifications.len(), 1);
+        assert_eq!(state.notification_receipts.len(), 1);
+    }
+
+    #[test]
+    fn notification_admission_limits_do_not_persist_rejection_or_evict_accepted_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        for index in 0..MAX_PENDING_SUBMISSIONS {
+            assert!(
+                handle
+                    .accept_notification(format!("notice-{index}"), "bounded".into())
+                    .unwrap()
+            );
+        }
+        let saved = handle.persisted_entries_for_test();
+        assert!(matches!(
+            handle.accept_notification("overflow".into(), "bounded".into()),
+            Err(PendingSubmissionError::CountLimit)
+        ));
+        assert_eq!(handle.persisted_entries_for_test().len(), saved.len());
+        assert_eq!(
+            handle.snapshot().notification_count as usize,
+            MAX_PENDING_SUBMISSIONS
+        );
+        // An exact retry remains accepted even at capacity; a changed body never does.
+        assert!(
+            !handle
+                .accept_notification("notice-0".into(), "bounded".into())
+                .unwrap()
+        );
+        assert!(matches!(
+            handle.accept_notification("notice-0".into(), "changed".into()),
+            Err(PendingSubmissionError::IdempotencyConflict)
+        ));
+        let bytes = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(bytes.path());
+        assert!(
+            handle
+                .accept_notification(
+                    "full-byte-budget".into(),
+                    "x".repeat(MAX_PENDING_SUBMISSION_BYTES as usize)
+                )
+                .unwrap()
+        );
+        let saved = handle.persisted_entries_for_test();
+        assert!(matches!(
+            handle.accept_notification("byte-overflow".into(), "x".into()),
+            Err(PendingSubmissionError::ByteLimit)
+        ));
+        assert_eq!(handle.persisted_entries_for_test().len(), saved.len());
+        let LogEntry::Extension { payload, .. } = saved.last().unwrap() else {
+            panic!("saved admission");
+        };
+        let state: PendingActivationState = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(state.pending_notifications.len(), 1);
+        assert_eq!(state.notification_receipts.len(), 1);
     }
 
     #[test]

@@ -1728,6 +1728,137 @@ mod tests {
     }
 
     #[test]
+    fn builtin_async_chat_exposes_only_opted_in_chat_and_bounded_features() {
+        let tmp = TempDir::new().unwrap();
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve(
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "async-chat"),
+                ProfileResolveOptions::with_worker_name("chat-worker"),
+            )
+            .unwrap();
+        let manifest = resolved.manifest;
+        let feature = &manifest.feature;
+        assert_eq!(manifest.engine.instruction, "role.async_chat");
+        assert!(resolved.raw_artifact["scope"].is_null());
+        assert!(resolved.raw_artifact["delegation_scope"].is_null());
+        assert!(manifest.scope.allow.is_empty());
+        assert!(manifest.delegation_scope.allow.is_empty());
+        assert!(manifest.mcp.stdio_servers.is_empty());
+        assert!(feature.subjektiv.profile.enabled);
+        assert!(feature.subjektiv.profile.chat.enabled);
+        assert!(!feature.subjektiv.profile.consolidation_tools);
+        assert!(!feature.subjektiv.profile.extraction.enabled);
+        assert!(feature.subjektiv.workspace_settings.is_none());
+        assert!(!feature.subjektiv.execution_enabled());
+        assert!(!feature.memory.profile.enabled);
+        assert!(!feature.memory.profile.staging_tools);
+        assert!(!feature.task.enabled);
+        assert!(!feature.sub_worker.enabled);
+        assert!(!feature.flow.enabled);
+        assert!(feature.worker.enabled);
+        assert!(feature.worker.direct_spawn);
+        assert!(!feature.workspace_worker_discovery.enabled);
+        assert!(feature.objective.enabled);
+        assert!(feature.ticket.enabled);
+        assert!(!feature.ticket.authoring);
+        assert!(!feature.ticket.thread);
+        assert!(!feature.ticket.intake);
+        assert!(!feature.ticket.workflow);
+        assert!(!feature.merge_request.show);
+        assert!(!feature.merge_request.open);
+        assert!(!feature.merge_request.review);
+        assert!(!feature.merge_request.readiness_check);
+        assert!(!feature.merge_request.complete);
+        for flag in [
+            feature.web,
+            feature.image,
+            feature.drive,
+            feature.manage_workdir,
+            feature.workdir_catalog,
+            feature.workspace_config,
+            feature.orchestration,
+        ] {
+            assert!(!flag.enabled);
+        }
+
+        let permissions = manifest.permissions.unwrap();
+        assert_eq!(
+            permissions.default_action,
+            crate::ToolPermissionAction::Deny
+        );
+        // Exact tool names and all-argument rules let the Worker statically hide
+        // denied filesystem tools while its permission hook enforces each call.
+        let allowed = permissions
+            .rules
+            .iter()
+            .map(|rule| {
+                assert_eq!(rule.action, crate::ToolPermissionAction::Allow);
+                assert_eq!(rule.pattern, "*");
+                rule.tool.as_str()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(allowed.len(), permissions.rules.len());
+        assert_eq!(
+            allowed,
+            BTreeSet::from([
+                "ConversationRead",
+                "ConversationSend",
+                "WorkerList",
+                "WorkerSpawn",
+                "WorkerSendInput",
+                "WorkerNotify",
+                "WorkerCancel",
+                "WorkerStop",
+                "WorkerRestore",
+                "ViewSessionOverview",
+                "SearchSessionEntries",
+                "ReadSessionEntry",
+                "SubjektivSessionList",
+                "SubjektivSessionSearch",
+                "SubjektivSessionRead",
+                "SubjektivMemoryQuery",
+                "SubjektivMemoryRead",
+                "SubjektivMemoryListChanges",
+                "QueryObjective",
+                "ShowObjective",
+                "QueryTicket",
+                "ShowTicket",
+                "WorkspaceTagList",
+                "TicketAssignmentTrackingQuery",
+                "TicketAssignmentTrackingHistory",
+                "TicketAssignmentsQuery",
+                "TicketAssignmentDiagnostics",
+                "TicketImplementationResultQuery",
+                "NotificationDiagnostics",
+            ])
+        );
+    }
+
+    #[test]
+    fn builtin_profiles_do_not_implicitly_enable_subject_chat() {
+        for entry in builtin_profile_entrypoints() {
+            if entry.selector == Some("builtin:async-chat") {
+                continue;
+            }
+            let artifact = resolve_builtin_profile_artifact(entry.selector.unwrap())
+                .unwrap()
+                .unwrap();
+            let feature: FeatureConfigPartial =
+                serde_json::from_value(artifact["feature"].clone()).unwrap();
+            assert!(
+                !crate::FeatureConfig::from(feature)
+                    .subjektiv
+                    .profile
+                    .chat
+                    .enabled,
+                "{:?} must remain opted out",
+                entry.selector
+            );
+        }
+    }
+
+    #[test]
     fn builtin_companion_combines_runtime_and_sub_worker_control_with_discovery() {
         let tmp = TempDir::new().unwrap();
         let resolved = ProfileResolver::new()

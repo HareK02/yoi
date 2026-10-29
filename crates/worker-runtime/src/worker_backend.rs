@@ -6542,9 +6542,11 @@ where
                 Method::NotifyTracked {
                     notification_request_id: notification_request_id.clone(),
                     message: input.content,
-                    source: protocol::AuthenticatedInputSource::Backend {
-                        operation_id: notification_request_id.clone(),
-                    },
+                    source: input.source.unwrap_or_else(|| {
+                        protocol::AuthenticatedInputSource::Backend {
+                            operation_id: notification_request_id.clone(),
+                        }
+                    }),
                 },
                 notification_request_id,
             );
@@ -9872,6 +9874,11 @@ mod tests {
     enum MockResponse {
         Complete(Vec<LlmEvent>),
         Hang(Vec<LlmEvent>),
+        Gated {
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            events: Vec<LlmEvent>,
+        },
     }
 
     #[derive(Clone)]
@@ -9916,6 +9923,20 @@ mod tests {
             match response {
                 MockResponse::Complete(events) => {
                     Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+                }
+                MockResponse::Gated {
+                    started,
+                    release,
+                    events,
+                } => {
+                    started.notify_one();
+                    Ok(Box::pin(
+                        futures::stream::once(async move {
+                            release.notified().await;
+                            futures::stream::iter(events.into_iter().map(Ok))
+                        })
+                        .flatten(),
+                    ))
                 }
                 MockResponse::Hang(events) => Ok(Box::pin(
                     futures::stream::iter(events.into_iter().map(Ok))
@@ -10940,6 +10961,7 @@ mod tests {
     #[cfg(feature = "fs-store")]
     include!("worker_backend_restore_failure_tests.rs");
     include!("worker_backend_restore_candidate_tests.rs");
+    include!("worker_backend_notify_transport_tests.rs");
 
     struct PendingFailureFactory {
         restore_calls: Arc<AtomicUsize>,

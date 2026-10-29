@@ -48,6 +48,42 @@ pub(crate) enum WorkerOperationContext {
 }
 
 impl WorkerOperationContext {
+    fn bind_input(&self, request: &mut WorkerInputRequest) {
+        // Public adapters cannot choose provenance or consume another input path's
+        // receipt IDs. Bind these only after the current caller is authorized.
+        request.source = match self {
+            WorkerOperationContext::Browser { source, .. } => Some(source.clone()),
+            WorkerOperationContext::WorkerControl { controller } => {
+                Some(protocol::AuthenticatedInputSource::Worker {
+                    runtime_id: controller.runtime_id.clone(),
+                    worker_id: controller.worker_id.clone(),
+                })
+            }
+            #[cfg(test)]
+            WorkerOperationContext::Backend => request.source.clone(),
+        };
+        if let Some(source) = request.source.as_ref() {
+            if let Some(client_id) = request.submission_request_id.take() {
+                let path = match request.kind {
+                    WorkerInputKind::Notify => "notify",
+                    WorkerInputKind::User => "user",
+                    WorkerInputKind::UserIfIdle => "user-if-idle",
+                    WorkerInputKind::Compact => "compact",
+                    WorkerInputKind::RegisterPeer => "register-peer",
+                };
+                // Fixed-size identity stays below the controller's request-ID ceiling
+                // even for long Runtime/Account IDs. Tuple framing remains unambiguous.
+                let canonical = serde_json::to_vec(&(source.namespace(), client_id))
+                    .expect("input namespace contains only strings");
+                let digest = sha2::Sha256::digest(canonical)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                request.submission_request_id = Some(format!("runtime-input:{path}:{digest}"));
+            }
+        }
+    }
+
     pub(super) async fn authorize_workspace(&self, api: &WorkspaceApi) -> ApiResult<()> {
         if let Self::Browser { headers, source } = self {
             let actor = resolve_actor(&ServerAuthApi::from(api), headers)
@@ -472,7 +508,26 @@ impl WorkspaceWorker {
     pub(super) async fn input(
         &self,
         context: &WorkerOperationContext,
+        request: WorkerInputRequest,
+    ) -> ApiResult<WorkerInputResult> {
+        self.input_impl(context, request, None).await
+    }
+
+    pub(super) async fn input_current_subject(
+        &self,
+        context: &WorkerOperationContext,
+        request: WorkerInputRequest,
+        expected_subject: &str,
+    ) -> ApiResult<WorkerInputResult> {
+        self.input_impl(context, request, Some(expected_subject.to_owned()))
+            .await
+    }
+
+    async fn input_impl(
+        &self,
+        context: &WorkerOperationContext,
         mut request: WorkerInputRequest,
+        expected_subject: Option<String>,
     ) -> ApiResult<WorkerInputResult> {
         let permission = if request.kind == WorkerInputKind::Notify {
             "notify"
@@ -488,12 +543,41 @@ impl WorkspaceWorker {
         {
             request.kind = WorkerInputKind::UserIfIdle;
         }
+        context.bind_input(&mut request);
         let worker = self.clone();
         self.api
             .host_executors
             .host()?
             .run(move || -> ApiResult<_> {
                 let (_control, _session) = (guard, session_guard);
+                // Re-resolve while excluding Subject replacement through Runtime
+                // admission. The DB read ends before Runtime I/O; a DB transaction
+                // fence here would deadlock reentrant Host operations.
+                let subject_gate = expected_subject
+                    .as_deref()
+                    .map(|subject| subjektiv_journal::lifecycle_lock(&worker.api, subject))
+                    .transpose()?;
+                let _subject_guard = subject_gate
+                    .as_ref()
+                    .map(|gate| {
+                        gate.lock()
+                            .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))
+                    })
+                    .transpose()?;
+                if let Some(subject) = expected_subject.as_deref() {
+                    let key = crate::subjektiv::subject_worker_singleton_key(subject)
+                        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+                    let owner = worker
+                        .api
+                        .store
+                        .current_worker_singleton_owner(worker.api.workspace_id(), &key)?;
+                    if !owner.is_some_and(|lease| lease.worker == worker.identity) {
+                        return Err(Error::WorkspacePermissionDenied(
+                            "chat input target is no longer the current Subject body".into(),
+                        )
+                        .into());
+                    }
+                }
                 Ok(worker
                     .api
                     .runtime
@@ -787,5 +871,92 @@ impl WorkspaceWorkerMethodSender {
                 code: code.into(), message: message.into(),
             }.into()
         })
+    }
+}
+
+#[cfg(test)]
+mod input_binding_tests {
+    use super::*;
+
+    fn notify(client_id: &str) -> WorkerInputRequest {
+        WorkerInputRequest {
+            kind: WorkerInputKind::Notify,
+            content: "message".into(),
+            source: Some(protocol::AuthenticatedInputSource::Backend {
+                operation_id: "forged-source".into(),
+            }),
+            submission_request_id: Some(client_id.into()),
+            segments: None,
+        }
+    }
+
+    #[test]
+    fn generic_input_binds_caller_source_and_isolates_client_ids_from_chat_and_other_paths() {
+        let browser = |id: &str| WorkerOperationContext::Browser {
+            headers: HeaderMap::new(),
+            source: protocol::AuthenticatedInputSource::Account {
+                account_id: id.into(),
+            },
+        };
+        let context = browser("account-a");
+        let raw_id = "chat-message:stored-message-uuid";
+        let mut request = notify(raw_id);
+        context.bind_input(&mut request);
+        assert_eq!(
+            request.source,
+            Some(protocol::AuthenticatedInputSource::Account {
+                account_id: "account-a".into(),
+            })
+        );
+        let bounded = request.submission_request_id.as_deref().unwrap();
+        assert!(bounded.starts_with("runtime-input:notify:"));
+        assert!(bounded.len() < 128);
+        assert_ne!(bounded, raw_id);
+        let mut retry = notify(raw_id);
+        context.bind_input(&mut retry);
+        assert_eq!(retry.submission_request_id, request.submission_request_id);
+        let mut other = notify(raw_id);
+        browser("account-b").bind_input(&mut other);
+        assert_ne!(other.submission_request_id, request.submission_request_id);
+        let mut submit = notify(raw_id);
+        submit.kind = WorkerInputKind::User;
+        context.bind_input(&mut submit);
+        assert_ne!(submit.submission_request_id, request.submission_request_id);
+        // JSON tuple framing keeps delimiter/quote characters unambiguous.
+        let mut delimiter = notify("a\",\"b");
+        context.bind_input(&mut delimiter);
+        assert_ne!(
+            delimiter.submission_request_id,
+            request.submission_request_id
+        );
+        let mut no_client_id = notify(raw_id);
+        no_client_id.submission_request_id = None;
+        context.bind_input(&mut no_client_id);
+        assert!(no_client_id.submission_request_id.is_none());
+    }
+
+    #[test]
+    fn worker_control_provenance_is_the_authenticated_controller_not_a_body_or_source_claim() {
+        let context = WorkerOperationContext::WorkerControl {
+            controller: RuntimeWorkerRef::new("controller-runtime", "controller-worker"),
+        };
+        let mut request = notify("same-id");
+        request.content = r#"{"source":{"kind":"account","account_id":"spoofed"}}"#.into();
+        context.bind_input(&mut request);
+        assert_eq!(
+            request.source,
+            Some(protocol::AuthenticatedInputSource::Worker {
+                runtime_id: "controller-runtime".into(),
+                worker_id: "controller-worker".into(),
+            })
+        );
+        assert!(
+            request
+                .submission_request_id
+                .as_deref()
+                .unwrap()
+                .starts_with("runtime-input:notify:")
+        );
+        assert!(request.submission_request_id.as_ref().unwrap().len() < 128);
     }
 }
