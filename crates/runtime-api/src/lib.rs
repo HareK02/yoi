@@ -450,6 +450,9 @@ pub struct CreateWorkerRequest {
     pub workdir_attachment_requests: Vec<WorkingDirectoryAttachmentRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workdir_attachments: Vec<WorkingDirectoryAttachmentClaim>,
+    /// Enables the optional Runtime-local peer observation provider, not operation
+    /// authority. Scoped Backend observation follows the Worker Feature and live
+    /// operation/control checks, including when this saved flag is false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worker_observation_enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

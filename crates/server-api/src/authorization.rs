@@ -42,8 +42,10 @@
 //! terminal confirmation and does not undo completed effects.
 //!
 //! A child receives no Subject body identity, singleton, whole Memory or public
-//! conversation-post authority. `worker.result` is explicit notify authority to a
-//! named origin Worker, not arbitrary control or publication. Chat delivery and
+//! conversation-post authority. `worker.messaging` permits the messaging operation;
+//! the Worker Feature's Backend control grant separately limits its target and direction.
+//! Stored `worker.result` and `worker.notify` names are read compatibility only, not
+//! result publication, arbitrary control or current request names. Chat delivery and
 //! conversation correlation belong to the caller integration, not this contract.
 //! Unset existing Subject policies deny new Subject execution/delegation; ordinary
 //! non-Subject Workers explicitly retain existing Backend/provider contracts.
@@ -115,6 +117,11 @@ pub enum PermissionResource {
         path: String,
         recursive: bool,
     },
+    /// Authorizes operation use, not a target Worker or a Workspace collection.
+    /// The Worker Feature must still enforce its directional target control grant.
+    WorkerOperation {
+        workspace_id: String,
+    },
     Worker {
         runtime_id: String,
         worker_id: String,
@@ -185,6 +192,9 @@ impl<'de> Deserialize<'de> for PermissionResource {
                 working_directory_id: String,
                 path: String,
                 recursive: bool,
+            },
+            WorkerOperation {
+                workspace_id: String,
             },
             Worker {
                 runtime_id: String,
@@ -285,6 +295,7 @@ impl<'de> Deserialize<'de> for PermissionResource {
                 path,
                 recursive,
             },
+            Wire::WorkerOperation { workspace_id } => Self::WorkerOperation { workspace_id },
             Wire::Worker {
                 runtime_id,
                 worker_id,
@@ -310,6 +321,7 @@ impl PermissionResource {
             | Self::Repository { workspace_id, .. }
             | Self::WorkdirAttachment { workspace_id, .. }
             | Self::WorkspaceConfig { workspace_id, .. }
+            | Self::WorkerOperation { workspace_id }
             | Self::Workspace { workspace_id } => Some(workspace_id),
             _ => None,
         }
@@ -414,7 +426,9 @@ impl PermissionResource {
                 validate_authorization_identifier(name)
             }
             Self::Feature => Ok(()),
-            Self::Workspace { workspace_id } => validate_authorization_identifier(workspace_id),
+            Self::Workspace { workspace_id } | Self::WorkerOperation { workspace_id } => {
+                validate_authorization_identifier(workspace_id)
+            }
             Self::Workdir {
                 working_directory_id,
                 path,
@@ -568,6 +582,10 @@ impl PermissionResource {
             (Self::Feature, Self::Feature) => true,
             (Self::Workspace { workspace_id: a }, Self::Workspace { workspace_id: b }) => a == b,
             (
+                Self::WorkerOperation { workspace_id: a },
+                Self::WorkerOperation { workspace_id: b },
+            ) => a == b,
+            (
                 Self::Worker {
                     runtime_id: ar,
                     worker_id: aw,
@@ -605,6 +623,14 @@ impl PermissionResource {
     }
 }
 
+/// Stored scopes retain their original resources and exact operation names.
+///
+/// A legacy Worker read adapter may use [`canonical_worker_operation`] to project
+/// operation use, but must retain the original target separately for the Worker
+/// Feature's control-grant check, including direction, revocation and delegation
+/// limits. Replacing an old Worker resource with WorkerOperation and discarding
+/// that target would broaden authority. Neither validation nor `covers` performs
+/// that conversion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
@@ -619,6 +645,14 @@ impl ScopedPermission {
         self.resource.validate()?;
         if matches!(self.resource, PermissionResource::Feature) && self.operation.contains('.') {
             return Err("Feature resources authorize activation names only, not operations".into());
+        }
+        if matches!(self.resource, PermissionResource::WorkerOperation { .. })
+            && canonical_worker_operation(&self.operation) != Some(self.operation.as_str())
+        {
+            return Err(
+                "WorkerOperation resources authorize only exact current Worker control operations"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -691,6 +725,18 @@ pub struct OperationAuthorizationRequest {
 
 impl OperationAuthorizationRequest {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(operation) = canonical_worker_operation(&self.operation) {
+            if operation != self.operation {
+                return Err(
+                    "legacy Worker message names are storage-only; request worker.messaging".into(),
+                );
+            }
+            if !matches!(self.resource, PermissionResource::WorkerOperation { .. }) {
+                return Err(
+                    "current Worker control requests require a WorkerOperation resource".into(),
+                );
+            }
+        }
         ScopedPermission {
             operation: self.operation.clone(),
             resource: self.resource.clone(),
@@ -734,6 +780,26 @@ pub enum BoundAuthorizationTarget {
 pub struct BoundOperationAuthorizationRequest {
     pub operation: String,
     pub target: BoundAuthorizationTarget,
+}
+
+/// Maps exact runtime Worker control names to the current operation-use contract.
+///
+/// `worker.notify` and `worker.result` are accepted here only to read saved
+/// policy/grants; current requests must use `worker.messaging`. This helper does
+/// not grant authority or convert resources: adapters must preserve legacy Worker
+/// target restrictions separately. Spawn, discovery/list and Internal SubWorker
+/// operations are not part of this contract. Unknown names return `None`.
+pub fn canonical_worker_operation(operation: &str) -> Option<&'static str> {
+    match operation {
+        "worker.messaging" | "worker.notify" | "worker.result" => Some("worker.messaging"),
+        "worker.send_input" => Some("worker.send_input"),
+        "worker.cancel" => Some("worker.cancel"),
+        "worker.stop" => Some("worker.stop"),
+        "worker.restore" => Some("worker.restore"),
+        "worker.remove" => Some("worker.remove"),
+        "worker.observe" => Some("worker.observe"),
+        _ => None,
+    }
 }
 
 pub fn validate_operation_name(value: &str) -> Result<(), String> {
@@ -895,6 +961,220 @@ mod tests {
                 serde_json::json!({"kind":"feature","workspace_id":"ws"})
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn worker_operation_wire_and_schema_require_only_workspace_identity() {
+        let wire = serde_json::json!({"kind":"worker_operation","workspace_id":"ws"});
+        let resource: PermissionResource = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&resource).unwrap(), wire);
+        assert_eq!(resource.workspace_id(), Some("ws"));
+        assert!(resource.validate().is_ok());
+        for invalid in [
+            serde_json::json!({"kind":"worker_operation"}),
+            serde_json::json!({"kind":"worker_operation","workspace_id":"ws","worker_id":"w"}),
+            serde_json::json!({"kind":"worker_operation","workspace_id":"ws","runtime_id":"r"}),
+        ] {
+            assert!(serde_json::from_value::<PermissionResource>(invalid).is_err());
+        }
+        for workspace_id in ["", " ws", "ws\n", "*", &"x".repeat(257)] {
+            let resource: PermissionResource = serde_json::from_value(
+                serde_json::json!({"kind":"worker_operation","workspace_id":workspace_id}),
+            )
+            .unwrap();
+            assert!(resource.validate().is_err(), "{workspace_id:?}");
+            assert!(!resource.covers(&resource));
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(PermissionResource)).unwrap();
+        let variant = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["const"] == "worker_operation")
+            .unwrap();
+        assert_eq!(variant["properties"]["workspace_id"]["type"], "string");
+        assert_eq!(
+            variant["required"],
+            serde_json::json!(["kind", "workspace_id"])
+        );
+        assert_eq!(variant["additionalProperties"], false);
+    }
+
+    #[test]
+    fn worker_operation_containment_never_crosses_workspace_or_resource_kind() {
+        let resource = PermissionResource::WorkerOperation {
+            workspace_id: "ws".into(),
+        };
+        assert!(resource.covers(&resource));
+        for other in [
+            PermissionResource::WorkerOperation {
+                workspace_id: "other".into(),
+            },
+            PermissionResource::Workspace {
+                workspace_id: "ws".into(),
+            },
+            PermissionResource::Worker {
+                runtime_id: "r".into(),
+                worker_id: "w".into(),
+            },
+            PermissionResource::SubWorker {
+                runtime_id: "r".into(),
+                worker_id: "w".into(),
+                name: "child".into(),
+            },
+        ] {
+            assert!(!resource.covers(&other), "{other:?}");
+            assert!(!other.covers(&resource), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn worker_operation_scopes_accept_only_seven_exact_current_operations() {
+        let resource = PermissionResource::WorkerOperation {
+            workspace_id: "ws".into(),
+        };
+        for operation in [
+            "worker.messaging",
+            "worker.send_input",
+            "worker.cancel",
+            "worker.stop",
+            "worker.restore",
+            "worker.remove",
+            "worker.observe",
+        ] {
+            assert_eq!(canonical_worker_operation(operation), Some(operation));
+            let permission = ScopedPermission {
+                operation: operation.into(),
+                resource: resource.clone(),
+            };
+            assert!(permission.validate().is_ok(), "{operation}");
+            assert!(permission.covers(&permission));
+            assert!(
+                OperationAuthorizationRequest {
+                    operation: operation.into(),
+                    resource: resource.clone(),
+                }
+                .validate()
+                .is_ok()
+            );
+            for old_resource in [
+                PermissionResource::Worker {
+                    runtime_id: "r".into(),
+                    worker_id: "w".into(),
+                },
+                PermissionResource::Workspace {
+                    workspace_id: "ws".into(),
+                },
+                PermissionResource::SubWorker {
+                    runtime_id: "r".into(),
+                    worker_id: "w".into(),
+                    name: "child".into(),
+                },
+            ] {
+                assert!(
+                    OperationAuthorizationRequest {
+                        operation: operation.into(),
+                        resource: old_resource,
+                    }
+                    .validate()
+                    .is_err()
+                );
+            }
+            let descendant = format!("{operation}.extra");
+            assert_eq!(canonical_worker_operation(&descendant), None);
+            assert!(
+                ScopedPermission {
+                    operation: descendant,
+                    resource: resource.clone(),
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for operation in [
+            "worker",
+            "worker.spawn",
+            "worker.lifecycle",
+            "worker.list",
+            "worker.input",
+            "subworker.stop",
+            "sub_worker.stop",
+            "ticket.read",
+            "worker.notify",
+            "worker.result",
+        ] {
+            assert!(
+                ScopedPermission {
+                    operation: operation.into(),
+                    resource: resource.clone(),
+                }
+                .validate()
+                .is_err(),
+                "{operation}"
+            );
+            if !matches!(operation, "worker.notify" | "worker.result") {
+                assert_eq!(canonical_worker_operation(operation), None);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_worker_message_storage_stays_exact_and_cannot_authorize_current_requests() {
+        let current = ScopedPermission {
+            operation: "worker.messaging".into(),
+            resource: PermissionResource::WorkerOperation {
+                workspace_id: "ws".into(),
+            },
+        };
+        for operation in ["worker.notify", "worker.result"] {
+            assert_eq!(
+                canonical_worker_operation(operation),
+                Some("worker.messaging")
+            );
+            let wire = serde_json::json!({
+                "operation":operation,
+                "resource":{"kind":"worker","runtime_id":"r","worker_id":"w"}
+            });
+            let stored: ScopedPermission = serde_json::from_value(wire.clone()).unwrap();
+            assert!(stored.validate().is_ok());
+            assert_eq!(serde_json::to_value(&stored).unwrap(), wire);
+            assert!(stored.covers(&stored));
+            assert!(!stored.covers(&current));
+            assert!(!current.covers(&stored));
+            let renamed = ScopedPermission {
+                operation: "worker.messaging".into(),
+                resource: stored.resource.clone(),
+            };
+            assert!(!stored.covers(&renamed));
+            assert!(!renamed.covers(&stored));
+            for resource in [
+                stored.resource,
+                current.resource.clone(),
+                PermissionResource::Workspace {
+                    workspace_id: "ws".into(),
+                },
+            ] {
+                assert!(
+                    OperationAuthorizationRequest {
+                        operation: operation.into(),
+                        resource,
+                    }
+                    .validate()
+                    .is_err()
+                );
+            }
+        }
+        // Creation and discovery remain outside runtime control operation-use scopes.
+        assert!(
+            OperationAuthorizationRequest {
+                operation: "worker.lifecycle".into(),
+                resource: PermissionResource::Workspace {
+                    workspace_id: "ws".into()
+                },
+            }
+            .validate()
+            .is_ok()
         );
     }
 

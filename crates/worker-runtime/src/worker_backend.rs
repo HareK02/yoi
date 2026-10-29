@@ -143,9 +143,6 @@ use workdir::{
 #[cfg(test)]
 use worker::WorkerController;
 use worker::feature::builtin::manage_workdir::WorkspaceAttachedWorkdirSession;
-use worker::feature::builtin::{
-    CompositeWorkerObservationProvider, WorkspaceClientWorkerObservationProvider,
-};
 use worker::feature::contracts::{
     WorkerObservationError, WorkerObservationProvider, WorkerObservationSubject,
     WorkerObservationSubjectRef, WorkerSessionCapture,
@@ -2161,20 +2158,15 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         if let (Some(runtime_id), Some(workspace_id)) =
             (observation_runtime_id, observation_workspace_id.clone())
             && observation_enabled
+            && !observation_grants.is_empty()
         {
-            let mut providers: Vec<Arc<dyn WorkerObservationProvider>> = vec![Arc::new(
-                WorkspaceClientWorkerObservationProvider::new(worker.workspace_client_handle()),
-            )];
-            if !observation_grants.is_empty() {
-                providers.push(Arc::new(RuntimeGrantedWorkerObservationProvider {
+            worker.bind_worker_observation_provider(Some(Arc::new(
+                RuntimeGrantedWorkerObservationProvider {
                     runtime_id,
                     workspace_id,
                     grants: observation_grants.into_iter().take(100).collect(),
                     hub: self.observation_hub.clone(),
-                }));
-            }
-            worker.bind_worker_observation_provider(Some(Arc::new(
-                CompositeWorkerObservationProvider::new(providers),
+                },
             )));
         }
         if flow_transition_enabled {
@@ -2877,30 +2869,24 @@ impl ProfileRuntimeWorkerFactory {
                 .expect("retained restore owner")
                 .sessions
                 .push(workdir_sessions.clone());
-            let mut providers: Vec<Arc<dyn WorkerObservationProvider>> = vec![Arc::new(
-                WorkspaceClientWorkerObservationProvider::new(workspace_client.clone()),
-            )];
             let observation_provider = if let (Some(runtime_id), Some(api)) = (
                 self.runtime_id.clone(),
                 request.request.workspace_api.as_ref(),
             ) && request.request.worker_observation_enabled
+                && !request.request.worker_observation_grants.is_empty()
             {
-                if !request.request.worker_observation_grants.is_empty() {
-                    providers.push(Arc::new(RuntimeGrantedWorkerObservationProvider {
-                        runtime_id,
-                        workspace_id: api.workspace_id.clone(),
-                        grants: request
-                            .request
-                            .worker_observation_grants
-                            .iter()
-                            .take(100)
-                            .cloned()
-                            .collect(),
-                        hub: self.observation_hub.clone(),
-                    }));
-                }
-                Some(Arc::new(CompositeWorkerObservationProvider::new(providers))
-                    as Arc<dyn WorkerObservationProvider>)
+                Some(Arc::new(RuntimeGrantedWorkerObservationProvider {
+                    runtime_id,
+                    workspace_id: api.workspace_id.clone(),
+                    grants: request
+                        .request
+                        .worker_observation_grants
+                        .iter()
+                        .take(100)
+                        .cloned()
+                        .collect(),
+                    hub: self.observation_hub.clone(),
+                }) as Arc<dyn WorkerObservationProvider>)
             } else {
                 None
             };

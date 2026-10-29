@@ -2061,7 +2061,7 @@ where
         crate::feature::builtin::objective::composition::compose(
             &mut feature_registry,
             feature_config.objective.enabled,
-            workspace_client,
+            workspace_client.clone(),
             objective_namespace.map(|route| (route, wip_permissions.clone())),
         )?;
 
@@ -2081,6 +2081,15 @@ where
             prompts,
         ) {
             observation_providers.push(provider);
+        }
+        // A scoped Backend provider belongs to the Worker Feature's composition,
+        // including ordinary spawn and restore. Runtime's optional local peer
+        // provider is not its enablement or authority: every actual capture still
+        // requires current operation use and the target's Backend control grant.
+        if worker_enabled {
+            observation_providers.push(Arc::new(
+                crate::feature::builtin::worker_observation::WorkspaceClientWorkerObservationProvider::new(workspace_client),
+            ));
         }
         if let Some(provider) = host_worker_observation_provider {
             observation_providers.push(provider);
@@ -4160,6 +4169,82 @@ mod tests {
                     "updated_at": "2026-10-08T00:00:00Z",
                     "latest_url": "/api/w/workspace-1/drive/download?entry_workspace_id=workspace-1&id=1"
                 }).to_string() })
+            }
+        }
+
+        #[tokio::test]
+        async fn scoped_observation_is_composed_only_with_runtime_worker_service_without_startup_access()
+         {
+            for enabled in [false, true] {
+                let root = TempDir::new().unwrap();
+                let mut manifest = manifest::WorkerManifest::from_toml(
+                    "[worker]\nname = 'observation-wiring'\n[model]\nscheme = 'anthropic'\nmodel_id = 'test'\n[engine]\n[scope]\n"
+                ).unwrap();
+                manifest.feature.worker.enabled = enabled;
+                manifest.feature.sub_worker.enabled = false;
+                manifest.feature.workdir_catalog.enabled = false;
+                let model = ScriptedClient::new(vec![]);
+                let engine =
+                    Engine::<_, agen::state::Mutable, crate::SessionHistoryMetadata>::new_annotated(
+                        model,
+                    );
+                let store = session_store::CombinedStore::new(
+                    session_store::FsStore::new(root.path().join("sessions")).unwrap(),
+                    session_store::FsWorkerStore::new(root.path().join("workers")).unwrap(),
+                );
+                let operations = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let host = Arc::new(DriveWorkspaceHost {
+                    available: true,
+                    workspace: Some("workspace-1"),
+                    granted: false,
+                    operations: operations.clone(),
+                });
+                let mut worker = Worker::new(
+                    manifest,
+                    engine,
+                    store,
+                    crate::worker::WorkerWorkspaceContext::with_client(
+                        Some(crate::worker::WorkspaceId::new("workspace-1").unwrap()),
+                        host,
+                    ),
+                    crate::worker::WorkerFilesystemAuthority::None,
+                    manifest::Scope::empty(),
+                )
+                .await
+                .unwrap();
+                worker.set_system_prompt_template(
+                    crate::SystemPromptTemplate::parse(
+                        "default",
+                        crate::PromptCatalogSource::builtins_only(),
+                    )
+                    .unwrap(),
+                );
+                let prepared = WorkerController::initialize(worker, root.path(), None)
+                    .await
+                    .unwrap();
+                let Event::Snapshot { greeting, .. } =
+                    crate::ipc::protocol_session::subscribe_worker_protocol_session(
+                        &prepared.handle,
+                    )
+                    .snapshot_event
+                else {
+                    panic!("initial committed greeting");
+                };
+                for name in [
+                    "ViewSessionOverview",
+                    "SearchSessionEntries",
+                    "ReadSessionEntry",
+                ] {
+                    assert_eq!(
+                        greeting.tools.iter().any(|tool| tool == name),
+                        enabled,
+                        "Worker service configuration must determine observation publication, not client availability alone"
+                    );
+                }
+                assert!(
+                    operations.lock().unwrap().is_empty(),
+                    "provider composition may not authorize or read protected resources"
+                );
             }
         }
 

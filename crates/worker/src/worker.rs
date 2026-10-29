@@ -762,6 +762,11 @@ pub enum WorkspaceServerOperation {
         result_id: String,
     },
     WorkerControlList,
+    WorkerControlAuthorize {
+        runtime_id: String,
+        worker_id: String,
+        permission: String,
+    },
     WorkerControlSpawn(server_api::CreateWorkspaceWorkerRequest),
     WorkerControlInput {
         runtime_id: String,
@@ -959,6 +964,16 @@ fn workspace_server_operation_request(
         ))),
         WorkspaceServerOperation::WorkerControlList => Ok(WorkspaceRequest::get(format!(
             "{base}/worker-control/workers"
+        ))),
+        WorkspaceServerOperation::WorkerControlAuthorize {
+            runtime_id,
+            worker_id,
+            permission,
+        } => Ok(WorkspaceRequest::get(format!(
+            "{base}/worker-control/workers/{}/{}/permissions/{}",
+            encode_workspace_path_segment(&runtime_id),
+            encode_workspace_path_segment(&worker_id),
+            encode_workspace_path_segment(&permission)
         ))),
         WorkspaceServerOperation::WorkerControlSpawn(request) => {
             workspace_server_json_request(format!("{base}/worker-control/workers"), &request)
