@@ -51,6 +51,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+mod catalog;
+pub use catalog::*;
+
 pub const MAX_SCOPED_PERMISSIONS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]

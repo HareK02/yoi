@@ -34,6 +34,8 @@ pub use workspace_config::*;
 #[serde(deny_unknown_fields)]
 pub struct SubjectPermissionsResponse {
     pub permissions: Option<authorization::SubjectPermissions>,
+    pub can_manage: bool,
+    pub operations: Vec<authorization::PermissionOperationDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -11060,6 +11062,16 @@ pub fn memory_api_typescript() -> String {
         MemoryStagingRecord::decl(&config),
         MemoryStagingEntry::decl(&config),
         MemoryStagingListResponse::decl(&config),
+        authorization::PermissionResource::decl(&config),
+        authorization::ScopedPermission::decl(&config),
+        authorization::SubjectPermissions::decl(&config),
+        authorization::SubjectPermissionsUpdate::decl(&config),
+        authorization::PermissionResourceKind::decl(&config),
+        authorization::PermissionOperationAvailability::decl(&config),
+        authorization::PermissionOperationDescriptor::decl(&config),
+        SubjectPermissionsResponse::decl(&config),
+        SubjectPermissionsMutationResponse::decl(&config),
+        SubjectPermissionInterruption::decl(&config),
     ];
     // These browser DTOs include nested types owned by `memory` and the Worker
     // launch API. Keep their exported names explicit so the generated Web

@@ -111,6 +111,118 @@ export type MemoryStagingListResponse = {
   diagnostics: Array<Diagnostic>;
 };
 
+export type PermissionResource =
+  | { "kind": "job"; workspace_id: string; job_id: string }
+  | { "kind": "ticket"; workspace_id: string; ticket_id: string }
+  | { "kind": "objective"; workspace_id: string; objective_id: string }
+  | { "kind": "merge_request"; workspace_id: string; merge_request_id: string }
+  | { "kind": "subject"; workspace_id: string; subject_id: string }
+  | { "kind": "drive_entry"; workspace_id: string; node_id: string }
+  | { "kind": "drive_request"; workspace_id: string; request_id: string }
+  | { "kind": "repository"; workspace_id: string; repository_key: string }
+  | {
+    "kind": "workdir_attachment";
+    workspace_id: string;
+    connection_id: string;
+  }
+  | {
+    "kind": "workspace_config";
+    workspace_id: string;
+    path: string;
+    recursive: boolean;
+  }
+  | { "kind": "network"; url: string }
+  | {
+    "kind": "sub_worker";
+    runtime_id: string;
+    worker_id: string;
+    name: string;
+  }
+  | { "kind": "feature" }
+  | { "kind": "workspace"; workspace_id: string }
+  | {
+    "kind": "workdir";
+    working_directory_id: string;
+    path: string;
+    recursive: boolean;
+  }
+  | { "kind": "worker"; runtime_id: string; worker_id: string };
+
+export type ScopedPermission = {
+  operation: string;
+  resource: PermissionResource;
+};
+
+export type SubjectPermissions = {
+  change_id: string;
+  execution: Array<ScopedPermission>;
+  delegation: Array<ScopedPermission>;
+};
+
+export type SubjectPermissionsUpdate = {
+  operation_id: string;
+  expected_change_id: string | null;
+  execution: Array<ScopedPermission>;
+  delegation: Array<ScopedPermission>;
+};
+
+export type PermissionResourceKind =
+  | "job"
+  | "ticket"
+  | "objective"
+  | "merge_request"
+  | "subject"
+  | "drive_entry"
+  | "drive_request"
+  | "repository"
+  | "workdir_attachment"
+  | "workspace_config"
+  | "network"
+  | "sub_worker"
+  | "feature"
+  | "workspace"
+  | "workdir"
+  | "worker";
+
+export type PermissionOperationAvailability = { "kind": "available" } | {
+  "kind": "unavailable";
+  reason: string;
+};
+
+export type PermissionOperationDescriptor = {
+  operation: string;
+  label: string;
+  description: string;
+  /**
+   * Accepted management input kinds, not a claim that a target exists or is usable.
+   */
+  resource_kinds: Array<PermissionResourceKind>;
+  availability: PermissionOperationAvailability;
+};
+
+export type SubjectPermissionsResponse = {
+  permissions: SubjectPermissions | null;
+  can_manage: boolean;
+  operations: Array<PermissionOperationDescriptor>;
+};
+
+export type SubjectPermissionsMutationResponse = {
+  permissions: SubjectPermissions;
+  /**
+   * New operations are already fenced. These are cancellation requests and
+   * Backend command cleanup evidence, not proof that a Runtime turn stopped.
+   */
+  interruptions: Array<SubjectPermissionInterruption>;
+};
+
+export type SubjectPermissionInterruption = {
+  runtime_id: string;
+  worker_id: string;
+  cancellation_accepted: boolean;
+  backend_command_sessions_closed: boolean;
+  diagnostics: Array<string>;
+};
+
 export type SubjektivSubjectState = "active" | "retired";
 
 export type SubjektivSubjectCreateRequest = {
