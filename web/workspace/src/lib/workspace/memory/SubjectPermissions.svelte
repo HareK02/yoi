@@ -167,16 +167,16 @@
 <style>
   .permissions { max-width: 72rem; min-width: 0; }
   header { display: flex; flex-wrap: wrap; align-items: baseline; gap: .75rem; }
-  h2 { margin: 0; font-size: 1.2rem; } h3 { font-size: 1rem; margin: 0 0 .5rem; } h4 { margin: 1rem 0 .4rem; }
-  p { line-height: 1.55; color: var(--text-muted); } .state { font-size: .8rem; }
+  h2 { margin: 0; font-size: var(--font-size-body); } h3 { font-size: var(--font-size-body); margin: 0 0 .5rem; } h4 { margin: 1rem 0 .4rem; }
+  p { line-height: 1.55; color: var(--text-muted); } .state { font-size: var(--font-size-compact); }
   .lanes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.5rem; margin: 1.5rem 0; }
   .lane { min-width: 0; border-top: 1px solid var(--line); padding-top: 1rem; }
   ul { list-style: none; padding: 0; margin: .75rem 0; } li { display: flex; align-items: start; gap: .75rem; justify-content: space-between; padding: .75rem 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
-  li > div { min-width: 0; } .resource, .legacy { display: block; margin-top: .35rem; font-size: .85rem; } .legacy { color: var(--text-muted); }
+  li > div { min-width: 0; } li button { flex-shrink: 0; white-space: nowrap; } .resource, .legacy { display: block; margin-top: .35rem; font-size: var(--font-size-body); } .legacy { color: var(--text-muted); }
   .permission-form, .diff { border-top: 1px solid var(--line); margin-top: 1.5rem; padding-top: 1rem; }
   fieldset { border: 0; padding: 0; min-width: 0; display: grid; gap: .75rem; max-width: 38rem; }
-  label { display: grid; gap: .35rem; font-size: .875rem; } input, select { width: 100%; min-width: 0; padding: .55rem; border: 1px solid var(--line); border-radius: 3px; background: var(--bg); color: var(--text); font: inherit; }
-  button { background: transparent; color: var(--text); border: 1px solid var(--line); padding: .45rem .7rem; border-radius: 3px; cursor: pointer; font: inherit; font-size: .85rem; } button:disabled { opacity: .5; cursor: default; } button.save { background: var(--text); color: var(--bg); margin-top: .75rem; }
+  label { display: grid; gap: .35rem; font-size: var(--font-size-body); } input, select { width: 100%; min-width: 0; padding: .55rem; border: 1px solid var(--line); border-radius: 3px; background: var(--bg); color: var(--text); font: inherit; }
+  button { background: transparent; color: var(--text); border: 1px solid var(--line); padding: .45rem .7rem; border-radius: 3px; cursor: pointer; font: inherit; font-size: var(--font-size-body); } button:disabled { opacity: .5; cursor: default; } button.save { background: var(--text); color: var(--bg); margin-top: .75rem; }
   .check { display: flex; align-items: start; gap: .5rem; } .check input { width: auto; margin-top: .2rem; } .reload { margin: 1rem 0; }
   .attention { border-left: 3px solid var(--text-muted); padding: .7rem 1rem; overflow-wrap: anywhere; } .help { margin: 1.5rem 0; } summary { cursor: pointer; } code { overflow-wrap: anywhere; }
   @media (max-width: 900px) { .lanes { grid-template-columns: 1fr; gap: 1rem; } }

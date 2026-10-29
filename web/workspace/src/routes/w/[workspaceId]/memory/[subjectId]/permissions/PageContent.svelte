@@ -13,4 +13,4 @@
     {#key JSON.stringify([data.workspaceId, data.subjectId])}<SubjectPermissions workspaceId={data.workspaceId} subjectId={data.subjectId} />{/key}
   {:else}<p role="alert">Target unavailable. {data.subject.error} An old page cannot recreate a deleted Subject.</p>{/if}
 </section>
-<style>.permission-page { padding: 1.5rem; min-width: 0; } h1 { font-size: 1.5rem; margin: 1rem 0 1.5rem; overflow-wrap: anywhere; } @media (max-width: 600px) { .permission-page { padding: 1rem; } }</style>
+<style>.permission-page { padding: 1.5rem; min-width: 0; } h1 { font-size: var(--font-size-title); margin: 1rem 0 1.5rem; overflow-wrap: anywhere; } @media (max-width: 600px) { .permission-page { padding: 1rem; } }</style>

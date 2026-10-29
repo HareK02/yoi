@@ -1,0 +1,138 @@
+{
+  "schemaVersion": 1,
+  "id": "subject-permissions-dark",
+  "title": "T-802 actual Web / synthetic HTTP NOT real Backend — dark",
+  "baseUrl": "http://127.0.0.1:15289",
+  "colorScheme": "dark",
+  "reducedMotion": "reduce",
+  "personas": [
+    {
+      "id": "fixture",
+      "label": "Synthetic HTTP projection, NOT real Backend authentication or authorization",
+      "auth": {
+        "kind": "anonymous"
+      }
+    }
+  ],
+  "viewports": [
+    {
+      "label": "desktop",
+      "width": 1440,
+      "height": 900
+    },
+    {
+      "label": "narrow",
+      "width": 768,
+      "height": 900
+    },
+    {
+      "label": "mobile",
+      "width": 390,
+      "height": 844
+    }
+  ],
+  "routes": [
+    {
+      "id": "permissions-empty",
+      "label": "Unset permissions",
+      "path": "/w/memory-review/memory/permissions-empty/permissions",
+      "goal": "Distinguish unset permission policy from unavailable or read-only; locate separate direct and delegation scopes.",
+      "dataState": "Synthetic HTTP only; no real Backend persistence, authorization, lifecycle or Worker evidence. Unset permissions.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-permission-state=ready][aria-busy=false]"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Unset permissions"
+        }
+      ]
+    },
+    {
+      "id": "permissions-edit",
+      "label": "Configured permissions",
+      "path": "/w/memory-review/memory/permissions-edit/permissions",
+      "goal": "Read exact operation and target before editing.",
+      "dataState": "Synthetic HTTP only; no real Backend persistence, authorization, lifecycle or Worker evidence. Configured permissions.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-permission-state=ready][aria-busy=false]"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Configured permissions"
+        }
+      ]
+    },
+    {
+      "id": "permissions-legacy",
+      "label": "Preserved unsupported permission",
+      "path": "/w/memory-review/memory/permissions-legacy/permissions",
+      "goal": "Recognize preserved legacy Worker target without treating T-803 messaging as available.",
+      "dataState": "Synthetic HTTP only; no real Backend persistence, authorization, lifecycle or Worker evidence. Preserved unsupported permission.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-permission-state=ready][aria-busy=false]"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Preserved unsupported permission"
+        }
+      ]
+    },
+    {
+      "id": "permissions-reader",
+      "label": "Read-only permissions",
+      "path": "/w/memory-review/memory/permissions-reader/permissions",
+      "goal": "Read policy without unauthorized editing controls.",
+      "dataState": "Synthetic HTTP only; no real Backend persistence, authorization, lifecycle or Worker evidence. Read-only permissions.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-permission-state=ready][aria-busy=false]"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Read-only permissions"
+        }
+      ]
+    },
+    {
+      "id": "permissions-unavailable",
+      "label": "Unavailable permission service",
+      "path": "/w/memory-review/memory/permissions-unavailable/permissions",
+      "goal": "Recover without success claims.",
+      "dataState": "Synthetic HTTP only; no real Backend persistence, authorization, lifecycle or Worker evidence. Unavailable permission service.",
+      "ready": {
+        "kind": "selector",
+        "selector": "[data-permission-state=error][aria-busy=false]"
+      },
+      "capturePoints": [
+        {
+          "id": "initial",
+          "label": "Unavailable permission service"
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "subject-permissions-synthetic-http",
+      "command": "deno",
+      "cwd": "..",
+      "args": [
+        "run",
+        "-A",
+        "browser-tests/memory_document_fixture_server.ts",
+        "15289",
+        "${WEB_UX_BUILD_ROOT}",
+        "3",
+        "permissions"
+      ],
+      "readyUrl": "http://127.0.0.1:15289/health"
+    }
+  ]
+}
