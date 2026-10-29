@@ -49,3 +49,38 @@ record (`changes` includes `body`), never a later title-only edit. Missing or em
 creator identities remain explicitly nullable, not inferred from later editors.
 The retained base SQL and frozen fixture schemas remain unchanged; fresh creation
 composes the ordered post migration.
+
+## Subject responsibility schema
+
+Component migration 14 owns the Subject principal CHECKs and assignment/current,
+operation, and legacy tracking/history guards. Fresh standalone stores and Workspace
+hosts use the same `migrate_sqlite_ticket_schema_in_transaction(&Connection)` startup
+composition; the host owns its surrounding transaction, authentication, live Subject
+body bindings, delivery/start fences, and notification routing. Request paths only
+verify the owning schema and never install a host-dependent fixture or fallback.
+
+Retained host startup migrations must instead call
+`migrate_historical_sqlite_ticket_schema_in_transaction(&Connection, HistoricalTicketSchemaTarget)`
+with the explicit `Cases10`, `Tracking11`, `Posts12`, or `Content13` boundary. This
+bounded API shares the latest composer's migration engine; it cannot select arbitrary
+versions or downgrade a current store. If the applied version is already newer, it
+verifies that actual contract without replaying old steps or relabelling receipts.
+Original baseline receipts are retained, including v6–9 baselines; their ordered
+v7/10 composition receipts are appended instead of overwriting the baseline. Previously
+retained normalized baseline10 histories remain supported. Neither composer is a
+request-path API or a grant of legacy execution authority.
+
+The additive migration leaves applied core/tracking SQL unchanged. It preflights
+complete known table generations (standalone or Workspace-parent FKs), widens only
+the three principal CHECKs with exact-SQL CAS, restores `writable_schema` on failure,
+and checks integrity before accepting the migration. This avoids rebuilding immutable
+parents and their host-owned FK graph inside a host transaction. Unsupported/mixed
+tables and weakened guards fail closed; a trigger name alone never selects a schema
+generation. Migration history selects the exact verified contract.
+
+Old `workspace_agent` relationships, handling/results, audit source JSON, and receipts
+remain readable as historical data, with a nonoperational diagnostic. They are not
+converted to an arbitrary Subject or replayed as new input. Newly authorized Subject
+Assign/reissue creates a distinct identity. Tracking sources use the Rust/JSON field
+`subject_id`; historical `agent_key` audit JSON remains an unmodified JSON value,
+not an alias accepted as current Subject authority.

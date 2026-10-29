@@ -4,7 +4,7 @@ fn tracking_store_source() -> TicketAssignmentTrackingSourceContext {
         actor: "authenticated-worker:r/worker".into(),
         runtime_id: "r".into(),
         worker_id: "worker".into(),
-        agent_key: "workspace-orchestrator".into(),
+        subject_id: "tracking-subject".into(),
         authentication_binding_id: "tracking-binding".into(),
     }
 }
@@ -14,8 +14,9 @@ async fn tracking_store_fixture() -> (tempfile::TempDir, SqliteWorkspaceStore) {
     seed_manual_start_ticket(&store, "tracking", "open");
     store.with_conn(|conn| {
         conn.execute("INSERT INTO workspace_runtime_bindings(workspace_id,runtime_id,display_name,base_url,public_key,public_key_fingerprint,binding_id,authentication_mode,created_at,updated_at) VALUES('w','r','Runtime','https://runtime.invalid','verified-fixture-key','verified-fixture-fingerprint','tracking-binding','workspace_identity','1','1')",[])?;
-        conn.execute("INSERT INTO worker_singleton_owners(workspace_id,singleton_key,runtime_id,worker_id,generation,created_at,updated_at) VALUES('w',?1,'r','worker',1,'1','1')",[crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY])?;
+        conn.execute("INSERT INTO worker_singleton_owners(workspace_id,singleton_key,runtime_id,worker_id,generation,created_at,updated_at) VALUES('w',?1,'r','worker',1,'1','1')",["subjektiv:tracking-subject"])?;
         conn.execute("INSERT INTO worker_registry(workspace_id,runtime_id,worker_id,display_name,retention_state,created_at,updated_at) VALUES('w','r','replacement','Replacement','normal','1','1')",[])?;
+        conn.execute("INSERT INTO worker_create_reservations(workspace_id,allocation_key,worker_id,runtime_id,create_fingerprint,state,created_at,updated_at,singleton_key,singleton_generation) VALUES('w','tracking-body','worker','r','tracking-body','created','1','1','subjektiv:tracking-subject',1)",[])?;
         Ok(())
     }).unwrap();
     (directory, store)
@@ -29,8 +30,8 @@ fn tracking_store_assign(
     let assignment = TicketRoleAssignmentRecord {
         assignment_id: id.into(),
         role: TicketAssignmentRole::Orchestrator,
-        principal: TicketAssignmentPrincipal::WorkspaceAgent {
-            agent_key: "workspace-orchestrator".into(),
+        principal: TicketAssignmentPrincipal::Subject {
+            subject_id: "tracking-subject".into(),
         },
         ..manual_worker_assignment("tracking", id)
     };
@@ -62,7 +63,15 @@ fn tracking_store_input(id: &str, event: &str, key: &str) -> TicketAssignmentTra
 #[tokio::test]
 async fn tracking_store_every_replay_fences_current_singleton_and_authenticated_binding_under_write_lock()
  {
-    for change in ["replacement", "revoke", "binding-change", "remove"] {
+    for change in [
+        "replacement",
+        "revoke",
+        "binding-change",
+        "generation",
+        "reservation-removed",
+        "subject-deleted",
+        "remove",
+    ] {
         let (directory, store) = tracking_store_fixture().await;
         tracking_store_assign(&store, "a", "assign-a");
         let source = tracking_store_source();
@@ -86,6 +95,9 @@ async fn tracking_store_every_replay_fences_current_singleton_and_authenticated_
                 "replacement" => {tx.execute("UPDATE worker_singleton_owners SET worker_id='replacement',generation=2 WHERE workspace_id='w'",[])?;},
                 "revoke" => {tx.execute("UPDATE workspace_runtime_bindings SET revoked_at='revoked' WHERE workspace_id='w'",[])?;},
                 "binding-change" => {tx.execute("UPDATE workspace_runtime_bindings SET binding_id='new-binding' WHERE workspace_id='w'",[])?;},
+                "generation" => {tx.execute("UPDATE worker_create_reservations SET singleton_generation=2 WHERE workspace_id='w'",[])?;},
+                "reservation-removed" => {tx.execute("UPDATE worker_create_reservations SET state='removed' WHERE workspace_id='w'",[])?;},
+                "subject-deleted" => {tx.execute("INSERT INTO subject_deletions(workspace_id,subject_id,operation_id) VALUES('w','tracking-subject','delete-subject')",[])?;},
                 _ => {tx.execute("DELETE FROM worker_singleton_owners WHERE workspace_id='w'",[])?;},
             }
             tx.commit()?;Ok(())
@@ -470,17 +482,41 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                         95,
                         "Common notification routing and durable Worker delivery".into()
                     ),
-                    (96,"Backend Job common notification routing".into()),
-                    (97, "MR notifications and authenticated implementation results".into()),
+                    (96, "Backend Job common notification routing".into()),
+                    (
+                        97,
+                        "MR notifications and authenticated implementation results".into()
+                    ),
                     (98, "Assignment-independent implementation reports".into()),
-                    (99, "Explicit hosting administrators and self-registration policy".into()),
-                    (100, "Provisional users and scoped passkey activation".into()),
+                    (
+                        99,
+                        "Explicit hosting administrators and self-registration policy".into()
+                    ),
+                    (
+                        100,
+                        "Provisional users and scoped passkey activation".into()
+                    ),
                     (101, "Durable explicit Subject body release".into()),
                     (102, "Durable failed Subject creation recovery".into()),
                     (103, "Passkey metadata and atomic addition results".into()),
-                    (104, "Converge Passkey results and Job input retention".into()),
-                    (105, "Durable Subject deletion snapshots and Job admission fences".into()),
-                    (106, crate::plugin_catalog::MIGRATION_NAME.into())
+                    (
+                        104,
+                        "Converge Passkey results and Job input retention".into()
+                    ),
+                    (
+                        105,
+                        "Durable Subject deletion snapshots and Job admission fences".into()
+                    ),
+                    (106, crate::plugin_catalog::MIGRATION_NAME.into()),
+                    (
+                        107,
+                        "Immutable Worker Plugin plans and retained pins".into()
+                    ),
+                    (
+                        108,
+                        "Subject Ticket responsibility and current-body notification routing"
+                            .into()
+                    )
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {
@@ -554,10 +590,10 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
 }
 
 #[test]
-fn tracking_store_schema91_closed_unknown_assignment_uses_assign_audit_for_first_self_report() {
+fn tracking_store_schema91_closed_unknown_assignment_retains_assign_audit_but_legacy_cannot_self_report()
+ {
     use ticket::TicketBackend;
-
-    for report_after_reopen in [false, true] {
+    for reopen_before_report in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("closed-unknown91.db");
         let conn = tracking_schema91_fixture(&path);
@@ -568,27 +604,8 @@ fn tracking_store_schema91_closed_unknown_assignment_uses_assign_audit_for_first
         let grants_before = stored_fixture_rows(&conn, "worker_control_grants");
         let releases_before = stored_fixture_rows(&conn, "ticket_assignment_work_releases");
         drop(conn);
-
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let backend = ticket::SqliteTicketBackend::open_verified(&path, "w").unwrap();
-        let reopen = || {
-            let observed = backend.show("historical-done".into()).unwrap();
-            backend
-                .update_case(
-                    "historical-done",
-                    ticket::TicketCaseUpdate {
-                        expected_content_digest: ticket::ticket_content_digest(&observed),
-                        expected_state: ticket::TicketState::Closed,
-                        expected_closure_operation_key: observed.closure_operation_key.clone(),
-                        operation_key: "explicit-reopen".into(),
-                        action: ticket::TicketCaseAction::Reopen,
-                        explanation: "Reopen without redelegation or restoring old work".into(),
-                        references: vec![],
-                        author: Some("account-author".into()),
-                    },
-                )
-                .unwrap();
-        };
         let unknown = store
             .get_ticket_assignment_tracking("w", "historical-done", "a-historical-done")
             .unwrap()
@@ -602,11 +619,59 @@ fn tracking_store_schema91_closed_unknown_assignment_uses_assign_audit_for_first
             Some("assigned-historical-done")
         );
         assert_eq!(
-            store
-                .list_current_ticket_assignment_tracking("w", "historical-done")
-                .unwrap(),
-            vec![unknown.clone()]
+            unknown.principal,
+            ticket::TicketAssignmentPrincipalSnapshot::WorkspaceAgent {
+                agent_key: "workspace-orchestrator".into()
+            }
         );
+        if reopen_before_report {
+            let observed = backend.show("historical-done".into()).unwrap();
+            backend
+                .update_case(
+                    "historical-done",
+                    ticket::TicketCaseUpdate {
+                        expected_content_digest: ticket::ticket_content_digest(&observed),
+                        expected_state: ticket::TicketState::Closed,
+                        expected_closure_operation_key: observed.closure_operation_key,
+                        operation_key: "explicit-reopen".into(),
+                        action: ticket::TicketCaseAction::Reopen,
+                        explanation: "Reopen is not Subject assignment or Worker restore".into(),
+                        references: vec![],
+                        author: Some("account-author".into()),
+                    },
+                )
+                .unwrap();
+        }
+        let mut legacy = tracking_store_source();
+        legacy.subject_id = "workspace-orchestrator".into();
+        let input = tracking_store_input(
+            "a-historical-done",
+            unknown.last_event_id.as_deref().unwrap(),
+            "legacy-result",
+        );
+        // Both the old identity and an unrelated Subject must fail even when
+        // they possess the authentic historical Assign observation.
+        let second = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        for source in [&legacy, &tracking_store_source()] {
+            for observer in [&store, &second] {
+                assert!(matches!(
+                    observer.update_ticket_assignment_tracking(
+                        "w",
+                        "historical-done",
+                        &input,
+                        source
+                    ),
+                    Err(Error::WorkspacePermissionDenied(_))
+                ));
+                assert_eq!(
+                    observer
+                        .get_ticket_assignment_tracking("w", "historical-done", "a-historical-done")
+                        .unwrap()
+                        .unwrap(),
+                    unknown
+                );
+            }
+        }
         assert!(
             store
                 .list_ticket_assignment_tracking_history(
@@ -616,129 +681,6 @@ fn tracking_store_schema91_closed_unknown_assignment_uses_assign_audit_for_first
                 )
                 .unwrap()
                 .is_empty()
-        );
-        store.with_conn(|conn| {
-            assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
-            assert_eq!(conn.query_row("SELECT MAX(version) FROM ticket_schema_migrations", [], |row| row.get::<_,i64>(0))?, 13);
-            assert_eq!(conn.query_row("SELECT workflow_state FROM typed_tickets WHERE ticket_id='historical-done'", [], |row| row.get::<_,String>(0))?, "closed");
-            let stored: (Option<String>, Option<String>) = conn.query_row("SELECT tracking_json,last_tracking_event_id FROM ticket_worker_assignments WHERE assignment_id='a-historical-done'", [], |row| Ok((row.get(0)?,row.get(1)?)))?;
-            assert_eq!(stored, (None, None), "read baseline must not manufacture tracking storage");
-            assert_eq!(stored_fixture_rows(conn, "ticket_worker_assignment_events"), audit_before);
-            Ok(())
-        }).unwrap();
-        if report_after_reopen {
-            reopen();
-        }
-        let source = tracking_store_source();
-        let input = tracking_store_input(
-            "a-historical-done",
-            unknown.last_event_id.as_deref().unwrap(),
-            "first-explicit-result",
-        );
-        let mut wrong_source = source.clone();
-        wrong_source.worker_id = "not-current-orchestrator".into();
-        assert!(matches!(
-            store.update_ticket_assignment_tracking("w", "historical-done", &input, &wrong_source),
-            Err(Error::WorkspacePermissionDenied(_))
-        ));
-        for (workspace, ticket) in [("other-workspace", "historical-done"), ("w", "pending")] {
-            assert!(
-                store
-                    .update_ticket_assignment_tracking(workspace, ticket, &input, &source)
-                    .is_err()
-            );
-        }
-        assert!(
-            store
-                .update_ticket_assignment_tracking(
-                    "w",
-                    "replaced",
-                    &tracking_store_input(
-                        "a-replaced",
-                        "assigned-replaced",
-                        "wrong-old-assignment"
-                    ),
-                    &source
-                )
-                .is_err()
-        );
-        // A second observer holds the same Assign baseline. Only the first
-        // explicit writer may consume it; BEGIN IMMEDIATE serializes the CAS.
-        let second = SqliteWorkspaceStore::open_for_test(&path).unwrap();
-        assert_eq!(
-            second
-                .get_ticket_assignment_tracking("w", "historical-done", "a-historical-done")
-                .unwrap()
-                .unwrap(),
-            unknown
-        );
-        let done = store
-            .update_ticket_assignment_tracking("w", "historical-done", &input, &source)
-            .unwrap();
-        assert_eq!(
-            done.tracking.as_ref().unwrap().status,
-            TicketAssignmentTrackingStatus::Done
-        );
-        assert_eq!(done.assignment_id, unknown.assignment_id);
-        assert_ne!(done.last_event_id, unknown.last_event_id);
-        assert_eq!(
-            store
-                .update_ticket_assignment_tracking("w", "historical-done", &input, &source)
-                .unwrap(),
-            done
-        );
-        assert!(matches!(
-            second.update_ticket_assignment_tracking(
-                "w",
-                "historical-done",
-                &tracking_store_input(
-                    "a-historical-done",
-                    "assigned-historical-done",
-                    "stale-second-observer"
-                ),
-                &source
-            ),
-            Err(Error::TicketAssignmentConflict(_))
-        ));
-        assert_eq!(
-            backend
-                .show("historical-done".into())
-                .unwrap()
-                .meta
-                .workflow_state,
-            if report_after_reopen {
-                ticket::TicketState::Open
-            } else {
-                ticket::TicketState::Closed
-            }
-        );
-        if !report_after_reopen {
-            reopen();
-        }
-        let after_reopen = store
-            .update_ticket_assignment_tracking(
-                "w",
-                "historical-done",
-                &tracking_store_input(
-                    "a-historical-done",
-                    done.last_event_id.as_deref().unwrap(),
-                    "explicit-result-after-reopen",
-                ),
-                &source,
-            )
-            .unwrap();
-        let history = store
-            .list_ticket_assignment_tracking_history("w", "historical-done", "a-historical-done")
-            .unwrap();
-        assert_eq!(
-            history.len(),
-            2,
-            "only explicit self-reports create handling events"
-        );
-        assert_eq!(history[0].event_id, done.last_event_id.clone().unwrap());
-        assert_eq!(
-            history[1].event_id,
-            after_reopen.last_event_id.clone().unwrap()
         );
         assert!(
             store
@@ -751,56 +693,40 @@ fn tracking_store_schema91_closed_unknown_assignment_uses_assign_audit_for_first
                 .is_none()
         );
         store.with_conn(|conn| {
-            assert_eq!(conn.query_row("SELECT COUNT(*) FROM ticket_worker_assignments WHERE workspace_id='w' AND ticket_id='historical-done'", [], |row| row.get::<_,i64>(0))?, 1);
             assert_eq!(stored_fixture_rows(conn, "ticket_worker_assignment_events"), audit_before);
             assert_eq!(stored_fixture_rows(conn, "worker_control_grants"), grants_before);
             assert_eq!(stored_fixture_rows(conn, "ticket_assignment_work_releases"), releases_before);
+            let stored: (Option<String>, Option<String>) = conn.query_row("SELECT tracking_json,last_tracking_event_id FROM ticket_worker_assignments WHERE assignment_id='a-historical-done'", [], |row| Ok((row.get(0)?,row.get(1)?)))?;
+            assert_eq!(stored, (None, None), "Assign audit baseline must not manufacture handling or authority");
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get::<_,i64>(0))?, 0);
             Ok(())
         }).unwrap();
+        assert_eq!(
+            backend
+                .show("historical-done".into())
+                .unwrap()
+                .meta
+                .workflow_state,
+            if reopen_before_report {
+                ticket::TicketState::Open
+            } else {
+                ticket::TicketState::Closed
+            }
+        );
         drop(second);
         drop(store);
-        let reopened_store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         assert_eq!(
-            reopened_store
+            reopened
                 .get_ticket_assignment_tracking("w", "historical-done", "a-historical-done")
                 .unwrap()
                 .unwrap(),
-            after_reopen
-        );
-        assert!(
-            reopened_store
-                .clear_current_ticket_orchestrator_assignment(
-                    "w",
-                    "historical-done",
-                    "a-historical-done",
-                    "explicit-release-event",
-                    "explicit-release",
-                    "human",
-                    "3",
-                    Some("Return responsibility"),
-                    &orchestrator_mutation_runtime_source()
-                )
-                .unwrap()
+            unknown
         );
         assert!(matches!(
-            reopened_store.update_ticket_assignment_tracking(
-                "w",
-                "historical-done",
-                &tracking_store_input(
-                    "a-historical-done",
-                    after_reopen.last_event_id.as_deref().unwrap(),
-                    "new-report-after-release"
-                ),
-                &source
-            ),
-            Err(Error::TicketAssignmentConflict(_))
+            reopened.update_ticket_assignment_tracking("w", "historical-done", &input, &legacy),
+            Err(Error::WorkspacePermissionDenied(_))
         ));
-        let released = reopened_store
-            .get_ticket_assignment_tracking("w", "historical-done", "a-historical-done")
-            .unwrap()
-            .unwrap();
-        assert!(!released.current);
-        assert_eq!(released.tracking, after_reopen.tracking);
     }
 }
 
@@ -858,7 +784,7 @@ fn orchestrator_mutation_runtime_source() -> TicketOrchestratorAssignmentSourceC
     TicketOrchestratorAssignmentSourceContext::Runtime {
         runtime_id: "r".into(),
         worker_id: "worker".into(),
-        agent_key: "workspace-orchestrator".into(),
+        agent_key: "tracking-subject".into(),
         authentication_binding_id: "tracking-binding".into(),
     }
 }
@@ -866,8 +792,8 @@ fn orchestrator_mutation_record(id: &str) -> TicketRoleAssignmentRecord {
     TicketRoleAssignmentRecord {
         assignment_id: id.into(),
         role: TicketAssignmentRole::Orchestrator,
-        principal: TicketAssignmentPrincipal::WorkspaceAgent {
-            agent_key: "workspace-orchestrator".into(),
+        principal: TicketAssignmentPrincipal::Subject {
+            subject_id: "tracking-subject".into(),
         },
         assigned_by: "readable Backend attribution".into(),
         ..manual_worker_assignment("tracking", id)
@@ -984,7 +910,7 @@ async fn orchestrator_assignment_receipts_bind_verified_source_even_when_readabl
         authentication_binding_id: "replacement-binding".into(),
         runtime_id: "r".into(),
         worker_id: "worker".into(),
-        agent_key: "workspace-orchestrator".into(),
+        agent_key: "tracking-subject".into(),
     };
     assert!(matches!(
         store.set_current_ticket_orchestrator_assignment(
@@ -1349,8 +1275,8 @@ async fn tracking_history_pages_are_append_ordered_exact_scope_cursors_and_bound
     seed_manual_start_ticket(&store, "another-ticket", "open");
     let other_ticket = TicketRoleAssignmentRecord {
         role: TicketAssignmentRole::Orchestrator,
-        principal: TicketAssignmentPrincipal::WorkspaceAgent {
-            agent_key: "workspace-orchestrator".into(),
+        principal: TicketAssignmentPrincipal::Subject {
+            subject_id: "tracking-subject".into(),
         },
         ..manual_worker_assignment("another-ticket", "other-ticket-assignment")
     };
@@ -1521,7 +1447,7 @@ fn assignment_answer_source() -> TicketOrchestratorAssignmentSourceContext {
     TicketOrchestratorAssignmentSourceContext::Runtime {
         runtime_id: "r".into(),
         worker_id: "worker".into(),
-        agent_key: "workspace-orchestrator".into(),
+        agent_key: "tracking-subject".into(),
         authentication_binding_id: "tracking-binding".into(),
     }
 }
@@ -1711,8 +1637,8 @@ async fn assignment_answer_new_input_rejects_replaced_or_changed_handling_but_ex
     );
     let mut replacement = manual_worker_assignment("tracking", "answer-b");
     replacement.role = TicketAssignmentRole::Orchestrator;
-    replacement.principal = TicketAssignmentPrincipal::WorkspaceAgent {
-        agent_key: "workspace-orchestrator".into(),
+    replacement.principal = TicketAssignmentPrincipal::Subject {
+        subject_id: "tracking-subject".into(),
     };
     store
         .set_current_ticket_role_assignment(
@@ -1775,8 +1701,8 @@ async fn assignment_identity_pages_keep_release_and_last_status_separate_and_rej
     tracking_store_assign(&store, "z-first", "first");
     let mut replacement = manual_worker_assignment("tracking", "a-second");
     replacement.role = TicketAssignmentRole::Orchestrator;
-    replacement.principal = TicketAssignmentPrincipal::WorkspaceAgent {
-        agent_key: "workspace-orchestrator".into(),
+    replacement.principal = TicketAssignmentPrincipal::Subject {
+        subject_id: "tracking-subject".into(),
     };
     store
         .set_current_ticket_role_assignment(

@@ -715,7 +715,7 @@ async fn worker_control_source_lookup_waits_off_tokio_and_retains_finite_host_ow
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn ticket_tracking_authority_and_case_audit_lookup_leave_db_and_tokio_free() {
+async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtime_lookup() {
     for operation in ["tracking", "case"] {
         let fixture = fixture().await;
         let ticket = browser_ticket_backend(&fixture.api)
@@ -767,6 +767,9 @@ async fn ticket_tracking_authority_and_case_audit_lookup_leave_db_and_tokio_free
         };
         let backend = browser_ticket_backend(&fixture.api).unwrap();
         let before = backend.show(TicketIdOrSlug::Id(ticket.id.clone())).unwrap();
+        // Tracking authority and case attribution are now local Subject/assignment
+        // reads, not observations of a singleton Runtime Worker. Keep a held
+        // Runtime endpoint to detect an accidental return to network authority.
         let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let api = fixture.api.clone();
         let ticket_id = ticket.id.clone();
@@ -819,8 +822,24 @@ async fn ticket_tracking_authority_and_case_audit_lookup_leave_db_and_tokio_free
             },
         ));
         assert!(futures::poll!(&mut decision).is_pending());
-        let request = observed(reply.entered.take().unwrap()).await.unwrap();
-        assert!(request.contains("/v1/workers/"), "{operation}: {request}");
+        let outcome = observed(decision.as_mut()).await;
+        if operation == "tracking" {
+            let error = outcome.unwrap_err();
+            assert!(
+                error.error.to_string().contains("Subject body"),
+                "{error:?}"
+            );
+        } else {
+            outcome.unwrap();
+        }
+        assert_eq!(leases.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(
+                reply.entered.as_mut().unwrap().try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "local assignment authority/audit must not observe Runtime"
+        );
         let store = fixture.store.clone();
         observed(
             fixture
@@ -836,7 +855,6 @@ async fn ticket_tracking_authority_and_case_audit_lookup_leave_db_and_tokio_free
         observed(tokio::time::sleep(StdDuration::from_millis(1))).await;
         assert!(!reply.upstream_released.load(Ordering::SeqCst));
         drop(decision);
-        assert_eq!(leases.load(Ordering::SeqCst), 1);
         reply.finish();
         observed(fixture.host_executor.drain()).await.unwrap();
         observed(fixture.executor.drain()).await.unwrap();
@@ -848,8 +866,8 @@ async fn ticket_tracking_authority_and_case_audit_lookup_leave_db_and_tokio_free
                 "tracking still requires live assignment authority"
             );
         } else {
-            // Profile-authorized case changes do not depend on a live
-            // Orchestrator lookup. Its failure only affects audit role context.
+            // Case changes do not depend on a remote singleton lookup.
+            // The local assignment-only audit falls back to an ordinary Worker.
             assert_eq!(after.meta.workflow_state, ticket::TicketState::Closed);
             assert_eq!(
                 after.events.last().unwrap().attributes["source_actor_role"],
@@ -890,6 +908,18 @@ async fn cancelled_feature_shutdown_keeps_sql_close_owned_without_blocking_contr
         released,
     };
     observed(waiting).await.unwrap(); // actual SQL transaction owns the Feature connection
+    // Force close to be queued before the sole DB worker can start it. Pending
+    // admission alone must not be mistaken for an available second queue slot.
+    let (started, running) = oneshot::channel();
+    let (start_close, held) = mpsc::channel();
+    fixture
+        .executor
+        .dispatch(move || {
+            let _ = started.send(());
+            let _ = held.recv_timeout(WATCHDOG);
+        })
+        .unwrap();
+    observed(running).await.unwrap();
     let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut close = Box::pin(crate::db_executor::with_operation_lifetime(
         Arc::new(CountJobLifetime(leases.clone())),
@@ -899,6 +929,30 @@ async fn cancelled_feature_shutdown_keeps_sql_close_owned_without_blocking_contr
         futures::poll!(&mut close).is_pending(),
         "Feature connection close must not wait on Tokio"
     );
+    assert!(matches!(
+        fixture.executor.dispatch(|| {}),
+        Err(Error::DbCapacityExceeded)
+    ));
+    start_close.send(()).unwrap();
+    let fenced = observed(async {
+        loop {
+            match fixture
+                .api
+                .feature_storage
+                .open(&fixture.api.subjektiv_registration)
+            {
+                Err(crate::FeatureStorageError::ShuttingDown) => break,
+                Ok(_) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected Feature admission failure: {error}"),
+            }
+        }
+    });
+    tokio::select! {
+        _ = fenced => {},
+        result = &mut close => panic!("close completed while its connection is held: {result:?}"),
+    }
+    // Observing the real shutdown fence proves close was dequeued and started;
+    // only now can the one waiting slot be filled deterministically.
     runtime_progress_while_locked(&lock).await;
     assert_eq!(
         observed(fixture.host_executor.run(|| Ok::<_, Error>("control")))

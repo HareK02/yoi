@@ -49,7 +49,7 @@ fn routing_ack_worker_pending(
 
 #[tokio::test]
 async fn notification_routing_diagnostics_preview_unrouted_requests_readonly_beyond_global_batch() {
-    let (_directory, store) = tracking_store_fixture().await;
+    let (_directory, store) = delivery_tracking_fixture().await;
     seed_manual_start_ticket(&store, "other-ticket", "open");
     store.with_conn_mut(|conn| {
         let tx = conn.transaction()?;
@@ -59,7 +59,7 @@ async fn notification_routing_diagnostics_preview_unrouted_requests_readonly_bey
         tx.commit()?;
         Ok(())
     }).unwrap();
-    tracking_store_assign(&store, "a", "assign-a");
+    delivery_tracking_assign(&store, "a", "assign-a");
     delivery_store_answer(&store, "preview-answer");
     // An answer without the assignment fence must be suppressed by the same Rust policy.
     delivery_store_external_event(&store, 1, "assignment_answer", None);
@@ -183,9 +183,9 @@ async fn notification_routing_orchestrator_ack_retains_authorized_target_after_r
         "worker-replaced",
     ] {
         for prepare in [false, true] {
-            let (_directory, store) = tracking_store_fixture().await;
-            tracking_store_assign(&store, "a", "assign-a");
-            let source = tracking_store_source();
+            let (_directory, store) = delivery_tracking_fixture().await;
+            delivery_tracking_assign(&store, "a", "assign-a");
+            let source = delivery_tracking_source();
             let delivery = delivery_store_reserve_initial(&store, &source);
             if prepare {
                 store
@@ -200,7 +200,7 @@ async fn notification_routing_orchestrator_ack_retains_authorized_target_after_r
             match change {
                 "done" => { store.update_ticket_assignment_tracking("w", "tracking", &tracking_store_input("a", "event-assign-a", "done-a"), &source).unwrap(); }
                 "release" => { store.clear_current_ticket_role_assignment("w", "tracking", TicketAssignmentRole::Orchestrator, "a", "clear-a", "clear-a", "human", "now", None).unwrap(); }
-                "reassign" => { tracking_store_assign(&store, "b", "assign-b"); }
+                "reassign" => { delivery_tracking_assign(&store, "b", "assign-b"); }
                 _ => store.with_conn(|conn| {
                     match change {
                         "revoked" => conn.execute("UPDATE workspace_runtime_bindings SET revoked_at='revoked' WHERE workspace_id='w'", [])?,
@@ -215,7 +215,7 @@ async fn notification_routing_orchestrator_ack_retains_authorized_target_after_r
                 match field {
                     "runtime" => forged.runtime_id = "forged".into(),
                     "worker" => forged.worker_id = "replacement".into(),
-                    "agent" => forged.agent_key = "forged".into(),
+                    "agent" => forged.subject_id = "forged".into(),
                     _ => forged.authentication_binding_id = "replacement-binding".into(),
                 }
                 assert!(
@@ -280,9 +280,9 @@ async fn notification_routing_orchestrator_ack_retains_authorized_target_after_r
 #[tokio::test]
 async fn notification_routing_replacement_target_requires_explicit_authorized_reserve_or_prepare() {
     for prepare in [false, true] {
-        let (_directory, store) = tracking_store_fixture().await;
-        tracking_store_assign(&store, "a", "assign-a");
-        let source = tracking_store_source();
+        let (_directory, store) = delivery_tracking_fixture().await;
+        delivery_tracking_assign(&store, "a", "assign-a");
+        let source = delivery_tracking_source();
         let delivery = delivery_store_reserve_initial(&store, &source);
         store
             .prepare_ticket_assignment_delivery_content(
@@ -292,10 +292,7 @@ async fn notification_routing_replacement_target_requires_explicit_authorized_re
                 &source,
             )
             .unwrap();
-        store.with_conn(|conn| {
-            conn.execute("UPDATE worker_singleton_owners SET worker_id='replacement' WHERE workspace_id='w'", [])?;
-            Ok(())
-        }).unwrap();
+        delivery_tracking_replace_body(&store);
         let replacement = TicketAssignmentTrackingSourceContext {
             worker_id: "replacement".into(),
             ..source.clone()
@@ -376,7 +373,7 @@ async fn notification_routing_replacement_target_requires_explicit_authorized_re
 
 #[tokio::test]
 async fn notification_routing_commit_without_callback_recovers_and_rollback_has_no_source() {
-    let (directory, store) = tracking_store_fixture().await;
+    let (directory, store) = delivery_tracking_fixture().await;
     let target = routing_worker_assign(&store, "worker-a");
     routing_ack_worker_pending(&store, &target);
     store.with_conn_mut(|conn| {
@@ -408,7 +405,7 @@ async fn notification_routing_commit_without_callback_recovers_and_rollback_has_
 
 #[tokio::test]
 async fn notification_routing_parallel_scan_and_render_reuse_request_after_response_loss() {
-    let (directory, store) = tracking_store_fixture().await;
+    let (directory, store) = delivery_tracking_fixture().await;
     let target = routing_worker_assign(&store, "worker-a");
     routing_ack_worker_pending(&store, &target);
     delivery_store_external_event(&store, 0, "comment", None);
@@ -497,7 +494,7 @@ async fn notification_routing_parallel_scan_and_render_reuse_request_after_respo
 
 #[tokio::test]
 async fn notification_routing_assignment_change_between_commit_and_scan_never_transfers_input() {
-    let (_directory, store) = tracking_store_fixture().await;
+    let (_directory, store) = delivery_tracking_fixture().await;
     let target = routing_worker_assign(&store, "worker-a");
     routing_ack_worker_pending(&store, &target);
     delivery_store_external_event(&store, 0, "comment", None);
@@ -517,7 +514,7 @@ async fn notification_routing_assignment_change_between_commit_and_scan_never_tr
 
 #[tokio::test]
 async fn notification_routing_ack_retains_acceptance_after_responsibility_changes() {
-    let (_directory, store) = tracking_store_fixture().await;
+    let (_directory, store) = delivery_tracking_fixture().await;
     let target = routing_worker_assign(&store, "worker-a");
     routing_ack_worker_pending(&store, &target);
     delivery_store_external_event(&store, 0, "comment", None);
@@ -557,7 +554,7 @@ async fn notification_routing_ack_retains_acceptance_after_responsibility_change
 
 #[tokio::test]
 async fn notification_routing_editor_is_not_original_author_and_unknown_events_are_deferred() {
-    let (directory, store) = tracking_store_fixture().await;
+    let (directory, store) = delivery_tracking_fixture().await;
     let target = routing_worker_assign(&store, "worker-a");
     routing_ack_worker_pending(&store, &target);
     use ticket::TicketBackend;
@@ -625,7 +622,7 @@ async fn notification_routing_editor_is_not_original_author_and_unknown_events_a
 
 #[tokio::test]
 async fn notification_routing_failures_do_not_starve_other_inputs_or_replace_requests() {
-    let (_directory, store) = tracking_store_fixture().await;
+    let (_directory, store) = delivery_tracking_fixture().await;
     let target = routing_worker_assign(&store, "worker-a");
     routing_ack_worker_pending(&store, &target);
     delivery_store_external_event(&store, 0, "comment", None);
@@ -674,7 +671,7 @@ async fn notification_routing_failures_do_not_starve_other_inputs_or_replace_req
 
 #[tokio::test]
 async fn notification_routing_target_binding_and_workspace_are_rechecked_before_prepare() {
-    let (_directory, store) = tracking_store_fixture().await;
+    let (_directory, store) = delivery_tracking_fixture().await;
     let target = routing_worker_assign(&store, "worker-a");
     let input = store
         .list_pending_ticket_worker_notifications("w", 100)
@@ -733,23 +730,27 @@ fn notification_routing_migration_preserves_receipts_does_not_replay_comments_an
         waiting_reason: None,
         next_action: None,
     };
+    // Retained94 stores an agent-key context, not today's Subject context.
+    let reserved_source_json = r#"{"actor":"authenticated-worker:r/worker","runtime_id":"r","worker_id":"worker","agent_key":"workspace-orchestrator","authentication_binding_id":"tracking-binding"}"#;
+    let acknowledged_source_json = r#"{"actor":"authenticated-worker:r/worker","runtime_id":"r","worker_id":"old-replacement","agent_key":"workspace-orchestrator","authentication_binding_id":"tracking-binding"}"#;
     conn.execute(
         "INSERT INTO ticket_assignment_deliveries VALUES('w','a-pending',?1,'preserved-id',?2,?3)",
         params![
             payload.input_event_id,
             serde_json::to_string(&payload).unwrap(),
-            serde_json::to_string(&tracking_store_source()).unwrap()
+            reserved_source_json
         ],
     )
     .unwrap();
     conn.execute("INSERT INTO ticket_assignment_delivery_requests VALUES('w','preserved-id','immutable request')",[]).unwrap();
     let acknowledged_target = TicketAssignmentTrackingSourceContext {
         worker_id: "old-replacement".into(),
-        ..tracking_store_source()
+        subject_id: "workspace-orchestrator".into(),
+        ..delivery_tracking_source()
     };
     conn.execute(
         "INSERT INTO ticket_assignment_delivery_acknowledgements VALUES('w','preserved-id',?1)",
-        [serde_json::to_string(&acknowledged_target).unwrap()],
+        [acknowledged_source_json],
     )
     .unwrap();
     let requests_before = stored_fixture_rows(&conn, "ticket_assignment_delivery_requests");
@@ -806,9 +807,18 @@ fn notification_routing_migration_preserves_receipts_does_not_replay_comments_an
         !pending.iter().any(|p| p.assignment_id == "a-pending"),
         "saved ACK remains authoritative even with non-derived legacy delivery ID"
     );
-    store
-        .ack_ticket_assignment_delivery("w", "preserved-id", &acknowledged_target)
-        .unwrap();
+    // A new Subject-shaped context must not reinterpret the immutable agent ACK.
+    assert!(matches!(
+        store.ack_ticket_assignment_delivery("w", "preserved-id", &acknowledged_target),
+        Err(Error::TicketAssignmentConflict(_))
+    ));
+    store.with_conn(|conn| {
+        assert_eq!(stored_fixture_rows(conn, "ticket_assignment_delivery_requests"), requests_before);
+        assert_eq!(stored_fixture_rows(conn, "ticket_assignment_delivery_acknowledgements"), acks_before);
+        assert_eq!(stored_fixture_rows(conn, "ticket_assignment_deliveries"), before);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM notification_assignment_targets WHERE delivery_id='preserved-id' AND agent_key='workspace-orchestrator'", [], |row| row.get::<_, i64>(0))?, 2);
+        Ok(())
+    }).unwrap();
 }
 
 #[tokio::test]
@@ -817,7 +827,7 @@ async fn notification_routing_missing_authorized_target_guard_refuses_startup() 
         "notification_assignment_targets_no_update",
         "notification_assignment_targets_no_delete",
     ] {
-        let (directory, store) = tracking_store_fixture().await;
+        let (directory, store) = delivery_tracking_fixture().await;
         store
             .with_conn(|conn| {
                 conn.execute_batch(&format!("DROP TRIGGER {guard}"))?;
@@ -859,7 +869,7 @@ async fn notification_routing_fresh_and_upgraded_schema_and_guards_match() {
             Ok(snapshot(conn))
         })
         .unwrap();
-    let (fresh_directory, fresh) = tracking_store_fixture().await;
+    let (fresh_directory, fresh) = delivery_tracking_fixture().await;
     fresh
         .with_conn(|conn| {
             assert_eq!(snapshot(conn), upgraded);
@@ -883,7 +893,7 @@ async fn notification_routing_fresh_and_upgraded_schema_and_guards_match() {
 
 #[tokio::test]
 async fn notification_routing_content_without_recipient_records_reason_and_domain_reference() {
-    let (directory, store) = tracking_store_fixture().await;
+    let (directory, store) = delivery_tracking_fixture().await;
     use ticket::TicketBackend;
     let backend =
         ticket::SqliteTicketBackend::open_verified(directory.path().join("workspace.db"), "w")
@@ -912,7 +922,7 @@ async fn notification_routing_content_without_recipient_records_reason_and_domai
 
 #[tokio::test]
 async fn notification_routing_clear_retains_original_assignment_and_suppression_reason() {
-    let (_directory, store) = tracking_store_fixture().await;
+    let (_directory, store) = delivery_tracking_fixture().await;
     let target = routing_worker_assign(&store, "worker-a");
     routing_ack_worker_pending(&store, &target);
     store
@@ -937,5 +947,299 @@ async fn notification_routing_clear_retains_original_assignment_and_suppression_
     store.with_conn(|conn| {
         let row:(String,String)=conn.query_row("SELECT s.assignment_id,d.reason FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.input_event_id='assignment-change:clear-a' AND s.assignment_id='worker-a'",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
         assert_eq!(row,("worker-a".into(),"historical_only".into()));Ok(())
+    }).unwrap();
+}
+
+#[tokio::test]
+async fn subject_notification_capture_uses_each_subject_current_body_and_results_never_retarget() {
+    let (_directory, store) = subject_notification_store().await;
+    subject_notification_assign(&store, "subject-ticket-a", "assigned-a", "subject-a");
+    subject_notification_assign(&store, "subject-ticket-b", "assigned-b", "subject-b");
+    let report = |operation: &str| server_api::TicketImplementationResultRequest {
+        operation_key: operation.into(),
+        kind: server_api::TicketImplementationResultKind::Result,
+        body: "Saved background result".into(),
+        merge_request: None,
+    };
+    // A Subject body's own result is not sent back to itself. The same Worker can
+    // report to another Subject without a global singleton stealing the recipient.
+    let body_a = RuntimeWorkerRef::new("r", "worker");
+    let own = store
+        .record_implementation_result(
+            "w",
+            "subject-ticket-a",
+            &report("own-a"),
+            &body_a,
+            "subject-binding",
+        )
+        .unwrap();
+    let other = store
+        .record_implementation_result(
+            "w",
+            "subject-ticket-b",
+            &report("a-to-b"),
+            &body_a,
+            "subject-binding",
+        )
+        .unwrap();
+    store
+        .list_pending_ticket_assignment_deliveries("w", 100)
+        .unwrap();
+    store.with_conn(|conn| {
+        let own_reason: String = conn.query_row("SELECT d.reason FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.input_event_id=?1", [format!("implementation-result:{}", own.result_id)], |row| row.get(0))?;
+        assert_eq!(own_reason, "self_notification");
+        let recipient: (String, String, String, String) = conn.query_row("SELECT s.assignment_id,json_extract(s.facts_json,'$.principal_id'),json_extract(s.facts_json,'$.worker_id'),d.reason FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.input_event_id=?1", [format!("implementation-result:{}", other.result_id)], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+        assert_eq!(recipient, ("assigned-b".into(), "subject-b".into(), "body-b".into(), "result".into()));
+        Ok(())
+    }).unwrap();
+    subject_notification_replace_body(&store, "subject-b");
+    let replacement = RuntimeWorkerRef::new("r", "body-replacement");
+    let self_after_swap = store
+        .record_implementation_result(
+            "w",
+            "subject-ticket-b",
+            &report("new-body-self"),
+            &replacement,
+            "subject-binding",
+        )
+        .unwrap();
+    store
+        .list_pending_ticket_assignment_deliveries("w", 100)
+        .unwrap();
+    store.with_conn(|conn| {
+        let self_reason: String = conn.query_row("SELECT d.reason FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.input_event_id=?1", [format!("implementation-result:{}", self_after_swap.result_id)], |row| row.get(0))?;
+        assert_eq!(self_reason, "self_notification");
+        Ok(())
+    }).unwrap();
+    subject_notification_assign(&store, "subject-ticket-b", "new-a-assignment", "subject-a");
+    assert!(
+        !store
+            .list_pending_ticket_assignment_deliveries("w", 100)
+            .unwrap()
+            .iter()
+            .any(|input| input.input_event_id
+                == format!("implementation-result:{}", other.result_id))
+    );
+    // Replaying the saved report is still evidence about the original assignment.
+    assert_eq!(
+        store
+            .record_implementation_result(
+                "w",
+                "subject-ticket-b",
+                &report("a-to-b"),
+                &body_a,
+                "subject-binding"
+            )
+            .unwrap(),
+        other
+    );
+    store
+        .with_conn(|conn| {
+            let recipient: String = conn.query_row(
+                "SELECT assignment_id FROM notification_sources WHERE input_event_id=?1",
+                [format!("implementation-result:{}", other.result_id)],
+                |row| row.get(0),
+            )?;
+            assert_eq!(recipient, "assigned-b");
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn subject_notification_upgrade_preserves_legacy_sources_requests_and_receipts_and_rolls_back() {
+    let directory = tempfile::tempdir().unwrap();
+    let conn = tracking_schema91_fixture(&directory.path().join("workspace.db"));
+    migrate_ticket_tracking_v91_to_v92(&conn).unwrap();
+    migrate_assignment_delivery_v92_to_v93(&conn).unwrap();
+    migrate_ticket_posts_v93_to_v94(&conn).unwrap();
+    migrate_notification_routing_v94_to_v95(&conn).unwrap();
+    migrate_job_notifications_v95_to_v96(&conn).unwrap();
+    migrate_business_notifications_v96_to_v97(&conn).unwrap();
+    migrate_result_reports_v97_to_v98(&conn).unwrap();
+    let legacy_source = TicketAssignmentTrackingSourceContext {
+        actor: "legacy-delivery".into(),
+        runtime_id: "old-runtime".into(),
+        worker_id: "old-worker".into(),
+        subject_id: "workspace-orchestrator".into(),
+        authentication_binding_id: "old-binding".into(),
+    };
+    let delivery = TicketAssignmentDelivery {
+        ticket_id: "pending".into(),
+        assignment_id: "a-pending".into(),
+        input_event_id: "assignment-event:migration-tracking:a-pending".into(),
+        delivery_id: "legacy-delivery".into(),
+        request_id: "legacy-request".into(),
+        waiting_reason: None,
+        next_action: None,
+    };
+    conn.execute(
+        "INSERT INTO ticket_assignment_deliveries VALUES('w','a-pending',?1,?2,?3,?4)",
+        params![
+            delivery.input_event_id,
+            delivery.delivery_id,
+            serde_json::to_string(&delivery).unwrap(),
+            serde_json::to_string(&legacy_source).unwrap()
+        ],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO ticket_assignment_delivery_requests VALUES('w','legacy-delivery','legacy bytes')", []).unwrap();
+    conn.execute(
+        "INSERT INTO ticket_assignment_delivery_acknowledgements VALUES('w','legacy-delivery',?1)",
+        [serde_json::to_string(&legacy_source).unwrap()],
+    )
+    .unwrap();
+    let tables = [
+        "ticket_worker_assignments",
+        "notification_sources",
+        "notification_decisions",
+        "ticket_assignment_deliveries",
+        "ticket_assignment_delivery_requests",
+        "ticket_assignment_delivery_acknowledgements",
+    ];
+    let before: Vec<_> = tables
+        .iter()
+        .map(|table| stored_fixture_rows(&conn, table))
+        .collect();
+    let triggers_before = fixture_query_rows(
+        &conn,
+        "SELECT name,sql FROM sqlite_schema WHERE type='trigger' ORDER BY name",
+    );
+    // Fail after some triggers were refreshed. The caller's transaction restores
+    // the entire previous capture schema, not a half-upgraded notification path.
+    {
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute_batch("DROP TRIGGER notification_mr_event; CREATE TRIGGER notification_mr_event AFTER INSERT ON merge_request_thread_events BEGIN SELECT 1; END;").unwrap();
+        assert!(notification_routing::install_subject_recipients(&tx).is_err());
+    }
+    assert_eq!(
+        fixture_query_rows(
+            &conn,
+            "SELECT name,sql FROM sqlite_schema WHERE type='trigger' ORDER BY name"
+        ),
+        triggers_before
+    );
+    let tx = conn.unchecked_transaction().unwrap();
+    notification_routing::install_subject_recipients(&tx).unwrap();
+    tx.commit().unwrap();
+    let after: Vec<_> = tables
+        .iter()
+        .map(|table| stored_fixture_rows(&conn, table))
+        .collect();
+    assert_eq!(after, before, "migration updates future capture only");
+    for trigger in [
+        "notification_ticket_event",
+        "notification_assignment_history",
+        "notification_assignment_change",
+        "notification_assignment_release",
+        "notification_content_input",
+        "notification_unassigned_content",
+        "notification_mr_event",
+        "notification_mr_source",
+        "notification_implementation_result",
+    ] {
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name=?1",
+                [trigger],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("a.principal_kind='subject'"), "{trigger}");
+        assert!(
+            !sql.contains("a.principal_kind='workspace_agent'"),
+            "{trigger}"
+        );
+    }
+    assert!(
+        notification_routing::pending_sources(&conn, "w", "orchestrator", 100)
+            .unwrap()
+            .is_empty(),
+        "old principals and receipts are evidence, not new Subject requests"
+    );
+}
+
+#[tokio::test]
+async fn notification_routing_cached_worker_attention_stops_after_ack_not_after_unknown_acceptance()
+{
+    let (directory, store) = delivery_tracking_fixture().await;
+    let target = routing_worker_assign(&store, "worker-a");
+    let cached = store
+        .list_pending_ticket_worker_notifications("w", 100)
+        .unwrap()
+        .remove(0);
+    assert!(
+        notification_routing::admit_worker_send(&store, "w", &cached.delivery_id, &target).is_err()
+    );
+    store
+        .prepare_ticket_worker_notification_content(
+            "w",
+            &cached.delivery_id,
+            "pinned attention",
+            &target,
+        )
+        .unwrap();
+    let mut sends = Vec::new();
+    let mut dispatch_cached = |store: &SqliteWorkspaceStore| {
+        if let Some(content) =
+            notification_routing::admit_worker_send(store, "w", &cached.delivery_id, &target)
+                .unwrap()
+        {
+            sends.push((cached.request_id.clone(), content));
+        }
+    };
+    dispatch_cached(&store);
+    store
+        .record_notification_delivery_failure(
+            "w",
+            &NotificationDeliveryKey::WorkerNotification {
+                delivery_id: cached.delivery_id.clone(),
+            },
+            NotificationFailureCode::AcceptanceUnknown,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .prepare_ticket_worker_notification_content(
+                "w",
+                &cached.delivery_id,
+                "different rendering",
+                &target
+            )
+            .unwrap(),
+        "pinned attention"
+    );
+    dispatch_cached(&store);
+    let other = SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).unwrap();
+    other
+        .ack_ticket_worker_notification("w", &cached.delivery_id, &target)
+        .unwrap();
+    dispatch_cached(&store);
+    assert_eq!(
+        sends,
+        vec![(cached.request_id.clone(), "pinned attention".into()); 2]
+    );
+    assert!(matches!(
+        store.prepare_ticket_worker_notification_content(
+            "w",
+            &cached.delivery_id,
+            "late render",
+            &target
+        ),
+        Err(Error::TicketAssignmentConflict(_))
+    ));
+    store
+        .ack_ticket_worker_notification("w", &cached.delivery_id, &target)
+        .unwrap();
+    assert!(
+        store
+            .list_pending_ticket_worker_notifications("w", 100)
+            .unwrap()
+            .is_empty()
+    );
+    store.with_conn(|conn| {
+        let content: String = conn.query_row("SELECT content FROM notification_requests WHERE workspace_id='w' AND delivery_id=?1", [&cached.delivery_id], |row| row.get(0))?;
+        assert_eq!(content, "pinned attention", "historical request bytes remain readable");
+        Ok(())
     }).unwrap();
 }

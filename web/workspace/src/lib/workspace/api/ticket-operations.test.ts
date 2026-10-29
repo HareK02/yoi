@@ -53,7 +53,7 @@ const current: TicketAssignmentTrackingProjection = {
   assignment_id: "assignment-1",
   role: "orchestrator",
   current: true,
-  principal: { kind: "workspace_agent", agent_key: "workspace-orchestrator" },
+  principal: { kind: "subject", subject_id: "subject-a" },
   assigned_by: "account/user",
   assigned_at: "2026-01-01T00:00:00Z",
   tracking: {
@@ -82,12 +82,14 @@ Deno.test("assignment retry retains the exact observed pointer, operation key an
     "ticket/one",
     old,
     "operation-1",
+    false,
+    { kind: "subject", subject_id: "subject-a" },
   );
   old.assignments[0].assignment_id = "replacement";
   assertEquals(JSON.parse(operation.body!), {
     operation_id: "operation-1",
     expected_assignment_id: "assignment-1",
-    principal: { kind: "workspace_agent", agent_key: "workspace-orchestrator" },
+    principal: { kind: "subject", subject_id: "subject-a" },
   });
   assertEquals(
     operation.path,
@@ -99,6 +101,8 @@ Deno.test("assignment retry retains the exact observed pointer, operation key an
     "ticket/one",
     old,
     "operation-2",
+    false,
+    { kind: "subject", subject_id: "subject-b" },
   );
   assertEquals(JSON.parse(fresh.body!).expected_assignment_id, "replacement");
   const clear = assignmentOperation(
@@ -272,4 +276,39 @@ Deno.test("conflict, permission, unavailable and unknown errors never claim succ
     operationError(new Error("network response lost")),
     "Outcome unknown",
   );
+});
+
+Deno.test("new Assign requires an explicit Subject; legacy assignments remain releasable audit", () => {
+  assertThrows(() =>
+    assignmentOperation("team", "ticket", observed(), "missing")
+  );
+  assertThrows(() =>
+    assignmentOperation("team", "ticket", observed(), "empty", false, {
+      kind: "subject",
+      subject_id: " ",
+    })
+  );
+  for (
+    const principal of [{ kind: "user", account_id: "alice" }, {
+      kind: "worker",
+      runtime_id: "r",
+      worker_id: "w",
+    }, {
+      kind: "workspace_agent",
+      agent_key: "workspace-orchestrator",
+    }] as const
+  ) {
+    assertThrows(() =>
+      answerOperation("team", "ticket", { ...current, principal }, "old", "op")
+    );
+    const operation = assignmentOperation(
+      "team",
+      "ticket",
+      { assignments: [{ ...observed().assignments[0], principal }] },
+      "release",
+      true,
+    );
+    assertEquals(operation.method, "DELETE");
+    assertStringIncludes(operation.path, "assignment_id=assignment-1");
+  }
 });

@@ -24,6 +24,7 @@
   import { currentRequirementApprovalStatus, summarySourceReviewStatus } from "#lib/workspace/merge-request-status.ts";
   import {
     relationLabel,
+    assignmentPrincipalLabel,
     ticketWorkerLaunchHref,
   } from "#lib/workspace/tickets/ticket-panel.ts";
   import type {
@@ -582,7 +583,7 @@
       <BevelLine decorative />
       {#each ticket.action_eligibility.blockers as blocker}<p class="workspace-callout">{blocker}</p>{/each}
       {#key JSON.stringify([data.workspaceId, ticket.id])}
-        <TicketHandling workspaceId={data.workspaceId} {ticket} orchestrator={data.orchestrator.data} refresh={refreshOperationTicket} />
+        <TicketHandling workspaceId={data.workspaceId} {ticket} refresh={refreshOperationTicket} />
         <BevelLine decorative />
         <TicketTags workspaceId={data.workspaceId} {ticket} refresh={refreshOperationTicket} />
       {/key}
@@ -696,15 +697,7 @@
             {#each ticket.assignments as assignment}
               <li>
                 <strong>{assignment.role}</strong>
-                <span>
-                  {#if assignment.principal.kind === "worker"}
-                    {assignment.principal.runtime_id}/{assignment.principal.worker_id}
-                  {:else if assignment.principal.kind === "user"}
-                    {assignment.principal.account_id}
-                  {:else}
-                    {assignment.principal.agent_key}
-                  {/if}
-                </span>
+                <span>{assignmentPrincipalLabel(assignment.principal)}</span>
               </li>
             {/each}
           </ul>

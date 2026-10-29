@@ -78,12 +78,12 @@ impl Fixture {
     fn assign(&self, id: &str, assignment: &str, status: Option<&str>, current: bool) {
         self.authority.store.with_conn(|conn| {
             conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at)
-                VALUES('w',?1,?2,'orchestrator','workspace_agent','workspace-orchestrator','owner-account','1')",params![id,assignment])?;
+                VALUES('w',?1,?2,'orchestrator','subject','subject-a','owner-account','1')",params![id,assignment])?;
             conn.execute("UPDATE ticket_worker_assignments SET tracking_json=?1,tracking_updated_at=?2 WHERE workspace_id='w' AND assignment_id=?3",
                 params![status.map(|s| serde_json::json!({"status":s,"waiting_reason":null,"progress":null,"next_action":null,"result":null}).to_string()),status.map(|_|"1"),assignment])?;
             if current {
                 conn.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,role,assignment_id,principal_kind,principal_id,updated_at)
-                    VALUES('w',?1,'orchestrator',?2,'workspace_agent','workspace-orchestrator','1')",params![id,assignment])?;
+                    VALUES('w',?1,'orchestrator',?2,'subject','subject-a','1')",params![id,assignment])?;
             }
             Ok(())
         }).unwrap();
@@ -100,9 +100,9 @@ impl Fixture {
         }).unwrap();
     }
 }
-fn agent() -> ticket::TicketAssignmentPrincipalSnapshot {
-    ticket::TicketAssignmentPrincipalSnapshot::WorkspaceAgent {
-        agent_key: "workspace-orchestrator".into(),
+fn assigned_subject() -> ticket::TicketAssignmentPrincipalSnapshot {
+    ticket::TicketAssignmentPrincipalSnapshot::Subject {
+        subject_id: "subject-a".into(),
     }
 }
 fn ids(response: &TicketBrowseQueryResponse) -> Vec<String> {
@@ -264,7 +264,7 @@ async fn ticket_browse_all_filters_are_applied_before_limit_and_batch_fields_mat
         query: Some("NEEDLE".into()),
         states: vec![TicketState::Closed],
         tag_ids: vec!["b".into(), "a".into(), "a".into()],
-        assigned_principal: Some(agent()),
+        assigned_principal: Some(assigned_subject()),
         handling_status: Some(ticket::TicketAssignmentTrackingStatus::Done),
         closure_reason: Some(TicketClosureReason::Other("custom reason".into())),
         limit: Some(1),
@@ -372,7 +372,7 @@ async fn ticket_browse_assignment_current_missing_unknown_and_cleared_semantics(
         f.authority.ticket_assignment_tracking(&unknown).unwrap()
     );
     let mut assigned = ids(&f.run(TicketBrowseQueryRequest {
-        assigned_principal: Some(agent()),
+        assigned_principal: Some(assigned_subject()),
         ..Default::default()
     }));
     assigned.sort();

@@ -29,7 +29,9 @@ Deno.test("ticket child operations reset across Workspaces even when the retaine
   const keyedChildren = [...pageSource.matchAll(
     /\{#key JSON\.stringify\(\[data\.workspaceId, ticket\.id\]\)\}([\s\S]*?)\{\/key\}/g,
   )].map((match) => match[1]);
-  for (const child of ["TicketTags", "TicketHandling", "TicketWorkerObservation"]) {
+  for (
+    const child of ["TicketTags", "TicketHandling", "TicketWorkerObservation"]
+  ) {
     assert(
       keyedChildren.some((block) => block.includes(`<${child}`)),
       `${child} must reset for the Workspace and Ticket, whether in main or rail`,
@@ -63,8 +65,20 @@ Deno.test("ticket detail fences stale mutation responses", () => {
 
 Deno.test("ticket responsibility display does not claim Worker liveness or work authority", () => {
   assertStringIncludes(pageSource, "Role assignments and manual Workers");
-  assertStringIncludes(pageSource, "Assignments are retained independently of Worker state.");
-  assertStringIncludes(pageSource, "assignment.principal.runtime_id");
-  assertStringIncludes(pageSource, "assignment.principal.worker_id");
+  assertStringIncludes(
+    pageSource,
+    "Assignments are retained independently of Worker state.",
+  );
+  assertStringIncludes(
+    pageSource,
+    "assignmentPrincipalLabel(assignment.principal)",
+  );
+  const modelSource = Deno.readTextFileSync(
+    new URL("../src/lib/workspace/tickets/ticket-panel.ts", import.meta.url),
+  );
+  assertStringIncludes(modelSource, 'principal.kind === "subject"');
+  assertStringIncludes(modelSource, "principal.subject_id");
+  assertStringIncludes(modelSource, "principal.runtime_id");
+  assertStringIncludes(modelSource, "principal.worker_id");
   assert(!pageSource.includes("No active role assignment."));
 });

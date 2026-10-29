@@ -597,9 +597,9 @@ fn verifier_rejects_weakened_fact_constraints_trigger_and_migration_history() {
         assert!(migrate_sqlite_ticket_schema(&f.conn).is_err(), "{from}");
     }
     for mutation in [
-        "UPDATE ticket_schema_migrations SET name='unrecognized' WHERE version=13",
+        "UPDATE ticket_schema_migrations SET name='unrecognized' WHERE version=14",
         "INSERT INTO ticket_schema_migrations VALUES(12,'Canonical Ticket posts','invalid extra history')",
-        "UPDATE ticket_schema_migrations SET version=14 WHERE version=13",
+        "UPDATE ticket_schema_migrations SET version=15 WHERE version=14",
     ] {
         let f = Fixture::new();
         f.conn.execute_batch(mutation).unwrap();

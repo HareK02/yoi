@@ -16,6 +16,7 @@ use crate::{Error, Result};
 /// Explicit domain-owned purge inventory. The deletion operation tombstone is intentionally
 /// excluded so retries and audit remain available after the Workspace row is gone.
 const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
+    "plugin_execution_plans",
     "plugin_references",
     "plugin_operations",
     "plugin_uploads",
@@ -508,6 +509,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             // commit; update guards remain installed throughout.
             let mut ticket_delete_guards = Vec::new();
             for (table, trigger) in [
+                ("plugin_execution_plans", "plugin_plan_replay_retained"),
                 ("notification_source_preparation_failures", "notification_source_preparation_failures_no_delete"),
                 ("notification_job_targets", "notification_job_targets_no_delete"),
                 ("notification_job_legacy_receipts", "notification_job_legacy_no_delete"),
@@ -1049,8 +1051,8 @@ mod tests {
                             ticket_id: initial.meta.id.clone(),
                             assignment_id: assignment_id.clone(),
                             role: crate::store::TicketAssignmentRole::Orchestrator,
-                            principal: crate::store::TicketAssignmentPrincipal::WorkspaceAgent {
-                                agent_key: "workspace-orchestrator".into(),
+                            principal: crate::store::TicketAssignmentPrincipal::Subject {
+                                subject_id: "deletion-fixture-subject".into(),
                             },
                             assigned_by: "owner".into(),
                             assigned_at: "2026-01-01T00:00:00Z".into(),
@@ -1094,7 +1096,7 @@ mod tests {
                                 actor: "orchestrator".into(),
                                 runtime_id: "fixture-runtime".into(),
                                 worker_id: "fixture-worker".into(),
-                                agent_key: "workspace-orchestrator".into(),
+                                subject_id: "deletion-fixture-subject".into(),
                                 authentication_binding_id: "fixture-binding".into(),
                             },
                         )?;

@@ -13,6 +13,7 @@
     "test:browser:hosting": "mkdir -p ../../target/web-ux/tmp && TMPDIR=../../target/web-ux/tmp deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/hosting-browser/hosting-shell.browser.test.ts test/hosting-browser/setup-shell.browser.test.ts",
     "test:browser:empty-workspace": "deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/visual-review/empty-workspace.browser.test.ts",
     "test:browser:drive": "deno test --config test/drive-browser/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/drive-browser/drive.browser.test.ts",
+    "test:browser:subject-handling": "deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/visual-review/subject-handling.browser.test.ts",
     "test:ticket:real-api": "cd ../.. && deno task test:ticket:real-api",
     "test:drive:real-api": "cd ../.. && cargo test -p yoi-workspace-server --lib drive_web_roundtrip_tests -- --ignored",
     "build": "deno run -A npm:vite@8.3.2 build",

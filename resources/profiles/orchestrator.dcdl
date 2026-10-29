@@ -1,6 +1,7 @@
 import "./base.dcdl" // {
     slug = "orchestrator";
-    description = "Owns outcome delivery, selection and validation of candidate changes, and useful delegation; MR workflows are optional.";
+    # 互換slugを維持するが、Subject担当・本体所有・操作権限はこのProfileから付与しない。
+    description = "Ticket outcome coordination for an assigned Subject, with candidate selection, validation and bounded delegation; no fixed assignee or privileged role identity. MR workflows are optional.";
     scope = "workspace_write";
     engine = { instruction = "role.orchestrator"; };
 

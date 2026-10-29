@@ -25,7 +25,7 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
         let input = |key: &str| {
             serde_json::to_vec(&serde_json::json!({
                 "operation_id": key,
-                "principal": {"kind":"workspace_agent","agent_key":"workspace-orchestrator"}
+                "principal": test_assignment_principal(&api)
             }))
             .unwrap()
         };
@@ -175,6 +175,7 @@ fn tracking_path(ticket: &str) -> String {
 }
 
 fn assignment_request(
+    api: &WorkspaceApi,
     identity: &RuntimeIdentityMaterial,
     worker: &str,
     ticket: &str,
@@ -182,7 +183,7 @@ fn assignment_request(
 ) -> Request<Body> {
     runtime_source_request(identity, Some(worker), "PUT",
         &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),
-        serde_json::to_vec(&serde_json::json!({"operation_id":operation,"principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"}})).unwrap())
+        serde_json::to_vec(&serde_json::json!({"operation_id":operation,"principal":test_assignment_principal(&api)})).unwrap())
 }
 
 fn assignment_clear_path(ticket: &str, assignment: &str, operation: &str) -> String {
@@ -191,22 +192,40 @@ fn assignment_clear_path(ticket: &str, assignment: &str, operation: &str) -> Str
     )
 }
 
-fn replace_tracking_orchestrator(
+async fn tracking_embedded_fixture(
+    root: &Path,
+) -> (
+    WorkspaceApi,
+    RuntimeIdentityMaterial,
+    RuntimeWorkerRef,
+    String,
+) {
+    let (mut api, _) = assignment_test_api_with_recording_backend(root).await;
+    let identity = RuntimeIdentityMaterial::generate(EMBEDDED_WORKER_RUNTIME_ID).unwrap();
+    configure_runtime_request_auth(&mut api, &identity, EMBEDDED_WORKER_RUNTIME_ID);
+    let subject_id = ensure_test_assignment_subject(&api);
+    let source = create_test_assignment_body(&api, EMBEDDED_WORKER_RUNTIME_ID, &subject_id).await;
+    bootstrap_test_assignment_session(&api, &source);
+    let ticket = browser_ticket_backend(&api)
+        .unwrap()
+        .create(ticket::NewTicket::new("Subject body replacement"))
+        .unwrap();
+    grant_test_assignment_ticket(&api, &subject_id, &ticket.id);
+    (api, identity, source, ticket.id)
+}
+
+async fn replace_tracking_orchestrator(
     api: &WorkspaceApi,
-    runtime: &WorkdirlessFixtureRuntime,
     source: &RuntimeWorkerRef,
 ) -> RuntimeWorkerRef {
-    let replacement = RuntimeWorkerRef::new(&source.runtime_id, WorkerId::now_v7().to_string());
-    seed_worker_source_member(api, &replacement.runtime_id, &replacement.worker_id);
-    let mut summary = runtime.workers.lock().unwrap()[0].clone();
-    summary.worker = replacement.clone();
-    runtime.workers.lock().unwrap().push(summary);
-    let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
-    conn.execute("UPDATE worker_singleton_owners SET worker_id=?1,generation=generation+1 WHERE workspace_id=?2 AND singleton_key=?3", rusqlite::params![replacement.worker_id, TEST_WORKSPACE_ID, crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY]).unwrap();
-    assert_eq!(
-        find_workspace_orchestrator(api).unwrap().worker,
-        replacement
-    );
+    // Normal Subject release owns writer revocation and the singleton transition.
+    // This fixture substitutes the Controller receiver, not the lifetime protocol.
+    remove_test_assignment_body(api, source).await;
+    let subject_id = ensure_test_assignment_subject(api);
+    let replacement = create_test_assignment_body(api, &source.runtime_id, &subject_id).await;
+    bootstrap_test_assignment_session(api, &replacement);
+    assert_ne!(*source, replacement);
+    assert_eq!(test_assignment_body(api).unwrap().worker, replacement);
     replacement
 }
 
@@ -238,7 +257,13 @@ async fn revoked_runtime_cannot_retry_assign_clear_or_record_tracking() {
     let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
     conn.execute("UPDATE workspace_runtime_bindings SET revoked_at='2026-10-11T00:00:00Z' WHERE workspace_id=?1 AND runtime_id=?2", rusqlite::params![TEST_WORKSPACE_ID, source.runtime_id]).unwrap();
     for request in [
-        assignment_request(&identity, &source.worker_id, &ticket, "assign-tracking"),
+        assignment_request(
+            &api,
+            &identity,
+            &source.worker_id,
+            &ticket,
+            "assign-tracking",
+        ),
         runtime_source_request(
             &identity,
             Some(&source.worker_id),
@@ -267,7 +292,7 @@ async fn revoked_runtime_cannot_retry_assign_clear_or_record_tracking() {
 #[tokio::test]
 async fn replaced_worker_cannot_retry_assign_clear_and_new_owner_cannot_reuse_old_receipts() {
     let dir = tempfile::tempdir().unwrap();
-    let (api, runtime, identity, source, ticket) = tracking_fixture(dir.path()).await;
+    let (api, identity, source, ticket) = tracking_embedded_fixture(dir.path()).await;
     let current = assign_tracking(&api, &identity, &source, &ticket).await;
     let app = build_router(api.clone());
     let clear_path =
@@ -284,7 +309,7 @@ async fn replaced_worker_cannot_retry_assign_clear_and_new_owner_cannot_reuse_ol
         StatusCode::OK,
     )
     .await;
-    let replacement = replace_tracking_orchestrator(&api, &runtime, &source);
+    let replacement = replace_tracking_orchestrator(&api, &source).await;
     for worker in [&source.worker_id, &replacement.worker_id] {
         let expected = if worker == &source.worker_id {
             StatusCode::UNAUTHORIZED
@@ -293,7 +318,7 @@ async fn replaced_worker_cannot_retry_assign_clear_and_new_owner_cannot_reuse_ol
         };
         tracking_response(
             app.clone(),
-            assignment_request(&identity, worker, &ticket, "assign-tracking"),
+            assignment_request(&api, &identity, worker, &ticket, "assign-tracking"),
             expected,
         )
         .await;
@@ -313,6 +338,7 @@ async fn replaced_worker_cannot_retry_assign_clear_and_new_owner_cannot_reuse_ol
     tracking_response(
         app,
         assignment_request(
+            &api,
             &identity,
             &replacement.worker_id,
             &ticket,
@@ -330,19 +356,30 @@ async fn replaced_worker_cannot_retry_assign_clear_and_new_owner_cannot_reuse_ol
 }
 
 #[tokio::test]
-async fn runtime_orchestrator_tags_without_backend_singleton_do_not_grant_assignment_authority() {
+async fn runtime_orchestrator_tags_without_operation_policy_do_not_grant_assignment_authority() {
     let dir = tempfile::tempdir().unwrap();
     let (api, runtime, identity, source, ticket) = tracking_fixture(dir.path()).await;
     let current = assign_tracking(&api, &identity, &source, &ticket).await;
-    let forged = RuntimeWorkerRef::new(&source.runtime_id, WorkerId::now_v7().to_string());
-    seed_worker_source_member(&api, &forged.runtime_id, &forged.worker_id);
-    let mut summary = runtime.workers.lock().unwrap()[0].clone();
-    summary.worker = forged.clone();
+    let unprivileged = open_subjektiv_store(&api)
+        .unwrap()
+        .create_subject(
+            crate::subjektiv::SubjectRole::new("unprivileged-assignment-source").unwrap(),
+        )
+        .unwrap();
+    let forged = create_test_assignment_body(&api, &source.runtime_id, &unprivileged.id).await;
+    // Runtime display metadata cannot mint operation policy. Backend ownership
+    // remains this real, unprivileged Subject, even if the adapter advertises tags.
+    let mut workers = runtime.workers.lock().unwrap();
+    let summary = workers
+        .iter_mut()
+        .find(|worker| worker.worker == forged)
+        .unwrap();
+    summary.tags = vec!["orchestrator".into(), "singleton".into()];
     summary.singleton_key = Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.into());
-    runtime.workers.lock().unwrap().push(summary);
+    drop(workers);
     let app = build_router(api.clone());
     for request in [
-        assignment_request(&identity, &forged.worker_id, &ticket, "forged-assign"),
+        assignment_request(&api, &identity, &forged.worker_id, &ticket, "forged-assign"),
         runtime_source_request(
             &identity,
             Some(&forged.worker_id),
@@ -376,7 +413,7 @@ async fn authenticated_account_assign_and_clear_retries_preserve_source_and_reje
         seed_test_workspace_owner_token(api.store.as_ref(), "assignment-account-owner").await;
     let other = seed_test_api_token(api.store.as_ref(), "assignment-account-other");
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator");
-    let body = serde_json::to_vec(&serde_json::json!({"operation_id":"account-assign", "principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"}})).unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({"operation_id":"account-assign", "principal":test_assignment_principal(&api)})).unwrap();
     let request = |token: &str, method: &str, path: &str, body: Vec<u8>| {
         Request::builder()
             .method(method)
@@ -459,7 +496,7 @@ async fn assign_tracking(
     let value = tracking_response(build_router(api.clone()), runtime_source_request(
         identity, Some(&source.worker_id), "PUT",
         &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),
-        serde_json::to_vec(&serde_json::json!({ "operation_id": "assign-tracking", "principal": { "kind": "workspace_agent", "agent_key": "workspace-orchestrator" } })).unwrap(),
+        serde_json::to_vec(&serde_json::json!({ "operation_id": "assign-tracking", "principal": test_assignment_principal(&api) })).unwrap(),
     ), StatusCode::OK).await;
     assert_eq!(
         value["assignment"]["assigned_by"],
@@ -755,61 +792,14 @@ async fn tracking_fixture(
     api.runtime.register_or_replace(runtime.clone());
     let identity = RuntimeIdentityMaterial::generate(runtime_id).unwrap();
     configure_runtime_request_auth(&mut api, &identity, runtime_id);
-    let memory = api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
-    let reservation = api
-        .config_store
-        .reserve_worker_create(
-            TEST_WORKSPACE_ID,
-            runtime_id,
-            "tracking-orchestrator",
-            "sha256:tracking-orchestrator",
-            Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY),
-            &memory,
-        )
-        .unwrap();
-    let mut summary = WorkdirlessFixtureRuntime::worker_summary(
-        WorkerCreateBinding {
-            worker_id: reservation.worker_id,
-            create_fingerprint: reservation.create_fingerprint,
-        },
-        &WorkerSpawnRequest {
-            requested_worker_name: Some("Tracking Orchestrator".into()),
-            singleton_key: Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.into()),
-            intent: WorkerSpawnIntent::WorkspaceCompanion,
-            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 0,
-            },
-            profile: ProfileSelector::Builtin("builtin:orchestrator".into()),
-            ticket_assignment: None,
-            initial_submit: Vec::new(),
-            workdir_attachment_requests: Vec::new(),
-            resolved_workdir_attachment_requests: Vec::new(),
-            resolved_workdir_attachments: Vec::new(),
-            resolved_config_bundle: None,
-            resolved_worker_observation_enabled: false,
-            resolved_worker_observation_grants: Vec::new(),
-            resolved_workspace_api: None,
-            resolved_memory_settings: None,
-            resolved_subjektiv_attached: false,
-            resolved_control_operation: None,
-            resolved_execution_grant: None,
-        },
-    );
-    summary.tags = vec!["orchestrator".into(), "singleton".into()];
-    let source = summary.worker.clone();
-    runtime.workers.lock().unwrap().push(summary);
-    seed_worker_source_member(&api, runtime_id, &source.worker_id);
-    api.config_store
-        .complete_worker_create_reservation(TEST_WORKSPACE_ID, source.worker_id.parse().unwrap())
-        .unwrap();
-    assert_eq!(find_workspace_orchestrator(&api).unwrap().worker, source);
+    let subject_id = ensure_test_assignment_subject(&api);
+    let source = create_test_assignment_body(&api, runtime_id, &subject_id).await;
+    assert_eq!(test_assignment_body(&api).unwrap().worker, source);
     let ticket = browser_ticket_backend(&api)
         .unwrap()
         .create(ticket::NewTicket::new("Tracking authority"))
         .unwrap();
+    grant_test_assignment_ticket(&api, &subject_id, &ticket.id);
     (api, runtime, identity, source, ticket.id)
 }
 
@@ -922,7 +912,7 @@ async fn tracking_unassign_and_reassign_keep_results_and_fence_old_assignment() 
         .await,
         result
     );
-    tracking_response(app.clone(), runtime_source_request(&identity, Some(&source.worker_id), "PUT", &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"), serde_json::to_vec(&serde_json::json!({"operation_id":"assign-again", "principal":{"kind":"workspace_agent", "agent_key":"workspace-orchestrator"}})).unwrap()), StatusCode::OK).await;
+    tracking_response(app.clone(), runtime_source_request(&identity, Some(&source.worker_id), "PUT", &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"), serde_json::to_vec(&serde_json::json!({"operation_id":"assign-again", "principal":test_assignment_principal(&api)})).unwrap()), StatusCode::OK).await;
     let next = api
         .store
         .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket)
@@ -1003,7 +993,7 @@ async fn tracking_other_workspace_routes_and_unsigned_reads_are_rejected() {
 #[tokio::test]
 async fn replaced_orchestrator_cannot_update_or_replay_and_current_replacement_inherits_tracking() {
     let dir = tempfile::tempdir().unwrap();
-    let (api, runtime, identity, source, ticket) = tracking_fixture(dir.path()).await;
+    let (api, identity, source, ticket) = tracking_embedded_fixture(dir.path()).await;
     let current = assign_tracking(&api, &identity, &source, &ticket).await;
     let update = tracking_update(&current, "old-orchestrator-result");
     let app = build_router(api.clone());
@@ -1013,18 +1003,7 @@ async fn replaced_orchestrator_cannot_update_or_replay_and_current_replacement_i
         StatusCode::OK,
     )
     .await;
-    let replacement = RuntimeWorkerRef::new(&source.runtime_id, WorkerId::now_v7().to_string());
-    seed_worker_source_member(&api, &replacement.runtime_id, &replacement.worker_id);
-    let mut summary = runtime.workers.lock().unwrap()[0].clone();
-    summary.worker = replacement.clone();
-    runtime.workers.lock().unwrap().push(summary);
-    // Seed the authoritative replacement, not merely a Runtime tag or model role.
-    let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
-    conn.execute("UPDATE worker_singleton_owners SET worker_id=?1,generation=generation+1 WHERE workspace_id=?2 AND singleton_key=?3", rusqlite::params![replacement.worker_id, TEST_WORKSPACE_ID, crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY]).unwrap();
-    assert_eq!(
-        find_workspace_orchestrator(&api).unwrap().worker,
-        replacement
-    );
+    let replacement = replace_tracking_orchestrator(&api, &source).await;
     tracking_response(
         app.clone(),
         signed_tracking_update(&identity, Some(&source.worker_id), &ticket, &update),
@@ -1111,7 +1090,7 @@ async fn assignment_retry_is_idempotent_but_another_authenticated_actor_cannot_r
     assert_eq!(replay, current);
     let token = seed_test_workspace_owner_token(api.store.as_ref(), "assignment-replay-user").await;
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator");
-    let body = serde_json::to_vec(&serde_json::json!({"operation_id":"assign-tracking", "principal":{"kind":"workspace_agent", "agent_key":"workspace-orchestrator"}})).unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({"operation_id":"assign-tracking", "principal":test_assignment_principal(&api)})).unwrap();
     tracking_response(
         build_router(api.clone()),
         Request::builder()
@@ -1261,7 +1240,7 @@ async fn assignment_receipt_cannot_be_replayed_under_a_new_runtime_binding() {
     let conn = rusqlite::Connection::open(&api.config.database_path).unwrap();
     conn.execute("UPDATE workspace_runtime_bindings SET binding_id='new-assignment-binding' WHERE workspace_id=?1 AND runtime_id=?2", rusqlite::params![TEST_WORKSPACE_ID, source.runtime_id]).unwrap();
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator");
-    let body = serde_json::to_vec(&serde_json::json!({"operation_id":"assign-tracking", "principal":{"kind":"workspace_agent", "agent_key":"workspace-orchestrator"}})).unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({"operation_id":"assign-tracking", "principal":test_assignment_principal(&api)})).unwrap();
     tracking_response(
         build_router(api.clone()),
         runtime_source_request(&identity, Some(&source.worker_id), "PUT", &path, body),
@@ -1377,7 +1356,7 @@ async fn released_assignment_query_retains_principal_assign_audit_and_last_track
     assert_eq!(released["role"], "orchestrator");
     assert_eq!(
         released["principal"],
-        serde_json::json!({"kind":"workspace_agent","agent_key":"workspace-orchestrator"})
+        serde_json::json!(test_assignment_principal(&api))
     );
     assert_eq!(released["assigned_by"], current.assigned_by);
     assert_eq!(released["assigned_at"], current.assigned_at);
@@ -1407,6 +1386,11 @@ async fn released_assignment_query_retains_principal_assign_audit_and_last_track
         .unwrap()
         .create(ticket::NewTicket::new("Different Ticket"))
         .unwrap();
+    grant_test_assignment_ticket(
+        &api,
+        &ensure_test_assignment_subject(&api),
+        &other_ticket.id,
+    );
     assert_eq!(
         tracking_response(
             app,
@@ -1441,7 +1425,7 @@ async fn same_principal_reassignment_retains_old_result_and_projects_replacement
         StatusCode::OK,
     )
     .await;
-    let assignment = tracking_response(app.clone(), runtime_source_request(&identity, Some(&source.worker_id), "PUT", &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"), serde_json::to_vec(&serde_json::json!({"operation_id":"request-again", "expected_assignment_id":current.assignment_id,"principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"}})).unwrap()), StatusCode::OK).await;
+    let assignment = tracking_response(app.clone(), runtime_source_request(&identity, Some(&source.worker_id), "PUT", &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"), serde_json::to_vec(&serde_json::json!({"operation_id":"request-again", "expected_assignment_id":current.assignment_id,"principal":test_assignment_principal(&api)})).unwrap()), StatusCode::OK).await;
     let next_id = assignment["assignment"]["assignment_id"].as_str().unwrap();
     assert_ne!(next_id, current.assignment_id);
     let old = tracking_response(
@@ -1494,7 +1478,7 @@ async fn assignment_signed_runtime_without_worker_cannot_self_assign_service_rol
     let (api, _, identity, _, ticket) = tracking_fixture(dir.path()).await;
     let input = serde_json::json!({
         "operation_id": "runtime-only-assign",
-        "principal": { "kind": "workspace_agent", "agent_key": "workspace-orchestrator" }
+        "principal": test_assignment_principal(&api)
     });
     tracking_response(
         build_router(api.clone()),
@@ -1595,7 +1579,7 @@ async fn public_assignment_answer_authenticates_source_replays_saved_result_and_
     .await;
     let assignment_path =
         format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator");
-    tracking_response(app.clone(),runtime_source_request(&identity,Some(&source.worker_id),"PUT",&assignment_path,serde_json::to_vec(&serde_json::json!({"operation_id":"replace-after-read","expected_assignment_id":current.assignment_id,"principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"}})).unwrap()),StatusCode::OK).await;
+    tracking_response(app.clone(),runtime_source_request(&identity,Some(&source.worker_id),"PUT",&assignment_path,serde_json::to_vec(&serde_json::json!({"operation_id":"replace-after-read","expected_assignment_id":current.assignment_id,"principal":test_assignment_principal(&api)})).unwrap()),StatusCode::OK).await;
     let mut stale = body.clone();
     stale["operation_key"] = "fresh-stale-answer".into();
     tracking_response(app.clone(), account_request(&stale), StatusCode::CONFLICT).await;
@@ -1709,11 +1693,11 @@ async fn ticket_query_principal_and_handling_filter_before_single_item_page_with
             .create(ticket::NewTicket::new(format!("Unassigned newer {n}")))
             .unwrap();
     }
-    let query:server_api::TicketQueryRequest=serde_json::from_value(serde_json::json!({"handling_status":"done","assigned_principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"},"limit":1})).unwrap();
+    let query:server_api::TicketQueryRequest=serde_json::from_value(serde_json::json!({"handling_status":"done","assigned_principal":test_assignment_principal(&api),"limit":1})).unwrap();
     let found = api.authority.query_tickets(query).unwrap();
     assert_eq!(found.items.len(), 1);
     assert_eq!(found.items[0].id, ticket);
-    let query:server_api::TicketQueryRequest=serde_json::from_value(serde_json::json!({"handling_status":"waiting","assigned_principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"},"limit":1})).unwrap();
+    let query:server_api::TicketQueryRequest=serde_json::from_value(serde_json::json!({"handling_status":"waiting","assigned_principal":test_assignment_principal(&api),"limit":1})).unwrap();
     assert!(api.authority.query_tickets(query).unwrap().items.is_empty());
     let query:server_api::TicketQueryRequest=serde_json::from_value(serde_json::json!({"assigned_principal":{"kind":"worker","runtime_id":source.runtime_id,"worker_id":source.worker_id},"limit":1})).unwrap();
     assert!(api.authority.query_tickets(query).unwrap().items.is_empty());
@@ -2060,5 +2044,493 @@ async fn closure_reason_filter_matches_current_judgment_before_paging_and_text_s
     assert_eq!(
         query(json!({"query":"Superseded plan","limit":1})).items[0].id,
         reference.id
+    );
+}
+
+// FeatureStorage policy, body singleton ownership and signed Runtime HTTP are real.
+// Bodies are Workdir-free. Connected concurrent delegate/tool execution is tested
+// separately in subject_authorization_tests, not claimed by this identity test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_subjects_signed_assignment_isolates_current_subjects_and_stale_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    init_clean_git_workspace(dir.path());
+    for branch in ["subject-a-work", "subject-b-work"] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["branch", branch])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let (mut api, _execution) = test_api_with_recording_backend(dir.path()).await;
+    let identity = RuntimeIdentityMaterial::generate(EMBEDDED_WORKER_RUNTIME_ID).unwrap();
+    configure_runtime_request_auth(&mut api, &identity, EMBEDDED_WORKER_RUNTIME_ID);
+    let token = seed_test_workspace_owner_token(api.store.as_ref(), "parallel-subject-owner").await;
+    let app = build_router(api.clone());
+    let mut cases = Vec::new();
+    for (name, branch) in [
+        ("subject-a", "subject-a-work"),
+        ("subject-b", "subject-b-work"),
+    ] {
+        let subject = open_subjektiv_store(&api)
+            .unwrap()
+            .create_subject_with_behavior(
+                crate::subjektiv::SubjectRole::new(name).unwrap(),
+                format!("Own only {name}'s Ticket."),
+            )
+            .unwrap();
+        let mut input = ticket::NewTicket::new(name);
+        set_test_ticket_target(&mut input, "test-repository", branch);
+        let ticket = browser_ticket_backend(&api).unwrap().create(input).unwrap();
+        grant_test_assignment_ticket(&api, &subject.id, &ticket.id);
+        let created = request_json_authenticated(
+            app.clone(),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
+            Some(
+                json!({"runtime_id":EMBEDDED_WORKER_RUNTIME_ID, "display_name":name,
+                "profile":"builtin:companion", "initial_submit":[],
+                "feature_connections":{"subjektiv":{"subject_id":subject.id}},
+                "workdir_attachments":[]}),
+            ),
+            &token,
+            StatusCode::OK,
+        )
+        .await;
+        let body = RuntimeWorkerRef::new(
+            EMBEDDED_WORKER_RUNTIME_ID,
+            created["worker_id"].as_str().unwrap(),
+        );
+        let assign_path = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/orchestrator",
+            ticket.id
+        );
+        let assign = json!({"operation_id":format!("assign-{name}"),
+            "principal":{"kind":"subject", "subject_id":subject.id}});
+        let receipt = tracking_response(
+            app.clone(),
+            runtime_source_request(
+                &identity,
+                Some(&body.worker_id),
+                "PUT",
+                &assign_path,
+                serde_json::to_vec(&assign).unwrap(),
+            ),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(receipt["assignment"]["principal"], assign["principal"]);
+        assert_eq!(receipt["assignment"]["role"], "orchestrator");
+        let current = api
+            .store
+            .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket.id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            current.tracking.as_ref().unwrap().status,
+            ticket::TicketAssignmentTrackingStatus::Waiting
+        );
+        let links = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &body)
+            .unwrap();
+        assert!(links.is_empty());
+        let key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
+        assert_eq!(
+            api.store
+                .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
+                .unwrap()
+                .unwrap()
+                .worker,
+            body
+        );
+        cases.push((subject.id, ticket.id, body, current));
+    }
+    assert_ne!(cases[0].0, cases[1].0);
+    assert_ne!(cases[0].2, cases[1].2);
+    assert!(
+        api.store
+            .current_worker_singleton_owner(
+                TEST_WORKSPACE_ID,
+                crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY
+            )
+            .unwrap()
+            .is_none()
+    );
+    let (subject_a, ticket_a, body_a, current_a) = &cases[0];
+    let (subject_b, ticket_b, body_b, current_b) = &cases[1];
+    let update_a = tracking_update(current_a, "a-result");
+    // Exact operation grant is required even for a live body of another Subject.
+    tracking_response(
+        app.clone(),
+        signed_tracking_update(&identity, Some(&body_b.worker_id), ticket_a, &update_a),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    grant_test_assignment_ticket(&api, subject_b, ticket_a);
+    // Granting the operation still cannot impersonate the assigned Subject.
+    tracking_response(
+        app.clone(),
+        signed_tracking_update(&identity, Some(&body_b.worker_id), ticket_a, &update_a),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    let saved = tracking_response(
+        app.clone(),
+        signed_tracking_update(&identity, Some(&body_a.worker_id), ticket_a, &update_a),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        api.store
+            .get_ticket_assignment_tracking(TEST_WORKSPACE_ID, ticket_b, &current_b.assignment_id)
+            .unwrap()
+            .unwrap(),
+        *current_b
+    );
+    // Same Subject body may author reassignment if granted, but ownership of A
+    // immediately moves to B. A's old done receipt remains evidence, not authority.
+    let reassign = json!({"operation_id":"a-to-b", "expected_assignment_id":current_a.assignment_id,
+        "principal":{"kind":"subject", "subject_id":subject_b}});
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket_a}/assignments/orchestrator");
+    tracking_response(
+        app.clone(),
+        runtime_source_request(
+            &identity,
+            Some(&body_a.worker_id),
+            "PUT",
+            &path,
+            serde_json::to_vec(&reassign).unwrap(),
+        ),
+        StatusCode::OK,
+    )
+    .await;
+    let next = api
+        .store
+        .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, ticket_a)
+        .unwrap()
+        .remove(0);
+    assert_ne!(next.assignment_id, current_a.assignment_id);
+    let fresh = tracking_update(&next, "old-body-new-delegation");
+    tracking_response(
+        app.clone(),
+        signed_tracking_update(&identity, Some(&body_a.worker_id), ticket_a, &fresh),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    let mut forged_receipt = update_a.clone();
+    forged_receipt.assignment_id = next.assignment_id.clone();
+    forged_receipt.expected_last_event_id = next.last_event_id.clone().unwrap();
+    tracking_response(
+        app.clone(),
+        signed_tracking_update(
+            &identity,
+            Some(&body_b.worker_id),
+            ticket_a,
+            &forged_receipt,
+        ),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    // A retained self-report receipt is never rewritten to point at the new row.
+    assert_eq!(saved["assignment_id"], current_a.assignment_id);
+    tracking_response(
+        app.clone(),
+        runtime_source_request(
+            &identity,
+            Some(&body_b.worker_id),
+            "DELETE",
+            &assignment_clear_path(ticket_a, &next.assignment_id, "clear-a-from-b"),
+            Vec::new(),
+        ),
+        StatusCode::OK,
+    )
+    .await;
+    let after_clear = tracking_update(&next, "after-clear");
+    tracking_response(
+        app.clone(),
+        signed_tracking_update(&identity, Some(&body_b.worker_id), ticket_a, &after_clear),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert!(
+        api.store
+            .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, ticket_a)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        api.store
+            .get_ticket_assignment_tracking(TEST_WORKSPACE_ID, ticket_b, &current_b.assignment_id)
+            .unwrap()
+            .unwrap(),
+        *current_b
+    );
+    assert_eq!(
+        api.authority.ticket(ticket_a).unwrap().state,
+        server_api::BrowserTicketState::Open
+    );
+    assert_eq!(
+        api.authority.ticket(ticket_b).unwrap().state,
+        server_api::BrowserTicketState::Open
+    );
+    assert_eq!(
+        open_subjektiv_store(&api)
+            .unwrap()
+            .subject(subject_a)
+            .unwrap()
+            .unwrap()
+            .behavior_md,
+        "Own only subject-a's Ticket."
+    );
+}
+
+#[tokio::test]
+async fn subject_operation_policy_revocation_rejects_saved_mutation_receipts_without_releasing_assignment()
+ {
+    use server_api::authorization::SubjectPermissionsUpdate;
+    let dir = tempfile::tempdir().unwrap();
+    let (api, _, identity, source, ticket) = tracking_fixture(dir.path()).await;
+    let current = assign_tracking(&api, &identity, &source, &ticket).await;
+    let input = tracking_update(&current, "result-before-policy-revocation");
+    let app = build_router(api.clone());
+    let saved = tracking_response(
+        app.clone(),
+        signed_tracking_update(&identity, Some(&source.worker_id), &ticket, &input),
+        StatusCode::OK,
+    )
+    .await;
+    let before = api
+        .store
+        .get_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket, &current.assignment_id)
+        .unwrap()
+        .unwrap();
+    let subject_id = ensure_test_assignment_subject(&api);
+    let store = open_subjektiv_store(&api).unwrap();
+    let policy = store.subject_permissions(&subject_id).unwrap().unwrap();
+    store
+        .set_subject_permissions(
+            &subject_id,
+            &SubjectPermissionsUpdate {
+                operation_id: "revoke-assignment-operations".into(),
+                expected_change_id: Some(policy.change_id),
+                execution: vec![],
+                delegation: vec![],
+            },
+        )
+        .unwrap();
+    let answer = json!({"assignment_id":current.assignment_id,
+        "expected_last_event_id":saved["last_event_id"], "operation_key":"answer-after-revoke", "body":"No authority"});
+    let answer_path = format!("/workspaces/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignment-answer");
+    for request in [
+        assignment_request(
+            &api,
+            &identity,
+            &source.worker_id,
+            &ticket,
+            "assign-tracking",
+        ),
+        signed_tracking_update(&identity, Some(&source.worker_id), &ticket, &input),
+        runtime_source_request(
+            &identity,
+            Some(&source.worker_id),
+            "DELETE",
+            &assignment_clear_path(&ticket, &current.assignment_id, "clear-after-revoke"),
+            Vec::new(),
+        ),
+        runtime_source_request(
+            &identity,
+            Some(&source.worker_id),
+            "POST",
+            &answer_path,
+            serde_json::to_vec(&answer).unwrap(),
+        ),
+    ] {
+        tracking_response(app.clone(), request, StatusCode::FORBIDDEN).await;
+    }
+    assert_eq!(
+        api.store
+            .get_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket, &current.assignment_id)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert!(before.current);
+    assert_eq!(
+        api.store
+            .list_ticket_assignment_tracking_history(
+                TEST_WORKSPACE_ID,
+                &ticket,
+                &current.assignment_id
+            )
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        api.authority.ticket(&ticket).unwrap().state,
+        server_api::BrowserTicketState::Open
+    );
+}
+
+#[tokio::test]
+async fn generic_delegated_worker_authors_with_operation_grants_but_cannot_self_report_subject_handling()
+ {
+    use server_api::authorization::{
+        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (api, _, identity, body, ticket) = tracking_fixture(dir.path()).await;
+    let subject_id = ensure_test_assignment_subject(&api);
+    let store = open_subjektiv_store(&api).unwrap();
+    let policy = store.subject_permissions(&subject_id).unwrap().unwrap();
+    let permissions: Vec<_> = [
+        "ticket.assignment.assign",
+        "ticket.assignment.clear",
+        "ticket.assignment.answer",
+        "ticket.assignment.update",
+    ]
+    .into_iter()
+    .map(|operation| ScopedPermission {
+        operation: operation.into(),
+        resource: PermissionResource::Ticket {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            ticket_id: ticket.clone(),
+        },
+    })
+    .collect();
+    let policy = store
+        .set_subject_permissions(
+            &subject_id,
+            &SubjectPermissionsUpdate {
+                operation_id: "allow-generic-assignment-author".into(),
+                expected_change_id: Some(policy.change_id),
+                execution: policy.execution,
+                delegation: permissions.clone(),
+            },
+        )
+        .unwrap();
+    let app = build_router(api.clone());
+    // Existing Worker control/FeatureStorage grant path, not a Ticket executor
+    // or a role fixture. No implementation start or T-803 integration is claimed.
+    let child = tracking_response(app.clone(), runtime_source_request(&identity, Some(&body.worker_id), "POST",
+        &format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers"),
+        serde_json::to_vec(&json!({"runtime_id":body.runtime_id, "display_name":"Generic assignment author",
+            "profile":"builtin:intake", "initial_submit":[], "workdir_attachments":[], "feature_connections":{},
+            "control_operation_id":"spawn-generic-author",
+            "execution_grant":{"permissions":permissions, "redelegation":[]}})).unwrap()), StatusCode::OK).await;
+    let worker_id = child["worker_id"].as_str().unwrap();
+    assert!(child["worker"]["singleton_key"].is_null());
+    assert_eq!(child["worker"]["profile"], "builtin:intake");
+    let saved = tracking_response(
+        app.clone(),
+        assignment_request(&api, &identity, worker_id, &ticket, "generic-assign"),
+        StatusCode::OK,
+    )
+    .await;
+    let current = api
+        .store
+        .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket)
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        saved["assignment"]["principal"],
+        test_assignment_principal(&api)
+    );
+    assert_eq!(
+        saved["assignment"]["assigned_by"],
+        format!("worker:{}/{worker_id}", body.runtime_id)
+    );
+    // Operation policy alone never makes a background Worker the Subject body.
+    tracking_response(
+        app.clone(),
+        signed_tracking_update(
+            &identity,
+            Some(worker_id),
+            &ticket,
+            &tracking_update(&current, "child-cannot-report"),
+        ),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    let answer = json!({"assignment_id":current.assignment_id,
+        "expected_last_event_id":current.last_event_id, "operation_key":"generic-answer", "body":"Additional authorized input"});
+    let answer_path = format!("/workspaces/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignment-answer");
+    let receipt = tracking_response(
+        app.clone(),
+        runtime_source_request(
+            &identity,
+            Some(worker_id),
+            "POST",
+            &answer_path,
+            serde_json::to_vec(&answer).unwrap(),
+        ),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        tracking_response(
+            app.clone(),
+            runtime_source_request(
+                &identity,
+                Some(worker_id),
+                "POST",
+                &answer_path,
+                serde_json::to_vec(&answer).unwrap()
+            ),
+            StatusCode::OK
+        )
+        .await,
+        receipt
+    );
+    let clear = assignment_clear_path(&ticket, &current.assignment_id, "generic-clear");
+    tracking_response(
+        app.clone(),
+        runtime_source_request(&identity, Some(worker_id), "DELETE", &clear, Vec::new()),
+        StatusCode::OK,
+    )
+    .await;
+    store
+        .set_subject_permissions(
+            &subject_id,
+            &SubjectPermissionsUpdate {
+                operation_id: "revoke-generic-author".into(),
+                expected_change_id: Some(policy.change_id),
+                execution: policy.execution,
+                delegation: vec![],
+            },
+        )
+        .unwrap();
+    for request in [
+        assignment_request(&api, &identity, worker_id, &ticket, "generic-assign"),
+        runtime_source_request(&identity, Some(worker_id), "DELETE", &clear, Vec::new()),
+        runtime_source_request(
+            &identity,
+            Some(worker_id),
+            "POST",
+            &answer_path,
+            serde_json::to_vec(&answer).unwrap(),
+        ),
+    ] {
+        tracking_response(app.clone(), request, StatusCode::FORBIDDEN).await;
+    }
+    let retained = api
+        .store
+        .get_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket, &current.assignment_id)
+        .unwrap()
+        .unwrap();
+    assert!(!retained.current);
+    assert_eq!(
+        retained.tracking.unwrap().status,
+        ticket::TicketAssignmentTrackingStatus::Waiting
+    );
+    assert!(
+        api.store
+            .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket)
+            .unwrap()
+            .is_empty()
     );
 }

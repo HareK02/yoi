@@ -100,6 +100,10 @@ fn principal() -> Shape {
         "kind",
         vec![
             case(
+                "subject",
+                Some(record(vec![p("subject_id", true, Shape::String)])),
+            ),
+            case(
                 "user",
                 Some(record(vec![p("account_id", true, Shape::String)])),
             ),
@@ -115,6 +119,15 @@ fn principal() -> Shape {
                 Some(record(vec![p("agent_key", true, Shape::String)])),
             ),
         ],
+    )
+}
+fn assignment_principal() -> Shape {
+    union(
+        "kind",
+        vec![case(
+            "subject",
+            Some(record(vec![p("subject_id", true, Shape::String)])),
+        )],
     )
 }
 fn reason() -> Shape {
@@ -387,7 +400,7 @@ pub(super) fn contract(op: &str) -> Contract {
             "orchestrator_assign",
             "Delegate or explicitly reissue responsibility; no Worker starts. Observed null means unassigned, not unknown. Exact retries retain operation identity and full input.",
             vec![
-                p("principal", true, principal()),
+                p("principal", true, assignment_principal()),
                 group(
                     "observed",
                     true,

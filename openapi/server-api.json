@@ -12692,6 +12692,23 @@
           {
             "additionalProperties": false,
             "properties": {
+              "kind": {
+                "const": "subject",
+                "type": "string"
+              },
+              "subject_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "subject_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
               "account_id": {
                 "type": "string"
               },
@@ -12749,6 +12766,22 @@
       "TicketAssignmentPrincipalSnapshot": {
         "description": "Immutable principal as stored at Assign, not live Worker availability.",
         "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "subject",
+                "type": "string"
+              },
+              "subject_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "subject_id"
+            ],
+            "type": "object"
+          },
           {
             "properties": {
               "account_id": {
@@ -19420,7 +19453,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:812a8f0a3b60df97ffe16e4905915b5c8d31b6795b8cd535e2adc10ed19078ca"
+    "x-yoi-source-digest": "sha256:ff2fc2c7f04f17acb1aa95bbeb3908c37bb93c32d2537e1c2a31ddb5182f5ee3"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -24236,6 +24269,113 @@
             "description": "Error response"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/config/source-tree/preview": {
+      "post": {
+        "operationId": "workspace_config_tree_preview",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigCommitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceConfigTreeResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
             "content": {
               "application/json": {
                 "schema": {

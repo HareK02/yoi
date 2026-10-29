@@ -13,7 +13,7 @@ function assigned(status: "waiting" | "done" = "waiting"): TicketDetail {
   const row: TicketAssignmentTrackingProjection = {
     assignment_id: "assignment-1", role: "orchestrator", ticket_id: "internal-T-1", workspace_id: "team",
     assigned_at: "2026-10-13T09:00:00Z", assigned_by: "Mika", current: true,
-    principal: { kind: "workspace_agent", agent_key: "workspace-orchestrator" }, last_event_id: "handling-1",
+    principal: { kind: "subject", subject_id: "subject-a" }, last_event_id: "handling-1",
     tracking: { status, waiting_reason: "Choose the policy", progress: "Compared options", next_action: "Confirm the choice", result: "Comparison delivered" },
   };
   return { ...fixtureDetail("T-1"), assignment_tracking: [row],
@@ -24,6 +24,7 @@ function assigned(status: "waiting" | "done" = "waiting"): TicketDetail {
 function installFetch(handle: (path: string, init?: RequestInit) => Response | Promise<Response> = () => { throw new Error("Unexpected request"); }, emptyAssignments = true) {
   const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input);
+    if (path.includes("/subjektiv/subjects")) return Response.json(subjectPage);
     if (emptyAssignments && path === assignmentsPath) return Response.json({ items: [], next_assignment_id: null });
     return await handle(path, init);
   });
@@ -31,7 +32,7 @@ function installFetch(handle: (path: string, init?: RequestInit) => Response | P
   return fetcher;
 }
 function mount(ticket = assigned(), refresh = vi.fn(async () => {})) {
-  return { ...render(TicketHandling, { workspaceId: "team", ticket, orchestrator: null, refresh }), refresh };
+  return { ...render(TicketHandling, { workspaceId: "team", ticket, refresh }), refresh };
 }
 function expectNoDiagnostics(fetcher: ReturnType<typeof installFetch>, view: ReturnType<typeof mount>) {
   expect(view.container.querySelector(".ticket-delivery")).toBeNull();
@@ -43,10 +44,10 @@ function expectNoDiagnostics(fetcher: ReturnType<typeof installFetch>, view: Ret
 test("mount retains assignment and self-reported handling, progress and result without delivery UI or diagnostics reads", async () => {
   const fetcher = installFetch();
   const view = mount();
-  await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
   expect(view.getByText("Self-reported handling: waiting")).toBeTruthy();
   for (const text of ["Choose the policy", "Compared options", "Confirm the choice", "Comparison delivered", "Assignment details"]) expect(view.getByText(text)).toBeTruthy();
-  expect(view.container.querySelector(".ticket-orchestrator-worker")).not.toBeNull();
+  expect(view.container.querySelector(".ticket-subject-worker")).not.toBeNull();
   expectNoDiagnostics(fetcher, view);
 });
 
@@ -56,13 +57,14 @@ test("assignment save refreshes assignment history without diagnostics or delive
     expect(init?.method).toBe("PUT");
     return Response.json({ ticket_id: "internal-T-1", workspace_id: "team", assignment: {
       assignment_id: "assignment-2", assigned_at: "2026-10-13T10:00:00Z", assigned_by: "Mika", role: "orchestrator",
-      ticket_id: "internal-T-1", workspace_id: "team", principal: { kind: "workspace_agent", agent_key: "workspace-orchestrator" },
+      ticket_id: "internal-T-1", workspace_id: "team", principal: { kind: "subject", subject_id: "subject-a" },
     } });
   });
   const view = mount(assigned("done"));
+  await chooseSubject(view);
   await fireEvent.click(view.getByRole("button", { name: "Request again (new assignment)" }));
   await waitFor(() => {
-    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(fetcher).toHaveBeenCalledTimes(4);
     expect(view.queryByText("Loading assignment history…")).toBeNull();
   });
   expect(view.refresh).toHaveBeenCalledTimes(1);
@@ -81,7 +83,7 @@ test("answer save keeps handling unchanged and refreshes history without diagnos
   await fireEvent.input(view.getByRole("textbox", { name: "Answer / continue this handling" }), { target: { value: "Use read-only comparison" } });
   await fireEvent.click(view.getByRole("button", { name: "Send answer to this assignment" }));
   await waitFor(() => {
-    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(fetcher).toHaveBeenCalledTimes(4);
     expect(view.queryByText("Loading assignment history…")).toBeNull();
   });
   expect(view.refresh).toHaveBeenCalledTimes(1);
@@ -93,11 +95,12 @@ test("answer save keeps handling unchanged and refreshes history without diagnos
 test("uncertain assignment reconciliation only refreshes the projection and assignment history", async () => {
   const fetcher = installFetch(() => { throw new Error("Response lost"); });
   const view = mount(assigned("done"));
+  await chooseSubject(view);
   await fireEvent.click(view.getByRole("button", { name: "Request again (new assignment)" }));
   await waitFor(() => expect(view.getByRole("alert").textContent).toContain("Outcome unknown"));
   await fireEvent.click(view.getByRole("button", { name: "Refresh and reconcile assignment" }));
   await waitFor(() => {
-    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(fetcher).toHaveBeenCalledTimes(4);
     expect(view.queryByText("Loading assignment history…")).toBeNull();
   });
   expect(view.refresh).toHaveBeenCalledTimes(1);
@@ -186,10 +189,10 @@ test("released done is retained as past result without current Answer or implici
   await fireEvent.click(view.getByRole("button", { name: /Past · done/ }));
   await waitFor(() => expect(view.getByText(/unassigned by Mika/)).toBeTruthy());
   expect(view.getByText("Previous result: Comparison delivered")).toBeTruthy();
-  expect(view.getByText("No current Orchestrator assignment.")).toBeTruthy();
+  expect(view.getByText("No current Subject assignment.")).toBeTruthy();
   expect(view.queryByRole("textbox", { name: "Answer / continue this handling" })).toBeNull();
   expect(view.queryByRole("button", { name: "Read replacement assignment" })).toBeNull();
-  expect(view.getByRole("button", { name: "Request Orchestrator" })).toBeTruthy();
+  expect(view.getByRole("button", { name: "Assign Subject" })).toBeTruthy();
   expect(fetcher.mock.calls.every(([, init]) => !init?.method || init.method === "GET")).toBe(true);
   expectNoDiagnostics(fetcher, view);
 });
@@ -198,15 +201,15 @@ test("case close and reopen keep done result non-actionable and require an expli
   const fetcher = installFetch();
   const ticket = assigned("done");
   const view = mount(ticket);
-  await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
   for (const state of ["closed", "open"] as const) {
-    await view.rerender({ workspaceId: "team", ticket: { ...ticket, state }, orchestrator: null, refresh: view.refresh });
+    await view.rerender({ workspaceId: "team", ticket: { ...ticket, state }, refresh: view.refresh });
     expect(view.getByText(`This handling was returned. Ticket ${state} is unchanged.`)).toBeTruthy();
     expect(view.getByText("Comparison delivered")).toBeTruthy();
     expect(view.queryByRole("textbox", { name: "Answer / continue this handling" })).toBeNull();
     expect(view.getByRole("button", { name: "Request again (new assignment)" })).toBeTruthy();
   }
-  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(fetcher).toHaveBeenCalledTimes(2);
   expect(view.refresh).not.toHaveBeenCalled();
   expectNoDiagnostics(fetcher, view);
 });
@@ -240,4 +243,25 @@ test("releasing responsibility while reading an old result uses current assignme
   expect(view.getByText("Previous result: Comparison delivered")).toBeTruthy();
   expect(fetcher.mock.calls.filter(([, init]) => init?.method === "DELETE")).toHaveLength(1);
   expectNoDiagnostics(fetcher, view);
+});
+
+const subjectPage = { limit: 100, items: [{ id: "subject-a", role: "Research", state: "active", behavior_md: "", memory_fingerprint: "f", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", current_worker: null }], has_more: false, next_cursor: null };
+async function chooseSubject(view: ReturnType<typeof mount>) {
+  await fireEvent.click(view.getByText("Choose responsible Subject"));
+  await waitFor(() => expect(view.queryByText("Loading Subjects…")).toBeNull());
+  // Current Subject is the observed reissue candidate; different-Subject native selection is covered in Playwright.
+}
+
+test("legacy principal is audit-only with no Answer or mandatory singleton observation", async () => {
+  const ticket = assigned();
+  ticket.assignment_tracking[0].principal = { kind: "workspace_agent", agent_key: "workspace-orchestrator" };
+  ticket.assignments[0].principal = ticket.assignment_tracking[0].principal;
+  const fetcher = installFetch();
+  const view = mount(ticket);
+  await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+  expect(view.getByText(/Legacy assignment retained for audit only/)).toBeTruthy();
+  expect(view.getByText("Workspace agent: workspace-orchestrator")).toBeTruthy();
+  expect(view.queryByRole("textbox", { name: "Answer / continue this handling" })).toBeNull();
+  expect(fetcher.mock.calls.some(([path]) => String(path).endsWith("/orchestrator"))).toBe(false);
+  expect(view.queryByLabelText("Principal kind")).toBeNull();
 });

@@ -87,13 +87,14 @@ async fn delivery_http(
 }
 
 async fn delivery_assign(api: &WorkspaceApi, ticket: &str, key: &str) -> Value {
+    grant_test_assignment_ticket(api, &ensure_test_assignment_subject(api), ticket);
     delivery_http(
         api,
         "PUT",
         &delivery_assignment_path(ticket),
         Some(json!({
             "operation_id": key,
-            "principal": {"kind":"workspace_agent", "agent_key":"workspace-orchestrator"}
+            "principal": test_assignment_principal(&api)
         })),
         StatusCode::OK,
     )
@@ -152,7 +153,7 @@ async fn delivery_recording_fixture(
     RuntimeWorkerRef,
     RuntimeIdentityMaterial,
 ) {
-    let (mut api, execution) = test_api_with_recording_backend(root).await;
+    let (mut api, execution) = assignment_test_api_with_recording_backend(root).await;
     seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
     let worker = delivery_worker(start_attention_test_orchestrator(&api).await);
     let identity = RuntimeIdentityMaterial::generate(EMBEDDED_WORKER_RUNTIME_ID).unwrap();
@@ -617,7 +618,7 @@ async fn assignment_clear_and_reassign_discard_old_unknown_delivery_without_stop
             "clear/reissue must not rewrite the old status to done"
         );
         assert_eq!(
-            find_workspace_orchestrator(&api).unwrap().worker,
+            test_assignment_body(&api).unwrap().worker,
             worker,
             "clear/reassign are not Worker stop or replacement"
         );
@@ -782,34 +783,46 @@ struct DeliveryWorkerFactory {
 }
 
 impl DeliveryWorkerFactory {
+    fn manifest(
+        worker_id: &str,
+        profile: &worker_runtime::catalog::ProfileSelector,
+        bundle: Option<&worker_runtime::config_bundle::ConfigBundle>,
+    ) -> std::result::Result<manifest::WorkerManifest, String> {
+        let selector = match profile {
+            worker_runtime::catalog::ProfileSelector::Builtin(value)
+            | worker_runtime::catalog::ProfileSelector::Named(value) => value,
+        };
+        let mut manifest = crate::profile_settings::resolve_profile_manifest_from_config_bundle(
+            bundle.ok_or("delivery fixture requires the normal resolved Config bundle")?,
+            selector,
+        )
+        .map_err(|e| e.to_string())?;
+        manifest.worker.name = format!("worker-runtime-{worker_id}");
+        // These notification fixtures attach no Workdirs. Apply that zero-file
+        // launch ceiling rather than resolving Profile scope against the test cwd.
+        manifest.scope.allow.clear();
+        // Retain the resolved Profile; bootstrap saves the actual execution policy,
+        // including that ceiling, through its normal metadata writer.
+        assert!(manifest.requires_persisted_execution_snapshot());
+        Ok(manifest)
+    }
+
     async fn controller(
         &self,
         worker_id: String,
         restore: bool,
+        manifest: manifest::WorkerManifest,
     ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
-        let name = format!("delivery-{worker_id}");
+        let name = format!("worker-runtime-{worker_id}");
         let root = self.root.join("workers").join(&worker_id);
         let store = session_store::CombinedStore::new(
             WorkerSessionStore::new(root.join("session")).map_err(|e| e.to_string())?,
             session_store::WorkerAggregateStore::new(&root, &name).map_err(|e| e.to_string())?,
         );
-        let manifest = manifest::WorkerManifest::from_toml(&format!(
-            r#"
-            [worker]
-            name = "{name}"
-            pwd = "./"
-            [model]
-            scheme = "anthropic"
-            model_id = "scripted-delivery"
-            auth = {{ kind = "none" }}
-            [engine]
-            max_tokens = 64
-            [scope]
-            allow = []
-        "#
-        ))
-        .map_err(|e| e.to_string())?;
-        let context = worker::WorkerWorkspaceContext::local_filesystem(None);
+
+        let context = worker::WorkerWorkspaceContext::local_filesystem(Some(
+            worker::WorkspaceId::new(TEST_WORKSPACE_ID).unwrap(),
+        ));
         let workspace_client = context.client_handle();
         let bootstrap = worker::WorkerBootstrap::new(
             manifest,
@@ -827,7 +840,7 @@ impl DeliveryWorkerFactory {
         } else {
             bootstrap.prepare().await
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:?}"))?;
         let started = prepared.start().await.map_err(|e| e.to_string())?;
         Ok(worker_runtime::worker_backend::RuntimeWorkerController {
             handle: started.handle,
@@ -845,8 +858,13 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for DeliveryWorkerFact
         &self,
         request: delivery_execution::WorkerExecutionSpawnRequest,
     ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
-        self.controller(request.worker_ref.worker_id.to_string(), false)
-            .await
+        let worker_id = request.worker_ref.worker_id.to_string();
+        let manifest = Self::manifest(
+            &worker_id,
+            &request.request.profile,
+            request.config_bundle.as_ref(),
+        )?;
+        self.controller(worker_id, false, manifest).await
     }
     async fn prepare_restore(
         &self,
@@ -855,13 +873,27 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for DeliveryWorkerFact
         Box<dyn worker_runtime::worker_backend::RuntimeRestoreCandidate>,
         worker_runtime::worker_backend::RuntimeRestoreFailure,
     > {
+        let worker_id = request.worker_ref.worker_id.to_string();
+        // Restore must read the saved execution snapshot, not reselect today's
+        // Config/Profile (a reopened Runtime need not have a cached bundle).
+        // Workspace-bound prepare_restored rejects a missing saved snapshot.
+        let mut fallback = manifest::WorkerManifestConfig::resolution_defaults();
+        fallback.worker.name = Some(format!("worker-runtime-{worker_id}"));
+        let manifest = manifest::WorkerManifest::try_from(fallback).map_err(|error| {
+            eprintln!("delivery fixture restore defaults failed: {error}");
+            worker_runtime::worker_backend::RuntimeRestoreFailure::refused(
+                worker_runtime::worker_backend::RuntimeRestoreStage::Reconstruction,
+                "delivery fixture restore defaults failed",
+            )
+        })?;
         Ok(Box::new(DeliveryRestoreCandidate {
             inputs: Some((
                 DeliveryWorkerFactory {
                     root: self.root.clone(),
                     client: self.client.clone(),
                 },
-                request.worker_ref.worker_id.to_string(),
+                worker_id,
+                manifest,
             )),
         }))
     }
@@ -870,7 +902,7 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for DeliveryWorkerFact
 // Retain the same scripted client/receipt store without opening either store or
 // starting a Controller until activation. Discard drops only these owned inputs.
 struct DeliveryRestoreCandidate {
-    inputs: Option<(DeliveryWorkerFactory, String)>,
+    inputs: Option<(DeliveryWorkerFactory, String, manifest::WorkerManifest)>,
 }
 
 #[async_trait::async_trait]
@@ -885,18 +917,22 @@ impl worker_runtime::worker_backend::RuntimeRestoreCandidate for DeliveryRestore
         worker_runtime::worker_backend::RuntimeWorkerController,
         worker_runtime::worker_backend::RuntimeRestoreFailure,
     > {
-        let (factory, worker_id) = self.inputs.take().ok_or_else(|| {
+        let (factory, worker_id, manifest) = self.inputs.take().ok_or_else(|| {
             worker_runtime::worker_backend::RuntimeRestoreFailure::refused(
                 worker_runtime::worker_backend::RuntimeRestoreStage::Controller,
                 "delivery fixture candidate already consumed",
             )
         })?;
-        factory.controller(worker_id, true).await.map_err(|_| {
-            worker_runtime::worker_backend::RuntimeRestoreFailure::unproven(
-                worker_runtime::worker_backend::RuntimeRestoreStage::Reconstruction,
-                "delivery fixture reconstruction failed",
-            )
-        })
+        factory
+            .controller(worker_id, true, manifest)
+            .await
+            .map_err(|error| {
+                eprintln!("delivery fixture reconstruction failed: {error}");
+                worker_runtime::worker_backend::RuntimeRestoreFailure::unproven(
+                    worker_runtime::worker_backend::RuntimeRestoreStage::Reconstruction,
+                    "delivery fixture reconstruction failed",
+                )
+            })
     }
 
     async fn discard(
@@ -918,6 +954,12 @@ struct DeliveryResponseLossBackend {
 impl delivery_execution::WorkerExecutionBackend for DeliveryResponseLossBackend {
     fn backend_id(&self) -> &str {
         self.inner.backend_id()
+    }
+    fn subject_release(
+        &self,
+        request: &runtime_api::SubjectReleaseRequest,
+    ) -> std::result::Result<runtime_api::SubjectReleaseResponse, String> {
+        self.inner.subject_release(request)
     }
     fn spawn_worker(
         &self,
@@ -1364,17 +1406,24 @@ async fn assignment_worker_replacement_receives_pending_input_without_recreating
     let initial = delivery_tracking(&api, &handled.id, assignment);
     let old_worker = delivery_worker(start_attention_test_orchestrator(&api).await);
     delivery_wait_idle(&api, &old_worker, 1).await;
-    delivery_stop(&api, &old_worker);
-    // Delete only this isolated fixture's stopped identity. A new live Worker
-    // has a new session; it is not a restore and cannot reuse old session receipts.
-    api.runtime.delete_worker(&old_worker).unwrap();
-    api.worker_projection
-        .publish_ordered(|| {
-            api.store
-                .delete_worker_registry(TEST_WORKSPACE_ID, &old_worker)
-                .map(|commit| ((), commit))
-        })
-        .unwrap();
+    assert_eq!(execution.attempts.lock().unwrap().len(), 1);
+    // The factory has no Journal tool wiring. Drive real Host admission and the
+    // dispatched Journal Job's sequential services over the actual saved source,
+    // rather than bypassing the normal release coverage invariant.
+    reflect_test_assignment_session(
+        &api,
+        &old_worker,
+        "Read the delegation; returning without starting a Coder.",
+    )
+    .await;
+    let reflected_attempts = execution.attempts.lock().unwrap().len();
+    assert_eq!(
+        reflected_attempts, 2,
+        "one delivery plus one actual Journal Job"
+    );
+    // Release while the actual Controller is Idle, before stopping/deleting its
+    // retained identity. Deletion itself cannot release connected Subject occupancy.
+    remove_test_assignment_body(&api, &old_worker).await;
     let pending = delivery_ticket(&api, "Pending input for replacement");
     let new_assign = delivery_assign(&api, &pending.id, "assign-pending-replacement").await;
     let pending_assignment = new_assign["assignment"]["assignment_id"].as_str().unwrap();
@@ -1391,7 +1440,10 @@ async fn assignment_worker_replacement_receives_pending_input_without_recreating
         !commits[0].contains(handled.resource_key.as_deref().unwrap()),
         "replacement must not execute acknowledged history"
     );
-    assert_eq!(execution.attempts.lock().unwrap().len(), 2);
+    assert_eq!(
+        execution.attempts.lock().unwrap().len(),
+        reflected_attempts + 1
+    );
     assert_eq!(
         delivery_tracking(&api, &handled.id, assignment),
         initial,
@@ -1402,7 +1454,10 @@ async fn assignment_worker_replacement_receives_pending_input_without_recreating
         pending_initial
     );
     delivery_scan(&api, &replacement);
-    assert_eq!(execution.attempts.lock().unwrap().len(), 2);
+    assert_eq!(
+        execution.attempts.lock().unwrap().len(),
+        reflected_attempts + 1
+    );
     delivery_stop(&api, &replacement);
 }
 

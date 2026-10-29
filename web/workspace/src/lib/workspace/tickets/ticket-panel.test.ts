@@ -64,7 +64,7 @@ Deno.test("generic Ticket launch carries natural text without role or resource c
 Deno.test("case, stable tags and principal filters survive every server-query page", () => {
   const filters = readTicketFilters(
     new URLSearchParams(
-      "q=options&case=open&tag=tag-1&tag=tag-2&principal=orchestrator",
+      "q=options&case=open&tag=tag-1&tag=tag-2&principal=subject&subject=subject-a",
     ),
   );
   for (const cursor of [null, "next-page"]) {
@@ -76,8 +76,8 @@ Deno.test("case, stable tags and principal filters survive every server-query pa
       states: ["open"],
       tag_ids: ["tag-1", "tag-2"],
       assigned_principal: {
-        kind: "workspace_agent",
-        agent_key: "workspace-orchestrator",
+        kind: "subject",
+        subject_id: "subject-a",
       },
       handling_status: null,
       sort: "updated_desc",
@@ -195,4 +195,25 @@ Deno.test("ticket detail keeps the operation rail outside main content", async (
     true,
   );
   assertEquals(css.includes("min-width: 0;"), true);
+});
+
+Deno.test("Subject identity survives every query page without singleton normalization", () => {
+  for (const subject of ["subject-a", "subject-b"]) {
+    const filters = readTicketFilters(
+      new URLSearchParams({ principal: "subject", subject }),
+    );
+    for (const cursor of [null, "next"]) {
+      assertEquals(ticketQueryRequest(filters, [], cursor).assigned_principal, {
+        kind: "subject",
+        subject_id: subject,
+      });
+    }
+  }
+  const legacy = readTicketFilters(
+    new URLSearchParams("principal=orchestrator"),
+  );
+  assertEquals(ticketQueryRequest(legacy, []).assigned_principal, {
+    kind: "workspace_agent",
+    agent_key: "workspace-orchestrator",
+  });
 });

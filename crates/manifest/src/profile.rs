@@ -652,6 +652,7 @@ fn resolve_profile_value(
         permissions: profile.permissions,
         feature: profile.feature,
         mcp: profile.mcp,
+        plugins: profile.plugins,
         compaction,
         web: profile.web,
         skills: profile.skills,
@@ -699,6 +700,8 @@ struct ProfileConfig {
     feature: FeatureConfigPartial,
     #[serde(default)]
     mcp: McpConfig,
+    #[serde(default)]
+    plugins: Option<crate::PluginProfileConfig>,
     #[serde(default)]
     compaction: Option<serde_json::Value>,
     #[serde(default)]

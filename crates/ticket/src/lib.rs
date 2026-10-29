@@ -31,6 +31,7 @@ mod assignment_tracking;
 pub mod config;
 mod content_changes;
 mod sqlite_schema;
+mod subject_assignment;
 mod tags;
 pub use assignment_tracking::*;
 pub use tags::{
@@ -39,6 +40,7 @@ pub use tags::{
 pub mod tool;
 
 pub use sqlite_schema::{
+    HistoricalTicketSchemaTarget, migrate_historical_sqlite_ticket_schema_in_transaction,
     migrate_sqlite_ticket_schema, migrate_sqlite_ticket_schema_in_transaction,
     verify_legacy_sqlite_ticket_schema, verify_pre_classification_ticket_schema,
     verify_sqlite_ticket_schema,

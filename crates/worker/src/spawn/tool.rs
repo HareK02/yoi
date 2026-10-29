@@ -1007,6 +1007,9 @@ fn manifest_to_reusable_config(manifest: &WorkerManifest) -> WorkerManifestConfi
             }),
         feature: manifest.feature.clone().into(),
         mcp: manifest.mcp.clone(),
+        // Reusable selection is not a plan or delegation authority. Backend launch
+        // must resolve it again within the child's own Workspace/delegation bound.
+        plugins: Some(manifest.plugins.clone()),
         compaction: manifest
             .compaction
             .as_ref()

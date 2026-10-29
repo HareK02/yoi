@@ -1,6 +1,6 @@
 import "./base.dcdl" // {
     slug = "intake";
-    description = "Ticket intake profile.";
+    description = "Ticket authoring and clarification; handoff does not assign a Subject or start execution.";
     scope = "workspace_write";
     engine = { instruction = "role.intake"; };
 

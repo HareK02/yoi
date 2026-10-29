@@ -21,7 +21,7 @@ const assignment = (
   ticket_id: "T-1",
   assignment_id: id,
   role: "orchestrator",
-  principal: { kind: "workspace_agent", agent_key: "workspace-orchestrator" },
+  principal: { kind: "subject", subject_id: "subject-a" },
   assigned_by: "user",
   assigned_at: "2026-01-01T00:00:00Z",
   current: true,
@@ -51,6 +51,7 @@ function detail(row = assignment()): TicketDetail {
   };
 }
 function reads(path: string, row: TicketAssignmentTrackingProjection) {
+  if (path.includes("/subjektiv/subjects")) return Response.json({ limit: 100, items: [{ id: "subject-a", role: "Research", state: "active", behavior_md: "", memory_fingerprint: "f", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }], has_more: false, next_cursor: null });
   if (path.includes("/assignment-tracking/assignments")) {
     return Response.json({ items: [row], next_assignment_id: null });
   }
@@ -80,7 +81,6 @@ test("an answer response loss keeps exact assignment/event/key/body for retry ev
   const view = render(TicketHandling, {
     workspaceId: "team",
     ticket: detail(row),
-    orchestrator: null,
     refresh,
   });
   await fireEvent.input(
@@ -136,11 +136,13 @@ test("a done reissue persists before a failed refresh and does not pretend deliv
   const view = render(TicketHandling, {
     workspaceId: "team",
     ticket: detail(row),
-    orchestrator: null,
     refresh: vi.fn(async () => {
       throw new Error("refresh unavailable");
     }),
   });
+  await fireEvent.click(view.getByText("Choose responsible Subject"));
+  await waitFor(() => expect(view.queryByText("Loading Subjects…")).toBeNull());
+  // Current Subject is the observed reissue candidate; different-Subject native selection is covered in Playwright.
   await fireEvent.click(view.getByText("Request again (new assignment)"));
   await waitFor(() =>
     expect(view.getByText(/Assignment operation saved: delegation-2/))

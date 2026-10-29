@@ -327,3 +327,19 @@ Deno.test("mixed search compiles every supported filter and only remaining words
     },
   );
 });
+
+Deno.test("Subject search preserves exact identity, rejects blanks and conflicts", () => {
+  for (const subject of ["subject-a", "subject-b"]) {
+    assertEquals(
+      compileTicketSearch("assignee:subject:" + subject, tags)
+        .assigned_principal,
+      { kind: "subject", subject_id: subject },
+    );
+  }
+  assertSearchError("assignee:subject:", "Subject identity");
+  assertSearchError('assignee:"subject:   "', "Subject identity");
+  assertSearchError(
+    "assignee:subject:a assignee:subject:b",
+    "Conflicting assignee:",
+  );
+});

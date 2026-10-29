@@ -458,6 +458,12 @@ impl SqliteWorkspaceAuthority {
             ];
             if let Some(principal) = &query.assigned_principal {
                 match principal {
+                    ticket::TicketAssignmentPrincipalSnapshot::Subject { subject_id } => {
+                        let value = bind(SqlValue::Text(subject_id.clone()));
+                        assignment.push(format!(
+                            "a.principal_kind='subject' AND a.principal_id={value}"
+                        ));
+                    }
                     ticket::TicketAssignmentPrincipalSnapshot::WorkspaceAgent { agent_key } => {
                         let value = bind(SqlValue::Text(agent_key.clone()));
                         assignment.push(format!(
@@ -854,6 +860,9 @@ impl SqliteWorkspaceAuthority {
                         runtime_id,
                         worker_id,
                     },
+                    TicketAssignmentPrincipal::Subject { subject_id } => {
+                        TicketAssignmentPrincipalSummary::Subject { subject_id }
+                    }
                     TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
                         TicketAssignmentPrincipalSummary::WorkspaceAgent { agent_key }
                     }
@@ -2136,6 +2145,7 @@ fn validate_ticket_query(query: &TicketQueryRequest) -> Result<()> {
     }
     if let Some(principal) = &query.assigned_principal {
         let ids: Vec<&str> = match principal {
+            ticket::TicketAssignmentPrincipalSnapshot::Subject { subject_id } => vec![subject_id],
             ticket::TicketAssignmentPrincipalSnapshot::User { account_id } => vec![account_id],
             ticket::TicketAssignmentPrincipalSnapshot::WorkspaceAgent { agent_key } => {
                 vec![agent_key]
@@ -3614,8 +3624,8 @@ mod tests {
         let orchestrator = crate::store::TicketRoleAssignmentRecord {
             role: TicketAssignmentRole::Orchestrator,
             assignment_id: "orchestrator".into(),
-            principal: TicketAssignmentPrincipal::WorkspaceAgent {
-                agent_key: "workspace-orchestrator".into(),
+            principal: TicketAssignmentPrincipal::Subject {
+                subject_id: "eligibility-subject".into(),
             },
             ..record.clone()
         };

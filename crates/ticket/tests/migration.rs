@@ -78,7 +78,17 @@ fn standalone_schema7_migration_preserves_six_state_snapshot_and_evidence_withou
             row.get(0)
         })
         .unwrap();
-    assert_eq!(marker, 10);
+    assert_eq!(marker, 7);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT applied_at FROM ticket_schema_migrations WHERE version=7",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "legacy"
+    );
     let after_events: Vec<_> = connection.prepare("SELECT ticket_id, from_state, to_state, reason, author, body FROM typed_ticket_events WHERE event_index >= 0 ORDER BY ticket_id").unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))).unwrap().collect::<std::result::Result<_, _>>().unwrap();
     assert_eq!(after_events, historical_events);
     let store = SqliteTicketBackend::open_verified(&path, "workspace").unwrap();
@@ -442,7 +452,7 @@ fn tagged_schema8_composes_cases_preserving_tombstones_membership_context_receip
     verify_sqlite_ticket_schema(&connection).unwrap();
     assert_eq!(
         rows(&connection, "ticket_schema_migrations")[0][0],
-        rusqlite::types::Value::Integer(10)
+        rusqlite::types::Value::Integer(8)
     );
     for (table, expected) in preserved.iter().zip(&before) {
         assert_eq!(&rows(&connection, table), expected, "changed {table}");
@@ -851,4 +861,219 @@ fn retained_workspace_foreign_keys_survive_composition_without_rebuilding_ticket
         })
         .unwrap();
     assert_eq!(failures, 0);
+}
+
+fn compose_historical(connection: &Connection, target: HistoricalTicketSchemaTarget) {
+    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    migrate_historical_sqlite_ticket_schema_in_transaction(connection, target).unwrap();
+    assert!(!connection.is_autocommit());
+    connection.execute_batch("COMMIT").unwrap();
+}
+
+fn max_component(connection: &Connection) -> i64 {
+    connection
+        .query_row(
+            "SELECT MAX(version) FROM ticket_schema_migrations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn historical_composition_stops_at_each_explicit_boundary_and_preserves_applied_receipts() {
+    use HistoricalTicketSchemaTarget::{Cases10, Content13, Posts12, Tracking11};
+    // Both empty stores and real old schema7 preimages must stop at the chosen
+    // contract, rather than installing the latest Subject schema prematurely.
+    for retained in [false, true] {
+        for (target, version) in [
+            (Cases10, 10),
+            (Tracking11, 11),
+            (Posts12, 12),
+            (Content13, 13),
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+            if retained {
+                schema7(&conn);
+            }
+            assert!(migrate_historical_sqlite_ticket_schema_in_transaction(&conn, target).is_err());
+            compose_historical(&conn, target);
+            assert_eq!(max_component(&conn), version);
+            let exists = |kind: &str, name: &str| -> bool {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type=?1 AND name=?2)",
+                    params![kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                exists("table", "typed_ticket_assignment_tracking_history"),
+                version >= 11
+            );
+            assert_eq!(exists("index", "typed_ticket_events_ref"), version >= 12);
+            assert_eq!(
+                exists("table", "typed_ticket_content_changes"),
+                version >= 13
+            );
+            assert!(!exists("trigger", "ticket_subject_current_insert"));
+            if retained {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT name,applied_at FROM ticket_schema_migrations WHERE version=7",
+                        [],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    )
+                    .unwrap(),
+                    ("ticket schema baseline".into(), "legacy".into())
+                );
+            }
+            let receipts = rows(&conn, "ticket_schema_migrations");
+            compose_historical(&conn, target);
+            assert_eq!(rows(&conn, "ticket_schema_migrations"), receipts);
+            // Older host hooks verify the actual newer historical generation;
+            // they neither replay older steps nor change its receipts.
+            compose_historical(&conn, Cases10);
+            assert_eq!(rows(&conn, "ticket_schema_migrations"), receipts);
+            assert!(verify_sqlite_ticket_schema(&conn).is_err());
+        }
+    }
+    let conn = Connection::open_in_memory().unwrap();
+    schema7(&conn);
+    let mut prior = rows(&conn, "ticket_schema_migrations");
+    for target in [Cases10, Tracking11, Posts12, Content13] {
+        compose_historical(&conn, target);
+        let after = rows(&conn, "ticket_schema_migrations");
+        assert_eq!(&after[..prior.len()], prior.as_slice());
+        prior = after;
+    }
+}
+
+#[test]
+fn historical_composition_verifies_actual_current_contract_without_downgrade_or_repair() {
+    let conn = Connection::open_in_memory().unwrap();
+    migrate_sqlite_ticket_schema(&conn).unwrap();
+    let receipts = rows(&conn, "ticket_schema_migrations");
+    for target in [
+        HistoricalTicketSchemaTarget::Cases10,
+        HistoricalTicketSchemaTarget::Tracking11,
+        HistoricalTicketSchemaTarget::Posts12,
+        HistoricalTicketSchemaTarget::Content13,
+    ] {
+        compose_historical(&conn, target);
+        assert_eq!(rows(&conn, "ticket_schema_migrations"), receipts);
+        verify_sqlite_ticket_schema(&conn).unwrap();
+    }
+    // A lower requested target cannot hide a weakened actual14 guard.
+    conn.execute_batch("DROP TRIGGER ticket_subject_current_insert; CREATE TRIGGER ticket_subject_current_insert BEFORE INSERT ON ticket_current_worker_assignments BEGIN SELECT 1; END;").unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(
+        migrate_historical_sqlite_ticket_schema_in_transaction(
+            &conn,
+            HistoricalTicketSchemaTarget::Cases10
+        )
+        .is_err()
+    );
+    assert!(!conn.is_autocommit());
+    assert_eq!(rows(&conn, "ticket_schema_migrations"), receipts);
+    conn.execute_batch("ROLLBACK").unwrap();
+
+    // A claimed13 marker over actual10 must also be rejected, not backfilled.
+    let conn = Connection::open_in_memory().unwrap();
+    compose_historical(&conn, HistoricalTicketSchemaTarget::Cases10);
+    conn.execute("UPDATE ticket_schema_migrations SET version=13", [])
+        .unwrap();
+    let before = rows(&conn, "ticket_schema_migrations");
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(
+        migrate_historical_sqlite_ticket_schema_in_transaction(
+            &conn,
+            HistoricalTicketSchemaTarget::Cases10
+        )
+        .is_err()
+    );
+    assert_eq!(rows(&conn, "ticket_schema_migrations"), before);
+    conn.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn bounded_content13_reopens_after_failed_subject_upgrade_then_migrates_atomically_to14() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("retained-content13.db");
+    let (receipts, history, old_table);
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        compose_historical(&conn, HistoricalTicketSchemaTarget::Content13);
+        // Actual retained13 accepts its historical stable-agent contract. It
+        // has not been created at14 and then merely relabelled as old.
+        conn.execute_batch("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,workflow_state,workflow_state_explicit) VALUES('workspace','t','t','Title','open','task','P2','open',1);
+            INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body) VALUES('workspace','t',-1,'t:-1','comment','Body');
+            INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES('workspace','t','old','orchestrator','workspace_agent','workspace-orchestrator','old-author','old-time');
+            INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,updated_at) VALUES('workspace','t','old','orchestrator','workspace_agent','workspace-orchestrator','old-time');
+            INSERT INTO ticket_worker_assignment_events(workspace_id,ticket_id,role,event_id,action,assignment_id,actor,created_at,operation_id) VALUES('workspace','t','orchestrator','old-assigned','assigned','old','old-author','old-time','old-op');
+            CREATE TRIGGER host_reject_subject_migration BEFORE UPDATE OF tracking_migration_diagnostic ON ticket_worker_assignments BEGIN SELECT RAISE(ABORT,'forced post-widen failure'); END;").unwrap();
+        receipts = rows(&conn, "ticket_schema_migrations");
+        history = rows(&conn, "typed_ticket_assignment_tracking_history");
+        old_table = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='ticket_worker_assignments'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE; CREATE TABLE host_work(value TEXT); INSERT INTO host_work VALUES('keep');").unwrap();
+        assert!(migrate_sqlite_ticket_schema_in_transaction(&conn).is_err());
+        assert!(!conn.is_autocommit());
+        assert_eq!(rows(&conn, "ticket_schema_migrations"), receipts);
+        assert_eq!(
+            rows(&conn, "typed_ticket_assignment_tracking_history"),
+            history
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='ticket_worker_assignments'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            old_table
+        );
+        assert!(
+            !conn
+                .pragma_query_value(None, "writable_schema", |r| r.get::<_, bool>(0))
+                .unwrap()
+        );
+        conn.execute_batch("COMMIT").unwrap();
+    }
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    compose_historical(&conn, HistoricalTicketSchemaTarget::Content13);
+    assert_eq!(max_component(&conn), 13);
+    assert_eq!(rows(&conn, "ticket_schema_migrations"), receipts);
+    assert_eq!(
+        conn.query_row("SELECT value FROM host_work", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "keep"
+    );
+    conn.execute_batch("DROP TRIGGER host_reject_subject_migration")
+        .unwrap();
+    migrate_sqlite_ticket_schema(&conn).unwrap();
+    verify_sqlite_ticket_schema(&conn).unwrap();
+    assert_eq!(max_component(&conn), 14);
+    assert_eq!(
+        &rows(&conn, "ticket_schema_migrations")[..receipts.len()],
+        receipts.as_slice()
+    );
+    assert_eq!(
+        rows(&conn, "typed_ticket_assignment_tracking_history"),
+        history
+    );
+    drop(conn);
+    let conn = Connection::open(&path).unwrap();
+    let applied14 = rows(&conn, "ticket_schema_migrations");
+    compose_historical(&conn, HistoricalTicketSchemaTarget::Content13);
+    assert_eq!(rows(&conn, "ticket_schema_migrations"), applied14);
+    verify_sqlite_ticket_schema(&conn).unwrap();
 }

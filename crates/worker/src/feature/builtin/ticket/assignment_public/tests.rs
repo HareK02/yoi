@@ -46,7 +46,7 @@ pub(super) fn cases() -> Vec<(PublicAssignmentKind, Value, Value)> {
     vec![
         (
             PublicAssignmentKind::Assign,
-            json!({"ticket":"T-743", "principal":{"kind":"workspace_agent", "agent_key":"workspace-orchestrator"}, "expected_assignment_id":null, "operation_id":"assign-1"}),
+            json!({"ticket":"T-743", "principal":{"kind":"subject", "subject_id":"subject-a"}, "expected_assignment_id":null, "operation_id":"assign-1"}),
             json!({"workspace_id":"workspace", "ticket_id":"T-743", "assignment":null}),
         ),
         (
@@ -164,6 +164,26 @@ async fn public_assignment_schemas_require_observations_and_exclude_model_actor_
         assert!(client.requests.lock().unwrap().is_empty());
     }
 }
+#[tokio::test]
+async fn new_assignment_rejects_retained_legacy_principals_before_transport() {
+    for principal in [
+        json!({"kind":"workspace_agent", "agent_key":"workspace-orchestrator"}),
+        json!({"kind":"user", "account_id":"owner"}),
+        json!({"kind":"worker", "runtime_id":"r", "worker_id":"old-body"}),
+    ] {
+        let client = transport(200, json!({}));
+        let (_, tool) = definition(client.clone(), PublicAssignmentKind::Assign)();
+        let input = json!({"ticket":"T-743", "principal":principal,
+            "expected_assignment_id":null, "operation_id":"legacy-is-not-new-authority"});
+        assert!(matches!(
+            tool.execute(&input.to_string(), ToolExecutionContext::direct())
+                .await,
+            Err(ToolError::InvalidArgument(_))
+        ));
+        assert!(client.requests.lock().unwrap().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn assign_reissue_and_clear_forward_observed_identity_and_exact_retry_without_new_key() {
     for (kind, mut input, response) in cases().into_iter().filter(|(kind, _, _)| {

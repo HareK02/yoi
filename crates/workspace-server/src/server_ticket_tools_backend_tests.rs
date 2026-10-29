@@ -208,7 +208,8 @@ impl TicketSurface {
         .await?;
         if name == "ShowTicket" {
             let mut page = serde_json::Map::new();
-            for (tool_field, native_field) in [("event_cursor", "cursor"), ("event_limit", "limit")] {
+            for (tool_field, native_field) in [("event_cursor", "cursor"), ("event_limit", "limit")]
+            {
                 if let Some(value) = input.as_object_mut().unwrap().remove(tool_field) {
                     page.insert(native_field.into(), value);
                 }
@@ -451,12 +452,29 @@ async fn reviewer_reads_saved_related_tickets_by_key_and_id_and_pages_their_thre
         let related_before = backend.show(related.id.clone().into()).unwrap();
         let bound_key = bound.meta.resource_key.as_deref().unwrap();
         let related_key = related.resource_key.as_deref().unwrap();
+        // A relation and Reviewer profile do not grant access to its target.
+        // Exercise the signed denial first, then grant only the related read.
         let transport = ticket_client(&api, identity, &source);
         // One client must retain its review binding while following related Tickets.
         let client = reviewer_client(transport.clone(), &bound_id);
         let surface =
             TicketSurface::with_access(dir.path(), client, wip, TicketFeatureAccess::review())
                 .await;
+        let denied = surface
+            .call(
+                "ShowTicket",
+                serde_json::json!({"id": related_key}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("403"), "{denied}");
+        grant_test_ticket_operations(
+            &api,
+            &ensure_test_assignment_subject(&api),
+            &related.id,
+            &["ticket.read"],
+        );
         for (reference, expected_key, expected_title, expected_body) in [
             (
                 bound_key,
@@ -684,12 +702,25 @@ async fn implementation_result_tool_and_wip_keep_host_owned_retry_identity_witho
         );
         assert_eq!(receipt["request"]["body"], input["body"]);
         assert_eq!(report_counts(&api), (1, 1));
-        let queried = surface
+        let query = serde_json::json!({"ticket":ticket,"result_id":receipt["result_id"]});
+        let denied = surface
             .call(
                 "TicketImplementationResultQuery",
-                serde_json::json!({"ticket":ticket,"result_id":receipt["result_id"]}),
-                context("query"),
+                query.clone(),
+                context("query-denied"),
             )
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("403"), "{denied}");
+        // Writing a result does not implicitly authorize reading it.
+        grant_test_ticket_operations(
+            &api,
+            &ensure_test_assignment_subject(&api),
+            &ticket,
+            &["ticket.implementation_result.read"],
+        );
+        let queried = surface
+            .call("TicketImplementationResultQuery", query, context("query"))
             .await
             .unwrap();
         assert_eq!(queried, receipt);

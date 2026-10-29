@@ -9,7 +9,9 @@ fn implementation_result_input() -> server_api::TicketImplementationResultReques
     }
 }
 
-fn implementation_result_business_state(conn: &Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+fn implementation_result_business_state(
+    conn: &Connection,
+) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
     [
         "typed_tickets",
         "typed_ticket_events",
@@ -63,21 +65,50 @@ async fn implementation_result_without_any_assignment_is_authenticated_and_never
     let receipt = store
         .record_implementation_result("w", "tracking", &input, &worker, "tracking-binding")
         .unwrap();
-    assert_eq!(store.with_conn(|conn| Ok(implementation_result_business_state(conn))).unwrap(), before);
-    assert_eq!(store.implementation_result("w", "tracking", &receipt.result_id).unwrap(), receipt);
+    assert_eq!(
+        store
+            .with_conn(|conn| Ok(implementation_result_business_state(conn)))
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        store
+            .implementation_result("w", "tracking", &receipt.result_id)
+            .unwrap(),
+        receipt
+    );
     // A second, independently authenticated Worker cannot reuse this Workspace operation key.
     let other = RuntimeWorkerRef::new("r", "worker");
-    assert!(store.record_implementation_result("w", "tracking", &input, &other, "tracking-binding").is_err());
+    assert!(
+        store
+            .record_implementation_result("w", "tracking", &input, &other, "tracking-binding")
+            .is_err()
+    );
     let mut other_input = input.clone();
     other_input.operation_key = "other-worker-result".into();
-    store.record_implementation_result("w", "tracking", &other_input, &other, "tracking-binding").unwrap();
+    store
+        .record_implementation_result("w", "tracking", &other_input, &other, "tracking-binding")
+        .unwrap();
     seed_manual_start_ticket(&store, "other-ticket", "open");
-    assert!(store.record_implementation_result("w", "other-ticket", &input, &worker, "tracking-binding").is_err());
+    assert!(
+        store
+            .record_implementation_result("w", "other-ticket", &input, &worker, "tracking-binding")
+            .is_err()
+    );
     let mut missing = input.clone();
     missing.operation_key = "missing-ticket-result".into();
-    assert!(store.record_implementation_result("w", "missing", &missing, &worker, "tracking-binding").is_err());
-    assert!(!store.list_pending_ticket_assignment_deliveries("w", 100).unwrap().iter()
-        .any(|p| p.input_event_id.starts_with("implementation-result:")));
+    assert!(
+        store
+            .record_implementation_result("w", "missing", &missing, &worker, "tracking-binding")
+            .is_err()
+    );
+    assert!(
+        !store
+            .list_pending_ticket_assignment_deliveries("w", 100)
+            .unwrap()
+            .iter()
+            .any(|p| p.input_event_id.starts_with("implementation-result:"))
+    );
     let evidence = store.with_conn(|conn| {
         let source: (String, String, String) = conn.query_row(
             "SELECT s.assignment_id,d.disposition,d.reason FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.input_event_id=?1",
@@ -90,9 +121,19 @@ async fn implementation_result_without_any_assignment_is_authenticated_and_never
     }).unwrap();
     // A later Orchestrator must not acquire previously recipient-less reports.
     tracking_store_assign(&store, "late-delegation", "assign-late");
-    assert_eq!(store.record_implementation_result("w", "tracking", &input, &worker, "tracking-binding").unwrap(), receipt);
-    assert!(!store.list_pending_ticket_assignment_deliveries("w", 100).unwrap().iter()
-        .any(|p| p.input_event_id.starts_with("implementation-result:")));
+    assert_eq!(
+        store
+            .record_implementation_result("w", "tracking", &input, &worker, "tracking-binding")
+            .unwrap(),
+        receipt
+    );
+    assert!(
+        !store
+            .list_pending_ticket_assignment_deliveries("w", 100)
+            .unwrap()
+            .iter()
+            .any(|p| p.input_event_id.starts_with("implementation-result:"))
+    );
     store.with_conn(|conn| {
         assert_eq!(conn.query_row("SELECT count(*) FROM notification_sources WHERE kind='implementation_result'", [], |r| r.get::<_, i64>(0))?, 2);
         // Assignment creation has its own evidence; old report evidence stays byte-for-byte intact.
@@ -101,22 +142,46 @@ async fn implementation_result_without_any_assignment_is_authenticated_and_never
         Ok(())
     }).unwrap();
     let reopened = SqliteWorkspaceStore::open_for_test(dir.path().join("workspace.db")).unwrap();
-    assert_eq!(reopened.record_implementation_result("w", "tracking", &input, &worker, "tracking-binding").unwrap(), receipt);
-    assert_eq!(reopened.implementation_result("w", "tracking", &receipt.result_id).unwrap(), receipt);
+    assert_eq!(
+        reopened
+            .record_implementation_result("w", "tracking", &input, &worker, "tracking-binding")
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        reopened
+            .implementation_result("w", "tracking", &receipt.result_id)
+            .unwrap(),
+        receipt
+    );
 }
 
 #[tokio::test]
 async fn implementation_result_requires_live_binding_and_registered_worker_even_for_replay() {
-    for change in ["revoked", "binding-changed", "unregistered", "foreign-worker", "foreign-binding"] {
+    for change in [
+        "revoked",
+        "binding-changed",
+        "unregistered",
+        "foreign-worker",
+        "foreign-binding",
+    ] {
         let (_dir, store) = tracking_store_fixture().await;
-        store.upsert_workspace(&WorkspaceRecord {
-            workspace_id: "other".into(), owner_account_id: "owner-account".into(),
-            display_name: "Other".into(), state: "active".into(),
-            created_at: "1".into(), updated_at: "1".into(),
-        }).await.unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "other".into(),
+                owner_account_id: "owner-account".into(),
+                display_name: "Other".into(),
+                state: "active".into(),
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .await
+            .unwrap();
         let worker = RuntimeWorkerRef::new("r", "replacement");
         let input = implementation_result_input();
-        store.record_implementation_result("w", "tracking", &input, &worker, "tracking-binding").unwrap();
+        store
+            .record_implementation_result("w", "tracking", &input, &worker, "tracking-binding")
+            .unwrap();
         store.with_conn(|conn| {
             match change {
                 "revoked" => { conn.execute("UPDATE workspace_runtime_bindings SET revoked_at='2' WHERE workspace_id='w'", [])?; }
@@ -131,8 +196,19 @@ async fn implementation_result_requires_live_binding_and_registered_worker_even_
         let mut fresh = input.clone();
         fresh.operation_key = "fresh-after-auth-change".into();
         for request in [&input, &fresh] {
-            assert!(matches!(store.record_implementation_result("w", "tracking", request, &worker, "tracking-binding"),
-                Err(Error::WorkspacePermissionDenied(_))), "{change}: {request:?}");
+            assert!(
+                matches!(
+                    store.record_implementation_result(
+                        "w",
+                        "tracking",
+                        request,
+                        &worker,
+                        "tracking-binding"
+                    ),
+                    Err(Error::WorkspacePermissionDenied(_))
+                ),
+                "{change}: {request:?}"
+            );
         }
         store.with_conn(|conn| {
             assert_eq!(conn.query_row("SELECT count(*) FROM ticket_implementation_results", [], |r| r.get::<_, i64>(0))?, 1);
@@ -144,7 +220,14 @@ async fn implementation_result_requires_live_binding_and_registered_worker_even_
 
 #[tokio::test]
 async fn implementation_result_late_reports_do_not_change_ticket_assignment_or_handling_state() {
-    for situation in ["never-assigned", "released", "reassigned", "closed", "no-orchestrator", "assigned-before-orchestrator"] {
+    for situation in [
+        "never-assigned",
+        "released",
+        "reassigned",
+        "closed",
+        "no-orchestrator",
+        "assigned-before-orchestrator",
+    ] {
         let (_dir, store) = tracking_store_fixture().await;
         if situation != "assigned-before-orchestrator" {
             tracking_store_assign(&store, "delegation", "assign");
@@ -157,12 +240,32 @@ async fn implementation_result_late_reports_do_not_change_ticket_assignment_or_h
         match situation {
             "never-assigned" => {}
             "released" => {
-                assert!(store.clear_current_ticket_role_assignment("w", "tracking", TicketAssignmentRole::Worker,
-                    "implementation", "release-event", "release-op", "human", "3", Some("Released")).unwrap());
+                assert!(
+                    store
+                        .clear_current_ticket_role_assignment(
+                            "w",
+                            "tracking",
+                            TicketAssignmentRole::Worker,
+                            "implementation",
+                            "release-event",
+                            "release-op",
+                            "human",
+                            "3",
+                            Some("Released")
+                        )
+                        .unwrap()
+                );
             }
             "reassigned" => {
-                store.set_current_ticket_role_assignment(&manual_worker_assignment("tracking", "replacement-implementation"),
-                    Some("implementation"), "reassign-event", "reassign-op", true).unwrap();
+                store
+                    .set_current_ticket_role_assignment(
+                        &manual_worker_assignment("tracking", "replacement-implementation"),
+                        Some("implementation"),
+                        "reassign-event",
+                        "reassign-op",
+                        true,
+                    )
+                    .unwrap();
             }
             "closed" => {
                 store.with_conn(|conn| {
@@ -171,16 +274,40 @@ async fn implementation_result_late_reports_do_not_change_ticket_assignment_or_h
                 }).unwrap();
             }
             "no-orchestrator" => {
-                assert!(store.clear_current_ticket_role_assignment("w", "tracking", TicketAssignmentRole::Orchestrator,
-                    "delegation", "release-orchestrator-event", "release-orchestrator-op", "human", "3", Some("Returned to human")).unwrap());
+                assert!(
+                    store
+                        .clear_current_ticket_role_assignment(
+                            "w",
+                            "tracking",
+                            TicketAssignmentRole::Orchestrator,
+                            "delegation",
+                            "release-orchestrator-event",
+                            "release-orchestrator-op",
+                            "human",
+                            "3",
+                            Some("Returned to human")
+                        )
+                        .unwrap()
+                );
             }
-            "assigned-before-orchestrator" => { tracking_store_assign(&store, "late-delegation", "assign-late"); }
+            "assigned-before-orchestrator" => {
+                tracking_store_assign(&store, "late-delegation", "assign-late");
+            }
             _ => unreachable!(),
         }
-        let before = store.with_conn(|conn| Ok(implementation_result_business_state(conn))).unwrap();
+        let before = store
+            .with_conn(|conn| Ok(implementation_result_business_state(conn)))
+            .unwrap();
         let input = implementation_result_input();
-        let receipt = store.record_implementation_result("w", "tracking", &input, &worker, "tracking-binding").unwrap();
-        assert_eq!(store.record_implementation_result("w", "tracking", &input, &worker, "tracking-binding").unwrap(), receipt);
+        let receipt = store
+            .record_implementation_result("w", "tracking", &input, &worker, "tracking-binding")
+            .unwrap();
+        assert_eq!(
+            store
+                .record_implementation_result("w", "tracking", &input, &worker, "tracking-binding")
+                .unwrap(),
+            receipt
+        );
         store.with_conn(|conn| {
             assert_eq!(implementation_result_business_state(conn), before, "{situation}");
             let expected = match situation {
@@ -239,9 +366,17 @@ async fn implementation_result_replay_is_atomic_and_cannot_be_retargeted() {
     );
     let mut changed_kind = input.clone();
     changed_kind.kind = server_api::TicketImplementationResultKind::Blocker;
-    assert!(store
-        .record_implementation_result("w", "tracking", &changed_kind, &worker, "tracking-binding")
-        .is_err());
+    assert!(
+        store
+            .record_implementation_result(
+                "w",
+                "tracking",
+                &changed_kind,
+                &worker,
+                "tracking-binding"
+            )
+            .is_err()
+    );
     for (workspace, ticket, source, binding) in [
         ("other", "tracking", worker.clone(), "tracking-binding"),
         ("w", "other", worker.clone(), "tracking-binding"),
@@ -322,11 +457,13 @@ async fn implementation_result_replay_is_atomic_and_cannot_be_retargeted() {
         }
         Ok(())
     }).unwrap();
-    assert!(store
-        .list_pending_ticket_assignment_deliveries("w", 100)
-        .unwrap()
-        .iter()
-        .any(|p| p.input_event_id == format!("implementation-result:{}", late.result_id)));
+    assert!(
+        store
+            .list_pending_ticket_assignment_deliveries("w", 100)
+            .unwrap()
+            .iter()
+            .any(|p| p.input_event_id == format!("implementation-result:{}", late.result_id))
+    );
 }
 
 #[tokio::test]
@@ -367,131 +504,120 @@ async fn implementation_result_rejects_forged_evidence_and_rolls_back_without_no
         .unwrap();
 }
 
-// Preserve seeded assignment evidence while rebuilding the actual pre-business
-// capture composition. Changing only a receipt leaves current admission fences
-// and erasure guards in an otherwise legacy fixture.
-fn reconstruct_implementation_schema96(conn: &Connection) -> Result<()> {
-    assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
-    conn.execute_batch("DROP TABLE plugin_references; DROP TABLE plugin_operations;
-        DROP TABLE plugin_uploads; DROP TABLE plugin_artifacts; DROP TABLE plugin_installations;
-        UPDATE __yoi_schema_migrations SET version=105 WHERE version=106;")?;
+// Historical migration fixtures start from the retained Workspace96/component13
+// composition. Wrapping the actual connection is test-only SQL access, not a
+// current-schema open or any claim of authenticated legacy execution authority.
+fn implementation_legacy96_fixture() -> (tempfile::TempDir, SqliteWorkspaceStore) {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("retained96.db");
+    let path = directory.path().join("workspace.db");
     prepare_retained_schema(&path, 96);
-    let retained = Connection::open(path)?;
-    for trigger in [
-        "notification_sources_no_delete",
-        "notification_decisions_no_delete",
-        "notification_requests_no_delete",
-        "notification_acknowledgements_no_delete",
-        "notification_failures_no_delete",
-        "notification_job_targets_no_delete",
-        "notification_job_legacy_no_delete",
-        "notification_source_preparation_failures_no_delete",
-    ] {
-        let definition: String = retained.query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
-            [trigger],
-            |row| row.get(0),
-        )?;
-        conn.execute_batch(&format!("DROP TRIGGER {trigger}; {definition};"))?;
-    }
-    for trigger in [
-        "subject_deleted_job_insert",
-        "subject_deleted_job_result",
-        "subject_deleted_attempt_insert",
-        "subject_deleted_attempt_result",
-        "subject_deleted_worker_reservation",
-        "subject_deleted_notification_source",
-        "subject_deleted_notification_payload",
-        "subject_deleted_notification_send",
-    ] {
-        conn.execute_batch(&format!("DROP TRIGGER {trigger};"))?;
-    }
-    // Children before parents; dropping the tables also drops snapshot guards.
-    conn.execute_batch(
-        "DROP TABLE subject_deletion_removals;
-        DROP TABLE subject_deletion_allocations;
-        DROP TABLE subject_deletion_jobs;
-        DROP TABLE subject_deletion_workers;
-        DROP TABLE subject_deletions;
-        UPDATE __yoi_schema_migrations SET version=104 WHERE version=105;",
+    let conn = Connection::open(&path).unwrap();
+    configure_sqlite(&conn).unwrap();
+    assert_eq!(current_schema_version(&conn).unwrap(), 96);
+    assert_eq!(
+        conn.query_row(
+            "SELECT max(version) FROM ticket_schema_migrations",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        13
+    );
+    conn.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) VALUES('legacy-owner','user','legacy-owner','Legacy owner','1','1');
+        INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at) VALUES('w','legacy-owner','Legacy workspace','active','1','1');
+        INSERT INTO worker_registry(workspace_id,runtime_id,worker_id,display_name,retention_state,created_at,updated_at) VALUES('w','r','worker','Legacy body','normal','1','1'),('w','r','replacement','Implementation','normal','1','1');
+        INSERT INTO workspace_runtime_bindings(workspace_id,runtime_id,display_name,base_url,public_key,public_key_fingerprint,binding_id,authentication_mode,created_at,updated_at) VALUES('w','r','Runtime','https://runtime.invalid','retained-key','retained-fingerprint','tracking-binding','workspace_identity','1','1');
+        INSERT INTO worker_singleton_owners(workspace_id,singleton_key,runtime_id,worker_id,generation,created_at,updated_at) VALUES('w','workspace-orchestrator','r','worker',1,'1','1');
+        INSERT INTO repositories(workspace_id,repository_id,repository_key,kind,provider,uri,created_at,updated_at,source_kind,source_uri,source_fingerprint) VALUES('w','main','main','git','git','file:///main','1','1','file','file:///main','sha256:fixture');").unwrap();
+    let store = SqliteWorkspaceStore {
+        conn: Arc::new(Mutex::new(conn)),
+        db_executor: crate::db_executor::DbExecutor::new(
+            crate::db_executor::DbExecutorLimits::default(),
+        )
+        .unwrap(),
+    };
+    seed_manual_start_ticket(&store, "tracking", "open");
+    store.with_conn(|conn| {
+        // The old principal and normal assignment triggers are genuine retained
+        // data. Current assignment APIs intentionally cannot create this identity.
+        conn.execute_batch("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at) VALUES('w','tracking','delegation','orchestrator','workspace_agent','workspace-orchestrator','legacy-owner','2');
+            INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,updated_at) VALUES('w','tracking','delegation','orchestrator','workspace_agent','workspace-orchestrator','2');
+            INSERT INTO ticket_worker_assignment_events(workspace_id,ticket_id,role,event_id,action,assignment_id,actor,created_at,operation_id) VALUES('w','tracking','orchestrator','legacy-assigned-event','assigned','delegation','legacy-owner','2','legacy-assign');")?;
+        Ok(())
+    }).unwrap();
+    (directory, store)
+}
+
+// Seed accepted PRE-upgrade notification evidence as historical SQL data. The
+// current router must never authorize workspace-orchestrator to recreate it.
+fn implementation_seed_legacy_result_delivery(conn: &Connection, index: usize) -> Result<()> {
+    let event = format!("implementation-result:legacy-result-{index}");
+    let delivery_id = format!("legacy-result-delivery-{index}");
+    let input = crate::store::TicketAssignmentDelivery {
+        ticket_id: "tracking".into(),
+        assignment_id: "delegation".into(),
+        input_event_id: event.clone(),
+        delivery_id: delivery_id.clone(),
+        request_id: delivery_id.clone(),
+        waiting_reason: None,
+        next_action: None,
+    };
+    let source = serde_json::json!({"actor":"backend:assignment-delivery", "runtime_id":"r", "worker_id":"worker", "agent_key":"workspace-orchestrator", "authentication_binding_id":"tracking-binding"}).to_string();
+    conn.execute("INSERT INTO notification_decisions(source_sequence,workspace_id,delivery_id,disposition,reason,purpose) SELECT sequence,'w',?1,'deliver','result','result' FROM notification_sources WHERE input_event_id=?2 AND role='orchestrator'", params![delivery_id,event])?;
+    conn.execute(
+        "INSERT INTO ticket_assignment_deliveries VALUES('w','delegation',?1,?2,?3,?4)",
+        params![
+            event,
+            delivery_id,
+            serde_json::to_string(&input).unwrap(),
+            source
+        ],
     )?;
-    conn.execute_batch(
-        "DROP TRIGGER notification_mr_event;
-            DROP TRIGGER notification_mr_source;
-            DROP TRIGGER notification_implementation_result;
-            DROP TRIGGER IF EXISTS implementation_delegation_capture;
-            DROP TABLE ticket_implementation_results;
-            DROP TABLE ticket_implementation_delegations;
-            DROP TABLE merge_request_source_observations;
-            DROP TRIGGER passkey_metadata_insert;
-            DROP TABLE passkey_addition_receipts;
-            DROP TABLE passkey_metadata;
-            DROP TRIGGER backend_job_input_retirement;
-            DROP TRIGGER backend_job_identity_immutable;
-            ALTER TABLE backend_jobs DROP COLUMN input_disposition;
-            UPDATE __yoi_schema_migrations SET version=102 WHERE version=104;
-            DROP TABLE subject_create_recoveries;
-            UPDATE __yoi_schema_migrations SET version=101 WHERE version=102;
-            DROP TABLE subject_worker_releases;
-            UPDATE __yoi_schema_migrations SET version=100 WHERE version=101;
-            DROP TABLE user_activations;
-            UPDATE __yoi_schema_migrations SET version=99 WHERE version=100;
-            DROP TABLE hosting_administrators; DROP TABLE hosting_settings;
-            UPDATE __yoi_schema_migrations SET version=98 WHERE version=99;
-            UPDATE __yoi_schema_migrations SET version=96 WHERE version=98;",
+    conn.execute("INSERT INTO ticket_assignment_delivery_requests VALUES('w',?1,'Retained legacy report notification')", [&delivery_id])?;
+    conn.execute(
+        "INSERT INTO ticket_assignment_delivery_acknowledgements VALUES('w',?1,?2)",
+        params![delivery_id, source],
     )?;
-    assert_eq!(current_schema_version(conn)?, 96);
-    assert_eq!(conn.query_row(
-        "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'subject_delet%' OR sql LIKE '%subject_deletion%'",
-        [], |row| row.get::<_, i64>(0),
-    )?, 0);
-    for table in [
-        "notification_sources",
-        "notification_decisions",
-        "notification_requests",
-        "notification_acknowledgements",
-        "notification_failures",
-        "notification_job_targets",
-        "notification_job_legacy_receipts",
-        "notification_source_preparation_failures",
-        "backend_jobs",
-        "backend_job_attempts",
-        "worker_create_reservations",
-    ] {
-        assert_eq!(
-            state_contract_schema_signature(conn, table),
-            state_contract_schema_signature(&retained, table),
-            "schema96 {table}"
-        );
-    }
+    conn.execute("INSERT INTO notification_assignment_targets VALUES('w',?1,'r','worker','workspace-orchestrator','tracking-binding')", [&delivery_id])?;
+    conn.execute(
+        "INSERT INTO notification_requests VALUES('w',?1,'Retained legacy report notification',?2)",
+        params![delivery_id, source],
+    )?;
+    conn.execute(
+        "INSERT INTO notification_acknowledgements VALUES('w',?1,?2)",
+        params![delivery_id, source],
+    )?;
+    conn.execute("INSERT INTO notification_failures(workspace_id,delivery_id,code,recorded_at) VALUES('w',?1,'runtime_rejected','4')", [&delivery_id])?;
     Ok(())
 }
 
 #[tokio::test]
-async fn implementation_result_v97_to_v98_preserves_legacy_bytes_receipts_and_notification_evidence() {
-    let (dir, store) = tracking_store_fixture().await;
-    tracking_store_assign(&store, "delegation", "assign");
+async fn implementation_result_v97_to_v98_preserves_legacy_bytes_receipts_and_notification_evidence()
+ {
+    let (dir, store) = implementation_legacy96_fixture();
     let worker = routing_worker_assign(&store, "implementation").worker;
-    // Reconstruct schema97 from a fresh current-schema fixture, including its historical capture.
-    store.with_conn(|conn| {
-        reconstruct_implementation_schema96(conn)?;
-        migrate_business_notifications_v96_to_v97(conn)?;
-        assert_eq!(current_schema_version(conn)?, 97);
-        Ok(())
-    }).unwrap();
+    // Apply the real forward 96 -> 97 migration before seeding schema97 reports.
+    store
+        .with_conn(|conn| {
+            migrate_business_notifications_v96_to_v97(conn)?;
+            assert_eq!(current_schema_version(conn)?, 97);
+            Ok(())
+        })
+        .unwrap();
     let input = implementation_result_input();
     let mut second = input.clone();
     second.operation_key = "legacy-second-operation".into();
     second.body = "A second retained report".into();
     let requests = [input.clone(), second];
-    let raw_requests = requests.iter().map(|request| {
-        let mut legacy = serde_json::to_value(request).unwrap();
-        legacy["assignment_id"] = serde_json::json!("implementation");
-        legacy["orchestrator_assignment_id"] = serde_json::json!("delegation");
-        format!(" \n{}\n ", serde_json::to_string_pretty(&legacy).unwrap())
-    }).collect::<Vec<_>>();
+    let raw_requests = requests
+        .iter()
+        .map(|request| {
+            let mut legacy = serde_json::to_value(request).unwrap();
+            legacy["assignment_id"] = serde_json::json!("implementation");
+            legacy["orchestrator_assignment_id"] = serde_json::json!("delegation");
+            format!(" \n{}\n ", serde_json::to_string_pretty(&legacy).unwrap())
+        })
+        .collect::<Vec<_>>();
     store.with_conn(|conn| {
         for (index, request) in requests.iter().enumerate() {
             conn.execute("INSERT INTO ticket_implementation_results(workspace_id,ticket_id,operation_key,result_id,assignment_id,orchestrator_assignment_id,runtime_id,worker_id,request_json,created_at)
@@ -500,23 +626,16 @@ async fn implementation_result_v97_to_v98_preserves_legacy_bytes_receipts_and_no
         }
         Ok(())
     }).unwrap();
-    // Populate persisted request, target, ACK and failure evidence, not just source rows.
-    let pending = store.list_pending_ticket_assignment_deliveries("w", 100).unwrap();
-    for index in 0..requests.len() {
-        let input_event = format!("implementation-result:legacy-result-{index}");
-        assert!(pending.iter().any(|p| p.input_event_id == input_event));
-        let reserved = store.reserve_ticket_assignment_delivery("w", "delegation", &input_event, &tracking_store_source()).unwrap();
-        store.prepare_ticket_assignment_delivery_content("w", &reserved.delivery_id, "Retained legacy report notification", &tracking_store_source()).unwrap();
-        store.ack_ticket_assignment_delivery("w", &reserved.delivery_id, &tracking_store_source()).unwrap();
-        store.with_conn(|conn| {
-            conn.execute("INSERT INTO notification_failures(workspace_id,delivery_id,code,recorded_at) VALUES('w',?1,'legacy-failure','4')", [&reserved.delivery_id])?;
+    // Persist real historical row shapes without calling current Subject-only
+    // send/reserve APIs as though the legacy identity were live authority.
+    store
+        .with_conn(|conn| {
+            for index in 0..requests.len() {
+                implementation_seed_legacy_result_delivery(conn, index)?;
+            }
             Ok(())
-        }).unwrap();
-    }
-    routing_ack_worker_pending(&store, &TicketWorkerNotificationTarget {
-        worker: worker.clone(),
-        authentication_binding_id: "tracking-binding".into(),
-    });
+        })
+        .unwrap();
     let (results, business, evidence) = store.with_conn(|conn| {
         Ok((
             fixture_query_rows(conn, "SELECT workspace_id,ticket_id,operation_key,result_id,runtime_id,worker_id,request_json,created_at FROM ticket_implementation_results ORDER BY rowid"),
@@ -524,7 +643,10 @@ async fn implementation_result_v97_to_v98_preserves_legacy_bytes_receipts_and_no
             implementation_result_notification_evidence(conn),
         ))
     }).unwrap();
-    assert!(evidence.iter().all(|rows| !rows.is_empty()), "fixture must retain nonempty source, decision, request, target, ACK and failure evidence");
+    assert!(
+        evidence.iter().all(|rows| !rows.is_empty()),
+        "fixture must retain nonempty source, decision, request, target, ACK and failure evidence"
+    );
     store.with_conn(|conn| {
         // The migration must roll back its trigger drops and leave every byte replayable.
         conn.execute_batch("CREATE TABLE ticket_implementation_results_v98(collision INTEGER);")?;
@@ -557,52 +679,114 @@ async fn implementation_result_v97_to_v98_preserves_legacy_bytes_receipts_and_no
     let reopened = SqliteWorkspaceStore::open_for_test(dir.path().join("workspace.db")).unwrap();
     for (index, request) in requests.iter().enumerate() {
         let expected = server_api::TicketImplementationResultReceipt {
-            result_id: format!("legacy-result-{index}"), ticket_id: "tracking".into(),
-            request: request.clone(), created_at: "4".into(),
+            result_id: format!("legacy-result-{index}"),
+            ticket_id: "tracking".into(),
+            request: request.clone(),
+            created_at: "4".into(),
         };
-        assert_eq!(reopened.implementation_result("w", "tracking", &expected.result_id).unwrap(), expected);
-        assert_eq!(reopened.record_implementation_result("w", "tracking", request, &worker, "tracking-binding").unwrap(), expected);
+        assert_eq!(
+            reopened
+                .implementation_result("w", "tracking", &expected.result_id)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            reopened
+                .record_implementation_result("w", "tracking", request, &worker, "tracking-binding")
+                .unwrap(),
+            expected
+        );
     }
-    reopened.with_conn(|conn| {
-        assert_eq!(fixture_query_rows(conn, "SELECT * FROM ticket_implementation_results ORDER BY rowid"), results);
-        assert_eq!(implementation_result_notification_evidence(conn), evidence, "reading and replaying legacy JSON must never recapture notifications");
-        Ok(())
-    }).unwrap();
+    reopened
+        .with_conn(|conn| {
+            assert_eq!(
+                fixture_query_rows(
+                    conn,
+                    "SELECT * FROM ticket_implementation_results ORDER BY rowid"
+                ),
+                results
+            );
+            assert_eq!(
+                implementation_result_notification_evidence(conn),
+                evidence,
+                "reading and replaying legacy JSON must never recapture notifications"
+            );
+            Ok(())
+        })
+        .unwrap();
     tracking_store_assign(&reopened, "new-delegation", "assign-new");
     routing_worker_assign(&reopened, "new-implementation");
-    reopened.with_conn(|conn| {
-        assert_eq!(stored_fixture_rows(conn, "ticket_implementation_delegations"), business[9], "historical delegation evidence must not grow");
-        for index in 0..requests.len() {
-            assert_eq!(conn.query_row("SELECT assignment_id FROM notification_sources WHERE input_event_id=?1", [format!("implementation-result:legacy-result-{index}")], |r| r.get::<_, String>(0))?, "delegation");
-        }
-        Ok(())
-    }).unwrap();
+    reopened
+        .with_conn(|conn| {
+            assert_eq!(
+                stored_fixture_rows(conn, "ticket_implementation_delegations"),
+                business[9],
+                "historical delegation evidence must not grow"
+            );
+            for index in 0..requests.len() {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT assignment_id FROM notification_sources WHERE input_event_id=?1",
+                        [format!("implementation-result:legacy-result-{index}")],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    "delegation"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
     for request in &requests {
-        reopened.record_implementation_result("w", "tracking", request, &worker, "tracking-binding").unwrap();
+        reopened
+            .record_implementation_result("w", "tracking", request, &worker, "tracking-binding")
+            .unwrap();
     }
     let mut fresh = input;
     fresh.operation_key = "new-schema98-report".into();
-    let receipt = reopened.record_implementation_result("w", "tracking", &fresh, &worker, "tracking-binding").unwrap();
-    reopened.with_conn(|conn| {
-        assert_eq!(conn.query_row("SELECT assignment_id FROM notification_sources WHERE input_event_id=?1", [format!("implementation-result:{}", receipt.result_id)], |r| r.get::<_, String>(0))?, "new-delegation");
-        for index in 0..requests.len() {
-            assert_eq!(conn.query_row("SELECT request_json FROM ticket_implementation_results WHERE result_id=?1", [format!("legacy-result-{index}")], |r| r.get::<_, String>(0))?, raw_requests[index]);
-            assert_eq!(conn.query_row("SELECT count(*) FROM notification_sources WHERE input_event_id=?1", [format!("implementation-result:legacy-result-{index}")], |r| r.get::<_, i64>(0))?, 1);
-        }
-        Ok(())
-    }).unwrap();
+    let receipt = reopened
+        .record_implementation_result("w", "tracking", &fresh, &worker, "tracking-binding")
+        .unwrap();
+    reopened
+        .with_conn(|conn| {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT assignment_id FROM notification_sources WHERE input_event_id=?1",
+                    [format!("implementation-result:{}", receipt.result_id)],
+                    |r| r.get::<_, String>(0)
+                )?,
+                "new-delegation"
+            );
+            for index in 0..requests.len() {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT request_json FROM ticket_implementation_results WHERE result_id=?1",
+                        [format!("legacy-result-{index}")],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    raw_requests[index]
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT count(*) FROM notification_sources WHERE input_event_id=?1",
+                        [format!("implementation-result:legacy-result-{index}")],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    1
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[tokio::test]
 async fn mr_notification_upgrade_recovers_events_not_comments_and_retains_unknown_legacy_results() {
-    let (_dir, store) = tracking_store_fixture().await;
-    tracking_store_assign(&store, "delegation", "assign");
+    let (_dir, store) = implementation_legacy96_fixture();
     routing_worker_assign(&store, "implementation");
     routing_worker_assign(&store, "known-implementation");
     store.with_conn(|conn| {
-        conn.execute("INSERT INTO ticket_assignment_operation_fences VALUES('w','operation-known-implementation','delegation','r','worker','workspace-orchestrator','tracking-binding',?1)",[serde_json::to_string(&tracking_store_source()).unwrap()])?;
-        // Reconstruct the prior composition before its new business capture existed.
-        reconstruct_implementation_schema96(conn)?;
+        let legacy_source = serde_json::json!({"actor":"authenticated-worker:r/worker", "runtime_id":"r", "worker_id":"worker", "agent_key":"workspace-orchestrator", "authentication_binding_id":"tracking-binding"});
+        conn.execute("INSERT INTO ticket_assignment_operation_fences VALUES('w','operation-known-implementation','delegation','r','worker','workspace-orchestrator','tracking-binding',?1)",[legacy_source.to_string()])?;
         conn.execute_batch("INSERT INTO merge_requests VALUES('w','historical-mr','main','open','refs/heads/work','refs/heads/main','3','3');
             INSERT INTO merge_request_ticket_relations VALUES('w','historical-mr','tracking','implements','3');
             INSERT INTO merge_request_thread_events VALUES('w','historical-mr','approved-event',1,'review','{\"subject_ref\":\"source-a\",\"decision\":\"approve\"}',NULL,'3');
@@ -629,8 +813,14 @@ async fn mr_notification_upgrade_recovers_events_not_comments_and_retains_unknow
     assert!(
         inputs
             .iter()
-            .any(|i| i.input_event_id == "mr-event:historical-mr:approved-event")
+            .all(|i| i.input_event_id != "mr-event:historical-mr:approved-event"),
+        "retained legacy capture must not become current Subject delivery authority"
     );
+    store.with_conn(|conn| {
+        let decision: (String, String) = conn.query_row("SELECT d.disposition,d.reason FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.input_event_id='mr-event:historical-mr:approved-event' AND s.role='orchestrator'", [], |row| Ok((row.get(0)?,row.get(1)?)))?;
+        assert_eq!(decision, ("suppress".into(),"unsupported_recipient".into()));
+        Ok(())
+    }).unwrap();
     for _ in 0..2 {
         store
             .observe_merge_request_source("w", "main", "refs/heads/work", "source-b")
@@ -681,7 +871,14 @@ async fn implementation_result_notification_failure_rolls_back_and_concurrent_re
                 0
             );
             assert_eq!(implementation_result_business_state(conn), before);
-            assert_eq!(conn.query_row("SELECT count(*) FROM notification_sources WHERE kind='implementation_result'", [], |r| r.get::<_, i64>(0))?, 0);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM notification_sources WHERE kind='implementation_result'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                0
+            );
             conn.execute_batch("DROP TRIGGER reject_result_notification;")?;
             Ok(())
         })
@@ -742,20 +939,37 @@ async fn implementation_result_notification_failure_rolls_back_and_concurrent_re
 #[tokio::test]
 async fn mr_event_actors_preserve_self_suppression_in_capture_and_backfill() {
     for historical in [false, true] {
-        let (_dir, store) = tracking_store_fixture().await;
-        tracking_store_assign(&store, "delegation", "assign");
+        let (_dir, store) = if historical {
+            implementation_legacy96_fixture()
+        } else {
+            let fixture = tracking_store_fixture().await;
+            tracking_store_assign(&fixture.1, "delegation", "assign");
+            fixture
+        };
         routing_worker_assign(&store, "implementation");
         let events = [
-            ("review_requested", Some("requested_by"), Some("replacement"), Some("worker")),
+            (
+                "review_requested",
+                Some("requested_by"),
+                Some("replacement"),
+                Some("worker"),
+            ),
             ("review", Some("reviewer"), Some("reviewer-child"), None),
-            ("review_revoked", Some("revoked_by"), Some("replacement"), Some("worker")),
-            ("merge", Some("merged_by"), Some("worker"), Some("orchestrator")),
+            (
+                "review_revoked",
+                Some("revoked_by"),
+                Some("replacement"),
+                Some("worker"),
+            ),
+            (
+                "merge",
+                Some("merged_by"),
+                Some("worker"),
+                Some("orchestrator"),
+            ),
             ("review_cancelled", None, None, None),
         ];
         store.with_conn(|conn| {
-            if historical {
-                reconstruct_implementation_schema96(conn)?;
-            }
             conn.execute_batch("INSERT INTO merge_requests VALUES('w','actor-mr','main','open','work','main','3','3');
                 INSERT INTO merge_request_ticket_relations VALUES('w','actor-mr','tracking','implements','3');")?;
             for (index, (kind, field, worker, _)) in events.iter().enumerate() {
@@ -777,7 +991,10 @@ async fn mr_event_actors_preserve_self_suppression_in_capture_and_backfill() {
                         "SELECT s.actor,d.disposition,d.reason FROM notification_sources s JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.input_event_id=?1 AND s.role=?2",
                         params![format!("mr-event:actor-mr:{kind}"),role],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
                     assert_eq!(actor,worker.map(|w|format!("worker:r/{w}")),"{kind}, historical={historical}");
-                    if suppressed_role == Some(role) {
+                    if historical && role == "orchestrator" {
+                        assert_eq!((disposition.as_str(),reason.as_str()),("suppress","unsupported_recipient"),
+                            "legacy capture preserves actors but never restores Subject routing authority");
+                    } else if suppressed_role == Some(role) {
                         assert_eq!((disposition.as_str(),reason.as_str()),("suppress","self_notification"),"{kind}, historical={historical}");
                     } else {
                         assert_eq!((disposition.as_str(),reason.as_str()),("deliver","attention"),"{kind}, {role}, historical={historical}");
@@ -792,9 +1009,9 @@ async fn mr_event_actors_preserve_self_suppression_in_capture_and_backfill() {
 #[tokio::test]
 async fn implementation_result_accepts_only_observations_with_matching_mr_ticket_workspace() {
     let (_dir, store) = tracking_store_fixture().await;
-    tracking_store_assign(&store,"delegation","assign");
-    let worker = routing_worker_assign(&store,"implementation").worker;
-    seed_manual_start_ticket(&store,"unrelated","open");
+    tracking_store_assign(&store, "delegation", "assign");
+    let worker = routing_worker_assign(&store, "implementation").worker;
+    seed_manual_start_ticket(&store, "unrelated", "open");
     store.with_conn(|conn| {
         conn.execute_batch("INSERT INTO merge_requests VALUES('w','observed-mr','main','open','work','main','3','3');
             INSERT INTO merge_request_ticket_relations VALUES('w','observed-mr','tracking','implements','3');
@@ -802,23 +1019,56 @@ async fn implementation_result_accepts_only_observations_with_matching_mr_ticket
             INSERT INTO merge_request_ticket_relations VALUES('w','other-mr','unrelated','implements','3');")?;
         Ok(())
     }).unwrap();
-    store.observe_merge_request_source("w","main","work","source-b").unwrap();
-    store.observe_merge_request_source("w","main","other","other-source").unwrap();
-    for (workspace,mr,subject,accepted) in [
-        ("w","observed-mr","forged",false),
-        ("w","observed-mr","other-source",false),
-        ("w","other-mr","other-source",false),
-        ("other","observed-mr","source-b",false),
-        ("w","observed-mr","source-b",true),
+    store
+        .observe_merge_request_source("w", "main", "work", "source-b")
+        .unwrap();
+    store
+        .observe_merge_request_source("w", "main", "other", "other-source")
+        .unwrap();
+    for (workspace, mr, subject, accepted) in [
+        ("w", "observed-mr", "forged", false),
+        ("w", "observed-mr", "other-source", false),
+        ("w", "other-mr", "other-source", false),
+        ("other", "observed-mr", "source-b", false),
+        ("w", "observed-mr", "source-b", true),
     ] {
         let mut input = implementation_result_input();
-        input.merge_request = Some(server_api::MergeRequestReviewSubject {merge_request_id:mr.into(),subject_ref:subject.into()});
-        let result = store.record_implementation_result(workspace,"tracking",&input,&worker,"tracking-binding");
-        assert_eq!(result.is_ok(),accepted,"{workspace}/{mr}/{subject}: {result:?}");
+        input.merge_request = Some(server_api::MergeRequestReviewSubject {
+            merge_request_id: mr.into(),
+            subject_ref: subject.into(),
+        });
+        let result = store.record_implementation_result(
+            workspace,
+            "tracking",
+            &input,
+            &worker,
+            "tracking-binding",
+        );
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{workspace}/{mr}/{subject}: {result:?}"
+        );
     }
-    store.with_conn(|conn| {
-        assert_eq!(conn.query_row("SELECT count(*) FROM merge_request_thread_events",[],|r|r.get::<_,i64>(0))?,0);
-        assert_eq!(conn.query_row("SELECT count(*) FROM ticket_implementation_results",[],|r|r.get::<_,i64>(0))?,1);
-        Ok(())
-    }).unwrap();
+    store
+        .with_conn(|conn| {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM merge_request_thread_events",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM ticket_implementation_results",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
 }

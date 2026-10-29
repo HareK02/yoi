@@ -76,6 +76,13 @@ let
             search = { enabled = Bool; provider = String; api_key_secret = String; timeout_secs = Int; base_url = String; country = String; search_lang = String; ui_lang = String; safesearch = String; };
             fetch = { enabled = Bool; timeout_secs = Int; redirect_limit = Int; max_response_bytes = Int; max_output_bytes = Int; allow_private_addresses = Bool; };
         };
+        plugins = { selections = [...{
+            installation_id = String; tools = [...String]; logging = Bool;
+            https_slots = [...String];
+            # 非秘密のoverrideは補完用のshapeではなく、導入済みpackageの
+            # closed typed schemaで検証する。
+            config = { ...Unknown };
+        }]; };
         skills = { directories = [...String]; };
     };
 in {

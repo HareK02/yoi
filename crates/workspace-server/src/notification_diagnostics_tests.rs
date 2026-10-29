@@ -45,7 +45,13 @@ async fn notification_diagnostics_preserves_unknown_acceptance_and_marks_replace
         assert_eq!(read().stage, S::AcceptanceUnknown);
         assert!(read().acceptance_outcome_unknown);
         assert_eq!(read().last_failure_code.as_deref(), Some("target_stopped"));
-        store.with_conn(|conn|{conn.execute("UPDATE worker_singleton_owners SET worker_id='replacement' WHERE workspace_id='w'",[])?;Ok(())}).unwrap();
+        store.with_conn(|conn| {
+            conn.execute_batch("UPDATE worker_create_reservations SET state='removed' WHERE workspace_id='w' AND singleton_key='subjektiv:tracking-subject';
+                UPDATE worker_singleton_owners SET worker_id='replacement',generation=2 WHERE workspace_id='w' AND singleton_key='subjektiv:tracking-subject';
+                INSERT INTO worker_create_reservations(workspace_id,allocation_key,worker_id,runtime_id,create_fingerprint,state,created_at,updated_at,singleton_key,singleton_generation)
+                VALUES('w','replacement-body','replacement','r','replacement-body','created','2','2','subjektiv:tracking-subject',2);")?;
+            Ok(())
+        }).unwrap();
         let replacement = TicketAssignmentTrackingSourceContext {
             worker_id: "replacement".into(),
             ..source
@@ -182,8 +188,8 @@ async fn notification_diagnostics_detects_unconnected_origin_and_retains_history
 #[tokio::test]
 async fn notification_diagnostics_is_readonly_paginated_and_workspace_scoped() {
     use server_api::{NotificationDiagnosticStage as S, NotificationDiagnosticsQuery as Q};
-    let (_dir, store) = tracking_store_fixture().await;
-    tracking_store_assign(&store, "a", "assign-a");
+    let (_dir, store) = delivery_tracking_fixture().await;
+    delivery_tracking_assign(&store, "a", "assign-a");
     delivery_store_answer(&store, "answer-a");
     let before = store
         .with_conn(|conn| {
@@ -377,8 +383,18 @@ async fn notification_source_metadata_resolves_hashed_and_legacy_identities_with
     use server_api::authorization::PermissionResource;
     let (_dir, store) = tracking_store_fixture().await;
     let (_, source) = job_notice_fixture(&store, "metadata-only", false);
-    let job = store.get_backend_job("w", "metadata-only").unwrap().unwrap();
-    let retired = store.reclaim_backend_job_input("w", "metadata-only", &job.input_digest, crate::backend_job::JobInputRetirementReason::ExplicitErasure).unwrap();
+    let job = store
+        .get_backend_job("w", "metadata-only")
+        .unwrap()
+        .unwrap();
+    let retired = store
+        .reclaim_backend_job_input(
+            "w",
+            "metadata-only",
+            &job.input_digest,
+            crate::backend_job::JobInputRetirementReason::ExplicitErasure,
+        )
+        .unwrap();
     assert!(retired.load_executable_request().is_err());
     store.with_conn(|conn| {
         // Retired protected input cannot execute, but notification ownership
@@ -402,7 +418,13 @@ async fn notification_source_metadata_resolves_hashed_and_legacy_identities_with
         );
         let other = store.notification_source_resource("other", event).unwrap();
         if event == "mr-event:legacy-job:e" {
-            assert_eq!(other, Some(PermissionResource::MergeRequest { workspace_id: "other".into(), merge_request_id: "legacy-job".into() }));
+            assert_eq!(
+                other,
+                Some(PermissionResource::MergeRequest {
+                    workspace_id: "other".into(),
+                    merge_request_id: "legacy-job".into()
+                })
+            );
         } else {
             assert!(other.is_none());
         }
