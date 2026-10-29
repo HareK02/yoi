@@ -34788,7 +34788,8 @@ pub(crate) fn authorize_browser_worker_method(
             notification_request_id,
             message,
         } => Ok(protocol::Method::NotifyTracked {
-            notification_request_id: format!("browser-ws-notify:{notification_request_id}"),
+            receipt_scope: protocol::NotificationReceiptScope::BrowserConsole,
+            notification_request_id,
             message,
             source: source.clone(),
         }),

@@ -777,7 +777,10 @@ fn publish_chat_fixture_profile(api: &WorkspaceApi) {
 }
 
 impl ConnectedChat {
-    async fn new(model: ChatModel, app_layer: impl FnOnce(Router) -> Router) -> Self {
+    async fn new(
+        model: impl agen::llm_client::LlmClient + Clone + 'static,
+        app_layer: impl FnOnce(Router) -> Router,
+    ) -> Self {
         const RUNTIME: &str = "connected-chat";
         let dir = tempfile::tempdir().unwrap();
         let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1269,4 +1272,240 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         "explicit retry after restore preserves one public User message"
     );
     assert!(!public.to_string().contains("INTERNAL_ASSISTANT"));
+}
+
+#[derive(Clone)]
+struct NotifyObservationModel(tokio::sync::mpsc::Sender<String>);
+#[async_trait::async_trait]
+impl agen::llm_client::LlmClient for NotifyObservationModel {
+    async fn stream(
+        &self,
+        request: agen::llm_client::Request,
+    ) -> std::result::Result<agen::llm_client::ResponseStream, agen::llm_client::ClientError> {
+        use agen::llm_client::event::{Event, StopReason};
+        self.0.send(format!("{:?}", request.items)).await.unwrap();
+        Ok(Box::pin(futures::stream::iter([
+            Ok(Event::text_block_start(0)),
+            Ok(Event::text_delta(0, "internal only")),
+            Ok(Event::text_block_stop(0, Some(StopReason::EndTurn))),
+        ])))
+    }
+    fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
+        Box::new(self.clone())
+    }
+}
+
+/// Real authenticated Backend WS -> signed Runtime WS -> controller -> SQLite,
+/// followed by the production Console admission tracker (Deno, the normal test
+/// runner prerequisite). Only the model is scripted; no browser rendering claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn browser_notify_preserves_ack_id_limits_retry_and_console_next_draft() {
+    let (tx, mut inputs) = tokio::sync::mpsc::channel(32);
+    let f = ConnectedChat::new(NotifyObservationModel(tx), |router| router).await;
+    let subject = open_subjektiv_store(&f.api)
+        .unwrap()
+        .create_subject(crate::subjektiv::SubjectRole::new("notify-console").unwrap())
+        .unwrap()
+        .id;
+    let operations = [
+        "session.record",
+        "memory.resident.read",
+        "memory.resident.supply",
+        "journal.startup.read",
+        "journal.startup.supply",
+        "chat.read",
+        "chat.send",
+    ];
+    f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),json!({"operation_id":"notify-console-policy","expected_change_id":null,"execution":operations.into_iter().map(|op|subject_permission(&subject,op)).collect::<Vec<_>>(),"delegation":[]})).await;
+    let conversation = f
+        .post(
+            &conversations_path(),
+            json!({"operation_id":"notify-console-conversation","subject_id":subject}),
+        )
+        .await;
+    let c = conversation["id"].as_str().unwrap();
+    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Notify Console","profile":"project:connected-chat","initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
+    let worker = created["worker_id"].as_str().unwrap();
+    let chat = f
+        .post(
+            &messages_path(c),
+            json!({"operation_id":"notify-console-chat","text":"HTTP_CHAT_RECEIPT"}),
+        )
+        .await;
+    assert_eq!(chat["delivery"]["state"], "accepted");
+    // Deliberately reuse the exact Runtime ID of the accepted HTTP chat input.
+    // Its receipt must not reject/consume a different Console message.
+    let canonical = serde_json::to_vec(&(
+        format!(
+            "account:{}",
+            conversation["participant_account_id"].as_str().unwrap()
+        ),
+        format!("chat-message:{}", chat["message"]["id"].as_str().unwrap()),
+    ))
+    .unwrap();
+    let digest = sha2::Sha256::digest(canonical)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let collision_id = format!("runtime-input:notify:{digest}");
+    let url = format!(
+        "{}/api/w/{TEST_WORKSPACE_ID}/runtimes/connected-chat/workers/{worker}/protocol/ws",
+        f.url.replacen("http://", "ws://", 1)
+    );
+    let mut request = url.into_client_request().unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", f.owner).parse().unwrap(),
+    );
+    let (mut ws, _) = connect_async(request).await.unwrap();
+    let cases = [
+        (collision_id, "WS_ISOLATED_FROM_HTTP", true),
+        ("a".repeat(128), "WS_ASCII_LIMIT", true),
+        ("é".repeat(64), "WS_UTF8_LIMIT", true),
+        ("b".repeat(129), "WS_ASCII_OVER_LIMIT", false),
+        (format!("{}x", "é".repeat(64)), "WS_UTF8_OVER_LIMIT", false),
+        ("console-next-id".into(), "WS_NEXT_DRAFT", true),
+    ];
+    let mut exchanges = Vec::new();
+    for (id, text, accepted) in &cases {
+        let method = protocol::Method::Notify {
+            notification_request_id: id.clone(),
+            message: (*text).into(),
+        };
+        let ack = console_notify_ack(&mut ws, &method).await;
+        assert_eq!(
+            matches!(ack, protocol::Event::NotificationAccepted { .. }),
+            *accepted,
+            "{ack:?}"
+        );
+        let mut delivered_ack = ack;
+        if *accepted {
+            // Lose the first ACK at the Console boundary, resend the exact wire
+            // input, and deliver the real retry ACK to the actual tracker below.
+            delivered_ack = console_notify_ack(&mut ws, &method).await;
+            assert!(matches!(
+                delivered_ack,
+                protocol::Event::NotificationAccepted { .. }
+            ));
+        }
+        exchanges.push(
+            json!({"method":method,"event":delivered_ack,"accepted":accepted,"retry":accepted}),
+        );
+        if *accepted {
+            let changed = protocol::Method::Notify {
+                notification_request_id: id.clone(),
+                message: format!("CHANGED_{text}"),
+            };
+            let rejected = console_notify_ack(&mut ws, &changed).await;
+            assert!(
+                matches!(rejected, protocol::Event::NotificationRejected { .. }),
+                "{rejected:?}"
+            );
+            exchanges
+                .push(json!({"method":changed,"event":rejected,"accepted":false,"retry":false}));
+        }
+    }
+    let mut console = tokio::process::Command::new("deno");
+    console
+        .kill_on_drop(true)
+        .args(["run", "--quiet"])
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/support/console_notify_admissions.ts"),
+        )
+        .arg(serde_json::to_string(&exchanges).unwrap());
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), console.output())
+        .await
+        .expect("Console admission tracker deadline")
+        .expect("Deno (normal test runner prerequisite)");
+    assert!(
+        output.status.success(),
+        "production Console admission tracker failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !inputs
+            .recv()
+            .await
+            .expect("real model input")
+            .contains("WS_NEXT_DRAFT")
+        {}
+    })
+    .await
+    .expect("accepted Console input must reach next model request");
+    let history = session_store::read_retained_session_snapshot(
+        &f._dir.path().join("runtime/workers").join(worker),
+        &format!("worker-runtime-{worker}"),
+        2 * 1024 * 1024,
+    )
+    .unwrap();
+    let notifications = history
+        .snapshot
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.data {
+            protocol::SessionSnapshotEntryData::SystemItem {
+                item_kind, content, ..
+            } if item_kind == "notification" => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for (_, text, accepted) in cases {
+        assert_eq!(
+            notifications.matches(text).count(),
+            usize::from(accepted),
+            "one history input per accepted ID, none for rejection: {notifications}"
+        );
+        assert!(!notifications.contains(&format!("CHANGED_{text}")));
+    }
+    assert_eq!(notifications.matches("HTTP_CHAT_RECEIPT").count(), 1);
+}
+
+async fn console_notify_ack(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    method: &protocol::Method,
+) -> protocol::Event {
+    let protocol::Method::Notify {
+        notification_request_id: expected,
+        ..
+    } = method
+    else {
+        panic!("Console Notify required")
+    };
+    ws.send(TungsteniteMessage::Text(
+        protocol::stream::encode_method(method).unwrap().into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let frame = ws.next().await.expect("real protocol WS frame").unwrap();
+            if let TungsteniteMessage::Text(text) = frame {
+                let event = protocol::stream::decode_event(&text).unwrap();
+                match &event {
+                    protocol::Event::NotificationAccepted {
+                        notification_request_id,
+                    }
+                    | protocol::Event::NotificationRejected {
+                        notification_request_id,
+                        ..
+                    } => {
+                        assert_eq!(
+                            notification_request_id, expected,
+                            "client-visible ACK must preserve original request identity"
+                        );
+                        return event;
+                    }
+                    protocol::Event::Error { .. } => panic!("unexpected protocol error: {event:?}"),
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .expect("Console Notify ACK deadline")
 }

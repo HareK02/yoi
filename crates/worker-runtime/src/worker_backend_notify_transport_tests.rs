@@ -91,6 +91,7 @@ mod notify_transport {
                 let mut events = lost_handle.subscribe();
                 lost_handle
                     .send(Method::NotifyTracked {
+                        receipt_scope: protocol::NotificationReceiptScope::Source,
                         notification_request_id: "same-client-id".into(),
                         message: "human-notice-body".into(),
                         source: account,

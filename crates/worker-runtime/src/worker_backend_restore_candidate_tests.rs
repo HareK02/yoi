@@ -100,6 +100,7 @@ mod restore_candidate {
         let mut events = handle.subscribe();
         let method = match source {
             Some(source) => Method::NotifyTracked {
+                receipt_scope: protocol::NotificationReceiptScope::Source,
                 notification_request_id: NOTICE.into(),
                 message: NOTICE.into(),
                 source,

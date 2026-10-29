@@ -6540,6 +6540,7 @@ where
                 WorkerExecutionOperation::Input,
                 worker,
                 Method::NotifyTracked {
+                    receipt_scope: protocol::NotificationReceiptScope::Source,
                     notification_request_id: notification_request_id.clone(),
                     message: input.content,
                     source: input.source.unwrap_or_else(|| {

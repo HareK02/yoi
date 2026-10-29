@@ -601,6 +601,7 @@ fn notify_rejects_typed_side_effect_message_payloads() {
             message: "/prepare(first)".into(),
         },
         protocol::Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id: "n-1".into(),
             message: "/prepare(first)".into(),
             source: protocol::AuthenticatedInputSource::UntrustedWire,

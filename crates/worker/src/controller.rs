@@ -546,6 +546,7 @@ fn durable_parent_notification_target<St: Store + Clone + Send + Sync + 'static>
 ) -> crate::spawn::tool::ParentNotificationTarget {
     crate::spawn::tool::ParentNotificationTarget::Durable(Arc::new(move |method| {
         let Method::NotifyTracked {
+            receipt_scope,
             notification_request_id,
             message,
             source,
@@ -554,6 +555,7 @@ fn durable_parent_notification_target<St: Store + Clone + Send + Sync + 'static>
             return;
         };
         let (source_namespace, provenance) = resolved_input_source(&pending_submissions, &source);
+        let source_namespace = receipt_scope.namespace(source_namespace);
         match pending_submissions.accept_notification_from_source(
             notification_request_id,
             message,
@@ -2268,12 +2270,14 @@ where
             None
         }
         Method::NotifyTracked {
+            receipt_scope,
             notification_request_id,
             message,
             source,
         } => {
             let (source_namespace, provenance) =
                 resolved_input_source(pending_submissions, &source);
+            let source_namespace = receipt_scope.namespace(source_namespace);
             durably_accept_notification(
                 notification_request_id,
                 message,
@@ -2749,12 +2753,14 @@ async fn controller_loop<C, St>(
             }
 
             Method::NotifyTracked {
+                receipt_scope,
                 notification_request_id,
                 message,
                 source,
             } => {
                 let (source_namespace, provenance) =
                     resolved_input_source(&pending_submissions, &source);
+                let source_namespace = receipt_scope.namespace(source_namespace);
                 durably_accept_notification(
                     notification_request_id,
                     message,
@@ -3671,12 +3677,14 @@ where
                         });
                     }
                     Some(Method::NotifyTracked {
+                        receipt_scope,
                         notification_request_id,
                         message,
                         source,
                     }) => {
                         let (source_namespace, provenance) =
                             resolved_input_source(pending_submissions, &source);
+                        let source_namespace = receipt_scope.namespace(source_namespace);
                         if durably_accept_notification(
                             notification_request_id,
                             message,
@@ -4824,6 +4832,7 @@ mod tests {
         let pending = PendingSubmissionHandle::for_test(dir.path());
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let method = Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id: "completion-1".into(),
             message: "subworker completed".into(),
             source: protocol::AuthenticatedInputSource::UntrustedWire,

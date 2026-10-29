@@ -272,6 +272,7 @@ impl ParentNotificationTarget {
 
     pub(crate) fn notify(&self, child_session_id: String, message: String) {
         let method = Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id: protocol::new_submission_request_id(),
             message,
             source: protocol::AuthenticatedInputSource::SubWorker {
