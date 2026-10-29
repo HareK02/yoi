@@ -30,6 +30,10 @@ job.workspace = true
 protocol = { workspace = true }
 runtime-api.workspace = true
 server-api.workspace = true
+secrets.workspace = true
+yoi-plugin-runtime = { path = "../plugin-runtime" }
+tokio-util = { version = "0.7", features = ["rt"] }
+flate2 = "1"
 project-record.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
 ring.workspace = true
@@ -61,6 +65,8 @@ webauthn-rs = { workspace = true, features = ["conditional-ui"] }
 webauthn-rs-proto = "0.5.5"
 
 [dev-dependencies]
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 wip-protocol.workspace = true
 agen.workspace = true
 tempfile.workspace = true

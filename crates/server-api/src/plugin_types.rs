@@ -1,4 +1,28 @@
-//! Generated management types share the exact DTOs used by the HTTP declaration.
+//! Generated plugin types share the exact DTOs used by the HTTP declarations.
+#[cfg(feature = "typescript")]
+pub fn plugin_host_typescript() -> String {
+    use crate::*;
+    use ts_rs::TS;
+    let config = ts_rs::Config::default();
+    let declarations = [
+        PluginHttpMethod::decl(&config),
+        PluginConsumer::decl(&config),
+        PluginHostRequest::decl(&config),
+        PluginHostOperation::decl(&config),
+        PluginHttpRequest::decl(&config),
+        PluginHttpResponse::decl(&config),
+        PluginHostResponse::decl(&config),
+        PluginLogEntry::decl(&config),
+        PluginLogLevel::decl(&config),
+        PluginLogField::decl(&config),
+        PluginLogScalar::decl(&config),
+        PluginHostError::decl(&config),
+        PluginHostErrorCode::decl(&config),
+        PluginEffectObservation::decl(&config),
+    ];
+    declarations.map(|d| format!("export {d}")).join("\n\n")
+}
+
 #[cfg(feature = "typescript")]
 pub fn plugin_api_typescript() -> String {
     use crate::*;
@@ -31,6 +55,25 @@ pub fn plugin_api_typescript() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "typescript")]
+    #[test]
+    fn host_typescript_preserves_wire_numbers_and_lossless_scalar_strings() {
+        let text = super::plugin_host_typescript();
+        for name in [
+            "PluginHostRequest",
+            "PluginHostResponse",
+            "PluginHostError",
+            "PluginConsumer",
+            "PluginHttpRequest",
+            "PluginHttpResponse",
+            "PluginLogEntry",
+        ] {
+            assert!(text.contains(&format!("export type {name} =")), "{name}");
+        }
+        assert!(text.contains("expires_at_ms: number"));
+        assert!(text.contains("\"signed\", \"value\": string"));
+        assert!(text.contains("\"unsigned\", \"value\": string"));
+    }
     #[test]
     fn plugin_routes_use_binary_upload_and_closed_management_contracts() {
         let document = crate::canonical_openapi_document().unwrap();

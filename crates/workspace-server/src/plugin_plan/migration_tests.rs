@@ -30,6 +30,10 @@ fn plugin_plan_migration_marker_failure_preserves_catalog_then_retries_and_match
                 108,
                 "Subject Ticket responsibility and current-body notification routing".into(),
             ));
+            expected.push((
+                109,
+                "Durable Plugin Host invocations and HTTPS effect receipts".into(),
+            ));
             assert_eq!(workspace_schema_migration_history(conn)?, expected);
             subject_assignment_migration::verify(conn)?;
             crate::plugin_plan::verify_plan_schema(conn)?;

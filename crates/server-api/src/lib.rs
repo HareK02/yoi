@@ -10,11 +10,13 @@ pub mod authorization;
 mod drive;
 mod notification;
 mod plugin;
+pub mod plugin_host;
 mod plugin_types;
 pub use notification::*;
 pub use plugin::*;
+pub use plugin_host::*;
 #[cfg(feature = "typescript")]
-pub use plugin_types::plugin_api_typescript;
+pub use plugin_types::{plugin_api_typescript, plugin_host_typescript};
 mod ticket_browse;
 pub use ticket_browse::*;
 pub mod repository_openapi_typescript;
@@ -210,6 +212,9 @@ macro_rules! impl_openapi_schema {
 }
 
 impl_openapi_schema!(
+    PluginHostRequest,
+    PluginHostResponse,
+    PluginHostError,
     PluginInstallRequest,
     PluginAddArtifactRequest,
     PluginRevokeRequest,
@@ -577,6 +582,15 @@ pub struct WorkspaceWorkerSessionHistoryResponse {
 /// Response loss does not imply rollback.
 #[api(reqwest, axum, openapi)]
 pub trait ServerApi {
+    /// Runtime Host owner boundary; human plugin-management authority is not accepted here.
+    #[post("/api/w/{workspace_id}/plugin-host", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], normalize_body_errors = true)]
+    async fn plugin_host(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: PluginHostRequest,
+    ) -> Result<PluginHostResponse, PluginHostError>;
+
     #[get("/health", status = 200, error_status = 400)]
     async fn health(&self) -> Result<HealthResponse, RepositoryApiError>;
 
@@ -14968,7 +14982,7 @@ mod openapi_artifact_tests {
         // Session observation retains its existing explicit non-OpenAPI boundary independently of
         // the Runtime/Worker-source signed operation inventory above.
         const OTHER_OPENAPI_EXCLUDED: &[&str] = &["worker_session", "worker_session_history"];
-        const DOCUMENTED_SIGNED_INTERNAL: &[&str] = &["workspace_runtime_config"];
+        const DOCUMENTED_SIGNED_INTERNAL: &[&str] = &["workspace_runtime_config", "plugin_host"];
         const BROWSER_ONLY: &[&str] = &["merge_request_selector_repair"];
 
         let document = canonical_openapi_document().expect("canonical OpenAPI contract must build");

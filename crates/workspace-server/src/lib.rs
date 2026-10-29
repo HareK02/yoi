@@ -14,7 +14,10 @@ pub mod memory_staging;
 pub mod observation;
 pub mod plugin_binding;
 pub mod plugin_catalog;
+pub mod plugin_host;
+pub mod plugin_https;
 pub mod plugin_plan;
+pub mod plugin_receipt;
 pub mod plugin_settings;
 pub mod profile_settings;
 pub mod prompt_settings;
@@ -167,6 +170,8 @@ pub enum Error {
     WorkspaceSigningIdentity { code: String, message: String },
     #[error("Plugin catalog error: {0}")]
     PluginCatalog(#[from] plugin_catalog::PluginCatalogError),
+    #[error("Plugin Host operation rejected: {0}")]
+    PluginHost(#[from] server_api::PluginHostError),
     #[error("Workspace Drive error: {0}")]
     Drive(#[from] workspace_drive::Error),
     #[error("DB execution capacity exceeded")]

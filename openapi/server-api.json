@@ -7536,6 +7536,65 @@
         ],
         "type": "object"
       },
+      "PluginConsumer": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "tool_call",
+                "type": "string"
+              },
+              "tool_call_id": {
+                "type": "string"
+              },
+              "tool_name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "tool_call_id",
+              "tool_name"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Reserved consumer identity; this does not enable service/event delivery.",
+            "properties": {
+              "consumer_id": {
+                "type": "string"
+              },
+              "event_id": {
+                "type": "string"
+              },
+              "export_name": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "consumer",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "consumer_id",
+              "event_id",
+              "export_name"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginEffectObservation": {
+        "enum": [
+          "not_dispatched",
+          "response_observed",
+          "indeterminate"
+        ],
+        "type": "string"
+      },
       "PluginGrantMetadata": {
         "oneOf": [
           {
@@ -7570,6 +7629,375 @@
           }
         ]
       },
+      "PluginHostError": {
+        "additionalProperties": false,
+        "description": "Deliberately excludes raw diagnostics, transport bodies and arbitrary messages.",
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/PluginHostErrorCode"
+          },
+          "diagnostic_id": {
+            "type": "string"
+          },
+          "effect": {
+            "$ref": "#/components/schemas/PluginEffectObservation"
+          }
+        },
+        "required": [
+          "code",
+          "effect",
+          "diagnostic_id"
+        ],
+        "type": "object"
+      },
+      "PluginHostErrorCode": {
+        "enum": [
+          "invalid_input",
+          "denied",
+          "not_found",
+          "conflict",
+          "unsupported",
+          "quota_exceeded",
+          "deadline_exceeded",
+          "cancelled",
+          "unavailable",
+          "indeterminate",
+          "receipt_expired"
+        ],
+        "type": "string"
+      },
+      "PluginHostOperation": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "admit",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "publish",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "additionalProperties": false,
+                "properties": {
+                  "slot": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "slot"
+                ],
+                "type": "object"
+              },
+              "kind": {
+                "const": "open",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "additionalProperties": false,
+                "properties": {
+                  "slot": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "slot"
+                ],
+                "type": "object"
+              },
+              "kind": {
+                "const": "send",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "log",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginHostRequest": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "consumer": {
+                "$ref": "#/components/schemas/PluginConsumer"
+              },
+              "installation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "begin",
+                "type": "string"
+              },
+              "plan_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "plan_id",
+              "installation_id",
+              "consumer"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Irreversible cancellation of this authenticated logical invocation.",
+            "properties": {
+              "invocation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "cancel",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "invocation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "authorize",
+                "type": "string"
+              },
+              "operation": {
+                "$ref": "#/components/schemas/PluginHostOperation"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation_id",
+              "operation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "invocation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "open",
+                "type": "string"
+              },
+              "slot": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation_id",
+              "slot"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "invocation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "send",
+                "type": "string"
+              },
+              "request": {
+                "$ref": "#/components/schemas/PluginHttpRequest"
+              },
+              "slot": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation_id",
+              "slot",
+              "request"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "entry": {
+                "$ref": "#/components/schemas/PluginLogEntry"
+              },
+              "invocation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "log",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation_id",
+              "entry"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginHostResponse": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "additionalProperties": false,
+                "properties": {
+                  "expires_at_ms": {
+                    "format": "int64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "invocation_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "invocation_id",
+                  "expires_at_ms"
+                ],
+                "type": "object"
+              },
+              "kind": {
+                "const": "invocation",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "authorized",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "opened",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "additionalProperties": false,
+                "properties": {
+                  "response": {
+                    "$ref": "#/components/schemas/PluginHttpResponse"
+                  }
+                },
+                "required": [
+                  "response"
+                ],
+                "type": "object"
+              },
+              "kind": {
+                "const": "response",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "logged",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "PluginHttpMethod": {
         "enum": [
           "GET",
@@ -7581,6 +8009,118 @@
           "OPTIONS"
         ],
         "type": "string"
+      },
+      "PluginHttpRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "effect_key": {
+            "type": "string"
+          },
+          "headers": {
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "method": {
+            "$ref": "#/components/schemas/PluginHttpMethod"
+          },
+          "path": {
+            "type": "string"
+          },
+          "query": {
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "timeout_ms": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "method",
+          "path",
+          "query",
+          "headers",
+          "body",
+          "timeout_ms",
+          "effect_key"
+        ],
+        "type": "object"
+      },
+      "PluginHttpResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "headers": {
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "status": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "headers",
+          "body"
+        ],
+        "type": "object"
       },
       "PluginInstallRequest": {
         "additionalProperties": false,
@@ -7706,6 +8246,149 @@
           "installations"
         ],
         "type": "object"
+      },
+      "PluginLogEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "event_code": {
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/PluginLogField"
+            },
+            "type": "array"
+          },
+          "level": {
+            "$ref": "#/components/schemas/PluginLogLevel"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "level",
+          "event_code",
+          "message",
+          "fields"
+        ],
+        "type": "object"
+      },
+      "PluginLogField": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/PluginLogScalar"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
+      "PluginLogLevel": {
+        "enum": [
+          "trace",
+          "debug",
+          "info",
+          "warn",
+          "error"
+        ],
+        "type": "string"
+      },
+      "PluginLogScalar": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "text",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "boolean",
+                "type": "string"
+              },
+              "value": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "signed",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unsigned",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "number",
+                "type": "string"
+              },
+              "value": {
+                "format": "double",
+                "type": "number"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "PluginOperationKind": {
         "enum": [
@@ -19135,7 +19818,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:709b2f3a7004d11109fc14a2826d4ffffadfd4818698f550ce9150a36442f494"
+    "x-yoi-source-digest": "sha256:4b347d659dbdedb2ae773c617ee8a8b8acb13936860a93d8dd0f651af6e4fb41"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -28637,6 +29320,125 @@
             "browserSession": []
           }
         ]
+      }
+    },
+    "/api/w/{workspace_id}/plugin-host": {
+      "post": {
+        "operationId": "plugin_host",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PluginHostRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginHostResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginHostError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginHostError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginHostError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginHostError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginHostError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginHostError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginHostError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginHostError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        }
       }
     },
     "/api/w/{workspace_id}/plugin-operations/{operation_id}": {

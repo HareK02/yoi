@@ -129,7 +129,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 108;
+const LATEST_SCHEMA_VERSION: i64 = 109;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -476,6 +476,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 108,
         name: "Subject Ticket responsibility and current-body notification routing",
         apply: migrate_subject_assignments_v107_to_v108,
+    },
+    Migration {
+        version: 109,
+        name: "Durable Plugin Host invocations and HTTPS effect receipts",
+        apply: migrate_plugin_receipts_v108_to_v109,
     },
 ];
 
@@ -15851,6 +15856,27 @@ fn migrate_subject_assignments_v107_to_v108(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_plugin_receipts_v108_to_v109(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 108 {
+        return Err(Error::Store(
+            "Plugin receipt migration requires schema 108".into(),
+        ));
+    }
+    verify_schema_history(conn, 108)?;
+    crate::plugin_catalog::verify(conn)?;
+    crate::plugin_plan::verify_plan_schema(conn)?;
+    subject_assignment_migration::verify(conn)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::plugin_receipt::SCHEMA_SQL)?;
+    crate::plugin_host::verify_receipt_schema(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(109,?1)",
+        ["Durable Plugin Host invocations and HTTPS effect receipts"],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure(conn)?;
     assignment_delivery::install(conn)?;
@@ -15889,6 +15915,7 @@ fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
     conn.execute_batch(include_str!("activation_schema.sql"))?;
     conn.execute_batch(include_str!("passkey_results_schema.sql"))?;
     conn.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
+    conn.execute_batch(crate::plugin_receipt::SCHEMA_SQL)?;
     Ok(())
 }
 
@@ -16931,6 +16958,7 @@ fn apply_migrations_with_secret_source(
     verify_schema_history(conn, LATEST_SCHEMA_VERSION)?;
     crate::plugin_catalog::verify(conn)?;
     crate::plugin_plan::verify_plan_schema(conn)?;
+    crate::plugin_host::verify_receipt_schema(conn)?;
     subject_assignment_migration::verify(conn)?;
     verify_workspace_runtime_binding_schema(conn)?;
     verify_workspace_runtime_verification_schema(conn)?;
@@ -19214,6 +19242,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     include!("ticket_tag_upgrade_tests.rs");
     include!("ticket_post_upgrade_tests.rs");
     include!("migration_entrypoint_tests.rs");
+    include!("plugin_host_migration_tests.rs");
     include!("legacy_evidence_column_tests.rs");
 
     #[test]
@@ -19629,6 +19658,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:106, name:crate::plugin_catalog::MIGRATION_NAME.into()},
                 WorkspaceSchemaMigrationStep {version:107, name:"Immutable Worker Plugin plans and retained pins".into()},
                 WorkspaceSchemaMigrationStep {version:108, name:"Subject Ticket responsibility and current-body notification routing".into()},
+                WorkspaceSchemaMigrationStep {version:109, name:"Durable Plugin Host invocations and HTTPS effect receipts".into()},
             ]
         );
 
@@ -19747,6 +19777,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (106, crate::plugin_catalog::MIGRATION_NAME.to_string()),
 (107, "Immutable Worker Plugin plans and retained pins".to_string()),
 (108, "Subject Ticket responsibility and current-body notification routing".to_string()),
+(109, "Durable Plugin Host invocations and HTTPS effect receipts".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -23036,7 +23067,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (105, "Durable Subject deletion snapshots and Job admission fences".into()),
                          (106, crate::plugin_catalog::MIGRATION_NAME.into()),
                          (107, "Immutable Worker Plugin plans and retained pins".into()),
-                         (108, "Subject Ticket responsibility and current-body notification routing".into())]);
+                         (108, "Subject Ticket responsibility and current-body notification routing".into()),
+                         (109, "Durable Plugin Host invocations and HTTPS effect receipts".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

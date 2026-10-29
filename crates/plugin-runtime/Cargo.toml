@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 manifest.workspace = true
+server-api.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
@@ -23,4 +24,4 @@ wit-component = { version = "0.244.0", features = ["dummy-module"] }
 wit-parser = "0.244.0"
 wasmprinter = "0.244.0"
 wat = "1"
-tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util", "net"] }

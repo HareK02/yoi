@@ -48,6 +48,8 @@ mod drive;
 mod drive_grants;
 #[path = "server_plugin.rs"]
 mod plugin;
+#[path = "server_plugin_host.rs"]
+mod plugin_host;
 #[path = "server_workspace_config.rs"]
 mod workspace_config;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1999,6 +2001,8 @@ pub struct WorkspaceApi {
     workdir_remove_attempt_owner: WorkdirRemovalAttemptOwner,
     worker_control_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     attachment_upload_grants: Arc<Mutex<HashMap<String, AttachmentUploadGrant>>>,
+    #[cfg(test)]
+    plugin_https_transport: Option<Arc<crate::plugin_https::HttpsTransport>>,
 }
 
 #[derive(Clone)]
@@ -4510,6 +4514,8 @@ impl WorkspaceApi {
             workdir_remove_attempt_owner: current_workdir_removal_attempt_owner()?,
             worker_control_locks: Arc::new(Mutex::new(HashMap::new())),
             attachment_upload_grants: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            plugin_https_transport: None,
         };
         // Restore the domain fence before this API can issue any Drive handle,
         // including blocked/failed deletions not scheduled for automatic recovery.
@@ -7646,6 +7652,7 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(plugin::router(service.clone()))
+        .merge(plugin_host::router(service.clone()))
         .merge(server_api::server_api_axum::current_worker_workspace_config_get(service.clone()))
         .merge(server_api::server_api_axum::current_worker_workspace_config_attach(service.clone()))
         .merge(
@@ -13486,6 +13493,22 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn plugin_host(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::PluginHostRequest,
+    ) -> std::result::Result<server_api::PluginHostResponse, server_api::PluginHostError> {
+        let api = self
+            .workspace_api()
+            .map_err(|_| server_api::PluginHostError {
+                code: server_api::PluginHostErrorCode::Unavailable,
+                effect: server_api::PluginEffectObservation::NotDispatched,
+                diagnostic_id: String::new(),
+            })?;
+        plugin_host::execute(Arc::new(api.clone()), context, workspace_id, request).await
     }
 
     async fn plugin_upload(
@@ -38642,6 +38665,9 @@ mod tests {
 
     mod plugin_tests {
         include!("server_plugin_tests.rs");
+    }
+    mod plugin_host_tests {
+        include!("server_plugin_host_tests.rs");
     }
 
     mod ticket_tags_tests {

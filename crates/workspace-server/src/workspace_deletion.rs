@@ -16,6 +16,8 @@ use crate::{Error, Result};
 /// Explicit domain-owned purge inventory. The deletion operation tombstone is intentionally
 /// excluded so retries and audit remain available after the Workspace row is gone.
 const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
+    "plugin_effect_receipts",
+    "plugin_invocations",
     "plugin_execution_plans",
     "plugin_references",
     "plugin_operations",
@@ -509,6 +511,8 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             // commit; update guards remain installed throughout.
             let mut ticket_delete_guards = Vec::new();
             for (table, trigger) in [
+                ("plugin_effect_receipts", "plugin_effect_retained"),
+                ("plugin_invocations", "plugin_invocation_retained"),
                 ("plugin_execution_plans", "plugin_plan_replay_retained"),
                 ("notification_source_preparation_failures", "notification_source_preparation_failures_no_delete"),
                 ("notification_job_targets", "notification_job_targets_no_delete"),
@@ -1303,6 +1307,12 @@ mod tests {
                 for kind in ["config","pending","active","restorable"] {
                     conn.execute("INSERT INTO plugin_references VALUES(?1,?2,'owner','installation',?3)", params![workspace,kind,digest])?;
                 }
+                conn.execute("INSERT INTO plugin_execution_plans VALUES(?1,'plan','actor','create',?2,'{}','active')", params![workspace,digest])?;
+                conn.execute("INSERT INTO plugin_invocations(workspace_id,invocation_id,plan_id,plan_fingerprint,installation_id,runtime_id,worker_id,execution_json,consumer_key,consumer_json,created_at_ms,expires_at_ms) VALUES(?1,'invocation','plan',?2,'installation','runtime','worker','{}','[\"tool_call\",\"call\"]','{}',1,1000)", params![workspace,digest])?;
+                conn.execute("INSERT INTO plugin_effect_receipts(workspace_id,invocation_id,effect_key,fingerprint,admitted_at_ms,state,error_json) VALUES(?1,'invocation','key',?2,2,'pending',?3)", params![workspace,digest,r#"{"code":"indeterminate","effect":"indeterminate","diagnostic_id":"safe"}"#])?;
+                for table in ["plugin_effect_receipts", "plugin_invocations", "plugin_execution_plans"] {
+                    assert!(conn.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1"), [workspace]).is_err());
+                }
                 Ok(())
             }).unwrap();
         }
@@ -1310,6 +1320,9 @@ mod tests {
             store
                 .with_conn(|conn| {
                     [
+                        "plugin_effect_receipts",
+                        "plugin_invocations",
+                        "plugin_execution_plans",
                         "plugin_references",
                         "plugin_operations",
                         "plugin_uploads",
@@ -1329,7 +1342,7 @@ mod tests {
                 .unwrap()
         };
         let other = counts("workspace-b");
-        assert_eq!(counts("workspace-a"), vec![4, 1, 1, 1, 1]);
+        assert_eq!(counts("workspace-a"), vec![1, 1, 1, 4, 1, 1, 1, 1]);
         let preflight = store
             .workspace_deletion_preflight(&owner, &workspace_id)
             .unwrap();
@@ -1345,6 +1358,24 @@ mod tests {
             )
             .unwrap()
             .operation;
+        store.with_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER plugin_purge_failure BEFORE DELETE ON workspaces WHEN OLD.workspace_id='workspace-a' BEGIN SELECT RAISE(ABORT,'injected purge failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            store
+                .finalize_workspace_deletion(&operation.operation_id)
+                .is_err()
+        );
+        assert_eq!(counts("workspace-a"), vec![1, 1, 1, 4, 1, 1, 1, 1]);
+        assert_eq!(counts("workspace-b"), other);
+        store
+            .with_conn(|conn| {
+                crate::plugin_host::verify_receipt_schema(conn)?;
+                conn.execute_batch("DROP TRIGGER plugin_purge_failure")?;
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(
             store
                 .finalize_workspace_deletion(&operation.operation_id)
@@ -1352,10 +1383,22 @@ mod tests {
                 .state,
             WorkspaceDeletionState::Succeeded
         );
-        assert_eq!(counts("workspace-a"), vec![0; 5]);
+        assert_eq!(counts("workspace-a"), vec![0; 8]);
         assert_eq!(counts("workspace-b"), other);
         store
             .with_conn(|conn| {
+                crate::plugin_host::verify_receipt_schema(conn)?;
+                assert_eq!(
+                    conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?,
+                    "ok"
+                );
+                assert!(
+                    conn.execute(
+                        "DELETE FROM plugin_effect_receipts WHERE workspace_id='workspace-b'",
+                        []
+                    )
+                    .is_err()
+                );
                 assert_eq!(
                     conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
                         .get::<_, i64>(

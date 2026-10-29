@@ -1094,7 +1094,7 @@ mod subject_assignment_migration_tests {
         }
 
         fn expected_tail(version: i64) -> Vec<(i64, String)> {
-            match version {
+            let mut tail = match version {
                 96 => vec![
                     (
                         97,
@@ -1127,7 +1127,9 @@ mod subject_assignment_migration_tests {
                 106 => vec![(107, PLAN_NAME.into()), (108, SUBJECT_NAME.into())],
                 107 => vec![(108, SUBJECT_NAME.into())],
                 _ => panic!("unsupported fixture origin"),
-            }
+            };
+            tail.push((109, "Durable Plugin Host invocations and HTTPS effect receipts".into()));
+            tail
         }
 
         fn plan_steps(version: i64) -> Vec<WorkspaceSchemaMigrationStep> {
@@ -1176,12 +1178,12 @@ mod subject_assignment_migration_tests {
         fn plugin_schema(conn: &Connection) -> Rows {
             fixture_query_rows(
                 conn,
-                "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema WHERE tbl_name LIKE 'plugin_%' ORDER BY type,name",
+                "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema WHERE tbl_name LIKE 'plugin_%' AND tbl_name NOT IN ('plugin_invocations','plugin_effect_receipts') ORDER BY type,name",
             )
         }
 
         #[tokio::test]
-        async fn applied107_only108_preserves_canonical_plans_pins_and_released_replay() {
+        async fn applied107_preserves_canonical_plans_pins_and_released_replay_through_later_tail() {
             let (_dir, path, conn, receipts) = populated107().await;
             let before = snapshot(&conn);
             let rows = data(&conn, true);
@@ -1193,10 +1195,7 @@ mod subject_assignment_migration_tests {
             assert_eq!(plan.current_schema_version, 107);
             assert_eq!(
                 plan.migrations,
-                vec![WorkspaceSchemaMigrationStep {
-                    version: 108,
-                    name: SUBJECT_NAME.into()
-                }]
+                plan_steps(107)
             );
             assert_eq!(snapshot(&conn), before);
             drop(conn);
