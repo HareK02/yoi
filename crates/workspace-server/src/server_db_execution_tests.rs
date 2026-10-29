@@ -77,6 +77,7 @@ impl Fixture {
             runtime_event_sources: Vec::new(),
             remote_runtime_sources: Vec::new(),
             backend_base_url: Some("http://localhost:8787".into()),
+            control_plane_endpoints: Default::default(),
         };
         let store = Arc::new(
             SqliteWorkspaceStore::open_for_test(&config.database_path)

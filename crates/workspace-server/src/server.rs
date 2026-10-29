@@ -307,6 +307,9 @@ pub struct ServerConfig {
     pub runtime_event_sources: Vec<RuntimeObservationSourceConfig>,
     pub remote_runtime_sources: Vec<RemoteRuntimeConfig>,
     pub backend_base_url: Option<String>,
+    // Operational deny inventory survives Workspace capability filtering. It is
+    // never deserialized from Workspace configuration or returned to a guest.
+    pub(crate) control_plane_endpoints: std::collections::BTreeSet<String>,
 }
 
 impl ServerConfig {
@@ -344,6 +347,7 @@ impl ServerConfig {
             runtime_event_sources: Vec::new(),
             remote_runtime_sources: Vec::new(),
             backend_base_url: None,
+            control_plane_endpoints: Default::default(),
         }
     }
 
@@ -414,6 +418,28 @@ impl ServerConfig {
         self
     }
 
+    fn plugin_control_plane_endpoints(&self) -> std::collections::BTreeSet<String> {
+        let AuthConfig::Passkey {
+            public_base_url, ..
+        } = &self.auth;
+        self.control_plane_endpoints
+            .iter()
+            .chain(std::iter::once(public_base_url))
+            .chain(self.backend_base_url.iter())
+            .chain(
+                self.remote_runtime_sources
+                    .iter()
+                    .map(|source| &source.base_url),
+            )
+            .chain(
+                self.runtime_event_sources
+                    .iter()
+                    .map(|source| &source.endpoint),
+            )
+            .cloned()
+            .collect()
+    }
+
     fn for_catalog_workspace(
         &self,
         workspace: &WorkspaceRecord,
@@ -456,6 +482,7 @@ impl ServerConfig {
         scoped.repositories = repositories;
         // Runtime trust is server-global. Only explicitly assigned sources enter
         // this Workspace's registry and receive Workspace-scoped capabilities.
+        scoped.control_plane_endpoints = self.plugin_control_plane_endpoints();
         scoped.remote_runtime_sources.retain(|runtime| {
             runtime.workspace_id.as_deref() == Some(workspace.workspace_id.as_str())
         });

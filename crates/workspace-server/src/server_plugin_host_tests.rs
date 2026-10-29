@@ -1258,6 +1258,7 @@ async fn remote_owner_for(
     }));
     let client = server_api::ServerApiClient::builder(format!("http://{address}"))
         .unwrap()
+        .response_body_limit(yoi_plugin_runtime::owner::PLUGIN_HOST_RESPONSE_BODY_LIMIT)
         .client(
             reqwest::Client::builder()
                 .no_proxy()
@@ -1556,4 +1557,324 @@ async fn reserved_job_without_canonical_job_binding_cannot_fall_back_to_ordinary
     assert_eq!(f.count("plugin_invocations"), 0);
     assert_eq!(f.count("plugin_effect_receipts"), 0);
     f.shutdown().await;
+}
+
+#[tokio::test]
+async fn active_remote_and_embedded_sends_close_on_cancel_revoke_permission_loss_and_owner_failure()
+{
+    use crate::plugin_https::test_support::Reply;
+    use server_api::PluginEffectObservation;
+    for remote in [false, true] {
+        for action in ["cancel", "revoke", "permission", "unavailable"] {
+            let mut peer = Peer::new(HOST, vec![Reply::Stall]).await;
+            let mut f = Fixture::new(Some(peer_binding(&peer))).await;
+            f.api.plugin_https_transport = Some(Arc::new(peer.transport_for_requests(4)));
+            let (remote_owner, server) =
+                remote_owner_for(&f, &f.source.worker_id, TEST_WORKSPACE_ID).await;
+            let owner = if remote {
+                remote_owner
+            } else {
+                f.owner(Some(peer.transport_for_requests(4))).await
+            };
+            let host = f.host(owner.clone(), "active-interruption").await;
+            let id = host.context().invocation_id.clone();
+            let request = send(&id, PluginHttpMethod::Post, "once");
+            let mut recovered_api = f.api.clone();
+            recovered_api.config_store =
+                Arc::new(SqliteWorkspaceStore::open_for_test(&f.api.config.database_path).unwrap());
+            let attempt = owner.call(request.clone());
+            tokio::pin!(attempt);
+            tokio::select! {
+                result = &mut attempt => panic!("request must reach the stalled peer: {result:?}"),
+                _ = peer.observed() => {},
+            }
+            match action {
+                "cancel" => host.cancel().await.unwrap(),
+                "revoke" => f.revoke(),
+                "permission" => f.deny(),
+                "unavailable" => f
+                    .api
+                    .config_store
+                    .with_conn(|conn| {
+                        conn.execute_batch(
+                            "ALTER TABLE plugin_execution_plans RENAME TO unavailable_plugin_plans",
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            // No response is released. HTTP has a five-second timeout; authority
+            // loss must close the owner transport substantially before that.
+            let error = tokio::time::timeout(std::time::Duration::from_secs(2), &mut attempt)
+                .await
+                .expect("active transport did not stop")
+                .unwrap_err();
+            assert_eq!(
+                error.effect,
+                PluginEffectObservation::Indeterminate,
+                "{remote}/{action}"
+            );
+            peer.closed().await;
+            if action == "unavailable" {
+                f.api
+                    .config_store
+                    .with_conn(|conn| {
+                        conn.execute_batch(
+                            "ALTER TABLE unavailable_plugin_plans RENAME TO plugin_execution_plans",
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            if action == "permission" {
+                set_policy(
+                    &f.api,
+                    &f.subject,
+                    &f.installed.installation.installation_id,
+                    true,
+                );
+            }
+            // Another actual owner with an independent SQLite connection has no
+            // local attempt state. Reopen after ordinary cancellation/revocation;
+            // the unavailable-owner fault deliberately changes SQLite DDL quotes.
+            if action != "unavailable" {
+                recovered_api.config_store = Arc::new(
+                    SqliteWorkspaceStore::open_for_test(&f.api.config.database_path).unwrap(),
+                );
+            }
+            let recovered = plugin_host::EmbeddedPluginHostOwner::new(
+                Arc::new(recovered_api),
+                f.verified_context().await,
+                TEST_WORKSPACE_ID.into(),
+            )
+            .with_transport(peer.transport_for_requests(4));
+            assert!(recovered.call(request).await.is_err());
+            assert_eq!(f.count("plugin_effect_receipts"), 1);
+            assert_eq!(
+                peer.connection_count(),
+                1,
+                "recovery resent {remote}/{action}"
+            );
+            drop(server);
+            f.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn binary_ceiling_matches_generated_remote_router_and_embedded_owner_limits() {
+    let ceiling = crate::plugin_binding::PluginConnectionPolicyCeiling::default().limits;
+    let body = vec![255; ceiling.max_request_bytes as usize];
+    let mut peer = Peer::new(
+        HOST,
+        vec![response(200, &[], &body), response(200, &[], &body)],
+    )
+    .await;
+    let mut binding = peer_binding(&peer);
+    binding.limits.max_request_bytes = ceiling.max_request_bytes;
+    binding.limits.max_response_bytes = ceiling.max_response_bytes;
+    let mut f = Fixture::new(Some(binding)).await;
+    f.api.plugin_https_transport = Some(Arc::new(peer.transport_for_requests(4)));
+    let embedded = f.owner(Some(peer.transport_for_requests(4))).await;
+    let (remote, server) = remote_owner_for(&f, &f.source.worker_id, TEST_WORKSPACE_ID).await;
+    let host = f.host(remote.clone(), "binary-boundary").await;
+    let id = &host.context().invocation_id;
+    for (index, owner) in [&embedded, &remote].into_iter().enumerate() {
+        let mut input = send(id, PluginHttpMethod::Post, &format!("binary-{index}"));
+        if let PluginHostRequest::Send { request, .. } = &mut input {
+            request.body = body.clone();
+        }
+        assert!(serde_json::to_vec(&input).unwrap().len() > 4 * 1024 * 1024);
+        let PluginHostResponse::Response { response } = owner.call(input.clone()).await.unwrap()
+        else {
+            panic!("expected response")
+        };
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.len(), body.len());
+        assert!(response.body.iter().all(|byte| *byte == 255));
+        let observed = peer.observed().await;
+        assert!(observed.ends_with(&body));
+        assert_eq!(peer.connection_count(), index + 1);
+        // Replays cross adapters without a new connection.
+        embedded.call(input).await.unwrap();
+        let mut oversized = send(id, PluginHttpMethod::Post, &format!("oversized-{index}"));
+        if let PluginHostRequest::Send { request, .. } = &mut oversized {
+            request.body = vec![255; body.len() + 1];
+        }
+        let error = owner.call(oversized).await.unwrap_err();
+        assert_eq!(error.code, PluginHostErrorCode::QuotaExceeded);
+        assert_eq!(peer.connection_count(), index + 1);
+    }
+    assert_eq!(f.count("plugin_effect_receipts"), 2);
+    let mut enormous = send(id, PluginHttpMethod::Post, "wire-overflow");
+    if let PluginHostRequest::Send { request, .. } = &mut enormous {
+        request.body = vec![255; 2 * body.len()];
+    }
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/plugin-host");
+    let response = build_router(f.api.clone())
+        .oneshot(runtime_source_request(
+            &f.identity,
+            Some(&f.source.worker_id),
+            "POST",
+            &path,
+            serde_json::to_vec(&enormous).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(peer.connection_count(), 2);
+    drop(server);
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn other_workspace_control_plane_hosts_ips_and_dns_aliases_never_connect() {
+    for dynamic in [false, true] {
+        for host in [HOST, "8.8.8.8", "runtime-alias.example.com"] {
+            let peer = Peer::new(HOST, vec![]).await;
+            let mut binding = peer_binding(&peer);
+            binding.origin = format!("https://{host}:{}", peer.public_address().port());
+            let mut f = Fixture::new(Some(binding)).await;
+            let endpoint = format!("https://{HOST}:{}", peer.public_address().port());
+            if dynamic {
+                let mut workspace = test_workspace();
+                workspace.workspace_id = "workspace-b".into();
+                f.api.store.upsert_workspace(&workspace).await.unwrap();
+                f.api
+                    .store
+                    .upsert_workspace_runtime_binding_record(
+                        WorkspaceRuntimeBinding {
+                            workspace_id: "workspace-b".into(),
+                            runtime_id: "only-b".into(),
+                            display_name: "Only B".into(),
+                            base_url: endpoint,
+                            public_key: f.identity.public_key.clone(),
+                            public_key_fingerprint: String::new(),
+                            binding_id: String::new(),
+                            authentication_mode:
+                                StoredRuntimeAuthenticationMode::LegacyServerIssuer,
+                            created_at: "1".into(),
+                            updated_at: "1".into(),
+                            revoked_at: None,
+                        },
+                        true,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                let mut operational = f.api.config.clone();
+                operational.remote_runtime_sources.push(
+                    RemoteRuntimeConfig::new("only-b", "Only B", endpoint, None)
+                        .with_workspace_id("workspace-b"),
+                );
+                f.api.config = operational
+                    .for_catalog_workspace(&test_workspace(), vec![])
+                    .unwrap();
+                assert!(
+                    !f.api
+                        .config
+                        .remote_runtime_sources
+                        .iter()
+                        .any(|source| source.runtime_id == "only-b")
+                );
+            }
+            // Only external DNS/socket/trust are substituted. The operational
+            // inventory and concrete shared owner/adapters remain production code.
+            let policy = plugin_host::transport_policy(&f.api, |name, port| async move {
+                let ip = if name == HOST { "8.8.8.8" } else { "9.9.9.9" };
+                Ok(vec![format!("{ip}:{port}").parse().unwrap()])
+            })
+            .await
+            .unwrap();
+            assert!(policy.denied_hosts.contains(HOST));
+            assert!(
+                policy
+                    .denied_addresses
+                    .contains(&"8.8.8.8".parse().unwrap())
+            );
+            f.api.plugin_https_transport =
+                Some(Arc::new(peer.transport_with_policy(policy.clone())));
+            let embedded = f.owner(Some(peer.transport_with_policy(policy))).await;
+            let (remote, server) =
+                remote_owner_for(&f, &f.source.worker_id, TEST_WORKSPACE_ID).await;
+            let invocation = f.host(embedded.clone(), "forbidden-control-plane").await;
+            for owner in [&embedded, &remote] {
+                assert_denied(
+                    owner
+                        .call(send(
+                            &invocation.context().invocation_id,
+                            PluginHttpMethod::Get,
+                            "blocked",
+                        ))
+                        .await,
+                );
+            }
+            assert_eq!(peer.connection_count(), 0, "{dynamic}/{host}");
+            drop(server);
+            f.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn stalled_authority_monitor_closes_active_transport_and_consumes_effect() {
+    use crate::plugin_https::test_support::Reply;
+    for remote in [false, true] {
+        let mut peer = Peer::new(HOST, vec![Reply::Stall]).await;
+        let mut f = Fixture::new(Some(peer_binding(&peer))).await;
+        f.api.plugin_https_transport = Some(Arc::new(peer.transport_for_requests(4)));
+        let (remote_owner, server) =
+            remote_owner_for(&f, &f.source.worker_id, TEST_WORKSPACE_ID).await;
+        let owner = if remote {
+            remote_owner
+        } else {
+            f.owner(Some(peer.transport_for_requests(4))).await
+        };
+        let host = f.host(owner.clone(), "monitor-unavailable").await;
+        let request = send(
+            &host.context().invocation_id,
+            PluginHttpMethod::Post,
+            "once",
+        );
+        let attempt = owner.call(request.clone());
+        tokio::pin!(attempt);
+        tokio::select! {
+            result = &mut attempt => panic!("request must reach peer: {result:?}"),
+            _ = peer.observed() => {},
+        }
+        // Hold the actual authority DB connection. The monitor cannot complete
+        // its read, and may not treat a past permission as continued authority.
+        let store = f.api.config_store.clone();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let held = tokio::task::spawn_blocking(move || {
+            store.with_conn(|_| {
+                let _ = started.send(());
+                let _ = gate.blocking_recv();
+                Ok(())
+            })
+        });
+        waiting.await.unwrap();
+        tokio::select! {
+            result = &mut attempt => panic!("DB is held but owner finished: {result:?}"),
+            _ = peer.closed() => {},
+        }
+        release.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(3), &mut attempt)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.effect,
+            server_api::PluginEffectObservation::Indeterminate
+        );
+        assert_eq!(error.code, PluginHostErrorCode::Unavailable);
+        assert!(owner.call(request).await.is_err());
+        assert_eq!(f.count("plugin_effect_receipts"), 1);
+        assert_eq!(peer.connection_count(), 1);
+        drop(server);
+        f.shutdown().await;
+    }
 }

@@ -108,6 +108,7 @@ pub(crate) struct Peer {
     pub(super) root: reqwest::Certificate,
     pub(super) observations: mpsc::Receiver<Vec<u8>>,
     pub(super) connections: Arc<AtomicUsize>,
+    closed: mpsc::Receiver<()>,
     task: JoinHandle<()>,
     _directory: tempfile::TempDir,
 }
@@ -164,6 +165,7 @@ impl Peer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (observed, observations) = mpsc::channel(16);
+        let (closed_sender, closed) = mpsc::channel(16);
         let connections = Arc::new(AtomicUsize::new(0));
         let count = connections.clone();
         let mut replies = VecDeque::from(replies);
@@ -176,6 +178,7 @@ impl Peer {
                         count.fetch_add(1, Ordering::SeqCst);
                         let acceptor = acceptor.clone();
                         let observed = observed.clone();
+                        let closed_sender = closed_sender.clone();
                         let reply = replies.pop_front().unwrap_or(Reply::Close);
                         handlers.spawn(async move {
                             let Ok(mut socket) = acceptor.accept(socket).await else { return; };
@@ -185,7 +188,7 @@ impl Peer {
                                 let Ok(length) = socket.read(&mut buffer).await else { return; };
                                 if length == 0 { return; }
                                 bytes.extend_from_slice(&buffer[..length]);
-                                assert!(bytes.len() <= 64 * 1024, "test request exceeded fixture bound");
+                                assert!(bytes.len() <= 2 * 1024 * 1024, "test request exceeded fixture bound");
                                 if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
                                     let text = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
                                     let length = text.lines().find_map(|line| line.strip_prefix("content-length: "))
@@ -197,7 +200,13 @@ impl Peer {
                             match reply {
                                 Reply::Bytes(bytes) => { let _ = socket.write_all(&bytes).await; let _ = socket.shutdown().await; }
                                 Reply::StallAfter(bytes) => { let _ = socket.write_all(&bytes).await; pending::<()>().await; }
-                                Reply::Stall => pending::<()>().await,
+                                Reply::Stall => {
+                                    let mut byte = [0];
+                                    match socket.read(&mut byte).await {
+                                        Ok(0) | Err(_) => { let _ = closed_sender.send(()).await; }
+                                        Ok(_) => panic!("unexpected bytes after complete request"),
+                                    }
+                                },
                                 Reply::Close => {},
                                 Reply::Gated(release) => {
                                     if let Ok(bytes) = release.await {
@@ -217,6 +226,7 @@ impl Peer {
             root: reqwest::Certificate::from_pem(&certificate).unwrap(),
             observations,
             connections,
+            closed,
             task,
             _directory: directory,
         }
@@ -230,6 +240,19 @@ impl Peer {
 
     pub(crate) fn connection_count(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn closed(&mut self) {
+        tokio::time::timeout(Duration::from_secs(2), self.closed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    pub(crate) fn transport_with_policy(&self, policy: TransportPolicy) -> HttpsTransport {
+        let mut transport = self.transport_for_requests(4);
+        transport.policy = policy;
+        transport
     }
 
     pub(crate) fn transport(&self) -> HttpsTransport {

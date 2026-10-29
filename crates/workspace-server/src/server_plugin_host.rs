@@ -77,7 +77,14 @@ use tokio_util::sync::CancellationToken;
 const RECEIPT_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 pub(super) fn router(service: Arc<ServerApiContractService>) -> Router {
-    server_api_axum::plugin_host(service).layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+    // Vec<u8> uses JSON's numeric array representation (up to four wire bytes
+    // per decoded byte). Reserve bounded room for IDs, URL/query and escaped
+    // headers; the shared owner still enforces every decoded field/body limit.
+    let body_ceiling = crate::plugin_binding::PluginConnectionPolicyCeiling::default()
+        .limits
+        .max_request_bytes as usize;
+    server_api_axum::plugin_host(service)
+        .layer(DefaultBodyLimit::max(4 * body_ceiling + 512 * 1024))
 }
 
 fn denied() -> PluginHostError {
@@ -623,32 +630,41 @@ async fn execute_with_transport(
                         None => Arc::new(transport(&api).await?),
                     };
                     let cancellation = CancellationToken::new();
-                    let result = transport
-                        .execute_with_guard(
-                            binding,
-                            prepared,
-                            secret.as_deref().map(|v| v.as_str()),
-                            &cancellation,
-                            || async {
-                                invocation(
-                                    api.clone(),
-                                    &context,
-                                    &workspace,
-                                    &invocation_id,
-                                    operation.clone(),
-                                )
-                                .await
-                                .map(|_| ())
-                                .map_err(|_| https::TransportError::Denied)
-                            },
-                        )
-                        .await
-                        .map(|response| PluginHttpResponse {
+                    let sending = transport.execute_with_guard(
+                        binding,
+                        prepared,
+                        secret.as_deref().map(|v| v.as_str()),
+                        &cancellation,
+                        || async {
+                            invocation(
+                                api.clone(),
+                                &context,
+                                &workspace,
+                                &invocation_id,
+                                operation.clone(),
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(|_| https::TransportError::Denied)
+                        },
+                    );
+                    // Monitor the existing durable owners rather than maintaining
+                    // another revocation registry. Dropping the transport future
+                    // shuts down its single-use client/socket. A stalled authority
+                    // owner also closes the attempt; it is never permission to run
+                    // until the HTTP deadline. Admission remains consumed even if
+                    // the shutdown acknowledgement or completion write is lost.
+                    let result = tokio::select! {
+                        result = sending => result.map(|response| PluginHttpResponse {
                             status: response.status,
                             headers: response.headers,
                             body: response.body,
-                        })
-                        .map_err(sent_transport_error);
+                        }).map_err(sent_transport_error),
+                        error = monitor_invocation(api.clone(), &context, &workspace, &invocation_id, operation.clone()) => {
+                            cancellation.cancel();
+                            Err(error)
+                        }
+                    };
                     let store = api.config_store.clone();
                     let r = record;
                     let fp = fingerprint;
@@ -699,25 +715,92 @@ async fn execute_with_transport(
     }
 }
 
+async fn monitor_invocation(
+    api: Arc<WorkspaceApi>,
+    context: &ServerRequestContext,
+    workspace: &str,
+    invocation_id: &str,
+    operation: PluginHostOperation,
+) -> PluginHostError {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let checked = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            invocation(
+                api.clone(),
+                context,
+                workspace,
+                invocation_id,
+                operation.clone(),
+            ),
+        )
+        .await;
+        let error = match checked {
+            Ok(Ok(_)) => continue,
+            Ok(Err(error)) => error,
+            Err(_) => policy::map_error(policy::failure(PluginHostErrorCode::Unavailable)),
+        };
+        // After admission the request may have reached the peer. Neither a
+        // failed check nor a local connection shutdown proves remote rollback.
+        return PluginHostError {
+            effect: PluginEffectObservation::Indeterminate,
+            ..error
+        };
+    }
+}
+
 async fn transport(
     api: &WorkspaceApi,
 ) -> std::result::Result<https::HttpsTransport, PluginHostError> {
+    let policy = transport_policy(api, |host, port| async move {
+        tokio::net::lookup_host((host, port))
+            .await
+            .map(|addresses| addresses.take(65).collect::<Vec<_>>())
+            .map_err(|_| https::TransportError::Dns)
+    })
+    .await?;
+    Ok(https::HttpsTransport::new(policy))
+}
+
+pub(super) async fn transport_policy<F, Fut>(
+    api: &WorkspaceApi,
+    resolve: F,
+) -> std::result::Result<https::TransportPolicy, PluginHostError>
+where
+    F: Fn(String, u16) -> Fut,
+    Fut: std::future::Future<
+            Output = std::result::Result<Vec<std::net::SocketAddr>, https::TransportError>,
+        >,
+{
     let mut hosts = std::collections::BTreeSet::new();
     let mut ips = std::collections::BTreeSet::new();
-    let AuthConfig::Passkey {
-        public_base_url, ..
-    } = &api.config.auth;
-    for address in std::iter::once(public_base_url)
-        .chain(api.config.backend_base_url.iter())
-        .chain(
-            api.config
-                .remote_runtime_sources
-                .iter()
-                .map(|source| &source.base_url),
-        )
+    // Current server-owned bindings include dynamically registered endpoints in
+    // other Workspaces, even when they were absent from the startup config.
+    let store = api.config_store.clone();
+    let registered = store
+        .db_executor()
+        .run(move || {
+            store.with_conn(|conn| {
+                let mut statement =
+                    conn.prepare("SELECT DISTINCT base_url FROM workspace_runtime_bindings")?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+        })
+        .await
+        .map_err(policy::map_error)?;
+    for address in api
+        .config
+        .plugin_control_plane_endpoints()
+        .iter()
+        .chain(registered.iter())
     {
         if let Ok(url) = url::Url::parse(address) {
+            if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
+                continue;
+            }
             if let Some(host) = url.host_str() {
+                let host = host.trim_start_matches('[').trim_end_matches(']');
                 hosts.insert(host.to_ascii_lowercase());
                 if let Ok(ip) = host.parse() {
                     ips.insert(ip);
@@ -725,12 +808,15 @@ async fn transport(
                     let port = url.port_or_known_default().ok_or_else(denied)?;
                     let resolved = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        tokio::net::lookup_host((host, port)),
+                        resolve(host.to_owned(), port),
                     )
                     .await
                     .map_err(|_| transport_error(https::TransportError::Dns))?
                     .map_err(|_| transport_error(https::TransportError::Dns))?;
-                    for (index, address) in resolved.enumerate() {
+                    if resolved.is_empty() {
+                        return Err(transport_error(https::TransportError::Dns));
+                    }
+                    for (index, address) in resolved.into_iter().enumerate() {
                         if index >= 64 {
                             return Err(transport_error(https::TransportError::Dns));
                         }
@@ -740,10 +826,10 @@ async fn transport(
             }
         }
     }
-    Ok(https::HttpsTransport::new(https::TransportPolicy {
+    Ok(https::TransportPolicy {
         denied_addresses: ips,
         denied_hosts: hosts,
-    }))
+    })
 }
 fn sent_transport_error(error: https::TransportError) -> PluginHostError {
     match error {

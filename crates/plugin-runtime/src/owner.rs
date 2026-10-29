@@ -44,6 +44,12 @@ pub trait PluginHostOwner: Send + Sync {
     }
 }
 
+/// Finite generated-client response budget for the supported one-MiB binary
+/// body, its worst-case JSON numeric-array expansion, headers and envelope.
+/// Set `response_body_limit` on the injected client before constructing a Remote
+/// owner; a smaller operator-selected limit may reject otherwise valid replies.
+pub const PLUGIN_HOST_RESPONSE_BODY_LIMIT: usize = 4 * 1024 * 1024 + 512 * 1024;
+
 /// Uses an injected, already configured generated client (including its existing
 /// Runtime request authorizer). This adapter never creates or owns credentials.
 pub struct RemotePluginHostOwner<A> {
