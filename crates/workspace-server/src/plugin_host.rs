@@ -35,7 +35,7 @@ pub fn authorize(
     execution: &HostExecutionIdentity,
     plan_id: &str,
     installation: &str,
-    consumer: &PluginConsumer,
+    tools: &[String],
     operation: &PluginHostOperation,
 ) -> Result<AdmittedPluginOperation> {
     let plan = plugin_plan_load(tx, workspace, plan_id)?;
@@ -49,22 +49,23 @@ pub fn authorize(
         .find(|pin| pin.installation_id() == installation)
         .cloned()
         .ok_or_else(|| failure(PluginHostErrorCode::Denied))?;
-    let tool_name = match consumer {
-        PluginConsumer::ToolCall {
-            tool_call_id,
-            tool_name,
-        } if !tool_call_id.is_empty()
-            && tool_call_id.len() <= 512
-            && !tool_call_id.chars().any(char::is_control) =>
-        {
-            tool_name
-        }
-        // The scope is reserved for future authenticated consumers. This initial
-        // Tool implementation cannot manufacture Service/event admission.
-        _ => return Err(failure(PluginHostErrorCode::Unsupported)),
-    };
+    if tools.is_empty()
+        || tools.len() > 256
+        || tools
+            .iter()
+            .any(|tool| tool.is_empty() || tool.len() > 512 || tool.chars().any(char::is_control))
+        || tools
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != tools.len()
+    {
+        return Err(failure(PluginHostErrorCode::InvalidInput));
+    }
     if !pin.projection().surfaces.contains(&PluginSurface::Tool)
-        || !pin.projection().tools.contains(tool_name)
+        || tools
+            .iter()
+            .any(|tool| !pin.projection().tools.contains(tool))
     {
         return Err(failure(PluginHostErrorCode::Denied));
     }

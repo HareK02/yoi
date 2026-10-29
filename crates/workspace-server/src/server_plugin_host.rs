@@ -3,7 +3,75 @@
 //! JSON. Network dispatch is single-attempt and follows durable effect admission.
 use super::*;
 use crate::{plugin_host as policy, plugin_https as https, plugin_receipt as receipt};
+use rusqlite::OptionalExtension;
 use server_api::*;
+
+impl WorkspaceApi {
+    /// Host plan creation after the canonical reservation and grant/Job binding,
+    /// before Runtime dispatch. The reservation is re-read, never trusted as a
+    /// caller-issued principal. This derives identity only, not execution rights.
+    pub(crate) fn plugin_reserved_execution_identity(
+        &self,
+        runtime_id: &str,
+        reservation: &crate::store::WorkerCreateReservation,
+        expected_grant: Option<&server_api::authorization::WorkerExecutionGrant>,
+    ) -> crate::Result<crate::plugin_plan::HostExecutionIdentity> {
+        let worker = RuntimeWorkerRef::new(runtime_id, reservation.worker_id.to_string());
+        self.plugin_reserved_identity(
+            &worker,
+            Some(&reservation.create_fingerprint),
+            expected_grant,
+        )
+    }
+
+    fn plugin_reserved_identity(
+        &self,
+        worker: &RuntimeWorkerRef,
+        expected_fingerprint: Option<&str>,
+        expected_grant: Option<&server_api::authorization::WorkerExecutionGrant>,
+    ) -> crate::Result<crate::plugin_plan::HostExecutionIdentity> {
+        let refused = || policy::failure(PluginHostErrorCode::Denied);
+        let (fingerprint, allocation) = self.config_store.with_conn(|conn| {
+            Ok(conn.query_row("SELECT create_fingerprint,allocation_key FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='reserved'",
+                rusqlite::params![self.workspace_id(), worker.runtime_id, worker.worker_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional()?)
+        })?.ok_or_else(refused)?;
+        // A Job which has not yet acquired its canonical attempt/Worker binding
+        // must not accidentally become a legacy ordinary Worker principal.
+        if allocation.starts_with("backend-job:")
+            && self
+                .store
+                .worker_registry_projection(self.workspace_id(), worker)?
+                .and_then(|projection| projection.job)
+                .is_none()
+        {
+            return Err(refused());
+        }
+        if expected_fingerprint.is_some_and(|expected| expected != fingerprint) {
+            return Err(refused());
+        }
+        self.config_store
+            .get_workspace_runtime_binding(self.workspace_id(), &worker.runtime_id)?
+            .filter(|binding| binding.revoked_at.is_none())
+            .ok_or_else(refused)?;
+        self.store
+            .require_current_worker_singleton_owner(self.workspace_id(), worker)?;
+        if let Some(expected) = expected_grant {
+            let mut expected = expected.clone();
+            expected.worker_id = worker.worker_id.clone();
+            let actual = open_subjektiv_store(self)
+                .map_err(|e| e.error)?
+                .worker_execution_grant(&worker.runtime_id, &worker.worker_id)
+                .map_err(|_| refused())?;
+            if actual.as_ref() != Some(&expected) {
+                return Err(refused());
+            }
+        }
+        // This is the same owner as live identity. Do not manufacture a separate
+        // principal/delegation spelling or copy policy into the reservation.
+        subject_authorization::plugin_execution_identity(self, worker).map_err(|e| e.error)
+    }
+}
+
 use tokio_util::sync::CancellationToken;
 
 const RECEIPT_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -37,13 +105,61 @@ async fn check(
     consumer: PluginConsumer,
     operation: PluginHostOperation,
 ) -> std::result::Result<policy::AdmittedPluginOperation, PluginHostError> {
+    let tools = match consumer {
+        PluginConsumer::ToolCall {
+            tool_call_id,
+            tool_name,
+        } if !tool_call_id.is_empty()
+            && tool_call_id.len() <= 512
+            && !tool_call_id.chars().any(char::is_control) =>
+        {
+            vec![tool_name]
+        }
+        _ => {
+            return Err(policy::map_error(policy::failure(
+                PluginHostErrorCode::Unsupported,
+            )));
+        }
+    };
+    check_tools(
+        api,
+        context,
+        workspace,
+        plan_id,
+        installation,
+        tools,
+        operation,
+        false,
+    )
+    .await
+}
+
+async fn check_tools(
+    api: Arc<WorkspaceApi>,
+    context: ServerRequestContext,
+    workspace: String,
+    plan_id: String,
+    installation: String,
+    tools: Vec<String>,
+    operation: PluginHostOperation,
+    preparing: bool,
+) -> std::result::Result<policy::AdmittedPluginOperation, PluginHostError> {
     validate_workspace_scope(&api, &workspace).map_err(|e| policy::map_error(e.error))?;
     let worker = subject_authorization::source_from_context(&context)
         .map_err(|e| policy::map_error(e.error))?;
-    let execution = api
-        .plugin_execution_identity(&worker)
-        .await
-        .map_err(policy::map_error)?;
+    let execution = if preparing
+        && api
+            .store
+            .has_active_worker_create_reservation(api.workspace_id(), &worker)
+            .map_err(policy::map_error)?
+    {
+        api.plugin_reserved_identity(&worker, None, None)
+            .map_err(policy::map_error)?
+    } else {
+        api.plugin_execution_identity(&worker)
+            .await
+            .map_err(policy::map_error)?
+    };
     let executor = api.config_store.db_executor();
     executor
         .run(move || {
@@ -66,7 +182,7 @@ async fn check(
                     &execution,
                     &plan_id,
                     &installation,
-                    &consumer,
+                    &tools,
                     &operation,
                 )
             })
@@ -129,11 +245,36 @@ async fn invocation(
 #[derive(Clone)]
 pub struct EmbeddedPluginHostOwner {
     api: Arc<WorkspaceApi>,
-    context: ServerRequestContext,
+    source: EmbeddedPluginSource,
     workspace: String,
     transport_override: Option<Arc<https::HttpsTransport>>,
 }
+
+#[derive(Clone)]
+enum EmbeddedPluginSource {
+    Signed(Arc<dyn server_api::client_support::RequestAuthorizer>),
+    #[cfg(test)]
+    Verified(ServerRequestContext),
+}
+
 impl EmbeddedPluginHostOwner {
+    /// Uses the Runtime's existing signer. Every request is verified by the same
+    /// proof owner as Remote; this factory neither creates Worker claims nor
+    /// borrows human credentials. No HTTP loopback or standalone fallback.
+    pub(crate) fn authenticated(
+        api: Arc<WorkspaceApi>,
+        workspace: String,
+        authorizer: Arc<dyn server_api::client_support::RequestAuthorizer>,
+    ) -> Self {
+        Self {
+            api,
+            workspace,
+            source: EmbeddedPluginSource::Signed(authorizer),
+            transport_override: None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         api: Arc<WorkspaceApi>,
         context: ServerRequestContext,
@@ -141,7 +282,7 @@ impl EmbeddedPluginHostOwner {
     ) -> Self {
         Self {
             api,
-            context,
+            source: EmbeddedPluginSource::Verified(context),
             workspace,
             transport_override: None,
         }
@@ -158,9 +299,58 @@ impl yoi_plugin_runtime::owner::PluginHostOwner for EmbeddedPluginHostOwner {
         &self,
         request: PluginHostRequest,
     ) -> std::result::Result<PluginHostResponse, PluginHostError> {
+        let context = match &self.source {
+            #[cfg(test)]
+            EmbeddedPluginSource::Verified(context) => context.clone(),
+            EmbeddedPluginSource::Signed(authorizer) => {
+                let body = serde_json::to_vec(&request).map_err(|_| denied())?;
+                let mut url =
+                    url::Url::parse("https://plugin-owner.invalid/").map_err(|_| denied())?;
+                url.path_segments_mut().map_err(|_| denied())?.extend([
+                    "api",
+                    "w",
+                    &self.workspace,
+                    "plugin-host",
+                ]);
+                let path = url.path();
+                let headers = authorizer
+                    .authorize(server_api::client_support::AuthorizerRequest {
+                        method: &reqwest::Method::POST,
+                        path_and_query: path,
+                        body: &body,
+                    })
+                    .map_err(|_| denied())?;
+                let proof = headers
+                    .get(worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(denied)?;
+                let source = crate::worker_source::verify_runtime_request_source_proof(
+                    &self.api,
+                    proof,
+                    &self.workspace,
+                    worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+                    "POST",
+                    path,
+                    &worker_runtime::auth::request_body_digest(&body),
+                )
+                .await
+                .map_err(|_| denied())?;
+                server_request_context(
+                    None,
+                    None,
+                    Some(ServerRuntimeSource {
+                        authentication_binding_id: source.authentication_binding_id,
+                        runtime_id: source.runtime_id,
+                        worker_id: source.worker_id,
+                    }),
+                    None,
+                    &headers,
+                )
+            }
+        };
         execute_with_transport(
             self.api.clone(),
-            self.context.clone(),
+            context,
             self.workspace.clone(),
             request,
             self.transport_override.clone(),
@@ -192,6 +382,24 @@ async fn execute_with_transport(
     // Human management and a Runtime-only (no Worker) source both fail closed.
     subject_authorization::source_from_context(&context).map_err(|_| denied())?;
     match request {
+        PluginHostRequest::Prepare {
+            plan_id,
+            installation_id,
+            tools,
+        } => {
+            check_tools(
+                api,
+                context,
+                workspace,
+                plan_id,
+                installation_id,
+                tools,
+                PluginHostOperation::Admit,
+                true,
+            )
+            .await?;
+            Ok(PluginHostResponse::Authorized)
+        }
         PluginHostRequest::Begin {
             plan_id,
             installation_id,

@@ -7765,6 +7765,35 @@
         "oneOf": [
           {
             "additionalProperties": false,
+            "description": "Fresh export/restore admission only; issues no invocation or effect identity.",
+            "properties": {
+              "installation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "prepare",
+                "type": "string"
+              },
+              "plan_id": {
+                "type": "string"
+              },
+              "tools": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "plan_id",
+              "installation_id",
+              "tools"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
             "properties": {
               "consumer": {
                 "$ref": "#/components/schemas/PluginConsumer"
@@ -19818,7 +19847,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:d0830733128babb97634d7a55273591fd4b3b5afa5f038a983999e9192c1af55"
+    "x-yoi-source-digest": "sha256:63f6a6713e8a5d5e9aaf9e75482ec9271ffedff394ca1f32d19210929723ea80"
   },
   "openapi": "3.1.0",
   "paths": {

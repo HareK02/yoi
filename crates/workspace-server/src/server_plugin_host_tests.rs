@@ -33,6 +33,7 @@ const METHODS: &[PluginHttpMethod] = &[
 
 struct Fixture {
     api: WorkspaceApi,
+    runtime: WorkdirlessFixtureRuntime,
     identity: RuntimeIdentityMaterial,
     source: RuntimeWorkerRef,
     subject: String,
@@ -51,8 +52,8 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         let mut api = test_api(directory.path()).await;
         register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
-        api.runtime
-            .register_or_replace(WorkdirlessFixtureRuntime::default());
+        let runtime = WorkdirlessFixtureRuntime::default();
+        api.runtime.register_or_replace(runtime.clone());
         let subject = open_subjektiv_store(&api)
             .unwrap()
             .create_subject(crate::subjektiv::SubjectRole::new("plugin-host-integration").unwrap())
@@ -175,6 +176,7 @@ impl Fixture {
             .unwrap();
         Self {
             api,
+            runtime,
             identity,
             source,
             subject,
@@ -254,10 +256,15 @@ impl Fixture {
     }
 
     async fn owner(&self, transport: Option<HttpsTransport>) -> Arc<dyn PluginHostOwner> {
-        let owner = plugin_host::EmbeddedPluginHostOwner::new(
+        let owner = plugin_host::EmbeddedPluginHostOwner::authenticated(
             Arc::new(self.api.clone()),
-            self.verified_context().await,
             TEST_WORKSPACE_ID.into(),
+            Arc::new(SignedAuthorizer {
+                signer: worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(
+                    &self.identity,
+                ),
+                worker_id: self.source.worker_id.clone(),
+            }),
         );
         Arc::new(match transport {
             None => owner,
@@ -729,33 +736,82 @@ async fn all_methods_lost_dispatch_acknowledgement_replays_indeterminate_without
     // A new real receipt connection and owner have no in-memory replay state.
     // This models lost owner completion, not an arbitrary OS crash.
     let mut recovered_api = f.api.clone();
-    recovered_api.config_store = Arc::new(SqliteWorkspaceStore::open_for_test(&f.api.config.database_path).unwrap());
-    let recovered = Arc::new(plugin_host::EmbeddedPluginHostOwner::new(
-        Arc::new(recovered_api.clone()), f.verified_context().await, TEST_WORKSPACE_ID.into(),
-    ).with_transport(peer.transport()));
+    recovered_api.config_store =
+        Arc::new(SqliteWorkspaceStore::open_for_test(&f.api.config.database_path).unwrap());
+    let recovered = Arc::new(
+        plugin_host::EmbeddedPluginHostOwner::new(
+            Arc::new(recovered_api.clone()),
+            f.verified_context().await,
+            TEST_WORKSPACE_ID.into(),
+        )
+        .with_transport(peer.transport()),
+    );
     let restored = f.host(recovered.clone(), "lost-acknowledgements").await;
-    assert_eq!(restored.context().invocation_id, host.context().invocation_id);
+    assert_eq!(
+        restored.context().invocation_id,
+        host.context().invocation_id
+    );
     for (index, method) in METHODS.iter().enumerate() {
-        let error = recovered.call(send(&restored.context().invocation_id, method.clone(), &format!("lost-{index}"))).await.unwrap_err();
+        let error = recovered
+            .call(send(
+                &restored.context().invocation_id,
+                method.clone(),
+                &format!("lost-{index}"),
+            ))
+            .await
+            .unwrap_err();
         assert_eq!(error.code, PluginHostErrorCode::Indeterminate);
     }
-    let expiry = recovered_api.config_store.with_immediate_transaction(|tx| {
-        let record = crate::plugin_receipt::lookup(tx, TEST_WORKSPACE_ID, &restored.context().invocation_id)?;
-        crate::plugin_receipt::prune(tx, TEST_WORKSPACE_ID, record.expires_at_ms)
-    }).unwrap();
+    let expiry = recovered_api
+        .config_store
+        .with_immediate_transaction(|tx| {
+            let record = crate::plugin_receipt::lookup(
+                tx,
+                TEST_WORKSPACE_ID,
+                &restored.context().invocation_id,
+            )?;
+            crate::plugin_receipt::prune(tx, TEST_WORKSPACE_ID, record.expires_at_ms)
+        })
+        .unwrap();
     assert_eq!(expiry, METHODS.len());
     for key in ["lost-0", "unused-after-retention"] {
-        assert_eq!(recovered.call(send(&restored.context().invocation_id, PluginHttpMethod::Get, key)).await.unwrap_err().code,
-            PluginHostErrorCode::ReceiptExpired);
+        assert_eq!(
+            recovered
+                .call(send(
+                    &restored.context().invocation_id,
+                    PluginHttpMethod::Get,
+                    key
+                ))
+                .await
+                .unwrap_err()
+                .code,
+            PluginHostErrorCode::ReceiptExpired
+        );
     }
     assert_eq!(peer.connection_count(), METHODS.len());
-    assert_eq!(recovered.call(PluginHostRequest::Authorize {
-        invocation_id: restored.context().invocation_id.clone(), operation: PluginHostOperation::Publish,
-    }).await.unwrap_err().code, PluginHostErrorCode::ReceiptExpired);
-    assert_eq!(recovered.call(PluginHostRequest::Begin {
-        plan_id: f.plan.plan_id.clone(), installation_id: f.installed.installation.installation_id.clone(),
-        consumer: f.consumer("lost-acknowledgements"),
-    }).await.unwrap_err().code, PluginHostErrorCode::ReceiptExpired);
+    assert_eq!(
+        recovered
+            .call(PluginHostRequest::Authorize {
+                invocation_id: restored.context().invocation_id.clone(),
+                operation: PluginHostOperation::Publish,
+            })
+            .await
+            .unwrap_err()
+            .code,
+        PluginHostErrorCode::ReceiptExpired
+    );
+    assert_eq!(
+        recovered
+            .call(PluginHostRequest::Begin {
+                plan_id: f.plan.plan_id.clone(),
+                installation_id: f.installed.installation.installation_id.clone(),
+                consumer: f.consumer("lost-acknowledgements"),
+            })
+            .await
+            .unwrap_err()
+            .code,
+        PluginHostErrorCode::ReceiptExpired
+    );
     f.shutdown().await;
 }
 
@@ -1041,7 +1097,11 @@ async fn revocation_or_cancellation_during_dns_prevents_dispatch_and_recovery() 
             result = &mut call => panic!("send finished before DNS gate: {result:?}"),
             result = started => result.unwrap(),
         }
-        assert_eq!(f.count("plugin_effect_receipts"), 1, "admission committed before DNS");
+        assert_eq!(
+            f.count("plugin_effect_receipts"),
+            1,
+            "admission committed before DNS"
+        );
         if cancel {
             host.cancel().await.unwrap();
             host.cancel().await.unwrap();
@@ -1050,16 +1110,34 @@ async fn revocation_or_cancellation_during_dns_prevents_dispatch_and_recovery() 
         }
         release.send(vec![peer.public_address()]).unwrap();
         let error = call.await.unwrap_err();
-        assert_eq!(error.code, if cancel { PluginHostErrorCode::Cancelled } else { PluginHostErrorCode::Denied });
-        assert!(owner.call(send(&id, PluginHttpMethod::Post, "key")).await.is_err());
-        assert!(owner.call(send(&id, PluginHttpMethod::Get, "unused-key")).await.is_err());
+        assert_eq!(
+            error.code,
+            if cancel {
+                PluginHostErrorCode::Cancelled
+            } else {
+                PluginHostErrorCode::Denied
+            }
+        );
+        assert!(
+            owner
+                .call(send(&id, PluginHttpMethod::Post, "key"))
+                .await
+                .is_err()
+        );
+        assert!(
+            owner
+                .call(send(&id, PluginHttpMethod::Get, "unused-key"))
+                .await
+                .is_err()
+        );
         assert_eq!(peer.connection_count(), 0);
         f.shutdown().await;
     }
 }
 
 #[tokio::test]
-async fn authority_removed_after_dispatch_withholds_response_and_restored_read_replays_without_send() {
+async fn authority_removed_after_dispatch_withholds_response_and_restored_read_replays_without_send()
+ {
     use crate::plugin_https::test_support::Reply;
     let (release, waiting) = tokio::sync::oneshot::channel();
     let mut peer = Peer::new(HOST, vec![Reply::Gated(waiting)]).await;
@@ -1074,18 +1152,31 @@ async fn authority_removed_after_dispatch_withholds_response_and_restored_read_r
         _ = peer.observed() => {},
     }
     f.deny();
-    release.send(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata".to_vec()).unwrap();
+    release
+        .send(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata".to_vec())
+        .unwrap();
     assert_denied(call.await);
     assert_denied(owner.call(send(&id, PluginHttpMethod::Post, "key")).await);
-    set_policy(&f.api, &f.subject, &f.installed.installation.installation_id, true);
-    let replay = owner.call(send(&id, PluginHttpMethod::Post, "key")).await.unwrap();
-    assert!(matches!(replay, PluginHostResponse::Response { response } if response.body == b"data"));
+    set_policy(
+        &f.api,
+        &f.subject,
+        &f.installed.installation.installation_id,
+        true,
+    );
+    let replay = owner
+        .call(send(&id, PluginHttpMethod::Post, "key"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(replay, PluginHostResponse::Response { response } if response.body == b"data")
+    );
     assert_eq!(peer.connection_count(), 1);
     f.shutdown().await;
 }
 
 #[tokio::test]
-async fn generated_remote_owner_component_https_and_embedded_replay_share_receipt_and_live_denial() {
+async fn generated_remote_owner_component_https_and_embedded_replay_share_receipt_and_live_denial()
+{
     use yoi_plugin_runtime::owner::RemotePluginHostOwner;
     let mut peer = Peer::new(HOST, vec![response(503, &[], b"peer data")]).await;
     let mut f = Fixture::new(Some(peer_binding(&peer))).await;
@@ -1093,27 +1184,376 @@ async fn generated_remote_owner_component_https_and_embedded_replay_share_receip
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = build_router(f.api.clone());
-    let mut server = ServerTask(tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); }));
+    let mut server = ServerTask(tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    }));
     let client = server_api::ServerApiClient::builder(format!("http://{address}"))
-        .unwrap().client(reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(10)).build().unwrap())
+        .unwrap()
+        .client(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap(),
+        )
         .authorizer(SignedAuthorizer {
             signer: worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&f.identity),
             worker_id: f.source.worker_id.clone(),
-        }).build().unwrap();
-    let owner = Arc::new(RemotePluginHostOwner::new(Arc::new(client), TEST_WORKSPACE_ID.into()));
+        })
+        .build()
+        .unwrap();
+    let owner = Arc::new(RemotePluginHostOwner::new(
+        Arc::new(client),
+        TEST_WORKSPACE_ID.into(),
+    ));
     let host = f.host(owner.clone(), "remote-https").await;
     let id = host.context().invocation_id.clone();
     let result = f.invoke(host).await.unwrap();
     assert_eq!(result.output.summary, "HTTP response observed");
-    assert!(String::from_utf8(peer.observed().await).unwrap().starts_with("GET /status HTTP/1.1\r\n"));
-    let remote = owner.call(send(&id, PluginHttpMethod::Get, "status-v1")).await.unwrap();
+    assert!(
+        String::from_utf8(peer.observed().await)
+            .unwrap()
+            .starts_with("GET /status HTTP/1.1\r\n")
+    );
+    let remote = owner
+        .call(send(&id, PluginHttpMethod::Get, "status-v1"))
+        .await
+        .unwrap();
     let embedded = f.owner(Some(peer.transport())).await;
-    assert_eq!(embedded.call(send(&id, PluginHttpMethod::Get, "status-v1")).await.unwrap(), remote);
+    assert_eq!(
+        embedded
+            .call(send(&id, PluginHttpMethod::Get, "status-v1"))
+            .await
+            .unwrap(),
+        remote
+    );
     assert_eq!(f.count("plugin_effect_receipts"), 1);
     f.deny();
-    assert_denied(owner.call(send(&id, PluginHttpMethod::Get, "status-v1")).await);
-    assert_denied(embedded.call(send(&id, PluginHttpMethod::Get, "status-v1")).await);
+    assert_denied(
+        owner
+            .call(send(&id, PluginHttpMethod::Get, "status-v1"))
+            .await,
+    );
+    assert_denied(
+        embedded
+            .call(send(&id, PluginHttpMethod::Get, "status-v1"))
+            .await,
+    );
     assert_eq!(peer.connection_count(), 1);
-    server.0.abort(); let _ = (&mut server.0).await;
+    server.0.abort();
+    let _ = (&mut server.0).await;
+    f.shutdown().await;
+}
+
+async fn remote_owner_for(
+    f: &Fixture,
+    worker_id: &str,
+    workspace: &str,
+) -> (Arc<dyn PluginHostOwner>, ServerTask) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = build_router(f.api.clone());
+    let task = ServerTask(tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    }));
+    let client = server_api::ServerApiClient::builder(format!("http://{address}"))
+        .unwrap()
+        .client(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap(),
+        )
+        .authorizer(SignedAuthorizer {
+            signer: worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&f.identity),
+            worker_id: worker_id.into(),
+        })
+        .build()
+        .unwrap();
+    (
+        Arc::new(yoi_plugin_runtime::owner::RemotePluginHostOwner::new(
+            Arc::new(client),
+            workspace.into(),
+        )),
+        task,
+    )
+}
+
+fn prepare(f: &Fixture) -> PluginHostRequest {
+    PluginHostRequest::Prepare {
+        plan_id: f.plan.plan_id.clone(),
+        installation_id: f.installed.installation.installation_id.clone(),
+        tools: vec![f.tool.into()],
+    }
+}
+
+#[tokio::test]
+async fn pure_and_https_restore_prepare_rechecks_live_owner_without_consuming_calls_or_receipts() {
+    for https in [false, true] {
+        let peer = Peer::new(HOST, vec![]).await;
+        let f = Fixture::new(https.then(|| peer_binding(&peer))).await;
+        let embedded = f.owner(Some(peer.transport())).await;
+        let (remote, mut server) =
+            remote_owner_for(&f, &f.source.worker_id, TEST_WORKSPACE_ID).await;
+        for owner in [&embedded, &remote] {
+            assert_eq!(
+                owner.call(prepare(&f)).await.unwrap(),
+                PluginHostResponse::Authorized
+            );
+            owner
+                .prepare(
+                    f.plan.plan_id.clone(),
+                    f.installed.installation.installation_id.clone(),
+                    vec![f.tool.into()],
+                )
+                .await
+                .unwrap();
+            let mut expanded = prepare(&f);
+            if let PluginHostRequest::Prepare { tools, .. } = &mut expanded {
+                tools.push("not-selected".into());
+            }
+            assert_denied(owner.call(expanded).await);
+        }
+        f.api
+            .config_store
+            .plugin_plan_transition(
+                TEST_WORKSPACE_ID,
+                &f.plan.plan_id,
+                PlanPinState::Active,
+                PlanPinState::Restorable,
+            )
+            .unwrap();
+        for owner in [&embedded, &remote] {
+            assert_eq!(
+                owner.call(prepare(&f)).await.unwrap(),
+                PluginHostResponse::Authorized
+            );
+        }
+        f.deny();
+        for owner in [&embedded, &remote] {
+            assert_denied(owner.call(prepare(&f)).await);
+        }
+        set_policy(
+            &f.api,
+            &f.subject,
+            &f.installed.installation.installation_id,
+            true,
+        );
+        f.revoke();
+        for owner in [&embedded, &remote] {
+            assert_denied(owner.call(prepare(&f)).await);
+        }
+        assert_eq!(f.count("plugin_invocations"), 0);
+        assert_eq!(f.count("plugin_effect_receipts"), 0);
+        assert_eq!(peer.connection_count(), 0);
+        server.0.abort();
+        let _ = (&mut server.0).await;
+        f.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn prepare_unavailable_owner_foreign_workspace_and_unsigned_embedded_never_admit_or_consume()
+{
+    let f = Fixture::new(None).await;
+    let unsigned = plugin_host::EmbeddedPluginHostOwner::authenticated(
+        Arc::new(f.api.clone()),
+        TEST_WORKSPACE_ID.into(),
+        Arc::new(server_api::client_support::NoAuthorizer),
+    );
+    assert_denied(unsigned.call(prepare(&f)).await);
+    let (foreign, mut foreign_server) =
+        remote_owner_for(&f, &f.source.worker_id, "foreign-workspace").await;
+    assert!(foreign.call(prepare(&f)).await.is_err());
+    let embedded = f.owner(None).await;
+    let (remote, mut server) = remote_owner_for(&f, &f.source.worker_id, TEST_WORKSPACE_ID).await;
+    f.api
+        .config_store
+        .with_conn(|conn| {
+            conn.execute_batch("DROP TABLE plugin_execution_plans")?;
+            Ok(())
+        })
+        .unwrap();
+    for owner in [&embedded, &remote] {
+        assert_eq!(
+            owner.call(prepare(&f)).await.unwrap_err().code,
+            PluginHostErrorCode::Unavailable
+        );
+    }
+    assert_eq!(f.count("plugin_invocations"), 0);
+    assert_eq!(f.count("plugin_effect_receipts"), 0);
+    server.0.abort();
+    let _ = (&mut server.0).await;
+    foreign_server.0.abort();
+    let _ = (&mut foreign_server.0).await;
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn canonical_reserved_child_identity_and_prepare_match_live_owner_and_fence_lost_delegation()
+{
+    use server_api::authorization::WorkerDelegationRequest;
+    let f = Fixture::new(None).await;
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
+    store
+        .set_subject_permissions(
+            &f.subject,
+            &SubjectPermissionsUpdate {
+                operation_id: "delegate-plugin".into(),
+                expected_change_id: Some(previous.change_id),
+                execution: previous.execution.clone(),
+                delegation: previous.execution.clone(),
+            },
+        )
+        .unwrap();
+    let request = WorkerDelegationRequest {
+        permissions: previous.execution,
+        redelegation: vec![],
+    };
+    let grant = subject_authorization::prepare_delegation(
+        &f.api,
+        &f.source,
+        Some(&request),
+        &f.source.runtime_id,
+        PROFILE,
+        "profile-digest",
+        None,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    let memory = f
+        .api
+        .config_store
+        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+        .unwrap();
+    let reserved = f
+        .api
+        .config_store
+        .reserve_worker_create(
+            TEST_WORKSPACE_ID,
+            &f.source.runtime_id,
+            "prepare-child",
+            "sha256:reserved-child",
+            None,
+            &memory,
+        )
+        .unwrap();
+    assert!(
+        f.api
+            .plugin_reserved_execution_identity(&f.source.runtime_id, &reserved, Some(&grant))
+            .is_err(),
+        "unbound delegation must not become an ordinary Worker"
+    );
+    subject_authorization::bind_reserved_grant(&f.api, &grant, &reserved.worker_id.to_string())
+        .unwrap();
+    let child = RuntimeWorkerRef::new(&f.source.runtime_id, reserved.worker_id.to_string());
+    assert!(f.api.runtime.worker(&child).is_err());
+    let identity = f
+        .api
+        .plugin_reserved_execution_identity(&child.runtime_id, &reserved, Some(&grant))
+        .unwrap();
+    let mut forged = reserved.clone();
+    forged.create_fingerprint.push_str("different");
+    assert!(
+        f.api
+            .plugin_reserved_execution_identity(&child.runtime_id, &forged, Some(&grant))
+            .is_err()
+    );
+    let state = f
+        .api
+        .config_store
+        .load_workspace_config(TEST_WORKSPACE_ID)
+        .unwrap()
+        .unwrap();
+    let plan = f
+        .api
+        .config_store
+        .with_immediate_transaction(|tx| {
+            let plan = crate::plugin_settings::resolve_worker_plugin_plan(
+                tx,
+                TEST_WORKSPACE_ID,
+                &state.snapshot.digest,
+                PROFILE,
+                identity.clone(),
+            )?;
+            crate::plugin_plan::plugin_plan_create(tx, "fixture-host", "child-plan", &plan)
+        })
+        .unwrap();
+    let embedded = Arc::new(plugin_host::EmbeddedPluginHostOwner::authenticated(
+        Arc::new(f.api.clone()),
+        TEST_WORKSPACE_ID.into(),
+        Arc::new(SignedAuthorizer {
+            signer: worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&f.identity),
+            worker_id: child.worker_id.clone(),
+        }),
+    )) as Arc<dyn PluginHostOwner>;
+    let (remote, mut server) = remote_owner_for(&f, &child.worker_id, TEST_WORKSPACE_ID).await;
+    let preflight = PluginHostRequest::Prepare {
+        plan_id: plan.plan_id,
+        installation_id: f.installed.installation.installation_id.clone(),
+        tools: vec![f.tool.into()],
+    };
+    for owner in [&embedded, &remote] {
+        assert_eq!(
+            owner.call(preflight.clone()).await.unwrap(),
+            PluginHostResponse::Authorized
+        );
+    }
+    // Only unrelated Worker execution/summary is substituted by this fixture.
+    // The identity, reservation, signed proof and delegation checks stay real.
+    let mut summary = f.api.runtime.worker(&f.source).unwrap();
+    summary.worker.worker_id = child.worker_id.clone();
+    summary.singleton_key = None;
+    f.runtime.workers.lock().unwrap().push(summary);
+    assert_eq!(
+        f.api.plugin_execution_identity(&child).await.unwrap(),
+        identity
+    );
+    f.deny();
+    assert!(
+        f.api
+            .plugin_reserved_execution_identity(&child.runtime_id, &reserved, Some(&grant))
+            .is_err()
+    );
+    for owner in [&embedded, &remote] {
+        assert_denied(owner.call(preflight.clone()).await);
+    }
+    assert_eq!(f.count("plugin_invocations"), 0);
+    assert_eq!(f.count("plugin_effect_receipts"), 0);
+    server.0.abort();
+    let _ = (&mut server.0).await;
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn reserved_job_without_canonical_job_binding_cannot_fall_back_to_ordinary_identity() {
+    let f = Fixture::new(None).await;
+    let memory = f
+        .api
+        .config_store
+        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+        .unwrap();
+    let reserved = f
+        .api
+        .config_store
+        .reserve_worker_create(
+            TEST_WORKSPACE_ID,
+            &f.source.runtime_id,
+            &crate::backend_job::allocation_key("not-bound-attempt"),
+            "sha256:unbound-job",
+            None,
+            &memory,
+        )
+        .unwrap();
+    assert!(
+        f.api
+            .plugin_reserved_execution_identity(&f.source.runtime_id, &reserved, None)
+            .is_err()
+    );
+    assert_eq!(f.count("plugin_invocations"), 0);
+    assert_eq!(f.count("plugin_effect_receipts"), 0);
     f.shutdown().await;
 }

@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginHostRequest {
+    /// Fresh export/restore admission only; issues no invocation or effect identity.
+    Prepare {
+        plan_id: String,
+        installation_id: String,
+        tools: Vec<String>,
+    },
     Begin {
         plan_id: String,
         installation_id: String,

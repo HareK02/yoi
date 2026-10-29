@@ -21,6 +21,27 @@ use tokio::time::Instant;
 pub trait PluginHostOwner: Send + Sync {
     async fn call(&self, request: PluginHostRequest)
     -> Result<PluginHostResponse, PluginHostError>;
+
+    /// Recheck export/restore admission without inventing or consuming a Tool call.
+    /// Success is a current observation, never a reusable execution capability.
+    async fn prepare(
+        &self,
+        plan_id: String,
+        installation_id: String,
+        tools: Vec<String>,
+    ) -> Result<(), PluginHostError> {
+        match self
+            .call(PluginHostRequest::Prepare {
+                plan_id,
+                installation_id,
+                tools,
+            })
+            .await?
+        {
+            PluginHostResponse::Authorized => Ok(()),
+            _ => Err(protocol_error(false)),
+        }
+    }
 }
 
 /// Uses an injected, already configured generated client (including its existing
@@ -537,6 +558,7 @@ mod tests {
                 });
             }
             Ok(match request {
+                PluginHostRequest::Prepare { .. } => PluginHostResponse::Authorized,
                 PluginHostRequest::Begin { .. } => PluginHostResponse::Invocation {
                     invocation_id: "owner-issued".into(),
                     expires_at_ms: i64::try_from(
