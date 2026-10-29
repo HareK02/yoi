@@ -17,6 +17,7 @@ pub mod job;
 mod metadata_lifecycle;
 pub mod model_client;
 mod paste_artifact_tool;
+pub mod plugin;
 pub mod profile_manifest;
 pub mod prompt;
 #[cfg(test)]

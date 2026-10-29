@@ -3057,6 +3057,7 @@ mod tests {
         let profile = ProfileSelector::Builtin("builtin:coder".to_string());
         let bundle = test_bundle(profile.clone());
         CreateWorkerRequest {
+            plugin_execution: None,
             worker_id: WorkerId::now_v7(),
             create_fingerprint: "test-create".to_string(),
             profile,
@@ -5024,6 +5025,7 @@ mod ws_tests {
     fn ws_create_request() -> CreateWorkerRequest {
         let bundle = ws_test_bundle(ProfileSelector::Builtin("builtin:companion".to_string()));
         CreateWorkerRequest {
+            plugin_execution: None,
             worker_id: WorkerId::now_v7(),
             create_fingerprint: "test-create".to_string(),
             profile: ProfileSelector::Builtin("builtin:companion".to_string()),

@@ -2,8 +2,11 @@
 //! Component. Execution/Host side effects are intentionally outside this boundary.
 use super::*;
 use crate::store::{ControlPlaneStore, SqliteWorkspaceStore, WorkspaceRecord};
+use manifest::plugin;
 use rusqlite::{Connection, TransactionBehavior, params};
+use serde_json::Value;
 use server_api::*;
+use sha2::{Digest, Sha256};
 use std::fs;
 use tempfile::{TempDir, tempdir};
 
@@ -111,7 +114,17 @@ fn package(version: &str) -> Vec<u8> {
         .bytes
 }
 fn digest(seed: &str) -> String {
-    hash_bytes(seed.as_bytes())
+    let hex: String = Sha256::digest(seed.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("sha256:{hex}")
+}
+// Exercise untrusted serialized snapshots without exposing mutable pin internals.
+fn with_pin_field(pin: &WorkerPluginPin, field: &str, value: Value) -> WorkerPluginPin {
+    let mut wire = serde_json::to_value(pin).unwrap();
+    wire[field] = value;
+    serde_json::from_value(wire).unwrap()
 }
 fn projection() -> PluginPinProjection {
     PluginPinProjection {
@@ -202,13 +215,25 @@ async fn canonical_order_and_fingerprint_bind_all_provenance_and_both_digests() 
     changed.execution.delegation_id = Some("different".into());
     changes.push(changed);
     let mut changed = base.clone();
-    changed.plugins[0].package_digest = digest("new package");
+    changed.plugins[0] = with_pin_field(
+        &changed.plugins[0],
+        "package_digest",
+        digest("new package").into(),
+    );
     changes.push(changed);
     let mut changed = base.clone();
-    changed.plugins[0].artifact_digest = digest("new artifact");
+    changed.plugins[0] = with_pin_field(
+        &changed.plugins[0],
+        "artifact_digest",
+        digest("new artifact").into(),
+    );
     changes.push(changed);
     let mut changed = base;
-    changed.plugins[0].expected_last_operation = "new observation".into();
+    changed.plugins[0] = with_pin_field(
+        &changed.plugins[0],
+        "expected_last_operation",
+        "new observation".into(),
+    );
     changes.push(changed);
     for changed in changes {
         assert_ne!(
@@ -220,7 +245,7 @@ async fn canonical_order_and_fingerprint_bind_all_provenance_and_both_digests() 
         );
     }
     error(
-        WorkerPluginExecutionPlan::canonicalize(input(vec![pin(&a), pin(&a)])),
+        WorkerPluginExecutionPlan::canonicalize(input(vec![pin(&a), pin(&a)])).map_err(Into::into),
         PluginCatalogError::Invalid,
     );
 }
@@ -326,7 +351,7 @@ async fn create_replay_is_immutable_across_restart_and_rejects_changed_input() {
             .pin_state,
         PlanPinState::Active
     );
-    let mut changed = plan.input.clone();
+    let mut changed = plan.input().clone();
     changed.profile.projection_digest = digest("new profile");
     error(
         reopened.plugin_plan_create(
@@ -541,10 +566,14 @@ async fn owner_savepoint_and_outer_transaction_rollback_leave_no_partial_plan_or
     let f = Fixture::new().await;
     let first = f.install("one");
     let second = f.install("two");
-    let mut bad_input = f.configure(&[&first, &second]).input;
+    let mut bad_input = f.configure(&[&first, &second]).input().clone();
     let mut pins = bad_input.plugins.clone();
-    pins.sort_by(|a, b| a.installation_id.cmp(&b.installation_id));
-    pins[1].artifact_size += 1;
+    pins.sort_by(|a, b| a.installation_id().cmp(b.installation_id()));
+    pins[1] = with_pin_field(
+        &pins[1],
+        "artifact_size",
+        (pins[1].artifact_size() + 1).into(),
+    );
     bad_input.plugins = pins;
     let bad_plan = WorkerPluginExecutionPlan::canonicalize(bad_input).unwrap();
     f.store
@@ -583,7 +612,7 @@ async fn cross_workspace_and_exact_digest_mismatches_fail_without_retaining_refe
     let f = Fixture::new().await;
     let installed = f.install("one");
     let base = f.configure(&[&installed]);
-    let mut other_workspace = base.input.clone();
+    let mut other_workspace = base.input().clone();
     other_workspace.workspace_id = "b".into();
     error(
         f.store.plugin_plan_create(
@@ -594,11 +623,19 @@ async fn cross_workspace_and_exact_digest_mismatches_fail_without_retaining_refe
         PluginCatalogError::NotFound,
     );
     for change_package in [true, false] {
-        let mut changed = base.input.clone();
+        let mut changed = base.input().clone();
         if change_package {
-            changed.plugins[0].package_digest = digest("wrong-package");
+            changed.plugins[0] = with_pin_field(
+                &changed.plugins[0],
+                "package_digest",
+                digest("wrong-package").into(),
+            );
         } else {
-            changed.plugins[0].artifact_digest = digest("wrong-artifact");
+            changed.plugins[0] = with_pin_field(
+                &changed.plugins[0],
+                "artifact_digest",
+                digest("wrong-artifact").into(),
+            );
         }
         let result = f.store.plugin_plan_create(
             "actor",
@@ -749,8 +786,8 @@ impl SqliteWorkspaceStore {
         let two = f.install("migration-two");
         let plan = f.configure(&[&one, &two]);
         assert_ne!(
-            plan.plugins()[0].package_digest,
-            plan.plugins()[0].artifact_digest
+            plan.plugins()[0].package_digest(),
+            plan.plugins()[0].artifact_digest()
         );
         let mut receipts = Vec::new();
         for (key, state) in [

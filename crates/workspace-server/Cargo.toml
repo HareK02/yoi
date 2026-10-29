@@ -26,7 +26,7 @@ workspace-drive.workspace = true
 subjektiv.workspace = true
 flow = { path = "../flow" }
 manifest.workspace = true
-yoi-plugin-runtime = { path = "../plugin-runtime" }
+plugin-plan.workspace = true
 job.workspace = true
 protocol = { workspace = true }
 runtime-api.workspace = true

@@ -517,6 +517,7 @@ pub struct WorkerControlOperation {
 pub struct WorkerCreateBinding {
     pub worker_id: EmbeddedWorkerId,
     pub create_fingerprint: String,
+    pub plugin_execution: Option<runtime_api::PluginExecutionSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -6130,6 +6131,7 @@ fn runtime_create_worker_request(
         worker_observation_grants: request.resolved_worker_observation_grants.clone(),
         workspace_api: Some(workspace_api),
         memory_settings: request.resolved_memory_settings.clone(),
+        plugin_execution: binding.plugin_execution,
         subjektiv_attached: request.resolved_subjektiv_attached,
         backend_job: match &request.intent {
             WorkerSpawnIntent::BackendJob {
@@ -7247,6 +7249,7 @@ mod tests {
 
     fn test_create_binding() -> WorkerCreateBinding {
         WorkerCreateBinding {
+            plugin_execution: None,
             worker_id: EmbeddedWorkerId::now_v7(),
             create_fingerprint: "sha256:test-create".to_string(),
         }

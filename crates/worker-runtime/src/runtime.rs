@@ -1242,6 +1242,7 @@ impl Runtime {
             })?;
             if existing_request.create_fingerprint != request.create_fingerprint
                 || existing_request.backend_job != request.backend_job
+                || existing_request.plugin_execution != request.plugin_execution
             {
                 return Err(RuntimeError::InvalidRequest(format!(
                     "worker {} was already created with a different fingerprint",
@@ -1427,6 +1428,7 @@ impl Runtime {
                 })?;
                 if existing_request.create_fingerprint != request.create_fingerprint
                     || existing_request.backend_job != request.backend_job
+                    || existing_request.plugin_execution != request.plugin_execution
                 {
                     return Err(RuntimeError::InvalidRequest(format!(
                         "worker {} was already created with a different fingerprint",
@@ -7428,6 +7430,21 @@ fn validate_logical_workdir_attachments(
 }
 
 fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), RuntimeError> {
+    if let Some(snapshot) = &request.plugin_execution {
+        let valid = snapshot.plan.validate_canonical().is_ok()
+            && snapshot.plan.fingerprint().ok().as_ref() == Some(&snapshot.fingerprint)
+            && !snapshot.plan_id.is_empty()
+            && snapshot.plan.execution().worker_id == request.worker_id.to_string()
+            && request
+                .workspace_api
+                .as_ref()
+                .is_some_and(|api| api.workspace_id == snapshot.plan.workspace_id());
+        if !valid {
+            return Err(RuntimeError::InvalidRequest(
+                "Plugin execution snapshot does not match this Worker launch".into(),
+            ));
+        }
+    }
     if let Some(binding) = &request.backend_job {
         binding
             .validate()
@@ -8239,6 +8256,7 @@ mod tests {
         let profile = ProfileSelector::Builtin("builtin:coder".to_string());
         let bundle = test_bundle_for_profile(profile.clone());
         CreateWorkerRequest {
+            plugin_execution: None,
             worker_id: WorkerId::now_v7(),
             create_fingerprint: "test-create".to_string(),
             profile,

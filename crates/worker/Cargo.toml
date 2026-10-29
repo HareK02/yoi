@@ -15,6 +15,7 @@ agen = { workspace = true, features = ["codex"] }
 session-store = { workspace = true }
 secrets = { workspace = true }
 manifest = { workspace = true }
+yoi-plugin-runtime = { path = "../plugin-runtime" }
 job = { workspace = true }
 mcp = { workspace = true }
 protocol = { workspace = true, features = ["json-schema"] }

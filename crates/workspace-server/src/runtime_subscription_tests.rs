@@ -51,6 +51,7 @@ const TOKEN: &str = "runtime-subscription-test-token";
 
 fn create_request(name: &str) -> CreateWorkerRequest {
     CreateWorkerRequest {
+        plugin_execution: None,
         worker_id: WorkerId::now_v7(),
         create_fingerprint: "test-create".to_string(),
         profile: ProfileSelector::Builtin("builtin:companion".to_string()),

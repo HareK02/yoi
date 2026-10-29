@@ -112,10 +112,10 @@ pub fn plugin_plan_create(
             plugin_catalog::plugin_artifact_admit(
                 tx,
                 plan.workspace_id(),
-                &pin.installation_id,
-                &pin.expected_last_operation,
-                &pin.package_digest,
-                &pin.artifact_digest,
+                pin.installation_id(),
+                pin.expected_last_operation(),
+                pin.package_digest(),
+                pin.artifact_digest(),
             )?;
         }
         crate::plugin_settings::validate_plan_source(tx, plan)?;
@@ -128,10 +128,10 @@ pub fn plugin_plan_create(
             let artifact = plugin_catalog::plugin_artifact_admit(
                 tx,
                 plan.workspace_id(),
-                &pin.installation_id,
-                &pin.expected_last_operation,
-                &pin.package_digest,
-                &pin.artifact_digest,
+                pin.installation_id(),
+                pin.expected_last_operation(),
+                pin.package_digest(),
+                pin.artifact_digest(),
             )?;
             if !pin.matches_artifact(&artifact)? {
                 return conflict();
@@ -142,10 +142,10 @@ pub fn plugin_plan_create(
                 &PluginReference {
                     kind: PluginReferenceKind::Pending,
                     owner: plan_id.clone(),
-                    installation_id: pin.installation_id.clone(),
-                    expected_last_operation: pin.expected_last_operation.clone(),
-                    package_digest: pin.package_digest.clone(),
-                    artifact_digest: pin.artifact_digest.clone(),
+                    installation_id: pin.installation_id().to_owned(),
+                    expected_last_operation: pin.expected_last_operation().to_owned(),
+                    package_digest: pin.package_digest().to_owned(),
+                    artifact_digest: pin.artifact_digest().to_owned(),
                 },
             )?;
         }
@@ -233,7 +233,7 @@ pub fn plugin_plan_transition(
             for pin in saved.plan.plugins() {
                 let operation: String = tx.query_row(
                     "SELECT last_operation FROM plugin_installations WHERE workspace_id=?1 AND installation_id=?2",
-                    params![workspace, pin.installation_id], |row| row.get(0),
+                    params![workspace, pin.installation_id()], |row| row.get(0),
                 )?;
                 plugin_catalog::plugin_reference_put(
                     tx,
@@ -241,10 +241,10 @@ pub fn plugin_plan_transition(
                     &PluginReference {
                         kind,
                         owner: plan_id.into(),
-                        installation_id: pin.installation_id.clone(),
+                        installation_id: pin.installation_id().to_owned(),
                         expected_last_operation: operation,
-                        package_digest: pin.package_digest.clone(),
-                        artifact_digest: pin.artifact_digest.clone(),
+                        package_digest: pin.package_digest().to_owned(),
+                        artifact_digest: pin.artifact_digest().to_owned(),
                     },
                 )?;
             }
@@ -256,8 +256,8 @@ pub fn plugin_plan_transition(
                     workspace,
                     kind,
                     plan_id,
-                    &pin.installation_id,
-                    &pin.artifact_digest,
+                    pin.installation_id(),
+                    pin.artifact_digest(),
                 )?;
             }
         }

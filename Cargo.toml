@@ -17,6 +17,7 @@ members = [
     "crates/runtime-api",
     "crates/server-api",
     "crates/plugin-pdk",
+    "crates/plugin-plan",
     "crates/plugin-runtime",
     "crates/yoi",
     "crates/protocol",
@@ -58,6 +59,7 @@ default-members = [
     "crates/runtime-api",
     "crates/server-api",
     "crates/plugin-pdk",
+    "crates/plugin-plan",
     "crates/plugin-runtime",
     "crates/yoi",
     "crates/protocol",
@@ -122,6 +124,7 @@ project-record = { path = "crates/project-record" }
 worker = { path = "crates/worker" }
 worker-runtime = { path = "crates/worker-runtime" }
 yoi-plugin-pdk = { path = "crates/plugin-pdk" }
+plugin-plan = { path = "crates/plugin-plan" }
 yoi = { path = "crates/yoi" }
 protocol = { path = "crates/protocol" }
 session-metrics = { path = "crates/session-metrics" }

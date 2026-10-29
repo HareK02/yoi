@@ -67,6 +67,7 @@ fn resolved() -> manifest::WorkerManifest {
 
 fn request() -> CreateWorkerRequest {
     CreateWorkerRequest {
+        plugin_execution: None,
         worker_id: worker_id(),
         create_fingerprint: "new-create-fingerprint".into(),
         profile: ProfileSelector::Builtin("default".into()),

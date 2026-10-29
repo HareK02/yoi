@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 api-macros = { workspace = true, features = ["reqwest", "axum"] }
 manifest.workspace = true
+plugin-plan = { path = "../plugin-plan" }
 protocol.workspace = true
 session-store.workspace = true
 serde = { workspace = true, features = ["derive"] }

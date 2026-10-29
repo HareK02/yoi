@@ -564,6 +564,7 @@ pub fn resolve_worker_plugin_plan(
         execution,
         plugins: project_profile_plugins(&resolved, &profile.manifest.plugins)?,
     })
+    .map_err(Into::into)
 }
 
 fn resolve_profile(

@@ -122,6 +122,44 @@ pub struct PluginArtifact {
     pub revocation_reason: Option<String>,
 }
 
+impl plugin_plan::ArtifactDescriptor for PluginArtifact {
+    fn artifact_identity(&self) -> plugin_plan::ArtifactIdentityProjection {
+        plugin_plan::ArtifactIdentityProjection {
+            package_id: self.package_id.clone(),
+            version: self.version.clone(),
+            package_digest: self.package_digest.clone(),
+            artifact_digest: self.artifact_digest.clone(),
+            artifact_size: self.artifact_size,
+            schema_version: self.schema_version,
+            world: self.world.clone(),
+            required_imports: self.required_imports.clone(),
+            tools: self.tools.iter().map(|tool| tool.name.clone()).collect(),
+            connections: self
+                .connections
+                .iter()
+                .map(|slot| slot.name.clone())
+                .collect(),
+            requested_grants: self
+                .requested_grants
+                .iter()
+                .map(|grant| match grant {
+                    PluginGrantMetadata::Logging => plugin_plan::PluginGrant::Logging,
+                    PluginGrantMetadata::Https { slot } => {
+                        plugin_plan::PluginGrant::Https { slot: slot.clone() }
+                    }
+                })
+                .collect(),
+            config_schema: plugin_plan::PluginSchemaIdentity {
+                identity: self.config_schema.identity.clone(),
+                version: self.config_schema.version.clone(),
+                digest: self.config_schema.digest.clone(),
+                namespace: self.config_schema.namespace.clone(),
+            },
+            revoked: self.revoked,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]

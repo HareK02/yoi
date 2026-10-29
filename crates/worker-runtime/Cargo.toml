@@ -37,6 +37,7 @@ flow = { path = "../flow" }
 fs4 = { workspace = true, optional = true }
 manifest.workspace = true
 yoi-plugin-runtime = { path = "../plugin-runtime" }
+plugin-plan = { path = "../plugin-plan" }
 libc.workspace = true
 protocol.workspace = true
 runtime-api.workspace = true

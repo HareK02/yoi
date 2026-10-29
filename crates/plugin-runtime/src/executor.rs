@@ -91,6 +91,11 @@ impl CompiledTool {
     pub fn identity(&self) -> &ArtifactIdentity {
         &self.identity
     }
+
+    /// Declarations from the verified immutable package, not execution grants.
+    pub fn tools(&self) -> &[PluginToolManifest] {
+        &self.manifest.tools
+    }
 }
 
 #[derive(Debug)]

@@ -431,6 +431,17 @@ pub struct BackendJobExecutionBinding {
     pub subjektiv_journal: bool,
 }
 
+/// Server-authored immutable launch input, retained unchanged across restoration.
+/// A snapshot fixes selection and ceilings; each preparation and invocation must
+/// still consult the current owner. No credential or cache location is serialized.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginExecutionSnapshot {
+    pub plan_id: String,
+    pub fingerprint: String,
+    pub plan: plugin_plan::WorkerPluginExecutionPlan,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CreateWorkerRequest {
     pub worker_id: WorkerId,
@@ -458,6 +469,8 @@ pub struct CreateWorkerRequest {
     pub workspace_api: Option<WorkspaceApiRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_execution: Option<PluginExecutionSnapshot>,
     /// Backend-attested subject or consolidation attachment. Profile policy alone
     /// never activates subjektiv for an ordinary Workspace Worker.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

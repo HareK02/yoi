@@ -48,10 +48,10 @@ mod drive;
 mod drive_grants;
 #[path = "server_plugin.rs"]
 mod plugin;
-#[path = "server_plugin_host.rs"]
-mod plugin_host;
 #[path = "server_plugin_delivery.rs"]
 mod plugin_delivery;
+#[path = "server_plugin_host.rs"]
+mod plugin_host;
 pub use plugin_delivery::InProcessPluginArtifactSource;
 #[path = "server_workspace_config.rs"]
 mod workspace_config;
@@ -6066,6 +6066,7 @@ impl WorkspaceApi {
         request.resolved_memory_settings = Some(reservation.memory_settings);
         let reservation_fingerprint = reservation.create_fingerprint.clone();
         let create_binding = WorkerCreateBinding {
+            plugin_execution: None,
             worker_id,
             create_fingerprint: reservation.create_fingerprint,
         };
@@ -43498,6 +43499,7 @@ mod tests {
 
     fn test_create_binding() -> WorkerCreateBinding {
         WorkerCreateBinding {
+            plugin_execution: None,
             worker_id: WorkerId::now_v7(),
             create_fingerprint: "sha256:test-create".to_string(),
         }
@@ -52175,6 +52177,7 @@ mod tests {
             .create_worker_scoped(
                 &worker_runtime::RuntimeWorkspaceScope::new(TEST_WORKSPACE_ID, "embedded-backend"),
                 worker_runtime::catalog::CreateWorkerRequest {
+                    plugin_execution: None,
                     worker_id: binding.worker_id,
                     create_fingerprint: binding.create_fingerprint,
                     profile: ProfileSelector::Builtin(request.profile.clone()),
@@ -65670,6 +65673,7 @@ mod tests {
         let mut memory_settings = test_worker_memory_settings();
         memory_settings.workspace_id = "local".to_owned();
         worker_runtime::catalog::CreateWorkerRequest {
+            plugin_execution: None,
             worker_id: WorkerId::now_v7(),
             create_fingerprint: "test-create".to_string(),
             profile: worker_runtime::catalog::ProfileSelector::Builtin(

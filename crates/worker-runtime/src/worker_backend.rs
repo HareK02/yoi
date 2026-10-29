@@ -825,6 +825,7 @@ type SpawnModelClientFactory =
 #[derive(Clone)]
 pub struct ProfileRuntimeWorkerFactory {
     spawn_model_client_factory: Option<SpawnModelClientFactory>,
+    plugin_runtime: Option<Arc<dyn crate::plugin::PluginToolRuntime>>,
     observation_hub: Arc<RuntimeWorkerObservationHub>,
     profile_base_dir: PathBuf,
     worker_aggregate_root: Option<PathBuf>,
@@ -949,6 +950,7 @@ impl ProfileRuntimeWorkerFactory {
         let profile_base_dir = profile_base_dir.into();
         Self {
             spawn_model_client_factory: None,
+            plugin_runtime: None,
             observation_hub: Arc::new(RuntimeWorkerObservationHub::default()),
             profile_base_dir,
             worker_aggregate_root: None,
@@ -988,6 +990,16 @@ impl ProfileRuntimeWorkerFactory {
         self.runtime_id = Some(identity.identity_id.clone());
         self.worker_mutation_identity = Some(identity);
         self.embedded_worker_mutation_dispatcher = None;
+        self
+    }
+
+    /// Bind process-owned Plugin composition. Profile selection without this
+    /// service fails closed; no ambient or offline fallback is available.
+    pub fn with_plugin_runtime(
+        mut self,
+        runtime: Arc<dyn crate::plugin::PluginToolRuntime>,
+    ) -> Self {
+        self.plugin_runtime = Some(runtime);
         self
     }
 
@@ -2125,6 +2137,23 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             }
         })?;
         let worker = prepared.worker_mut();
+        if let Some(snapshot) = &request.request.plugin_execution {
+            if self.runtime_id.as_deref() != Some(snapshot.plan.execution().runtime_id.as_str()) {
+                return Err("Plugin plan Runtime identity mismatch".into());
+            }
+            let runtime = self
+                .plugin_runtime
+                .as_ref()
+                .ok_or("Plugin runtime provider unavailable")?;
+            let tools = runtime
+                .prepare(
+                    &request.worker_ref,
+                    snapshot,
+                    &worker.session_id().to_string(),
+                )
+                .await?;
+            worker.bind_plugin_tools(tools);
+        }
         if let Some(binding) = request.request.backend_job.as_ref() {
             worker
                 .bind_backend_job(binding.clone())
@@ -2932,6 +2961,27 @@ impl ProfileRuntimeWorkerFactory {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Err("restore run artifacts cannot be inspected"),
+            }
+            if let Some(snapshot) = &request.request.plugin_execution {
+                if self.runtime_id.as_deref() != Some(snapshot.plan.execution().runtime_id.as_str())
+                {
+                    return Err("Plugin plan Runtime identity mismatch");
+                }
+                let runtime = self
+                    .plugin_runtime
+                    .as_ref()
+                    .ok_or("Plugin runtime provider unavailable")?;
+                let tools = runtime
+                    .prepare(
+                        &request.worker_ref,
+                        snapshot,
+                        &candidate.session_id().to_string(),
+                    )
+                    .await
+                    .map_err(|_| "Plugin restore preparation refused or unavailable")?;
+                candidate
+                    .bind_plugin_tools(tools)
+                    .map_err(|_| "restored Plugin binding failed")?;
             }
             let prepared = candidate
                 .prepare_runtime_controller(
@@ -10430,6 +10480,7 @@ mod tests {
     fn create_request(_name: &str) -> CreateWorkerRequest {
         let bundle = test_bundle();
         CreateWorkerRequest {
+            plugin_execution: None,
             worker_id: WorkerId::now_v7(),
             create_fingerprint: "test-create".to_string(),
             profile: ProfileSelector::Builtin("builtin:companion".to_string()),

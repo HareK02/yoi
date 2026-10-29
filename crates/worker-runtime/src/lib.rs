@@ -14,6 +14,7 @@ pub mod identity;
 pub mod interaction;
 pub mod management;
 pub mod observation;
+pub mod plugin;
 pub mod profile_archive;
 pub mod resource;
 #[cfg(feature = "restore-checkpoints")]

@@ -1544,6 +1544,18 @@ where
     } else {
         (FeatureRegistryBuilder::new(), None)
     };
+    match worker.plugin_tools() {
+        Some(tools) => {
+            feature_registry.add_module(tools);
+        }
+        None if !worker.manifest().plugins.is_empty() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Plugin selection requires a persisted plan and current Host preparation",
+            ));
+        }
+        None => {}
+    }
     feature_registry
         .add_module(crate::feature::builtin::chat_invocation::AttachmentInvocationFeature);
     if let Some(binding) = backend_job.as_ref() {

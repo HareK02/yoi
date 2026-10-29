@@ -4232,6 +4232,21 @@ where
         &self.worker().manifest
     }
 
+    /// Stable Session identity used to correlate restored Plugin Tool calls.
+    pub fn session_id(&self) -> SessionId {
+        self.worker().session_id()
+    }
+
+    /// Bind exact Host-prepared contributions without exposing execution or
+    /// reopening a candidate whose cleanup has begun.
+    pub fn bind_plugin_tools(
+        &mut self,
+        tools: crate::plugin::PluginToolsFeature,
+    ) -> Result<(), WorkerError> {
+        self.worker_mut()?.bind_plugin_tools(tools);
+        Ok(())
+    }
+
     /// Retain the same Workdir resource owner for explicit cleanup, including
     /// after discard fails. This does not grant Worker input or execution access.
     pub fn workdir_cleanup(&self) -> RestoreCandidateWorkdirCleanup {
@@ -4485,6 +4500,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// Host-owned projection of Worker sessions explicitly granted to this Worker.
     /// The provider reauthorizes every capture and never derives authority from model input.
     worker_observation_provider: Option<Arc<dyn WorkerObservationProvider>>,
+    plugin_tools: Option<crate::plugin::PluginToolsFeature>,
     /// Parsed system-prompt template awaiting first-turn materialisation.
     /// Retained until the complete initial seed and active metadata are durable.
     system_prompt_template: Option<SystemPromptTemplate>,
@@ -4853,6 +4869,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             tracker: None,
             task_feature: TaskFeature::new(),
             worker_observation_provider: None,
+            plugin_tools: None,
             system_prompt_template: None,
             feature_instructions: Vec::new(),
             alerter: None,
@@ -5365,6 +5382,16 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             }
             crate::feature::FeatureInstallation::Restore => Ok(()),
         }
+    }
+
+    /// Bind Host-prepared exact Plugin contributions before controller start.
+    /// This handle is never persisted in a Manifest or inherited by a SubWorker.
+    pub fn bind_plugin_tools(&mut self, tools: crate::plugin::PluginToolsFeature) {
+        self.plugin_tools = Some(tools);
+    }
+
+    pub(crate) fn plugin_tools(&self) -> Option<crate::plugin::PluginToolsFeature> {
+        self.plugin_tools.clone()
     }
 
     /// Install enabled feature modules into the Worker host surfaces.
@@ -9579,6 +9606,7 @@ where
             tracker: None,
             task_feature: TaskFeature::new(),
             worker_observation_provider: None,
+            plugin_tools: None,
             system_prompt_template: common.system_prompt_template,
             feature_instructions: common.feature_instructions,
             alerter: None,
@@ -9987,6 +10015,7 @@ where
             tracker: None,
             task_feature: TaskFeature::new(),
             worker_observation_provider: None,
+            plugin_tools: None,
             system_prompt_template: common.system_prompt_template,
             feature_instructions: common.feature_instructions,
             alerter: None,
@@ -10452,6 +10481,7 @@ where
             tracker: None,
             task_feature,
             worker_observation_provider: None,
+            plugin_tools: None,
             // Restore replays the saved system_prompt verbatim — no
             // template re-render on resume.
             system_prompt_template: None,
