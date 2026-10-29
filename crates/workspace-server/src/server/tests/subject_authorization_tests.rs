@@ -7,6 +7,8 @@
 use super::*;
 #[path = "subject_job_model_supply_tests.rs"]
 mod subject_job_model_supply;
+#[path = "ticket_worker_messaging_connected_tests.rs"]
+mod ticket_worker_messaging_connected;
 #[path = "worker_messaging_connected_tests.rs"]
 mod worker_messaging_connected;
 #[path = "worker_operation_authorization_tests.rs"]
