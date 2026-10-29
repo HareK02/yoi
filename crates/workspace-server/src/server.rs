@@ -49,6 +49,9 @@ mod drive;
 mod drive_grants;
 #[path = "server_plugin.rs"]
 mod plugin;
+#[path = "server_plugin_delivery.rs"]
+mod plugin_delivery;
+pub use plugin_delivery::InProcessPluginArtifactSource;
 #[path = "server_workspace_config.rs"]
 mod workspace_config;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -7656,6 +7659,7 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(plugin::router(service.clone()))
+        .merge(plugin_delivery::router(service.clone()))
         .merge(server_api::server_api_axum::current_worker_workspace_config_get(service.clone()))
         .merge(server_api::server_api_axum::current_worker_workspace_config_attach(service.clone()))
         .merge(
@@ -13584,6 +13588,27 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn plugin_artifact_authorize(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::PluginArtifactDeliveryRequest,
+    ) -> std::result::Result<
+        server_api::PluginArtifactDeliveryMetadata,
+        server_api::RepositoryApiError,
+    > {
+        plugin_delivery::authorize(self.workspace_api()?, context, workspace_id, request).await
+    }
+
+    async fn plugin_artifact_pull(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::PluginArtifactDeliveryRequest,
+    ) -> std::result::Result<server_api::BinaryBody, server_api::RepositoryApiError> {
+        plugin_delivery::pull(self.workspace_api()?, context, workspace_id, request).await
     }
 
     async fn plugin_upload(
@@ -38739,6 +38764,10 @@ mod tests {
 
     mod ticket_case_signed_tests {
         include!("server_ticket_case_signed_tests.rs");
+    }
+
+    mod plugin_delivery_tests {
+        include!("server_plugin_delivery_tests.rs");
     }
 
     mod plugin_tests {

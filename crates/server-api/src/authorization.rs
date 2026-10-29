@@ -62,6 +62,10 @@ pub const MAX_SCOPED_PERMISSIONS: usize = 256;
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PermissionResource {
+    PluginInstallation {
+        workspace_id: String,
+        installation_id: String,
+    },
     Job {
         workspace_id: String,
         job_id: String,
@@ -138,6 +142,10 @@ impl<'de> Deserialize<'de> for PermissionResource {
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
         enum Wire {
+            PluginInstallation {
+                workspace_id: String,
+                installation_id: String,
+            },
             Job {
                 workspace_id: String,
                 job_id: String,
@@ -205,6 +213,13 @@ impl<'de> Deserialize<'de> for PermissionResource {
             },
         }
         Ok(match Wire::deserialize(deserializer)? {
+            Wire::PluginInstallation {
+                workspace_id,
+                installation_id,
+            } => Self::PluginInstallation {
+                workspace_id,
+                installation_id,
+            },
             Wire::Job {
                 workspace_id,
                 job_id,
@@ -314,7 +329,8 @@ impl PermissionResource {
     /// Checks Workspace membership without a target existence or data lookup.
     pub fn workspace_id(&self) -> Option<&str> {
         match self {
-            Self::Job { workspace_id, .. }
+            Self::PluginInstallation { workspace_id, .. }
+            | Self::Job { workspace_id, .. }
             | Self::Ticket { workspace_id, .. }
             | Self::Objective { workspace_id, .. }
             | Self::MergeRequest { workspace_id, .. }
@@ -332,6 +348,13 @@ impl PermissionResource {
 
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::PluginInstallation {
+                workspace_id,
+                installation_id,
+            } => {
+                validate_authorization_identifier(workspace_id)?;
+                validate_authorization_identifier(installation_id)
+            }
             Self::Job {
                 workspace_id,
                 job_id,
@@ -455,6 +478,16 @@ impl PermissionResource {
             return false;
         }
         match (self, other) {
+            (
+                Self::PluginInstallation {
+                    workspace_id: a,
+                    installation_id: ai,
+                },
+                Self::PluginInstallation {
+                    workspace_id: b,
+                    installation_id: bi,
+                },
+            ) => a == b && ai == bi,
             (
                 Self::Job {
                     workspace_id: a,
@@ -866,6 +899,56 @@ pub fn validate_relative_permission_path(path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_installation_permissions_require_exact_workspace_and_installation() {
+        let resource = PermissionResource::PluginInstallation {
+            workspace_id: "ws".into(),
+            installation_id: "install".into(),
+        };
+        assert_eq!(resource.workspace_id(), Some("ws"));
+        let wire = serde_json::json!({"kind":"plugin_installation","workspace_id":"ws","installation_id":"install"});
+        assert_eq!(serde_json::to_value(&resource).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<PermissionResource>(wire.clone()).unwrap(),
+            resource
+        );
+        assert!(resource.covers(&resource));
+        for other in [
+            PermissionResource::PluginInstallation {
+                workspace_id: "other".into(),
+                installation_id: "install".into(),
+            },
+            PermissionResource::PluginInstallation {
+                workspace_id: "ws".into(),
+                installation_id: "other".into(),
+            },
+            PermissionResource::Workspace {
+                workspace_id: "ws".into(),
+            },
+            PermissionResource::Feature,
+        ] {
+            assert!(!resource.covers(&other));
+            assert!(!other.covers(&resource));
+        }
+        for (field, value) in [
+            ("workspace_id", ""),
+            ("installation_id", "*"),
+            ("installation_id", " install"),
+        ] {
+            let mut invalid = wire.clone();
+            invalid[field] = value.into();
+            assert!(
+                serde_json::from_value::<PermissionResource>(invalid)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        let mut claims = wire;
+        claims["subject"] = "owner".into();
+        assert!(serde_json::from_value::<PermissionResource>(claims).is_err());
+    }
 
     fn workdir(path: &str, recursive: bool) -> PermissionResource {
         PermissionResource::Workdir {

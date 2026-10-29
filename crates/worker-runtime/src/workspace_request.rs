@@ -18,6 +18,8 @@ use crate::auth::{
     RuntimeRequestSourceSigner,
 };
 
+pub mod plugin_delivery;
+
 const DEFAULT_REQUEST_PROOF_TTL_SECONDS: u64 = 60;
 const RUNTIME_ID_HEADER: &str = "x-yoi-runtime-id";
 const WORKER_ID_HEADER: &str = "x-yoi-worker-id";

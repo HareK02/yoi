@@ -235,6 +235,8 @@ impl_openapi_schema!(
     PluginInstallation,
     PluginListResponse,
     PluginOperationResponse,
+    PluginArtifactDeliveryRequest,
+    PluginArtifactDeliveryMetadata,
     SubjectPermissionsResponse,
     SubjectPermissionsMutationResponse,
     SubjectPermissionInterruption,
@@ -3053,6 +3055,22 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] operation_id: String,
     ) -> Result<PluginOperationResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/workers/self/plugin-artifacts/authorize", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], openapi = false, normalize_body_errors = true)]
+    async fn plugin_artifact_authorize(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: PluginArtifactDeliveryRequest,
+    ) -> Result<PluginArtifactDeliveryMetadata, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/workers/self/plugin-artifacts/pull", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], openapi = false, normalize_body_errors = true)]
+    async fn plugin_artifact_pull(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: PluginArtifactDeliveryRequest,
+    ) -> Result<BinaryBody, RepositoryApiError>;
 
     // Ordinary operations accept member browser sessions or trusted Worker request
     // context. The service resolves Worker grants; no operation accepts an actor or
@@ -14996,6 +15014,8 @@ mod openapi_artifact_tests {
         // identity, or a one-use Reviewer capability. They remain generated Rust client/Axum
         // operations, but must not appear as unauthenticated operations in the public OpenAPI.
         const SIGNED_INTERNAL: &[&str] = &[
+            "plugin_artifact_authorize",
+            "plugin_artifact_pull",
             "operation_authorize",
             "bound_operation_authorize",
             "current_worker_workspace_config_get",

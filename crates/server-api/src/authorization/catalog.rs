@@ -13,6 +13,7 @@ mod tests;
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionResourceKind {
+    PluginInstallation,
     Job,
     Ticket,
     Objective,
@@ -36,6 +37,7 @@ impl PermissionResource {
     pub fn kind(&self) -> PermissionResourceKind {
         use PermissionResourceKind as K;
         match self {
+            Self::PluginInstallation { .. } => K::PluginInstallation,
             Self::Job { .. } => K::Job,
             Self::Ticket { .. } => K::Ticket,
             Self::Objective { .. } => K::Objective,

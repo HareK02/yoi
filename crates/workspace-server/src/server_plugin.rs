@@ -24,7 +24,7 @@ pub(super) fn router(service: Arc<ServerApiContractService>) -> Router {
         .layer(middleware::from_fn(normalize_rejections))
 }
 
-async fn normalize_rejections(request: Request, next: Next) -> Response {
+pub(super) async fn normalize_rejections(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     // The management contract classifies malformed DTOs/queries as invalid=400,
     // including Axum's JSON data/media rejections. Preserve the common envelope
@@ -40,7 +40,7 @@ async fn normalize_rejections(request: Request, next: Next) -> Response {
             Json(RepositoryApiError::new(
                 400,
                 "plugin_invalid",
-                "Invalid Plugin catalog request",
+                "Invalid Plugin request",
                 vec![],
             )),
         )

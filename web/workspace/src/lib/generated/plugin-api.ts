@@ -34,3 +34,7 @@ export type PluginListResponse = { installations: Array<PluginInstallationSummar
 export type PluginOperationKind = "install" | "add_artifact" | "revoke" | "uninstall";
 
 export type PluginOperationResponse = { operation_id: string, kind: PluginOperationKind, installation: PluginInstallation, };
+
+export type PluginArtifactDeliveryRequest = { plan_id: string, plan_fingerprint: string, installation_id: string, artifact_digest: string, };
+
+export type PluginArtifactDeliveryMetadata = { workspace_id: string, request: PluginArtifactDeliveryRequest, artifact: PluginArtifact, };

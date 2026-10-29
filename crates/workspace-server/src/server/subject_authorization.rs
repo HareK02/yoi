@@ -458,6 +458,37 @@ pub(super) fn worker_permissions(
     authority.subject_permissions(worker)
 }
 
+/// Host-only identity shared by plan creation and live Plugin operations. The
+/// identity is an immutable ceiling, not a permission: recheck the live lineage
+/// on every use, including byte delivery and cache hits.
+pub(super) fn plugin_execution_identity(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> ApiResult<crate::plugin_plan::HostExecutionIdentity> {
+    worker_permissions(api, worker)?;
+    let (principal_id, delegation_id) = if let Some(grant) = live_child_grant(api, worker)? {
+        (
+            format!("subject:{}", grant.subject_id),
+            Some(grant.source_change_id),
+        )
+    } else if let Some(subject) = current_body_subject(api, worker)? {
+        (format!("subject:{subject}"), None)
+    } else if let Some(subject) = job_subject(api, worker)? {
+        (format!("subject:{subject}"), None)
+    } else {
+        (
+            format!("worker:{}/{}", worker.runtime_id, worker.worker_id),
+            None,
+        )
+    };
+    Ok(crate::plugin_plan::HostExecutionIdentity {
+        runtime_id: worker.runtime_id.clone(),
+        worker_id: worker.worker_id.clone(),
+        principal_id,
+        delegation_id,
+    })
+}
+
 pub(super) fn authorize(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
@@ -884,6 +915,50 @@ pub(super) async fn interrupt_subject_workers(
         results.push(evidence);
     }
     results
+}
+
+impl WorkspaceApi {
+    /// Trusted Host plan creation uses the same identity as live Plugin operations.
+    /// Principal and delegation are derived here, never accepted from public JSON.
+    pub async fn plugin_execution_identity(
+        &self,
+        worker: &RuntimeWorkerRef,
+    ) -> crate::Result<crate::plugin_plan::HostExecutionIdentity> {
+        self.store
+            .get_workspace_runtime_binding(self.workspace_id(), &worker.runtime_id)
+            .await?
+            .filter(|binding| binding.revoked_at.is_none())
+            .ok_or_else(|| {
+                Error::WorkspacePermissionDenied("Plugin Runtime trust revoked".into())
+            })?;
+        let api = self.clone();
+        let worker = worker.clone();
+        self.host_executors
+            .host()?
+            .run(move || {
+                let member = api.store.get_worker_registry(api.workspace_id(), &worker)?;
+                let reserved = api
+                    .store
+                    .has_active_worker_create_reservation(api.workspace_id(), &worker)?;
+                if member.is_none() && !reserved {
+                    return Err(Error::WorkspacePermissionDenied(
+                        "Plugin Worker is not registered".into(),
+                    ));
+                }
+                api.store
+                    .require_current_worker_singleton_owner(api.workspace_id(), &worker)?;
+                let summary = api.runtime.worker(&worker).map_err(|_| {
+                    Error::WorkspacePermissionDenied("Plugin Worker unavailable".into())
+                })?;
+                if summary.workspace.workspace_id.as_deref() != Some(api.workspace_id()) {
+                    return Err(Error::WorkspacePermissionDenied(
+                        "foreign Plugin Worker".into(),
+                    ));
+                }
+                plugin_execution_identity(&api, &worker).map_err(|error| error.error)
+            })
+            .await
+    }
 }
 
 pub(super) fn administration_actor(
