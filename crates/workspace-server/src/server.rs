@@ -9774,20 +9774,28 @@ impl server_api::ServerApi for ServerApiContractService {
         let api = self.workspace_api()?.clone();
         let actor = subject_authorization::administration_actor(&context)
             .map_err(ApiError::into_repository_api_error)?;
-        require_workspace_owner(
-            &api,
-            &workspace_id,
-            actor,
-            "Subject permission administration",
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
+        validate_workspace_scope(&api, &workspace_id)
+            .map_err(ApiError::into_repository_api_error)?;
+        let workspace = api
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)?
+            .ok_or_else(|| {
+                ApiError::from(Error::WorkspaceIdMismatch).into_repository_api_error()
+            })?;
+        let can_manage = workspace.owner_account_id == actor.account_id;
         api.store
             .db_executor()
             .run(move || -> ApiResult<_> {
                 Ok(open_subjektiv_store(&api)?
                     .subject_permissions(&subject_id)
-                    .map(|permissions| server_api::SubjectPermissionsResponse { permissions })
+                    .map(|permissions| server_api::SubjectPermissionsResponse {
+                        permissions,
+                        can_manage,
+                        operations: server_api::authorization::subject_permission_operations(),
+                    })
                     .map_err(subjektiv_store_error)?)
             })
             .await
@@ -9828,7 +9836,7 @@ impl server_api::ServerApi for ServerApiContractService {
                 let was_current = before.as_ref().map(|policy| &policy.change_id)
                     == request.expected_change_id.as_ref();
                 let permissions = store
-                    .set_subject_permissions(&mutation_subject, &request)
+                    .set_managed_subject_permissions(&mutation_subject, &request)
                     .map_err(subjektiv_store_error)?;
                 let changed = was_current
                     && before.as_ref().map(|source| &source.change_id)

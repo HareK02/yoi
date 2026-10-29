@@ -78,6 +78,7 @@ function subject() {
 
 function subjectIndexData(items = [subject()]) {
   return {
+    workspace: { permissions: { delete_subjects: false } },
     workspaceId: "workspace-1",
     cursor: null,
     subjects: result({
@@ -91,6 +92,7 @@ function subjectIndexData(items = [subject()]) {
 test("renders the subject index as the Memory product entry", () => {
   render(SubjectIndexPage, {
     data: {
+      workspace: { permissions: { delete_subjects: false } },
       workspaceId: "workspace-1",
       cursor: "subject-current",
       subjects: result({
@@ -273,6 +275,7 @@ test("warns about an unknown create outcome without replaying the POST", async (
 test("renders a ready resident surface and committed Memory lifecycle states", async () => {
   render(SubjectPage, {
     data: {
+      workspace: { permissions: { delete_subjects: false } },
       workspaceId: "workspace-1",
       workspace: memoryWorkspace(),
       subjectId: "subject-1",
@@ -368,6 +371,7 @@ test("edits and clears user-managed behavior with CAS while distinguishing save 
   vi.stubGlobal("fetch", fetchMock);
   render(SubjectPage, {
     data: {
+      workspace: { permissions: { delete_subjects: false } },
       workspaceId: "workspace-1",
       workspace: memoryWorkspace(),
       subjectId: "subject-1",
@@ -440,6 +444,7 @@ test.each([false, true])(
 
 function subjectPageData(record = subject(), workspaceId = "workspace-1") {
   return {
+    workspace: { permissions: { delete_subjects: false } },
     workspaceId,
     workspace: memoryWorkspace(workspaceId),
     subjectId: record.id,
@@ -773,6 +778,7 @@ test("candidate-only Subjects show no committed Memories, not an inferred candid
   // the same empty committed list as a new Subject; candidates are not a page input.
   render(SubjectPage, {
     data: {
+      workspace: { permissions: { delete_subjects: false } },
       workspaceId: "workspace-1",
       workspace: memoryWorkspace(),
       subjectId: "subject-1",
@@ -857,6 +863,7 @@ test.each(["ready", "ungenerated", "stale", "failed"] as const)(
 
 test("distinguishes ready-empty, stale, failed, unavailable, and request error surfaces", async () => {
   const base = {
+    workspace: { permissions: { delete_subjects: false } },
     workspaceId: "workspace-1",
     workspace: memoryWorkspace(),
     subjectId: "subject-1",
@@ -943,6 +950,7 @@ test("distinguishes ready-empty, stale, failed, unavailable, and request error s
 test("renders committed Memory detail, provenance, derivation, and immutable changes", async () => {
   render(MemoryDetailPage, {
     data: {
+      workspace: { permissions: { delete_subjects: false } },
       workspaceId: "workspace-1",
       workspace: memoryWorkspace(),
       subjectId: "subject-1",

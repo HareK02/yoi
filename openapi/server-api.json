@@ -7023,6 +7023,72 @@
         ],
         "type": "object"
       },
+      "PermissionOperationAvailability": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "available",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unavailable",
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PermissionOperationDescriptor": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/PermissionOperationAvailability"
+          },
+          "description": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "operation": {
+            "type": "string"
+          },
+          "resource_kinds": {
+            "description": "Accepted management input kinds, not a claim that a target exists or is usable.",
+            "items": {
+              "$ref": "#/components/schemas/PermissionResourceKind"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operation",
+          "label",
+          "description",
+          "resource_kinds",
+          "availability"
+        ],
+        "type": "object"
+      },
       "PermissionResource": {
         "oneOf": [
           {
@@ -7376,6 +7442,28 @@
             "type": "object"
           }
         ]
+      },
+      "PermissionResourceKind": {
+        "enum": [
+          "job",
+          "ticket",
+          "objective",
+          "merge_request",
+          "subject",
+          "drive_entry",
+          "drive_request",
+          "repository",
+          "workdir_attachment",
+          "workspace_config",
+          "network",
+          "sub_worker",
+          "feature",
+          "workspace",
+          "workdir",
+          "worker",
+          "worker_operation"
+        ],
+        "type": "string"
       },
       "PluginAddArtifactRequest": {
         "additionalProperties": false,
@@ -11276,6 +11364,15 @@
       "SubjectPermissionsResponse": {
         "additionalProperties": false,
         "properties": {
+          "can_manage": {
+            "type": "boolean"
+          },
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/PermissionOperationDescriptor"
+            },
+            "type": "array"
+          },
           "permissions": {
             "anyOf": [
               {
@@ -11287,6 +11384,10 @@
             ]
           }
         },
+        "required": [
+          "can_manage",
+          "operations"
+        ],
         "type": "object"
       },
       "SubjectPermissionsUpdate": {
@@ -19114,7 +19215,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:6f738263ef6d2c939d021e719e7d8986edea9389d5ae4805f275b36a9cf722d3"
+    "x-yoi-source-digest": "sha256:2dc24ccd7bfaafdde2f79df2bc064ce11b2362065402191517535848a4105b5a"
   },
   "openapi": "3.1.0",
   "paths": {
