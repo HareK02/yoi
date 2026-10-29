@@ -170,7 +170,7 @@ impl Drop for PendingFile {
         let _ = fs::remove_file(&self.0);
     }
 }
-fn read_blob(root: &Path, artifact: &str, size: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_blob(root: &Path, artifact: &str, size: u64) -> Result<Vec<u8>> {
     let path = blob_path(root, artifact)?;
     let metadata = storage(fs::symlink_metadata(&path))?;
     if !metadata.is_file()
@@ -222,7 +222,7 @@ fn artifact_metadata(
     canonical: &plugin::CanonicalPluginArtifact,
 ) -> Result<PluginArtifact> {
     let m = &package.package.manifest;
-    let schema_digest = format!("sha256:{}", hash(m.config_schema.as_bytes()));
+    let schema = plugin::plugin_config_schema_identity(m);
     Ok(PluginArtifact {
         package_id: m.id.clone(),
         name: m.name.clone(),
@@ -250,10 +250,10 @@ fn artifact_metadata(
         connections: decode(&encode(&m.connections)?)?,
         requested_grants: decode(&encode(&m.requested_grants)?)?,
         config_schema: PluginSchemaContribution {
-            identity: format!("{}/config", m.id),
-            version: m.version.clone(),
-            namespace: format!("{}/config/{}/{}", m.id, m.version, schema_digest),
-            digest: schema_digest,
+            identity: schema.identity,
+            version: schema.version,
+            namespace: schema.namespace,
+            digest: schema.digest,
             dcdl: m.config_schema.clone(),
         },
         revoked: false,

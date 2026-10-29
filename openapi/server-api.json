@@ -7028,6 +7028,27 @@
           {
             "additionalProperties": false,
             "properties": {
+              "installation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "plugin_installation",
+                "type": "string"
+              },
+              "workspace_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "workspace_id",
+              "installation_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
               "job_id": {
                 "type": "string"
               },
@@ -19062,7 +19083,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:e538f535da2bcf56ee07f439f8e29ef58a2fc55fc6f03eac31604ef2b3cc1dbc"
+    "x-yoi-source-digest": "sha256:b3db53e7ada43ed5cd7fa9ccad963c394d19b53091a5734f8c2e08d45e7eaefd"
   },
   "openapi": "3.1.0",
   "paths": {

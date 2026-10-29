@@ -10,6 +10,7 @@ pub mod bindings {
     });
 }
 
+pub mod delivery;
 mod executor;
 pub mod host;
 mod sandbox;
