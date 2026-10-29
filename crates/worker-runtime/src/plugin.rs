@@ -85,3 +85,208 @@ pub async fn materialize(
         .await
         .map_err(|error| error.to_string())
 }
+
+pub struct PluginRuntimeServices {
+    pub artifacts: std::sync::Arc<dyn yoi_plugin_runtime::delivery::ArtifactSource>,
+    pub owner: std::sync::Arc<dyn yoi_plugin_runtime::owner::PluginHostOwner>,
+}
+
+/// Supplies authenticated process-owned adapters, not a Plugin resolver. Handles
+/// are bound to the exact requested Worker; a connection failure has no fallback.
+#[async_trait]
+pub trait PluginRuntimeProviders: Send + Sync {
+    async fn connect(
+        &self,
+        workspace: &str,
+        worker: &WorkerRef,
+    ) -> Result<PluginRuntimeServices, String>;
+}
+
+pub struct PinnedPluginToolRuntime {
+    providers: std::sync::Arc<dyn PluginRuntimeProviders>,
+    cache: yoi_plugin_runtime::delivery::ArtifactCache,
+    limits: yoi_plugin_runtime::Limits,
+}
+impl PinnedPluginToolRuntime {
+    pub fn new(
+        providers: std::sync::Arc<dyn PluginRuntimeProviders>,
+        private_cache_root: &std::path::Path,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            providers,
+            cache: yoi_plugin_runtime::delivery::ArtifactCache::new(
+                private_cache_root,
+                yoi_plugin_runtime::delivery::CacheLimits::default(),
+            )
+            .map_err(|_| "Plugin cache initialization failed")?,
+            limits: yoi_plugin_runtime::Limits::default(),
+        })
+    }
+}
+#[async_trait]
+impl PluginToolRuntime for PinnedPluginToolRuntime {
+    async fn prepare(
+        &self,
+        worker: &WorkerRef,
+        snapshot: &runtime_api::PluginExecutionSnapshot,
+        session_id: &str,
+    ) -> Result<worker::plugin::PluginToolsFeature, String> {
+        snapshot
+            .plan
+            .validate_canonical()
+            .map_err(|_| "invalid Plugin plan")?;
+        if snapshot
+            .plan
+            .fingerprint()
+            .map_err(|_| "invalid Plugin plan")?
+            != snapshot.fingerprint
+            || snapshot.plan.execution().worker_id != worker.worker_id.to_string()
+        {
+            return Err("Plugin launch identity mismatch".into());
+        }
+        let services = self
+            .providers
+            .connect(snapshot.plan.workspace_id(), worker)
+            .await?;
+        for pin in snapshot.plan.plugins() {
+            services
+                .owner
+                .prepare(
+                    snapshot.plan_id.clone(),
+                    pin.installation_id().into(),
+                    pin.projection().tools.clone(),
+                )
+                .await
+                .map_err(|_| "Plugin startup admission refused or unavailable")?;
+        }
+        let tools = materialize(
+            worker,
+            snapshot,
+            session_id,
+            services.artifacts.as_ref(),
+            services.owner.clone(),
+            &self.cache,
+            self.limits.clone(),
+        )
+        .await?;
+        // Materialization and compilation can wait on I/O. Recheck at publication
+        // preparation, including pure Tools and cache hits, without making a call.
+        for pin in snapshot.plan.plugins() {
+            services
+                .owner
+                .prepare(
+                    snapshot.plan_id.clone(),
+                    pin.installation_id().into(),
+                    pin.projection().tools.clone(),
+                )
+                .await
+                .map_err(|_| "Plugin startup publication refused or unavailable")?;
+        }
+        Ok(tools)
+    }
+}
+
+#[cfg(feature = "http-server")]
+pub mod remote {
+    use super::*;
+    use crate::{
+        workspace_issuer::WorkspaceIssuerTrustRecord,
+        workspace_request::{
+            RuntimeWorkspaceRequestClient,
+            plugin_delivery::{CurrentArtifactServer, RemotePluginArtifactSource},
+        },
+    };
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+    pub type CurrentPluginServer = dyn Fn(&str) -> Result<WorkspaceIssuerTrustRecord, yoi_plugin_runtime::delivery::DeliveryError>
+        + Send
+        + Sync;
+    pub struct RemotePluginRuntimeProviders {
+        clients: HashMap<String, RuntimeWorkspaceRequestClient>,
+        current: Arc<CurrentPluginServer>,
+    }
+    impl RemotePluginRuntimeProviders {
+        pub fn new(
+            clients: HashMap<String, RuntimeWorkspaceRequestClient>,
+            current: Arc<CurrentPluginServer>,
+        ) -> Self {
+            Self { clients, current }
+        }
+    }
+    struct RegisteredOwner {
+        source: Arc<RemotePluginArtifactSource>,
+        owner: Arc<dyn yoi_plugin_runtime::owner::PluginHostOwner>,
+    }
+    #[async_trait]
+    impl yoi_plugin_runtime::owner::PluginHostOwner for RegisteredOwner {
+        async fn call(
+            &self,
+            request: server_api::PluginHostRequest,
+        ) -> Result<server_api::PluginHostResponse, server_api::PluginHostError> {
+            let denied = || server_api::PluginHostError {
+                code: server_api::PluginHostErrorCode::Denied,
+                effect: server_api::PluginEffectObservation::NotDispatched,
+                diagnostic_id: String::new(),
+            };
+            self.source.registration().map_err(|_| denied())?;
+            let dispatched = matches!(request, server_api::PluginHostRequest::Send { .. });
+            let response = self.owner.call(request).await?;
+            self.source
+                .registration()
+                .map_err(|_| server_api::PluginHostError {
+                    code: server_api::PluginHostErrorCode::Denied,
+                    effect: if dispatched {
+                        server_api::PluginEffectObservation::Indeterminate
+                    } else {
+                        server_api::PluginEffectObservation::NotDispatched
+                    },
+                    diagnostic_id: String::new(),
+                })?;
+            Ok(response)
+        }
+    }
+    #[async_trait]
+    impl PluginRuntimeProviders for RemotePluginRuntimeProviders {
+        async fn connect(
+            &self,
+            workspace: &str,
+            worker: &WorkerRef,
+        ) -> Result<PluginRuntimeServices, String> {
+            let client = self
+                .clients
+                .get(workspace)
+                .ok_or("Plugin Server is not registered")?
+                .clone();
+            let current = self.current.clone();
+            let workspace = workspace.to_owned();
+            let registered: Arc<CurrentArtifactServer> = Arc::new(move || current(&workspace));
+            let source = Arc::new(
+                RemotePluginArtifactSource::new(
+                    client.clone(),
+                    worker.worker_id.to_string(),
+                    registered,
+                )
+                .map_err(|_| "Plugin Server trust unavailable")?,
+            );
+            let generated = client
+                .server_api_client(
+                    crate::auth::WORKSPACE_REQUEST_PERMISSION,
+                    Some(worker.worker_id.to_string()),
+                    reqwest::header::HeaderMap::new(),
+                    Duration::from_secs(30),
+                    8 * 1024 * 1024,
+                )
+                .map_err(|_| "Plugin Host client unavailable")?;
+            let owner = Arc::new(RegisteredOwner {
+                source: source.clone(),
+                owner: Arc::new(yoi_plugin_runtime::owner::RemotePluginHostOwner::new(
+                    Arc::new(generated),
+                    client.workspace_id().into(),
+                )),
+            });
+            Ok(PluginRuntimeServices {
+                artifacts: source,
+                owner,
+            })
+        }
+    }
+}

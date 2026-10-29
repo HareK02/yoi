@@ -45,13 +45,40 @@ async fn worker_from_context(
     context: &server_api::ServerRequestContext,
 ) -> std::result::Result<RuntimeWorkerRef, server_api::RepositoryApiError> {
     validate_workspace_scope(api, workspace).map_err(failure)?;
-    let headers = current_worker_contract_headers(context)?;
-    authenticate_worker_mutation_source_owned(api, workspace, &headers)
-        .await
-        .map_err(failure)
+    // Runtime source proof has already been checked by the contract router.
+    // Byte preparation precedes controller publication, so a live Runtime
+    // summary is not required; the reservation/lineage owner below is required.
+    subject_authorization::source_from_context(context).map_err(failure)
 }
 
 impl WorkspaceApi {
+    async fn plugin_artifact_execution_identity(
+        &self,
+        worker: &RuntimeWorkerRef,
+    ) -> crate::Result<crate::plugin_plan::HostExecutionIdentity> {
+        let api = self.clone();
+        let worker_owned = worker.clone();
+        let preparing = self
+            .host_executors
+            .host()?
+            .run(move || {
+                if api
+                    .store
+                    .has_active_worker_create_reservation(api.workspace_id(), &worker_owned)?
+                {
+                    api.plugin_reserved_identity(&worker_owned, None, None)
+                        .map(Some)
+                } else {
+                    Ok(None)
+                }
+            })
+            .await?;
+        match preparing {
+            Some(identity) => Ok(identity),
+            None => self.plugin_execution_identity(worker).await,
+        }
+    }
+
     /// A Host-only adapter bound to this Server and Worker, not a loopback client.
     /// Construction resolves the active Server key; every operation checks it
     /// again, together with Worker membership, live grants, lineage and pin state.
@@ -60,7 +87,7 @@ impl WorkspaceApi {
         worker: RuntimeWorkerRef,
     ) -> crate::Result<InProcessPluginArtifactSource> {
         let authority = authority_identity(self)?;
-        self.plugin_execution_identity(&worker).await?;
+        self.plugin_artifact_execution_identity(&worker).await?;
         Ok(InProcessPluginArtifactSource {
             api: self.clone(),
             worker,
@@ -91,7 +118,7 @@ async fn current_execution(
 ) -> std::result::Result<crate::plugin_plan::HostExecutionIdentity, server_api::RepositoryApiError>
 {
     let execution = api
-        .plugin_execution_identity(worker)
+        .plugin_artifact_execution_identity(worker)
         .await
         .map_err(failure)?;
     let stage_api = api.clone();

@@ -5,6 +5,49 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+pub(crate) const WORKER_LAUNCH_ACTOR: &str = "server-plugin-launch";
+pub(crate) fn worker_launch_key(runtime: &str, worker: &str) -> String {
+    config_source::digest_bytes(&serde_json::to_vec(&(runtime, worker)).expect("identity encoding"))
+}
+
+/// An existing row with a NULL plan seals the empty selection. Absence is an
+/// unresolved reservation, not permission to reselect after Runtime dispatch.
+pub(crate) fn worker_launch_selection(
+    conn: &Connection,
+    workspace: &str,
+    runtime: &str,
+    worker: &str,
+) -> Result<Option<Option<StoredPluginPlan>>> {
+    let id: Option<Option<String>> = conn.query_row("SELECT plan_id FROM worker_plugin_launches WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+        params![workspace, runtime, worker], |row| row.get(0)).optional()?;
+    id.map(|id| {
+        id.map(|id| plugin_plan_load(conn, workspace, &id))
+            .transpose()
+    })
+    .transpose()
+}
+pub(crate) fn worker_launch_plan(
+    conn: &Connection,
+    workspace: &str,
+    runtime: &str,
+    worker: &str,
+) -> Result<Option<StoredPluginPlan>> {
+    Ok(worker_launch_selection(conn, workspace, runtime, worker)?.flatten())
+}
+
+pub(crate) fn transition_worker_launch_plan(
+    tx: &Transaction<'_>,
+    workspace: &str,
+    runtime: &str,
+    worker: &str,
+    target: PlanPinState,
+) -> Result<()> {
+    if let Some(plan) = worker_launch_plan(tx, workspace, runtime, worker)? {
+        plugin_plan_transition(tx, workspace, &plan.plan_id, plan.pin_state, target)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanPinState {
@@ -304,6 +347,25 @@ impl SqliteWorkspaceStore {
             Ok(saved)
         })
     }
+}
+
+pub(crate) fn verify_launch_schema(conn: &Connection) -> Result<()> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(LAUNCH_SCHEMA_SQL)?;
+    let sql: String = expected.query_row(
+        "SELECT sql FROM sqlite_schema WHERE name='worker_plugin_launches'",
+        [],
+        |row| row.get(0),
+    )?;
+    let actual: String = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE name='worker_plugin_launches'",
+        [],
+        |row| row.get(0),
+    )?;
+    if actual != sql {
+        return Err(Error::Store("Worker Plugin launch schema mismatch".into()));
+    }
+    Ok(())
 }
 
 pub(crate) fn verify_plan_schema(conn: &Connection) -> Result<()> {

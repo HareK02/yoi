@@ -86,7 +86,7 @@ impl Fixture {
         let upload = api
             .config_store
             .plugin_upload(
-                &directory.path().join("blobs"),
+                &ServerConfig::server_data_root_for_data_dir(&api.config.data_root).join("plugin-artifacts"),
                 TEST_WORKSPACE_ID,
                 "fixture-owner",
                 &package.bytes,

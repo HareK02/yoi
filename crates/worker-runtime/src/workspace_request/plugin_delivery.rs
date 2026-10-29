@@ -42,7 +42,7 @@ impl RemotePluginArtifactSource {
         Ok(source)
     }
 
-    fn registration(&self) -> Result<(), DeliveryError> {
+    pub(crate) fn registration(&self) -> Result<(), DeliveryError> {
         let registration = (self.current_server)()?;
         if registration.state != WorkspaceIssuerTrustState::Active
             || registration.workspace_id != self.client.workspace_id

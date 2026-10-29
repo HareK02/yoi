@@ -24,7 +24,7 @@ impl WorkspaceApi {
         )
     }
 
-    fn plugin_reserved_identity(
+    pub(super) fn plugin_reserved_identity(
         &self,
         worker: &RuntimeWorkerRef,
         expected_fingerprint: Option<&str>,

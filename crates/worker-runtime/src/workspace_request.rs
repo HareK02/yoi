@@ -174,6 +174,23 @@ impl RuntimeWorkspaceRequestClient {
             && self.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
     }
 
+    /// Expose the existing Runtime signer only as a request-bound authorizer for
+    /// the in-process Plugin Host adapter. This does not authenticate a request;
+    /// the Server still verifies its method/path/body proof on every operation.
+    pub fn plugin_host_authorizer(
+        &self,
+        worker_id: String,
+    ) -> std::sync::Arc<dyn server_api::client_support::RequestAuthorizer> {
+        std::sync::Arc::new(RuntimeWorkspaceRequestAuthorizer {
+            workspace_id: self.workspace_id.clone(),
+            runtime_id: self.runtime_id.clone(),
+            request_source: self.request_source.clone(),
+            permission: crate::auth::WORKSPACE_REQUEST_PERMISSION.into(),
+            worker_id: Some(worker_id),
+            extra_headers: HeaderMap::new(),
+        })
+    }
+
     pub(crate) fn server_api_client(
         &self,
         permission: impl Into<String>,

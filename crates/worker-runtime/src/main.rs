@@ -232,8 +232,9 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
         _ => fs_paths.runtime_dir.clone(),
     };
     let mut factory = ProfileRuntimeWorkerFactory::new(fs_paths.worker_dir.join("worker-root"))
-        .with_runtime_store_dir(runtime_store_dir);
+        .with_runtime_store_dir(runtime_store_dir.clone());
     let runtime_auth = read_runtime_auth_file(&runtime_auth_path(config))?;
+    let mut plugin_clients = std::collections::HashMap::new();
     if let Some(identity) = runtime_auth.identity.clone() {
         factory = factory.with_remote_worker_mutation_identity(identity);
     }
@@ -243,15 +244,41 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
             .iter()
             .filter(|issuer| issuer.state == WorkspaceIssuerTrustState::Active)
         {
-            factory = factory.with_workspace_request_client(
-                RuntimeWorkspaceRequestClient::new(
-                    issuer.workspace_id.clone(),
-                    issuer.backend_url.clone(),
-                    identity.identity_id.clone(),
-                )
-                .with_runtime_request_source(identity, issuer.backend_url.clone()),
-            );
+            let client = RuntimeWorkspaceRequestClient::new(
+                issuer.workspace_id.clone(),
+                issuer.backend_url.clone(),
+                identity.identity_id.clone(),
+            )
+            .with_runtime_request_source(identity, issuer.backend_url.clone());
+            plugin_clients.insert(issuer.workspace_id.clone(), client.clone());
+            factory = factory.with_workspace_request_client(client);
         }
+    }
+    if !plugin_clients.is_empty() {
+        let auth_path = runtime_auth_path(config);
+        let current: Arc<worker_runtime::plugin::remote::CurrentPluginServer> =
+            Arc::new(move |workspace| {
+                read_runtime_auth_file(&auth_path)
+                    .ok()
+                    .and_then(|auth| {
+                        auth.workspace_issuers
+                            .into_iter()
+                            .find(|issuer| issuer.workspace_id == workspace)
+                    })
+                    .ok_or(yoi_plugin_runtime::delivery::DeliveryError::Denied)
+            });
+        let providers = Arc::new(
+            worker_runtime::plugin::remote::RemotePluginRuntimeProviders::new(
+                plugin_clients,
+                current,
+            ),
+        );
+        let plugins = worker_runtime::plugin::PinnedPluginToolRuntime::new(
+            providers,
+            &runtime_store_dir.join("plugin-cache"),
+        )
+        .map_err(ProcessError::WorkerAdapter)?;
+        factory = factory.with_plugin_runtime(Arc::new(plugins));
     }
     let mut backend_resource_client: Option<
         Arc<dyn worker_runtime::resource::BackendResourceClient>,

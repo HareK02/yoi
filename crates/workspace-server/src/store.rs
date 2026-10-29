@@ -129,7 +129,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 109;
+const LATEST_SCHEMA_VERSION: i64 = 110;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -481,6 +481,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 109,
         name: "Durable Plugin Host invocations and HTTPS effect receipts",
         apply: migrate_plugin_receipts_v108_to_v109,
+    },
+    Migration {
+        version: 110,
+        name: "Worker Plugin launch selection associations",
+        apply: migrate_plugin_launches_v109_to_v110,
     },
 ];
 
@@ -3729,8 +3734,10 @@ impl SqliteWorkspaceStore {
         workspace_id: &str,
         worker_id: WorkerId,
     ) -> Result<()> {
-        self.with_conn(|conn| {
-            let changed = conn.execute(
+        self.with_immediate_transaction(|tx| {
+            let runtime: String = tx.query_row("SELECT runtime_id FROM worker_create_reservations WHERE workspace_id=?1 AND worker_id=?2", params![workspace_id, worker_id.to_string()], |row| row.get(0))?;
+            crate::plugin_plan::transition_worker_launch_plan(tx, workspace_id, &runtime, &worker_id.to_string(), crate::plugin_plan::PlanPinState::Active)?;
+            let changed = tx.execute(
                 "UPDATE worker_create_reservations \
                  SET state = 'created', updated_at = ?3 \
                  WHERE workspace_id = ?1 AND worker_id = ?2 AND state IN ('reserved', 'created')",
@@ -3822,6 +3829,7 @@ impl SqliteWorkspaceStore {
                     )));
                 }
             }
+            crate::plugin_plan::transition_worker_launch_plan(&tx, workspace_id, &runtime_id, &worker_id.to_string(), crate::plugin_plan::PlanPinState::Released)?;
             let resource_id = worker_resource_id(&RuntimeWorkerRef::new(
                 runtime_id,
                 worker_id.to_string(),
@@ -3880,6 +3888,7 @@ impl SqliteWorkspaceStore {
                     worker_id
                 )));
             }
+            crate::plugin_plan::transition_worker_launch_plan(&tx, workspace_id, &runtime_id, &worker_id.to_string(), crate::plugin_plan::PlanPinState::Released)?;
             let resource_id = worker_resource_id(&RuntimeWorkerRef::new(
                 runtime_id,
                 worker_id.to_string(),
@@ -9088,6 +9097,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         chrono::Utc::now().to_rfc3339(),
                     ],
                 )?;
+                crate::plugin_plan::transition_worker_launch_plan(&tx, workspace_id, &worker.runtime_id, &worker.worker_id, crate::plugin_plan::PlanPinState::Released)?;
                 commit_worker_catalog_removal(&tx, workspace_id, worker)?
             } else if tx
                 .query_row(
@@ -15856,6 +15866,23 @@ fn migrate_subject_assignments_v107_to_v108(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_plugin_launches_v109_to_v110(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 109 {
+        return Err(Error::Store(
+            "Plugin launch migration requires schema 109".into(),
+        ));
+    }
+    verify_schema_history(conn, 109)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::plugin_plan::LAUNCH_SCHEMA_SQL)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(110,?1)",
+        ["Worker Plugin launch selection associations"],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_plugin_receipts_v108_to_v109(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 108 {
         return Err(Error::Store(
@@ -15916,6 +15943,7 @@ fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
     conn.execute_batch(include_str!("passkey_results_schema.sql"))?;
     conn.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
     conn.execute_batch(crate::plugin_receipt::SCHEMA_SQL)?;
+    conn.execute_batch(crate::plugin_plan::LAUNCH_SCHEMA_SQL)?;
     Ok(())
 }
 
@@ -16959,6 +16987,7 @@ fn apply_migrations_with_secret_source(
     crate::plugin_catalog::verify(conn)?;
     crate::plugin_plan::verify_plan_schema(conn)?;
     crate::plugin_host::verify_receipt_schema(conn)?;
+    crate::plugin_plan::verify_launch_schema(conn)?;
     subject_assignment_migration::verify(conn)?;
     verify_workspace_runtime_binding_schema(conn)?;
     verify_workspace_runtime_verification_schema(conn)?;
@@ -17002,6 +17031,7 @@ mod tests {
     include!("job_notification_tests.rs");
     include!("implementation_result_tests.rs");
     include!("store_workspace_config_tests.rs");
+    include!("plugin_plan/launch_migration_tests.rs");
 
     fn drive_grant_fixture(store: &SqliteWorkspaceStore) -> server_api::DriveGrantResponse {
         store.with_conn(|c| {
@@ -19659,6 +19689,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:107, name:"Immutable Worker Plugin plans and retained pins".into()},
                 WorkspaceSchemaMigrationStep {version:108, name:"Subject Ticket responsibility and current-body notification routing".into()},
                 WorkspaceSchemaMigrationStep {version:109, name:"Durable Plugin Host invocations and HTTPS effect receipts".into()},
+                WorkspaceSchemaMigrationStep {version:110, name:"Worker Plugin launch selection associations".into()},
             ]
         );
 
@@ -19778,6 +19809,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (107, "Immutable Worker Plugin plans and retained pins".to_string()),
 (108, "Subject Ticket responsibility and current-body notification routing".to_string()),
 (109, "Durable Plugin Host invocations and HTTPS effect receipts".to_string()),
+(110, "Worker Plugin launch selection associations".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -23068,7 +23100,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (106, crate::plugin_catalog::MIGRATION_NAME.into()),
                          (107, "Immutable Worker Plugin plans and retained pins".into()),
                          (108, "Subject Ticket responsibility and current-body notification routing".into()),
-                         (109, "Durable Plugin Host invocations and HTTPS effect receipts".into())]);
+                         (109, "Durable Plugin Host invocations and HTTPS effect receipts".into()),
+                         (110, "Worker Plugin launch selection associations".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

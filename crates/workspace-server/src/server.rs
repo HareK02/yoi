@@ -52,6 +52,8 @@ mod plugin;
 mod plugin_delivery;
 #[path = "server_plugin_host.rs"]
 mod plugin_host;
+#[path = "server_plugin_runtime.rs"]
+mod plugin_runtime;
 pub use plugin_delivery::InProcessPluginArtifactSource;
 #[path = "server_workspace_config.rs"]
 mod workspace_config;
@@ -1990,6 +1992,7 @@ pub struct WorkspaceApi {
     backend_job_drain_requests: Arc<AtomicU64>,
     journal_lifecycle: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     journal_dispatch_owner: Option<Arc<WorkspaceApi>>,
+    plugin_runtime_owner: Option<Arc<WorkspaceApi>>,
     observation_proxy: BackendObservationProxy,
     runtime_subscription_broker: RuntimeSubscriptionBroker,
     pub(crate) worker_projection: Arc<crate::worker_projection::WorkerProjectionService>,
@@ -4157,8 +4160,15 @@ impl WorkspaceApi {
                 store.clone(),
             ),
         );
+        let plugin_providers = Arc::new(plugin_runtime::EmbeddedPluginRuntimeProviders::default());
+        let plugins = worker_runtime::plugin::PinnedPluginToolRuntime::new(
+            plugin_providers.clone(),
+            &config.embedded_runtime_store_root.join("plugin-cache"),
+        )
+        .map_err(crate::Error::Config)?;
         let execution_backend = WorkerRuntimeExecutionBackend::new(
             ProfileRuntimeWorkerFactory::new(config.workspace_execution_root.clone())
+                .with_plugin_runtime(Arc::new(plugins))
                 .with_embedded_worker_mutation_dispatcher(
                     EMBEDDED_RUNTIME_ID,
                     worker_remove_dispatcher.clone(),
@@ -4194,7 +4204,7 @@ impl WorkspaceApi {
             })
             .collect::<HashMap<_, _>>();
         let workspace_id = config.workspace_id.clone();
-        let api = Self::new_with_execution_backend_and_broker(
+        let mut api = Self::new_with_execution_backend_and_broker(
             config,
             store,
             Arc::new(execution_backend),
@@ -4245,6 +4255,9 @@ impl WorkspaceApi {
         {
             api.register_workspace_runtime_binding(binding)?;
         }
+        let plugin_owner = Arc::new(api.clone());
+        plugin_providers.bind(&plugin_owner);
+        api.plugin_runtime_owner = Some(plugin_owner);
         Ok(api)
     }
 
@@ -4503,6 +4516,7 @@ impl WorkspaceApi {
             backend_job_drain_requests: Arc::new(AtomicU64::new(0)),
             journal_lifecycle: Arc::new(Mutex::new(HashMap::new())),
             journal_dispatch_owner: None,
+            plugin_runtime_owner: None,
             observation_proxy,
             runtime_subscription_broker,
             worker_projection,
@@ -6063,13 +6077,26 @@ impl WorkspaceApi {
                 &worker_id.to_string(),
             )?;
         }
-        request.resolved_memory_settings = Some(reservation.memory_settings);
-        let reservation_fingerprint = reservation.create_fingerprint.clone();
-        let create_binding = WorkerCreateBinding {
-            plugin_execution: None,
-            worker_id,
-            create_fingerprint: reservation.create_fingerprint,
+        let create_binding = match self.plugin_launch_binding(runtime_id, &request, &reservation) {
+            Ok(binding) => binding,
+            Err(error) => {
+                let mut diagnostics = cleanup_spawn_created_workdirs(self, &spawned_workdir_ids);
+                if let Err(cleanup) = self.config_store.fail_worker_create_reservation(
+                    &self.config.workspace_id,
+                    runtime_id,
+                    worker_id,
+                    &reservation.create_fingerprint,
+                ) {
+                    diagnostics.push(spawn_compensation_diagnostic(
+                        "plugin_launch_reservation_cleanup_failed",
+                        cleanup.to_string(),
+                    ));
+                }
+                return Err(ApiError::with_diagnostics(error, diagnostics));
+            }
         };
+        request.resolved_memory_settings = Some(reservation.memory_settings);
+        let reservation_fingerprint = create_binding.create_fingerprint.clone();
         let lifecycle_assignment = request.ticket_assignment.clone();
         let compensation_context = WorkerSpawnCompensationContext {
             assignment: lifecycle_assignment.as_ref(),
@@ -38691,6 +38718,7 @@ mod tests {
 
     mod plugin_delivery_tests {
         include!("server_plugin_delivery_tests.rs");
+        include!("server_plugin_launch_tests.rs");
     }
 
     mod plugin_tests {
@@ -38698,6 +38726,7 @@ mod tests {
     }
     mod plugin_host_tests {
         include!("server_plugin_host_tests.rs");
+        include!("server_plugin_runtime_tests.rs");
     }
 
     mod ticket_tags_tests {

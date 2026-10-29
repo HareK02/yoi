@@ -24,6 +24,7 @@ pub use store::*;
 
 /// Included by the config owner's ordered database migration, never at runtime.
 pub const SCHEMA_SQL: &str = include_str!("plugin_plan/schema.sql");
+pub(crate) const LAUNCH_SCHEMA_SQL: &str = include_str!("plugin_plan/launch_schema.sql");
 
 impl From<PlanError> for Error {
     fn from(error: PlanError) -> Self {
