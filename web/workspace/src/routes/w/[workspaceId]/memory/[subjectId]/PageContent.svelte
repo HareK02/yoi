@@ -180,7 +180,7 @@
   {/if}
 
   {#if !deletionStarted}
-  <nav aria-label="Subjectの記録"><a href={workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}/journal`)}>Journal · 最近の出来事とSessionを探す →</a></nav>
+  <nav aria-label="Subjectの記録と管理"><a href={workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}/journal`)}>Journal · 最近の出来事とSessionを探す →</a> · <a href={workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}/permissions`)}>Operation permissions · 直接操作と委譲上限 →</a></nav>
 
   {#if subject}
     <section class="subject-overview" aria-label="Subject status">

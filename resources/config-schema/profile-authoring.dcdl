@@ -49,7 +49,7 @@ let
                 extraction = Extraction;
                 consolidation = { request_enabled = Bool; };
             };
-            subjektiv = { enabled = Bool; consolidation_tools = Bool; extraction = Extraction; };
+            subjektiv = { enabled = Bool; consolidation_tools = Bool; chat = Flag; extraction = Extraction; };
         };
         mcp = { stdio_server = [...{
             name = String; command = String; args = [...String];

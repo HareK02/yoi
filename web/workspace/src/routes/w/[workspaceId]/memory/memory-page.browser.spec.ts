@@ -78,6 +78,7 @@ function subject() {
 
 function subjectIndexData(items = [subject()]) {
   return {
+    workspace: { permissions: { delete_subjects: false } },
     workspaceId: "workspace-1",
     cursor: null,
     subjects: result({
@@ -91,6 +92,7 @@ function subjectIndexData(items = [subject()]) {
 test("renders the subject index as the Memory product entry", () => {
   render(SubjectIndexPage, {
     data: {
+      workspace: { permissions: { delete_subjects: false } },
       workspaceId: "workspace-1",
       cursor: "subject-current",
       subjects: result({

@@ -26,6 +26,7 @@
 
 use subjektiv::api::*;
 mod backend_job_profile;
+mod chat;
 mod external_operation_audit;
 mod subject_authorization;
 mod subjektiv_deletion;
@@ -4959,6 +4960,7 @@ impl WorkspaceApi {
         let submitted = match self.runtime.send_input(
             &worker.worker,
             WorkerInputRequest {
+                source: None,
                 kind: WorkerInputKind::User,
                 content: worker_input,
                 submission_request_id: Some(runtime_run_id.clone()),
@@ -7668,6 +7670,14 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::subjektiv_record_session(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::chat_create_conversation(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::chat_messages(service.clone()))
+        .merge(server_api::server_api_axum::chat_receive(service.clone()))
+        .merge(server_api::server_api_axum::chat_worker_operation(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::subjektiv_memory_backend(
             service.clone(),
         ))
@@ -8243,10 +8253,25 @@ fn worker_input_request_from_api(
             )));
         }
     };
+    if let Some(id) = request.submission_request_id.as_ref() {
+        if kind != WorkerInputKind::Notify
+            || id.is_empty()
+            || id.len() > 256
+            || id.trim() != id
+            || id.chars().any(char::is_control)
+        {
+            return Err(Error::InvalidInput(
+                "submission_request_id requires Notify and a nonempty bounded identifier".into(),
+            ));
+        }
+    }
     Ok(WorkerInputRequest {
         kind,
         content: request.content,
-        submission_request_id: None,
+        submission_request_id: request
+            .submission_request_id
+            .map(|id| format!("public-notify:{id}")),
+        source: None,
         segments: request.segments,
     })
 }
@@ -9862,20 +9887,28 @@ impl server_api::ServerApi for ServerApiContractService {
         let api = self.workspace_api()?.clone();
         let actor = subject_authorization::administration_actor(&context)
             .map_err(ApiError::into_repository_api_error)?;
-        require_workspace_owner(
-            &api,
-            &workspace_id,
-            actor,
-            "Subject permission administration",
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
+        validate_workspace_scope(&api, &workspace_id)
+            .map_err(ApiError::into_repository_api_error)?;
+        let workspace = api
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)?
+            .ok_or_else(|| {
+                ApiError::from(Error::WorkspaceIdMismatch).into_repository_api_error()
+            })?;
+        let can_manage = workspace.owner_account_id == actor.account_id;
         api.store
             .db_executor()
             .run(move || -> ApiResult<_> {
                 Ok(open_subjektiv_store(&api)?
                     .subject_permissions(&subject_id)
-                    .map(|permissions| server_api::SubjectPermissionsResponse { permissions })
+                    .map(|permissions| server_api::SubjectPermissionsResponse {
+                        permissions,
+                        can_manage,
+                        operations: server_api::authorization::subject_permission_operations(),
+                    })
                     .map_err(subjektiv_store_error)?)
             })
             .await
@@ -9916,7 +9949,7 @@ impl server_api::ServerApi for ServerApiContractService {
                 let was_current = before.as_ref().map(|policy| &policy.change_id)
                     == request.expected_change_id.as_ref();
                 let permissions = store
-                    .set_subject_permissions(&mutation_subject, &request)
+                    .set_managed_subject_permissions(&mutation_subject, &request)
                     .map_err(subjektiv_store_error)?;
                 let changed = was_current
                     && before.as_ref().map(|source| &source.change_id)
@@ -10150,6 +10183,71 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn chat_create_conversation(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::ChatCreateConversationRequest,
+    ) -> std::result::Result<server_api::ChatConversation, server_api::RepositoryApiError> {
+        chat::create(
+            self.workspace_api()?.clone(),
+            context,
+            workspace_id,
+            request,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)
+    }
+    async fn chat_messages(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        conversation_id: String,
+        query: server_api::ChatMessagePageQuery,
+    ) -> std::result::Result<server_api::ChatMessagePage, server_api::RepositoryApiError> {
+        chat::messages(
+            self.workspace_api()?.clone(),
+            context,
+            workspace_id,
+            conversation_id,
+            query,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)
+    }
+    async fn chat_receive(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        conversation_id: String,
+        request: server_api::ChatUserMessageRequest,
+    ) -> std::result::Result<server_api::ChatReceiveResponse, server_api::RepositoryApiError> {
+        chat::receive(
+            self.workspace_api()?.clone(),
+            context,
+            workspace_id,
+            conversation_id,
+            request,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)
+    }
+    async fn chat_worker_operation(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        request: server_api::ChatWorkerRequest,
+    ) -> std::result::Result<server_api::ChatWorkerResponse, server_api::RepositoryApiError> {
+        chat::worker_operation(
+            self.workspace_api()?.clone(),
+            context,
+            workspace_id,
+            request,
+        )
+        .await
         .map_err(ApiError::into_repository_api_error)
     }
 
@@ -23017,6 +23115,7 @@ fn send_orchestrator_attention(
         let result = api.runtime.send_input(
             worker,
             WorkerInputRequest {
+                source: None,
                 kind: WorkerInputKind::Notify,
                 content,
                 submission_request_id: Some(delivery.request_id.clone()),
@@ -25889,6 +25988,7 @@ fn try_reuse_memory_consolidation_worker(
         .send_input(
             &worker.worker,
             WorkerInputRequest {
+                source: None,
                 kind: WorkerInputKind::User,
                 content: input_content.to_string(),
                 submission_request_id: None,
@@ -35319,6 +35419,7 @@ pub(crate) fn authorize_browser_worker_method(
             notification_request_id,
             message,
         } => Ok(protocol::Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::BrowserConsole,
             notification_request_id,
             message,
             source: source.clone(),
@@ -45972,6 +46073,7 @@ mod tests {
             worker: RuntimeWorkerRef::new(&created.runtime_id, &created.worker_id),
         };
         let request = |kind: &str| server_api::RuntimeWorkerInputRequest {
+            submission_request_id: None,
             kind: Some(kind.to_string()),
             content: "follow-up".to_string(),
             segments: None,
@@ -48000,6 +48102,7 @@ mod tests {
             .send_input(
                 &worker_ref,
                 WorkerInputRequest {
+                    source: None,
                     kind: WorkerInputKind::User,
                     content: "Commit one subject-scoped Session".to_string(),
                     submission_request_id: None,
@@ -51996,6 +52099,7 @@ mod tests {
             State(api.clone()),
             AxumPath((worker.runtime_id.clone(), worker.worker_id.clone())),
             Json(server_api::RuntimeWorkerInputRequest {
+                submission_request_id: None,
                 kind: Some("user".to_string()),
                 content: "attempt to rerun immutable Job input".to_string(),
                 segments: None,
@@ -68076,6 +68180,7 @@ mod tests {
             .send_input(
                 &worker_ref,
                 WorkerInputRequest {
+                    source: None,
                     kind: WorkerInputKind::User,
                     content: "persist me".to_string(),
                     submission_request_id: None,
@@ -68162,6 +68267,7 @@ mod tests {
             .send_input(
                 &worker_ref,
                 WorkerInputRequest {
+                    source: None,
                     kind: WorkerInputKind::User,
                     content: "reject input without live Worker".to_string(),
                     submission_request_id: None,

@@ -408,6 +408,9 @@ pub enum WorkerInputKind {
 pub struct WorkerInput {
     pub kind: WorkerInputKind,
     pub content: String,
+    /// Provenance stamped by the authenticated Backend, never by public/model input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<protocol::AuthenticatedInputSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1623,6 +1626,30 @@ pub const REMAINING_RUNTIME_ROUTES: &[RemainingRuntimeRoute] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_notify_source_round_trips_and_omitted_source_defaults_to_none() {
+        let mut value = serde_json::json!({
+            "kind": "notify", "content": "message", "submission_request_id": "stable-id"
+        });
+        let legacy: WorkerInput = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.source.is_none());
+        assert_eq!(serde_json::to_value(legacy).unwrap(), value);
+        for source in [
+            protocol::AuthenticatedInputSource::Account {
+                account_id: "account-a".into(),
+            },
+            protocol::AuthenticatedInputSource::Worker {
+                runtime_id: "runtime-a".into(),
+                worker_id: "worker-a".into(),
+            },
+        ] {
+            value["source"] = serde_json::to_value(&source).unwrap();
+            let input: WorkerInput = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(input.source, Some(source));
+            assert_eq!(serde_json::to_value(input).unwrap(), value);
+        }
+    }
 
     #[test]
     fn backend_job_journal_grant_defaults_off_and_does_not_enable_memory_grant() {

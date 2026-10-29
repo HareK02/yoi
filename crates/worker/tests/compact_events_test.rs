@@ -1935,6 +1935,7 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
     let completion_request_id = "subworker-completion-during-compact";
     handle
         .send(Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id: completion_request_id.into(),
             message: "subworker completed".into(),
             source: protocol::AuthenticatedInputSource::UntrustedWire,

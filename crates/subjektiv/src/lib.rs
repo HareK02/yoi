@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod api;
+pub mod chat;
 pub mod deletion;
 pub mod job;
 pub use deletion::{DeletionSubjectJob, SubjectDeletion};
@@ -656,6 +657,7 @@ static MIGRATIONS: &[FeatureMigration] = &[
         "add permanent Subject deletion fences and explicit erasure",
         deletion::migrate,
     ),
+    FeatureMigration::new(15, "add retained text-only conversations", chat::migrate),
 ];
 
 pub const REGISTRATION: FeatureRegistration =

@@ -5,8 +5,14 @@
 //! runs a real ProfileRuntimeWorkerFactory/Controller and materialized Workdir;
 //! only its external model stream is scripted. Neither fixture claims OS isolation.
 use super::*;
+#[path = "chat_delegation_connected_tests.rs"]
+mod chat_delegation_connected;
+#[path = "chat_tests.rs"]
+mod chat_tests;
 #[path = "subject_job_model_supply_tests.rs"]
 mod subject_job_model_supply;
+#[path = "subject_permission_management_tests.rs"]
+mod subject_permission_management;
 #[path = "ticket_worker_messaging_connected_tests.rs"]
 mod ticket_worker_messaging_connected;
 #[path = "worker_messaging_connected_tests.rs"]
@@ -43,6 +49,14 @@ fn subject_permission(subject: &str, operation: &str) -> ScopedPermission {
 fn create_permission() -> ScopedPermission {
     ScopedPermission {
         operation: "ticket.create".into(),
+        resource: PermissionResource::Workspace {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+        },
+    }
+}
+fn query_permission() -> ScopedPermission {
+    ScopedPermission {
+        operation: "ticket.query".into(),
         resource: PermissionResource::Workspace {
             workspace_id: TEST_WORKSPACE_ID.into(),
         },
@@ -184,6 +198,27 @@ impl Fixture {
             "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions",
             self.subject
         )
+    }
+    // Seed only intentionally unsupported saved input, never a management save.
+    // This models pre-catalog policies without teaching the HTTP validator to issue them.
+    fn seed_saved_policy(
+        &self,
+        execution: Vec<ScopedPermission>,
+        delegation: Vec<ScopedPermission>,
+    ) -> SubjectPermissions {
+        let store = open_subjektiv_store(&self.api).unwrap();
+        let previous = store.subject_permissions(&self.subject).unwrap();
+        store
+            .set_subject_permissions(
+                &self.subject,
+                &SubjectPermissionsUpdate {
+                    operation_id: Uuid::now_v7().to_string(),
+                    expected_change_id: previous.map(|policy| policy.change_id),
+                    execution,
+                    delegation,
+                },
+            )
+            .unwrap()
     }
     async fn assign(
         &self,
@@ -418,6 +453,7 @@ async fn signed_current_body_uses_explicit_policy_and_old_unset_body_denies() {
         let (status, body) = f.check(&f.source, &permission).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "unset policy: {body}");
     }
+    f.seed_saved_policy(vec![activation("ticket")], vec![]);
     f.assign(vec![activation("ticket"), create_permission()], vec![])
         .await;
     for permission in [activation("ticket"), create_permission()] {
@@ -603,7 +639,7 @@ async fn signed_host_never_expands_saved_workspace_or_feature_grants_to_new_reso
             },
         })
         .collect();
-    f.assign(workspace_grants.clone(), vec![]).await;
+    f.seed_saved_policy(workspace_grants.clone(), vec![]);
     for permission in &requested {
         let (status, body) = f.check(&f.source, permission).await;
         assert_eq!(
@@ -618,8 +654,7 @@ async fn signed_host_never_expands_saved_workspace_or_feature_grants_to_new_reso
         .iter()
         .map(|permission| permission.operation.split('.').next().unwrap())
         .collect();
-    f.assign(feature_names.into_iter().map(activation).collect(), vec![])
-        .await;
+    f.seed_saved_policy(feature_names.into_iter().map(activation).collect(), vec![]);
     for permission in &requested {
         assert_eq!(
             f.check(&f.source, permission).await.0,
@@ -627,7 +662,7 @@ async fn signed_host_never_expands_saved_workspace_or_feature_grants_to_new_reso
             "{permission:?}"
         );
     }
-    f.assign(requested.clone(), vec![]).await;
+    f.seed_saved_policy(requested.clone(), vec![]);
     for permission in &requested {
         let (status, body) = f.check(&f.source, permission).await;
         assert_eq!(
@@ -653,7 +688,7 @@ async fn signed_host_never_expands_saved_workspace_or_feature_grants_to_new_reso
 async fn signed_host_rejects_cross_workspace_resource_claims_before_alias_resolution() {
     let f = Fixture::new().await;
     let permissions = concrete_resource_permissions(&f);
-    f.assign(permissions.clone(), vec![]).await;
+    f.seed_saved_policy(permissions.clone(), vec![]);
     for permission in permissions
         .iter()
         .filter(|permission| permission.resource.workspace_id().is_some())
@@ -802,8 +837,8 @@ async fn signed_host_ungranted_operation_does_not_disclose_ticket_or_subject_exi
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authorization_rejects_missing_source_unknown_identity_fields_and_tampered_signed_body() {
     let f = Fixture::new().await;
-    f.assign(vec![activation("ticket")], vec![]).await;
-    let body = serde_json::to_value(activation("ticket")).unwrap();
+    f.assign(vec![create_permission()], vec![]).await;
+    let body = serde_json::to_value(create_permission()).unwrap();
     let (status, error) = response(
         &f.api,
         human_request(&f.owner, "POST", &authorization_path(), Some(body.clone())),
@@ -901,7 +936,7 @@ async fn authorization_rejects_missing_source_unknown_identity_fields_and_tamper
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn only_owner_account_can_read_assign_shrink_and_revoke_subject_permissions() {
+async fn only_owner_account_can_assign_shrink_and_revoke_subject_permissions() {
     let f = Fixture::new().await;
     let (status, body) = response(
         &f.api,
@@ -912,8 +947,8 @@ async fn only_owner_account_can_read_assign_shrink_and_revoke_subject_permission
     assert!(body["permissions"].is_null());
     let original = f
         .assign(
-            vec![activation("ticket"), create_permission()],
-            vec![activation("ticket")],
+            vec![create_permission(), query_permission()],
+            vec![create_permission()],
         )
         .await;
     let (status, body) = response(
@@ -965,9 +1000,20 @@ async fn only_owner_account_can_read_assign_shrink_and_revoke_subject_permission
         .await;
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
-            "foreign account {method}: {body}"
+            if method == "GET" {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            },
+            "non-owner account {method}: {body}"
         );
+        if method == "GET" {
+            assert_eq!(body["can_manage"], false);
+            assert_eq!(
+                body["permissions"],
+                serde_json::to_value(&original).unwrap()
+            );
+        }
     }
     assert_eq!(
         open_subjektiv_store(&f.api)
@@ -976,7 +1022,7 @@ async fn only_owner_account_can_read_assign_shrink_and_revoke_subject_permission
             .unwrap(),
         Some(original.clone())
     );
-    let shrunk = f.assign(vec![activation("ticket")], vec![]).await;
+    let shrunk = f.assign(vec![query_permission()], vec![]).await;
     assert_ne!(shrunk.change_id, original.change_id);
     assert_eq!(
         f.check(&f.source, &create_permission()).await.0,
@@ -995,7 +1041,7 @@ async fn only_owner_account_can_read_assign_shrink_and_revoke_subject_permission
     let revoked = f.assign(vec![], vec![]).await;
     assert!(revoked.execution.is_empty() && revoked.delegation.is_empty());
     assert_eq!(
-        f.check(&f.source, &activation("ticket")).await.0,
+        f.check(&f.source, &query_permission()).await.0,
         StatusCode::FORBIDDEN
     );
 }
@@ -1146,6 +1192,7 @@ async fn ticket_registration_is_local_and_only_create_permission_allows_backend_
         ("old-feature-only", vec![activation("ticket")]),
         ("wrong-resource", vec![wrong_workspace]),
     ] {
+        f.seed_saved_policy(permissions.clone(), vec![]);
         f.assign(permissions, vec![]).await;
         client.requests.lock().unwrap().clear();
         let (installed, tool) = ticket_tool_host(&f._dir.path().join(name), client.clone()).await;
@@ -1188,7 +1235,7 @@ async fn ticket_registration_is_local_and_only_create_permission_allows_backend_
         1,
         "genuine SQLite Ticket backend result: {created}"
     );
-    f.assign(vec![activation("ticket")], vec![]).await;
+    f.assign(vec![], vec![]).await;
     let result = tool
         .execute(
             r#"{"title":"revoked after install"}"#,
@@ -1528,7 +1575,7 @@ fn creation_record_counts(f: &Fixture) -> [i64; 3] {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn generic_create_routes_refuse_body_and_child_delegation_before_any_creation_effect() {
     let f = Fixture::new().await;
-    let permissions = vec![activation("ticket"), create_permission()];
+    let permissions = vec![query_permission(), create_permission()];
     f.assign(vec![], permissions.clone()).await;
     let mut child_request = f.child_request("redelegating-editor", permissions.clone());
     child_request["execution_grant"]["redelegation"] = json!(permissions);
@@ -1645,7 +1692,7 @@ async fn generic_create_routes_preserve_human_and_non_subject_worker_creation() 
 async fn subject_control_creation_recovers_control_grant_failure_and_lost_response_without_duplicates()
  {
     let f = Fixture::new().await;
-    let permissions = vec![activation("ticket"), create_permission()];
+    let permissions = vec![query_permission(), create_permission()];
     f.assign(vec![], permissions.clone()).await;
     let mut missing_id = f.child_request("control-grant-recovery", permissions.clone());
     missing_id
@@ -1842,7 +1889,7 @@ async fn explicit_delegation_creates_workdirless_ticketless_editor_and_replays_o
     let (status, body) = f
         .spawn(
             &child,
-            f.child_request("undelegatable-grandchild", vec![activation("ticket")]),
+            f.child_request("undelegatable-grandchild", vec![query_permission()]),
         )
         .await;
     assert_eq!(
@@ -1855,12 +1902,12 @@ async fn explicit_delegation_creates_workdirless_ticketless_editor_and_replays_o
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delegated_creation_rejects_excess_permissions_and_body_identity_before_runtime_spawn() {
     let f = Fixture::new().await;
-    f.assign(vec![], vec![activation("ticket")]).await;
-    let mut singleton = f.child_request("singleton-escalation", vec![activation("ticket")]);
+    f.assign(vec![], vec![query_permission()]).await;
+    let mut singleton = f.child_request("singleton-escalation", vec![query_permission()]);
     singleton["singleton_key"] = json!("model-chosen-singleton");
-    let mut body_attachment = f.child_request("subject-escalation", vec![activation("ticket")]);
+    let mut body_attachment = f.child_request("subject-escalation", vec![query_permission()]);
     body_attachment["feature_connections"] = json!({"subjektiv":{"subject_id":f.subject}});
-    let mut spoof = f.child_request("origin-escalation", vec![activation("ticket")]);
+    let mut spoof = f.child_request("origin-escalation", vec![query_permission()]);
     spoof["execution_grant"]["subject_id"] = json!(f.subject);
     for request in [
         singleton,
@@ -1882,12 +1929,9 @@ async fn delegated_creation_rejects_excess_permissions_and_body_identity_before_
 async fn restored_child_cannot_refresh_revoked_policy_and_released_origin_never_falls_back_to_legacy()
  {
     let f = Fixture::new().await;
-    f.assign(vec![], vec![activation("ticket")]).await;
-    let child = f.child("revocable-child", vec![activation("ticket")]).await;
-    assert_eq!(
-        f.check(&child, &activation("ticket")).await.0,
-        StatusCode::OK
-    );
+    f.assign(vec![], vec![query_permission()]).await;
+    let child = f.child("revocable-child", vec![query_permission()]).await;
+    assert_eq!(f.check(&child, &query_permission()).await.0, StatusCode::OK);
     let before = open_subjektiv_store(&f.api)
         .unwrap()
         .worker_execution_grant(&child.runtime_id, &child.worker_id)
@@ -1895,7 +1939,7 @@ async fn restored_child_cannot_refresh_revoked_policy_and_released_origin_never_
         .unwrap();
     f.assign(vec![], vec![]).await;
     assert_eq!(
-        f.check(&child, &activation("ticket")).await.0,
+        f.check(&child, &query_permission()).await.0,
         StatusCode::FORBIDDEN
     );
     let observation = f
@@ -1913,7 +1957,7 @@ async fn restored_child_cannot_refresh_revoked_policy_and_released_origin_never_
         Some(json!({"expected_observation_token":observation,"request_id":"restore-revoked-child"})))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        f.check(&child, &activation("ticket")).await.0,
+        f.check(&child, &query_permission()).await.0,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
@@ -1925,33 +1969,33 @@ async fn restored_child_cannot_refresh_revoked_policy_and_released_origin_never_
     );
     // Regranting identical permissions changes the assignment identity. Old
     // grants remain revoked rather than refreshing during restore/reconnect.
-    f.assign(vec![], vec![activation("ticket")]).await;
+    f.assign(vec![], vec![query_permission()]).await;
     assert_eq!(
-        f.check(&child, &activation("ticket")).await.0,
+        f.check(&child, &query_permission()).await.0,
         StatusCode::FORBIDDEN
     );
     let current = f
-        .child("current-before-origin-release", vec![activation("ticket")])
+        .child("current-before-origin-release", vec![query_permission()])
         .await;
     assert_eq!(
-        f.check(&current, &activation("ticket")).await.0,
+        f.check(&current, &query_permission()).await.0,
         StatusCode::OK
     );
     f.release_source_lease();
     assert_eq!(
-        f.check(&current, &activation("ticket")).await.0,
+        f.check(&current, &query_permission()).await.0,
         StatusCode::CONFLICT,
         "the captured source lease is no longer current"
     );
     assert_eq!(
-        f.check(&f.source, &activation("ticket")).await.0,
+        f.check(&f.source, &query_permission()).await.0,
         StatusCode::UNAUTHORIZED,
         "released body fails signed-source authentication instead of falling through to legacy compatibility"
     );
     let (status, _) = f
         .spawn(
             &f.source,
-            f.child_request("released-origin-spawn", vec![activation("ticket")]),
+            f.child_request("released-origin-spawn", vec![query_permission()]),
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1960,7 +2004,7 @@ async fn restored_child_cannot_refresh_revoked_policy_and_released_origin_never_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_wip_ticket_create_uses_same_signed_authorization_before_real_backend() {
     let f = Fixture::new().await;
-    f.assign(vec![activation("ticket")], vec![]).await;
+    f.assign(vec![], vec![]).await;
     let client = f.client(&f.source);
     let (mut host, installed) =
         ticket_worker_host(&f._dir.path().join("wip-host"), client.clone()).await;
@@ -2027,7 +2071,7 @@ async fn native_wip_ticket_create_uses_same_signed_authorization_before_real_bac
     let backend = browser_ticket_backend(&f.api).unwrap();
     let tickets = backend.list(Default::default()).unwrap();
     assert_eq!(tickets.len(), 1);
-    f.assign(vec![activation("ticket")], vec![]).await;
+    f.assign(vec![], vec![]).await;
     assert!(
         invoke
             .execute(&args, ToolExecutionContext::direct())
@@ -2047,7 +2091,7 @@ async fn policy_replacement_reports_interruption_evidence_but_exact_replay_does_
  {
     let f = Fixture::new().await;
     let update = json!({"operation_id":"policy-interruption-once","expected_change_id":null,
-        "execution":[activation("ticket")],"delegation":[]});
+        "execution":[create_permission()],"delegation":[]});
     let (status, body) = response(
         &f.api,
         human_request(&f.owner, "POST", &f.policy_path(), Some(update.clone())),
@@ -2101,13 +2145,13 @@ async fn policy_replacement_reports_interruption_evidence_but_exact_replay_does_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grandchild_grant_uses_immediate_parent_subset_not_root_subject_ceiling() {
     let f = Fixture::new().await;
-    f.assign(vec![], vec![activation("ticket"), create_permission()])
+    f.assign(vec![], vec![query_permission(), create_permission()])
         .await;
     let mut request = f.child_request(
         "redelegating-parent",
-        vec![activation("ticket"), create_permission()],
+        vec![query_permission(), create_permission()],
     );
-    request["execution_grant"]["redelegation"] = json!([activation("ticket")]);
+    request["execution_grant"]["redelegation"] = json!([query_permission()]);
     let (status, body) = f.spawn(&f.source, request).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let parent = RuntimeWorkerRef::new(
@@ -2117,7 +2161,7 @@ async fn grandchild_grant_uses_immediate_parent_subset_not_root_subject_ceiling(
     let (status, body) = f
         .spawn(
             &parent,
-            f.child_request("allowed-grandchild", vec![activation("ticket")]),
+            f.child_request("allowed-grandchild", vec![query_permission()]),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -2135,7 +2179,7 @@ async fn grandchild_grant_uses_immediate_parent_subset_not_root_subject_ceiling(
         "keep immediate lineage instead of flattening to the body"
     );
     assert_eq!(
-        f.check(&grandchild, &activation("ticket")).await.0,
+        f.check(&grandchild, &query_permission()).await.0,
         StatusCode::OK
     );
     assert_eq!(
@@ -2157,7 +2201,7 @@ async fn grandchild_grant_uses_immediate_parent_subset_not_root_subject_ceiling(
     assert_eq!(f.runtime.spawn_requests().len(), calls);
     f.assign(vec![], vec![]).await;
     assert_eq!(
-        f.check(&grandchild, &activation("ticket")).await.0,
+        f.check(&grandchild, &query_permission()).await.0,
         StatusCode::FORBIDDEN
     );
 }
@@ -2165,8 +2209,8 @@ async fn grandchild_grant_uses_immediate_parent_subset_not_root_subject_ceiling(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_profile_name_with_wider_resolved_scope_cannot_rebind_existing_operation() {
     let f = Fixture::new().await;
-    f.assign(vec![], vec![activation("ticket")]).await;
-    let mut request = f.child_request("profile-bound-once", vec![activation("ticket")]);
+    f.assign(vec![], vec![query_permission()]).await;
+    let mut request = f.child_request("profile-bound-once", vec![query_permission()]);
     request["profile"] = json!("project:authority-editor");
     let (status, body) = f.spawn(&f.source, request.clone()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -2202,7 +2246,7 @@ async fn same_profile_name_with_wider_resolved_scope_cannot_rebind_existing_oper
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn installed_ticket_service_and_raw_backend_recheck_current_signed_source() {
     let f = Fixture::new().await;
-    f.assign(vec![activation("ticket")], vec![]).await;
+    f.assign(vec![], vec![]).await;
     let client = f.client(&f.source);
     let (_host, installed, service) =
         ticket_worker_host_with_service(&f._dir.path().join("service-host"), client.clone()).await;
@@ -2278,7 +2322,7 @@ async fn installed_ticket_service_and_raw_backend_recheck_current_signed_source(
         "Service authorized"
     );
     assert_eq!(ticket_posts(&client), 1);
-    f.assign(vec![activation("ticket")], vec![]).await;
+    f.assign(vec![], vec![]).await;
     assert!(
         tokio::task::spawn_blocking(move || service.create(NewTicket::new("Revoked service")))
             .await
@@ -2716,7 +2760,7 @@ impl ConnectedWorkerHarness {
     }
 
     async fn start<M: agen::llm_client::LlmClient + Clone + 'static>(model: M) -> Self {
-        Self::start_configured(model, None).await
+        Self::start_with_layer(model, |router| router).await
     }
 
     /// Keep the existing signed RuntimeHTTP assembly, adding only the production
@@ -2726,12 +2770,20 @@ impl ConnectedWorkerHarness {
         model: M,
         transport: Arc<crate::plugin_https::HttpsTransport>,
     ) -> Self {
-        Self::start_configured(model, Some(transport)).await
+        Self::start_configured(model, Some(transport), |router| router).await
+    }
+
+    async fn start_with_layer<M: agen::llm_client::LlmClient + Clone + 'static>(
+        model: M,
+        app_layer: impl FnOnce(Router) -> Router,
+    ) -> Self {
+        Self::start_configured(model, None, app_layer).await
     }
 
     async fn start_configured<M: agen::llm_client::LlmClient + Clone + 'static>(
         model: M,
         plugin_https_transport: Option<Arc<crate::plugin_https::HttpsTransport>>,
+        app_layer: impl FnOnce(Router) -> Router,
     ) -> Self {
         const RUNTIME: &str = CONNECTED_RUNTIME;
         let dir = tempfile::tempdir().unwrap();
@@ -2962,7 +3014,7 @@ impl ConnectedWorkerHarness {
                 }
             },
         ));
-        let backend_server = AuthorizationCallbackServer::start(backend_listener, app);
+        let backend_server = AuthorizationCallbackServer::start(backend_listener, app_layer(app));
         let owner =
             seed_test_workspace_owner_token(api.store.as_ref(), "connected-authorization-owner")
                 .await;

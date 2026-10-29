@@ -85,29 +85,37 @@ async fn delivery_worker(api: &WorkspaceApi, subject: Option<&str>) -> RuntimeWo
     delivery_worker_profile(api, subject, "builtin:companion").await
 }
 
-async fn delivery_worker_profile(api: &WorkspaceApi, subject: Option<&str>, profile: &str) -> RuntimeWorkerRef {
+async fn delivery_worker_profile(
+    api: &WorkspaceApi,
+    subject: Option<&str>,
+    profile: &str,
+) -> RuntimeWorkerRef {
     let Json(worker) = create_workspace_worker(
-        State(api.clone()), HeaderMap::new(), Json(delivery_create_request(subject, profile)),
-    ).await.unwrap();
+        State(api.clone()),
+        HeaderMap::new(),
+        Json(delivery_create_request(subject, profile)),
+    )
+    .await
+    .unwrap();
     RuntimeWorkerRef::new(worker.runtime_id, worker.worker_id)
 }
 
 fn delivery_create_request(subject: Option<&str>, profile: &str) -> CreateWorkspaceWorkerRequest {
     CreateWorkspaceWorkerRequest {
-            runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.into(),
-            display_name: "Artifact consumer".into(),
-            singleton_key: None,
-            profile: Some(profile.into()),
-            ticket_assignment: None,
-            initial_submit: vec![],
-            workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: subject.map(|subject| server_api::SubjektivWorkerConnectionRequest {
-                    subject_id: subject.into(),
-                }),
-            },
-            control_operation_id: None,
-            execution_grant: None,
+        runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.into(),
+        display_name: "Artifact consumer".into(),
+        singleton_key: None,
+        profile: Some(profile.into()),
+        ticket_assignment: None,
+        initial_submit: vec![],
+        workdir_attachments: vec![],
+        feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+            subjektiv: subject.map(|subject| server_api::SubjektivWorkerConnectionRequest {
+                subject_id: subject.into(),
+            }),
+        },
+        control_operation_id: None,
+        execution_grant: None,
     }
 }
 

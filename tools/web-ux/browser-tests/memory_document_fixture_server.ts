@@ -1,5 +1,9 @@
 import { extname, join, normalize } from "jsr:@std/path@1.1.4";
 import { journalBrowserFixture } from "./journal_browser_fixture.ts";
+import {
+  createSubjectPermissionsFixture,
+  permissionFixtureSubjects,
+} from "./subject_permissions_fixture.ts";
 
 const port = Number(Deno.args[0]);
 const buildRoot = Deno.args[1];
@@ -11,6 +15,15 @@ if (
   throw new Error("usage: server.ts <port> <build-root> [section-count: 3..100]");
 }
 
+// 既存Memory scenarioとpaginationを変えないよう、明示選択時だけ有効にする。
+const permissionsMode = Deno.args[3] === "permissions";
+if (permissionsMode) {
+  // 権限の証拠は親から渡された実製品buildを使って採取する。
+  // build欠落時に/healthを成功させたり、fixture HTMLで代替したりしない。
+  await Deno.stat(join(buildRoot, "index.html"));
+  await Deno.stat(join(buildRoot, "_app/immutable"));
+}
+const permissionsFixture = createSubjectPermissionsFixture();
 const workspaceId = "memory-review";
 const representativeSubjectId =
   "release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review";
@@ -81,6 +94,11 @@ const subjects = [
   subject(ungeneratedSubjectId, "Ungenerated subject", "active", "fingerprint-0"),
   subject(errorSubjectId, "Unavailable subject", "retired", "fingerprint-3"),
 ];
+if (permissionsMode) {
+  subjects.push(
+    ...permissionFixtureSubjects.map(([id, role]) => subject(id, role, "active", "fingerprint-0")),
+  );
+}
 const pagedSubject = subject(pagedSubjectId, "Subject on the next page", "active", "fingerprint-1");
 
 function connectedWorker(displayName: string) {
@@ -132,7 +150,13 @@ function memoriesFor(subjectId: string) {
   if (subjectId === emptySubjectId || subjectId === ungeneratedSubjectId) return [];
   if (subjectId === staleSubjectId) {
     return [
-      memorySummary("stale-memory-1", "change-earlier", "lesson", "resolved", "A resolved stale-surface lesson"),
+      memorySummary(
+        "stale-memory-1",
+        "change-earlier",
+        "lesson",
+        "resolved",
+        "A resolved stale-surface lesson",
+      ),
     ];
   }
   if (subjectId === failedSubjectId) {
@@ -227,7 +251,12 @@ function surfaceFor(subjectId: string) {
 function memoryDetail(memoryId: string, requestedChangeId: string | null) {
   const currentChangeId = memoryId === derivedMemoryId ? "change-parent" : "change-current";
   const changeId = requestedChangeId ?? currentChangeId;
-  const states: Record<string, string> = { "change-original": "retracted", "change-earlier": "resolved", "change-current": "active", "change-parent": "active" };
+  const states: Record<string, string> = {
+    "change-original": "retracted",
+    "change-earlier": "resolved",
+    "change-current": "active",
+    "change-parent": "active",
+  };
   return {
     memory_id: memoryId,
     change_id: changeId,
@@ -361,6 +390,10 @@ async function staticResponse(pathname: string): Promise<Response> {
 Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const url = new URL(request.url);
   if (url.pathname === "/health") return new Response("ok");
+  if (permissionsMode) {
+    const response = await permissionsFixture(request);
+    if (response) return response;
+  }
   if (url.pathname === "/fixture/subject-create-requests") {
     return json({ count: subjectCreateRequests.length, requests: subjectCreateRequests });
   }
@@ -393,6 +426,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
         manage_secrets: false,
         manage_runtimes: false,
         delete_workspace: false,
+        delete_subjects: false,
       },
       extension_points: {
         store: "fixture",
@@ -409,7 +443,13 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     return json({ workspace_id: workspaceId, items: [], diagnostics: [] });
   }
   if (url.pathname === `/api/w/${workspaceId}/workers`) {
-    return json({ workspace_id: workspaceId, limit: 200, items: [], source: "fixture", diagnostics: [] });
+    return json({
+      workspace_id: workspaceId,
+      limit: 200,
+      items: [],
+      source: "fixture",
+      diagnostics: [],
+    });
   }
   if (url.pathname === `/api/w/${workspaceId}/workers/launch-options`) {
     return json({
@@ -521,7 +561,15 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       const paginated = subjectId === representativeSubjectId;
       const continued = paginated && url.searchParams.get("cursor") === memoryPageCursor;
       const items = continued
-        ? [memorySummary("memory-page-two", "change-original", "lesson", "active", "Memory on the next page")]
+        ? [
+          memorySummary(
+            "memory-page-two",
+            "change-original",
+            "lesson",
+            "active",
+            "Memory on the next page",
+          ),
+        ]
         : memoriesFor(subjectId);
       return json({
         items,
@@ -536,7 +584,9 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       }
       if (parts.length === 3) {
         const requested = url.searchParams.get("change_id");
-        const knownChanges = memoryId === derivedMemoryId ? ["change-parent"] : ["change-original", "change-earlier", "change-current"];
+        const knownChanges = memoryId === derivedMemoryId
+          ? ["change-parent"]
+          : ["change-original", "change-earlier", "change-current"];
         if (requested !== null && !knownChanges.includes(requested)) return json({}, 404);
         return json(memoryDetail(memoryId, requested));
       }

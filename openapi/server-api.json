@@ -644,6 +644,338 @@
         ],
         "type": "string"
       },
+      "ChatConversation": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "last_user_message_id": {
+            "description": "Latest user input in this conversation; empty conversations use null.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "participant_account_id": {
+            "type": "string"
+          },
+          "subject_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "subject_id",
+          "participant_account_id"
+        ],
+        "type": "object"
+      },
+      "ChatCreateConversationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "operation_id": {
+            "type": "string"
+          },
+          "subject_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "subject_id"
+        ],
+        "type": "object"
+      },
+      "ChatDelivery": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "state": {
+                "const": "no_current_body",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "runtime_id": {
+                "type": "string"
+              },
+              "state": {
+                "const": "accepted",
+                "type": "string"
+              },
+              "worker_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "runtime_id",
+              "worker_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "runtime_id": {
+                "type": "string"
+              },
+              "state": {
+                "const": "rejected",
+                "type": "string"
+              },
+              "worker_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "runtime_id",
+              "worker_id",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "runtime_id": {
+                "type": "string"
+              },
+              "state": {
+                "const": "unknown",
+                "type": "string"
+              },
+              "worker_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "runtime_id",
+              "worker_id",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "state": {
+                "const": "unavailable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "detail"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ChatMessage": {
+        "additionalProperties": false,
+        "properties": {
+          "conversation_id": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_user_message_id": {
+            "description": "User messages refer to themselves; Subject messages pin the latest observed user input.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "reply_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender": {
+            "$ref": "#/components/schemas/ChatMessageSender"
+          },
+          "sequence": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          },
+          "work_ref": {
+            "description": "Opaque related-work reference, not a grant or an attachment path.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "conversation_id",
+          "sequence",
+          "sender",
+          "text",
+          "operation_id"
+        ],
+        "type": "object"
+      },
+      "ChatMessagePage": {
+        "additionalProperties": false,
+        "properties": {
+          "conversation": {
+            "$ref": "#/components/schemas/ChatConversation"
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/ChatMessage"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "conversation",
+          "messages",
+          "has_more"
+        ],
+        "type": "object"
+      },
+      "ChatMessagePageQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "after_sequence": {
+            "default": null,
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ChatMessageSender": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "account_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "user",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "account_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "subject",
+                "type": "string"
+              },
+              "subject_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "subject_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ChatReceiveResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "delivery": {
+            "$ref": "#/components/schemas/ChatDelivery"
+          },
+          "message": {
+            "$ref": "#/components/schemas/ChatMessage"
+          }
+        },
+        "required": [
+          "message",
+          "delivery"
+        ],
+        "type": "object"
+      },
+      "ChatUserMessageRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "operation_id": {
+            "type": "string"
+          },
+          "reply_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "work_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "operation_id",
+          "text"
+        ],
+        "type": "object"
+      },
       "CleanupTargetKind": {
         "enum": [
           "worker_delete",
@@ -7023,6 +7355,72 @@
         ],
         "type": "object"
       },
+      "PermissionOperationAvailability": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "available",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unavailable",
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PermissionOperationDescriptor": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/PermissionOperationAvailability"
+          },
+          "description": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "operation": {
+            "type": "string"
+          },
+          "resource_kinds": {
+            "description": "Accepted management input kinds, not a claim that a target exists or is usable.",
+            "items": {
+              "$ref": "#/components/schemas/PermissionResourceKind"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "operation",
+          "label",
+          "description",
+          "resource_kinds",
+          "availability"
+        ],
+        "type": "object"
+      },
       "PermissionResource": {
         "oneOf": [
           {
@@ -7397,6 +7795,29 @@
             "type": "object"
           }
         ]
+      },
+      "PermissionResourceKind": {
+        "enum": [
+          "plugin_installation",
+          "job",
+          "ticket",
+          "objective",
+          "merge_request",
+          "subject",
+          "drive_entry",
+          "drive_request",
+          "repository",
+          "workdir_attachment",
+          "workspace_config",
+          "network",
+          "sub_worker",
+          "feature",
+          "workspace",
+          "workdir",
+          "worker",
+          "worker_operation"
+        ],
+        "type": "string"
       },
       "PluginAddArtifactRequest": {
         "additionalProperties": false,
@@ -10892,6 +11313,13 @@
               "array",
               "null"
             ]
+          },
+          "submission_request_id": {
+            "description": "Stable Notify identity. Non-Notify unary input does not share this replay contract.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -12385,6 +12813,15 @@
       "SubjectPermissionsResponse": {
         "additionalProperties": false,
         "properties": {
+          "can_manage": {
+            "type": "boolean"
+          },
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/PermissionOperationDescriptor"
+            },
+            "type": "array"
+          },
           "permissions": {
             "anyOf": [
               {
@@ -12396,6 +12833,10 @@
             ]
           }
         },
+        "required": [
+          "can_manage",
+          "operations"
+        ],
         "type": "object"
       },
       "SubjectPermissionsUpdate": {
@@ -20223,7 +20664,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:3e616b1d2ec6b52f7504cf0f81f30c976cd6a18e510084ea50f4f9e340089581"
+    "x-yoi-source-digest": "sha256:1053b09bb77ff0fc09fec2d3f96af04b76974c5ea52870f805381302e1b29fe4"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -23857,6 +24298,335 @@
             "description": "Error response"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/chat/conversations": {
+      "post": {
+        "operationId": "chat_create_conversation",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatCreateConversationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatConversation"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/chat/conversations/{conversation_id}/messages": {
+      "get": {
+        "operationId": "chat_messages",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ChatMessagePageQuery"
+            },
+            "style": "form"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatMessagePage"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "chat_receive",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatUserMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatReceiveResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
             "content": {
               "application/json": {
                 "schema": {

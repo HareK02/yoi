@@ -1415,6 +1415,14 @@ fn authorize_runtime_protocol_method(
             message,
             ..
         } => protocol::Method::NotifyTracked {
+            receipt_scope: if matches!(
+                transport_source,
+                Some(protocol::AuthenticatedInputSource::Account { .. })
+            ) {
+                protocol::NotificationReceiptScope::BrowserConsole
+            } else {
+                protocol::NotificationReceiptScope::Source
+            },
             source: transport_source.cloned().unwrap_or_else(|| {
                 protocol::AuthenticatedInputSource::Backend {
                     operation_id: notification_request_id.clone(),
@@ -2985,6 +2993,7 @@ mod tests {
             .unwrap()
             .expect("account source header must resolve");
         let wire = serde_json::to_string(&protocol::Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id: "notification-1".into(),
             message: "hello".into(),
             source: protocol::AuthenticatedInputSource::Account {
@@ -2997,9 +3006,11 @@ mod tests {
         assert!(matches!(
             authorize_runtime_protocol_method(decoded, Some(&source)),
             protocol::Method::NotifyTracked {
+                receipt_scope: protocol::NotificationReceiptScope::BrowserConsole,
+                notification_request_id,
                 source: protocol::AuthenticatedInputSource::Account { account_id },
                 ..
-            } if account_id == "account-1"
+            } if account_id == "account-1" && notification_request_id == "notification-1"
         ));
     }
 
@@ -5312,6 +5323,7 @@ mod ws_tests {
         let (mut stream, _) = connect_async(request).await.unwrap();
         let _ = next_frame(&mut stream).await;
         let notification = protocol::Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id: "notification-1".into(),
             message: "hello".into(),
             source: protocol::AuthenticatedInputSource::Account {

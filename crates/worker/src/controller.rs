@@ -546,6 +546,7 @@ fn durable_parent_notification_target<St: Store + Clone + Send + Sync + 'static>
 ) -> crate::spawn::tool::ParentNotificationTarget {
     crate::spawn::tool::ParentNotificationTarget::Durable(Arc::new(move |method| {
         let Method::NotifyTracked {
+            receipt_scope,
             notification_request_id,
             message,
             source,
@@ -554,6 +555,7 @@ fn durable_parent_notification_target<St: Store + Clone + Send + Sync + 'static>
             return;
         };
         let (source_namespace, provenance) = resolved_input_source(&pending_submissions, &source);
+        let source_namespace = receipt_scope.namespace(source_namespace);
         match pending_submissions.accept_notification_from_source(
             notification_request_id,
             message,
@@ -1499,7 +1501,7 @@ where
         // Keep the alias-routed schemas installed for the Worker lifetime. The
         // attachment set may be empty or mutate after registration, so target
         // resolution and provider capability checks happen per invocation.
-        let workdir_tools = if restrict_workdir_tools_to_current_capabilities {
+        let mut workdir_tools = if restrict_workdir_tools_to_current_capabilities {
             tools::routed_builtin_tools_for_current_capabilities(
                 workdir_sessions.clone(),
                 tracker.clone(),
@@ -1512,6 +1514,11 @@ where
                 bash_output.clone(),
             )
         };
+        if let Some(policy) = &spawner_manifest.permissions {
+            workdir_tools.retain(|definition| {
+                !crate::permission::tool_is_unconditionally_denied(policy, &definition().0.name)
+            });
+        }
         worker.engine_mut().register_tools(workdir_tools);
     }
     if feature_config.image.enabled && model_supports_image_attachments(&spawner_manifest.model) {
@@ -1657,6 +1664,15 @@ where
             feature_registry.add_module(refresh_feature);
         }
         feature_prompt_contribution = Some((Some(resident_summary_source), None));
+    }
+    if backend_job.is_none()
+        && let Some(chat) =
+            crate::feature::builtin::subjektiv_chat::SubjektivChatFeature::from_resolved_config(
+                &worker.manifest().feature.subjektiv,
+                subjektiv_host.clone(),
+            )?
+    {
+        feature_registry.add_module(chat);
     }
     if ordinary_subjektiv_features_enabled
         && let Some(subjektiv_memory) =
@@ -2275,12 +2291,14 @@ where
             None
         }
         Method::NotifyTracked {
+            receipt_scope,
             notification_request_id,
             message,
             source,
         } => {
             let (source_namespace, provenance) =
                 resolved_input_source(pending_submissions, &source);
+            let source_namespace = receipt_scope.namespace(source_namespace);
             durably_accept_notification(
                 notification_request_id,
                 message,
@@ -2756,12 +2774,14 @@ async fn controller_loop<C, St>(
             }
 
             Method::NotifyTracked {
+                receipt_scope,
                 notification_request_id,
                 message,
                 source,
             } => {
                 let (source_namespace, provenance) =
                     resolved_input_source(&pending_submissions, &source);
+                let source_namespace = receipt_scope.namespace(source_namespace);
                 durably_accept_notification(
                     notification_request_id,
                     message,
@@ -3678,12 +3698,14 @@ where
                         });
                     }
                     Some(Method::NotifyTracked {
+                        receipt_scope,
                         notification_request_id,
                         message,
                         source,
                     }) => {
                         let (source_namespace, provenance) =
                             resolved_input_source(pending_submissions, &source);
+                        let source_namespace = receipt_scope.namespace(source_namespace);
                         if durably_accept_notification(
                             notification_request_id,
                             message,
@@ -4907,6 +4929,7 @@ mod tests {
         let pending = PendingSubmissionHandle::for_test(dir.path());
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let method = Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id: "completion-1".into(),
             message: "subworker completed".into(),
             source: protocol::AuthenticatedInputSource::UntrustedWire,

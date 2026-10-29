@@ -273,12 +273,16 @@ fn every_subject_owned_table_has_old_and_new_sql_fences_and_retention_is_scoped(
         for table in tables {
             let columns = c.prepare(&format!("PRAGMA table_info({table})"))?.query_map([], |r| r.get::<_,String>(1))?.collect::<std::result::Result<Vec<_>,_>>()?;
             if !columns.iter().any(|v| v == "subject_id") || table.starts_with("subject_delet") { continue; }
-            assert!(DIRECT.contains(&table.as_str()) || table == "journal_erased_sessions", "unclassified Subject table: {table}");
+            assert!(DIRECT.contains(&table.as_str()) || table == "journal_erased_sessions" || table == "chat_conversations", "unclassified Subject table: {table}");
         }
         for table in DIRECT.iter().copied().chain(INDIRECT.iter().map(|v| v.0)).chain(["journal_erased_sessions"]) {
             let sql: String = c.query_row("SELECT sql FROM sqlite_master WHERE name=?1", [format!("deletion_fence_{table}_UPDATE")], |r| r.get(0))?;
             assert!(sql.contains("OLD.") && sql.contains("NEW."), "{table}: {sql}");
         }
+        // Chat owns its later migration; keep the earlier deletion migration unchanged.
+        let chat_guard: String = c.query_row("SELECT sql FROM sqlite_master WHERE name='chat_conversations_update_fence'", [], |r| r.get(0))?;
+        assert!(chat_guard.contains("OLD.subject_id") && chat_guard.contains("NEW.subject_id"));
+        assert!(c.execute("INSERT INTO chat_conversations VALUES ('late',?1,'alice',NULL,'late')", [&a]).is_err());
         // OLD fenced -> NEW unfenced must not evade a guard.
         assert!(c.execute("UPDATE subjects SET subject_id=?2 WHERE subject_id=?1", params![a, "new-id"]).is_err());
         assert!(c.execute("UPDATE subjects SET subject_id=?2 WHERE subject_id=?1", params![b, a]).is_err());

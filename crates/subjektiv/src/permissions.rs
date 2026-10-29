@@ -37,6 +37,27 @@ impl SubjektivStore {
         subject_id: &str,
         update: &SubjectPermissionsUpdate,
     ) -> Result<SubjectPermissions> {
+        self.replace_subject_permissions(subject_id, update, false)
+    }
+
+    /// Management replacement rejects new unsupported operation/resource pairs while
+    /// retaining exact legacy entries in their original execution/delegation lane.
+    /// Validation shares the existing CAS/receipt transaction so a stale editor cannot
+    /// retain a removed legacy grant. Exact replay remains historical evidence.
+    pub fn set_managed_subject_permissions(
+        &self,
+        subject_id: &str,
+        update: &SubjectPermissionsUpdate,
+    ) -> Result<SubjectPermissions> {
+        self.replace_subject_permissions(subject_id, update, true)
+    }
+
+    fn replace_subject_permissions(
+        &self,
+        subject_id: &str,
+        update: &SubjectPermissionsUpdate,
+        managed: bool,
+    ) -> Result<SubjectPermissions> {
         validate_authorization_identifier(subject_id).map_err(SubjektivError::InvalidRecord)?;
         validate_authorization_identifier(&update.operation_id)
             .map_err(SubjektivError::InvalidRecord)?;
@@ -69,6 +90,10 @@ impl SubjektivStore {
             let current = source_in_connection(tx, subject_id)?;
             if current.as_ref().map(|source| &source.change_id) != update.expected_change_id.as_ref() {
                 return Err(SubjektivError::SubjectPermissionsConflict(subject_id.into()));
+            }
+            if managed {
+                server_api::authorization::validate_managed_subject_permissions(current.as_ref(), update)
+                    .map_err(SubjektivError::InvalidRecord)?;
             }
             let source = SubjectPermissions {
                 change_id: issued_id("permissions"),

@@ -261,6 +261,7 @@ pub(super) fn dispatch_ticket_worker_notifications(api: &WorkspaceApi) {
         let result = api.runtime.send_input(
             &input.worker,
             WorkerInputRequest {
+                source: None,
                 kind: WorkerInputKind::Notify,
                 content,
                 submission_request_id: Some(input.request_id.clone()),
@@ -596,6 +597,7 @@ pub(super) fn deliver_job_result(api: &WorkspaceApi, acceptance: &BackendJobResu
     let result = api.runtime.send_input(
         &target,
         WorkerInputRequest {
+            source: None,
             kind: WorkerInputKind::Notify,
             content,
             submission_request_id: Some(source.delivery_id.clone()),

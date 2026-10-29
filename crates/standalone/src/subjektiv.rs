@@ -803,6 +803,41 @@ impl LocalSubjectHost {
     }
 }
 impl SubjektivHost for LocalSubjectHost {
+    fn authorize_operation(
+        &self,
+        context: &SubjektivHostContext,
+        operation: &str,
+    ) -> Result<(), SubjektivHostError> {
+        // An explicit operator connection issues this local body capability.
+        // Revalidate its live writer on every access/supply, not Feature enablement.
+        // Job decisions and Backend conversations are not local body capabilities.
+        self.body(context)?;
+        match operation {
+            "session.record"
+            | "memory.resident.read"
+            | "memory.resident.supply"
+            | "memory.surface.supply"
+            | "memory.query"
+            | "memory.read"
+            | "memory.changes.list"
+            | "memory.proposal.validate"
+            | "memory.receipt.read"
+            | "memory.staging.write"
+            | "memory.extract.read"
+            | "memory.extract.supply"
+            | "memory.extract.commit"
+            | "memory.consolidation.request"
+            | "journal.startup.read"
+            | "journal.startup.supply"
+            | "journal.compaction.read"
+            | "journal.compaction.supply"
+            | "journal.recording.request" => Ok(()),
+            _ => Err(SubjektivHostError::PermissionDenied(format!(
+                "operation `{operation}` is not granted by the local Subject body capability"
+            ))),
+        }
+    }
+
     fn memory_journal(
         &self,
         context: &SubjektivHostContext,
@@ -1176,6 +1211,37 @@ impl LocalConsolidationHost {
     }
 }
 impl SubjektivHost for LocalConsolidationHost {
+    fn authorize_operation(
+        &self,
+        context: &SubjektivHostContext,
+        operation: &str,
+    ) -> Result<(), SubjektivHostError> {
+        self.live()?;
+        let attempt = format!("job:{}", self.attempt_id);
+        if context.worker_id != attempt || context.session_id != attempt {
+            return Err(SubjektivHostError::PermissionDenied(
+                "context is not bound to this local consolidation attempt".into(),
+            ));
+        }
+        // The Host-issued batch/attempt grant is independent of body permission.
+        // Domain operations still enforce candidate membership and saved receipts.
+        match operation {
+            "memory.query"
+            | "memory.read"
+            | "memory.changes.list"
+            | "memory.staging.list"
+            | "memory.staging.read"
+            | "memory.candidate.decide"
+            | "memory.surface.prepare"
+            | "memory.surface.supply"
+            | "memory.surface.publish"
+            | "memory.surface.fail" => Ok(()),
+            _ => Err(SubjektivHostError::PermissionDenied(format!(
+                "operation `{operation}` is not granted by the local consolidation attempt"
+            ))),
+        }
+    }
+
     fn settings(&self) -> SubjektivHostSettings {
         self.host.settings()
     }

@@ -162,6 +162,17 @@ pub trait SubjektivHost: Send + Sync + 'static {
     fn workspace_id(&self) -> Option<String> {
         None
     }
+    /// Text-only public conversation access. Restricted Job and standalone Hosts
+    /// inherit denial, not the connected Subject body's posting capability.
+    fn chat(
+        &self,
+        _context: &SubjektivHostContext,
+        _operation: ChatWorkerOperation,
+    ) -> Result<ChatWorkerResponse, SubjektivHostError> {
+        Err(SubjektivHostError::PermissionDenied(
+            "conversation access is not granted by this Host".into(),
+        ))
+    }
     fn memory(
         &self,
         context: &SubjektivHostContext,
@@ -399,6 +410,18 @@ impl SubjektivHost for BackendSubjektivHost {
     fn consolidation_granted(&self) -> bool {
         self.consolidation_granted
     }
+    fn chat(
+        &self,
+        context: &SubjektivHostContext,
+        operation: ChatWorkerOperation,
+    ) -> Result<ChatWorkerResponse, SubjektivHostError> {
+        self.authorize_operation(context, chat_operation_name(&operation))?;
+        // Backend revalidates current singleton ownership and conversation access
+        // at the read/write boundary; this preflight cannot replace those checks.
+        self.execute(WorkspaceServerOperation::ChatWorker(ChatWorkerRequest {
+            operation,
+        }))
+    }
     fn memory(
         &self,
         context: &SubjektivHostContext,
@@ -574,6 +597,13 @@ impl JournalJobHost for BackendJournalJobHost {
     }
 }
 
+fn chat_operation_name(operation: &ChatWorkerOperation) -> &'static str {
+    match operation {
+        ChatWorkerOperation::Read { .. } => "chat.read",
+        ChatWorkerOperation::Send { .. } => "chat.send",
+    }
+}
+
 /// Live connection with Worker-supplied authority. Not serializable and never
 /// inherited by an ordinary SubWorker.
 #[derive(Clone)]
@@ -631,6 +661,13 @@ impl SubjektivHostConnection {
         request: MemoryJournalRequest,
     ) -> Result<MemoryJournalResponse, SubjektivHostError> {
         self.host.memory_journal(&self.context, request)
+    }
+    pub fn chat(
+        &self,
+        operation: ChatWorkerOperation,
+    ) -> Result<ChatWorkerResponse, SubjektivHostError> {
+        self.authorize_operation(chat_operation_name(&operation))?;
+        self.host.chat(&self.context, operation)
     }
     pub fn memory(
         &self,
@@ -768,6 +805,28 @@ mod tests {
     use session_store::{CombinedStore, FsStore, FsWorkerStore, WorkerMetadataStore};
     use std::pin::Pin;
     use std::sync::Mutex;
+
+    #[test]
+    fn non_chat_local_hosts_do_not_inherit_public_conversation_access() {
+        let host = Arc::new(LocalHost::default());
+        let context = SubjektivHostContext {
+            worker_id: "worker".into(),
+            session_id: "session".into(),
+        };
+        let read = ChatWorkerOperation::Read {
+            conversation_id: "conversation".into(),
+            query: ChatMessagePageQuery::default(),
+        };
+        assert!(matches!(
+            host.chat(&context, read.clone()),
+            Err(SubjektivHostError::PermissionDenied(_))
+        ));
+        let connection = SubjektivHostConnection::new(host, context).unwrap();
+        assert!(matches!(
+            connection.chat(read),
+            Err(SubjektivHostError::PermissionDenied(_))
+        ));
+    }
 
     #[derive(Default)]
     struct LocalHost {

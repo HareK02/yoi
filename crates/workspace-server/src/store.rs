@@ -3729,6 +3729,37 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    /// Keep the Backend singleton writer fence through a bounded FeatureStorage commit.
+    /// The callback must not reenter this Store or call Runtime/network. This is not a
+    /// cross-database atomic commit: a lost response is recovered by the feature's
+    /// stable operation, but ownership cannot change before its publication commits.
+    pub(crate) fn with_current_subject_body<T>(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        expected: &WorkerSingletonLease,
+        publish: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let key = crate::subjektiv::subject_worker_singleton_key(subject_id)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        if expected.key != key {
+            return Err(Error::WorkspacePermissionDenied(
+                "chat requires Subject body ownership".into(),
+            ));
+        }
+        self.with_immediate_transaction(|tx| {
+            require_current_worker_singleton_lease(tx, workspace_id, expected)?;
+            if current_worker_singleton_owner(tx, workspace_id, &expected.key)?
+                .is_none_or(|(_, state)| state.as_deref() == Some("removed"))
+            {
+                return Err(Error::WorkspacePermissionDenied(
+                    "Subject body was released".into(),
+                ));
+            }
+            publish()
+        })
+    }
+
     pub(crate) fn complete_worker_create_reservation(
         &self,
         workspace_id: &str,

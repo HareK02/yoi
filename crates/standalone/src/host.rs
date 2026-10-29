@@ -706,6 +706,7 @@ fn authorize_local_input(method: protocol::Method) -> protocol::Method {
             message,
             ..
         } => Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id,
             message,
             source: AuthenticatedInputSource::LocalOperator,
@@ -952,6 +953,7 @@ mod local_input_tests {
                 message: "hello".into(),
             },
             Method::NotifyTracked {
+                receipt_scope: protocol::NotificationReceiptScope::Source,
                 notification_request_id: "tracked-notify".into(),
                 message: "hello".into(),
                 source,

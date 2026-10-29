@@ -8201,6 +8201,7 @@ mod tests {
         let input = WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
+            source: None,
             submission_request_id: None,
             segments: Some(vec![protocol::Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
@@ -8214,6 +8215,7 @@ mod tests {
         let input = WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
+            source: None,
             submission_request_id: None,
             segments: Some(Vec::new()),
         };
@@ -8229,6 +8231,7 @@ mod tests {
         request.initial_input = Some(WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
+            source: None,
             submission_request_id: None,
             segments: Some(vec![protocol::Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
@@ -13696,6 +13699,7 @@ mod tests {
         request.initial_input = Some(WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
+            source: None,
             submission_request_id: None,
             segments: Some(vec![
                 protocol::Segment::Flow {
@@ -13739,6 +13743,7 @@ mod tests {
         let input = WorkerInput {
             kind: WorkerInputKind::User,
             content: String::new(),
+            source: None,
             submission_request_id: None,
             segments: Some(vec![protocol::Segment::Flow {
                 selector: "builtin:coder-review".to_string(),
