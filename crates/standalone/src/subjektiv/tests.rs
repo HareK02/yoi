@@ -86,11 +86,56 @@ fn closed_capabilities_and_foreign_worker_context_are_rejected() {
         session_id: session_store::SessionId::now_v7().to_string(),
     };
     assert!(port.memory(&owner, read.clone()).is_ok());
+    let local_operations = [
+        "memory.resident.read",
+        "memory.resident.supply",
+        "memory.staging.write",
+        "journal.startup.read",
+        "journal.startup.supply",
+        "journal.compaction.read",
+        "journal.compaction.supply",
+        "journal.recording.request",
+    ];
+    for operation in local_operations {
+        assert!(
+            port.authorize_operation(&owner, operation).is_ok(),
+            "{operation}"
+        );
+        assert!(
+            port.authorize_operation(&foreign, operation).is_err(),
+            "{operation}"
+        );
+    }
+    for operation in [
+        "chat.read",
+        "chat.send",
+        "worker.messaging",
+        "memory.candidate.decide",
+        "memory.surface.publish",
+        "memory.staging.list",
+        "journal",
+        "journal.startup",
+        "journal.startup.read.future",
+    ] {
+        assert!(
+            matches!(
+                port.authorize_operation(&owner, operation),
+                Err(SubjektivHostError::PermissionDenied(_))
+            ),
+            "local body must not grant {operation}"
+        );
+    }
     assert!(
         port.record_session(&owner, false).is_err(),
         "unattributed Session is not read authority"
     );
     connection.close().unwrap();
+    for operation in local_operations {
+        assert!(
+            port.authorize_operation(&owner, operation).is_err(),
+            "released capability: {operation}"
+        );
+    }
     assert!(port.memory(&owner, read).is_err());
 }
 
@@ -131,6 +176,94 @@ fn different_local_roots_do_not_authorize_shared_subject_ids() {
     assert!(
         other
             .connect(&subject.id, protocol::WorkerId::now_v7())
+            .is_err()
+    );
+}
+
+#[test]
+fn consolidation_operation_policy_is_attempt_bound_and_does_not_inherit_body_rights() {
+    struct Fence(AtomicBool);
+    impl crate::jobs::JobAttemptFence for Fence {
+        fn ensure_live(&self) -> Result<(), String> {
+            self.0
+                .load(Ordering::Acquire)
+                .then_some(())
+                .ok_or("attempt revoked".into())
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let catalog = StandaloneSubjects::open(temp.path().join("state")).unwrap();
+    let subject = catalog.create("owner", None).unwrap();
+    let mut body = catalog
+        .connect(&subject.id, protocol::WorkerId::now_v7())
+        .unwrap();
+    let fence = Arc::new(Fence(AtomicBool::new(true)));
+    let job = LocalConsolidationHost {
+        host: body.host.clone(),
+        grant: LocalConsolidationGrant {
+            binding: body.binding.clone(),
+            candidate_ids: vec![],
+        },
+        job_id: "job-1".into(),
+        attempt_id: "attempt-1".into(),
+        fence: fence.clone(),
+    };
+    let context = SubjektivHostContext {
+        worker_id: "job:attempt-1".into(),
+        session_id: "job:attempt-1".into(),
+    };
+    assert!(
+        job.authorize_operation(&context, "memory.staging.list")
+            .is_ok()
+    );
+    assert!(
+        job.authorize_operation(&context, "memory.surface.supply")
+            .is_ok()
+    );
+    let foreign = SubjektivHostContext {
+        worker_id: "job:old-attempt".into(),
+        session_id: "job:old-attempt".into(),
+    };
+    assert!(
+        job.authorize_operation(&foreign, "memory.staging.list")
+            .is_err()
+    );
+    for op in [
+        "session.record",
+        "memory.resident.read",
+        "memory.resident.supply",
+        "memory.extract.read",
+        "memory.staging.write",
+        "journal.startup.read",
+        "chat.send",
+        "memory",
+    ] {
+        assert!(
+            matches!(
+                job.authorize_operation(&context, op),
+                Err(SubjektivHostError::PermissionDenied(_))
+            ),
+            "Job must not gain {op}"
+        );
+    }
+    assert!(
+        job.memory(
+            &context,
+            SubjektivMemoryBackendOperation::ReadCandidate(SubjektivMemoryCandidateReadRequest {
+                candidate_id: "outside-batch".into()
+            })
+        )
+        .is_err()
+    );
+    fence.0.store(false, Ordering::Release);
+    assert!(
+        job.authorize_operation(&context, "memory.staging.list")
+            .is_err()
+    );
+    fence.0.store(true, Ordering::Release);
+    body.close().unwrap();
+    assert!(
+        job.authorize_operation(&context, "memory.staging.list")
             .is_err()
     );
 }
