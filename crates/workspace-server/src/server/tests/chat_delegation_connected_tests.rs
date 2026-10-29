@@ -72,6 +72,8 @@ struct Context {
     workdir: Option<String>,
     permissions: Vec<ScopedPermission>,
     spawned: Option<RuntimeWorkerRef>,
+    ticket: Option<String>,
+    denials: Vec<(String, Value, String)>,
 }
 #[derive(Clone)]
 struct DelegationModel {
@@ -86,7 +88,7 @@ struct DelegationModel {
     lose_spawn_ack: bool,
 }
 impl DelegationModel {
-    fn spawn(&self, page: &Value) -> Value {
+    fn spawn(&self, page: &Value, request: &agen::llm_client::Request) -> Value {
         let c = self.context.lock().unwrap();
         let message = page["conversation"]["last_user_message_id"]
             .as_str()
@@ -98,6 +100,18 @@ impl DelegationModel {
             "execution_grant":{"permissions":c.permissions,"redelegation":[]}});
         if let Some(id) = &c.workdir {
             input["working_directory_id"] = json!(id);
+        }
+        if let Some(ticket) = &c.ticket {
+            let current = value(request, "ticket-current");
+            let assignment = current["assignment_tracking"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["role"] == "orchestrator")
+                .expect("current Subject responsibility");
+            assert_eq!(assignment["principal"]["kind"], "subject");
+            input["ticket_id"] = json!(ticket);
+            input["orchestrator_assignment_id"] = assignment["assignment_id"].clone();
         }
         input
     }
@@ -135,6 +149,133 @@ impl agen::llm_client::LlmClient for DelegationModel {
     ) -> std::result::Result<agen::llm_client::client::ResponseStream, agen::llm_client::ClientError>
     {
         let child = request.items.iter().any(|item| matches!(item, Item::Message { content, .. } if serde_json::to_string(content).unwrap().contains(CHILD)));
+        let ticket = self.context.lock().unwrap().ticket.clone();
+        let messages = request
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Message { content, .. } => Some(serde_json::to_string(content).unwrap()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preliminary = if child && self.child_phase.load(Ordering::SeqCst) >= 5 {
+            // Assignment-change notifications can reach the finished background
+            // Worker; they do not reissue the original chat work.
+            Some(done())
+        } else if child
+            && ticket.is_some()
+            && self.child_phase.load(Ordering::SeqCst) == 3
+            && output(&request, "ticket-result").is_none()
+        {
+            Some(call(
+                "ticket-result",
+                "TicketImplementationResult",
+                json!({"ticket":ticket,"kind":"result","body":"Verified real README Read/Write for the chat request"}),
+            ))
+        } else if !child {
+            let phase = self.body_phase.load(Ordering::SeqCst);
+            if phase >= 13
+                || (phase == 0
+                    && !messages.contains("Please perform bounded background work for A"))
+                || (phase == 5 && !messages.contains("A separate question B"))
+                || (phase == 8 && !messages.contains(REPORT))
+                || (phase == 11 && !messages.contains("Attempt follow-up"))
+            {
+                // Business notifications are private context, not a new chat request
+                // or permission to advance the scripted consumer's decision.
+                Some(done())
+            } else if ticket.is_some() && phase == 0 && output(&request, "ticket-current").is_none()
+            {
+                Some(call("ticket-current", "ShowTicket", json!({"id":ticket})))
+            } else if ticket.is_some() && phase == 1 {
+                let denials = self.context.lock().unwrap().denials.clone();
+                let mut next = None;
+                for (id, overrides, reason) in denials {
+                    if let Some((error, text)) = output(&request, &id) {
+                        assert!(
+                            error && text.contains(&reason),
+                            "public chat {id} must exercise {reason}, not another fence: {text}"
+                        );
+                    } else {
+                        let mut input = self.spawn(&value(&request, "origin-read"), &request);
+                        for (name, value) in overrides.as_object().unwrap() {
+                            input[name] = value.clone();
+                        }
+                        input["operation_id"] = json!(id);
+                        next = Some(call(&id, "WorkerSpawn", input));
+                        break;
+                    }
+                }
+                next
+            } else if ticket.is_some()
+                && phase == 8
+                && output(&request, "ticket-evaluate").is_none()
+            {
+                let report = request
+                    .items
+                    .iter()
+                    .find_map(|item| {
+                        let Item::Message { content, .. } = item else {
+                            return None;
+                        };
+                        content.iter().find_map(|part| {
+                            let agen::llm_client::types::ContentPart::Text { text } = part else {
+                                return None;
+                            };
+                            text.find(REPORT).and_then(|offset| {
+                                serde_json::Deserializer::from_str(&text[offset + REPORT.len()..])
+                                    .into_iter::<Value>()
+                                    .next()
+                                    .transpose()
+                                    .expect("report JSON")
+                            })
+                        })
+                    })
+                    .expect("ordinary Notify report reference");
+                assert_eq!(report["ticket"], json!(ticket));
+                Some(call(
+                    "ticket-evaluate",
+                    "TicketImplementationResultQuery",
+                    json!({"ticket":ticket,"result_id":report["result_id"]}),
+                ))
+            } else if ticket.is_some() && phase == 10 {
+                let current = value(&request, "ticket-publication-recheck");
+                let initial = value(&request, "ticket-current");
+                if current["assignment_tracking"][0]["assignment_id"]
+                    != initial["assignment_tracking"][0]["assignment_id"]
+                {
+                    if let Some((error, text)) = output(&request, "old-report-spawn") {
+                        assert!(
+                            error && text.contains("assignment"),
+                            "old report cannot authorize a new Ticket execution: {text}"
+                        );
+                        self.body_phase.fetch_add(1, Ordering::SeqCst);
+                        self.completed.try_send(()).unwrap();
+                        Some(done())
+                    } else {
+                        let mut input = self.spawn(&value(&request, "origin-read"), &request);
+                        input["operation_id"] = json!("old-ticket-report-new-attempt");
+                        Some(call("old-report-spawn", "WorkerSpawn", input))
+                    }
+                } else if output(&request, "a-send").is_none() {
+                    Some(call(
+                        "a-send",
+                        "ConversationSend",
+                        self.send(&request, "a-reread", PUBLIC_A, "answer-a", true),
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(events) = preliminary {
+            return Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))));
+        }
         let events = if child {
             let phase = self.child_phase.fetch_add(1, Ordering::SeqCst);
             let workdir = self.context.lock().unwrap().workdir.is_some();
@@ -185,10 +326,27 @@ impl agen::llm_client::LlmClient for DelegationModel {
                     assert_eq!(origins.len(), 1, "confirmed origin: {list}");
                     assert_eq!(origins[0]["permissions"], json!(["notify"]));
                     let c = self.context.lock().unwrap();
+                    let report = if c.ticket.is_some() {
+                        let result = value(&request, "ticket-result");
+                        format!(
+                            "{REPORT}{}",
+                            json!({"conversation":c.a,"ticket":c.ticket,"result_id":result["result_id"]})
+                        )
+                    } else {
+                        format!(
+                            "{REPORT}; conversation={}; work={}",
+                            c.a,
+                            if workdir {
+                                "README read/write"
+                            } else {
+                                "bounded objective query"
+                            }
+                        )
+                    };
                     call(
                         "report",
                         "WorkerNotify",
-                        json!({"subject":origins[0]["subject"],"content":format!("{REPORT}; conversation={}; work={}", c.a, if workdir {"README read/write"} else {"bounded objective query"})}),
+                        json!({"subject":origins[0]["subject"],"content":report}),
                     )
                 }
                 3 | 4 => {
@@ -215,7 +373,7 @@ impl agen::llm_client::LlmClient for DelegationModel {
                 1 => call(
                     "spawn-first",
                     "WorkerSpawn",
-                    self.spawn(&value(&request, "origin-read")),
+                    self.spawn(&value(&request, "origin-read"), &request),
                 ),
                 2 => {
                     let (error, text) = output(&request, "spawn-first").unwrap();
@@ -230,7 +388,7 @@ impl agen::llm_client::LlmClient for DelegationModel {
                     call(
                         "spawn-retry",
                         "WorkerSpawn",
-                        self.spawn(&value(&request, "origin-read")),
+                        self.spawn(&value(&request, "origin-read"), &request),
                     )
                 }
                 3 => {
@@ -244,7 +402,7 @@ impl agen::llm_client::LlmClient for DelegationModel {
                     call(
                         "spawn-exact-replay",
                         "WorkerSpawn",
-                        self.spawn(&value(&request, "origin-read")),
+                        self.spawn(&value(&request, "origin-read"), &request),
                     )
                 }
                 4 => {
@@ -282,6 +440,14 @@ impl agen::llm_client::LlmClient for DelegationModel {
                     )
                 }
                 9 => {
+                    if let Some(ticket) = &ticket {
+                        let result = value(&request, "ticket-evaluate");
+                        assert_eq!(result["ticket_id"], json!(ticket));
+                        assert_eq!(
+                            result["request"]["body"],
+                            "Verified real README Read/Write for the chat request"
+                        );
+                    }
                     self.private_report.try_send(()).unwrap();
                     tokio::time::timeout(
                         std::time::Duration::from_secs(60),
@@ -291,11 +457,19 @@ impl agen::llm_client::LlmClient for DelegationModel {
                     .expect("inspect private report before explicit publication")
                     .unwrap()
                     .forget();
-                    call(
-                        "a-send",
-                        "ConversationSend",
-                        self.send(&request, "a-reread", PUBLIC_A, "answer-a", true),
-                    )
+                    if ticket.is_some() {
+                        call(
+                            "ticket-publication-recheck",
+                            "ShowTicket",
+                            json!({"id":ticket}),
+                        )
+                    } else {
+                        call(
+                            "a-send",
+                            "ConversationSend",
+                            self.send(&request, "a-reread", PUBLIC_A, "answer-a", true),
+                        )
+                    }
                 }
                 10 => {
                     value(&request, "a-send");
@@ -347,7 +521,8 @@ fn publish_profiles(api: &WorkspaceApi) {
               { tool = "Write"; pattern = "*"; action = "allow"; },
               { tool = "QueryObjective"; pattern = "*"; action = "allow"; },
               { tool = "WorkerList"; pattern = "*"; action = "allow"; },
-              { tool = "WorkerNotify"; pattern = "*"; action = "allow"; }
+              { tool = "WorkerNotify"; pattern = "*"; action = "allow"; },
+              { tool = "TicketImplementationResult"; pattern = "*"; action = "allow"; }
             ]; };
           }; }
     ]; }; }"#;
@@ -384,15 +559,27 @@ async fn idle(
         worker_runtime::observation::WorkerObservationEvent,
     >,
     worker: &str,
+    phase: &AtomicUsize,
+    expected: usize,
 ) {
     tokio::time::timeout(std::time::Duration::from_secs(60),async {
         loop {
             let event = events.recv().await.unwrap();
-            if event.worker_ref.worker_id.to_string() == worker && matches!(event.payload,protocol::Event::WorkerState {snapshot} if snapshot.state == protocol::WorkerState::Idle) {break;}
+            if phase.load(Ordering::SeqCst) >= expected && event.worker_ref.worker_id.to_string() == worker && matches!(event.payload,protocol::Event::WorkerState {snapshot} if snapshot.state == protocol::WorkerState::Idle) {break;}
         }
     }).await.expect("real chat Controller Idle boundary");
 }
-async fn connected_chat_delegation(explicit_workdir: bool, lose_spawn_ack: bool) {
+enum Scenario {
+    Workdir,
+    Workdirless,
+    Ticket,
+    ReassignedTicket,
+}
+async fn connected_chat_delegation(scenario: Scenario) {
+    let explicit_workdir = !matches!(scenario, Scenario::Workdirless);
+    let ticket_mode = matches!(scenario, Scenario::Ticket | Scenario::ReassignedTicket);
+    let reassign_before_evaluation = matches!(scenario, Scenario::ReassignedTicket);
+    let lose_spawn_ack = matches!(scenario, Scenario::Workdir | Scenario::Ticket);
     let context = Arc::new(Mutex::new(Context::default()));
     let (started, mut start) = tokio::sync::mpsc::channel(1);
     let (completed, mut completion) = tokio::sync::mpsc::channel(2);
@@ -432,8 +619,22 @@ async fn connected_chat_delegation(explicit_workdir: bool, lose_spawn_ack: bool)
         operation("worker.list", true),
     ];
     let mut readme = None;
+    let selector = if ticket_mode {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(h._dir.path())
+                .args(["branch", "chat-ticket"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        "chat-ticket"
+    } else {
+        "HEAD"
+    };
     if explicit_workdir {
-        let created = account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),Some(json!({"runtime_id":CONNECTED_RUNTIME,"repository_key":"test-repository","selector":"HEAD","operation_id":"chat-workdir"}))).await;
+        let created = account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),Some(json!({"runtime_id":CONNECTED_RUNTIME,"repository_key":"test-repository","selector":selector,"operation_id":"chat-workdir"}))).await;
         let id = created["item"]["working_directory_id"]
             .as_str()
             .unwrap()
@@ -454,6 +655,17 @@ async fn connected_chat_delegation(explicit_workdir: bool, lose_spawn_ack: bool)
                     recursive: true,
                 },
             });
+        }
+        if ticket_mode {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(readme.as_ref().unwrap().parent().unwrap())
+                    .args(["switch", "-c", selector])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
         }
         context.lock().unwrap().workdir = Some(id);
     } else {
@@ -481,7 +693,89 @@ async fn connected_chat_delegation(explicit_workdir: bool, lose_spawn_ack: bool)
         operation("worker.create", true),
         operation("worker.messaging", false),
     ]);
-    account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),Some(json!({"operation_id":"chat-policy","expected_change_id":null,"execution":execution,"delegation":child_permissions}))).await;
+    let mut foreign = None;
+    let mut delegation = child_permissions.clone();
+    if ticket_mode {
+        let mut input = NewTicket::new("Chat requested Ticket work");
+        set_test_ticket_target(&mut input, "test-repository", selector);
+        let ticket = browser_ticket_backend(&h.api)
+            .unwrap()
+            .create(input)
+            .unwrap()
+            .id;
+        let other_subject = store
+            .create_subject(crate::subjektiv::SubjectRole::new("other-chat-subject").unwrap())
+            .unwrap()
+            .id;
+        let mut input = NewTicket::new("Other Subject Ticket");
+        set_test_ticket_target(&mut input, "test-repository", selector);
+        let other_ticket = browser_ticket_backend(&h.api)
+            .unwrap()
+            .create(input)
+            .unwrap()
+            .id;
+        let assigned = account_request(&h,"PUT",&format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{other_ticket}/assignments/orchestrator"),Some(json!({"operation_id":"other-ticket-assign","expected_assignment_id":null,"principal":{"kind":"subject","subject_id":other_subject}}))).await;
+        let other_assignment = assigned["assignment"]["assignment_id"].clone();
+        for (id, name) in [
+            (&ticket, "ticket.read"),
+            (&ticket, "ticket.assignment.assign"),
+            (&ticket, "ticket.implementation_result.read"),
+            (&other_ticket, "ticket.assignment.assign"),
+        ] {
+            execution.push(ScopedPermission {
+                operation: name.into(),
+                resource: PermissionResource::Ticket {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    ticket_id: id.clone(),
+                },
+            });
+        }
+        for name in ["ticket.read", "ticket.implementation_result.write"] {
+            child_permissions.push(ScopedPermission {
+                operation: name.into(),
+                resource: PermissionResource::Ticket {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    ticket_id: ticket.clone(),
+                },
+            });
+        }
+        delegation = child_permissions.clone();
+        let wrong = account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),Some(json!({"runtime_id":CONNECTED_RUNTIME,"repository_key":"test-repository","selector":"HEAD","operation_id":"wrong-chat-workdir"}))).await;
+        let wrong = wrong["item"]["working_directory_id"].as_str().unwrap();
+        let mut wrong_permissions = child_permissions
+            .iter()
+            .filter(|p| !p.operation.starts_with("filesystem."))
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in ["filesystem.read", "filesystem.write"] {
+            let p = ScopedPermission {
+                operation: name.into(),
+                resource: PermissionResource::Workdir {
+                    working_directory_id: wrong.into(),
+                    path: ".".into(),
+                    recursive: true,
+                },
+            };
+            delegation.push(p.clone());
+            wrong_permissions.push(p);
+        }
+        context.lock().unwrap().permissions = child_permissions.clone();
+        context.lock().unwrap().ticket = Some(ticket);
+        context.lock().unwrap().denials = vec![
+            (
+                "chat-denied-other-assignee".into(),
+                json!({"ticket_id":other_ticket,"orchestrator_assignment_id":other_assignment}),
+                "target Subject".into(),
+            ),
+            (
+                "chat-denied-wrong-target".into(),
+                json!({"working_directory_id":wrong,"execution_grant":{"permissions":wrong_permissions,"redelegation":[]}}),
+                "selector".into(),
+            ),
+        ];
+        foreign = Some((other_subject, other_ticket));
+    }
+    account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),Some(json!({"operation_id":"chat-policy","expected_change_id":null,"execution":execution,"delegation":delegation}))).await;
     let original_policy = store.subject_permissions(&subject).unwrap().unwrap();
     for (name, target) in [("conversation-a", true), ("conversation-b", false)] {
         let c = account_request(
@@ -507,6 +801,9 @@ async fn connected_chat_delegation(explicit_workdir: bool, lose_spawn_ack: bool)
         source["runtime_id"].as_str().unwrap(),
         source["worker_id"].as_str().unwrap(),
     );
+    if let Some(ticket) = context.lock().unwrap().ticket.clone() {
+        account_request(&h,"PUT",&format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),Some(json!({"operation_id":"chat-ticket-assign","expected_assignment_id":null,"principal":{"kind":"subject","subject_id":subject}}))).await;
+    }
     let mut events = h.runtime.subscribe_worker_observation().unwrap();
     let first = account_request(&h,"POST",&messages(&a),Some(json!({"operation_id":"request-a","text":"Please perform bounded background work for A"}))).await;
     assert_eq!(first["delivery"]["state"], "accepted");
@@ -514,7 +811,7 @@ async fn connected_chat_delegation(explicit_workdir: bool, lose_spawn_ack: bool)
         .await
         .expect("real child started")
         .unwrap();
-    idle(&mut events, &source.worker_id).await;
+    idle(&mut events, &source.worker_id, &body_phase, 5).await;
     assert_eq!(
         body_phase.load(Ordering::SeqCst),
         5,
@@ -538,7 +835,7 @@ async fn connected_chat_delegation(explicit_workdir: bool, lose_spawn_ack: bool)
     );
     let second = account_request(&h,"POST",&messages(&b),Some(json!({"operation_id":"request-b","text":"A separate question B while background work continues"}))).await;
     assert_eq!(second["delivery"]["state"], "accepted");
-    idle(&mut events, &source.worker_id).await;
+    idle(&mut events, &source.worker_id, &body_phase, 8).await;
     let page_b = account_request(&h, "GET", &messages(&b), None).await;
     assert_eq!(page_b["messages"].as_array().unwrap().len(), 2);
     assert_eq!(page_b["messages"][1]["text"], PUBLIC_B);
@@ -574,16 +871,35 @@ async fn connected_chat_delegation(explicit_workdir: bool, lose_spawn_ack: bool)
             "background changed after real Read\n"
         );
     }
+    if reassign_before_evaluation {
+        let ticket = context.lock().unwrap().ticket.clone().unwrap();
+        let current = h
+            .api
+            .store
+            .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket)
+            .unwrap()
+            .remove(0);
+        let (other, _) = foreign.as_ref().unwrap();
+        account_request(&h,"PUT",&format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignments/orchestrator"),Some(json!({"operation_id":"reassign-before-chat-result-evaluation","expected_assignment_id":current.assignment_id,"principal":{"kind":"subject","subject_id":other}}))).await;
+    }
     release_send.add_permits(1);
     tokio::time::timeout(std::time::Duration::from_secs(60), completion.recv())
         .await
         .expect("ordinary report and explicit A send")
         .unwrap();
-    idle(&mut events, &source.worker_id).await;
+    idle(&mut events, &source.worker_id, &body_phase, 11).await;
     let page_a = account_request(&h, "GET", &messages(&a), None).await;
-    assert_eq!(page_a["messages"].as_array().unwrap().len(), 2);
-    assert_eq!(page_a["messages"][1]["text"], PUBLIC_A);
-    assert_eq!(page_a["messages"][1]["reply_to"], first["message"]["id"]);
+    if reassign_before_evaluation {
+        assert_eq!(
+            page_a["messages"].as_array().unwrap().len(),
+            1,
+            "old report does not automatically publish or grant a new Ticket attempt"
+        );
+    } else {
+        assert_eq!(page_a["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(page_a["messages"][1]["text"], PUBLIC_A);
+        assert_eq!(page_a["messages"][1]["reply_to"], first["message"]["id"]);
+    }
     assert_eq!(
         account_request(&h, "GET", &messages(&b), None).await,
         page_b,
@@ -627,6 +943,64 @@ async fn connected_chat_delegation(explicit_workdir: bool, lose_spawn_ack: bool)
         .unwrap()
         .unwrap();
     assert_eq!(grant.permissions, context.lock().unwrap().permissions);
+    if ticket_mode {
+        let ticket = context.lock().unwrap().ticket.clone().unwrap();
+        assert_eq!(
+            h.api
+                .store
+                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket)
+                .unwrap()
+                .unwrap()
+                .worker,
+            child
+        );
+        let results = h.api.config_store.with_conn(|conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM ticket_implementation_results WHERE workspace_id=?1 AND ticket_id=?2",rusqlite::params![TEST_WORKSPACE_ID,ticket],|row|row.get::<_,i64>(0))?)
+        }).unwrap();
+        assert_eq!(
+            results, 1,
+            "one canonical Ticket result, no parallel result ledger"
+        );
+        assert_eq!(
+            h.api.authority.ticket(&ticket).unwrap().state,
+            server_api::BrowserTicketState::Open
+        );
+        let current = h
+            .api
+            .store
+            .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, &ticket)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            current.principal,
+            ticket::TicketAssignmentPrincipalSnapshot::Subject {
+                subject_id: if reassign_before_evaluation {
+                    foreign.as_ref().unwrap().0.clone()
+                } else {
+                    subject.clone()
+                }
+            }
+        );
+        assert_eq!(
+            current.tracking.unwrap().status,
+            ticket::TicketAssignmentTrackingStatus::Waiting
+        );
+        let (other, other_ticket) = foreign.as_ref().unwrap();
+        assert_ne!(&subject, other);
+        assert!(
+            h.api
+                .store
+                .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, other_ticket)
+                .unwrap()
+                .is_none(),
+            "wrong Subject request has no Ticket execution effect"
+        );
+        assert_eq!(
+            h.runtime.list_workers().unwrap().len(),
+            2,
+            "denials/retries allocate no extra Worker"
+        );
+    }
     assert!(
         !grant
             .permissions
@@ -661,7 +1035,7 @@ async fn connected_chat_delegation(explicit_workdir: bool, lose_spawn_ack: bool)
         .await
         .expect("public refusal after revocation")
         .unwrap();
-    idle(&mut events, &source.worker_id).await;
+    idle(&mut events, &source.worker_id, &body_phase, 13).await;
     let snapshot = h
         .factory
         .retained_session_snapshot(&worker_runtime::identity::WorkerRef::try_from(&child).unwrap())
@@ -676,7 +1050,7 @@ async fn connected_chat_delegation(explicit_workdir: bool, lose_spawn_ack: bool)
             .as_array()
             .unwrap()
             .len(),
-        3,
+        if reassign_before_evaluation { 2 } else { 3 },
         "failed Notify creates no automatic success publication"
     );
     assert_eq!(dropped.load(Ordering::SeqCst), lose_spawn_ack);
@@ -684,9 +1058,20 @@ async fn connected_chat_delegation(explicit_workdir: bool, lose_spawn_ack: bool)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn restricted_chat_delegates_real_file_work_answers_b_then_explicitly_returns_to_a() {
-    connected_chat_delegation(true, true).await;
+    connected_chat_delegation(Scenario::Workdir).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn restricted_workdirless_chat_delegates_bounded_query_and_refuses_revoked_messaging() {
-    connected_chat_delegation(false, false).await;
+    connected_chat_delegation(Scenario::Workdirless).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn restricted_chat_uses_current_ticket_assignee_target_and_saved_result_before_publication() {
+    connected_chat_delegation(Scenario::Ticket).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn reassignment_during_private_chat_result_evaluation_refuses_old_report_as_execution_authority()
+ {
+    connected_chat_delegation(Scenario::ReassignedTicket).await;
 }
