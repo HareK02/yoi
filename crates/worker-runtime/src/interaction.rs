@@ -26,6 +26,9 @@ impl WorkerInputKind {
 pub struct WorkerInput {
     pub kind: WorkerInputKind,
     pub content: String,
+    /// Provenance stamped by the authenticated Backend, never by public/model input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<protocol::AuthenticatedInputSource>,
     /// Authenticated client-generated idempotency key. Runtime generates one
     /// only for trusted internal callers that omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -39,6 +42,7 @@ impl WorkerInput {
         Self {
             kind: WorkerInputKind::User,
             content: content.into(),
+            source: None,
             submission_request_id: None,
             segments: None,
         }
@@ -48,6 +52,7 @@ impl WorkerInput {
         Self {
             kind: WorkerInputKind::Notify,
             content: content.into(),
+            source: None,
             submission_request_id: None,
             segments: None,
         }

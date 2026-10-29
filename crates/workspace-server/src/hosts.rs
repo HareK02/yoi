@@ -616,6 +616,7 @@ fn initial_worker_input(segments: &[Segment]) -> Option<EmbeddedWorkerInput> {
     Some(EmbeddedWorkerInput {
         kind: EmbeddedWorkerInputKind::User,
         content: Segment::flatten_to_text(segments),
+        source: None,
         submission_request_id: None,
         segments: Some(segments.to_vec()),
     })
@@ -748,6 +749,9 @@ pub struct WorkerInputRequest {
     #[serde(default = "default_worker_input_kind")]
     pub kind: WorkerInputKind,
     pub content: String,
+    /// Provenance stamped by the authenticated Backend, never by public/model input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<protocol::AuthenticatedInputSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3695,6 +3699,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
+            source: request.source,
             submission_request_id: request.submission_request_id,
             segments: request.segments,
         };
@@ -5914,6 +5919,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
+            source: request.source,
             submission_request_id: request.submission_request_id,
             segments: request.segments,
         };
@@ -7435,6 +7441,9 @@ mod tests {
             let input = EmbeddedWorkerInput {
                 kind,
                 content: "contract test".to_string(),
+                source: Some(protocol::AuthenticatedInputSource::Account {
+                    account_id: "contract-account".into(),
+                }),
                 submission_request_id: Some("contract-request".to_string()),
                 segments: Some(vec![protocol::Segment::text("contract test")]),
             };
@@ -7463,6 +7472,7 @@ mod tests {
         let input = EmbeddedWorkerInput {
             kind: EmbeddedWorkerInputKind::User,
             content: protocol::Segment::flatten_to_text(&segments),
+            source: None,
             submission_request_id: Some("submit-request".into()),
             segments: Some(segments),
         };
@@ -8292,6 +8302,7 @@ mod tests {
             WorkerInputRequest {
                 kind: WorkerInputKind::User,
                 content: "hello".to_string(),
+                source: None,
                 submission_request_id: Some("tracked-input-1".to_string()),
                 segments: None,
             },
@@ -8393,6 +8404,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "hello embedded runtime".to_string(),
+                    source: None,
                     submission_request_id: None,
                     segments: None,
                 },
@@ -8842,6 +8854,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "hello remote".to_string(),
+                    source: None,
                     submission_request_id: None,
                     segments: None,
                 },

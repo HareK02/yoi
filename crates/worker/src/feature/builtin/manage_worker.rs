@@ -210,6 +210,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                         runtime_id,
                         worker_id,
                         request: server_api::RuntimeWorkerInputRequest {
+                            submission_request_id: None,
                             kind: Some(kind.to_string()),
                             content,
                             segments: None,

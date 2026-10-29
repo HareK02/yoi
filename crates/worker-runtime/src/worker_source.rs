@@ -789,6 +789,11 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                                 client.subjektiv_record_session(workspace_id, request).await,
                             )
                         }
+                        WorkspaceServerOperation::ChatWorker(request) => {
+                            generated_workspace_response(
+                                client.chat_worker_operation(workspace_id, request).await,
+                            )
+                        }
                         WorkspaceServerOperation::SubjektivMemory(request) => {
                             generated_workspace_response(
                                 client.subjektiv_memory_backend(workspace_id, request).await,
@@ -1142,6 +1147,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "http-server")]
+    #[test]
+    fn generated_chat_worker_transport_preserves_request_and_signed_worker_source() {
+        use crate::auth::{RuntimeRequestSourceExpectation, verify_runtime_request_source};
+        let identity = RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        let request = server_api::ChatWorkerRequest {
+            operation: server_api::ChatWorkerOperation::Send {
+                request: server_api::ChatSendMessageRequest {
+                    conversation_id: "conversation-a".into(),
+                    operation_id: "send-a".into(),
+                    text: "explicit reply\ncontinued".into(),
+                    reply_to: Some("message-a".into()),
+                    work_ref: Some("work-a".into()),
+                    expected_last_user_message_id: Some("user-message-1".into()),
+                },
+            },
+        };
+        let reply = serde_json::json!({"kind":"sent","message":{
+            "id":"message-b","conversation_id":"conversation-a","sequence":2,
+            "sender":{"kind":"subject","subject_id":"subject-a"},
+            "text":"explicit reply\ncontinued","reply_to":"message-a","work_ref":"work-a",
+            "operation_id":"send-a","last_user_message_id":"user-message-1"
+        }})
+        .to_string();
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).into_bytes();
+        let (url, server) = binary_loopback(response);
+        let client = RuntimeOwnedWorkspaceClient::new("workspace-a", url, "runtime-a", "worker-a")
+            .with_runtime_request_source(&identity, "server-a");
+        let result = client
+            .execute_server_operation(WorkspaceServerOperation::ChatWorker(request.clone()))
+            .unwrap();
+        assert_eq!(result.status, 200);
+        let (head, body) = server.join().unwrap();
+        let path = "/api/w/workspace-a/subjektiv/chat/worker";
+        assert!(head.starts_with(&format!("POST {path} HTTP/1.1\r\n")));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::to_value(request).unwrap()
+        );
+        let proof = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
+                    .then(|| value.trim())
+            })
+            .unwrap();
+        let digest = request_body_digest(&body);
+        verify_runtime_request_source(
+            proof,
+            &identity.public_key,
+            &RuntimeRequestSourceExpectation {
+                identity_id: "runtime-a",
+                audience: "server-a",
+                workspace_id: "workspace-a",
+                worker_id: Some("worker-a"),
+                permission: WORKSPACE_REQUEST_PERMISSION,
+                method: "POST",
+                path,
+                body_digest: &digest,
+                now_unix: unix_now_seconds() as i64,
+            },
+        )
+        .unwrap();
     }
 
     #[cfg(feature = "http-server")]

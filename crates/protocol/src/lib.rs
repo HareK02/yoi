@@ -103,6 +103,33 @@ impl AuthenticatedInputSource {
     }
 }
 
+/// Server-owned receipt partition, independent of client-visible ACK identity.
+/// Console Notify keeps its original bounded ID without sharing HTTP/chat receipts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationReceiptScope {
+    #[default]
+    Source,
+    BrowserConsole,
+}
+
+impl NotificationReceiptScope {
+    pub fn namespace(self, source_namespace: String) -> String {
+        match self {
+            Self::Source => source_namespace,
+            Self::BrowserConsole => format!("browser-console:{source_namespace}"),
+        }
+    }
+}
+
+// Like provenance, a receipt partition is rebound by the authenticated transport.
+fn ignore_wire_notification_scope<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<NotificationReceiptScope, D::Error> {
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(NotificationReceiptScope::Source)
+}
+
 /// Caller-owned identity for one state-changing Worker command.
 ///
 /// Commands operate on the controller state at admission time, not a caller's
@@ -311,6 +338,8 @@ pub enum Method {
     NotifyTracked {
         notification_request_id: String,
         message: String,
+        #[serde(default, deserialize_with = "ignore_wire_notification_scope")]
+        receipt_scope: NotificationReceiptScope,
         #[serde(default, deserialize_with = "ignore_wire_input_source")]
         source: AuthenticatedInputSource,
     },
@@ -2240,6 +2269,29 @@ mod tests {
             AuthenticatedInputSource::LocalOperator.namespace(),
             AuthenticatedInputSource::UntrustedWire.namespace()
         );
+    }
+
+    #[test]
+    fn notification_receipt_scope_is_not_selected_by_wire_input() {
+        for scope in [
+            serde_json::json!("browser_console"),
+            serde_json::json!({"forged":true}),
+            serde_json::Value::Null,
+        ] {
+            let method: Method = serde_json::from_value(serde_json::json!({
+                "method":"notify_tracked", "params":{
+                    "notification_request_id":"original", "message":"advisory",
+                    "receipt_scope":scope,
+                    "source":{"kind":"account","account_id":"forged"}
+                }
+            }))
+            .unwrap();
+            assert!(matches!(method, Method::NotifyTracked {
+                receipt_scope: NotificationReceiptScope::Source,
+                source: AuthenticatedInputSource::UntrustedWire,
+                notification_request_id, ..
+            } if notification_request_id == "original"));
+        }
     }
 
     #[test]

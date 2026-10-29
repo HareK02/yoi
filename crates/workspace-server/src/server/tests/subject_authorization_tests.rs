@@ -5,6 +5,10 @@
 //! runs a real ProfileRuntimeWorkerFactory/Controller and materialized Workdir;
 //! only its external model stream is scripted. Neither fixture claims OS isolation.
 use super::*;
+#[path = "chat_delegation_connected_tests.rs"]
+mod chat_delegation_connected;
+#[path = "chat_tests.rs"]
+mod chat_tests;
 #[path = "subject_job_model_supply_tests.rs"]
 mod subject_job_model_supply;
 #[path = "ticket_worker_messaging_connected_tests.rs"]
@@ -2749,6 +2753,13 @@ impl ConnectedWorkerHarness {
     }
 
     async fn start<M: agen::llm_client::LlmClient + Clone + 'static>(model: M) -> Self {
+        Self::start_with_layer(model, |router| router).await
+    }
+
+    async fn start_with_layer<M: agen::llm_client::LlmClient + Clone + 'static>(
+        model: M,
+        app_layer: impl FnOnce(Router) -> Router,
+    ) -> Self {
         const RUNTIME: &str = CONNECTED_RUNTIME;
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
@@ -2948,7 +2959,7 @@ impl ConnectedWorkerHarness {
                 }
             },
         ));
-        let backend_server = AuthorizationCallbackServer::start(backend_listener, app);
+        let backend_server = AuthorizationCallbackServer::start(backend_listener, app_layer(app));
         let owner =
             seed_test_workspace_owner_token(api.store.as_ref(), "connected-authorization-owner")
                 .await;

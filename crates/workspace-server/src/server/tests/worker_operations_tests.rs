@@ -2,6 +2,7 @@ use super::*;
 
 fn operation_input(kind: WorkerInputKind) -> WorkerInputRequest {
     WorkerInputRequest {
+        source: None,
         kind,
         content: "operation-boundary-test".into(),
         submission_request_id: None,
@@ -474,6 +475,7 @@ async fn generic_and_scoped_input_aliases_match_handle_idle_only_and_notify_sema
     assert_eq!(notify.state, InternalWorkerOperationState::Accepted);
 
     let request = || server_api::RuntimeWorkerInputRequest {
+        submission_request_id: None,
         kind: Some("user".into()),
         content: "human input".into(),
         segments: None,
@@ -673,6 +675,7 @@ async fn generic_management_aliases_cannot_bypass_worker_grants_or_target_bound_
         }))
     };
     let input = || server_api::RuntimeWorkerInputRequest {
+        submission_request_id: None,
         kind: Some("user".into()),
         content: "must not execute".into(),
         segments: None,

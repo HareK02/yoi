@@ -265,6 +265,7 @@ async fn ambiguous_existing_worker_restore_keeps_claim_pending_until_accepted_re
         .input(
             &WorkerOperationContext::Backend,
             WorkerInputRequest {
+                source: None,
                 kind: WorkerInputKind::User,
                 content: "Do not run while claim is unresolved".into(),
                 segments: None,
@@ -530,6 +531,7 @@ async fn pending_manual_worker_claim_reconciles_same_runtime_restore_and_commits
         .input(
             &WorkerOperationContext::Backend,
             WorkerInputRequest {
+                source: None,
                 kind: WorkerInputKind::User,
                 content: "Do not submit while the manual claim is pending".into(),
                 segments: None,

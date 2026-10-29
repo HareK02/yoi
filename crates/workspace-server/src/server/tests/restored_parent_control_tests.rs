@@ -410,6 +410,7 @@ async fn restored_runtime_parent_lists_and_inputs_existing_child() {
             .send_input(
                 &parent,
                 WorkerInputRequest {
+                    source: None,
                     kind: WorkerInputKind::UserIfIdle,
                     content: "parent bootstrap".into(),
                     submission_request_id: None,

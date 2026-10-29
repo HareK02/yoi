@@ -419,6 +419,8 @@ pub struct SubjektivFeatureProfileConfig {
     pub enabled: bool,
     /// Explicit consolidation tool policy; never grants Job or subject authority.
     pub consolidation_tools: bool,
+    /// Opt-in conversation tools; the Host must bind an explicit Subject connection.
+    pub chat: FeatureFlagConfig,
     pub extraction: MemoryExtractionProfileConfig,
 }
 
@@ -427,6 +429,7 @@ impl Default for SubjektivFeatureProfileConfig {
         Self {
             enabled: false,
             consolidation_tools: false,
+            chat: FeatureFlagConfig::disabled(),
             extraction: MemoryExtractionProfileConfig::default(),
         }
     }
