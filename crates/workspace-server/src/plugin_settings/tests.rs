@@ -15,6 +15,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_schema("{ mode = String; }").await
+    }
+    async fn with_schema(schema: &str) -> Self {
         let dir = tempdir().unwrap();
         let store = crate::SqliteWorkspaceStore::open_for_test(dir.path().join("db")).unwrap();
         for id in ["a", "b"] {
@@ -35,7 +38,7 @@ impl Fixture {
                 &dir.path().join("artifacts"),
                 "a",
                 "owner",
-                &package("0.1.0"),
+                &package_with_schema("0.1.0", schema),
             )
             .unwrap();
         let installed = store
@@ -135,6 +138,9 @@ fn bundle() -> WorkspaceConfigSchemaBundle {
     .unwrap()
 }
 fn package(version: &str) -> Vec<u8> {
+    package_with_schema(version, "{ mode = String; }")
+}
+fn package_with_schema(version: &str, schema: &str) -> Vec<u8> {
     use manifest::plugin::*;
     let d = tempdir().unwrap();
     let source =
@@ -142,7 +148,7 @@ fn package(version: &str) -> Vec<u8> {
             .replace("version = \"0.1.0\"", &format!("version = \"{version}\""))
             .replace(
                 "config_schema = \"{}\"",
-                "config_schema = \"{ mode = String; }\"",
+                &format!("config_schema = {}", serde_json::to_string(schema).unwrap()),
             );
     std::fs::write(d.path().join("plugin.toml"), source).unwrap();
     std::fs::write(
@@ -519,5 +525,60 @@ async fn https_config_binding_is_validated_pinned_by_digest_and_never_copied_to_
             .plugin_plan_create("host", "https-plan", &plan)
             .unwrap(),
         receipt
+    );
+}
+
+#[tokio::test]
+async fn nested_profile_override_pins_evaluated_singletons_through_create_restart_and_replay() {
+    use crate::plugin_plan::{WorkerPluginExecutionPlan, WorkerPluginPlanInput};
+    let f = Fixture::with_schema("{ nested = { mode = String; count = 1; }; }").await;
+    let mut source = f.source();
+    source["plugins"]["enabled"]["echo"]["config"] = json!({"nested":{"mode":"base","count":1}});
+    source["profile"]["entries"][0]["profile"]["plugins"]["selections"][0]["config"] =
+        json!({"nested":{"mode":"override"}});
+    let state = f.commit(source);
+    let plan = f.plan(&state);
+    let expected = json!({"nested":{"count":1,"mode":"override"}});
+    assert_eq!(plan.plugins()[0].projection().config, expected);
+    assert_eq!(
+        serde_json::to_value(&plan).unwrap()["input"]["plugins"][0]["config_digest"],
+        config_source::digest_bytes(&serde_json::to_vec(&expected).unwrap())
+    );
+    let receipt = f
+        .store
+        .plugin_plan_create("host", "singletons", &plan)
+        .unwrap();
+    assert_eq!(receipt.plan.plugins()[0].projection().config, expected);
+    let reopened = crate::SqliteWorkspaceStore::open_for_test(f.dir.path().join("db")).unwrap();
+    let stored = reopened.plugin_plan_load("a", &receipt.plan_id).unwrap();
+    assert_eq!(stored.plan, plan);
+    assert_eq!(
+        reopened
+            .plugin_plan_create("host", "singletons", &plan)
+            .unwrap(),
+        receipt
+    );
+    // Even a canonically rehashed candidate cannot substitute the raw override
+    // for the complete projection reconstructed at the public create fence.
+    let mut forged = serde_json::to_value(&plan).unwrap()["input"].clone();
+    forged["plugins"][0]["projection"]["config"] = json!({"nested":{"mode":"override"}});
+    let input: WorkerPluginPlanInput = serde_json::from_value(forged).unwrap();
+    let incomplete = WorkerPluginExecutionPlan::canonicalize(input).unwrap();
+    assert!(
+        reopened
+            .plugin_plan_create("host", "raw-override", &incomplete)
+            .is_err()
+    );
+}
+
+#[test]
+fn effective_config_size_limit_applies_after_schema_concretization() {
+    let schema = format!("{{ value = {}; }}", json!("a".repeat(64 * 1024)));
+    let error = evaluate_effective_config(&json!({}), &schema).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("non-secret config exceeds 64 KiB"),
+        "{error}"
     );
 }

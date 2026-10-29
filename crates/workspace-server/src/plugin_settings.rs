@@ -406,7 +406,8 @@ fn project_profile_plugins(
         for (key, value) in &selection.config {
             object.insert(key.clone(), value.clone());
         }
-        validate_effective_config(&config, &resolved.artifacts[alias].config_schema.dcdl)?;
+        let config =
+            evaluate_effective_config(&config, &resolved.artifacts[alias].config_schema.dcdl)?;
         let mut grants = Vec::new();
         if selection.logging {
             grants.push(PluginGrant::Logging);
@@ -442,7 +443,7 @@ fn project_profile_plugins(
     Ok(pins)
 }
 
-fn validate_effective_config(value: &serde_json::Value, schema: &str) -> Result<()> {
+fn evaluate_effective_config(value: &serde_json::Value, schema: &str) -> Result<serde_json::Value> {
     use config_source::{ConfigContentType, ConfigEntry, VirtualPath};
     if serde_json::to_vec(value).map_err(config_error)?.len() > 64 * 1024 {
         return Err(config_error("non-secret config exceeds 64 KiB"));
@@ -466,8 +467,19 @@ fn validate_effective_config(value: &serde_json::Value, schema: &str) -> Result<
     )
     .map_err(config_error)?])
     .map_err(config_error)?;
-    evaluate(&snapshot, &contract(bundle))?;
-    Ok(())
+    // Static singleton fields can concretize omitted nested override values.
+    // Pin the complete projection, not just the candidate that passed validation.
+    let evaluated = evaluate(&snapshot, &contract(bundle))?;
+    let config = evaluated
+        .projections
+        .first()
+        .and_then(|projection| projection.data_json.get("config"))
+        .filter(|config| config.is_object())
+        .ok_or_else(|| config_error("effective Plugin config projection must be an object"))?;
+    if serde_json::to_vec(config).map_err(config_error)?.len() > 64 * 1024 {
+        return Err(config_error("non-secret config exceeds 64 KiB"));
+    }
+    Ok(config.clone())
 }
 
 pub(crate) fn render_value(value: &serde_json::Value) -> Result<String> {
