@@ -7,7 +7,7 @@
 // complete create-controller/restore vertical or a Runtime lifecycle test.
 // Run: cargo test -p yoi-workspace-server --lib plugin_runtime_tests
 // Prerequisite: openssl, as required by the shared Peer fixture.
-mod plugin_runtime_tests {
+pub(super) mod plugin_runtime_tests {
     use super::*;
     use agen::llm_client::event::{Event as ModelEvent, ResponseStatus, StatusEvent};
     use agen::llm_client::{ClientError, LlmClient, Request as ModelRequest};
@@ -125,9 +125,9 @@ mod plugin_runtime_tests {
     }
 
     #[derive(Clone)]
-    struct Model {
-        tool_name: String,
-        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    pub(in crate::server::tests) struct Model {
+        pub(in crate::server::tests) tool_name: String,
+        pub(in crate::server::tests) requests: Arc<Mutex<Vec<ModelRequest>>>,
     }
 
     #[async_trait::async_trait]
@@ -149,7 +149,14 @@ mod plugin_runtime_tests {
             let events = match turn {
                 0 => vec![
                     ModelEvent::tool_use_start(0, "https-call", &self.tool_name),
-                    ModelEvent::tool_input_delta(0, "{}"),
+                    ModelEvent::tool_input_delta(
+                        0,
+                        if self.tool_name.ends_with("__example_echo") {
+                            r#"{"text":"probe"}"#
+                        } else {
+                            "{}"
+                        },
+                    ),
                     ModelEvent::tool_use_stop(0),
                 ],
                 1 => vec![
@@ -170,7 +177,7 @@ mod plugin_runtime_tests {
         }
     }
 
-    fn assert_https_history(items: &[agen::Item], public_name: &str) {
+    pub(in crate::server::tests) fn assert_https_history(items: &[agen::Item], public_name: &str) {
         let calls = items
             .iter()
             .filter_map(|item| match item {
@@ -215,7 +222,11 @@ mod plugin_runtime_tests {
         assert_eq!(results.len(), 1);
         let (call, summary, content, disposition, is_error, attachments) = results[0];
         assert_eq!(call, calls[0].0);
-        assert_eq!(*disposition, agen::ToolResultDisposition::Success);
+        assert_eq!(
+            *disposition,
+            agen::ToolResultDisposition::Success,
+            "{summary}: {content:?}"
+        );
         assert!(!*is_error);
         assert!(attachments.is_empty());
         assert_eq!(summary, "HTTP response observed");

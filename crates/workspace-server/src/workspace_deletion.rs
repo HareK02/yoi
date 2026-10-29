@@ -18,6 +18,7 @@ use crate::{Error, Result};
 const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "plugin_effect_receipts",
     "plugin_invocations",
+    "worker_plugin_launches",
     "plugin_execution_plans",
     "plugin_references",
     "plugin_operations",
@@ -513,6 +514,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             for (table, trigger) in [
                 ("plugin_effect_receipts", "plugin_effect_retained"),
                 ("plugin_invocations", "plugin_invocation_retained"),
+                ("worker_plugin_launches", "worker_plugin_launch_retained"),
                 ("plugin_execution_plans", "plugin_plan_replay_retained"),
                 ("notification_source_preparation_failures", "notification_source_preparation_failures_no_delete"),
                 ("notification_job_targets", "notification_job_targets_no_delete"),

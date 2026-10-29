@@ -7587,6 +7587,131 @@
           }
         ]
       },
+      "PluginDiagnosticAdmission": {
+        "description": "A successful observation is not retained admission authority.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "admissible",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "refused",
+                "type": "string"
+              },
+              "reason_code": {
+                "$ref": "#/components/schemas/PluginHostErrorCode"
+              }
+            },
+            "required": [
+              "kind",
+              "reason_code"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginDiagnosticConnection": {
+        "additionalProperties": false,
+        "properties": {
+          "effective_limits": {
+            "$ref": "#/components/schemas/PluginDiagnosticConnectionLimits"
+          },
+          "slot": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "slot",
+          "effective_limits"
+        ],
+        "type": "object"
+      },
+      "PluginDiagnosticConnectionLimits": {
+        "description": "Limits are absent when the current binding cannot be admitted; never fall\nback to a launch-time policy or a permissive default.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "available",
+                "type": "string"
+              },
+              "max_header_bytes": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "max_request_bytes": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "max_response_bytes": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "timeout_ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "timeout_ms",
+              "max_request_bytes",
+              "max_response_bytes",
+              "max_header_bytes"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unavailable",
+                "type": "string"
+              },
+              "reason_code": {
+                "$ref": "#/components/schemas/PluginHostErrorCode"
+              }
+            },
+            "required": [
+              "kind",
+              "reason_code"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginDiagnosticPinState": {
+        "enum": [
+          "pending",
+          "active",
+          "restorable",
+          "released"
+        ],
+        "type": "string"
+      },
+      "PluginDiagnosticSurface": {
+        "enum": [
+          "tool"
+        ],
+        "type": "string"
+      },
       "PluginEffectObservation": {
         "enum": [
           "not_dispatched",
@@ -8472,6 +8597,105 @@
         ],
         "type": "object"
       },
+      "PluginRuntimeLimits": {
+        "additionalProperties": false,
+        "description": "Fixed Tool Runtime budgets, not usage counters or caller-selectable limits.",
+        "properties": {
+          "config_bytes": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fuel": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "host_operations": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "http_body_bytes": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "http_header_bytes": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "http_header_pairs": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "instances": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "log_bytes": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "memories": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "memory_bytes": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "payload_bytes": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resources": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "table_elements": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tables": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wall_time_ms": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "payload_bytes",
+          "config_bytes",
+          "memory_bytes",
+          "table_elements",
+          "instances",
+          "memories",
+          "tables",
+          "resources",
+          "fuel",
+          "wall_time_ms",
+          "host_operations",
+          "http_body_bytes",
+          "http_header_bytes",
+          "http_header_pairs",
+          "log_bytes"
+        ],
+        "type": "object"
+      },
       "PluginSchemaContribution": {
         "additionalProperties": false,
         "properties": {
@@ -8564,6 +8788,158 @@
           "upload_id",
           "expires_at",
           "artifact"
+        ],
+        "type": "object"
+      },
+      "PluginWorkerDiagnostic": {
+        "additionalProperties": false,
+        "properties": {
+          "admission": {
+            "$ref": "#/components/schemas/PluginDiagnosticAdmission"
+          },
+          "artifact_digest": {
+            "type": "string"
+          },
+          "artifact_size": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "connections": {
+            "items": {
+              "$ref": "#/components/schemas/PluginDiagnosticConnection"
+            },
+            "type": "array"
+          },
+          "installation_id": {
+            "type": "string"
+          },
+          "package_digest": {
+            "type": "string"
+          },
+          "package_id": {
+            "type": "string"
+          },
+          "package_version": {
+            "type": "string"
+          },
+          "selected_tools": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "surfaces": {
+            "items": {
+              "$ref": "#/components/schemas/PluginDiagnosticSurface"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "installation_id",
+          "package_id",
+          "package_version",
+          "package_digest",
+          "artifact_digest",
+          "artifact_size",
+          "surfaces",
+          "selected_tools",
+          "admission",
+          "connections"
+        ],
+        "type": "object"
+      },
+      "PluginWorkerDiagnosticSelection": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "No sealed launch selection exists; do not infer current Profile selection.",
+            "properties": {
+              "kind": {
+                "const": "unrecorded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The owner sealed an explicitly empty selection (a NULL plan).",
+            "properties": {
+              "kind": {
+                "const": "empty",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "fingerprint": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "plan",
+                "type": "string"
+              },
+              "pin_state": {
+                "$ref": "#/components/schemas/PluginDiagnosticPinState"
+              },
+              "plan_id": {
+                "type": "string"
+              },
+              "plugins": {
+                "items": {
+                  "$ref": "#/components/schemas/PluginWorkerDiagnostic"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "plan_id",
+              "fingerprint",
+              "pin_state",
+              "plugins"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginWorkerDiagnostics": {
+        "additionalProperties": false,
+        "description": "Point-in-time owner observation only, never a permission or execution lease.\nDeliberately excludes configuration, credentials and artifact locations.",
+        "properties": {
+          "runtime_id": {
+            "type": "string"
+          },
+          "runtime_limits": {
+            "$ref": "#/components/schemas/PluginRuntimeLimits"
+          },
+          "selection": {
+            "$ref": "#/components/schemas/PluginWorkerDiagnosticSelection"
+          },
+          "worker_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "runtime_id",
+          "worker_id",
+          "runtime_limits",
+          "selection"
         ],
         "type": "object"
       },
@@ -19847,7 +20223,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:63f6a6713e8a5d5e9aaf9e75482ec9271ffedff394ca1f32d19210929723ea80"
+    "x-yoi-source-digest": "sha256:3e616b1d2ec6b52f7504cf0f81f30c976cd6a18e510084ea50f4f9e340089581"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -29947,6 +30323,113 @@
             "description": "Error response"
           },
           "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/plugins/worker-diagnostics/{runtime_id}/{worker_id}": {
+      "get": {
+        "operationId": "plugin_worker_diagnostics",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "runtime_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "worker_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginWorkerDiagnostics"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
             "content": {
               "application/json": {
                 "schema": {

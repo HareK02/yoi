@@ -196,7 +196,7 @@ pub mod remote {
             plugin_delivery::{CurrentArtifactServer, RemotePluginArtifactSource},
         },
     };
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{collections::HashMap, sync::Arc};
     pub type CurrentPluginServer = dyn Fn(&str) -> Result<WorkspaceIssuerTrustRecord, yoi_plugin_runtime::delivery::DeliveryError>
         + Send
         + Sync;
@@ -268,13 +268,7 @@ pub mod remote {
                 .map_err(|_| "Plugin Server trust unavailable")?,
             );
             let generated = client
-                .server_api_client(
-                    crate::auth::WORKSPACE_REQUEST_PERMISSION,
-                    Some(worker.worker_id.to_string()),
-                    reqwest::header::HeaderMap::new(),
-                    Duration::from_secs(30),
-                    8 * 1024 * 1024,
-                )
+                .plugin_host_client(worker.worker_id.to_string())
                 .map_err(|_| "Plugin Host client unavailable")?;
             let owner = Arc::new(RegisteredOwner {
                 source: source.clone(),

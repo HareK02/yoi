@@ -48,6 +48,16 @@ pub fn plugin_api_typescript() -> String {
         PluginOperationResponse::decl(&config),
         PluginArtifactDeliveryRequest::decl(&config),
         PluginArtifactDeliveryMetadata::decl(&config),
+        PluginHostErrorCode::decl(&config),
+        PluginWorkerDiagnostics::decl(&config),
+        PluginWorkerDiagnosticSelection::decl(&config),
+        PluginDiagnosticPinState::decl(&config),
+        PluginDiagnosticSurface::decl(&config),
+        PluginWorkerDiagnostic::decl(&config),
+        PluginDiagnosticAdmission::decl(&config),
+        PluginDiagnosticConnection::decl(&config),
+        PluginDiagnosticConnectionLimits::decl(&config),
+        PluginRuntimeLimits::decl(&config),
     ];
     format!(
         "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_plugin_api_types > web/workspace/src/lib/generated/plugin-api.ts\n\n{}\n",

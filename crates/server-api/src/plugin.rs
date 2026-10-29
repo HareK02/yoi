@@ -221,6 +221,126 @@ pub struct PluginOperationResponse {
     pub installation: PluginInstallation,
 }
 
+/// Point-in-time owner observation only, never a permission or execution lease.
+/// Deliberately excludes configuration, credentials and artifact locations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginWorkerDiagnostics {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub runtime_limits: PluginRuntimeLimits,
+    pub selection: PluginWorkerDiagnosticSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginWorkerDiagnosticSelection {
+    /// No sealed launch selection exists; do not infer current Profile selection.
+    Unrecorded,
+    /// The owner sealed an explicitly empty selection (a NULL plan).
+    Empty,
+    Plan {
+        plan_id: String,
+        fingerprint: String,
+        pin_state: PluginDiagnosticPinState,
+        plugins: Vec<PluginWorkerDiagnostic>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum PluginDiagnosticPinState {
+    Pending,
+    Active,
+    Restorable,
+    Released,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum PluginDiagnosticSurface {
+    Tool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginWorkerDiagnostic {
+    pub installation_id: String,
+    pub package_id: String,
+    pub package_version: String,
+    pub package_digest: String,
+    pub artifact_digest: String,
+    pub artifact_size: u32,
+    pub surfaces: Vec<PluginDiagnosticSurface>,
+    pub selected_tools: Vec<String>,
+    pub admission: PluginDiagnosticAdmission,
+    pub connections: Vec<PluginDiagnosticConnection>,
+}
+
+/// A successful observation is not retained admission authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginDiagnosticAdmission {
+    Admissible,
+    Refused {
+        reason_code: crate::PluginHostErrorCode,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginDiagnosticConnection {
+    pub slot: String,
+    pub effective_limits: PluginDiagnosticConnectionLimits,
+}
+
+/// Limits are absent when the current binding cannot be admitted; never fall
+/// back to a launch-time policy or a permissive default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginDiagnosticConnectionLimits {
+    Available {
+        timeout_ms: u32,
+        max_request_bytes: u32,
+        max_response_bytes: u32,
+        max_header_bytes: u32,
+    },
+    Unavailable {
+        reason_code: crate::PluginHostErrorCode,
+    },
+}
+
+/// Fixed Tool Runtime budgets, not usage counters or caller-selectable limits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginRuntimeLimits {
+    pub payload_bytes: u32,
+    pub config_bytes: u32,
+    pub memory_bytes: u32,
+    pub table_elements: u32,
+    pub instances: u32,
+    pub memories: u32,
+    pub tables: u32,
+    pub resources: u32,
+    pub fuel: u32,
+    pub wall_time_ms: u32,
+    pub host_operations: u32,
+    pub http_body_bytes: u32,
+    pub http_header_bytes: u32,
+    pub http_header_pairs: u32,
+    pub log_bytes: u32,
+}
+
 /// Namespace a byte cache by the authenticated Server origin and signing key.
 /// This is not a package hash or an authorization decision. Hosts derive the
 /// bundle from their current registered authority, never from a delivery reply.

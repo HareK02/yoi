@@ -295,8 +295,11 @@ impl EmbeddedPluginHostOwner {
         }
     }
     #[cfg(test)]
-    pub(crate) fn with_transport(mut self, transport: https::HttpsTransport) -> Self {
-        self.transport_override = Some(Arc::new(transport));
+    pub(crate) fn with_transport(
+        mut self,
+        transport: impl Into<Arc<https::HttpsTransport>>,
+    ) -> Self {
+        self.transport_override = Some(transport.into());
         self
     }
 }

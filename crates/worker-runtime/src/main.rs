@@ -275,7 +275,7 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
         );
         let plugins = worker_runtime::plugin::PinnedPluginToolRuntime::new(
             providers,
-            &runtime_store_dir.join("plugin-cache"),
+            &runtime_store_dir.with_extension("plugin-cache"),
         )
         .map_err(ProcessError::WorkerAdapter)?;
         factory = factory.with_plugin_runtime(Arc::new(plugins));

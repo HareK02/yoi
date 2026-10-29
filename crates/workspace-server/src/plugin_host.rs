@@ -134,7 +134,7 @@ pub fn authorize(
     Ok(AdmittedPluginOperation { plan, pin, binding })
 }
 
-fn live_binding(
+pub(crate) fn live_binding(
     tx: &Transaction<'_>,
     workspace: &str,
     reference: &BindingPolicyReference,

@@ -352,18 +352,21 @@ impl SqliteWorkspaceStore {
 pub(crate) fn verify_launch_schema(conn: &Connection) -> Result<()> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(LAUNCH_SCHEMA_SQL)?;
-    let sql: String = expected.query_row(
-        "SELECT sql FROM sqlite_schema WHERE name='worker_plugin_launches'",
-        [],
-        |row| row.get(0),
-    )?;
-    let actual: String = conn.query_row(
-        "SELECT sql FROM sqlite_schema WHERE name='worker_plugin_launches'",
-        [],
-        |row| row.get(0),
-    )?;
-    if actual != sql {
-        return Err(Error::Store("Worker Plugin launch schema mismatch".into()));
+    let mut statement = expected.prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND tbl_name='worker_plugin_launches' ORDER BY name")?;
+    for row in statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (name, sql) = row?;
+        let actual = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name=?1",
+                [&name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if actual.as_deref() != Some(&sql) {
+            return Err(Error::Store("Worker Plugin launch schema mismatch".into()));
+        }
     }
     Ok(())
 }

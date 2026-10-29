@@ -191,6 +191,37 @@ impl RuntimeWorkspaceRequestClient {
         })
     }
 
+    pub(crate) fn plugin_host_client(
+        &self,
+        worker_id: String,
+    ) -> Result<
+        server_api::ServerApiClient<RuntimeWorkspaceRequestAuthorizer>,
+        RuntimeWorkspaceRequestError,
+    > {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(RuntimeWorkspaceRequestError::transport)?;
+        let authorizer = RuntimeWorkspaceRequestAuthorizer {
+            workspace_id: self.workspace_id.clone(),
+            runtime_id: self.runtime_id.clone(),
+            request_source: self.request_source.clone(),
+            permission: crate::auth::WORKSPACE_REQUEST_PERMISSION.into(),
+            worker_id: Some(worker_id),
+            extra_headers: HeaderMap::new(),
+        };
+        server_api::ServerApiClient::builder(&self.base_url)
+            .map_err(|error| RuntimeWorkspaceRequestError::InvalidRequest(error.to_string()))?
+            .client(http)
+            .authorizer(authorizer)
+            .request_timeout(Duration::from_secs(30))
+            .response_body_limit(yoi_plugin_runtime::owner::PLUGIN_HOST_RESPONSE_BODY_LIMIT)
+            .build()
+            .map_err(|error| RuntimeWorkspaceRequestError::InvalidRequest(error.to_string()))
+    }
+
     pub(crate) fn server_api_client(
         &self,
         permission: impl Into<String>,

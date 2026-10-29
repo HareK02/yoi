@@ -2662,17 +2662,19 @@ async fn delegated_subject_child_cannot_downgrade_ticket_start_to_manual_by_omit
     );
 }
 
-const CONNECTED_RUNTIME: &str = "connected-subject-authorization";
+pub(super) const CONNECTED_RUNTIME: &str = "connected-subject-authorization";
 
 /// Shared signed Backend/Runtime connection. Only the supplied model is replaced;
 /// temporary roots, request authentication and Controller/tool dispatch stay real.
-struct ConnectedWorkerHarness {
-    api: WorkspaceApi,
+pub(super) struct ConnectedWorkerHarness {
+    pub(super) api: WorkspaceApi,
+    // Expose only the persisted root needed to reopen ordinary Session history.
+    pub(super) runtime_root: PathBuf,
     runtime: worker_runtime::Runtime,
     factory: worker_runtime::worker_backend::ProfileRuntimeWorkerFactory,
     identity: RuntimeIdentityMaterial,
     backend_url: String,
-    owner: String,
+    pub(super) owner: String,
     materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
     authorizations: Arc<Mutex<Vec<(Value, StatusCode)>>>,
     runtime_errors: Arc<Mutex<Vec<String>>>,
@@ -2681,7 +2683,12 @@ struct ConnectedWorkerHarness {
     _dir: tempfile::TempDir,
 }
 impl ConnectedWorkerHarness {
-    async fn human(&self, method: reqwest::Method, path: &str, body: Value) -> (StatusCode, Value) {
+    pub(super) async fn human(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
         let response = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -2709,6 +2716,23 @@ impl ConnectedWorkerHarness {
     }
 
     async fn start<M: agen::llm_client::LlmClient + Clone + 'static>(model: M) -> Self {
+        Self::start_configured(model, None).await
+    }
+
+    /// Keep the existing signed RuntimeHTTP assembly, adding only the production
+    /// Plugin bridge and a TLS-peer transport on the Server before either router
+    /// can handle a request. No guest, delivery or owner implementation is replaced.
+    pub(super) async fn start_with_plugins<M: agen::llm_client::LlmClient + Clone + 'static>(
+        model: M,
+        transport: Arc<crate::plugin_https::HttpsTransport>,
+    ) -> Self {
+        Self::start_configured(model, Some(transport)).await
+    }
+
+    async fn start_configured<M: agen::llm_client::LlmClient + Clone + 'static>(
+        model: M,
+        plugin_https_transport: Option<Arc<crate::plugin_https::HttpsTransport>>,
+    ) -> Self {
         const RUNTIME: &str = CONNECTED_RUNTIME;
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
@@ -2721,49 +2745,24 @@ impl ConnectedWorkerHarness {
         let materializer = worker_runtime::working_directory::RuntimeGitMaterializer::new(
             dir.path().join("connected-workdirs"),
         );
-        let factory = worker_runtime::worker_backend::ProfileRuntimeWorkerFactory::new(
-            dir.path().join("connected-profiles"),
-        )
-        .with_remote_worker_mutation_identity(identity.clone())
-        .with_workspace_request_client(
-            worker_runtime::workspace_request::RuntimeWorkspaceRequestClient::new(
-                TEST_WORKSPACE_ID,
-                &backend_url,
-                RUNTIME,
-            )
-            .with_runtime_request_source(&identity, &backend_url),
-        )
-        .with_runtime_store_dir(&runtime_root)
-        .with_spawn_model_client_factory(move || Box::new(model.clone()));
-        let execution =
-            worker_runtime::worker_backend::WorkerRuntimeExecutionBackend::new(factory.clone())
-                .unwrap()
-                .with_working_directory_materializer(materializer.clone());
-        let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
-            worker_runtime::fs_store::FsRuntimeStoreOptions {
-                root: runtime_root,
-                runtime_id: RUNTIME.into(),
-                display_name: None,
-            },
-            Arc::new(execution),
-        )
-        .unwrap();
 
         let mut config = test_server_config(dir.path());
         config.backend_base_url = Some(backend_url.clone());
-        // The embedded Runtime is unused. Both source and child below execute on the
-        // connected real Runtime above, not on this existing Host fixture backend.
+        // The embedded Runtime is unused. Connected Workers execute on the real
+        // Runtime assembled below, not on this Host fixture's embedded backend.
         let control = Arc::new(test_control_store(&config));
         seed_test_registered_workspace(control.as_ref(), &config)
             .await
             .unwrap();
-        let api = WorkspaceApi::new_with_execution_backend(
+        let mut api = WorkspaceApi::new_with_execution_backend(
             config,
             control,
             Arc::new(DeterministicExecutionBackend::default()),
         )
         .await
         .unwrap();
+        let plugins_enabled = plugin_https_transport.is_some();
+        api.plugin_https_transport = plugin_https_transport;
         let now = now_registry_timestamp();
         api.store
             .upsert_workspace_runtime_binding_record(
@@ -2796,27 +2795,82 @@ impl ConnectedWorkerHarness {
             .signing_identities
             .provision_existing(TEST_WORKSPACE_ID, &test_owner_actor().account_id)
             .unwrap();
+        let registration = worker_runtime::workspace_issuer::WorkspaceIssuerTrustRecord {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            backend_url: backend_url.clone(),
+            key_id: workspace_identity.key_id.clone(),
+            algorithm: workspace_identity.algorithm.clone(),
+            public_key: workspace_identity.public_key.clone().unwrap(),
+            public_key_fingerprint: workspace_identity.public_key_fingerprint.clone().unwrap(),
+            trust_id: "connected-authorization-workspace-trust".into(),
+            state: worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Active,
+            registered_at_unix: 1,
+            updated_at_unix: 1,
+        };
         let verifier = worker_runtime::workspace_issuer::WorkspaceCapabilityVerifier::new(
-            vec![
-                worker_runtime::workspace_issuer::WorkspaceIssuerTrustRecord {
-                    workspace_id: TEST_WORKSPACE_ID.into(),
-                    backend_url: backend_url.clone(),
-                    key_id: workspace_identity.key_id.clone(),
-                    algorithm: workspace_identity.algorithm.clone(),
-                    public_key: workspace_identity.public_key.clone().unwrap(),
-                    public_key_fingerprint: workspace_identity
-                        .public_key_fingerprint
-                        .clone()
-                        .unwrap(),
-                    trust_id: "connected-authorization-workspace-trust".into(),
-                    state: worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Active,
-                    registered_at_unix: 1,
-                    updated_at_unix: 1,
-                },
-            ],
+            vec![registration.clone()],
             Arc::new(
                 worker_runtime::workspace_issuer::InMemoryWorkspaceClaimReplayProtection::default(),
             ),
+        )
+        .unwrap();
+        let workspace_client =
+            worker_runtime::workspace_request::RuntimeWorkspaceRequestClient::new(
+                TEST_WORKSPACE_ID,
+                &backend_url,
+                RUNTIME,
+            )
+            .with_runtime_request_source(&identity, &backend_url);
+        let mut factory = worker_runtime::worker_backend::ProfileRuntimeWorkerFactory::new(
+            dir.path().join("connected-profiles"),
+        )
+        .with_remote_worker_mutation_identity(identity.clone())
+        .with_workspace_request_client(workspace_client.clone())
+        .with_runtime_store_dir(&runtime_root)
+        .with_spawn_model_client_factory(move || Box::new(model.clone()));
+        if plugins_enabled {
+            // This is the Runtime's registered Server, also used by the HTTP
+            // verifier above, not a fabricated Plugin admission response. All
+            // admission/delivery/Host operations still traverse the signed client.
+            let current: Arc<worker_runtime::plugin::remote::CurrentPluginServer> =
+                Arc::new(move |workspace| {
+                    if workspace == registration.workspace_id {
+                        Ok(registration.clone())
+                    } else {
+                        Err(yoi_plugin_runtime::delivery::DeliveryError::Denied)
+                    }
+                });
+            // Remote providers build the standard signed Host client, retaining
+            // PLUGIN_HOST_RESPONSE_BODY_LIMIT (finite 4.5 MiB); do not substitute
+            // an unbounded test client or an in-process owner fallback here.
+            let providers = Arc::new(
+                worker_runtime::plugin::remote::RemotePluginRuntimeProviders::new(
+                    std::collections::HashMap::from([(
+                        TEST_WORKSPACE_ID.to_string(),
+                        workspace_client,
+                    )]),
+                    current,
+                ),
+            );
+            let plugins = worker_runtime::plugin::PinnedPluginToolRuntime::new(
+                providers,
+                &runtime_root.with_extension("plugin-cache"),
+            )
+            .unwrap();
+            factory = factory.with_plugin_runtime(Arc::new(plugins));
+        }
+        // Freeze the fully configured factory only after installing the bridge.
+        let execution =
+            worker_runtime::worker_backend::WorkerRuntimeExecutionBackend::new(factory.clone())
+                .unwrap()
+                .with_working_directory_materializer(materializer.clone());
+        let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
+            worker_runtime::fs_store::FsRuntimeStoreOptions {
+                root: runtime_root.clone(),
+                runtime_id: RUNTIME.into(),
+                display_name: None,
+            },
+            Arc::new(execution),
         )
         .unwrap();
         let runtime_errors = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -2915,6 +2969,7 @@ impl ConnectedWorkerHarness {
 
         Self {
             api,
+            runtime_root,
             runtime,
             factory,
             identity,

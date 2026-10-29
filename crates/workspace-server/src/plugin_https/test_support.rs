@@ -300,7 +300,11 @@ impl Peer {
     }
 
     pub(crate) async fn observed(&mut self) -> Vec<u8> {
-        tokio::time::timeout(Duration::from_secs(5), self.observations.recv())
+        self.observed_within(Duration::from_secs(5)).await
+    }
+
+    pub(crate) async fn observed_within(&mut self, deadline: Duration) -> Vec<u8> {
+        tokio::time::timeout(deadline, self.observations.recv())
             .await
             .unwrap()
             .unwrap()

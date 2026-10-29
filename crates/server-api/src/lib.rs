@@ -226,6 +226,7 @@ impl_openapi_schema!(
     PluginOperationResponse,
     PluginArtifactDeliveryRequest,
     PluginArtifactDeliveryMetadata,
+    PluginWorkerDiagnostics,
     SubjectPermissionsResponse,
     SubjectPermissionsMutationResponse,
     SubjectPermissionInterruption,
@@ -2972,6 +2973,15 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[query] query: PluginListRequest,
     ) -> Result<PluginListResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/plugins/worker-diagnostics/{runtime_id}/{worker_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,503], bearer_auth = true, browser_auth = true)]
+    async fn plugin_worker_diagnostics(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] worker_id: String,
+    ) -> Result<PluginWorkerDiagnostics, RepositoryApiError>;
 
     #[get("/api/w/{workspace_id}/plugins/{installation_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true)]
     async fn plugin_show(

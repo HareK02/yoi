@@ -86,7 +86,8 @@ impl Fixture {
         let upload = api
             .config_store
             .plugin_upload(
-                &ServerConfig::server_data_root_for_data_dir(&api.config.data_root).join("plugin-artifacts"),
+                &ServerConfig::server_data_root_for_data_dir(&api.config.data_root)
+                    .join("plugin-artifacts"),
                 TEST_WORKSPACE_ID,
                 "fixture-owner",
                 &package.bytes,
@@ -1372,7 +1373,7 @@ async fn prepare_unavailable_owner_foreign_workspace_and_unsigned_embedded_never
     f.api
         .config_store
         .with_conn(|conn| {
-            conn.execute_batch("DROP TABLE plugin_execution_plans")?;
+            conn.execute_batch("ALTER TABLE plugin_execution_plans RENAME COLUMN plan_json TO unavailable_plan_json")?;
             Ok(())
         })
         .unwrap();

@@ -38,3 +38,23 @@ export type PluginOperationResponse = { operation_id: string, kind: PluginOperat
 export type PluginArtifactDeliveryRequest = { plan_id: string, plan_fingerprint: string, installation_id: string, artifact_digest: string, };
 
 export type PluginArtifactDeliveryMetadata = { workspace_id: string, request: PluginArtifactDeliveryRequest, artifact: PluginArtifact, };
+
+export type PluginHostErrorCode = "invalid_input" | "denied" | "not_found" | "conflict" | "unsupported" | "quota_exceeded" | "deadline_exceeded" | "cancelled" | "unavailable" | "indeterminate" | "receipt_expired";
+
+export type PluginWorkerDiagnostics = { workspace_id: string, runtime_id: string, worker_id: string, runtime_limits: PluginRuntimeLimits, selection: PluginWorkerDiagnosticSelection, };
+
+export type PluginWorkerDiagnosticSelection = { "kind": "unrecorded" } | { "kind": "empty" } | { "kind": "plan", plan_id: string, fingerprint: string, pin_state: PluginDiagnosticPinState, plugins: Array<PluginWorkerDiagnostic>, };
+
+export type PluginDiagnosticPinState = "pending" | "active" | "restorable" | "released";
+
+export type PluginDiagnosticSurface = "tool";
+
+export type PluginWorkerDiagnostic = { installation_id: string, package_id: string, package_version: string, package_digest: string, artifact_digest: string, artifact_size: number, surfaces: Array<PluginDiagnosticSurface>, selected_tools: Array<string>, admission: PluginDiagnosticAdmission, connections: Array<PluginDiagnosticConnection>, };
+
+export type PluginDiagnosticAdmission = { "kind": "admissible" } | { "kind": "refused", reason_code: PluginHostErrorCode, };
+
+export type PluginDiagnosticConnection = { slot: string, effective_limits: PluginDiagnosticConnectionLimits, };
+
+export type PluginDiagnosticConnectionLimits = { "kind": "available", timeout_ms: number, max_request_bytes: number, max_response_bytes: number, max_header_bytes: number, } | { "kind": "unavailable", reason_code: PluginHostErrorCode, };
+
+export type PluginRuntimeLimits = { payload_bytes: number, config_bytes: number, memory_bytes: number, table_elements: number, instances: number, memories: number, tables: number, resources: number, fuel: number, wall_time_ms: number, host_operations: number, http_body_bytes: number, http_header_bytes: number, http_header_pairs: number, log_bytes: number, };

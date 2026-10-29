@@ -25,7 +25,7 @@ fn package_bytes(version: &str) -> Vec<u8> {
     .bytes
 }
 
-async fn request(
+pub(super) async fn request(
     app: Router,
     token: Option<&str>,
     method: &str,
@@ -415,29 +415,101 @@ async fn api_restart_recovers_orphan_publication_and_preserves_committed_catalog
 
 #[tokio::test]
 async fn workspace_owner_without_hosting_admin_configures_plugin_through_existing_config_commit() {
-    let dir=tempfile::tempdir().unwrap();
-    let api=test_api(dir.path()).await;
-    let owner=seed_test_workspace_owner_token(api.store.as_ref(),"plugin-config-owner").await;
-    let reader=seed_test_api_token(api.store.as_ref(),"plugin-config-reader");
-    let app=build_router(api.clone());
-    let prefix=format!("/api/w/{TEST_WORKSPACE_ID}");
-    let upload=request(app.clone(),Some(&owner),"POST",&format!("{prefix}/plugin-uploads"),package_bytes("0.1.0"),true,StatusCode::OK).await;
+    let dir = tempfile::tempdir().unwrap();
+    let api = test_api(dir.path()).await;
+    let owner = seed_test_workspace_owner_token(api.store.as_ref(), "plugin-config-owner").await;
+    let reader = seed_test_api_token(api.store.as_ref(), "plugin-config-reader");
+    let app = build_router(api.clone());
+    let prefix = format!("/api/w/{TEST_WORKSPACE_ID}");
+    let upload = request(
+        app.clone(),
+        Some(&owner),
+        "POST",
+        &format!("{prefix}/plugin-uploads"),
+        package_bytes("0.1.0"),
+        true,
+        StatusCode::OK,
+    )
+    .await;
     let installed=json(app.clone(),&owner,&format!("{prefix}/plugins"),serde_json::json!({"upload_id":upload["upload_id"],"alias":"configured","operation_key":"config-install"}),StatusCode::OK).await;
-    let state=get(app.clone(),Some(&owner),&format!("{prefix}/config/source-tree"),StatusCode::OK).await;
-    let a=&installed["installation"]["artifacts"][0];
-    let source=format!("{{ plugins.enabled.echo = {{ installation_id = {}; expected_last_operation = {}; package_digest = {}; artifact_digest = {}; tools = [\"example_echo\"]; config = {{}}; }}; }} as WorkspaceConfigSchema",installed["installation"]["installation_id"],installed["operation_id"],a["package_digest"],a["artifact_digest"]);
-    let change=serde_json::json!({"base_digest":state["snapshot"]["digest"],"entrypoints":["main.dcdl"],"changes":[{"kind":"update","path":"main.dcdl","expected_digest":state["snapshot"]["entries"]["main.dcdl"]["content_digest"],"content":source}]});
-    json(app.clone(),&reader,&format!("{prefix}/config/source-tree/commit"),change.clone(),StatusCode::FORBIDDEN).await;
-    json(app.clone(),&reader,&format!("{prefix}/config/source-tree/preview"),change.clone(),StatusCode::FORBIDDEN).await;
-    let preview=json(app.clone(),&owner,&format!("{prefix}/config/source-tree/preview"),change.clone(),StatusCode::OK).await;
-    let unchanged=get(app.clone(),Some(&owner),&format!("{prefix}/config/source-tree"),StatusCode::OK).await;
-    assert_eq!(unchanged["snapshot"]["digest"],state["snapshot"]["digest"]);
-    let saved=json(app.clone(),&owner,&format!("{prefix}/config/source-tree/commit"),change.clone(),StatusCode::CREATED).await;
-    assert_eq!(saved,preview);
-    assert_ne!(saved["snapshot"]["digest"],state["snapshot"]["digest"]);
-    json(app.clone(),&owner,&format!("{prefix}/config/source-tree/commit"),change,StatusCode::CONFLICT).await;
+    let state = get(
+        app.clone(),
+        Some(&owner),
+        &format!("{prefix}/config/source-tree"),
+        StatusCode::OK,
+    )
+    .await;
+    let a = &installed["installation"]["artifacts"][0];
+    let source = format!(
+        "{{ plugins.enabled.echo = {{ installation_id = {}; expected_last_operation = {}; package_digest = {}; artifact_digest = {}; tools = [\"example_echo\"]; config = {{}}; }}; }} as WorkspaceConfigSchema",
+        installed["installation"]["installation_id"],
+        installed["operation_id"],
+        a["package_digest"],
+        a["artifact_digest"]
+    );
+    let change = serde_json::json!({"base_digest":state["snapshot"]["digest"],"entrypoints":["main.dcdl"],"changes":[{"kind":"update","path":"main.dcdl","expected_digest":state["snapshot"]["entries"]["main.dcdl"]["content_digest"],"content":source}]});
+    json(
+        app.clone(),
+        &reader,
+        &format!("{prefix}/config/source-tree/commit"),
+        change.clone(),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    json(
+        app.clone(),
+        &reader,
+        &format!("{prefix}/config/source-tree/preview"),
+        change.clone(),
+        StatusCode::FORBIDDEN,
+    )
+    .await;
+    let preview = json(
+        app.clone(),
+        &owner,
+        &format!("{prefix}/config/source-tree/preview"),
+        change.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    let unchanged = get(
+        app.clone(),
+        Some(&owner),
+        &format!("{prefix}/config/source-tree"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(unchanged["snapshot"]["digest"], state["snapshot"]["digest"]);
+    let saved = json(
+        app.clone(),
+        &owner,
+        &format!("{prefix}/config/source-tree/commit"),
+        change.clone(),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(saved, preview);
+    assert_ne!(saved["snapshot"]["digest"], state["snapshot"]["digest"]);
+    json(
+        app.clone(),
+        &owner,
+        &format!("{prefix}/config/source-tree/commit"),
+        change,
+        StatusCode::CONFLICT,
+    )
+    .await;
     json(app.clone(),&owner,&format!("{prefix}/plugins/{}/uninstall",installed["installation"]["installation_id"].as_str().unwrap()),serde_json::json!({"expected_last_operation":installed["operation_id"],"operation_key":"config-blocks-uninstall"}),StatusCode::CONFLICT).await;
-    let current=api.config_store.load_workspace_config(TEST_WORKSPACE_ID).unwrap().unwrap();
-    let candidates=current.contract.schema_bundle.contributions.iter().filter(|c|c.provider_id=="builtin:plugins").count();
-    assert_eq!(candidates,1);
+    let current = api
+        .config_store
+        .load_workspace_config(TEST_WORKSPACE_ID)
+        .unwrap()
+        .unwrap();
+    let candidates = current
+        .contract
+        .schema_bundle
+        .contributions
+        .iter()
+        .filter(|c| c.provider_id == "builtin:plugins")
+        .count();
+    assert_eq!(candidates, 1);
 }

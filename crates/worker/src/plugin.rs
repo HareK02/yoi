@@ -351,7 +351,24 @@ impl Tool for PluginTool {
                 &self.config_json,
             )
             .await
-            .map_err(|_| failure("Plugin invocation failed; no automatic retry"))?
+            .map_err(|error| {
+                let reason = match error {
+                    yoi_plugin_runtime::ExecutionError::Artifact(_) => "artifact",
+                    yoi_plugin_runtime::ExecutionError::UnsupportedComponent(_) => {
+                        "unsupported-component"
+                    }
+                    yoi_plugin_runtime::ExecutionError::InvalidInput(_) => "invalid-input",
+                    yoi_plugin_runtime::ExecutionError::InvalidOutput(_) => "invalid-output",
+                    yoi_plugin_runtime::ExecutionError::Cancelled => "cancelled",
+                    yoi_plugin_runtime::ExecutionError::Deadline => "deadline",
+                    yoi_plugin_runtime::ExecutionError::Host(_) => "host-refused-or-unavailable",
+                    yoi_plugin_runtime::ExecutionError::Guest { .. } => "guest-error",
+                    yoi_plugin_runtime::ExecutionError::Trap(_) => "trap-or-limit",
+                };
+                failure(&format!(
+                    "Plugin invocation failed ({reason}); no automatic retry"
+                ))
+            })?
             .output;
         // Fence again at the adapter publication boundary, not just on guest return.
         host.authorize(host.context(), Operation::Publish)

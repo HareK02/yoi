@@ -1129,6 +1129,7 @@ mod subject_assignment_migration_tests {
                 _ => panic!("unsupported fixture origin"),
             };
             tail.push((109, "Durable Plugin Host invocations and HTTPS effect receipts".into()));
+            tail.push((110, "Worker Plugin launch selection associations".into()));
             tail
         }
 

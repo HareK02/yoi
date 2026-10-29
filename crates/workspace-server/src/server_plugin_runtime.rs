@@ -60,21 +60,36 @@ impl WorkspaceApi {
                 plugin_execution: None,
             });
         }
-        let selector = match &request.profile {
+        let selector_name = match &request.profile {
+            worker_runtime::catalog::ProfileSelector::Builtin(s) if !s.starts_with("builtin:") => {
+                format!("builtin:{s}")
+            }
             worker_runtime::catalog::ProfileSelector::Builtin(s)
-            | worker_runtime::catalog::ProfileSelector::Named(s) => s,
+            | worker_runtime::catalog::ProfileSelector::Named(s) => s.clone(),
         };
-        let manifest = match &request.resolved_config_bundle {
-            Some(bundle) => crate::profile_settings::resolve_profile_manifest_from_config_bundle(
-                bundle, selector,
-            )?,
-            None => crate::profile_settings::builtin_profile_source_archive(&request.profile)
-                .map_err(Error::Config)?
-                .verify()
-                .map_err(|_| Error::Config("Plugin Profile archive invalid".into()))?
-                .resolve_profile(selector, Path::new("/"), "plugin-launch")
-                .map_err(|_| Error::Config("Plugin Profile unavailable".into()))?,
+        let selector = selector_name.as_str();
+        let archive = match request.resolved_config_bundle.as_ref() {
+            Some(bundle) if bundle.profile_source_archive.is_some() => bundle
+                .profile_source_archive
+                .clone()
+                .expect("checked archive"),
+            Some(bundle) if bundle.profile_source_archive_handle.is_some() => {
+                let handle = bundle
+                    .profile_source_archive_handle
+                    .as_ref()
+                    .expect("checked handle");
+                self.resource_broker
+                    .profile_source_archive(&handle.digest)
+                    .ok_or_else(|| Error::Config("Plugin Profile archive unavailable".into()))?
+            }
+            _ => crate::profile_settings::builtin_profile_source_archive(&request.profile)
+                .map_err(Error::Config)?,
         };
+        let manifest = archive
+            .verify()
+            .map_err(|_| Error::Config("Plugin Profile archive invalid".into()))?
+            .resolve_profile(selector, Path::new("/"), "plugin-launch")
+            .map_err(|_| Error::Config("Plugin Profile unavailable".into()))?;
         if manifest.plugins.selections.is_empty() {
             return self.config_store.with_immediate_transaction(|tx| {
                 tx.execute("INSERT INTO worker_plugin_launches(workspace_id,runtime_id,worker_id,plan_id) SELECT workspace_id,runtime_id,worker_id,NULL FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND create_fingerprint=?4 AND state='reserved' ON CONFLICT(workspace_id,worker_id) DO NOTHING",
@@ -159,11 +174,18 @@ impl PluginRuntimeProviders for EmbeddedPluginRuntimeProviders {
             EMBEDDED_RUNTIME_ID,
         )
         .with_runtime_request_source(&EMBEDDED_RUNTIME_REQUEST_IDENTITY, audience);
+        #[cfg(test)]
+        let transport = api.plugin_https_transport.clone();
         let owner = plugin_host::EmbeddedPluginHostOwner::authenticated(
             api,
             workspace.into(),
             client.plugin_host_authorizer(worker.worker_id),
         );
+        #[cfg(test)]
+        let owner = match transport {
+            Some(transport) => owner.with_transport(transport),
+            None => owner,
+        };
         Ok(PluginRuntimeServices {
             artifacts: Arc::new(artifacts),
             owner: Arc::new(owner),

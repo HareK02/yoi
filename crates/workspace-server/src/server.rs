@@ -50,6 +50,8 @@ mod drive_grants;
 mod plugin;
 #[path = "server_plugin_delivery.rs"]
 mod plugin_delivery;
+#[path = "server_plugin_diagnostics.rs"]
+mod plugin_diagnostics;
 #[path = "server_plugin_host.rs"]
 mod plugin_host;
 #[path = "server_plugin_runtime.rs"]
@@ -4154,6 +4156,23 @@ impl WorkspaceApi {
         store: Arc<dyn ControlPlaneStore>,
         host_executors: HostExecutors,
     ) -> Result<Self> {
+        Self::new_with_embedded_configurators(
+            config,
+            store,
+            host_executors,
+            |factory| factory,
+            |_| {},
+        )
+        .await
+    }
+
+    async fn new_with_embedded_configurators(
+        config: ServerConfig,
+        store: Arc<dyn ControlPlaneStore>,
+        host_executors: HostExecutors,
+        configure_factory: impl FnOnce(ProfileRuntimeWorkerFactory) -> ProfileRuntimeWorkerFactory,
+        configure_api: impl FnOnce(&mut WorkspaceApi),
+    ) -> Result<Self> {
         let resource_broker = BackendResourceBroker::default();
         if store.get_workspace(&config.workspace_id).await?.is_none() {
             return Err(crate::Error::Config(format!(
@@ -4190,10 +4209,12 @@ impl WorkspaceApi {
         let plugin_providers = Arc::new(plugin_runtime::EmbeddedPluginRuntimeProviders::default());
         let plugins = worker_runtime::plugin::PinnedPluginToolRuntime::new(
             plugin_providers.clone(),
-            &config.embedded_runtime_store_root.join("plugin-cache"),
+            &config
+                .embedded_runtime_store_root
+                .with_extension("plugin-cache"),
         )
         .map_err(crate::Error::Config)?;
-        let execution_backend = WorkerRuntimeExecutionBackend::new(
+        let execution_backend = WorkerRuntimeExecutionBackend::new(configure_factory(
             ProfileRuntimeWorkerFactory::new(config.workspace_execution_root.clone())
                 .with_plugin_runtime(Arc::new(plugins))
                 .with_embedded_worker_mutation_dispatcher(
@@ -4210,7 +4231,7 @@ impl WorkspaceApi {
                 )
                 .with_runtime_store_dir(config.embedded_runtime_store_root.clone())
                 .with_resource_client(Arc::new(resource_broker.clone())),
-        )
+        ))
         .map_err(|err| {
             crate::Error::Store(format!(
                 "failed to initialize embedded Worker backend: {err}"
@@ -4282,6 +4303,7 @@ impl WorkspaceApi {
         {
             api.register_workspace_runtime_binding(binding)?;
         }
+        configure_api(&mut api);
         let plugin_owner = Arc::new(api.clone());
         plugin_providers.bind(&plugin_owner);
         api.plugin_runtime_owner = Some(plugin_owner);
@@ -13620,6 +13642,24 @@ impl server_api::ServerApi for ServerApiContractService {
     ) -> std::result::Result<server_api::PluginListResponse, server_api::RepositoryApiError> {
         let api = self.workspace_api()?;
         plugin::list(api, actor, workspace_id, query).await
+    }
+
+    async fn plugin_worker_diagnostics(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        runtime_id: String,
+        worker_id: String,
+    ) -> std::result::Result<server_api::PluginWorkerDiagnostics, server_api::RepositoryApiError>
+    {
+        plugin_diagnostics::diagnostics(
+            self.workspace_api()?,
+            actor,
+            workspace_id,
+            runtime_id,
+            worker_id,
+        )
+        .await
     }
 
     async fn plugin_show(
@@ -38755,6 +38795,8 @@ mod tests {
         include!("server_plugin_host_tests.rs");
         include!("server_plugin_runtime_tests.rs");
     }
+    include!("server_plugin_controller_tests.rs");
+    include!("server_plugin_remote_controller_tests.rs");
 
     mod ticket_tags_tests {
         include!("server_ticket_tags_tests.rs");

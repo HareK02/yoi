@@ -16,6 +16,7 @@ pub(super) fn router(service: Arc<ServerApiContractService>) -> Router {
         )
         .merge(server_api_axum::plugin_install(service.clone()))
         .merge(server_api_axum::plugin_list(service.clone()))
+        .merge(server_api_axum::plugin_worker_diagnostics(service.clone()))
         .merge(server_api_axum::plugin_show(service.clone()))
         .merge(server_api_axum::plugin_artifact_add(service.clone()))
         .merge(server_api_axum::plugin_revoke(service.clone()))
@@ -60,7 +61,7 @@ pub(super) fn is_catalog_path(path: &str) -> bool {
         })
 }
 
-fn failure(error: Error) -> RepositoryApiError {
+pub(super) fn failure(error: Error) -> RepositoryApiError {
     let (status, code) = match error {
         Error::PluginCatalog(error) => (error.status(), error.code()),
         Error::WorkspacePermissionDenied(_) => (403, "access_denied"),
@@ -73,7 +74,7 @@ fn failure(error: Error) -> RepositoryApiError {
     RepositoryApiError::new(status, code, format!("Plugin catalog: {code}"), vec![])
 }
 
-async fn authorize(
+pub(super) async fn authorize(
     api: &WorkspaceApi,
     workspace: &str,
     actor: &RequestActor,
