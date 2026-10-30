@@ -4,6 +4,8 @@
 // proof verification, current Subject permissions and all Host checks are real.
 // Run with `cargo test -p yoi-workspace-server --lib plugin_host_tests`.
 // The shared TLS fixture requires openssl; tests never mutate process environment.
+#[path = "server_plugin_authority_storage_tests.rs"]
+mod authority_storage;
 #[path = "server_plugin_data_tests.rs"]
 mod data;
 
@@ -1359,6 +1361,59 @@ async fn remote_owner_for_with_limit(
         )),
         task,
     )
+}
+
+fn assert_check_physical_initializations(
+    f: &Fixture,
+    before: crate::feature_storage::OpenObservation,
+    expected: u64,
+) {
+    let observed = f
+        .api
+        .subjektiv_registration
+        .open_observation()
+        .since(before);
+    let directory = f
+        .api
+        .config
+        .database_path
+        .parent()
+        .unwrap()
+        .join("feature-storage")
+        .join(TEST_WORKSPACE_ID)
+        .join("features");
+    let resolved = fs::canonicalize(&directory).unwrap();
+    let ancestors: std::collections::HashSet<_> =
+        directory.ancestors().chain(resolved.ancestors()).collect();
+    assert_eq!(observed.completed_initializations, expected, "{observed:?}");
+    assert_eq!(observed.physical_open_attempts, expected, "{observed:?}");
+    assert_eq!(observed.physical_opens, expected, "{observed:?}");
+    assert_eq!(
+        observed.directory_sync_attempts,
+        expected * ancestors.len() as u64,
+        "{observed:?}"
+    );
+    assert_eq!(
+        observed.directory_sync_successes,
+        observed.directory_sync_attempts
+    );
+}
+
+#[tokio::test]
+async fn tool_check_reuses_physical_subject_database_only_within_each_sync_scope() {
+    let f = Fixture::new(None).await;
+    let owner = f.owner(None).await;
+    for _ in 0..2 {
+        let before = f.api.subjektiv_registration.open_observation();
+        assert!(matches!(
+            owner.call(prepare(&f)).await.unwrap(),
+            PluginHostResponse::Authorized
+        ));
+        // Identity and permission checks are two separate synchronous scopes.
+        // The next call must open again rather than keeping a cross-call cache.
+        assert_check_physical_initializations(&f, before, 2);
+    }
+    f.shutdown().await;
 }
 
 fn prepare(f: &Fixture) -> PluginHostRequest {

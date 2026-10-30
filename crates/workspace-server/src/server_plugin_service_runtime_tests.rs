@@ -37,6 +37,33 @@ mod service_connection {
         f
     }
 
+    #[tokio::test]
+    async fn service_check_reuses_physical_subject_database_only_within_each_sync_scope() {
+        let peer = Peer::new(HOST, vec![]).await;
+        let f = fixture(&peer).await;
+        let owner = f.owner(None).await;
+        for _ in 0..2 {
+            let before = f.api.subjektiv_registration.open_observation();
+            assert_eq!(
+                request(
+                    owner.as_ref(),
+                    PluginServiceRequest::Prepare {
+                        plan_id: f.plan.plan_id.clone(),
+                        installation_id: f.installed.installation.installation_id.clone(),
+                        service_name: SERVICE.into(),
+                        operation: PluginServiceLifecycleOperation::Admit,
+                    }
+                )
+                .await
+                .unwrap(),
+                PluginServiceResponse::Prepared
+            );
+            assert_check_physical_initializations(&f, before, 2);
+        }
+        assert_eq!(peer.connection_count(), 0);
+        f.shutdown().await;
+    }
+
     async fn request(
         owner: &dyn PluginHostOwner,
         request: PluginServiceRequest,
@@ -1092,17 +1119,24 @@ mod service_connection {
         ));
         // Delegation validity is source-identity based, not wall-clock based.
         // Even identical replacement policy expires this retained child grant.
-        store
-            .set_subject_permissions(
-                &f.subject,
-                &SubjectPermissionsUpdate {
-                    operation_id: "expire-service-source".into(),
-                    expected_change_id: Some(source.change_id),
-                    execution: source.execution,
-                    delegation: source.delegation,
-                },
-            )
-            .unwrap();
+        crate::server::plugin_host::with_authority_database(&f.api, || {
+            subject_authorization::plugin_execution_identity(&f.api, &f.source).unwrap();
+            let (_manager, independent) = authority_storage::independent_store(&f.api);
+            independent
+                .set_subject_permissions(
+                    &f.subject,
+                    &SubjectPermissionsUpdate {
+                        operation_id: "expire-service-source".into(),
+                        expected_change_id: Some(source.change_id),
+                        execution: source.execution,
+                        delegation: source.delegation,
+                    },
+                )
+                .unwrap();
+            assert!(subject_authorization::plugin_execution_identity(&f.api, &f.source).is_err());
+            Ok(())
+        })
+        .unwrap();
         assert_late_operations_rejected(
             &owners,
             &lease,
