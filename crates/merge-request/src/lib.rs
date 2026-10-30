@@ -210,12 +210,7 @@ impl MergeRequestThreadEvent {
     }
     fn bound_bodies(&mut self) {
         match self {
-            Self::Review(value) => {
-                truncate_body(&mut value.body);
-                for finding in &mut value.findings {
-                    truncate_body(&mut finding.body);
-                }
-            }
+            Self::Review(_) => {}
             Self::ReviewRevoked(value) => truncate_body(&mut value.reason),
             Self::ReviewCancelled(value) => truncate_body(&mut value.reason),
             Self::Comment(value) => truncate_body(&mut value.body),
@@ -939,10 +934,6 @@ impl MergeRequestStore {
         &self,
         i: SubmitMergeRequestReview,
     ) -> Result<ReviewEvent, MergeRequestError> {
-        bounded_body("review body", &i.body)?;
-        for finding in &i.findings {
-            bounded_body("review finding", &finding.body)?;
-        }
         let mut c = self.lock()?;
         let t = c.transaction()?;
         let g: Option<(String, String, String, String, String, String)> = t
