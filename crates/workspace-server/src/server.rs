@@ -704,28 +704,52 @@ impl WorkdirSessionRegistry {
     }
 }
 
+// Extraction is not release confirmation. Retain every unconfirmed entry across
+// the await, including entries not yet attempted when the close future is dropped.
+// Callers keep their Worker session fence until this restoration has completed.
+struct UnconfirmedWorkdirSessionCloses<'a> {
+    registry: &'a Arc<Mutex<WorkdirSessionRegistry>>,
+    registered: Vec<RegisteredWorkdirSession>,
+}
+
+impl Drop for UnconfirmedWorkdirSessionCloses<'_> {
+    fn drop(&mut self) {
+        if self.registered.is_empty() {
+            return;
+        }
+        let mut sessions = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for item in self.registered.drain(..) {
+            sessions.restore(item);
+        }
+    }
+}
+
 async fn close_registered_workdir_sessions(
     registry: &Arc<Mutex<WorkdirSessionRegistry>>,
     registered: Vec<RegisteredWorkdirSession>,
 ) -> std::result::Result<(), String> {
-    let mut failed = Vec::new();
+    let mut unconfirmed = UnconfirmedWorkdirSessionCloses {
+        registry,
+        registered,
+    };
     let mut errors = Vec::new();
-    for item in registered {
-        let session = match &item {
+    let mut index = 0;
+    while let Some(item) = unconfirmed.registered.get(index) {
+        let session = match item {
             RegisteredWorkdirSession::Attachment { session, .. } => session,
             RegisteredWorkdirSession::Command { session, .. } => &session.source,
         };
-        if let Err(error) = session.close().await {
-            errors.push(error.to_string());
-            failed.push(item);
-        }
-    }
-    if !failed.is_empty() {
-        let mut sessions = registry
-            .lock()
-            .map_err(|_| "Workdir session registry was poisoned".to_string())?;
-        for item in failed {
-            sessions.restore(item);
+        match session.close().await {
+            Ok(()) => {
+                unconfirmed.registered.remove(index);
+            }
+            Err(error) => {
+                errors.push(error.to_string());
+                index += 1;
+            }
         }
     }
     if errors.is_empty() {
@@ -21380,17 +21404,19 @@ async fn close_current_worker_attachment_session_locked(
         .expect("Workdir session registry lock poisoned")
         .remove_attachment(worker);
     if let Some(session) = session {
-        if let Err(error) = session.close().await {
-            api.workdir_sessions
-                .lock()
-                .expect("Workdir session registry lock poisoned")
-                .insert_attachment(worker.clone(), session);
-            return Err(Error::RuntimeOperationFailed {
-                runtime_id: worker.runtime_id.clone(),
-                code: "workdir_session_close_failed".to_string(),
-                message: error.to_string(),
-            });
-        }
+        close_registered_workdir_sessions(
+            &api.workdir_sessions,
+            vec![RegisteredWorkdirSession::Attachment {
+                worker: worker.clone(),
+                session,
+            }],
+        )
+        .await
+        .map_err(|message| Error::RuntimeOperationFailed {
+            runtime_id: worker.runtime_id.clone(),
+            code: "workdir_session_close_failed".to_string(),
+            message,
+        })?;
     }
     Ok(())
 }
@@ -39283,6 +39309,7 @@ mod tests {
     mod ticket_worker_launch_tests;
     mod value_profiles_tests;
     mod workdir_delegation_tests;
+    mod workdir_session_close_tests;
     mod worker_drive_tests;
     mod worker_operations_tests;
     mod worker_protocol_tests;
@@ -51226,6 +51253,10 @@ mod tests {
         let worker_root = root
             .join(".test-embedded-runtime-store/workers")
             .join(&worker.worker_id);
+        seed_worker_session_at_root(&worker_root);
+    }
+
+    fn seed_worker_session_at_root(worker_root: &Path) {
         use session_store::Store;
         let store = session_store::WorkerSessionStore::new(worker_root.join("session")).unwrap();
         let session = session_store::new_session_id();
