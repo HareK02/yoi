@@ -556,6 +556,7 @@ mod client {
         capabilities: WorkdirSessionCapabilities,
         environment: crate::WorkdirSessionEnvironment,
         closed: AtomicBool,
+        close_lock: tokio::sync::Mutex<()>,
     }
 
     impl RemoteWorkdirSession {
@@ -616,6 +617,7 @@ mod client {
                 capabilities: opened.capabilities,
                 environment: opened.environment,
                 closed: AtomicBool::new(false),
+                close_lock: tokio::sync::Mutex::new(()),
             })
         }
 
@@ -1014,7 +1016,11 @@ mod client {
         }
 
         async fn close(&self) -> Result<(), WorkdirError> {
-            if self.closed.swap(true, Ordering::AcqRel) {
+            // In-flight is not closed. Dropping this guard on error or cancellation
+            // leaves confirmation unset, so the next caller can retry Runtime's
+            // idempotent DELETE even when the previous response was lost.
+            let _close = self.close_lock.lock().await;
+            if self.closed.load(Ordering::Acquire) {
                 return Ok(());
             }
             let url = endpoint(
@@ -1033,6 +1039,7 @@ mod client {
                 .await
                 .map_err(http_unavailable)?;
             if response.status() == StatusCode::NO_CONTENT || response.status().is_success() {
+                self.closed.store(true, Ordering::Release);
                 Ok(())
             } else {
                 Err(decode_error(response).await)
@@ -1211,7 +1218,7 @@ mod client {
 
             // Seed an already-open session to exercise the public operation and
             // close boundaries independently of the rejected open request.
-            let remote = RemoteWorkdirSession {
+            let mut remote = RemoteWorkdirSession {
                 client,
                 base_url,
                 authorization: authorization.clone(),
@@ -1222,6 +1229,7 @@ mod client {
                     WorkdirSessionCapabilities::EMPTY,
                 ),
                 closed: AtomicBool::new(false),
+                close_lock: tokio::sync::Mutex::new(()),
             };
             let stat = StatRequest {
                 path: crate::WorkdirPath::new("file").unwrap(),
@@ -1263,6 +1271,15 @@ mod client {
                 listener.accept().unwrap_err().kind(),
                 std::io::ErrorKind::WouldBlock
             );
+            // An invalid endpoint cannot be produced by a successful open, but
+            // must not turn a pre-dispatch error into a confirmed close either.
+            remote.base_url = Url::parse("data:invalid-base").unwrap();
+            for _ in 0..2 {
+                assert!(matches!(
+                    remote.close().await,
+                    Err(WorkdirError::InvalidArgument(_))
+                ));
+            }
         }
     }
 

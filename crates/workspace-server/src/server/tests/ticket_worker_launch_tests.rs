@@ -13,6 +13,7 @@ use worker_runtime::execution::{
 #[derive(Default)]
 struct LaunchExecutionBackend {
     execution: DeterministicExecutionBackend,
+    provider_close_gate: Mutex<Option<Arc<super::workdir_session_close_tests::ProviderCloseGate>>>,
     bundles: Mutex<std::collections::HashMap<String, worker_runtime::config_bundle::ConfigBundle>>,
     creates: Mutex<Vec<worker_runtime::catalog::CreateWorkerRequest>>,
     submits: Mutex<
@@ -122,6 +123,35 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
         self.execution.working_directory(id)
     }
 
+    fn open_workdir_session(
+        &self,
+        id: &str,
+    ) -> std::result::Result<
+        WorkdirSessionHandle,
+        worker_runtime::working_directory::WorkingDirectoryDiagnostic,
+    > {
+        let binding = self
+            .execution
+            .materializer
+            .bind_working_directory(id, None)?;
+        let scope = manifest::Scope::writable(binding.root()).unwrap();
+        let session: WorkdirSessionHandle = Arc::new(
+            workdir::LocalWorkdirSession::materialized_bound_with_environment(
+                workdir::Workdir::new(id),
+                binding.root().to_owned(),
+                binding.root().to_owned(),
+                manifest::SharedScope::new(scope),
+                workdir::WorkdirSessionCapabilities::ALL,
+                binding.command_environment(),
+                binding.session_resources()?,
+            ),
+        );
+        Ok(match self.provider_close_gate.lock().unwrap().as_ref() {
+            Some(gate) => gate.wrap(session),
+            None => session,
+        })
+    }
+
     fn create_working_directory(
         &self,
         request: &worker_runtime::catalog::WorkingDirectoryRequest,
@@ -180,11 +210,15 @@ pub(super) struct LaunchFixture {
     backend: Arc<LaunchExecutionBackend>,
     runtime_id: String,
     runtime_server: Option<tokio::task::JoinHandle<()>>,
+    runtime_router: Option<Router>,
     runtime_identity: Option<RuntimeIdentityMaterial>,
 }
 
 impl Drop for LaunchFixture {
     fn drop(&mut self) {
+        if let Some(gate) = self.backend.provider_close_gate.lock().unwrap().as_ref() {
+            gate.release();
+        }
         if let Some(server) = &self.runtime_server {
             server.abort();
         }
@@ -192,13 +226,38 @@ impl Drop for LaunchFixture {
 }
 
 impl LaunchFixture {
+    pub(super) fn hold_provider_close(
+        &self,
+        gate: Arc<super::workdir_session_close_tests::ProviderCloseGate>,
+    ) {
+        *self.backend.provider_close_gate.lock().unwrap() = Some(gate);
+    }
+
+    pub(super) fn runtime_router(&self) -> Router {
+        self.runtime_router.clone().unwrap()
+    }
+
+    pub(super) fn publish_profile(&self, profile: &str) {
+        self.backend.publish_profile(&self.api, profile);
+    }
+
+    pub(super) fn seed_remote_session_for_cleanup(&self, worker: &RuntimeWorkerRef) {
+        seed_worker_session_at_root(
+            &self
+                ._temp
+                .path()
+                .join(".test-embedded-runtime-store/source-runtime/workers")
+                .join(&worker.worker_id),
+        );
+    }
+
     // Reuse the authenticated Runtime HTTP harness for Drive/source lifetime
     // assertions without duplicating its trust/bootstrap/listener lifecycle.
     pub(super) async fn with_source_workdir() -> (
         Self,
         worker_runtime::working_directory::WorkingDirectoryBinding,
     ) {
-        let fixture = Self::new(true).await;
+        let fixture = Self::new_with_runtime_store(true, true).await;
         init_clean_git_workspace(fixture._temp.path());
         let (_, Json(created)) = create_workspace_working_directory(
             &fixture.api,
@@ -224,6 +283,10 @@ impl LaunchFixture {
     }
 
     async fn new(remote: bool) -> Self {
+        Self::new_with_runtime_store(remote, false).await
+    }
+
+    async fn new_with_runtime_store(remote: bool, persistent: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let config = test_server_config(temp.path());
         let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
@@ -247,6 +310,7 @@ impl LaunchFixture {
             backend,
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
             runtime_server: None,
+            runtime_router: None,
             runtime_identity: None,
         };
         if remote {
@@ -282,11 +346,26 @@ impl LaunchFixture {
                 Arc::new(InMemoryWorkspaceClaimReplayProtection::default()),
             )
             .unwrap();
-            let runtime = worker_runtime::Runtime::with_execution_backend(
-                worker_runtime::RuntimeOptions::default(),
-                fixture.backend.clone(),
-            )
+            let runtime = if persistent {
+                worker_runtime::Runtime::with_fs_store_and_execution_backend(
+                    worker_runtime::fs_store::FsRuntimeStoreOptions {
+                        root: fixture
+                            ._temp
+                            .path()
+                            .join(".test-embedded-runtime-store/source-runtime"),
+                        runtime_id: fixture.runtime_id.clone(),
+                        display_name: None,
+                    },
+                    fixture.backend.clone(),
+                )
+            } else {
+                worker_runtime::Runtime::with_execution_backend(
+                    worker_runtime::RuntimeOptions::default(),
+                    fixture.backend.clone(),
+                )
+            }
             .unwrap();
+            runtime.bind_runtime_identity(&fixture.runtime_id).unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let binding = WorkspaceRuntimeBinding {
@@ -318,18 +397,17 @@ impl LaunchFixture {
                 .unwrap()
                 .unwrap();
             let runtime_id = fixture.runtime_id.clone();
+            let router = worker_runtime::http_server::runtime_http_router_with_workspace_auth(
+                runtime,
+                None,
+                worker_runtime::http_server::WorkspaceRuntimeHttpAuth {
+                    verifier,
+                    runtime_id,
+                },
+            );
+            fixture.runtime_router = Some(router.clone());
             fixture.runtime_server = Some(tokio::spawn(async move {
-                worker_runtime::http_server::serve_runtime_http_with_workspace_auth(
-                    runtime,
-                    listener,
-                    None,
-                    worker_runtime::http_server::WorkspaceRuntimeHttpAuth {
-                        verifier,
-                        runtime_id,
-                    },
-                )
-                .await
-                .unwrap();
+                axum::serve(listener, router).await.unwrap();
             }));
             let mut remote_config = RemoteRuntimeConfig {
                 runtime_id: fixture.runtime_id.clone(),

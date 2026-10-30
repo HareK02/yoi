@@ -11,6 +11,8 @@
 //! filesystem/Git inspection and unlink; conflicting target use is rejected promptly.
 
 mod runtime_management_api;
+#[cfg(test)]
+mod workdir_close_tests;
 
 use crate::auth::{RuntimeAuthContext, new_token_id, unix_now_seconds};
 use crate::catalog::{
@@ -373,9 +375,12 @@ pub struct WorkspaceRuntimeHttpAuth {
     pub runtime_id: String,
 }
 
+type RuntimeHttpWorkdirCloseResult = Result<(), RuntimeHttpWorkdirError>;
+
 struct RuntimeHttpWorkdirSession {
     owner: RuntimeWorkspaceScope,
     session: WorkdirSessionHandle,
+    close_attempt: Option<tokio::sync::watch::Receiver<Option<RuntimeHttpWorkdirCloseResult>>>,
 }
 
 /// `GET /v1/runtime` response.
@@ -878,7 +883,11 @@ async fn open_workdir_session(
         .map_err(|_| RuntimeHttpWorkdirError::internal())?
         .insert(
             session_id.as_str().to_string(),
-            RuntimeHttpWorkdirSession { owner, session },
+            RuntimeHttpWorkdirSession {
+                owner,
+                session,
+                close_attempt: None,
+            },
         );
     Ok(Json(response))
 }
@@ -898,7 +907,7 @@ async fn run_workdir_session_operation(
             .map_err(|_| RuntimeHttpWorkdirError::internal())?;
         let record = sessions
             .get(&session_id)
-            .filter(|record| record.owner == owner)
+            .filter(|record| record.owner == owner && record.close_attempt.is_none())
             .ok_or_else(RuntimeHttpWorkdirError::not_found)?;
         record.session.clone()
     };
@@ -934,24 +943,55 @@ async fn close_workdir_session(
     auth: Option<Extension<RuntimeAuthContext>>,
 ) -> Result<StatusCode, RuntimeHttpWorkdirError> {
     let owner = required_workdir_owner(auth)?;
-    let session = {
+    let mut completion = {
         let mut sessions = state
             .workdir_sessions
             .lock()
             .map_err(|_| RuntimeHttpWorkdirError::internal())?;
-        if sessions
-            .get(&session_id)
-            .is_some_and(|record| record.owner == owner)
-        {
-            sessions.remove(&session_id).map(|record| record.session)
+        let Some(record) = sessions
+            .get_mut(&session_id)
+            .filter(|record| record.owner == owner)
+        else {
+            return Ok(StatusCode::NO_CONTENT);
+        };
+        if let Some(completion) = &record.close_attempt {
+            completion.clone()
         } else {
-            None
+            let (result_tx, completion) = tokio::sync::watch::channel(None);
+            record.close_attempt = Some(completion.clone());
+            let session = record.session.clone();
+            let registry = state.workdir_sessions.clone();
+            // The task, not an HTTP waiter, owns provider teardown. In particular,
+            // Local close marks itself closed before awaiting command teardown;
+            // cancelling that future would make a later provider close a false ack.
+            tokio::spawn(async move {
+                let result = session.close().await.map_err(RuntimeHttpWorkdirError::from);
+                let result = match registry.lock() {
+                    Ok(mut sessions) => {
+                        if result.is_ok() {
+                            sessions.remove(&session_id);
+                        } else if let Some(record) = sessions.get_mut(&session_id) {
+                            record.close_attempt = None;
+                        }
+                        result
+                    }
+                    Err(_) => Err(RuntimeHttpWorkdirError::internal()),
+                };
+                result_tx.send_replace(Some(result));
+            });
+            completion
         }
     };
-    if let Some(session) = session {
-        session.close().await?;
+    loop {
+        if let Some(result) = completion.borrow_and_update().clone() {
+            result?;
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        completion
+            .changed()
+            .await
+            .map_err(|_| RuntimeHttpWorkdirError::internal())?;
     }
-    Ok(StatusCode::NO_CONTENT)
 }
 
 fn required_workdir_owner(
@@ -2149,7 +2189,7 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     None
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RuntimeHttpWorkdirError {
     status: StatusCode,
     payload: WorkdirTransportError,
@@ -2890,6 +2930,7 @@ mod tests {
                 RuntimeHttpWorkdirSession {
                     owner: RuntimeWorkspaceScope::new("workspace-a", "https://backend.test"),
                     session,
+                    close_attempt: None,
                 },
             )]))),
             ssh_keyscan_program: Arc::new(PathBuf::from("ssh-keyscan")),
@@ -3194,6 +3235,7 @@ mod tests {
                 RuntimeHttpWorkdirSession {
                     owner: owner.clone(),
                     session: session.clone(),
+                    close_attempt: None,
                 },
             )]))),
             ssh_keyscan_program: Arc::new(PathBuf::from("ssh-keyscan")),
@@ -3313,6 +3355,41 @@ mod tests {
         .await
         .expect_err("cross-workspace session access must fail");
         assert_eq!(error.status, StatusCode::NOT_FOUND);
+
+        for unauthorized in [
+            None,
+            Some(Extension(RuntimeAuthContext {
+                workspace_id: "workspace-b".into(),
+                ..auth.clone()
+            })),
+            Some(Extension(RuntimeAuthContext {
+                server_id: "server-b".into(),
+                ..auth.clone()
+            })),
+        ] {
+            let missing_auth = unauthorized.is_none();
+            let result =
+                close_workdir_session(State(state.clone()), Path("session-1".into()), unauthorized)
+                    .await;
+            if missing_auth {
+                assert_eq!(result.unwrap_err().status, StatusCode::FORBIDDEN);
+            } else {
+                assert_eq!(result.unwrap(), StatusCode::NO_CONTENT);
+            }
+            assert!(
+                state
+                    .workdir_sessions
+                    .lock()
+                    .unwrap()
+                    .contains_key("session-1")
+            );
+            session
+                .stat(StatRequest {
+                    path: WorkdirPath::new("hello.txt").unwrap(),
+                })
+                .await
+                .expect("unauthorized close must not reach provider");
+        }
 
         assert_eq!(
             close_workdir_session(
