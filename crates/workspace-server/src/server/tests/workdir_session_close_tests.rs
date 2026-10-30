@@ -4,7 +4,74 @@
 //! tests use LaunchFixture's isolated SQLite, materializations and loopback Runtime.
 use super::ticket_worker_launch_tests::LaunchFixture;
 use super::*;
+use std::{future::Future, task::Poll};
 use tokio::sync::{Notify, Semaphore};
+use tower::ServiceExt;
+
+#[derive(Debug)]
+pub(super) struct ProviderCloseGate {
+    entered: Notify,
+    release: Semaphore,
+}
+
+impl ProviderCloseGate {
+    pub(super) fn release(&self) {
+        self.release.add_permits(1);
+    }
+
+    pub(super) fn wrap(self: &Arc<Self>, source: WorkdirSessionHandle) -> WorkdirSessionHandle {
+        Arc::new(GatedProviderClose {
+            source,
+            gate: self.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct GatedProviderClose {
+    source: WorkdirSessionHandle,
+    gate: Arc<ProviderCloseGate>,
+}
+
+// Forward the real provider operations; only suspend an already-pending close.
+macro_rules! gated_provider {
+    ($($name:ident($request:ident: $input:ty) -> $output:ty;)*) => {
+        #[async_trait::async_trait]
+        impl WorkdirSession for GatedProviderClose {
+            fn workdir(&self) -> &workdir::Workdir { self.source.workdir() }
+            fn capabilities(&self) -> workdir::WorkdirSessionCapabilities { self.source.capabilities() }
+            fn environment(&self) -> workdir::WorkdirSessionEnvironment { self.source.environment() }
+            $(async fn $name(&self, $request: $input) -> std::result::Result<$output, workdir::WorkdirError> {
+                self.source.$name($request).await
+            })*
+            async fn close(&self) -> std::result::Result<(), workdir::WorkdirError> {
+                let mut closing = Box::pin(self.source.close());
+                match std::future::poll_fn(|cx| Poll::Ready(closing.as_mut().poll(cx))).await {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => {
+                        self.gate.entered.notify_one();
+                        self.gate.release.acquire().await.unwrap().forget();
+                        closing.await
+                    }
+                }
+            }
+        }
+    };
+}
+
+gated_provider! {
+        stat(request: workdir::StatRequest) -> workdir::StatResult;
+        read(request: workdir::ReadRequest) -> workdir::ReadResult;
+        write(request: workdir::WriteRequest) -> workdir::WriteResult;
+        edit(request: workdir::EditRequest) -> workdir::EditResult;
+        list(request: workdir::ListRequest) -> workdir::ListResult;
+        glob(request: workdir::GlobRequest) -> workdir::GlobResult;
+        grep(request: workdir::GrepRequest) -> workdir::GrepResult;
+        start_command(request: workdir::CommandRequest) -> workdir::CommandHandle;
+        command_status(handle: workdir::CommandHandle) -> workdir::CommandStatus;
+        command_output(request: workdir::CommandOutputRequest) -> workdir::CommandOutput;
+        cancel_command(handle: workdir::CommandHandle) -> ();
+}
 
 #[derive(Clone, Copy)]
 enum CloseFault {
@@ -19,6 +86,9 @@ struct CloseTransport {
     fault: Mutex<Option<CloseFault>>,
     attempts: Mutex<Vec<String>>,
     runtime_closes: Mutex<Vec<(String, StatusCode)>>,
+    direct_runtime: Mutex<Option<Router>>,
+    pending_dispatches: Mutex<Vec<bool>>,
+    dispatched: Notify,
     entered: Notify,
     release: Semaphore,
 }
@@ -41,6 +111,30 @@ impl CloseTransport {
             }
             // The actual Runtime has not seen this request or released its lease.
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        let direct = state.direct_runtime.lock().unwrap().clone();
+        if let Some(router) = direct.filter(|_| is_close) {
+            // Poll the production authenticated handler without another socket
+            // scheduling boundary, so a duplicate's Pending/204 is observable.
+            let mut response = Box::pin(router.oneshot(request));
+            let first_poll =
+                std::future::poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx))).await;
+            state
+                .pending_dispatches
+                .lock()
+                .unwrap()
+                .push(first_poll.is_pending());
+            state.dispatched.notify_one();
+            let response = match first_poll {
+                Poll::Ready(result) => result.unwrap(),
+                Poll::Pending => response.await.unwrap(),
+            };
+            state
+                .runtime_closes
+                .lock()
+                .unwrap()
+                .push((path, response.status()));
+            return response;
         }
         let (parts, body) = request.into_parts();
         let body = to_bytes(body, 1024 * 1024).await.unwrap();
@@ -125,6 +219,9 @@ impl Fixture {
             fault: Mutex::new(None),
             attempts: Mutex::new(Vec::new()),
             runtime_closes: Mutex::new(Vec::new()),
+            direct_runtime: Mutex::new(None),
+            pending_dispatches: Mutex::new(Vec::new()),
+            dispatched: Notify::new(),
             entered: Notify::new(),
             release: Semaphore::new(0),
         });
@@ -310,6 +407,88 @@ async fn failure_restoration(path: ClosePath) {
         attempts[0], attempts[1],
         "retry closes the SAME Runtime session"
     );
+    fixture.assert_removed().await;
+}
+
+#[tokio::test]
+async fn cancelled_backend_close_retry_waits_for_actual_provider_teardown_before_confirmation() {
+    let fixture = Fixture::new().await;
+    let gate = Arc::new(ProviderCloseGate {
+        entered: Notify::new(),
+        release: Semaphore::new(0),
+    });
+    fixture.source.hold_provider_close(gate.clone());
+    *fixture.transport.direct_runtime.lock().unwrap() = Some(fixture.source.runtime_router());
+    let worker = fixture.registry_owner();
+    let session = fixture.open().await;
+    session
+        .start_command(workdir::CommandRequest {
+            command: "sleep 60".into(),
+            timeout_secs: 60,
+            transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
+            cwd: workdir::WorkdirPath::root(),
+            tool_call_id: None,
+        })
+        .await
+        .unwrap();
+    fixture
+        .api()
+        .workdir_sessions
+        .lock()
+        .unwrap()
+        .insert_attachment(worker.clone(), session.clone());
+    fixture.assert_busy().await;
+    let api = fixture.api().clone();
+    let first_worker = worker.clone();
+    let first = tokio::spawn(async move { close(&api, &first_worker, ClosePath::Registry).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+        .await
+        .expect("actual Local provider teardown reached Pending");
+    fixture.transport.dispatched.notified().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    fixture.assert_restored(&worker, &session);
+    fixture.assert_busy().await;
+
+    let api = fixture.api().clone();
+    let retry_worker = worker.clone();
+    let retry = tokio::spawn(async move { close(&api, &retry_worker, ClosePath::Registry).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.transport.dispatched.notified(),
+    )
+    .await
+    .expect("retry reached production Runtime handler");
+    assert_eq!(
+        *fixture.transport.pending_dispatches.lock().unwrap(),
+        vec![true, true],
+        "duplicate DELETE must wait, not acknowledge an extracted record"
+    );
+    assert!(
+        !retry.is_finished(),
+        "Backend cannot confirm while provider close is held"
+    );
+    assert!(fixture.transport.runtime_closes.lock().unwrap().is_empty());
+    fixture.assert_busy().await;
+    gate.release.add_permits(1);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), retry)
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .api()
+            .workdir_sessions
+            .lock()
+            .unwrap()
+            .attachments
+            .contains_key(&worker)
+    );
+    let attempts = fixture.transport.attempts();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], attempts[1]);
     fixture.assert_removed().await;
 }
 

@@ -99,6 +99,7 @@ impl Harness {
                 RuntimeHttpWorkdirSession {
                     owner: RuntimeWorkspaceScope::new("workspace-a", "https://backend.test"),
                     session: session.clone(),
+                    close_attempt: None,
                 },
             )]))),
             ssh_keyscan_program: Arc::new(PathBuf::from("ssh-keyscan")),
