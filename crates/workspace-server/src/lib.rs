@@ -134,6 +134,12 @@ pub enum Error {
     TicketAssignmentConflict(String),
     #[error("Workdir attachment conflict: {0}")]
     WorkdirAttachmentConflict(String),
+    #[error("Workdir {workdir_id} is already attached to Worker {runtime_id}:{worker_id}")]
+    WorkdirOccupied {
+        workdir_id: String,
+        runtime_id: String,
+        worker_id: String,
+    },
     #[error("Workspace permission denied: {0}")]
     WorkspacePermissionDenied(String),
     #[error("Workspace config update conflict: {0}")]

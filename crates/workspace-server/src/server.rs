@@ -21001,15 +21001,17 @@ async fn scoped_attach_current_worker_workdir(
         run_worker_workdir_db_stage_locked(&api, &_session_guard, move |api| -> ApiResult<_> {
             let existing = api
                 .store
-                .list_worker_workdir_links(&api.config.workspace_id, &stage_worker)?
+                .list_workdir_worker_links(&api.config.workspace_id, &stage_workdir_id)?
                 .into_iter()
-                .find(|link| link.unlinked_at.is_none() && link.alias == stage_alias);
+                .next();
             if let Some(existing) = existing {
-                if existing.workdir_id != stage_workdir_id {
-                    return Err(Error::WorkdirAttachmentConflict(format!(
-                    "Worker {}:{} attachment alias `{stage_alias}` is already bound to Workdir {}",
-                    stage_worker.runtime_id, stage_worker.worker_id, existing.workdir_id
-                )).into());
+                if existing.worker != stage_worker {
+                    return Err(Error::WorkdirOccupied {
+                        workdir_id: stage_workdir_id,
+                        runtime_id: existing.worker.runtime_id,
+                        worker_id: existing.worker.worker_id,
+                    }
+                    .into());
                 }
                 let effective_capabilities = existing.capabilities.intersection(capabilities);
                 if effective_capabilities != existing.capabilities {
@@ -21019,6 +21021,21 @@ async fn scoped_attach_current_worker_workdir(
                 }
                 Ok(Some((existing, effective_capabilities)))
             } else {
+                if let Some(existing) = api
+                    .store
+                    .list_worker_workdir_links(&api.config.workspace_id, &stage_worker)?
+                    .into_iter()
+                    .find(|link| link.unlinked_at.is_none() && link.alias == stage_alias)
+                {
+                    return Err(Error::WorkdirAttachmentConflict(format!(
+                        "Worker {}:{} attachment alias '{}' is already bound to Workdir {}",
+                        stage_worker.runtime_id,
+                        stage_worker.worker_id,
+                        stage_alias,
+                        existing.workdir_id
+                    ))
+                    .into());
+                }
                 Ok(None)
             }
         })
@@ -21031,7 +21048,7 @@ async fn scoped_attach_current_worker_workdir(
             .map_err(ApiError::from)?;
         return Ok(Json(server_api::CurrentWorkerWorkdirAttachmentResponse {
             workspace_id: api.config.workspace_id.clone(),
-            alias: alias.to_string(),
+            alias: link.alias.clone(),
             working_directory_id: workdir_id.to_string(),
             capabilities: effective_capabilities,
             environment: Some(
@@ -21046,6 +21063,7 @@ async fn scoped_attach_current_worker_workdir(
                 .await?,
             ),
             attached: true,
+            already_attached: true,
         }));
     }
     close_current_worker_attachment_session_locked(&api, &worker).await?;
@@ -21107,6 +21125,7 @@ async fn scoped_attach_current_worker_workdir(
         capabilities,
         environment: Some(environment),
         attached: true,
+        already_attached: false,
     }))
 }
 
@@ -21350,6 +21369,7 @@ async fn detach_current_worker_workdir(
         capabilities: workdir::WorkdirSessionCapabilities::EMPTY,
         environment: None,
         attached: false,
+        already_attached: false,
     })
 }
 
@@ -37665,6 +37685,7 @@ impl ApiError {
             status.as_u16(),
             match self.error {
                 Error::RestoreObservationConflict => "restore_observation_conflict",
+                Error::WorkdirOccupied { .. } => "workdir_occupied",
                 Error::RuntimeBindingIdConflict { .. } => "stale_binding",
                 Error::RuntimeBindingFingerprintConflict { .. } => "fingerprint_in_use",
                 _ => status.canonical_reason().unwrap_or("error"),
@@ -37688,6 +37709,7 @@ fn api_error_status(error: &Error) -> StatusCode {
         }
         Error::TicketAssignmentConflict(_)
         | Error::WorkdirAttachmentConflict(_)
+        | Error::WorkdirOccupied { .. }
         | Error::WorkspaceConfigConflict(_)
         | Error::RuntimeBindingConflict(_)
         | Error::RuntimeBindingIdConflict { .. }
@@ -61384,6 +61406,130 @@ mod tests {
                 .iter()
                 .any(|guard| guard.category == "active_attachment")
         );
+    }
+
+    #[tokio::test]
+    async fn current_worker_attach_uses_workdir_ownership_before_requested_alias() {
+        let mut fixture = manual_worker_assignment_fixture().await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
+                .unwrap();
+        configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+        let api = &fixture.api;
+        let before = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+            .unwrap();
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-attachments");
+        for alias in ["docs", "different-name", "checkout"] {
+            let response = build_router(api.clone())
+                .oneshot(runtime_source_request(
+                    &identity,
+                    Some(&fixture.worker.worker_id),
+                    "POST",
+                    &path,
+                    serde_json::to_vec(
+                        &json!({"alias": alias, "working_directory_id": fixture.docs_workdir_id}),
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            let response: server_api::CurrentWorkerWorkdirAttachmentResponse =
+                serde_json::from_slice(&body).unwrap();
+            assert!(response.attached && response.already_attached);
+            assert_eq!(response.alias, "docs");
+            assert_eq!(response.working_directory_id, fixture.docs_workdir_id);
+            assert!(response.environment.is_some());
+            assert_eq!(
+                api.store
+                    .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+                    .unwrap(),
+                before
+            );
+        }
+        api.store
+            .detach_worker_workdir(
+                TEST_WORKSPACE_ID,
+                &fixture.worker,
+                Some(&fixture.docs_workdir_id),
+                "test detach",
+            )
+            .unwrap();
+        sync_runtime_worker_workdir_attachments(api, &fixture.worker).unwrap();
+        for (alias, expected) in [
+            ("checkout", StatusCode::CONFLICT),
+            ("new-docs", StatusCode::OK),
+        ] {
+            let response = build_router(api.clone())
+                .oneshot(runtime_source_request(
+                    &identity,
+                    Some(&fixture.worker.worker_id),
+                    "POST",
+                    &path,
+                    serde_json::to_vec(
+                        &json!({"alias": alias, "working_directory_id": fixture.docs_workdir_id}),
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+            if status == StatusCode::OK {
+                let response: server_api::CurrentWorkerWorkdirAttachmentResponse =
+                    serde_json::from_slice(&body).unwrap();
+                assert!(response.attached);
+                assert!(!response.already_attached);
+                assert_eq!(response.alias, "new-docs");
+            }
+        }
+        let mut other = api
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, &fixture.worker)
+            .unwrap()
+            .unwrap();
+        other.worker.worker_id = "another-owner".into();
+        api.store.upsert_worker_registry(&other).unwrap();
+        let mut occupied = api
+            .store
+            .list_workdir_worker_links(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        api.store
+            .detach_worker_workdir(
+                TEST_WORKSPACE_ID,
+                &fixture.worker,
+                Some(&fixture.docs_workdir_id),
+                "transfer fixture",
+            )
+            .unwrap();
+        sync_runtime_worker_workdir_attachments(api, &fixture.worker).unwrap();
+        occupied.worker = other.worker;
+        api.store.attach_worker_workdir(&occupied).unwrap();
+        let response = build_router(api.clone())
+            .oneshot(runtime_source_request(
+                &identity,
+                Some(&fixture.worker.worker_id),
+                "POST",
+                &path,
+                serde_json::to_vec(
+                    &json!({"alias": "checkout", "working_directory_id": fixture.docs_workdir_id}),
+                )
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error: server_api::RepositoryApiError =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(error.error, "workdir_occupied");
     }
 
     #[tokio::test]

@@ -702,31 +702,46 @@ impl WorkspaceHttpWorkdirBackend {
             ATTACH_TOOL,
             "working_directory_id",
         )?;
-        let alias_key = workdir::WorkdirAttachmentAlias::new(alias)
-            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
-        if self.session_router.session(&alias_key).is_some() {
-            return Err(ToolError::InvalidArgument(format!(
-                "attachment alias `{alias}` already exists"
-            )));
-        }
         let response = self.attach_response(alias, working_directory_id)?;
-        if let Err(error) = self.session_router.attach(
-            alias_key.clone(),
+        if !response.attachment.attached
+            || response.attachment.working_directory_id != working_directory_id
+        {
+            return Err(ToolError::ExecutionFailed(
+                "Workdir attachment response does not match the target".into(),
+            ));
+        }
+        // Backend ownership decides the name. A requested alias cannot rename
+        // an existing attachment or create a second route to the same Workdir.
+        let attached_alias = &response.attachment.alias;
+        let alias_key = workdir::WorkdirAttachmentAlias::new(attached_alias.clone())
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        if let Some(session) = self.session_router.session(&alias_key) {
+            if session.workdir().id().as_str() != working_directory_id {
+                return Err(ToolError::ExecutionFailed("Local Workdir attachment differs from Backend; refresh attachments before retrying".into()));
+            }
+        } else if let Err(error) = self.session_router.attach(
+            alias_key,
             WorkspaceAttachedWorkdirSession::handle_for_workdir_with_environment(
                 self.client.clone(),
-                alias,
+                attached_alias,
                 working_directory_id,
                 response.attachment.capabilities,
                 response.environment.clone(),
             ),
         ) {
-            let _ = self.detach(alias);
+            if !response.attachment.already_attached {
+                let _ = self.detach(attached_alias);
+            }
             return Err(ToolError::ExecutionFailed(format!(
                 "attach Workdir session route: {error}"
             )));
         }
         workdir_output(
-            format!("Attached Workdir {working_directory_id} as {alias}"),
+            if response.attachment.already_attached {
+                format!("Workdir {working_directory_id} is already attached as {attached_alias}")
+            } else {
+                format!("Attached Workdir {working_directory_id} as {attached_alias}")
+            },
             &response,
         )
     }
@@ -737,15 +752,31 @@ impl WorkspaceHttpWorkdirBackend {
         working_directory_id: &str,
     ) -> Result<WorkdirSessionAttachmentResponse, ToolError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
-        self.execute_json::<WorkdirSessionAttachmentResponse>(WorkspaceRequest::json(
-            WorkspaceRequestMethod::Post,
-            format!("/api/w/{workspace_id}/workers/self/workdir-attachments"),
-            serde_json::to_string(&WorkdirAttachRequest {
-                alias: alias.to_string(),
-                working_directory_id: working_directory_id.to_string(),
-            })
-            .map_err(decode_error)?,
-        ))
+        let response = self
+            .client
+            .execute(WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                format!("/api/w/{workspace_id}/workers/self/workdir-attachments"),
+                serde_json::to_string(&WorkdirAttachRequest {
+                    alias: alias.to_string(),
+                    working_directory_id: working_directory_id.to_string(),
+                })
+                .map_err(decode_error)?,
+            ))
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("Workspace Workdir request failed: {error}"))
+            })?;
+        if response.status == 409
+            && let Ok(error) =
+                serde_json::from_str::<server_api::RepositoryApiError>(&response.body)
+            && error.error == "workdir_occupied"
+        {
+            return Err(ToolError::StructuredConflict {
+                code: "workdir_occupied".into(),
+                message: "Workdir is occupied by another Worker".into(),
+            });
+        }
+        decode_response(response)
     }
 
     fn detach(&self, alias: &str) -> Result<ToolOutput, ToolError> {
@@ -1231,6 +1262,8 @@ struct WorkdirAttachmentResponse {
     working_directory_id: String,
     capabilities: WorkdirSessionCapabilities,
     attached: bool,
+    #[serde(default)]
+    already_attached: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1698,6 +1731,98 @@ mod tests {
         assert_eq!(
             body,
             json!({"reason": "remove stale Workdir", "operation_id": "delete-call-1"})
+        );
+    }
+
+    #[test]
+    fn attach_reports_other_worker_occupancy_without_exposing_backend_details() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![WorkspaceResponse {
+            status: 409,
+            body: serde_json::to_string(&server_api::RepositoryApiError::new(
+                409,
+                "workdir_occupied",
+                "private backend detail",
+                Vec::new(),
+            ))
+            .unwrap(),
+        }]));
+        let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
+        let error = backend
+            .attach(WorkdirAttachInput {
+                alias: "work".into(),
+                working_directory_id: "occupied".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::StructuredConflict { code, message } if code == "workdir_occupied" && message == "Workdir is occupied by another Worker")
+        );
+        assert_eq!(client.requests().len(), 1);
+    }
+
+    #[test]
+    fn attach_reuses_backend_alias_without_duplicate_routes_or_detach() {
+        let client = Arc::new(RecordingWorkspaceClient::new((0..3).map(|_| response(json!({
+            "workspace_id": "workspace/test", "alias": "existing", "working_directory_id": "wd-existing",
+            "capabilities": {"bits": 63}, "attached": true, "already_attached": true,
+            "environment": workdir::WorkdirSessionEnvironment::root(WorkdirSessionCapabilities::ALL)
+        }))).collect()));
+        let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
+        let occupied_alias = workdir::WorkdirAttachmentAlias::new("other").unwrap();
+        backend
+            .session_router
+            .attach(
+                occupied_alias.clone(),
+                WorkspaceAttachedWorkdirSession::handle_for_workdir(
+                    client.clone(),
+                    "other",
+                    "wd-other",
+                ),
+            )
+            .unwrap();
+        for alias in ["new-name", "existing", "other"] {
+            let output = backend
+                .attach(WorkdirAttachInput {
+                    alias: alias.into(),
+                    working_directory_id: "wd-existing".into(),
+                })
+                .unwrap();
+            assert_eq!(
+                output.summary,
+                "Workdir wd-existing is already attached as existing"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+            assert_eq!(body["alias"], "existing");
+            assert_eq!(body["already_attached"], true);
+        }
+        assert!(
+            backend
+                .session_router
+                .session(&workdir::WorkdirAttachmentAlias::new("new-name").unwrap())
+                .is_none()
+        );
+        assert_eq!(
+            backend
+                .session_router
+                .session(&occupied_alias)
+                .unwrap()
+                .workdir()
+                .id()
+                .as_str(),
+            "wd-other"
+        );
+        assert!(
+            backend
+                .session_router
+                .session(&workdir::WorkdirAttachmentAlias::new("existing").unwrap())
+                .is_some()
+        );
+        assert_eq!(client.requests().len(), 3);
+        assert!(
+            client
+                .requests()
+                .iter()
+                .all(|request| request.method == WorkspaceRequestMethod::Post)
         );
     }
 

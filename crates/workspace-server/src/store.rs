@@ -11119,49 +11119,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.workdir_id
                 )));
             }
-            let active_for_alias = tx
-                .query_row(
-                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
-                       FROM worker_workdir_links
-                       WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
-                         AND alias = ?4 AND unlinked_at IS NULL"#,
-                    params![
-                        record.workspace_id,
-                        record.worker.runtime_id,
-                        record.worker.worker_id,
-                        record.alias,
-                    ],
-                    read_worker_workdir_link_record,
-                )
-                .optional()?;
-            if let Some(mut active) = active_for_alias {
-                if active.workdir_id == record.workdir_id {
-                    let capabilities = active.capabilities.intersection(record.capabilities);
-                    if capabilities != active.capabilities {
-                        tx.execute(
-                            r#"UPDATE worker_workdir_links
-                               SET capabilities = ?1
-                               WHERE workspace_id = ?2 AND runtime_id = ?3 AND worker_id = ?4
-                                 AND workdir_id = ?5 AND alias = ?6 AND unlinked_at IS NULL"#,
-                            params![
-                                encode_workdir_link_capabilities(capabilities)?,
-                                record.workspace_id,
-                                record.worker.runtime_id,
-                                record.worker.worker_id,
-                                record.workdir_id,
-                                record.alias,
-                            ],
-                        )?;
-                        active.capabilities = capabilities;
-                    }
-                    tx.commit()?;
-                    return Ok(active);
-                }
-                return Err(Error::WorkdirAttachmentConflict(format!(
-                    "Worker {}:{} attachment alias `{}` is already bound to Workdir {}",
-                    record.worker.runtime_id, record.worker.worker_id, record.alias, active.workdir_id
-                )));
-            }
+            // Ownership is keyed by Workdir, not by the requested local name.
             let active_for_workdir = tx
                 .query_row(
                     r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
@@ -11171,10 +11129,45 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     read_worker_workdir_link_record,
                 )
                 .optional()?;
-            if let Some(active) = active_for_workdir {
+            if let Some(mut active) = active_for_workdir {
+                if active.worker != record.worker {
+                    return Err(Error::WorkdirOccupied {
+                        workdir_id: record.workdir_id.clone(),
+                        runtime_id: active.worker.runtime_id,
+                        worker_id: active.worker.worker_id,
+                    });
+                }
+                let capabilities = active.capabilities.intersection(record.capabilities);
+                if capabilities != active.capabilities {
+                    tx.execute(
+                        r#"UPDATE worker_workdir_links SET capabilities = ?1
+                           WHERE workspace_id = ?2 AND runtime_id = ?3 AND worker_id = ?4
+                             AND workdir_id = ?5 AND alias = ?6 AND unlinked_at IS NULL"#,
+                        params![
+                            encode_workdir_link_capabilities(capabilities)?,
+                            active.workspace_id, active.worker.runtime_id, active.worker.worker_id,
+                            active.workdir_id, active.alias,
+                        ],
+                    )?;
+                    active.capabilities = capabilities;
+                }
+                tx.commit()?;
+                return Ok(active);
+            }
+            let active_for_alias = tx
+                .query_row(
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
+                       FROM worker_workdir_links
+                       WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                         AND alias = ?4 AND unlinked_at IS NULL"#,
+                    params![record.workspace_id, record.worker.runtime_id, record.worker.worker_id, record.alias],
+                    read_worker_workdir_link_record,
+                )
+                .optional()?;
+            if let Some(active) = active_for_alias {
                 return Err(Error::WorkdirAttachmentConflict(format!(
-                    "Workdir {} is already attached to Worker {}:{}",
-                    record.workdir_id, active.worker.runtime_id, active.worker.worker_id
+                    "Worker {}:{} attachment alias `{}` is already bound to Workdir {}",
+                    record.worker.runtime_id, record.worker.worker_id, record.alias, active.workdir_id
                 )));
             }
             // Direct attachments (including ordinary recovery/reconnection)
@@ -25496,6 +25489,24 @@ INSERT INTO worker_registry (
             2
         );
 
+        for alias in ["another-name", "docs"] {
+            let requested = WorkerWorkdirLinkRecord {
+                alias: alias.into(),
+                ..link.clone()
+            };
+            assert_eq!(
+                store.attach_worker_workdir(&requested).unwrap(),
+                downgraded_link
+            );
+            assert_eq!(
+                store
+                    .list_worker_workdir_links("local-dev", &worker.worker)
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+
         let second_worker = WorkerRegistryRecord {
             worker: RuntimeWorkerRef::new("embedded", "2"),
             display_name: "Browser 2".to_string(),
@@ -25511,7 +25522,7 @@ INSERT INTO worker_registry (
         };
         assert!(matches!(
             store.attach_worker_workdir(&workdir_conflict),
-            Err(Error::WorkdirAttachmentConflict(_))
+            Err(Error::WorkdirOccupied { .. })
         ));
         assert!(matches!(
             store.detach_worker_workdir("local-dev", &worker.worker, Some("wrong-workdir"), "6",),
