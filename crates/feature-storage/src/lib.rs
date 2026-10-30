@@ -121,13 +121,28 @@ impl FeatureRegistration {
     }
 }
 
+#[cfg(feature = "test-support")]
+#[path = "open_observation.rs"]
+mod open_observation;
+#[cfg(feature = "test-support")]
+pub use open_observation::OpenObservation;
+
 #[derive(Clone, Debug)]
 pub struct RegisteredFeature {
     manager_id: Uuid,
     feature_id: String,
+    #[cfg(feature = "test-support")]
+    observation: Arc<open_observation::Counters>,
 }
 
 impl RegisteredFeature {
+    /// Instance-local physical-operation counters for fixture assertions. The
+    /// observer retains no database and cannot replace or suppress durable I/O.
+    #[cfg(feature = "test-support")]
+    pub fn open_observation(&self) -> OpenObservation {
+        self.observation.snapshot()
+    }
+
     pub fn feature_id(&self) -> &str {
         &self.feature_id
     }
@@ -219,6 +234,8 @@ impl FeatureStorage {
         Ok(RegisteredFeature {
             manager_id: self.inner.id,
             feature_id,
+            #[cfg(feature = "test-support")]
+            observation: Arc::default(),
         })
     }
 
@@ -279,14 +296,32 @@ impl FeatureStorage {
         }
 
         let feature_dir = self.feature_dir(scope_id);
+        #[cfg(feature = "test-support")]
+        let mut counted_sync = |path: &Path| {
+            registration.observation.sync_attempt();
+            let result = sync(path);
+            if result.is_ok() {
+                registration.observation.sync_success();
+            }
+            result
+        };
+        #[cfg(feature = "test-support")]
+        durable_create_directory(&feature_dir, &mut counted_sync)?;
+        #[cfg(not(feature = "test-support"))]
         durable_create_directory(&feature_dir, &mut sync)?;
         let path = feature_dir.join(format!("{}.sqlite", registration.feature_id));
+        #[cfg(feature = "test-support")]
+        registration.observation.open_attempt();
         let connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
+        #[cfg(feature = "test-support")]
+        registration.observation.open_success();
         configure_connection(&connection)?;
         migrate(&connection, &registration.feature_id, migrations)?;
+        #[cfg(feature = "test-support")]
+        registration.observation.initialized();
         let connection = Arc::new(FeatureDatabaseInner {
             scope_id: scope_id.to_string(),
             feature_id: registration.feature_id.clone(),

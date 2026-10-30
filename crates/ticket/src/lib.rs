@@ -30,6 +30,7 @@ pub use assignment_answer::*;
 mod assignment_tracking;
 pub mod config;
 mod content_changes;
+pub mod service_outbox;
 mod sqlite_schema;
 mod subject_assignment;
 mod tags;
@@ -42,8 +43,8 @@ pub mod tool;
 pub use sqlite_schema::{
     HistoricalTicketSchemaTarget, migrate_historical_sqlite_ticket_schema_in_transaction,
     migrate_sqlite_ticket_schema, migrate_sqlite_ticket_schema_in_transaction,
-    verify_legacy_sqlite_ticket_schema, verify_pre_classification_ticket_schema,
-    verify_sqlite_ticket_schema,
+    verify_historical_sqlite_ticket_schema, verify_legacy_sqlite_ticket_schema,
+    verify_pre_classification_ticket_schema, verify_sqlite_ticket_schema,
 };
 
 const MAX_INTAKE_SUMMARY_BODY_BYTES: usize = 16 * 1024;
@@ -2617,6 +2618,14 @@ impl SqliteTicketBackend {
             conn.execute("INSERT INTO typed_ticket_event_attributes (workspace_id, ticket_id, event_index, key, value) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![self.workspace_id, ticket_id, next_index, key, value]).map_err(sqlite_err)?;
         }
+        service_outbox::insert(
+            conn,
+            &self.workspace_id,
+            ticket_id,
+            service_outbox::EventType::Changed,
+            event.at.as_deref().unwrap_or(&now_utc()),
+            &event_ref,
+        )?;
         if let Some(hook) = &self.mutation_hook {
             hook(
                 conn,

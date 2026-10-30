@@ -358,6 +358,7 @@ impl ArtifactCache {
             || d.world != m.runtime.world
             || d.required_imports != m.runtime.required_imports
             || !same_json(&d.tools, &m.tools)?
+            || !same_json(&d.services, &m.services)?
             || !same_json(&d.connections, &m.connections)?
             || !same_json(&d.requested_grants, &m.requested_grants)?
             || !same_json(&d.data_collections, &m.data_collections)?

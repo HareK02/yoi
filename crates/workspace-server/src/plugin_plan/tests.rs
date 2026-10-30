@@ -130,6 +130,7 @@ fn projection() -> PluginPinProjection {
     PluginPinProjection {
         config: serde_json::json!({}),
         surfaces: vec![PluginSurface::Tool],
+        services: vec![],
         tools: vec!["example_echo".into()],
         grants: vec![],
         bindings: vec![],

@@ -19,7 +19,17 @@ export type PluginHttpMethod = "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELE
 
 export type PluginConnectionMetadata = { name: string, methods: Array<PluginHttpMethod>, path_prefixes: Array<string>, };
 
-export type PluginGrantMetadata = { "kind": "logging" } | { "kind": "https", slot: string, } | { "kind": "ticket_read" } | { "kind": "ticket_data_read", collection: string, schema_id: string, schema_version: string, } | { "kind": "ticket_data_write", collection: string, schema_id: string, schema_version: string, };
+export type PluginGrantMetadata = { "kind": "logging" } | { "kind": "https", slot: string, } | { "kind": "ticket_read" } | { "kind": "ticket_events" } | { "kind": "ticket_data_read", collection: string, schema_id: string, schema_version: string, } | { "kind": "ticket_data_write", collection: string, schema_id: string, schema_version: string, };
+
+export type PluginServiceMetadata = { name: string, subscriptions: Array<string>, };
+
+export type PluginServicePauseReason = "rejected" | "attempts_exhausted" | "queue_full" | "retention_gap" | "indeterminate" | "authorization";
+
+export type PluginServiceDiagnostics = { consumer_id: string, pause_reason: PluginServicePauseReason | null, queued: number, attempt: number, current_event_id: string | null, lease_active: boolean, };
+
+export type PluginServiceRecoveryAction = { "kind": "resume" } | { "kind": "skip", event_id: string, } | { "kind": "accept_gap" };
+
+export type PluginServiceRecoveryRequest = { consumer_id: string, expected_pause: PluginServicePauseReason, action: PluginServiceRecoveryAction, operation_key: string, reason: string, };
 
 export type PluginDataSchemaMetadata = { collection: string, schema_id: string, schema_version: string, schema: unknown, };
 
@@ -29,7 +39,7 @@ export type PluginDataPurgeRequest = { operation_key: string, expected: PluginDa
 
 export type PluginDataPurgeResponse = { purge_id: string, observed: PluginDataPurgeState, };
 
-export type PluginArtifact = { package_id: string, name: string, version: string, description: string | null, package_digest: string, artifact_digest: string, artifact_size: number, schema_version: number, world: string, required_imports: Array<string>, tools: Array<PluginToolMetadata>, connections: Array<PluginConnectionMetadata>, requested_grants: Array<PluginGrantMetadata>, data_collections: Array<PluginDataSchemaMetadata>, config_schema: PluginSchemaContribution, revoked: boolean, revocation_reason: string | null, };
+export type PluginArtifact = { package_id: string, name: string, version: string, description: string | null, package_digest: string, artifact_digest: string, artifact_size: number, schema_version: number, world: string, required_imports: Array<string>, tools: Array<PluginToolMetadata>, services?: Array<PluginServiceMetadata>, connections: Array<PluginConnectionMetadata>, requested_grants: Array<PluginGrantMetadata>, data_collections: Array<PluginDataSchemaMetadata>, config_schema: PluginSchemaContribution, revoked: boolean, revocation_reason: string | null, };
 
 export type PluginUploadResponse = { upload_id: string, expires_at: string, artifact: PluginArtifact, };
 
@@ -55,9 +65,11 @@ export type PluginWorkerDiagnosticSelection = { "kind": "unrecorded" } | { "kind
 
 export type PluginDiagnosticPinState = "pending" | "active" | "restorable" | "released";
 
-export type PluginDiagnosticSurface = "tool";
+export type PluginDiagnosticSurface = "tool" | "service";
 
-export type PluginWorkerDiagnostic = { installation_id: string, package_id: string, package_version: string, package_digest: string, artifact_digest: string, artifact_size: number, surfaces: Array<PluginDiagnosticSurface>, selected_tools: Array<string>, admission: PluginDiagnosticAdmission, connections: Array<PluginDiagnosticConnection>, };
+export type PluginServiceConsumerDiagnostics = { service_name: string, diagnostics: PluginServiceDiagnostics, };
+
+export type PluginWorkerDiagnostic = { installation_id: string, package_id: string, package_version: string, package_digest: string, artifact_digest: string, artifact_size: number, surfaces: Array<PluginDiagnosticSurface>, selected_tools: Array<string>, selected_services: Array<string>, service_consumers: Array<PluginServiceConsumerDiagnostics>, admission: PluginDiagnosticAdmission, connections: Array<PluginDiagnosticConnection>, };
 
 export type PluginDiagnosticAdmission = { "kind": "admissible" } | { "kind": "refused", reason_code: PluginHostErrorCode, };
 

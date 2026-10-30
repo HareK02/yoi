@@ -955,7 +955,9 @@ impl WorkspaceApi {
                         "foreign Plugin Worker".into(),
                     ));
                 }
-                plugin_execution_identity(&api, &worker).map_err(|error| error.error)
+                super::plugin_host::with_authority_database(&api, || {
+                    plugin_execution_identity(&api, &worker).map_err(|error| error.error)
+                })
             })
             .await
     }

@@ -3,9 +3,13 @@
 //! access: callers bind exact persisted pins and current owner adapters before
 //! controller publication. Verified bytes and compiled Components are not leases.
 
+mod service;
+
+use crate::feature::background::{BackgroundTaskSpec, BackgroundTaskTrigger};
 use crate::feature::{
-    FeatureDescriptor, FeatureHookPoint, FeatureId, FeatureInstallContext, FeatureInstallError,
-    FeatureModule, FeatureRuntimeKind, HookDeclaration, ToolContribution, ToolDeclaration,
+    BackgroundTaskDeclaration, FeatureDescriptor, FeatureHookPoint, FeatureId,
+    FeatureInstallContext, FeatureInstallError, FeatureModule, FeatureRuntimeKind, HookDeclaration,
+    ToolContribution, ToolDeclaration,
 };
 use crate::hook::{
     Hook, HookError, HookErrorCategory, HookExecutionPolicy, WorkerStopping, WorkerStoppingContext,
@@ -39,6 +43,7 @@ pub struct PluginToolPin {
     pub request: server_api::PluginArtifactDeliveryRequest,
     pub expectation: ArtifactExpectation,
     pub tools: Vec<String>,
+    pub services: Vec<String>,
     pub config: Value,
     pub grants: Grants,
 }
@@ -96,8 +101,19 @@ impl Drop for CallLease {
 pub struct PluginToolsFeature {
     tools: Vec<(ToolMeta, Arc<PluginTool>)>,
     calls: Arc<Mutex<Calls>>,
+    services: Vec<Arc<service::ServiceDriver>>,
 }
 impl PluginToolsFeature {
+    /// Called only after the task registry has joined every driver. Retained
+    /// Service proofs keep shutdown ownership here until release is reconciled;
+    /// this never restarts a task or invokes a lifecycle export again.
+    pub(crate) async fn reconcile_service_shutdown(&self) -> Result<(), HookError> {
+        for service in &self.services {
+            service.reconcile_release().await?;
+        }
+        Ok(())
+    }
+
     pub async fn prepare(
         pins: Vec<PluginToolPin>,
         source: &dyn ArtifactSource,
@@ -116,6 +132,7 @@ impl PluginToolsFeature {
         let mut names = BTreeSet::new();
         let mut installations = BTreeSet::new();
         let mut tools = Vec::new();
+        let mut services = Vec::new();
         for pin in pins {
             let descriptor = pin.expectation.descriptor();
             if pin.workspace_id.is_empty()
@@ -138,6 +155,40 @@ impl PluginToolsFeature {
                 .resolve(source, &pin.workspace_id, &pin.request, &pin.expectation)
                 .await
                 .map_err(|_| Delivery)?;
+            if !pin.services.is_empty() {
+                if !pin.tools.is_empty() || !pin.grants.ticket_events || pin.services.len() > 32 {
+                    return Err(InvalidSnapshot);
+                }
+                let compiled = Arc::new(
+                    executor
+                        .compile_service(
+                            artifact.bytes(),
+                            &descriptor.package_digest,
+                            &descriptor.artifact_digest,
+                            u64::from(descriptor.artifact_size),
+                        )
+                        .map_err(|_| Component)?,
+                );
+                for name in &pin.services {
+                    if !compiled
+                        .services()
+                        .iter()
+                        .any(|service| &service.name == name)
+                        || !names.insert(format!("{}__{}", pin.installation_id, name))
+                    {
+                        return Err(InvalidSnapshot);
+                    }
+                    services.push(Arc::new(service::ServiceDriver::new(
+                        executor.clone(),
+                        compiled.clone(),
+                        owner.clone(),
+                        &pin,
+                        name.clone(),
+                        config_json.clone(),
+                    )));
+                }
+                continue;
+            }
             let compiled = Arc::new(
                 executor
                     .compile(
@@ -189,7 +240,16 @@ impl PluginToolsFeature {
                 tools.push((meta, tool));
             }
         }
-        Ok(Self { tools, calls })
+        // All immutable contributions have been validated before any lifecycle
+        // export. Start is logging-only; failed preparation leaves no consumer.
+        for service in &services {
+            service.prepare_start().await.map_err(|_| Component)?;
+        }
+        Ok(Self {
+            tools,
+            calls,
+            services,
+        })
     }
 }
 impl FeatureModule for PluginToolsFeature {
@@ -205,6 +265,14 @@ impl FeatureModule for PluginToolsFeature {
                 .tools
                 .push(ToolDeclaration::new(&meta.name, &meta.description));
         }
+        for service in &self.services {
+            descriptor
+                .background_tasks
+                .push(BackgroundTaskDeclaration::worker_managed(
+                    service.task_name(),
+                    "Commit-event Service pump",
+                ));
+        }
         descriptor
     }
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
@@ -216,6 +284,17 @@ impl FeatureModule for PluginToolsFeature {
             context
                 .tools()
                 .register(ToolContribution::new(name, definition))?;
+        }
+        for service in &self.services {
+            let mut spec = BackgroundTaskSpec::single_flight(
+                BackgroundTaskDeclaration::worker_managed(
+                    service.task_name(),
+                    "Commit-event Service pump",
+                ),
+                std::time::Duration::from_secs(30),
+            );
+            spec.trigger = BackgroundTaskTrigger::HostReady { interval_ms: 100 };
+            context.background_tasks().register(spec, service.clone())?;
         }
         context.hooks().add_worker_stopping(
             "stop",

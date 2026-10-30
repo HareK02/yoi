@@ -13766,6 +13766,30 @@ impl server_api::ServerApi for ServerApiContractService {
         plugin::list(api, actor, workspace_id, query).await
     }
 
+    async fn plugin_service_diagnostics(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        consumer_id: String,
+    ) -> std::result::Result<server_api::PluginServiceDiagnostics, server_api::RepositoryApiError>
+    {
+        self.workspace_api()?
+            .plugin_service_diagnostics(workspace_id, actor, consumer_id)
+            .await
+    }
+
+    async fn plugin_service_recover(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        request: server_api::PluginServiceRecoveryRequest,
+    ) -> std::result::Result<server_api::PluginServiceDiagnostics, server_api::RepositoryApiError>
+    {
+        self.workspace_api()?
+            .recover_plugin_service(workspace_id, actor, request)
+            .await
+    }
+
     async fn plugin_worker_diagnostics(
         &self,
         actor: RequestActor,

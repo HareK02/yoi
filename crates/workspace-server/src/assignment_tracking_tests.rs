@@ -525,7 +525,8 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                     (
                         111,
                         "Typed Plugin Ticket extension data and atomic mutation receipts".into()
-                    )
+                    ),
+                    (112, "Ticket Service outbox and fenced consumers".into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {

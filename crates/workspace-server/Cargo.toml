@@ -66,6 +66,7 @@ webauthn-rs = { workspace = true, features = ["conditional-ui"] }
 webauthn-rs-proto = "0.5.5"
 
 [dev-dependencies]
+feature-storage = { workspace = true, features = ["test-support"] }
 native-tls = "0.2"
 tokio-native-tls = "0.3"
 wip-protocol.workspace = true

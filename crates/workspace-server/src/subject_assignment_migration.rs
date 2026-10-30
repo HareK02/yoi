@@ -32,7 +32,11 @@ pub(super) fn install(conn: &Connection) -> Result<()> {
             "Subject assignment migration requires a caller-owned transaction".into(),
         ));
     }
-    ticket::migrate_sqlite_ticket_schema_in_transaction(conn).map_err(|error| {
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        conn,
+        ticket::HistoricalTicketSchemaTarget::Subjects14,
+    )
+    .map_err(|error| {
         Error::Store(format!(
             "Ticket Subject component composition failed: {error}"
         ))
@@ -58,7 +62,11 @@ pub(super) fn install(conn: &Connection) -> Result<()> {
 /// Ticket. Workspace verifies only its two complete trigger definitions/targets,
 /// followed by host database integrity and FK validation. No repair is performed.
 pub(super) fn verify(conn: &Connection) -> Result<()> {
-    ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
+    ticket::verify_historical_sqlite_ticket_schema(
+        conn,
+        ticket::HistoricalTicketSchemaTarget::Subjects14,
+    )
+    .map_err(|error| {
         Error::Store(format!(
             "Ticket Subject schema verification failed: {error}"
         ))

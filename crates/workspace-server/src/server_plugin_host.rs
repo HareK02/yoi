@@ -7,6 +7,12 @@ use rusqlite::OptionalExtension;
 use server_api::*;
 #[path = "server_plugin_data.rs"]
 mod data;
+#[path = "server_plugin_service.rs"]
+mod service;
+tokio::task_local! { static SERVICE_LEASE: PluginServiceLease; }
+fn service_lease() -> Option<PluginServiceLease> {
+    SERVICE_LEASE.try_with(Clone::clone).ok()
+}
 
 impl WorkspaceApi {
     /// Host plan creation after the canonical reservation and grant/Job binding,
@@ -92,6 +98,29 @@ pub(super) fn router(service: Arc<ServerApiContractService>) -> Router {
 fn denied() -> PluginHostError {
     policy::map_error(policy::failure(PluginHostErrorCode::Denied))
 }
+fn validate_log_entry(entry: &PluginLogEntry) -> std::result::Result<(), PluginHostError> {
+    if entry.message.len() > 4096
+        || entry.event_code.is_empty()
+        || entry.event_code.len() > 128
+        || !entry
+            .event_code
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        || entry.fields.len() > 32
+        || entry.fields.iter().any(|field| {
+            field.name.len() > 128
+                || field.name.is_empty()
+                || field.name.chars().any(char::is_control)
+                || matches!(&field.value, PluginLogScalar::Text(value) if value.len() > 1024)
+                || matches!(&field.value, PluginLogScalar::Number(value) if !value.is_finite())
+        })
+    {
+        return Err(policy::map_error(policy::failure(
+            PluginHostErrorCode::QuotaExceeded,
+        )));
+    }
+    Ok(())
+}
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -105,6 +134,20 @@ fn operation_name(op: &PluginHostOperation) -> &'static str {
     }
 }
 
+/// Retain the physical Subject database only for this synchronous check. Each
+/// policy/lineage query still reads its owner; no authorization result or lock
+/// survives the closure, and FeatureStorage continues to enforce lifecycle fences.
+pub(super) fn with_authority_database<T>(
+    api: &WorkspaceApi,
+    check: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<T> {
+    let _database = api
+        .feature_storage
+        .open(&api.subjektiv_registration)
+        .map_err(|error| Error::Store(error.to_string()))?;
+    check()
+}
+
 async fn check(
     api: Arc<WorkspaceApi>,
     context: ServerRequestContext,
@@ -114,6 +157,25 @@ async fn check(
     consumer: PluginConsumer,
     operation: PluginHostOperation,
 ) -> std::result::Result<policy::AdmittedPluginOperation, PluginHostError> {
+    if let PluginConsumer::Consumer {
+        consumer_id,
+        event_id,
+        export_name,
+    } = &consumer
+    {
+        return service::check_consumer(
+            api,
+            context,
+            workspace,
+            plan_id,
+            installation,
+            consumer_id,
+            event_id,
+            export_name,
+            operation,
+        )
+        .await;
+    }
     let tools = match consumer {
         PluginConsumer::ToolCall {
             tool_call_id,
@@ -172,28 +234,31 @@ async fn check_tools(
     let executor = api.config_store.db_executor();
     executor
         .run(move || {
-            subject_authorization::authorize_scope(
-                &api,
-                &worker,
-                &server_api::authorization::OperationAuthorizationRequest {
-                    operation: operation_name(&operation).into(),
-                    resource: server_api::authorization::PermissionResource::PluginInstallation {
-                        workspace_id: workspace.clone(),
-                        installation_id: installation.clone(),
+            with_authority_database(&api, || {
+                subject_authorization::authorize_scope(
+                    &api,
+                    &worker,
+                    &server_api::authorization::OperationAuthorizationRequest {
+                        operation: operation_name(&operation).into(),
+                        resource:
+                            server_api::authorization::PermissionResource::PluginInstallation {
+                                workspace_id: workspace.clone(),
+                                installation_id: installation.clone(),
+                            },
                     },
-                },
-            )
-            .map_err(|e| e.error)?;
-            api.config_store.with_immediate_transaction(|tx| {
-                policy::authorize(
-                    tx,
-                    &workspace,
-                    &execution,
-                    &plan_id,
-                    &installation,
-                    &tools,
-                    &operation,
                 )
+                .map_err(|e| e.error)?;
+                api.config_store.with_immediate_transaction(|tx| {
+                    policy::authorize(
+                        tx,
+                        &workspace,
+                        &execution,
+                        &plan_id,
+                        &installation,
+                        &tools,
+                        &operation,
+                    )
+                })
             })
         })
         .await
@@ -213,11 +278,12 @@ async fn invocation(
     let store = api.config_store.clone();
     let w = workspace.to_owned();
     let id = invocation_id.to_owned();
-    let record = store
+    let mut record = store
         .db_executor()
         .run(move || store.with_conn(|conn| receipt::lookup(conn, &w, &id)))
         .await
         .map_err(policy::map_error)?;
+    record.service_lease = service_lease();
     let admitted = check(
         api,
         context.clone(),
@@ -394,6 +460,14 @@ async fn execute_with_transport(
     // Human management and a Runtime-only (no Worker) source both fail closed.
     subject_authorization::source_from_context(&context).map_err(|_| denied())?;
     match request {
+        PluginHostRequest::Service { request } => {
+            if service_lease().is_some() {
+                return Err(denied());
+            }
+            service::execute(api, context, workspace, request, transport_override)
+                .await
+                .map(|response| PluginHostResponse::Service { response })
+        }
         request @ (PluginHostRequest::ResolveTicket { .. }
         | PluginHostRequest::ReadTicket { .. }
         | PluginHostRequest::DataGet { .. }
@@ -425,6 +499,9 @@ async fn execute_with_transport(
             installation_id,
             consumer,
         } => {
+            if matches!(consumer, PluginConsumer::Consumer { .. }) {
+                return Err(denied());
+            }
             let admitted = check(
                 api.clone(),
                 context,
@@ -469,6 +546,9 @@ async fn execute_with_transport(
             })
         }
         PluginHostRequest::Cancel { invocation_id } => {
+            if service_lease().is_some() {
+                return Err(denied());
+            }
             // Do not use invocation(): exact cancellation replay must work after
             // the irreversible bit has already been committed.
             let store = api.config_store.clone();
@@ -536,24 +616,7 @@ async fn execute_with_transport(
             .await?;
             // Guest text/fields are untrusted and may contain echoed credentials.
             // Standard diagnostics retain only this safe event, not their payload.
-            if entry.message.len() > 4096
-                || entry.event_code.is_empty()
-                || entry.event_code.len() > 128
-                || !entry
-                    .event_code
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-                || entry.fields.len() > 32 || entry.fields.iter().any(|field| {
-                field.name.len() > 128
-                    || field.name.is_empty()
-                    || field.name.chars().any(char::is_control)
-                    || matches!(&field.value, PluginLogScalar::Text(value) if value.len() > 1024)
-                    || matches!(&field.value, PluginLogScalar::Number(value) if !value.is_finite())
-            }) {
-                return Err(policy::map_error(policy::failure(
-                    PluginHostErrorCode::QuotaExceeded,
-                )));
-            }
+            validate_log_entry(&entry)?;
             tracing::debug!(invocation = %invocation_id, "plugin log event admitted");
             Ok(PluginHostResponse::Logged)
         }

@@ -16,7 +16,9 @@ mod notification;
 mod plugin;
 pub mod plugin_data;
 pub mod plugin_host;
+pub mod plugin_service;
 pub use plugin_data::*;
+pub use plugin_service::*;
 mod plugin_types;
 pub use notification::*;
 pub use plugin::*;
@@ -3093,6 +3095,22 @@ pub trait ServerApi {
         #[path] installation_id: String,
         #[body] request: PluginDataPurgeRequest,
     ) -> Result<PluginDataPurgeResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/plugins/service-consumers/{consumer_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,503], bearer_auth = true, browser_auth = true)]
+    async fn plugin_service_diagnostics(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] consumer_id: String,
+    ) -> Result<PluginServiceDiagnostics, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/plugins/service-consumers/recover", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_service_recover(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[body] request: PluginServiceRecoveryRequest,
+    ) -> Result<PluginServiceDiagnostics, RepositoryApiError>;
 
     #[get("/api/w/{workspace_id}/plugin-operations/{operation_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true)]
     async fn plugin_operation(

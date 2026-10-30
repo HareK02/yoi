@@ -45,6 +45,10 @@ pub struct PluginEnablement {
     pub package_digest: String,
     pub artifact_digest: String,
     pub tools: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<String>,
+    #[serde(default)]
+    pub ticket_events: bool,
     pub logging: bool,
     #[serde(default)]
     pub ticket_read: bool,
@@ -170,7 +174,7 @@ pub(crate) fn evaluate_catalog_config(
     // Each alias has its own closed schema. Reusing an artifact with distinct
     // bindings is intentional and does not manufacture another schema authority.
     let enabled_fields = artifacts.iter().map(|(alias, artifact)| {
-        format!("{} = {{ installation_id = String; expected_last_operation = String; package_digest = String; artifact_digest = String; tools = [...String]; logging = Bool default false; ticket_read = Bool default false; ticket_data_read = [...{{ collection = String; schema_id = String; schema_version = String; }}] default []; ticket_data_write = [...{{ collection = String; schema_id = String; schema_version = String; }}] default []; connections = {{ ...String }} default {{}}; config = ({}); }};", alias, artifact.config_schema.dcdl)
+        format!("{} = {{ installation_id = String; expected_last_operation = String; package_digest = String; artifact_digest = String; tools = [...String]; services = [...String] default []; ticket_events = Bool default false; logging = Bool default false; ticket_read = Bool default false; ticket_data_read = [...{{ collection = String; schema_id = String; schema_version = String; }}] default []; ticket_data_write = [...{{ collection = String; schema_id = String; schema_version = String; }}] default []; connections = {{ ...String }} default {{}}; config = ({}); }};", alias, artifact.config_schema.dcdl)
     }).collect::<Vec<_>>().join("\n");
     let enabled_schema = if enabled_fields.is_empty() {
         "{} default {}".to_string()
@@ -245,6 +249,7 @@ fn validate_enablement(
                 | manifest::plugin::PLUGIN_COMPONENT_LOGGED_TOOL_WORLD
                 | manifest::plugin::PLUGIN_COMPONENT_HTTPS_LOGGED_TOOL_WORLD
                 | "yoi:plugin/ticket-tool-plugin@2.1.0"
+                | "yoi:plugin/ticket-service-plugin@2.2.0"
         )
         || artifact.required_imports.iter().any(|i| {
             !matches!(
@@ -268,6 +273,21 @@ fn validate_enablement(
             .any(|name| !artifact.tools.iter().any(|tool| &tool.name == *name))
     {
         return Err(config_error("unknown or duplicate Tool selection"));
+    }
+    if enabled.services.iter().collect::<BTreeSet<_>>().len() != enabled.services.len()
+        || enabled
+            .services
+            .iter()
+            .any(|name| !artifact.services.iter().any(|s| &s.name == name))
+        || (enabled.ticket_events
+            && (!artifact
+                .requested_grants
+                .contains(&PluginGrantMetadata::TicketEvents)
+                || artifact.world != "yoi:plugin/ticket-service-plugin@2.2.0"))
+    {
+        return Err(config_error(
+            "Service selection/grant exceeds package request",
+        ));
     }
     if enabled.logging
         && !artifact
@@ -432,6 +452,11 @@ fn project_profile_plugins(
             .tools
             .iter()
             .any(|tool| !enabled.tools.contains(tool))
+            || selection
+                .services
+                .iter()
+                .any(|s| !enabled.services.contains(s))
+            || (selection.ticket_events && !enabled.ticket_events)
             || (selection.logging && !enabled.logging)
             || (selection.ticket_read && !enabled.ticket_read)
             || selection
@@ -461,6 +486,9 @@ fn project_profile_plugins(
         let config =
             evaluate_effective_config(&config, &resolved.artifacts[alias].config_schema.dcdl)?;
         let mut grants = Vec::new();
+        if selection.ticket_events {
+            grants.push(PluginGrant::TicketEvents);
+        }
         if selection.logging {
             grants.push(PluginGrant::Logging);
         }
@@ -498,12 +526,15 @@ fn project_profile_plugins(
             &resolved.artifacts[alias],
             PluginPinProjection {
                 config,
-                surfaces: if selection.tools.is_empty() {
-                    vec![]
-                } else {
-                    vec![PluginSurface::Tool]
-                },
+                surfaces: [
+                    (!selection.tools.is_empty()).then_some(PluginSurface::Tool),
+                    (!selection.services.is_empty()).then_some(PluginSurface::Service),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
                 tools: selection.tools.clone(),
+                services: selection.services.clone(),
                 grants,
                 bindings,
             },

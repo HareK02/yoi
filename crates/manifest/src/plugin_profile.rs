@@ -36,6 +36,10 @@ pub struct PluginProfileSelection {
     pub installation_id: String,
     #[serde(default)]
     pub tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ticket_events: bool,
     #[serde(default)]
     pub logging: bool,
     #[serde(default)]
@@ -279,5 +283,29 @@ strict = true
                 "{error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn service_selection_is_explicit_and_old_profiles_remain_off() {
+        let old: PluginProfileSelection =
+            serde_json::from_value(json!({"installation_id":"i", "tools":["read"]})).unwrap();
+        assert!(old.services.is_empty());
+        assert!(!old.ticket_events);
+        let retained = serde_json::to_value(&old).unwrap();
+        assert!(retained.get("services").is_none());
+        assert!(retained.get("ticket_events").is_none());
+        let selected: PluginProfileSelection = serde_json::from_value(
+            json!({"installation_id":"i", "services":["watch"], "ticket_events":true}),
+        )
+        .unwrap();
+        assert_eq!(selected.services, ["watch"]);
+        assert!(selected.ticket_events);
+        assert_ne!(serde_json::to_value(selected).unwrap(), retained);
     }
 }

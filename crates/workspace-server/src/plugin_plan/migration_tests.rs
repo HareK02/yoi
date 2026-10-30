@@ -39,6 +39,7 @@ fn plugin_plan_migration_marker_failure_preserves_catalog_then_retries_and_match
                 111,
                 "Typed Plugin Ticket extension data and atomic mutation receipts".into(),
             ));
+            expected.push((112, "Ticket Service outbox and fenced consumers".into()));
             assert_eq!(workspace_schema_migration_history(conn)?, expected);
             subject_assignment_migration::verify(conn)?;
             crate::plugin_plan::verify_plan_schema(conn)?;

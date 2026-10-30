@@ -78,6 +78,8 @@ let
         };
         plugins = { selections = [...{
             installation_id = String; tools = [...String]; logging = Bool;
+            services = [...String] default [];
+            ticket_events = Bool default false;
             https_slots = [...String];
             ticket_read = Bool default false;
             ticket_data_read = [...{ collection = String; schema_id = String; schema_version = String; }] default [];

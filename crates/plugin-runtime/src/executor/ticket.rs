@@ -51,7 +51,10 @@ fn receipt(r: server_api::PluginDataReceipt) -> data::Receipt {
 }
 impl State {
     fn ticket_world(&self) -> Result<(), errors::HostError> {
-        if self.manifest.runtime.world != plugin::PLUGIN_COMPONENT_TICKET_TOOL_WORLD {
+        if !matches!(
+            self.manifest.runtime.world.as_str(),
+            plugin::PLUGIN_COMPONENT_TICKET_TOOL_WORLD | plugin::PLUGIN_COMPONENT_SERVICE_WORLD
+        ) {
             return Err(denied());
         }
         Ok(())
@@ -111,7 +114,7 @@ impl State {
         target: Resource<Ticket>,
         operation: Op,
     ) -> wasmtime::Result<Result<Reply, errors::HostError>> {
-        let context = self.current()?;
+        let context = self.protected_current()?;
         let checked = (|| {
             self.operation()?;
             self.ticket_world()?;
@@ -152,20 +155,37 @@ impl State {
             None
         };
         let mutating = matches!(&operation, Op::Mutate { .. });
+        let lookup = matches!(&operation, Op::LookupMutation { .. });
         let expected_reply = match &operation {
             Op::Get(_) => 0,
             Op::Mutate { .. } => 1,
             Op::List { .. } => 2,
             Op::LookupMutation { .. } => 3,
         };
-        let reply = match self
+        let effect = mutating.then(|| self.effects.begin());
+        let reply = self
             .provider
             .ticket_data(&context, binding.as_ref(), operation)
-            .await
-        {
+            .await;
+        if let Some(effect) = effect {
+            effect.finish(&reply);
+        }
+        let reply = match reply {
             Ok(reply) => reply,
-            Err(e) => return Ok(Err(e)),
+            Err(e) => {
+                self.effects.observe(&e);
+                if lookup {
+                    self.effects.unresolved();
+                }
+                return Ok(Err(e));
+            }
         };
+        if matches!(
+            &reply,
+            Reply::MutationLookup(server_api::PluginDataMutationLookup::Expired)
+        ) {
+            self.effects.unresolved();
+        }
         check_current(&context).map_err(|_| wasmtime::Error::msg("late Ticket data result"))?;
         let actual_reply = match &reply {
             Reply::Cell(_) => 0,
@@ -179,6 +199,7 @@ impl State {
                 error.code = errors::Code::Indeterminate;
                 error.effect = errors::EffectObservation::Indeterminate;
             }
+            self.effects.observe(&error);
             return Ok(Err(error));
         }
         let valid = match &reply {
@@ -224,7 +245,7 @@ impl objects::Host for State {
         ticket_ref: String,
         requested: objects::Access,
     ) -> wasmtime::Result<Result<Resource<Ticket>, errors::HostError>> {
-        let context = self.current()?;
+        let context = self.protected_current()?;
         if let Err(e) = self.operation().and_then(|_| self.ticket_world()) {
             return Ok(Err(e));
         }
@@ -288,7 +309,7 @@ impl ticket_read::Host for State {
         &mut self,
         target: Resource<Ticket>,
     ) -> wasmtime::Result<Result<ticket_read::Snapshot, errors::HostError>> {
-        let context = self.current()?;
+        let context = self.protected_current()?;
         if let Err(e) = self.operation().and_then(|_| self.ticket_world()) {
             return Ok(Err(e));
         }

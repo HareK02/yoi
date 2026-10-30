@@ -270,7 +270,7 @@ fn schema12_migrates_body_authors_archived_history_and_stable_references_then_re
             |r| r.get::<_, i64>(0)
         )
         .unwrap(),
-        14
+        15
     );
     backend
         .add_event("known".into(), comment("Next", "author"))

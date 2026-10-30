@@ -138,6 +138,7 @@ fn make_plan(
             error_codes: vec![],
             external_write: false,
         }],
+        services: vec![],
         connections: vec![],
         requested_grants: vec![],
         data_collections: vec![],
@@ -158,6 +159,7 @@ fn make_plan(
         PluginPinProjection {
             config: serde_json::json!({}),
             surfaces: vec![PluginSurface::Tool],
+            services: vec![],
             tools: vec!["example_echo".into()],
             grants: vec![],
             bindings: vec![],

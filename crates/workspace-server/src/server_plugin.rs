@@ -17,6 +17,8 @@ pub(super) fn router(service: Arc<ServerApiContractService>) -> Router {
         .merge(server_api_axum::plugin_install(service.clone()))
         .merge(server_api_axum::plugin_list(service.clone()))
         .merge(server_api_axum::plugin_worker_diagnostics(service.clone()))
+        .merge(server_api_axum::plugin_service_diagnostics(service.clone()))
+        .merge(server_api_axum::plugin_service_recover(service.clone()))
         .merge(server_api_axum::plugin_show(service.clone()))
         .merge(server_api_axum::plugin_artifact_add(service.clone()))
         .merge(server_api_axum::plugin_revoke(service.clone()))

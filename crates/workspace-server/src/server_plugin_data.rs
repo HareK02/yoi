@@ -66,7 +66,7 @@ fn access_granted(admitted: &policy::AdmittedPluginOperation, access: PluginTick
         })
 }
 
-fn authorize_ticket(
+pub(super) fn authorize_ticket(
     api: &WorkspaceApi,
     context: &ServerRequestContext,
     workspace: &str,
@@ -268,11 +268,12 @@ pub(super) async fn execute(
     let config = api.config_store.clone();
     let w = workspace.clone();
     let id = invocation_id.clone();
-    let record = config
+    let mut record = config
         .db_executor()
         .run(move || config.with_conn(|conn| receipt::lookup(conn, &w, &id)))
         .await
         .map_err(policy::map_error)?;
+    record.service_lease = service_lease();
     let admitted = check(
         api.clone(),
         context.clone(),
@@ -298,8 +299,10 @@ pub(super) async fn execute(
         let ticket_id = authorize_ticket(&api, &context, &workspace, &selector, action.access())?;
         config.with_immediate_transaction(|tx| {
             let record = receipt::verify_record(tx, &record)?;
-            let tools = match &record.consumer { PluginConsumer::ToolCall { tool_name, .. } => vec![tool_name.clone()], _ => return Err(policy::failure(PluginHostErrorCode::Unsupported)) };
-            let admitted = policy::authorize(tx, &workspace, &record.execution, &record.plan_id, &record.installation_id, &tools, &PluginHostOperation::Admit)?;
+            let admitted = match &record.consumer {
+                PluginConsumer::ToolCall { tool_name, .. } => policy::authorize(tx, &workspace, &record.execution, &record.plan_id, &record.installation_id, &[tool_name.clone()], &PluginHostOperation::Admit)?,
+                PluginConsumer::Consumer {export_name, ..} => policy::authorize_service(tx, &workspace, &record.execution, &record.plan_id, &record.installation_id, export_name, &PluginHostOperation::Admit)?,
+            };
             if record.cancelled { return Err(policy::failure(PluginHostErrorCode::Cancelled)); }
             if !matches!(action, Action::Lookup(..)) && (record.expired || record.expires_at_ms <= now_ms()) { return Err(policy::failure(PluginHostErrorCode::ReceiptExpired)); }
             if !tx.query_row("SELECT EXISTS(SELECT 1 FROM typed_tickets t JOIN workspaces w USING(workspace_id) WHERE t.workspace_id=?1 AND t.ticket_id=?2 AND w.state='active')",rusqlite::params![workspace,ticket_id],|row|row.get::<_,bool>(0))? { return Err(policy::failure(PluginHostErrorCode::NotFound)); }

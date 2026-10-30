@@ -37,6 +37,7 @@ pub fn validate_component(
         "yoi:plugin/logged-tool-plugin@2.0.0" => "logged-tool-plugin",
         "yoi:plugin/https-logged-tool-plugin@2.0.0" => "https-logged-tool-plugin",
         "yoi:plugin/ticket-tool-plugin@2.1.0" => "ticket-tool-plugin",
+        "yoi:plugin/ticket-service-plugin@2.2.0" => "ticket-service-plugin",
         _ => return Err(format!("unsupported Component world `{world}`")),
     };
     if !wasmparser::Parser::is_component(bytes) {
@@ -111,7 +112,7 @@ fn contract(world_name: &str) -> Result<(Resolve, WorldId), String> {
     let old_package = resolve
         .push_str("yoi-plugin-v2.wit", PLUGIN_WIT)
         .map_err(|error| format!("invalid embedded Plugin WIT: {error:#}"))?;
-    let package = if world_name == "ticket-tool-plugin" {
+    let package = if matches!(world_name, "ticket-tool-plugin" | "ticket-service-plugin") {
         resolve
             .push_str(
                 "yoi-host-v2.1.wit",
@@ -128,6 +129,16 @@ fn contract(world_name: &str) -> Result<(Resolve, WorldId), String> {
             .map_err(|e| format!("invalid Ticket Plugin WIT: {e:#}"))?
     } else {
         old_package
+    };
+    let package = if world_name == "ticket-service-plugin" {
+        resolve
+            .push_str(
+                "yoi-plugin-v2.2.wit",
+                include_str!("../../../../resources/plugin/wit-service/yoi-plugin-v2.2.wit"),
+            )
+            .map_err(|e| format!("invalid Service WIT: {e:#}"))?
+    } else {
+        package
     };
     let world = resolve
         .select_world(&[package], Some(world_name))

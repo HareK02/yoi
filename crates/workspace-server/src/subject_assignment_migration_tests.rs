@@ -770,11 +770,11 @@ mod subject_assignment_migration_tests {
         let old_components = component_history(&conn);
         {
             let tx = conn.unchecked_transaction().unwrap();
-            ticket::migrate_sqlite_ticket_schema_in_transaction(&tx).unwrap();
+            ticket::migrate_historical_sqlite_ticket_schema_in_transaction(&tx, ticket::HistoricalTicketSchemaTarget::Subjects14).unwrap();
             tx.commit().unwrap();
         }
         assert_component14_append(&conn, &old_components);
-        ticket::verify_sqlite_ticket_schema(&conn).unwrap();
+        ticket::verify_historical_sqlite_ticket_schema(&conn, ticket::HistoricalTicketSchemaTarget::Subjects14).unwrap();
         // The host must not append the owning diagnostic again or issue even a
         // redundant diagnostic UPDATE for any already-diagnosed legacy row.
         conn.execute_batch(
@@ -1070,7 +1070,14 @@ mod subject_assignment_migration_tests {
                 expected
             );
             assert_eq!(history.len(), host.len() + expected.len());
-            assert_component14_append(conn, component);
+            let history = component_history(conn);
+            assert_eq!(&history[..component.len()], component, "owner receipt prefix is preserved");
+            assert_eq!(history.len(), component.len() + 2);
+            let tail: Vec<(i64, String, String)> = conn.prepare("SELECT version,name,applied_at FROM ticket_schema_migrations WHERE version>=14 ORDER BY version").unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert_eq!(tail.iter().map(|(v,name,_)| (*v,name.as_str())).collect::<Vec<_>>(), [(14,"Subject Ticket responsibility"), (15,"Ticket Service transactional outbox")]);
+            assert!(tail.iter().all(|(_,_,at)| !at.is_empty()));
+            ticket::verify_sqlite_ticket_schema(conn).unwrap();
             crate::plugin_catalog::verify_with_data(conn).unwrap();
             plugin_plan::verify_plan_schema(conn).unwrap();
             verify(conn).unwrap();
@@ -1134,6 +1141,7 @@ mod subject_assignment_migration_tests {
                 111,
                 "Typed Plugin Ticket extension data and atomic mutation receipts".into(),
             ));
+            tail.push((112, "Ticket Service outbox and fenced consumers".into()));
             tail
         }
 
@@ -1183,7 +1191,7 @@ mod subject_assignment_migration_tests {
         fn plugin_schema(conn: &Connection) -> Rows {
             fixture_query_rows(
                 conn,
-                "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema WHERE tbl_name LIKE 'plugin_%' AND tbl_name NOT LIKE 'plugin_data_%' AND tbl_name NOT IN ('plugin_invocations','plugin_effect_receipts','plugin_references') ORDER BY type,name",
+                "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema WHERE tbl_name LIKE 'plugin_%' AND tbl_name NOT LIKE 'plugin_data_%' AND tbl_name NOT LIKE 'plugin_service_%' AND tbl_name NOT IN ('plugin_invocations','plugin_effect_receipts','plugin_references') ORDER BY type,name",
             )
         }
 

@@ -5,6 +5,8 @@ let
         package_digest = String;
         artifact_digest = String;
         tools = [...String];
+        services = [...String] default [];
+        ticket_events = Bool default false;
         logging = Bool default false;
         ticket_read = Bool default false;
         ticket_data_read = [...{ collection = String; schema_id = String; schema_version = String; }] default [];

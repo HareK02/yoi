@@ -3,25 +3,44 @@ use crate::PluginHttpMethod;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PluginHostRequest {
-    /// Fresh export/restore admission only; issues no invocation or effect identity.
-    Prepare {
-        plan_id: String,
-        installation_id: String,
-        tools: Vec<String>,
-    },
-    Begin {
-        plan_id: String,
-        installation_id: String,
-        consumer: PluginConsumer,
-    },
-    /// Irreversible cancellation of this authenticated logical invocation.
-    Cancel {
-        invocation_id: String,
-    },
+// The same operation variants define Tool transport and the narrower leased
+// Service channel. Service cannot nest itself or issue Begin/Cancel, and the
+// wire schema remains finite rather than recursively admitting control requests.
+macro_rules! invocation_requests {
+    ($($variant:ident { $($field:ident: $ty:ty),* $(,)? }),* $(,)?) => {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+        #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        pub enum PluginInvocationRequest { $($variant { $($field: $ty),* }),* }
+
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+        #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        pub enum PluginHostRequest {
+            Service { request: crate::PluginServiceRequest },
+            Prepare { plan_id: String, installation_id: String, tools: Vec<String> },
+            Begin { plan_id: String, installation_id: String, consumer: PluginConsumer },
+            Cancel { invocation_id: String },
+            $($variant { $($field: $ty),* }),*
+        }
+        impl TryFrom<PluginHostRequest> for PluginInvocationRequest {
+            type Error = ();
+            fn try_from(request: PluginHostRequest) -> Result<Self, ()> {
+                match request {
+                    $(PluginHostRequest::$variant { $($field),* } => Ok(Self::$variant { $($field),* }),)*
+                    PluginHostRequest::Service { .. } | PluginHostRequest::Prepare { .. }
+                    | PluginHostRequest::Begin { .. } | PluginHostRequest::Cancel { .. } => Err(()),
+                }
+            }
+        }
+        impl From<PluginInvocationRequest> for PluginHostRequest {
+            fn from(request: PluginInvocationRequest) -> Self {
+                match request { $(PluginInvocationRequest::$variant { $($field),* } => Self::$variant { $($field),* }),* }
+            }
+        }
+    };
+}
+invocation_requests! {
     Authorize {
         invocation_id: String,
         operation: PluginHostOperation,
@@ -83,7 +102,7 @@ pub enum PluginConsumer {
         tool_call_id: String,
         tool_name: String,
     },
-    /// Reserved consumer identity; this does not enable service/event delivery.
+    /// Owner-issued Service delivery identity; never grants admission by itself.
     Consumer {
         consumer_id: String,
         event_id: String,
@@ -129,21 +148,42 @@ pub struct PluginHttpResponse {
     pub body: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(
-    tag = "kind",
-    content = "data",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum PluginHostResponse {
-    Invocation {
-        invocation_id: String,
-        #[schemars(range(min = 0, max = 9_007_199_254_740_991_i64))]
-        #[cfg_attr(feature = "typescript", ts(type = "number"))]
-        expires_at_ms: i64,
-    },
+macro_rules! invocation_responses {
+    ($($variant:ident $({ $($field:ident: $ty:ty),* $(,)? })?),* $(,)?) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+        #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+        #[serde(tag = "kind", content = "data", rename_all = "snake_case", deny_unknown_fields)]
+        pub enum PluginInvocationResponse { $($variant $({ $($field: $ty),* })?),* }
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+        #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+        #[serde(tag = "kind", content = "data", rename_all = "snake_case", deny_unknown_fields)]
+        pub enum PluginHostResponse {
+            Service { response: crate::PluginServiceResponse },
+            Invocation {
+                invocation_id: String,
+                #[schemars(range(min = 0, max = 9_007_199_254_740_991_i64))]
+                #[cfg_attr(feature = "typescript", ts(type = "number"))]
+                expires_at_ms: i64,
+            },
+            $($variant $({ $($field: $ty),* })?),*
+        }
+        impl TryFrom<PluginHostResponse> for PluginInvocationResponse {
+            type Error = ();
+            fn try_from(response: PluginHostResponse) -> Result<Self, ()> {
+                match response {
+                    $(PluginHostResponse::$variant $({ $($field),* })? => Ok(Self::$variant $({ $($field),* })?),)*
+                    PluginHostResponse::Service { .. } | PluginHostResponse::Invocation { .. } => Err(()),
+                }
+            }
+        }
+        impl From<PluginInvocationResponse> for PluginHostResponse {
+            fn from(response: PluginInvocationResponse) -> Self {
+                match response { $(PluginInvocationResponse::$variant $({ $($field),* })? => Self::$variant $({ $($field),* })?),* }
+            }
+        }
+    };
+}
+invocation_responses! {
     Authorized,
     Opened,
     Response {
@@ -358,6 +398,24 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_value::<PluginHostError>(serde_json::json!({"code":"denied","effect":"not_dispatched","diagnostic_id":"d","message":"secret"})).is_err());
+    }
+
+    #[test]
+    fn service_wire_rejects_nested_control_and_identity_claims() {
+        let lease = serde_json::json!({"consumer_id":"consumer", "lease_token":"lease"});
+        for nested in [
+            serde_json::json!({"kind":"service", "request":{"kind":"poll", "lease":lease}}),
+            serde_json::json!({"kind":"prepare", "plan_id":"p", "installation_id":"i", "tools":[]}),
+            serde_json::json!({"kind":"begin", "plan_id":"p", "installation_id":"i", "consumer":{"kind":"consumer", "consumer_id":"c", "event_id":"e", "export_name":"s"}}),
+            serde_json::json!({"kind":"cancel", "invocation_id":"i"}),
+            serde_json::json!({"kind":"authorize", "invocation_id":"i", "operation":{"kind":"admit"}, "subject":"owner"}),
+        ] {
+            let wire = serde_json::json!({"kind":"service", "request":{"kind":"host", "lease":lease, "request":nested}});
+            assert!(serde_json::from_value::<PluginHostRequest>(wire).is_err());
+        }
+        let wire = serde_json::json!({"kind":"service", "request":{"kind":"host", "lease":lease, "request":{"kind":"read_ticket", "invocation_id":"invocation", "ticket_id":"ticket"}}});
+        let request: PluginHostRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), wire);
     }
 
     #[test]

@@ -18,6 +18,9 @@ pub const TICKET_TOOL_WIT: &str =
     include_str!("../../../resources/plugin/wit-ticket/yoi-plugin-v2.1.wit");
 pub const TICKET_HOST_WIT: &str =
     include_str!("../../../resources/plugin/wit-ticket/deps/yoi-host-v2.1/yoi-host-v2.1.wit");
+pub const SERVICE_WORLD: &str = "yoi:plugin/ticket-service-plugin@2.2.0";
+pub const SERVICE_WIT: &str =
+    include_str!("../../../resources/plugin/wit-service/yoi-plugin-v2.2.wit");
 pub const MAX_EXTENSION_DATA_BYTES: usize = 64 * 1024;
 
 /// Encode a cell without implicit mutation retries or schema conversion.
@@ -360,4 +363,41 @@ mod tests {
         assert!(error.message().len() <= MAX_ERROR_MESSAGE_BYTES);
         assert!(error.message().ends_with('語'));
     }
+}
+
+/// Bind authored Service handlers to the generated ABI without a guest task loop.
+/// Each handler runs in fresh memory; recovery state belongs to Host data/receipts.
+#[macro_export]
+macro_rules! export_component_service {
+    ($adapter:ident, $start:path, $event:path, $stop:path) => {
+        struct $adapter;
+        impl exports::yoi::plugin::service::Guest for $adapter {
+            fn on_start(
+                config: String,
+            ) -> ::std::result::Result<(), exports::yoi::plugin::service::ServiceError> {
+                $start(config).map_err(|e: $crate::ToolError| {
+                    exports::yoi::plugin::service::ServiceError {
+                        code: e.code_str().into(),
+                        message: e.message().into(),
+                    }
+                })
+            }
+            fn on_event(
+                input: exports::yoi::plugin::service::Envelope,
+            ) -> exports::yoi::plugin::service::EventResult {
+                $event(input)
+            }
+            fn on_stop(
+                reason: String,
+            ) -> ::std::result::Result<(), exports::yoi::plugin::service::ServiceError> {
+                $stop(reason).map_err(|e: $crate::ToolError| {
+                    exports::yoi::plugin::service::ServiceError {
+                        code: e.code_str().into(),
+                        message: e.message().into(),
+                    }
+                })
+            }
+        }
+        export!($adapter);
+    };
 }

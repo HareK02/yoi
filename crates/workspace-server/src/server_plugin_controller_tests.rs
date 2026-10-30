@@ -1,6 +1,7 @@
 // Include directly in server::tests (this file owns its module).
 // Production Embedded Server assembly -> ProfileRuntimeWorkerFactory -> actual
-// Controller/Engine -> pinned Wasmtime Tool -> HTTPS -> SQLite and Session store.
+// Controller/Engine -> pinned Wasmtime Tool/Service -> HTTPS, Ticket outbox,
+// SQLite receipts/cursors and Session store.
 // Only the external model and the TLS peer's DNS/socket/trust are substituted.
 // No FixtureRuntime, manually prepared Plugin Feature, or fabricated Host owner.
 //
@@ -30,6 +31,12 @@ mod plugin_controller_tests {
     const PROFILE: &str = "project:plugin-controller";
     const TOOL: &str = "example_status";
     const WATCHDOG: Duration = Duration::from_secs(60);
+
+    enum FixtureSurface {
+        Tool,
+        HttpsTool,
+        Service,
+    }
 
     struct Fixture {
         api: WorkspaceApi,
@@ -114,22 +121,41 @@ mod plugin_controller_tests {
             peer: &Peer,
             https: bool,
         ) -> (server_api::PluginOperationResponse, Vec<u8>) {
+            self.install_surface(
+                peer,
+                if https {
+                    FixtureSurface::HttpsTool
+                } else {
+                    FixtureSurface::Tool
+                },
+            )
+            .await
+        }
+
+        async fn install_surface(
+            &self,
+            peer: &Peer,
+            surface: FixtureSurface,
+        ) -> (server_api::PluginOperationResponse, Vec<u8>) {
             use manifest::plugin::*;
             let directory = tempfile::tempdir().unwrap();
-            let (manifest, component): (&str, &[u8]) = if https {
-                (
+            let (manifest, component): (&str, &[u8]) = match surface {
+                FixtureSurface::Service => (
+                    include_str!("../../plugin-runtime/tests/service-guest/plugin.toml"),
+                    include_bytes!("../tests/fixtures/ticket-service-v2.component.wasm"),
+                ),
+                FixtureSurface::HttpsTool => (
                     include_str!(
                         "../../../resources/plugin/templates/rust-component-https/plugin.toml"
                     ),
                     include_bytes!("../../plugin-pdk/tests/fixtures/https-tool-v2.component.wasm"),
-                )
-            } else {
-                (
+                ),
+                FixtureSurface::Tool => (
                     include_str!(
                         "../../../resources/plugin/templates/rust-component-tool/plugin.toml"
                     ),
                     include_bytes!("../../plugin-pdk/tests/fixtures/tool-v2.component.wasm"),
-                )
+                ),
             };
             fs::write(directory.path().join("plugin.toml"), manifest).unwrap();
             fs::write(directory.path().join("plugin.component.wasm"), component).unwrap();
@@ -168,11 +194,10 @@ mod plugin_controller_tests {
                 })).unwrap(), false, StatusCode::OK).await;
             let installed: server_api::PluginOperationResponse =
                 serde_json::from_value(installed).unwrap();
-            *self.model_tool.lock().unwrap() = format!(
-                "{}__{}",
-                installed.installation.installation_id,
-                installed.installation.artifacts[0].tools[0].name
-            );
+            if let Some(tool) = installed.installation.artifacts[0].tools.first() {
+                *self.model_tool.lock().unwrap() =
+                    format!("{}__{}", installed.installation.installation_id, tool.name,);
+            }
             self.configure(&installed, peer, true).await;
             (installed, package.bytes)
         }
@@ -187,18 +212,26 @@ mod plugin_controller_tests {
             let mut binding = peer.binding();
             binding.methods = vec![server_api::PluginHttpMethod::Get];
             binding.path_prefixes = vec!["/status".into()];
-            let tool = &artifact.tools[0].name;
-            let https = tool == TOOL;
+            let service = artifact.services.first().map(|service| &service.name);
+            let tool = artifact.tools.first().map(|tool| &tool.name);
+            let https = tool.is_some_and(|tool| tool == TOOL);
+            let tools = tool.into_iter().collect::<Vec<_>>();
+            let services = service.into_iter().collect::<Vec<_>>();
+            let config = if service.is_some() {
+                json!({"mode":"normal"})
+            } else {
+                json!({})
+            };
             let plugins = json!({"enabled":{"controller":{
                 "installation_id":installed.installation.installation_id,
                 "expected_last_operation":installed.operation_id,
                 "package_digest":artifact.package_digest,"artifact_digest":artifact.artifact_digest,
-                "tools":[tool],"logging":false,"config":{},
+                "tools":tools,"services":services,"ticket_events":service.is_some(),"logging":service.is_some(),"config":config,
                 "connections":if https { json!({"api":"remote"}) } else { json!({}) }
             }},"bindings":if https { json!({"remote":binding}) } else { json!({}) }});
             let selection = if selected {
                 json!({"selections":[{"installation_id":installed.installation.installation_id,
-                    "tools":[tool],"logging":false,"https_slots":if https { vec!["api"] } else { vec![] }}]})
+                    "tools":tools,"services":services,"ticket_events":service.is_some(),"logging":service.is_some(),"https_slots":if https { vec!["api"] } else { vec![] }}]})
             } else {
                 json!({"selections":[]})
             };
@@ -552,7 +585,12 @@ mod plugin_controller_tests {
             peer.connection_count(),
             2,
             "a new logical call must not replay the first receipt; model requests: {:?}",
-            f.requests.lock().unwrap().iter().map(|r| &r.items).collect::<Vec<_>>()
+            f.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| &r.items)
+                .collect::<Vec<_>>()
         );
         assert_eq!(f.count("plugin_invocations"), 2);
         assert_eq!(f.count("plugin_effect_receipts"), 2);
@@ -738,6 +776,310 @@ mod plugin_controller_tests {
             assert_eq!(peer.connection_count(), 0);
             assert!(f.requests.lock().unwrap().is_empty());
         }
+        f.stop(&worker).await;
+        f.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embedded_service_audited_recovery_wakes_same_controller_and_restore_keeps_cursor() {
+        use crate::plugin_service::Consumer;
+        use rusqlite::OptionalExtension;
+        use server_api::{PluginServiceDiagnostics, PluginServicePauseReason};
+
+        async fn until(
+            phase: &str,
+            observe: impl Fn() -> Option<Consumer>,
+            ready: impl Fn(&Consumer) -> bool,
+        ) -> Consumer {
+            tokio::time::timeout(WATCHDOG, async {
+                loop {
+                    if let Some(consumer) = observe().filter(&ready) {
+                        return consumer;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                let state = observe().map(|c| {
+                    (
+                        c.consumer_id,
+                        c.cursor,
+                        c.pause,
+                        c.current_event_id,
+                        c.attempt,
+                        c.next_attempt_ms,
+                        c.lease_token.is_some(),
+                    )
+                });
+                panic!("Service {phase} did not converge: {state:?}");
+            })
+        }
+
+        let peer = Peer::new(HOST, vec![]).await;
+        let f = Fixture::new(&peer).await;
+        let (installed, _) = f.install_surface(&peer, FixtureSurface::Service).await;
+        let worker = f.create(PROFILE).await;
+        let state = || {
+            f.api.config_store.with_conn(|conn| {
+                let id: Option<String> = conn.query_row(
+                    "SELECT consumer_id FROM plugin_service_consumers WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+                    rusqlite::params![TEST_WORKSPACE_ID, worker.runtime_id, worker.worker_id],
+                    |row| row.get(0),
+                ).optional()?;
+                id.map(|id| crate::plugin_service::load(conn, TEST_WORKSPACE_ID, &id)).transpose()
+            }).unwrap()
+        };
+        let before = until("initial factory lease", &state, |c| c.lease_token.is_some()).await;
+        let pin = f.execution_request(&worker)["plugin_execution"].clone();
+        assert_eq!(pin["plan_id"], before.plan_id);
+        assert_eq!(f.model_clients.load(Ordering::SeqCst), 1);
+        let router = build_router(f.api.clone());
+        let prefix = format!("/api/w/{TEST_WORKSPACE_ID}");
+        let path = format!(
+            "{prefix}/plugins/worker-diagnostics/{}/{}",
+            worker.runtime_id, worker.worker_id
+        );
+        let observed = request(
+            router.clone(),
+            Some(&f.owner),
+            "GET",
+            &path,
+            vec![],
+            false,
+            StatusCode::OK,
+        )
+        .await;
+        let observed: server_api::PluginWorkerDiagnostics =
+            serde_json::from_value(observed).unwrap();
+        let server_api::PluginWorkerDiagnosticSelection::Plan {
+            plan_id, plugins, ..
+        } = observed.selection
+        else {
+            panic!("sealed Service launch selection missing");
+        };
+        assert_eq!(plan_id, before.plan_id);
+        assert_eq!(plugins[0].selected_services, ["ticket_events"]);
+        assert_eq!(
+            plugins[0].service_consumers[0].diagnostics.consumer_id,
+            before.consumer_id
+        );
+        assert_eq!(
+            plugins[0].admission,
+            server_api::PluginDiagnosticAdmission::Admissible
+        );
+        let consumer_path = format!("{prefix}/plugins/service-consumers/{}", before.consumer_id);
+        let recover_path = format!("{prefix}/plugins/service-consumers/recover");
+        request(
+            router.clone(),
+            None,
+            "GET",
+            &consumer_path,
+            vec![],
+            false,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        let observed = request(
+            router.clone(),
+            Some(&f.owner),
+            "GET",
+            &consumer_path,
+            vec![],
+            false,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(observed["consumer_id"], before.consumer_id);
+        assert_eq!(observed["lease_active"], true);
+        assert!(!observed.to_string().contains("lease_token"));
+        request(router.clone(), Some(&f.owner), "POST", &recover_path, serde_json::to_vec(&json!({
+            "consumer_id":before.consumer_id,"expected_pause":"rejected","action":{"kind":"resume"},"operation_key":"not-paused","reason":"must not override an active consumer"
+        })).unwrap(), false, StatusCode::CONFLICT).await;
+        let unchanged = state().unwrap();
+        assert_eq!(unchanged.cursor, before.cursor);
+        assert_eq!(unchanged.lease_token, before.lease_token);
+        assert!(unchanged.pause.is_none());
+        assert_eq!(f.count("plugin_invocations"), 0);
+        assert_eq!(peer.connection_count(), 0);
+        assert!(f.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            installed.installation.artifacts[0].services[0].name,
+            "ticket_events"
+        );
+
+        // The real guest requests extension_write, which this events/logging-only
+        // selection denies. Its RetryAfter exhausts the durable delivery budget.
+        let ticket = browser_ticket_backend(&f.api)
+            .unwrap()
+            .create(ticket::NewTicket::new("Same Controller Service recovery"))
+            .unwrap();
+        let exhausted = until("initial attempts exhausted and released", &state, |c| {
+            c.pause == Some(PluginServicePauseReason::AttemptsExhausted) && c.lease_token.is_none()
+        })
+        .await;
+        let observed = request(
+            router.clone(),
+            Some(&f.owner),
+            "GET",
+            &consumer_path,
+            vec![],
+            false,
+            StatusCode::OK,
+        )
+        .await;
+        let paused: PluginServiceDiagnostics = serde_json::from_value(observed).unwrap();
+        assert_eq!(paused.consumer_id, before.consumer_id);
+        assert_eq!(
+            paused.pause_reason,
+            Some(PluginServicePauseReason::AttemptsExhausted)
+        );
+        assert!(!paused.lease_active);
+        assert_eq!(paused.attempt, crate::plugin_service::MAX_ATTEMPTS);
+        assert_eq!(paused.current_event_id, exhausted.current_event_id);
+        let event_id = paused.current_event_id.as_ref().unwrap();
+        let sequence: i64 = f.api.config_store.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT sequence FROM typed_ticket_service_outbox WHERE workspace_id=?1 AND event_id=?2 AND ticket_id=?3",
+                rusqlite::params![TEST_WORKSPACE_ID, event_id, ticket.id.as_str()],
+                |row| row.get(0),
+            )?)
+        }).unwrap();
+        assert!(sequence > before.cursor);
+        assert_eq!(exhausted.cursor, before.cursor);
+        assert!(exhausted.next_attempt_ms > 0);
+        assert!(exhausted.invocation_id.is_some());
+        assert_eq!(f.count("plugin_invocations"), 1);
+
+        let resume_reason = "Retry the observed denied event on its existing Controller";
+        let resumed = request(router.clone(), Some(&f.owner), "POST", &recover_path, serde_json::to_vec(&json!({
+            "consumer_id":paused.consumer_id,"expected_pause":paused.pause_reason.unwrap(),
+            "action":{"kind":"resume"},"operation_key":"controller-resume","reason":resume_reason
+        })).unwrap(), false, StatusCode::OK).await;
+        assert_eq!(resumed["consumer_id"], before.consumer_id);
+        assert!(resumed["pause_reason"].is_null());
+        assert_eq!(resumed["current_event_id"], event_id.as_str());
+
+        // No stop/restore, Submit, manual Acquire, or replacement owner occurs
+        // here. A later durable retry deadline proves new guest delivery rather
+        // than accidentally accepting the already exhausted pre-recovery state.
+        let retried = until(
+            "same Controller recovery and renewed exhaustion",
+            &state,
+            |c| {
+                c.consumer_id == before.consumer_id
+                    && c.current_event_id.as_ref() == Some(event_id)
+                    && c.pause == paused.pause_reason
+                    && c.lease_token.is_none()
+                    && c.next_attempt_ms > exhausted.next_attempt_ms
+            },
+        )
+        .await;
+        assert_eq!(retried.plan_id, before.plan_id);
+        assert_eq!(retried.cursor, before.cursor);
+        assert_eq!(retried.attempt, crate::plugin_service::MAX_ATTEMPTS);
+        assert_eq!(retried.invocation_id, exhausted.invocation_id);
+        assert_eq!(f.count("plugin_invocations"), 1);
+        assert_eq!(f.model_clients.load(Ordering::SeqCst), 1);
+        let observed = request(
+            router.clone(),
+            Some(&f.owner),
+            "GET",
+            &consumer_path,
+            vec![],
+            false,
+            StatusCode::OK,
+        )
+        .await;
+        let paused_again: PluginServiceDiagnostics = serde_json::from_value(observed).unwrap();
+        assert_eq!(paused_again, paused);
+
+        let skip_reason = "Explicitly abandon the observed denied queue head";
+        let skipped = request(router.clone(), Some(&f.owner), "POST", &recover_path, serde_json::to_vec(&json!({
+            "consumer_id":paused_again.consumer_id,"expected_pause":paused_again.pause_reason.unwrap(),
+            "action":{"kind":"skip","event_id":event_id},"operation_key":"controller-skip","reason":skip_reason
+        })).unwrap(), false, StatusCode::OK).await;
+        assert_eq!(skipped["consumer_id"], before.consumer_id);
+        assert!(skipped["pause_reason"].is_null());
+        assert!(skipped["current_event_id"].is_null());
+        let checkpoint = until(
+            "same Controller reacquisition after audited Skip",
+            &state,
+            |c| {
+                c.consumer_id == before.consumer_id
+                    && c.cursor == sequence
+                    && c.pause.is_none()
+                    && c.current_event_id.is_none()
+                    && c.lease_token.is_some()
+            },
+        )
+        .await;
+        assert!(checkpoint.cursor > 0);
+        assert_eq!(checkpoint.plan_id, before.plan_id);
+        assert_ne!(checkpoint.lease_token, before.lease_token);
+        assert_eq!(f.model_clients.load(Ordering::SeqCst), 1);
+
+        let owner = f
+            .api
+            .store
+            .get_workspace(TEST_WORKSPACE_ID)
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_account_id;
+        let audit: Vec<(String, String, String, String, String)> = f.api.config_store.with_conn(|conn| {
+            Ok(conn.prepare(
+                "SELECT operation_key,consumer_id,actor,reason,action_json FROM plugin_service_recovery_audit WHERE workspace_id=?1 ORDER BY operation_key",
+            )?.query_map([TEST_WORKSPACE_ID], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?
+                .collect::<rusqlite::Result<_>>()?)
+        }).unwrap();
+        assert_eq!(
+            audit.len(),
+            2,
+            "the rejected no-op must not create an audit"
+        );
+        for (row, (key, reason, action)) in audit.iter().zip([
+            ("controller-resume", resume_reason, json!({"kind":"resume"})),
+            (
+                "controller-skip",
+                skip_reason,
+                json!({"kind":"skip","event_id":event_id}),
+            ),
+        ]) {
+            assert_eq!(row.0, key);
+            assert_eq!(row.1, before.consumer_id);
+            assert_eq!(
+                serde_json::from_str::<Value>(&row.2).unwrap(),
+                json!([owner, "user-plugin-controller-owner"])
+            );
+            assert_eq!(row.3, reason);
+            assert_eq!(serde_json::from_str::<Value>(&row.4).unwrap(), action);
+        }
+
+        f.stop(&worker).await;
+        assert!(state().unwrap().lease_token.is_none());
+        f.restore(&worker, "restore-service").await;
+        let restored = until("restored factory lease", &state, |c| {
+            c.lease_token.is_some()
+        })
+        .await;
+        assert_eq!(restored.consumer_id, checkpoint.consumer_id);
+        assert_eq!(restored.plan_id, checkpoint.plan_id);
+        assert_eq!(restored.cursor, checkpoint.cursor);
+        assert!(restored.pause.is_none());
+        assert!(restored.current_event_id.is_none());
+        assert_ne!(restored.lease_token, checkpoint.lease_token);
+        assert_eq!(f.execution_request(&worker)["plugin_execution"], pin);
+        let retained = f
+            .api
+            .config_store
+            .plugin_plan_load(TEST_WORKSPACE_ID, &restored.plan_id)
+            .unwrap();
+        assert_eq!(retained.pin_state, PlanPinState::Active);
+        assert_eq!(f.count("plugin_invocations"), 1);
+        assert_eq!(f.count("plugin_effect_receipts"), 0);
+        assert_eq!(peer.connection_count(), 0);
+        assert!(f.requests.lock().unwrap().is_empty());
         f.stop(&worker).await;
         f.close().await;
     }

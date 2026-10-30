@@ -129,7 +129,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 111;
+const LATEST_SCHEMA_VERSION: i64 = 112;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -491,6 +491,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 111,
         name: "Typed Plugin Ticket extension data and atomic mutation receipts",
         apply: migrate_plugin_data_v110_to_v111,
+    },
+    Migration {
+        version: 112,
+        name: "Ticket Service outbox and fenced consumers",
+        apply: migrate_plugin_services_v111_to_v112,
     },
 ];
 
@@ -15927,6 +15932,41 @@ fn verify_plugin_data_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_plugin_services_v111_to_v112(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 111 {
+        return Err(Error::Store("Service migration requires schema 111".into()));
+    }
+    verify_schema_history(conn, 111)?;
+    let tx = conn.unchecked_transaction()?;
+    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
+        .map_err(|e| Error::Store(format!("Ticket outbox migration failed: {e}")))?;
+    tx.execute_batch(crate::plugin_service::SCHEMA_SQL)?;
+    tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES(112,'Ticket Service outbox and fenced consumers')",[])?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn verify_plugin_service_schema(conn: &Connection) -> Result<()> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(crate::plugin_service::SCHEMA_SQL)?;
+    let mut stmt = expected
+        .prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")?;
+    for entry in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (name, sql) = entry?;
+        let actual: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name=?1",
+                [&name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if actual.as_deref() != Some(&sql) {
+            return Err(Error::Store("Plugin Service schema has drifted".into()));
+        }
+    }
+    Ok(())
+}
+
 fn migrate_plugin_data_v110_to_v111(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 110 {
         return Err(Error::Store(
@@ -16025,6 +16065,7 @@ fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::plugin_plan::LAUNCH_SCHEMA_SQL)?;
     conn.execute_batch(crate::plugin_data::REFERENCE_MIGRATION_SQL)?;
     conn.execute_batch(crate::plugin_data::SCHEMA_SQL)?;
+    conn.execute_batch(crate::plugin_service::SCHEMA_SQL)?;
     Ok(())
 }
 
@@ -17067,6 +17108,7 @@ fn apply_migrations_with_secret_source(
     verify_schema_history(conn, LATEST_SCHEMA_VERSION)?;
     crate::plugin_catalog::verify_with_data(conn)?;
     verify_plugin_data_schema(conn)?;
+    verify_plugin_service_schema(conn)?;
     crate::plugin_plan::verify_plan_schema(conn)?;
     crate::plugin_host::verify_receipt_schema(conn)?;
     crate::plugin_plan::verify_launch_schema(conn)?;
@@ -19356,6 +19398,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     include!("migration_entrypoint_tests.rs");
     include!("plugin_host_migration_tests.rs");
     include!("plugin_data_migration_tests.rs");
+    include!("plugin_service_migration_tests.rs");
     include!("legacy_evidence_column_tests.rs");
 
     #[test]
@@ -19774,6 +19817,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:109, name:"Durable Plugin Host invocations and HTTPS effect receipts".into()},
                 WorkspaceSchemaMigrationStep {version:110, name:"Worker Plugin launch selection associations".into()},
                 WorkspaceSchemaMigrationStep {version:111, name:"Typed Plugin Ticket extension data and atomic mutation receipts".into()},
+                WorkspaceSchemaMigrationStep {version:112, name:"Ticket Service outbox and fenced consumers".into()},
             ]
         );
 
@@ -19895,6 +19939,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (109, "Durable Plugin Host invocations and HTTPS effect receipts".to_string()),
 (110, "Worker Plugin launch selection associations".to_string()),
 (111, "Typed Plugin Ticket extension data and atomic mutation receipts".to_string()),
+(112, "Ticket Service outbox and fenced consumers".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -23187,7 +23232,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (108, "Subject Ticket responsibility and current-body notification routing".into()),
                          (109, "Durable Plugin Host invocations and HTTPS effect receipts".into()),
                          (110, "Worker Plugin launch selection associations".into()),
-                         (111, "Typed Plugin Ticket extension data and atomic mutation receipts".into())]);
+                         (111, "Typed Plugin Ticket extension data and atomic mutation receipts".into()),
+                         (112, "Ticket Service outbox and fenced consumers".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

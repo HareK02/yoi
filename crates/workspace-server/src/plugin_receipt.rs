@@ -46,6 +46,8 @@ pub struct InvocationRecord {
     pub expires_at_ms: i64,
     pub cancelled: bool,
     pub expired: bool,
+    /// Ephemeral proof supplied by the authenticated Service wrapper, never persisted.
+    pub service_lease: Option<server_api::PluginServiceLease>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +224,7 @@ pub fn lookup(conn: &Connection, workspace: &str, invocation_id: &str) -> Result
         expires_at_ms,
         cancelled,
         expired,
+        service_lease: None,
     })
 }
 
@@ -231,7 +234,7 @@ pub(crate) fn verify_record(
     conn: &Connection,
     supplied: &InvocationRecord,
 ) -> Result<InvocationRecord> {
-    let saved = lookup(conn, &supplied.workspace_id, &supplied.invocation_id)?;
+    let mut saved = lookup(conn, &supplied.workspace_id, &supplied.invocation_id)?;
     if supplied.plan_id != saved.plan_id
         || supplied.installation_id != saved.installation_id
         || supplied.execution != saved.execution
@@ -240,6 +243,13 @@ pub(crate) fn verify_record(
     {
         return conflict();
     }
+    crate::plugin_service::fence_invocation(
+        conn,
+        supplied,
+        supplied.service_lease.as_ref(),
+        chrono::Utc::now().timestamp_millis(),
+    )?;
+    saved.service_lease = supplied.service_lease.clone();
     Ok(saved)
 }
 fn is_expired(conn: &Connection, record: &InvocationRecord) -> Result<bool> {

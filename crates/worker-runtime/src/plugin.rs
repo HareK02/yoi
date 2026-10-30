@@ -64,6 +64,7 @@ pub async fn materialize(
         for grant in &pin.projection().grants {
             match grant {
                 plugin_plan::PluginGrant::Logging => grants.logging = true,
+                plugin_plan::PluginGrant::TicketEvents => grants.ticket_events = true,
                 plugin_plan::PluginGrant::Https { slot } => {
                     grants.connection_slots.insert(slot.clone());
                 }
@@ -100,6 +101,7 @@ pub async fn materialize(
             request,
             expectation: ArtifactExpectation::new(metadata.artifact),
             tools: pin.projection().tools.clone(),
+            services: pin.projection().services.clone(),
             config: pin.projection().config.clone(),
             grants,
         });
@@ -172,6 +174,31 @@ impl PluginToolRuntime for PinnedPluginToolRuntime {
             .connect(snapshot.plan.workspace_id(), worker)
             .await?;
         for pin in snapshot.plan.plugins() {
+            for name in &pin.projection().services {
+                let response = services
+                    .owner
+                    .call(server_api::PluginHostRequest::Service {
+                        request: server_api::PluginServiceRequest::Prepare {
+                            plan_id: snapshot.plan_id.clone(),
+                            installation_id: pin.installation_id().into(),
+                            service_name: name.clone(),
+                            operation: server_api::PluginServiceLifecycleOperation::Admit,
+                        },
+                    })
+                    .await
+                    .map_err(|_| "Plugin Service preflight refused or unavailable")?;
+                if !matches!(
+                    response,
+                    server_api::PluginHostResponse::Service {
+                        response: server_api::PluginServiceResponse::Prepared
+                    }
+                ) {
+                    return Err("Plugin Service preflight protocol mismatch".into());
+                }
+            }
+            if pin.projection().tools.is_empty() {
+                continue;
+            }
             services
                 .owner
                 .prepare(
@@ -195,6 +222,31 @@ impl PluginToolRuntime for PinnedPluginToolRuntime {
         // Materialization and compilation can wait on I/O. Recheck at publication
         // preparation, including pure Tools and cache hits, without making a call.
         for pin in snapshot.plan.plugins() {
+            for name in &pin.projection().services {
+                let response = services
+                    .owner
+                    .call(server_api::PluginHostRequest::Service {
+                        request: server_api::PluginServiceRequest::Prepare {
+                            plan_id: snapshot.plan_id.clone(),
+                            installation_id: pin.installation_id().into(),
+                            service_name: name.clone(),
+                            operation: server_api::PluginServiceLifecycleOperation::Admit,
+                        },
+                    })
+                    .await
+                    .map_err(|_| "Plugin Service preflight refused or unavailable")?;
+                if !matches!(
+                    response,
+                    server_api::PluginHostResponse::Service {
+                        response: server_api::PluginServiceResponse::Prepared
+                    }
+                ) {
+                    return Err("Plugin Service preflight protocol mismatch".into());
+                }
+            }
+            if pin.projection().tools.is_empty() {
+                continue;
+            }
             services
                 .owner
                 .prepare(
