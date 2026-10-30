@@ -31,30 +31,32 @@ async fn check_service(
     let executor = api.config_store.db_executor();
     executor
         .run(move || {
-            for op in ["plugin.service.consume", operation_name(&operation)] {
-                subject_authorization::authorize_scope(
-                    &api,
-                    &worker,
-                    &OperationAuthorizationRequest {
-                        operation: op.into(),
-                        resource: PermissionResource::PluginInstallation {
-                            workspace_id: workspace.clone(),
-                            installation_id: installation.clone(),
+            with_authority_database(&api, || {
+                for op in ["plugin.service.consume", operation_name(&operation)] {
+                    subject_authorization::authorize_scope(
+                        &api,
+                        &worker,
+                        &OperationAuthorizationRequest {
+                            operation: op.into(),
+                            resource: PermissionResource::PluginInstallation {
+                                workspace_id: workspace.clone(),
+                                installation_id: installation.clone(),
+                            },
                         },
-                    },
-                )
-                .map_err(|e| e.error)?;
-            }
-            api.config_store.with_immediate_transaction(|tx| {
-                policy::authorize_service(
-                    tx,
-                    &workspace,
-                    &execution,
-                    &plan_id,
-                    &installation,
-                    &name,
-                    &operation,
-                )
+                    )
+                    .map_err(|e| e.error)?;
+                }
+                api.config_store.with_immediate_transaction(|tx| {
+                    policy::authorize_service(
+                        tx,
+                        &workspace,
+                        &execution,
+                        &plan_id,
+                        &installation,
+                        &name,
+                        &operation,
+                    )
+                })
             })
         })
         .await

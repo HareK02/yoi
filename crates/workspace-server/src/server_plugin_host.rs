@@ -134,6 +134,20 @@ fn operation_name(op: &PluginHostOperation) -> &'static str {
     }
 }
 
+/// Retain the physical Subject database only for this synchronous check. Each
+/// policy/lineage query still reads its owner; no authorization result or lock
+/// survives the closure, and FeatureStorage continues to enforce lifecycle fences.
+pub(super) fn with_authority_database<T>(
+    api: &WorkspaceApi,
+    check: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<T> {
+    let _database = api
+        .feature_storage
+        .open(&api.subjektiv_registration)
+        .map_err(|error| Error::Store(error.to_string()))?;
+    check()
+}
+
 async fn check(
     api: Arc<WorkspaceApi>,
     context: ServerRequestContext,
@@ -220,28 +234,31 @@ async fn check_tools(
     let executor = api.config_store.db_executor();
     executor
         .run(move || {
-            subject_authorization::authorize_scope(
-                &api,
-                &worker,
-                &server_api::authorization::OperationAuthorizationRequest {
-                    operation: operation_name(&operation).into(),
-                    resource: server_api::authorization::PermissionResource::PluginInstallation {
-                        workspace_id: workspace.clone(),
-                        installation_id: installation.clone(),
+            with_authority_database(&api, || {
+                subject_authorization::authorize_scope(
+                    &api,
+                    &worker,
+                    &server_api::authorization::OperationAuthorizationRequest {
+                        operation: operation_name(&operation).into(),
+                        resource:
+                            server_api::authorization::PermissionResource::PluginInstallation {
+                                workspace_id: workspace.clone(),
+                                installation_id: installation.clone(),
+                            },
                     },
-                },
-            )
-            .map_err(|e| e.error)?;
-            api.config_store.with_immediate_transaction(|tx| {
-                policy::authorize(
-                    tx,
-                    &workspace,
-                    &execution,
-                    &plan_id,
-                    &installation,
-                    &tools,
-                    &operation,
                 )
+                .map_err(|e| e.error)?;
+                api.config_store.with_immediate_transaction(|tx| {
+                    policy::authorize(
+                        tx,
+                        &workspace,
+                        &execution,
+                        &plan_id,
+                        &installation,
+                        &tools,
+                        &operation,
+                    )
+                })
             })
         })
         .await
