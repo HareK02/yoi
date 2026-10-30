@@ -11,6 +11,7 @@ pub fn plugin_host_typescript() -> String {
         PluginServiceEventResult::decl(&config),
         PluginServicePauseReason::decl(&config),
         PluginServiceDiagnostics::decl(&config),
+        PluginServiceLifecycleOperation::decl(&config),
         PluginServiceRequest::decl(&config),
         PluginServiceResponse::decl(&config),
         PluginServiceRecoveryAction::decl(&config),
@@ -100,6 +101,29 @@ pub fn plugin_api_typescript() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "typescript")]
+    #[test]
+    fn host_typescript_module_resolves_all_wire_type_dependencies() {
+        // Exercise the actual generator and TypeScript checker, not a duplicated
+        // list of type names. Deno is a prerequisite of this typescript suite;
+        // the maintained runner bounds/reaps its process group on timeout.
+        let directory = tempfile::tempdir().unwrap();
+        let module = directory.path().join("plugin-host.ts");
+        std::fs::write(&module, super::plugin_host_typescript()).unwrap();
+        let output = std::process::Command::new("deno")
+            .args(["check", "--no-config", "--no-lock", "--no-remote"])
+            .arg(&module)
+            .current_dir(directory.path())
+            .output()
+            .expect("Host TypeScript contract tests require Deno on PATH");
+        assert!(
+            output.status.success(),
+            "generated Host TypeScript does not type-check:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     #[cfg(feature = "typescript")]
     #[test]
     fn host_typescript_preserves_wire_numbers_and_lossless_scalar_strings() {
