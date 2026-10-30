@@ -517,8 +517,15 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                         "Subject Ticket responsibility and current-body notification routing"
                             .into()
                     ),
-                    (109, "Durable Plugin Host invocations and HTTPS effect receipts".into()),
-                    (110, "Worker Plugin launch selection associations".into())
+                    (
+                        109,
+                        "Durable Plugin Host invocations and HTTPS effect receipts".into()
+                    ),
+                    (110, "Worker Plugin launch selection associations".into()),
+                    (
+                        111,
+                        "Typed Plugin Ticket extension data and atomic mutation receipts".into()
+                    )
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {

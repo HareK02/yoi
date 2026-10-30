@@ -6,6 +6,9 @@ let
         artifact_digest = String;
         tools = [...String];
         logging = Bool default false;
+        ticket_read = Bool default false;
+        ticket_data_read = [...{ collection = String; schema_id = String; schema_version = String; }] default [];
+        ticket_data_write = [...{ collection = String; schema_id = String; schema_version = String; }] default [];
         connections = { ...String } default {};
         config = { ...Unknown } default {};
     };

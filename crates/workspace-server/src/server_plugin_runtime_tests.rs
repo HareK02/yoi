@@ -311,6 +311,9 @@ pub(super) mod plugin_runtime_tests {
                 .plugins
                 .selections
                 .push(manifest::PluginProfileSelection {
+                    ticket_read: false,
+                    ticket_data_read: vec![],
+                    ticket_data_write: vec![],
                     installation_id: f.installed.installation.installation_id.clone(),
                     tools: vec![f.tool.into()],
                     logging: false,
@@ -834,6 +837,9 @@ pub(super) mod plugin_runtime_tests {
             .plugins
             .selections
             .push(manifest::PluginProfileSelection {
+                    ticket_read: false,
+                    ticket_data_read: vec![],
+                    ticket_data_write: vec![],
                 installation_id: f.installed.installation.installation_id.clone(),
                 tools: vec![f.tool.into()],
                 logging: false,

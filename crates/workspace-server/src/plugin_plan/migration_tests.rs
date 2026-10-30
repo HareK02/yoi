@@ -35,6 +35,10 @@ fn plugin_plan_migration_marker_failure_preserves_catalog_then_retries_and_match
                 "Durable Plugin Host invocations and HTTPS effect receipts".into(),
             ));
             expected.push((110, "Worker Plugin launch selection associations".into()));
+            expected.push((
+                111,
+                "Typed Plugin Ticket extension data and atomic mutation receipts".into(),
+            ));
             assert_eq!(workspace_schema_migration_history(conn)?, expected);
             subject_assignment_migration::verify(conn)?;
             crate::plugin_plan::verify_plan_schema(conn)?;

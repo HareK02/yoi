@@ -4,6 +4,9 @@
 // proof verification, current Subject permissions and all Host checks are real.
 // Run with `cargo test -p yoi-workspace-server --lib plugin_host_tests`.
 // The shared TLS fixture requires openssl; tests never mutate process environment.
+#[path = "server_plugin_data_tests.rs"]
+mod data;
+
 use super::*;
 use crate::plugin_binding::PluginConnectionBinding;
 use crate::plugin_https::{
@@ -48,17 +51,6 @@ struct Fixture {
 
 impl Fixture {
     async fn new(binding: Option<PluginConnectionBinding>) -> Self {
-        use manifest::plugin::*;
-        let directory = tempfile::tempdir().unwrap();
-        let mut api = test_api(directory.path()).await;
-        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
-        let runtime = WorkdirlessFixtureRuntime::default();
-        api.runtime.register_or_replace(runtime.clone());
-        let subject = open_subjektiv_store(&api)
-            .unwrap()
-            .create_subject(crate::subjektiv::SubjectRole::new("plugin-host-integration").unwrap())
-            .unwrap()
-            .id;
         let https = binding.is_some();
         let (manifest, component, tool) = if https {
             (include_str!("../../../resources/plugin/templates/rust-component-https/plugin.toml")
@@ -73,6 +65,27 @@ impl Fixture {
                 "example_echo",
             )
         };
+        Self::with_package(binding, manifest, component, tool, None).await
+    }
+
+    async fn with_package(
+        binding: Option<PluginConnectionBinding>,
+        manifest: String,
+        component: &[u8],
+        tool: &'static str,
+        ticket_grants: Option<Value>,
+    ) -> Self {
+        use manifest::plugin::*;
+        let directory = tempfile::tempdir().unwrap();
+        let mut api = test_api(directory.path()).await;
+        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+        let runtime = WorkdirlessFixtureRuntime::default();
+        api.runtime.register_or_replace(runtime.clone());
+        let subject = open_subjektiv_store(&api)
+            .unwrap()
+            .create_subject(crate::subjektiv::SubjectRole::new("plugin-host-integration").unwrap())
+            .unwrap()
+            .id;
         let package_dir = tempfile::tempdir().unwrap();
         fs::write(package_dir.path().join("plugin.toml"), manifest).unwrap();
         fs::write(package_dir.path().join("plugin.component.wasm"), component).unwrap();
@@ -105,7 +118,13 @@ impl Fixture {
                 },
             )
             .unwrap();
-        commit_config(&api, &installed, tool, binding.as_ref());
+        commit_config_with_ticket_grants(
+            &api,
+            &installed,
+            tool,
+            binding.as_ref(),
+            ticket_grants.as_ref(),
+        );
         let Json(created) = create_workspace_worker(
             State(api.clone()),
             HeaderMap::new(),
@@ -207,6 +226,7 @@ impl Fixture {
                 } else {
                     Default::default()
                 },
+                ..Grants::default()
             },
             deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(20),
             cancellation: CancellationToken::new(),
@@ -312,7 +332,7 @@ impl Fixture {
     }
 
     fn count(&self, table: &str) -> i64 {
-        assert!(["plugin_invocations", "plugin_effect_receipts"].contains(&table));
+        assert!(["plugin_invocations", "plugin_effect_receipts", "plugin_data_cells", "plugin_data_receipts", "plugin_data_purges"].contains(&table));
         self.api
             .config_store
             .with_conn(|conn| {
@@ -391,16 +411,49 @@ fn commit_config(
     tool: &str,
     binding: Option<&PluginConnectionBinding>,
 ) {
-    let artifact = &installed.installation.artifacts[0];
-    let plugins = json!({"enabled":{"integration":{
+    commit_config_with_ticket_grants(api, installed, tool, binding, None);
+}
+
+fn commit_config_with_ticket_grants(
+    api: &WorkspaceApi,
+    installed: &server_api::PluginOperationResponse,
+    tool: &str,
+    binding: Option<&PluginConnectionBinding>,
+    ticket_grants: Option<&Value>,
+) {
+    commit_config_for_artifact(
+        api,
+        installed,
+        &installed.installation.artifacts[0],
+        tool,
+        binding,
+        ticket_grants,
+    );
+}
+
+fn commit_config_for_artifact(
+    api: &WorkspaceApi,
+    installed: &server_api::PluginOperationResponse,
+    artifact: &server_api::PluginArtifact,
+    tool: &str,
+    binding: Option<&PluginConnectionBinding>,
+    ticket_grants: Option<&Value>,
+) {
+    let mut plugins = json!({"enabled":{"integration":{
         "installation_id":installed.installation.installation_id,
         "expected_last_operation":installed.operation_id,
         "package_digest":artifact.package_digest,"artifact_digest":artifact.artifact_digest,
         "tools":[tool],"logging":false,"config":{},
         "connections":if binding.is_some() { json!({"api":"remote"}) } else { json!({}) }
     }},"bindings":if let Some(binding) = binding { json!({"remote":binding}) } else { json!({}) }});
-    let selection = json!({"selections":[{"installation_id":installed.installation.installation_id,
+    let mut selection = json!({"selections":[{"installation_id":installed.installation.installation_id,
         "tools":[tool],"logging":false,"https_slots":if binding.is_some() { vec!["api"] } else { vec![] }}]});
+    if let Some(grants) = ticket_grants {
+        for (key, value) in grants.as_object().unwrap() {
+            plugins["enabled"]["integration"][key] = value.clone();
+            selection["selections"][0][key] = value.clone();
+        }
+    }
     let content = format!(
         r#"{{
         plugins = {};
@@ -1251,6 +1304,21 @@ async fn remote_owner_for(
     worker_id: &str,
     workspace: &str,
 ) -> (Arc<dyn PluginHostOwner>, ServerTask) {
+    remote_owner_for_with_limit(
+        f,
+        worker_id,
+        workspace,
+        yoi_plugin_runtime::owner::PLUGIN_HOST_RESPONSE_BODY_LIMIT,
+    )
+    .await
+}
+
+async fn remote_owner_for_with_limit(
+    f: &Fixture,
+    worker_id: &str,
+    workspace: &str,
+    response_limit: usize,
+) -> (Arc<dyn PluginHostOwner>, ServerTask) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = build_router(f.api.clone());
@@ -1259,7 +1327,7 @@ async fn remote_owner_for(
     }));
     let client = server_api::ServerApiClient::builder(format!("http://{address}"))
         .unwrap()
-        .response_body_limit(yoi_plugin_runtime::owner::PLUGIN_HOST_RESPONSE_BODY_LIMIT)
+        .response_body_limit(response_limit)
         .client(
             reqwest::Client::builder()
                 .no_proxy()

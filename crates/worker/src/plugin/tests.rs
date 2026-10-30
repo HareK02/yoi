@@ -102,6 +102,7 @@ impl Fixture {
             tools: serde_json::from_value(serde_json::to_value(m.tools).unwrap()).unwrap(),
             connections: vec![],
             requested_grants: vec![],
+            data_collections: vec![],
             config_schema: PluginSchemaContribution {
                 identity: format!("{}/config", m.id),
                 version: m.version.clone(),

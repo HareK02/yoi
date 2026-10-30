@@ -25,7 +25,7 @@ pub use model::{
     AuthRef, ModelCapability, ModelManifest, ReasoningControl, ReasoningEffort, SchemeKind,
 };
 pub use paths::user_profiles_path;
-pub use plugin_profile::{PluginProfileConfig, PluginProfileSelection};
+pub use plugin_profile::{PluginProfileConfig, PluginProfileSelection, PluginTicketDataGrant};
 pub use profile::{
     ProfileDiscovery, ProfileError, ProfileExecutionTarget, ProfileManifestSnapshot,
     ProfileMetadata, ProfileRegistry, ProfileRegistryEntry, ProfileRegistrySource,

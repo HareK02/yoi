@@ -19,9 +19,17 @@ export type PluginHttpMethod = "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELE
 
 export type PluginConnectionMetadata = { name: string, methods: Array<PluginHttpMethod>, path_prefixes: Array<string>, };
 
-export type PluginGrantMetadata = { "kind": "logging" } | { "kind": "https", slot: string, };
+export type PluginGrantMetadata = { "kind": "logging" } | { "kind": "https", slot: string, } | { "kind": "ticket_read" } | { "kind": "ticket_data_read", collection: string, schema_id: string, schema_version: string, } | { "kind": "ticket_data_write", collection: string, schema_id: string, schema_version: string, };
 
-export type PluginArtifact = { package_id: string, name: string, version: string, description: string | null, package_digest: string, artifact_digest: string, artifact_size: number, schema_version: number, world: string, required_imports: Array<string>, tools: Array<PluginToolMetadata>, connections: Array<PluginConnectionMetadata>, requested_grants: Array<PluginGrantMetadata>, config_schema: PluginSchemaContribution, revoked: boolean, revocation_reason: string | null, };
+export type PluginDataSchemaMetadata = { collection: string, schema_id: string, schema_version: string, schema: unknown, };
+
+export type PluginDataPurgeState = { installation_last_operation: string, cells_digest: string, cell_count: number, };
+
+export type PluginDataPurgeRequest = { operation_key: string, expected: PluginDataPurgeState, };
+
+export type PluginDataPurgeResponse = { purge_id: string, observed: PluginDataPurgeState, };
+
+export type PluginArtifact = { package_id: string, name: string, version: string, description: string | null, package_digest: string, artifact_digest: string, artifact_size: number, schema_version: number, world: string, required_imports: Array<string>, tools: Array<PluginToolMetadata>, connections: Array<PluginConnectionMetadata>, requested_grants: Array<PluginGrantMetadata>, data_collections: Array<PluginDataSchemaMetadata>, config_schema: PluginSchemaContribution, revoked: boolean, revocation_reason: string | null, };
 
 export type PluginUploadResponse = { upload_id: string, expires_at: string, artifact: PluginArtifact, };
 

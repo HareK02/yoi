@@ -23,6 +23,7 @@ pub struct AdmittedPluginOperation {
     pub plan: StoredPluginPlan,
     pub pin: WorkerPluginPin,
     pub binding: Option<PluginConnectionBinding>,
+    pub data_collections: Vec<PluginDataSchemaMetadata>,
 }
 
 /// `execution` is derived by the authenticated Host boundary from current Worker
@@ -131,7 +132,12 @@ pub fn authorize(
     } else {
         None
     };
-    Ok(AdmittedPluginOperation { plan, pin, binding })
+    Ok(AdmittedPluginOperation {
+        plan,
+        pin,
+        binding,
+        data_collections: artifact.data_collections,
+    })
 }
 
 pub(crate) fn live_binding(

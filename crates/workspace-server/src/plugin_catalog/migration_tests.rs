@@ -30,7 +30,7 @@ fn plugin_catalog_migration_matches_fresh_schema_from_oldest_retained_and_105() 
             // Plugin catalog remains migration 106 even when startup applies later steps.
             assert_eq!(after.iter().filter(|(version, _)| *version == 106).cloned().collect::<Vec<_>>(),
                 vec![(106, crate::plugin_catalog::MIGRATION_NAME.into())]);
-            assert_eq!(after.last().unwrap(), &(110, "Worker Plugin launch selection associations".into()));
+            assert_eq!(after.last().unwrap(), &(111, "Typed Plugin Ticket extension data and atomic mutation receipts".into()));
             assert_eq!(current_schema_version(c)?, LATEST_SCHEMA_VERSION);
             assert_eq!(c.query_row("SELECT display_name FROM workspaces WHERE workspace_id='plugin-workspace'",[],|r|r.get::<_,String>(0))?,"Plugins");
             assert_eq!(c.query_row("SELECT count(*) FROM pragma_foreign_key_check",[],|r|r.get::<_,i64>(0))?,0);
@@ -77,8 +77,12 @@ fn plugin_catalog_migration_marker_failure_rolls_back_then_retries_without_chang
                 "Durable Plugin Host invocations and HTTPS effect receipts".into(),
             ));
             expected.push((110, "Worker Plugin launch selection associations".into()));
+            expected.push((
+                111,
+                "Typed Plugin Ticket extension data and atomic mutation receipts".into(),
+            ));
             assert_eq!(workspace_schema_migration_history(c)?, expected);
-            crate::plugin_catalog::verify(c)?;
+            crate::plugin_catalog::verify_with_data(c)?;
             Ok(())
         })
         .unwrap();

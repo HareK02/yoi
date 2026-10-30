@@ -14,6 +14,7 @@ pub mod memory_staging;
 pub mod observation;
 pub mod plugin_binding;
 pub mod plugin_catalog;
+pub mod plugin_data;
 pub mod plugin_delivery;
 pub mod plugin_host;
 pub mod plugin_https;

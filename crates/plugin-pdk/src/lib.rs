@@ -12,6 +12,24 @@ pub const HTTPS_TOOL_WORLD: &str = "yoi:plugin/https-tool-plugin@2.0.0";
 pub const TOOL_WIT: &str = include_str!("../../../resources/plugin/wit/yoi-plugin-v2.wit");
 pub const HOST_WIT: &str =
     include_str!("../../../resources/plugin/wit/deps/yoi-host/yoi-host-v2.wit");
+/// Additive Ticket resource world. Existing world constants retain exact v2 ABI.
+pub const TICKET_TOOL_WORLD: &str = "yoi:plugin/ticket-tool-plugin@2.1.0";
+pub const TICKET_TOOL_WIT: &str =
+    include_str!("../../../resources/plugin/wit-ticket/yoi-plugin-v2.1.wit");
+pub const TICKET_HOST_WIT: &str =
+    include_str!("../../../resources/plugin/wit-ticket/deps/yoi-host-v2.1/yoi-host-v2.1.wit");
+pub const MAX_EXTENSION_DATA_BYTES: usize = 64 * 1024;
+
+/// Encode a cell without implicit mutation retries or schema conversion.
+/// The Host remains authoritative for closed-schema and namespace validation.
+pub fn extension_data_json<T: Serialize>(value: &T) -> Result<String> {
+    let json = serde_json::to_string(value).map_err(ToolError::serialization)?;
+    if json.len() > MAX_EXTENSION_DATA_BYTES {
+        return Err(ToolError::invalid_input("extension data exceeds 64 KiB"));
+    }
+    Ok(json)
+}
+
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_TOOL_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
@@ -213,13 +231,17 @@ pub fn run_json_tool<I: DeserializeOwned>(
 #[macro_export]
 macro_rules! export_component_tool {
     ($adapter:ident, $handler:path) => {
+        $crate::export_component_tool!($adapter, $handler, exports::yoi::plugin::tool);
+    };
+    ($adapter:ident, $handler:path, $interface:path) => {
+        use $interface as __yoi_component_tool_interface;
         struct $adapter;
-        impl exports::yoi::plugin::tool::Guest for $adapter {
+        impl __yoi_component_tool_interface::Guest for $adapter {
             fn invoke(
-                input: exports::yoi::plugin::tool::Invocation,
+                input: __yoi_component_tool_interface::Invocation,
             ) -> ::std::result::Result<
-                exports::yoi::plugin::tool::Output,
-                exports::yoi::plugin::tool::ToolError,
+                __yoi_component_tool_interface::Output,
+                __yoi_component_tool_interface::ToolError,
             > {
                 let context = $crate::ToolContext::new(
                     input.invocation_id,
@@ -230,19 +252,29 @@ macro_rules! export_component_tool {
                 $crate::run_json_tool(context, &input.input_json, $handler)
                     .map(|output| {
                         let (summary, content, structured_json) = output.into_parts();
-                        exports::yoi::plugin::tool::Output {
+                        __yoi_component_tool_interface::Output {
                             summary,
                             content,
                             structured_json,
                         }
                     })
-                    .map_err(|error| exports::yoi::plugin::tool::ToolError {
+                    .map_err(|error| __yoi_component_tool_interface::ToolError {
                         code: error.code_str().to_owned(),
                         message: error.message().to_owned(),
                     })
             }
         }
         export!($adapter);
+    };
+}
+
+/// Export glue for the exact Ticket world, retaining the original Tool ABI.
+/// Generate bindings from wit-ticket with generate_all; its versioned modules
+/// expose yoi::host2_1_0::{objects,ticket_read,extension_data} without raw ABI code.
+#[macro_export]
+macro_rules! export_ticket_component_tool {
+    ($adapter:ident, $handler:path) => {
+        $crate::export_component_tool!($adapter, $handler, exports::yoi::plugin2_0_0::tool);
     };
 }
 

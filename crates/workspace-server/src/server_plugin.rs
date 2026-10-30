@@ -21,6 +21,8 @@ pub(super) fn router(service: Arc<ServerApiContractService>) -> Router {
         .merge(server_api_axum::plugin_artifact_add(service.clone()))
         .merge(server_api_axum::plugin_revoke(service.clone()))
         .merge(server_api_axum::plugin_uninstall(service.clone()))
+        .merge(server_api_axum::plugin_data_observe(service.clone()))
+        .merge(server_api_axum::plugin_data_purge(service.clone()))
         .merge(server_api_axum::plugin_operation(service))
         .layer(middleware::from_fn(normalize_rejections))
 }
@@ -224,4 +226,86 @@ pub(super) async fn operation(
         .run(move || store.plugin_operation(&workspace, &operation_id))
         .await
         .map_err(failure)
+}
+
+fn data_failure(error: Error) -> RepositoryApiError {
+    if let Error::PluginHost(error) = error {
+        let (status, code) = match error.code {
+            PluginHostErrorCode::NotFound => (404, "not_found"),
+            PluginHostErrorCode::Denied => (403, "access_denied"),
+            PluginHostErrorCode::Conflict => (409, "plugin_data_conflict"),
+            PluginHostErrorCode::InvalidInput => (400, "plugin_invalid"),
+            _ => (503, "plugin_data_outcome_unknown"),
+        };
+        RepositoryApiError::new(status, code, "Plugin data operation", vec![])
+    } else {
+        failure(error)
+    }
+}
+fn purge_state(state: crate::plugin_data::PurgeSnapshot) -> PluginDataPurgeState {
+    PluginDataPurgeState {
+        installation_last_operation: state.installation_last_operation,
+        cells_digest: state.cells_digest,
+        cell_count: state.cell_count,
+    }
+}
+
+pub(super) async fn data_observe(
+    api: &WorkspaceApi,
+    actor: RequestActor,
+    workspace: String,
+    installation: String,
+) -> CatalogResult<PluginDataPurgeState> {
+    // Observing a purge confirmation is an administrator operation. It is only
+    // available after all execution artifacts have been irrevocably revoked.
+    authorize(api, &workspace, &actor, true).await?;
+    let store = api.config_store.clone();
+    store
+        .db_executor()
+        .run(move || {
+            store.with_immediate_transaction(|tx| {
+                crate::plugin_data::purge_snapshot(tx, &workspace, &installation)
+            })
+        })
+        .await
+        .map(purge_state)
+        .map_err(data_failure)
+}
+
+pub(super) async fn data_purge(
+    api: &WorkspaceApi,
+    actor: RequestActor,
+    workspace: String,
+    installation: String,
+    request: PluginDataPurgeRequest,
+) -> CatalogResult<PluginDataPurgeResponse> {
+    // Authenticate again even when this will be a receipt replay. Management
+    // credentials are never borrowed by guest invocations or used to run them.
+    authorize(api, &workspace, &actor, true).await?;
+    let actor = actor_identity(&actor);
+    let store = api.config_store.clone();
+    store
+        .db_executor()
+        .run(move || {
+            store.with_immediate_transaction(|tx| {
+                crate::plugin_data::purge(
+                    tx,
+                    &workspace,
+                    &installation,
+                    &actor,
+                    &request.operation_key,
+                    &crate::plugin_data::PurgeSnapshot {
+                        installation_last_operation: request.expected.installation_last_operation,
+                        cells_digest: request.expected.cells_digest,
+                        cell_count: request.expected.cell_count,
+                    },
+                )
+            })
+        })
+        .await
+        .map(|receipt| PluginDataPurgeResponse {
+            purge_id: receipt.purge_id,
+            observed: purge_state(receipt.observed),
+        })
+        .map_err(data_failure)
 }

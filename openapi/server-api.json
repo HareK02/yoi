@@ -7859,6 +7859,13 @@
             },
             "type": "array"
           },
+          "data_collections": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PluginDataSchemaMetadata"
+            },
+            "type": "array"
+          },
           "description": {
             "type": [
               "string",
@@ -8007,6 +8014,369 @@
             "type": "object"
           }
         ]
+      },
+      "PluginDataAddress": {
+        "additionalProperties": false,
+        "properties": {
+          "collection": {
+            "$ref": "#/components/schemas/PluginDataCollection"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "collection",
+          "key"
+        ],
+        "type": "object"
+      },
+      "PluginDataCell": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "never_written",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "additionalProperties": false,
+                "properties": {
+                  "last_write": {
+                    "type": "string"
+                  },
+                  "value_json": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "value_json",
+                  "last_write"
+                ],
+                "type": "object"
+              },
+              "kind": {
+                "const": "present",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "additionalProperties": false,
+                "properties": {
+                  "last_delete": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "last_delete"
+                ],
+                "type": "object"
+              },
+              "kind": {
+                "const": "deleted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginDataCollection": {
+        "additionalProperties": false,
+        "properties": {
+          "collection": {
+            "type": "string"
+          },
+          "schema_id": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "collection",
+          "schema_id",
+          "schema_version"
+        ],
+        "type": "object"
+      },
+      "PluginDataEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "cell": {
+            "$ref": "#/components/schemas/PluginDataCell"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "cell"
+        ],
+        "type": "object"
+      },
+      "PluginDataExpectation": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "never_written",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "last_write",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginDataMutation": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "expected": {
+                "$ref": "#/components/schemas/PluginDataExpectation"
+              },
+              "kind": {
+                "const": "put",
+                "type": "string"
+              },
+              "value_json": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "expected",
+              "value_json"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "expected_last_write": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "delete",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "expected_last_write"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginDataMutationLookup": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "not_recorded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/PluginDataReceipt"
+              },
+              "kind": {
+                "const": "committed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "expired",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginDataPage": {
+        "additionalProperties": false,
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/PluginDataEntry"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "entries"
+        ],
+        "type": "object"
+      },
+      "PluginDataPurgeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected": {
+            "$ref": "#/components/schemas/PluginDataPurgeState"
+          },
+          "operation_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_key",
+          "expected"
+        ],
+        "type": "object"
+      },
+      "PluginDataPurgeResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "observed": {
+            "$ref": "#/components/schemas/PluginDataPurgeState"
+          },
+          "purge_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "purge_id",
+          "observed"
+        ],
+        "type": "object"
+      },
+      "PluginDataPurgeState": {
+        "additionalProperties": false,
+        "properties": {
+          "cell_count": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cells_digest": {
+            "type": "string"
+          },
+          "installation_last_operation": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "installation_last_operation",
+          "cells_digest",
+          "cell_count"
+        ],
+        "type": "object"
+      },
+      "PluginDataReceipt": {
+        "additionalProperties": false,
+        "description": "A saved mutation result, not an observation of the current cell. The digest\ncovers the canonical resulting cell (including its final operation identity).",
+        "properties": {
+          "mutation_id": {
+            "type": "string"
+          },
+          "result_digest": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mutation_id",
+          "result_digest"
+        ],
+        "type": "object"
+      },
+      "PluginDataSchemaMetadata": {
+        "additionalProperties": false,
+        "properties": {
+          "collection": {
+            "type": "string"
+          },
+          "schema": true,
+          "schema_id": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "collection",
+          "schema_id",
+          "schema_version",
+          "schema"
+        ],
+        "type": "object"
       },
       "PluginDiagnosticAdmission": {
         "description": "A successful observation is not retained admission authority.",
@@ -8170,6 +8540,69 @@
             "required": [
               "kind",
               "slot"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "ticket_read",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "collection": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "ticket_data_read",
+                "type": "string"
+              },
+              "schema_id": {
+                "type": "string"
+              },
+              "schema_version": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "collection",
+              "schema_id",
+              "schema_version"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "collection": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "ticket_data_write",
+                "type": "string"
+              },
+              "schema_id": {
+                "type": "string"
+              },
+              "schema_version": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "collection",
+              "schema_id",
+              "schema_version"
             ],
             "type": "object"
           }
@@ -8468,6 +8901,176 @@
               "entry"
             ],
             "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "access": {
+                "$ref": "#/components/schemas/PluginTicketAccess"
+              },
+              "invocation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "resolve_ticket",
+                "type": "string"
+              },
+              "ticket_ref": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation_id",
+              "ticket_ref",
+              "access"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "invocation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "read_ticket",
+                "type": "string"
+              },
+              "ticket_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation_id",
+              "ticket_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "address": {
+                "$ref": "#/components/schemas/PluginDataAddress"
+              },
+              "invocation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "data_get",
+                "type": "string"
+              },
+              "ticket_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation_id",
+              "ticket_id",
+              "address"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "address": {
+                "$ref": "#/components/schemas/PluginDataAddress"
+              },
+              "invocation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "data_mutate",
+                "type": "string"
+              },
+              "mutation": {
+                "$ref": "#/components/schemas/PluginDataMutation"
+              },
+              "operation_key": {
+                "type": "string"
+              },
+              "ticket_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation_id",
+              "ticket_id",
+              "address",
+              "operation_key",
+              "mutation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "collection": {
+                "$ref": "#/components/schemas/PluginDataCollection"
+              },
+              "cursor": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "invocation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "data_list",
+                "type": "string"
+              },
+              "limit": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "ticket_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation_id",
+              "ticket_id",
+              "collection",
+              "limit"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "address": {
+                "$ref": "#/components/schemas/PluginDataAddress"
+              },
+              "invocation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "data_lookup_mutation",
+                "type": "string"
+              },
+              "operation_key": {
+                "type": "string"
+              },
+              "ticket_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation_id",
+              "ticket_id",
+              "address",
+              "operation_key"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -8568,6 +9171,162 @@
             },
             "required": [
               "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "additionalProperties": false,
+                "properties": {
+                  "ticket_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "ticket_id"
+                ],
+                "type": "object"
+              },
+              "kind": {
+                "const": "ticket_resolved",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "additionalProperties": false,
+                "properties": {
+                  "snapshot": {
+                    "$ref": "#/components/schemas/PluginTicketSnapshot"
+                  }
+                },
+                "required": [
+                  "snapshot"
+                ],
+                "type": "object"
+              },
+              "kind": {
+                "const": "ticket_read",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "additionalProperties": false,
+                "properties": {
+                  "cell": {
+                    "$ref": "#/components/schemas/PluginDataCell"
+                  }
+                },
+                "required": [
+                  "cell"
+                ],
+                "type": "object"
+              },
+              "kind": {
+                "const": "data_cell",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "additionalProperties": false,
+                "properties": {
+                  "receipt": {
+                    "$ref": "#/components/schemas/PluginDataReceipt"
+                  }
+                },
+                "required": [
+                  "receipt"
+                ],
+                "type": "object"
+              },
+              "kind": {
+                "const": "data_mutated",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "additionalProperties": false,
+                "properties": {
+                  "page": {
+                    "$ref": "#/components/schemas/PluginDataPage"
+                  }
+                },
+                "required": [
+                  "page"
+                ],
+                "type": "object"
+              },
+              "kind": {
+                "const": "data_listed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "data": {
+                "additionalProperties": false,
+                "properties": {
+                  "outcome": {
+                    "$ref": "#/components/schemas/PluginDataMutationLookup"
+                  }
+                },
+                "required": [
+                  "outcome"
+                ],
+                "type": "object"
+              },
+              "kind": {
+                "const": "data_mutation_lookup",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "data"
             ],
             "type": "object"
           }
@@ -9142,6 +9901,49 @@
           "digest",
           "namespace",
           "dcdl"
+        ],
+        "type": "object"
+      },
+      "PluginTicketAccess": {
+        "enum": [
+          "read",
+          "extension_write"
+        ],
+        "type": "string"
+      },
+      "PluginTicketCaseState": {
+        "enum": [
+          "open",
+          "closed"
+        ],
+        "type": "string"
+      },
+      "PluginTicketSnapshot": {
+        "additionalProperties": false,
+        "description": "Canonical Ticket identity is returned only after resolve authorizes it. It is\nstill a selector: every subsequent operation must reauthorize with the owner.",
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "case_state": {
+            "$ref": "#/components/schemas/PluginTicketCaseState"
+          },
+          "content_digest": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "title",
+          "case_state",
+          "content_digest",
+          "body",
+          "truncated"
         ],
         "type": "object"
       },
@@ -20664,7 +21466,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:1053b09bb77ff0fc09fec2d3f96af04b76974c5ea52870f805381302e1b29fe4"
+    "x-yoi-source-digest": "sha256:2373d17776c7822f8289243b5f79b6227bb78eec1ce101c0837e5abbb2af2350"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -31464,6 +32266,230 @@
             "description": "Error response"
           },
           "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/plugins/{installation_id}/data-purge": {
+      "post": {
+        "operationId": "plugin_data_purge",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "installation_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PluginDataPurgeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginDataPurgeResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/plugins/{installation_id}/data-state": {
+      "get": {
+        "operationId": "plugin_data_observe",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "installation_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginDataPurgeState"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
             "content": {
               "application/json": {
                 "schema": {

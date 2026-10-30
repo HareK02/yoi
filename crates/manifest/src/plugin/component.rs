@@ -36,6 +36,7 @@ pub fn validate_component(
         "yoi:plugin/https-tool-plugin@2.0.0" => "https-tool-plugin",
         "yoi:plugin/logged-tool-plugin@2.0.0" => "logged-tool-plugin",
         "yoi:plugin/https-logged-tool-plugin@2.0.0" => "https-logged-tool-plugin",
+        "yoi:plugin/ticket-tool-plugin@2.1.0" => "ticket-tool-plugin",
         _ => return Err(format!("unsupported Component world `{world}`")),
     };
     if !wasmparser::Parser::is_component(bytes) {
@@ -107,9 +108,27 @@ fn contract(world_name: &str) -> Result<(Resolve, WorldId), String> {
     resolve
         .push_str("yoi-host-v2.wit", HOST_WIT)
         .map_err(|error| format!("invalid embedded Host WIT: {error:#}"))?;
-    let package = resolve
+    let old_package = resolve
         .push_str("yoi-plugin-v2.wit", PLUGIN_WIT)
         .map_err(|error| format!("invalid embedded Plugin WIT: {error:#}"))?;
+    let package = if world_name == "ticket-tool-plugin" {
+        resolve
+            .push_str(
+                "yoi-host-v2.1.wit",
+                include_str!(
+                    "../../../../resources/plugin/wit-ticket/deps/yoi-host-v2.1/yoi-host-v2.1.wit"
+                ),
+            )
+            .map_err(|e| format!("invalid Ticket Host WIT: {e:#}"))?;
+        resolve
+            .push_str(
+                "yoi-plugin-v2.1.wit",
+                include_str!("../../../../resources/plugin/wit-ticket/yoi-plugin-v2.1.wit"),
+            )
+            .map_err(|e| format!("invalid Ticket Plugin WIT: {e:#}"))?
+    } else {
+        old_package
+    };
     let world = resolve
         .select_world(&[package], Some(world_name))
         .map_err(|error| format!("invalid embedded Plugin world: {error:#}"))?;
@@ -568,5 +587,59 @@ mod tests {
         let mut component = encode(&resolve, world);
         component.pop();
         assert!(validate_component(&component, PURE, &[]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ticket_tests {
+    use super::*;
+    #[test]
+    fn additive_ticket_world_cannot_be_claimed_as_an_old_component_world() {
+        let (resolve, world) = contract("ticket-tool-plugin").unwrap();
+        let mut core =
+            wit_component::dummy_module(&resolve, world, wit_parser::ManglingAndAbi::Standard32);
+        wit_component::embed_component_metadata(
+            &mut core,
+            &resolve,
+            world,
+            wit_component::StringEncoding::UTF8,
+        )
+        .unwrap();
+        let bytes = wit_component::ComponentEncoder::default()
+            .module(&core)
+            .unwrap()
+            .validate(true)
+            .encode()
+            .unwrap();
+        let imports: Vec<_> = surface(&resolve, world, true)
+            .unwrap()
+            .into_keys()
+            .collect();
+        let checked = validate_component(
+            &bytes,
+            crate::plugin::PLUGIN_COMPONENT_TICKET_TOOL_WORLD,
+            &imports,
+        )
+        .unwrap();
+        assert!(checked.imports.contains(&"yoi:host/objects@2.1.0".into()));
+        assert!(
+            checked
+                .imports
+                .contains(&"yoi:host/ticket-read@2.1.0".into())
+        );
+        assert!(
+            checked
+                .imports
+                .contains(&"yoi:host/extension-data@2.1.0".into())
+        );
+        assert_eq!(checked.exports, ["yoi:plugin/tool@2.0.0"]);
+        assert!(
+            validate_component(
+                &bytes,
+                crate::plugin::PLUGIN_COMPONENT_HTTPS_LOGGED_TOOL_WORLD,
+                &imports
+            )
+            .is_err()
+        );
     }
 }

@@ -91,12 +91,25 @@ pub enum PluginSurface {
     Tool,
 }
 
-/// Only capabilities implemented by the initial Tool Host are representable.
+/// Exact grant identities; new operations are never implied by old pins.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginGrant {
     Logging,
-    Https { slot: String },
+    Https {
+        slot: String,
+    },
+    TicketRead,
+    TicketDataRead {
+        collection: String,
+        schema_id: String,
+        schema_version: String,
+    },
+    TicketDataWrite {
+        collection: String,
+        schema_id: String,
+        schema_version: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -164,6 +177,7 @@ impl WorkerPluginPin {
                     | plugin::PLUGIN_COMPONENT_HTTPS_TOOL_WORLD
                     | plugin::PLUGIN_COMPONENT_LOGGED_TOOL_WORLD
                     | plugin::PLUGIN_COMPONENT_HTTPS_LOGGED_TOOL_WORLD
+                    | plugin::PLUGIN_COMPONENT_TICKET_TOOL_WORLD
             )
             || !valid_digest(&artifact.config_schema.digest)
             || !valid_identity(&artifact.package_id)
@@ -201,6 +215,27 @@ impl WorkerPluginPin {
                         .any(|slot| *slot == binding.slot)
             })
             || projection.grants.iter().any(|grant| match grant {
+                PluginGrant::TicketRead
+                | PluginGrant::TicketDataRead { .. }
+                | PluginGrant::TicketDataWrite { .. } => {
+                    artifact.world != plugin::PLUGIN_COMPONENT_TICKET_TOOL_WORLD
+                        || !artifact.requested_grants.contains(grant)
+                        || match grant {
+                            PluginGrant::TicketDataRead {
+                                collection,
+                                schema_id,
+                                schema_version,
+                            }
+                            | PluginGrant::TicketDataWrite {
+                                collection,
+                                schema_id,
+                                schema_version,
+                            } => [collection, schema_id, schema_version]
+                                .iter()
+                                .any(|v| !valid_identity(v) || v.len() > 128),
+                            _ => false,
+                        }
+                }
                 PluginGrant::Logging => !artifact.requested_grants.contains(&PluginGrant::Logging),
                 PluginGrant::Https { slot } => {
                     !valid_identity(slot)

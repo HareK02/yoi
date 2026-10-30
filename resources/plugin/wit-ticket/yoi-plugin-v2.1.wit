@@ -1,0 +1,10 @@
+package yoi:plugin@2.1.0;
+
+/// Additive exact world: never augment an old @2.0.0 pin's imports or grants.
+world ticket-tool-plugin {
+    include yoi:plugin/tool-plugin@2.0.0;
+    import yoi:host/errors@2.0.0;
+    import yoi:host/objects@2.1.0;
+    import yoi:host/ticket-read@2.1.0;
+    import yoi:host/extension-data@2.1.0;
+}

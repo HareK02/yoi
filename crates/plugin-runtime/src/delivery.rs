@@ -360,6 +360,7 @@ impl ArtifactCache {
             || !same_json(&d.tools, &m.tools)?
             || !same_json(&d.connections, &m.connections)?
             || !same_json(&d.requested_grants, &m.requested_grants)?
+            || !same_json(&d.data_collections, &m.data_collections)?
             || d.config_schema.dcdl != m.config_schema
             || d.config_schema.digest != schema.digest
             || d.config_schema.identity != schema.identity

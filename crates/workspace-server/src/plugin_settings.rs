@@ -46,6 +46,12 @@ pub struct PluginEnablement {
     pub artifact_digest: String,
     pub tools: Vec<String>,
     pub logging: bool,
+    #[serde(default)]
+    pub ticket_read: bool,
+    #[serde(default)]
+    pub ticket_data_read: Vec<manifest::PluginTicketDataGrant>,
+    #[serde(default)]
+    pub ticket_data_write: Vec<manifest::PluginTicketDataGrant>,
     pub connections: BTreeMap<String, String>,
     pub config: serde_json::Value,
 }
@@ -164,7 +170,7 @@ pub(crate) fn evaluate_catalog_config(
     // Each alias has its own closed schema. Reusing an artifact with distinct
     // bindings is intentional and does not manufacture another schema authority.
     let enabled_fields = artifacts.iter().map(|(alias, artifact)| {
-        format!("{} = {{ installation_id = String; expected_last_operation = String; package_digest = String; artifact_digest = String; tools = [...String]; logging = Bool default false; connections = {{ ...String }} default {{}}; config = ({}); }};", alias, artifact.config_schema.dcdl)
+        format!("{} = {{ installation_id = String; expected_last_operation = String; package_digest = String; artifact_digest = String; tools = [...String]; logging = Bool default false; ticket_read = Bool default false; ticket_data_read = [...{{ collection = String; schema_id = String; schema_version = String; }}] default []; ticket_data_write = [...{{ collection = String; schema_id = String; schema_version = String; }}] default []; connections = {{ ...String }} default {{}}; config = ({}); }};", alias, artifact.config_schema.dcdl)
     }).collect::<Vec<_>>().join("\n");
     let enabled_schema = if enabled_fields.is_empty() {
         "{} default {}".to_string()
@@ -238,6 +244,7 @@ fn validate_enablement(
                 | manifest::plugin::PLUGIN_COMPONENT_HTTPS_TOOL_WORLD
                 | manifest::plugin::PLUGIN_COMPONENT_LOGGED_TOOL_WORLD
                 | manifest::plugin::PLUGIN_COMPONENT_HTTPS_LOGGED_TOOL_WORLD
+                | "yoi:plugin/ticket-tool-plugin@2.1.0"
         )
         || artifact.required_imports.iter().any(|i| {
             !matches!(
@@ -246,6 +253,9 @@ fn validate_enablement(
                     | "yoi:host/connections@2.0.0"
                     | "yoi:host/http@2.0.0"
                     | "yoi:host/logging@2.0.0"
+                    | "yoi:host/objects@2.1.0"
+                    | "yoi:host/ticket-read@2.1.0"
+                    | "yoi:host/extension-data@2.1.0"
             )
         })
     {
@@ -265,6 +275,39 @@ fn validate_enablement(
             .contains(&PluginGrantMetadata::Logging)
     {
         return Err(config_error("logging exceeds package request"));
+    }
+    if enabled.ticket_read
+        && !artifact
+            .requested_grants
+            .contains(&PluginGrantMetadata::TicketRead)
+    {
+        return Err(config_error("Ticket read exceeds package request"));
+    }
+    for (write, grants) in [
+        (false, &enabled.ticket_data_read),
+        (true, &enabled.ticket_data_write),
+    ] {
+        if grants.iter().collect::<BTreeSet<_>>().len() != grants.len() {
+            return Err(config_error("duplicate Ticket data grant"));
+        }
+        for grant in grants {
+            let metadata = if write {
+                PluginGrantMetadata::TicketDataWrite {
+                    collection: grant.collection.clone(),
+                    schema_id: grant.schema_id.clone(),
+                    schema_version: grant.schema_version.clone(),
+                }
+            } else {
+                PluginGrantMetadata::TicketDataRead {
+                    collection: grant.collection.clone(),
+                    schema_id: grant.schema_id.clone(),
+                    schema_version: grant.schema_version.clone(),
+                }
+            };
+            if !artifact.requested_grants.contains(&metadata) {
+                return Err(config_error("Ticket data grant exceeds package request"));
+            }
+        }
     }
     for (slot, binding) in &enabled.connections {
         let requested = artifact
@@ -390,6 +433,15 @@ fn project_profile_plugins(
             .iter()
             .any(|tool| !enabled.tools.contains(tool))
             || (selection.logging && !enabled.logging)
+            || (selection.ticket_read && !enabled.ticket_read)
+            || selection
+                .ticket_data_read
+                .iter()
+                .any(|grant| !enabled.ticket_data_read.contains(grant))
+            || selection
+                .ticket_data_write
+                .iter()
+                .any(|grant| !enabled.ticket_data_write.contains(grant))
             || selection
                 .https_slots
                 .iter()
@@ -411,6 +463,23 @@ fn project_profile_plugins(
         let mut grants = Vec::new();
         if selection.logging {
             grants.push(PluginGrant::Logging);
+        }
+        if selection.ticket_read {
+            grants.push(PluginGrant::TicketRead);
+        }
+        for grant in &selection.ticket_data_read {
+            grants.push(PluginGrant::TicketDataRead {
+                collection: grant.collection.clone(),
+                schema_id: grant.schema_id.clone(),
+                schema_version: grant.schema_version.clone(),
+            });
+        }
+        for grant in &selection.ticket_data_write {
+            grants.push(PluginGrant::TicketDataWrite {
+                collection: grant.collection.clone(),
+                schema_id: grant.schema_id.clone(),
+                schema_version: grant.schema_version.clone(),
+            });
         }
         let mut bindings = Vec::new();
         for slot in &selection.https_slots {

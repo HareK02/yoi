@@ -16,6 +16,11 @@ use crate::{Error, Result};
 /// Explicit domain-owned purge inventory. The deletion operation tombstone is intentionally
 /// excluded so retries and audit remain available after the Workspace row is gone.
 const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
+    "plugin_data_receipts",
+    "plugin_data_purges",
+    "plugin_data_holders",
+    "plugin_data_cells",
+    "plugin_data_cursors",
     "plugin_effect_receipts",
     "plugin_invocations",
     "worker_plugin_launches",
@@ -512,6 +517,8 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             // commit; update guards remain installed throughout.
             let mut ticket_delete_guards = Vec::new();
             for (table, trigger) in [
+                ("plugin_data_receipts", "plugin_data_receipt_retained"),
+                ("plugin_data_purges", "plugin_data_purge_retained"),
                 ("plugin_effect_receipts", "plugin_effect_retained"),
                 ("plugin_invocations", "plugin_invocation_retained"),
                 ("worker_plugin_launches", "worker_plugin_launch_retained"),

@@ -202,3 +202,39 @@ fn deserialized_unknown_fields_versions_and_noncanonical_order_are_rejected() {
     unsorted.input.plugins.push(second);
     assert_eq!(unsorted.validate_canonical(), Err(PlanError::Invalid));
 }
+
+#[test]
+fn ticket_grants_require_exact_world_request_and_schema_namespace() {
+    let mut a = artifact();
+    let write = PluginGrant::TicketDataWrite {
+        collection: "notes".into(),
+        schema_id: "note".into(),
+        schema_version: "1".into(),
+    };
+    let read = PluginGrant::TicketDataRead {
+        collection: "notes".into(),
+        schema_id: "note".into(),
+        schema_version: "1".into(),
+    };
+    a.requested_grants
+        .extend([PluginGrant::TicketRead, write.clone()]);
+    let mut selected = projection();
+    selected.grants.push(write.clone());
+    // Even a fabricated metadata request cannot add Ticket operations to v2.0.
+    assert_eq!(pin(&a, selected.clone()), Err(PlanError::Invalid));
+    a.world = plugin::PLUGIN_COMPONENT_TICKET_TOOL_WORLD.into();
+    let exact = pin(&a, selected.clone()).unwrap();
+    assert!(exact.projection().grants.contains(&write));
+    assert!(!exact.projection().grants.contains(&read)); // write is not read
+    selected.grants.push(read);
+    assert_eq!(pin(&a, selected), Err(PlanError::Invalid));
+    let mut selected = projection();
+    selected.grants.push(PluginGrant::TicketDataWrite {
+        collection: "notes".into(),
+        schema_id: "note".into(),
+        schema_version: "2".into(),
+    });
+    assert_eq!(pin(&a, selected), Err(PlanError::Invalid));
+    a.requested_grants.retain(|g| g != &write);
+    assert_eq!(exact.matches_artifact(&a), Err(PlanError::Invalid));
+}

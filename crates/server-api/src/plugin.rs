@@ -97,7 +97,31 @@ pub struct PluginConnectionMetadata {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginGrantMetadata {
     Logging,
-    Https { slot: String },
+    Https {
+        slot: String,
+    },
+    TicketRead,
+    TicketDataRead {
+        collection: String,
+        schema_id: String,
+        schema_version: String,
+    },
+    TicketDataWrite {
+        collection: String,
+        schema_id: String,
+        schema_version: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginDataSchemaMetadata {
+    pub collection: String,
+    pub schema_id: String,
+    pub schema_version: String,
+    #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+    pub schema: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -117,6 +141,8 @@ pub struct PluginArtifact {
     pub tools: Vec<PluginToolMetadata>,
     pub connections: Vec<PluginConnectionMetadata>,
     pub requested_grants: Vec<PluginGrantMetadata>,
+    #[serde(default)]
+    pub data_collections: Vec<PluginDataSchemaMetadata>,
     pub config_schema: PluginSchemaContribution,
     pub revoked: bool,
     pub revocation_reason: Option<String>,
@@ -147,6 +173,25 @@ impl plugin_plan::ArtifactDescriptor for PluginArtifact {
                     PluginGrantMetadata::Https { slot } => {
                         plugin_plan::PluginGrant::Https { slot: slot.clone() }
                     }
+                    PluginGrantMetadata::TicketRead => plugin_plan::PluginGrant::TicketRead,
+                    PluginGrantMetadata::TicketDataRead {
+                        collection,
+                        schema_id,
+                        schema_version,
+                    } => plugin_plan::PluginGrant::TicketDataRead {
+                        collection: collection.clone(),
+                        schema_id: schema_id.clone(),
+                        schema_version: schema_version.clone(),
+                    },
+                    PluginGrantMetadata::TicketDataWrite {
+                        collection,
+                        schema_id,
+                        schema_version,
+                    } => plugin_plan::PluginGrant::TicketDataWrite {
+                        collection: collection.clone(),
+                        schema_id: schema_id.clone(),
+                        schema_version: schema_version.clone(),
+                    },
                 })
                 .collect(),
             config_schema: plugin_plan::PluginSchemaIdentity {
@@ -158,6 +203,33 @@ impl plugin_plan::ArtifactDescriptor for PluginArtifact {
             revoked: self.revoked,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginDataPurgeState {
+    pub installation_last_operation: String,
+    pub cells_digest: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub cell_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginDataPurgeRequest {
+    pub operation_key: String,
+    pub expected: PluginDataPurgeState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginDataPurgeResponse {
+    pub purge_id: String,
+    pub observed: PluginDataPurgeState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

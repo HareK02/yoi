@@ -227,7 +227,10 @@ pub fn lookup(conn: &Connection, workspace: &str, invocation_id: &str) -> Result
 
 // Never trust a passed record's mutable flags/deadline or accept a fabricated
 // plan/execution/consumer. Records may be stale only in monotonic terminal flags.
-fn verify_record(conn: &Connection, supplied: &InvocationRecord) -> Result<InvocationRecord> {
+pub(crate) fn verify_record(
+    conn: &Connection,
+    supplied: &InvocationRecord,
+) -> Result<InvocationRecord> {
     let saved = lookup(conn, &supplied.workspace_id, &supplied.invocation_id)?;
     if supplied.plan_id != saved.plan_id
         || supplied.installation_id != saved.installation_id
@@ -334,7 +337,11 @@ pub fn effect_admit(
     tx.execute(
         "INSERT INTO plugin_effect_receipts(workspace_id,invocation_id,effect_key,fingerprint,admitted_at_ms,state,error_json) VALUES(?1,?2,?3,?4,?5,'pending',?6)",
         params![record.workspace_id, record.invocation_id, effect_key, fingerprint, now_ms, encode(&unknown)?],
-    )?;
+    ).map_err(|error| match &error {
+        rusqlite::Error::SqliteFailure(_, Some(message)) if message == "Plugin operation key belongs to data" =>
+            Error::from(host_error(PluginHostErrorCode::Conflict, PluginEffectObservation::Indeterminate)),
+        _ => Error::from(error),
+    })?;
     Ok(EffectAdmission::Dispatch)
 }
 
@@ -441,8 +448,9 @@ pub fn cancel(tx: &Transaction<'_>, workspace: &str, invocation_id: &str) -> Res
 }
 
 /// Expire matching invocations and erase response/error payloads, never identity,
-/// fingerprints or keys. Returns the number of receipts newly tombstoned. Even a
-/// subsequent backwards clock cannot resurrect an explicitly expired invocation.
+/// fingerprints or keys. Returns the number of HTTPS receipts newly tombstoned;
+/// extension-data payload expiry follows the same invocation flag atomically.
+/// A backwards clock cannot resurrect an explicitly expired invocation.
 /// Tombstones survive until the parent's Workspace deletion cascade.
 pub fn prune(tx: &Transaction<'_>, workspace: &str, now_ms: i64) -> Result<usize> {
     if !valid_identity(workspace, 512) || now_ms < 0 {

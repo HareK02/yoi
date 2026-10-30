@@ -12,17 +12,17 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
     assert!(!table_exists(&conn, "plugin_invocations").unwrap());
     let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
     assert_eq!(plan.current_schema_version, 108);
-    assert_eq!(plan.migrations.iter().map(|step| step.version).collect::<Vec<_>>(), [109, 110]);
+    assert_eq!(plan.migrations.iter().map(|step| step.version).collect::<Vec<_>>(), [109, 110, 111]);
     assert_eq!(current_schema_version(&conn).unwrap(), 108);
     drop(conn);
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     store.with_conn(|conn| {
         crate::plugin_host::verify_receipt_schema(conn)?;
-        assert_eq!(current_schema_version(conn)?, 110);
+        assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
         let upgraded = workspace_schema_migration_history(conn)?;
         assert_eq!(&upgraded[..history.len()], history.as_slice());
         assert_eq!(upgraded.iter().find(|(version, _)| *version == 109).unwrap().1, "Durable Plugin Host invocations and HTTPS effect receipts");
-        assert_eq!(upgraded.last().unwrap().1, "Worker Plugin launch selection associations");
+        assert_eq!(upgraded.iter().find(|(version, _)| *version == 110).unwrap().1, "Worker Plugin launch selection associations");
         assert_eq!(conn.query_row("SELECT count(*) FROM workspaces WHERE workspace_id='space'", [], |row| row.get::<_, i64>(0))?, 1);
         assert_eq!(conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0))?, 0);
         Ok(())

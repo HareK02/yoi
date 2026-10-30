@@ -257,6 +257,8 @@ loggingはlevel、event code、安全なmessageとscalar fieldsに限定する�
 
 ## 9. 付随データの契約
 
+Ticket拡張の機械的契約は[追加world](wit-ticket/yoi-plugin-v2.1.wit)と[resource imports](wit-ticket/deps/yoi-host-v2.1/yoi-host-v2.1.wit)、`server-api::plugin_data`に置く。旧`@2.0.0` worldへのimport追加や保存pinへのgrant補完はしない。package保存formatのschema versionと、Component world/APIのexact versionは別の境界である。
+
 Server拡張はdomain objectに関連付けるPlugin所有のtyped dataとし、既存tableへの任意column追加では実現しない。物理保存schemaはHostが管理する。`feature-storage`のnative migration/SQLite handleは信頼済みHost用でありguestへ公開しない。
 
 addressはHost contextのWorkspace/installationと、認可済みobject resource、宣言collection、schema id/version、keyから決まる。schema id/versionも物理・論理namespaceに含め、新旧artifactが同じcellを別schemaで読み書きしない。guestにWorkspace selectorやraw table名を与えない。最初のobject kindはTicketとし、Hostが存在・Workspace・callerのread/write権限を検証したTicket resourceだけを使う。一般objectへの拡張はadapterと権限を追加して行う。
@@ -265,7 +267,7 @@ addressはHost contextのWorkspace/installationと、認可済みobject resource
 
 `ticket-read.read(borrow<ticket>)`はread権限を再検査し、title、case state、content digest、bounded bodyとtruncated flagだけを返す専用read APIとする。thread、添付、認証・管理情報、将来増えるfieldを汎用serializeで公開しない。上限は64 KiB、完全本文が必要なら本APIではunsupportedとする。eventの削除通知自体は安全なmetadataとして配送できるが、削除済みTicket resourceをresolve/readできる意味ではない。
 
-- packageはcollectionごとにschema id/versionとclosed typed schemaを宣言する。data valueのJSONはそのschemaで検証する。
+- packageはcollectionごとにschema id/versionとclosed typed schemaを宣言する。data valueのJSONはそのschemaで検証する。同installationの同collection/schema id/versionはrevoked artifactを含め同一schemaへ束縛し、artifact登録transactionで内容差を拒否する。exact artifactだけでは共有cellの意味を固定できないためである。value上限64 KiBはJSONのUTF-8表現（escapeを含む）のbyte数とし、listは最大100件、Remote envelopeの再escapeを含む有限response budgetを適用する。
 - APIは`get`、`put(expected_last_write | never_written, operation_key, value)`、`delete(expected_last_write, operation_key)`、bounded `list(cursor, limit)`。任意query、SQL、cross-object transactionは公開しない。
 - 同じcellへのput/deleteを確定した最終operation identityを、書込みtransaction内で観測値と比較する。CAS成功とoperation receiptを同じtransactionで保存し、自動読直しによるlast-write-winsへ変えない。同じ内容の再書込みや削除・再作成を時刻/内容hashだけで区別できないため、このoperationを比較する。
 - deleteは最終delete operationのtombstoneを保持する。再作成はそのoperationを期待値にし、`never_written`を通さない。これによりABAを防ぐ。`get`は対象objectの認可成功後に限り、present(value, last-write)、never-written、deleted(last-delete)を区別する。不可視objectと不存在は同じnot-foundにする。
@@ -276,7 +278,7 @@ addressはHost contextのWorkspace/installationと、認可済みobject resource
 - 親object削除とPlugin data書込みはowner側の削除fenceで競合を解決する。削除後に新しい子dataを作らず、retention後にHostが回収する。
 - schemaの破壊的変更は新しいschema version/namespaceとする。既存dataをguest起動時にmigrationしない。移行は新旧schemaを明示した認可付き操作として後続で設計し、初期APIでは自動変換しない。
 - rollbackで旧artifactを使う場合も元schemaだけを読む。最新schemaへ読み替えない。
-- revoke/disableではdataを消さない。Workspace管理者の明示purgeをoperation keyと期待data-generationで行い、先に実行をrevoke/fenceする。purge receiptを残し、uninstallとの一操作への暗黙統合をしない。
+- revoke/disableではdataを消さない。Workspace管理者の明示purgeは先に全artifactをrevoke/fenceし、その後のtransactionで観測したinstallation最終catalog operationと、全cell（tombstone含む）のnamespace/key/最終write operation/deleted状態の順序付き集合digest・件数を期待値として比較する。新規writeだけでなく同一値の再書込みやdelete/recreateも区別し、汎用更新番号は導入しない。operation keyによるpurge receiptを残し、uninstallとの一操作への暗黙統合をしない。
 
 ## 10. commit済みeventとService
 

@@ -5,6 +5,8 @@ use super::*;
 use crate::{plugin_host as policy, plugin_https as https, plugin_receipt as receipt};
 use rusqlite::OptionalExtension;
 use server_api::*;
+#[path = "server_plugin_data.rs"]
+mod data;
 
 impl WorkspaceApi {
     /// Host plan creation after the canonical reservation and grant/Job binding,
@@ -392,6 +394,14 @@ async fn execute_with_transport(
     // Human management and a Runtime-only (no Worker) source both fail closed.
     subject_authorization::source_from_context(&context).map_err(|_| denied())?;
     match request {
+        request @ (PluginHostRequest::ResolveTicket { .. }
+        | PluginHostRequest::ReadTicket { .. }
+        | PluginHostRequest::DataGet { .. }
+        | PluginHostRequest::DataMutate { .. }
+        | PluginHostRequest::DataList { .. }
+        | PluginHostRequest::DataLookupMutation { .. }) => {
+            data::execute(api, context, workspace, request).await
+        }
         PluginHostRequest::Prepare {
             plan_id,
             installation_id,

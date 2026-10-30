@@ -1,0 +1,46 @@
+package yoi:host@2.1.0;
+
+/// Handles are invocation-local selectors, not durable authorization.
+interface objects {
+    use yoi:host/errors@2.0.0.{host-error};
+    enum access { read, extension-write }
+    resource ticket;
+    resolve-ticket: func(ticket-ref: string, requested: access) -> result<ticket, host-error>;
+}
+
+interface ticket-read {
+    use yoi:host/errors@2.0.0.{host-error};
+    use objects.{ticket};
+    enum case-state { open, closed }
+    record snapshot {
+        title: string,
+        state: case-state,
+        content-digest: string,
+        body: string,
+        truncated: bool,
+    }
+    read: func(target: borrow<ticket>) -> result<snapshot, host-error>;
+}
+
+interface extension-data {
+    use yoi:host/errors@2.0.0.{host-error};
+    use objects.{ticket};
+    record collection {
+        collection: string,
+        schema-id: string,
+        schema-version: string,
+    }
+    record address { namespace: collection, key: string }
+    variant expectation { never-written, last-write(string) }
+    record present-cell { value-json: string, last-write: string }
+    variant cell { never-written, present(present-cell), deleted(string) }
+    record receipt { mutation-id: string, result-digest: string }
+    variant mutation-lookup { not-recorded, committed(receipt), expired }
+    record entry { key: string, value: cell }
+    record page { entries: list<entry>, next-cursor: option<string> }
+    get: func(target: borrow<ticket>, cell-address: address) -> result<cell, host-error>;
+    put: func(target: borrow<ticket>, cell-address: address, expected: expectation, operation-key: string, value-json: string) -> result<receipt, host-error>;
+    delete: func(target: borrow<ticket>, cell-address: address, expected-last-write: string, operation-key: string) -> result<receipt, host-error>;
+    %list: func(target: borrow<ticket>, namespace: collection, cursor: option<string>, limit: u32) -> result<page, host-error>;
+    lookup-mutation: func(target: borrow<ticket>, cell-address: address, operation-key: string) -> result<mutation-lookup, host-error>;
+}

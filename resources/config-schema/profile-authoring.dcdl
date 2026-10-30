@@ -79,6 +79,9 @@ let
         plugins = { selections = [...{
             installation_id = String; tools = [...String]; logging = Bool;
             https_slots = [...String];
+            ticket_read = Bool default false;
+            ticket_data_read = [...{ collection = String; schema_id = String; schema_version = String; }] default [];
+            ticket_data_write = [...{ collection = String; schema_id = String; schema_version = String; }] default [];
             # 非秘密のoverrideは補完用のshapeではなく、導入済みpackageの
             # closed typed schemaで検証する。
             config = { ...Unknown };

@@ -1,6 +1,10 @@
 //! Shared owner transport and WIT Host adapter. In-process owners implement the
 //! same trait directly; a failed remote call never selects a local fallback.
-use crate::host::{Host, InvocationContext, Operation, errors, http, logging};
+use crate::host::{
+    Host, InvocationContext, Operation, TicketDataOperation, TicketDataResult, errors, http,
+    logging, objects, ticket_read,
+};
+mod ticket;
 use async_trait::async_trait;
 use server_api::{
     PluginConsumer, PluginEffectObservation, PluginHostError, PluginHostErrorCode,
@@ -12,6 +16,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+pub(crate) use ticket::validate_operation;
 use tokio::time::Instant;
 
 /// Bound to one authenticated caller and Workspace by the integration. The owner
@@ -44,11 +49,12 @@ pub trait PluginHostOwner: Send + Sync {
     }
 }
 
-/// Finite generated-client response budget for the supported one-MiB binary
-/// body, its worst-case JSON numeric-array expansion, headers and envelope.
+/// Finite generated-client response budget: a 100-cell page of 64-KiB JSON
+/// strings, their wire escaping, plus keys/receipt metadata; also covers the
+/// original one-MiB binary HTTP body and numeric-array expansion.
 /// Set `response_body_limit` on the injected client before constructing a Remote
 /// owner; a smaller operator-selected limit may reject otherwise valid replies.
-pub const PLUGIN_HOST_RESPONSE_BODY_LIMIT: usize = 4 * 1024 * 1024 + 512 * 1024;
+pub const PLUGIN_HOST_RESPONSE_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Uses an injected, already configured generated client (including its existing
 /// Runtime request authorizer). This adapter never creates or owns credentials.
@@ -72,7 +78,10 @@ impl<A: server_api::client_support::RequestAuthorizer> PluginHostOwner
         &self,
         request: PluginHostRequest,
     ) -> Result<PluginHostResponse, PluginHostError> {
-        let may_dispatch = matches!(request, PluginHostRequest::Send { .. });
+        let may_dispatch = matches!(
+            request,
+            PluginHostRequest::Send { .. } | PluginHostRequest::DataMutate { .. }
+        );
         self.client
             .plugin_host(self.workspace_id.clone(), request)
             .await
@@ -210,6 +219,9 @@ impl OwnerHost {
             || context.invocation_id != bound.invocation_id
             || context.artifact != bound.artifact
             || context.tool_name != bound.tool_name
+            || context.grants.ticket_read != bound.grants.ticket_read
+            || context.grants.ticket_data_read != bound.grants.ticket_data_read
+            || context.grants.ticket_data_write != bound.grants.ticket_data_write
             || context.grants.logging != bound.grants.logging
             || context.grants.connection_slots != bound.grants.connection_slots
             // The executor may shorten the deadline and derive a child token.
@@ -253,6 +265,36 @@ impl OwnerHost {
 
 #[async_trait]
 impl Host for OwnerHost {
+    async fn resolve_ticket(
+        &self,
+        context: &InvocationContext,
+        ticket_ref: &str,
+        access: objects::Access,
+    ) -> Result<Arc<dyn Any + Send + Sync>, errors::HostError> {
+        self.resolve_ticket_binding(context, ticket_ref, access)
+            .await
+            .map_err(wit_error)
+    }
+    async fn read_ticket(
+        &self,
+        context: &InvocationContext,
+        binding: &(dyn Any + Send + Sync),
+    ) -> Result<ticket_read::Snapshot, errors::HostError> {
+        self.read_ticket_binding(context, binding)
+            .await
+            .map_err(wit_error)
+    }
+    async fn ticket_data(
+        &self,
+        context: &InvocationContext,
+        binding: &(dyn Any + Send + Sync),
+        operation: TicketDataOperation,
+    ) -> Result<TicketDataResult, errors::HostError> {
+        self.ticket_data_binding(context, binding, operation)
+            .await
+            .map_err(wit_error)
+    }
+
     async fn authorize(
         &self,
         context: &InvocationContext,
@@ -447,7 +489,10 @@ async fn call_owner(
     request: PluginHostRequest,
 ) -> Result<PluginHostResponse, PluginHostError> {
     check_lifetime(context)?;
-    let effect = if matches!(request, PluginHostRequest::Send { .. }) {
+    let effect = if matches!(
+        request,
+        PluginHostRequest::Send { .. } | PluginHostRequest::DataMutate { .. }
+    ) {
         PluginEffectObservation::Indeterminate
     } else {
         PluginEffectObservation::NotDispatched
@@ -588,6 +633,40 @@ mod tests {
                     },
                 },
                 PluginHostRequest::Log { .. } => PluginHostResponse::Logged,
+                PluginHostRequest::ResolveTicket { .. } => PluginHostResponse::TicketResolved {
+                    ticket_id: "canonical-ticket".into(),
+                },
+                PluginHostRequest::ReadTicket { .. } => PluginHostResponse::TicketRead {
+                    snapshot: server_api::PluginTicketSnapshot {
+                        title: "title".into(),
+                        case_state: server_api::PluginTicketCaseState::Open,
+                        content_digest: "digest".into(),
+                        body: "bounded".into(),
+                        truncated: false,
+                    },
+                },
+                PluginHostRequest::DataGet { .. } => PluginHostResponse::DataCell {
+                    cell: server_api::PluginDataCell::NeverWritten,
+                },
+                PluginHostRequest::DataMutate { operation_key, .. } => {
+                    PluginHostResponse::DataMutated {
+                        receipt: server_api::PluginDataReceipt {
+                            mutation_id: operation_key,
+                            result_digest: "digest".into(),
+                        },
+                    }
+                }
+                PluginHostRequest::DataList { .. } => PluginHostResponse::DataListed {
+                    page: server_api::PluginDataPage {
+                        entries: vec![],
+                        next_cursor: None,
+                    },
+                },
+                PluginHostRequest::DataLookupMutation { .. } => {
+                    PluginHostResponse::DataMutationLookup {
+                        outcome: server_api::PluginDataMutationLookup::NotRecorded,
+                    }
+                }
             })
         }
     }
@@ -607,6 +686,7 @@ mod tests {
             grants: Grants {
                 logging: true,
                 connection_slots: ["api".into(), "other".into()].into(),
+                ..Default::default()
             },
             deadline: Instant::now() + Duration::from_secs(60),
             cancellation: CancellationToken::new(),
@@ -858,6 +938,192 @@ mod tests {
             errors::Code::Cancelled
         );
         assert_eq!(owner.requests.lock().unwrap().len(), count + 1);
+    }
+
+    fn ticket_context() -> InvocationContext {
+        let mut c = context();
+        c.grants.ticket_read = true;
+        c.grants
+            .ticket_data_read
+            .insert(("notes".into(), "note".into(), "1".into()));
+        c.grants.ticket_data_write = c.grants.ticket_data_read.clone();
+        c
+    }
+    fn cell_address() -> server_api::PluginDataAddress {
+        server_api::PluginDataAddress {
+            collection: server_api::PluginDataCollection {
+                collection: "notes".into(),
+                schema_id: "note".into(),
+                schema_version: "1".into(),
+            },
+            key: "key".into(),
+        }
+    }
+    #[tokio::test]
+    async fn remote_and_direct_ticket_resources_reauthorize_and_reject_foreign_handles() {
+        let mut transcripts = Vec::new();
+        for use_remote in [false, true] {
+            let owner = Arc::new(TestOwner::default());
+            let (transport, _endpoint): (Arc<dyn PluginHostOwner>, _) = if use_remote {
+                let (t, e) = remote(owner.clone()).await;
+                (t, Some(e))
+            } else {
+                (owner.clone(), None)
+            };
+            let host = OwnerHost::begin(transport.clone(), ticket_context(), consumer())
+                .await
+                .unwrap();
+            let foreign = OwnerHost::begin(transport, ticket_context(), consumer())
+                .await
+                .unwrap();
+            let resource = host
+                .resolve_ticket(host.context(), "T-795", objects::Access::ExtensionWrite)
+                .await
+                .unwrap();
+            let other = foreign
+                .resolve_ticket(foreign.context(), "T-795", objects::Access::ExtensionWrite)
+                .await
+                .unwrap();
+            // Test owner deliberately reuses invocation IDs. Private Arc identity,
+            // not the string or canonical Ticket ID, still rejects foreign use.
+            let count = owner.requests.lock().unwrap().len();
+            assert_eq!(
+                host.read_ticket(host.context(), other.as_ref())
+                    .await
+                    .unwrap_err()
+                    .code,
+                errors::Code::Denied
+            );
+            assert_eq!(
+                host.ticket_data(
+                    host.context(),
+                    other.as_ref(),
+                    TicketDataOperation::Get(cell_address())
+                )
+                .await
+                .unwrap_err()
+                .code,
+                errors::Code::Denied
+            );
+            let mut widened = host.context().clone();
+            widened
+                .grants
+                .ticket_data_read
+                .insert(("foreign".into(), "note".into(), "1".into()));
+            assert_eq!(
+                host.read_ticket(&widened, resource.as_ref())
+                    .await
+                    .unwrap_err()
+                    .code,
+                errors::Code::Denied
+            );
+            assert_eq!(owner.requests.lock().unwrap().len(), count);
+            assert_eq!(
+                host.read_ticket(host.context(), resource.as_ref())
+                    .await
+                    .unwrap()
+                    .body,
+                "bounded"
+            );
+            let read_only = host
+                .resolve_ticket(host.context(), "T-795", objects::Access::Read)
+                .await
+                .unwrap();
+            let mutation = TicketDataOperation::Mutate {
+                address: cell_address(),
+                operation_key: "write".into(),
+                mutation: server_api::PluginDataMutation::Put {
+                    expected: server_api::PluginDataExpectation::NeverWritten,
+                    value_json: "{}".into(),
+                },
+            };
+            assert_eq!(
+                host.ticket_data(host.context(), read_only.as_ref(), mutation.clone())
+                    .await
+                    .unwrap_err()
+                    .code,
+                errors::Code::Denied
+            );
+            assert!(matches!(
+                host.ticket_data(host.context(), resource.as_ref(), mutation)
+                    .await
+                    .unwrap(),
+                TicketDataResult::Mutated(_)
+            ));
+            assert!(matches!(
+                host.ticket_data(
+                    host.context(),
+                    resource.as_ref(),
+                    TicketDataOperation::Get(cell_address())
+                )
+                .await
+                .unwrap(),
+                TicketDataResult::Cell(_)
+            ));
+            host.ticket_data(
+                host.context(),
+                resource.as_ref(),
+                TicketDataOperation::List {
+                    collection: cell_address().collection,
+                    cursor: None,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+            host.ticket_data(
+                host.context(),
+                resource.as_ref(),
+                TicketDataOperation::LookupMutation {
+                    address: cell_address(),
+                    operation_key: "write".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let mut wrong_schema = cell_address();
+            wrong_schema.collection.schema_version = "2".into();
+            assert_eq!(
+                host.ticket_data(
+                    host.context(),
+                    resource.as_ref(),
+                    TicketDataOperation::Get(wrong_schema)
+                )
+                .await
+                .unwrap_err()
+                .code,
+                errors::Code::Denied
+            );
+            owner.revoked.store(true, Ordering::SeqCst);
+            assert_eq!(
+                host.read_ticket(host.context(), resource.as_ref())
+                    .await
+                    .unwrap_err()
+                    .code,
+                errors::Code::Denied
+            );
+            assert_eq!(
+                host.ticket_data(
+                    host.context(),
+                    resource.as_ref(),
+                    TicketDataOperation::Get(cell_address())
+                )
+                .await
+                .unwrap_err()
+                .code,
+                errors::Code::Denied
+            );
+            host.context().cancellation.cancel();
+            assert_eq!(
+                host.read_ticket(host.context(), resource.as_ref())
+                    .await
+                    .unwrap_err()
+                    .code,
+                errors::Code::Cancelled
+            );
+            transcripts.push(owner.requests.lock().unwrap().clone());
+        }
+        assert_eq!(transcripts[0], transcripts[1]);
     }
 
     struct PendingOwner {

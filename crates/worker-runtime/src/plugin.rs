@@ -67,6 +67,29 @@ pub async fn materialize(
                 plugin_plan::PluginGrant::Https { slot } => {
                     grants.connection_slots.insert(slot.clone());
                 }
+                plugin_plan::PluginGrant::TicketRead => grants.ticket_read = true,
+                plugin_plan::PluginGrant::TicketDataRead {
+                    collection,
+                    schema_id,
+                    schema_version,
+                } => {
+                    grants.ticket_data_read.insert((
+                        collection.clone(),
+                        schema_id.clone(),
+                        schema_version.clone(),
+                    ));
+                }
+                plugin_plan::PluginGrant::TicketDataWrite {
+                    collection,
+                    schema_id,
+                    schema_version,
+                } => {
+                    grants.ticket_data_write.insert((
+                        collection.clone(),
+                        schema_id.clone(),
+                        schema_version.clone(),
+                    ));
+                }
             }
         }
         pins.push(worker::plugin::PluginToolPin {

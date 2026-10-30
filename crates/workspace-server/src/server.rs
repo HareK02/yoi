@@ -13806,6 +13806,33 @@ impl server_api::ServerApi for ServerApiContractService {
         plugin::uninstall(api, actor, workspace_id, installation_id, request).await
     }
 
+    async fn plugin_data_observe(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        installation_id: String,
+    ) -> std::result::Result<server_api::PluginDataPurgeState, server_api::RepositoryApiError> {
+        plugin::data_observe(self.workspace_api()?, actor, workspace_id, installation_id).await
+    }
+
+    async fn plugin_data_purge(
+        &self,
+        actor: RequestActor,
+        workspace_id: String,
+        installation_id: String,
+        request: server_api::PluginDataPurgeRequest,
+    ) -> std::result::Result<server_api::PluginDataPurgeResponse, server_api::RepositoryApiError>
+    {
+        plugin::data_purge(
+            self.workspace_api()?,
+            actor,
+            workspace_id,
+            installation_id,
+            request,
+        )
+        .await
+    }
+
     async fn plugin_operation(
         &self,
         actor: RequestActor,

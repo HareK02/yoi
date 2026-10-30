@@ -88,8 +88,19 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 pub(crate) fn verify(conn: &Connection) -> Result<()> {
+    verify_catalog_schema(conn, false)
+}
+/// Latest-schema verification after the separately registered typed-data
+/// migration. Historical migration preconditions continue to use `verify`.
+pub(crate) fn verify_with_data(conn: &Connection) -> Result<()> {
+    verify_catalog_schema(conn, true)
+}
+fn verify_catalog_schema(conn: &Connection, with_data: bool) -> Result<()> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(include_str!("plugin_catalog_schema.sql"))?;
+    if with_data {
+        expected.execute_batch(crate::plugin_data::REFERENCE_MIGRATION_SQL)?;
+    }
     let objects = expected.prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND tbl_name LIKE 'plugin_%' ORDER BY name")?
         .query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -249,6 +260,7 @@ fn artifact_metadata(
             .collect(),
         connections: decode(&encode(&m.connections)?)?,
         requested_grants: decode(&encode(&m.requested_grants)?)?,
+        data_collections: decode(&encode(&m.data_collections)?)?,
         config_schema: PluginSchemaContribution {
             identity: schema.identity,
             version: schema.version,
@@ -369,12 +381,79 @@ fn save_operation(
     tx.execute("INSERT INTO plugin_operations(workspace_id,operation_id,actor,kind,operation_key,fingerprint,result_json) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![workspace,operation,actor,kind_name(kind),key,fingerprint,encode(&result)?])?;
     Ok(result)
 }
+// Collection/schema-id/version is a durable namespace within one installation.
+// Revocation does not erase that contract: a later artifact must use a new schema
+// version instead of reinterpreting retained cells under a changed schema.
+fn canonical_schema(value: &serde_json::Value) -> Result<String> {
+    fn sorted(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let ordered: std::collections::BTreeMap<_, _> = map
+                    .iter()
+                    .map(|(key, value)| (key.clone(), sorted(value)))
+                    .collect();
+                serde_json::Value::Object(ordered.into_iter().collect())
+            }
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.iter().map(sorted).collect())
+            }
+            value => value.clone(),
+        }
+    }
+    encode(&sorted(value))
+}
+fn compare_data_schemas(
+    tx: &Transaction<'_>,
+    workspace: &str,
+    installation: &str,
+    artifact: &PluginArtifact,
+) -> Result<()> {
+    let mut incoming = std::collections::BTreeMap::new();
+    for schema in &artifact.data_collections {
+        let address = (
+            schema.collection.clone(),
+            schema.schema_id.clone(),
+            schema.schema_version.clone(),
+        );
+        let canonical = canonical_schema(&schema.schema)?;
+        if let Some(previous) = incoming.insert(address, canonical.clone()) {
+            if previous != canonical {
+                return fail(PluginCatalogError::Conflict);
+            }
+        }
+    }
+    if incoming.is_empty() {
+        return Ok(());
+    }
+    // No revoked filter: the schema identity outlives execution authority.
+    let mut statement = tx.prepare(
+        "SELECT metadata_json FROM plugin_artifacts WHERE workspace_id=?1 AND installation_id=?2",
+    )?;
+    let mut rows = statement.query(params![workspace, installation])?;
+    while let Some(row) = rows.next()? {
+        let registered: PluginArtifact = decode(&row.get::<_, String>(0)?)?;
+        for schema in registered.data_collections {
+            let address = (
+                schema.collection.clone(),
+                schema.schema_id.clone(),
+                schema.schema_version.clone(),
+            );
+            if let Some(candidate) = incoming.get(&address) {
+                if *candidate != canonical_schema(&schema.schema)? {
+                    return fail(PluginCatalogError::Conflict);
+                }
+            }
+        }
+    }
+    Ok(())
+}
 fn add_artifact(
     tx: &Transaction<'_>,
     workspace: &str,
     installation: &str,
     artifact: &PluginArtifact,
 ) -> Result<()> {
+    compare_data_schemas(tx, workspace, installation, artifact)?;
     let existing=tx.query_row("SELECT artifact_digest,package_digest,revoked FROM plugin_artifacts WHERE workspace_id=?1 AND installation_id=?2 AND version=?3",params![workspace,installation,artifact.version],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?))).optional()?;
     if let Some((old, package, revoked)) = existing {
         if old != artifact.artifact_digest || package != artifact.package_digest || revoked {
@@ -660,6 +739,8 @@ pub enum PluginReferenceKind {
     Pending,
     Active,
     Restorable,
+    /// Retained typed extension data, including delete tombstones.
+    Data,
 }
 impl PluginReferenceKind {
     fn name(self) -> &'static str {
@@ -668,6 +749,7 @@ impl PluginReferenceKind {
             Self::Pending => "pending",
             Self::Active => "active",
             Self::Restorable => "restorable",
+            Self::Data => "data",
         }
     }
 }
@@ -728,6 +810,10 @@ pub fn plugin_reference_remove(
     tx.execute("DELETE FROM plugin_references WHERE workspace_id=?1 AND kind=?2 AND owner=?3 AND installation_id=?4 AND artifact_digest=?5",params![workspace,kind.name(),owner,installation,artifact_digest])?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "plugin_data/catalog_tests.rs"]
+mod data_schema_tests;
 
 #[cfg(test)]
 mod tests;

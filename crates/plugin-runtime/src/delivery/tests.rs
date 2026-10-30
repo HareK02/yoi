@@ -46,6 +46,7 @@ fn fixture() -> (CanonicalPluginArtifact, PluginArtifact) {
         tools: serde_json::from_value(serde_json::to_value(m.tools).unwrap()).unwrap(),
         connections: vec![],
         requested_grants: vec![],
+        data_collections: vec![],
         config_schema: server_api::PluginSchemaContribution {
             identity: format!("{}/config", m.id),
             version: m.version.clone(),
@@ -391,6 +392,7 @@ async fn canonical_package_must_match_complete_descriptor_not_only_digests() {
         "tools",
         "connections",
         "grants",
+        "data_collections",
         "schema_identity",
         "schema_version",
         "schema_digest",
@@ -415,6 +417,14 @@ async fn canonical_package_must_match_complete_descriptor_not_only_digests() {
             "grants" => d
                 .requested_grants
                 .push(server_api::PluginGrantMetadata::Logging),
+            "data_collections" => d
+                .data_collections
+                .push(server_api::PluginDataSchemaMetadata {
+                    collection: "notes".into(),
+                    schema_id: "note".into(),
+                    schema_version: "1".into(),
+                    schema: serde_json::json!({"type":"string"}),
+                }),
             "schema_identity" => d.config_schema.identity.push('x'),
             "schema_version" => d.config_schema.version.push('x'),
             "schema_digest" => d.config_schema.digest.push('x'),

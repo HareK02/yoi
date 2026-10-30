@@ -140,6 +140,7 @@ fn make_plan(
         }],
         connections: vec![],
         requested_grants: vec![],
+        data_collections: vec![],
         config_schema: PluginSchemaContribution {
             identity: "schema".into(),
             version: "1".into(),

@@ -1,3 +1,4 @@
+mod ticket;
 use crate::sandbox::SandboxLimits;
 use crate::{
     bindings,
@@ -297,6 +298,15 @@ impl Executor {
             |s| s,
         )
         .map_err(trap)?;
+        if compiled.manifest.runtime.world == plugin::PLUGIN_COMPONENT_TICKET_TOOL_WORLD {
+            use crate::host::{extension_data, objects, ticket_read};
+            objects::add_to_linker::<_, wasmtime::component::HasSelf<_>>(&mut linker, |s| s)
+                .map_err(trap)?;
+            ticket_read::add_to_linker::<_, wasmtime::component::HasSelf<_>>(&mut linker, |s| s)
+                .map_err(trap)?;
+            extension_data::add_to_linker::<_, wasmtime::component::HasSelf<_>>(&mut linker, |s| s)
+                .map_err(trap)?;
+        }
         let instance = bindings::HttpsLoggedToolPlugin::instantiate_async(
             &mut store,
             &compiled.component,

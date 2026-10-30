@@ -111,6 +111,7 @@ fn context(component: &CompiledTool, id: &str) -> InvocationContext {
         grants: Grants {
             logging: true,
             connection_slots: BTreeSet::from(["api".into()]),
+            ..Default::default()
         },
         deadline: Instant::now() + Duration::from_secs(10),
         cancellation: CancellationToken::new(),

@@ -129,7 +129,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 110;
+const LATEST_SCHEMA_VERSION: i64 = 111;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -486,6 +486,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 110,
         name: "Worker Plugin launch selection associations",
         apply: migrate_plugin_launches_v109_to_v110,
+    },
+    Migration {
+        version: 111,
+        name: "Typed Plugin Ticket extension data and atomic mutation receipts",
+        apply: migrate_plugin_data_v110_to_v111,
     },
 ];
 
@@ -15897,6 +15902,49 @@ fn migrate_subject_assignments_v107_to_v108(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn verify_plugin_data_schema(conn: &Connection) -> Result<()> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(crate::plugin_receipt::SCHEMA_SQL)?;
+    expected.execute_batch(crate::plugin_data::SCHEMA_SQL)?;
+    let mut query = expected.prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND (name LIKE 'plugin_data_%' OR name='plugin_effect_data_collision') ORDER BY name")?;
+    for item in query.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (name, sql) = item?;
+        let actual: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name=?1",
+                [&name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual.as_deref() != Some(&sql) {
+            return Err(Error::Store(format!(
+                "Plugin extension-data schema has drifted: {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn migrate_plugin_data_v110_to_v111(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 110 {
+        return Err(Error::Store(
+            "Plugin extension-data migration requires schema 110".into(),
+        ));
+    }
+    verify_schema_history(conn, 110)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::plugin_data::REFERENCE_MIGRATION_SQL)?;
+    tx.execute_batch(crate::plugin_data::SCHEMA_SQL)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(111,?1)",
+        ["Typed Plugin Ticket extension data and atomic mutation receipts"],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_plugin_launches_v109_to_v110(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 109 {
         return Err(Error::Store(
@@ -15975,6 +16023,8 @@ fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
     conn.execute_batch(crate::plugin_receipt::SCHEMA_SQL)?;
     conn.execute_batch(crate::plugin_plan::LAUNCH_SCHEMA_SQL)?;
+    conn.execute_batch(crate::plugin_data::REFERENCE_MIGRATION_SQL)?;
+    conn.execute_batch(crate::plugin_data::SCHEMA_SQL)?;
     Ok(())
 }
 
@@ -17015,7 +17065,8 @@ fn apply_migrations_with_secret_source(
     }
 
     verify_schema_history(conn, LATEST_SCHEMA_VERSION)?;
-    crate::plugin_catalog::verify(conn)?;
+    crate::plugin_catalog::verify_with_data(conn)?;
+    verify_plugin_data_schema(conn)?;
     crate::plugin_plan::verify_plan_schema(conn)?;
     crate::plugin_host::verify_receipt_schema(conn)?;
     crate::plugin_plan::verify_launch_schema(conn)?;
@@ -19304,6 +19355,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     include!("ticket_post_upgrade_tests.rs");
     include!("migration_entrypoint_tests.rs");
     include!("plugin_host_migration_tests.rs");
+    include!("plugin_data_migration_tests.rs");
     include!("legacy_evidence_column_tests.rs");
 
     #[test]
@@ -19721,6 +19773,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:108, name:"Subject Ticket responsibility and current-body notification routing".into()},
                 WorkspaceSchemaMigrationStep {version:109, name:"Durable Plugin Host invocations and HTTPS effect receipts".into()},
                 WorkspaceSchemaMigrationStep {version:110, name:"Worker Plugin launch selection associations".into()},
+                WorkspaceSchemaMigrationStep {version:111, name:"Typed Plugin Ticket extension data and atomic mutation receipts".into()},
             ]
         );
 
@@ -19841,6 +19894,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (108, "Subject Ticket responsibility and current-body notification routing".to_string()),
 (109, "Durable Plugin Host invocations and HTTPS effect receipts".to_string()),
 (110, "Worker Plugin launch selection associations".to_string()),
+(111, "Typed Plugin Ticket extension data and atomic mutation receipts".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -23132,7 +23186,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (107, "Immutable Worker Plugin plans and retained pins".into()),
                          (108, "Subject Ticket responsibility and current-body notification routing".into()),
                          (109, "Durable Plugin Host invocations and HTTPS effect receipts".into()),
-                         (110, "Worker Plugin launch selection associations".into())]);
+                         (110, "Worker Plugin launch selection associations".into()),
+                         (111, "Typed Plugin Ticket extension data and atomic mutation receipts".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

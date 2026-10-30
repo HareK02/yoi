@@ -5,6 +5,7 @@
 //! cancellation-safe, bound their own allocations and never auto-retry effects.
 
 pub use crate::bindings::yoi::host::{errors, http, logging};
+pub use crate::ticket_bindings::yoi::host2_1_0::{extension_data, objects, ticket_read};
 use async_trait::async_trait;
 use std::{any::Any, collections::BTreeSet, sync::Arc};
 use tokio::time::Instant;
@@ -30,12 +31,20 @@ pub struct InvocationContext {
 pub struct Grants {
     pub logging: bool,
     pub connection_slots: BTreeSet<String>,
+    pub ticket_read: bool,
+    pub ticket_data_read: BTreeSet<(String, String, String)>,
+    pub ticket_data_write: BTreeSet<(String, String, String)>,
 }
 
 /// Opaque Host-owned capability, stored only within one invocation's Store.
 /// The provider must not interpret a guest resource representation as identity.
 pub struct Connection {
     pub(crate) slot: String,
+    pub(crate) binding: Arc<dyn Any + Send + Sync>,
+}
+
+/// Opaque Ticket capability stored only in one invocation's Store.
+pub struct Ticket {
     pub(crate) binding: Arc<dyn Any + Send + Sync>,
 }
 
@@ -54,7 +63,8 @@ pub enum Operation<'a> {
     Log,
 }
 
-/// No default implementation is supplied. Test providers belong to test targets.
+/// Core operations require implementations. Additive APIs default to Unsupported
+/// for old providers, never to permission or success. Test providers belong to tests.
 ///
 /// `authorize` must check the current installation/artifact/plan/subject and
 /// operation against live owner policy. `open`/`send` must also enforce concrete
@@ -63,6 +73,35 @@ pub enum Operation<'a> {
 /// dropped on cancellation/deadline; providers must not leave detached work.
 #[async_trait]
 pub trait Host: Send + Sync {
+    /// Old providers fail closed, never infer permission from an old grant.
+    async fn resolve_ticket(
+        &self,
+        _context: &InvocationContext,
+        _ticket_ref: &str,
+        _access: objects::Access,
+    ) -> Result<Arc<dyn Any + Send + Sync>, errors::HostError> {
+        Err(error(errors::Code::Unsupported, "Ticket API unavailable"))
+    }
+    async fn read_ticket(
+        &self,
+        _context: &InvocationContext,
+        _binding: &(dyn Any + Send + Sync),
+    ) -> Result<ticket_read::Snapshot, errors::HostError> {
+        Err(error(errors::Code::Unsupported, "Ticket API unavailable"))
+    }
+    /// Providers live-authorize the concrete operation, Ticket and namespace.
+    async fn ticket_data(
+        &self,
+        _context: &InvocationContext,
+        _binding: &(dyn Any + Send + Sync),
+        _operation: TicketDataOperation,
+    ) -> Result<TicketDataResult, errors::HostError> {
+        Err(error(
+            errors::Code::Unsupported,
+            "Ticket data API unavailable",
+        ))
+    }
+
     async fn authorize(
         &self,
         context: &InvocationContext,
@@ -93,4 +132,31 @@ pub(crate) fn error(code: errors::Code, message: &str) -> errors::HostError {
         diagnostic_id: String::new(),
         effect: errors::EffectObservation::NotDispatched,
     }
+}
+
+/// Portable provider boundary shared by Remote and Embedded owners.
+#[derive(Debug, Clone)]
+pub enum TicketDataOperation {
+    Get(server_api::PluginDataAddress),
+    Mutate {
+        address: server_api::PluginDataAddress,
+        operation_key: String,
+        mutation: server_api::PluginDataMutation,
+    },
+    List {
+        collection: server_api::PluginDataCollection,
+        cursor: Option<String>,
+        limit: u32,
+    },
+    LookupMutation {
+        address: server_api::PluginDataAddress,
+        operation_key: String,
+    },
+}
+#[derive(Debug)]
+pub enum TicketDataResult {
+    Cell(server_api::PluginDataCell),
+    Mutated(server_api::PluginDataReceipt),
+    Listed(server_api::PluginDataPage),
+    MutationLookup(server_api::PluginDataMutationLookup),
 }

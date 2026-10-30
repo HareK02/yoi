@@ -40,8 +40,22 @@ pub struct PluginProfileSelection {
     pub logging: bool,
     #[serde(default)]
     pub https_slots: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ticket_read: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ticket_data_read: Vec<PluginTicketDataGrant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ticket_data_write: Vec<PluginTicketDataGrant>,
     #[serde(default)]
     pub config: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginTicketDataGrant {
+    pub collection: String,
+    pub schema_id: String,
+    pub schema_version: String,
 }
 
 #[cfg(test)]

@@ -136,10 +136,32 @@ impl fmt::Display for PluginSurface {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PluginRequestedGrant {
     Logging,
-    Https { slot: String },
+    Https {
+        slot: String,
+    },
+    TicketRead,
+    TicketDataRead {
+        collection: String,
+        schema_id: String,
+        schema_version: String,
+    },
+    TicketDataWrite {
+        collection: String,
+        schema_id: String,
+        schema_version: String,
+    },
 }
 
 /// A slot requests HTTPS protocol bounds, not credentials or concrete bindings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginDataCollection {
+    pub collection: String,
+    pub schema_id: String,
+    pub schema_version: String,
+    pub schema: serde_json::Value,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginConnectionSlot {
@@ -240,6 +262,8 @@ pub struct PluginPackageManifest {
     pub connections: Vec<PluginConnectionSlot>,
     #[serde(default)]
     pub requested_grants: Vec<PluginRequestedGrant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_collections: Vec<PluginDataCollection>,
 }
 
 impl PluginPackageManifest {
@@ -247,6 +271,8 @@ impl PluginPackageManifest {
         self.surfaces.iter().copied().collect()
     }
 }
+
+pub const PLUGIN_COMPONENT_TICKET_TOOL_WORLD: &str = "yoi:plugin/ticket-tool-plugin@2.1.0";
 
 pub const PLUGIN_RUNTIME_COMPONENT_KIND: &str = "wasm-component";
 pub const PLUGIN_COMPONENT_TOOL_WORLD: &str = "yoi:plugin/tool-plugin@2.0.0";
@@ -1088,6 +1114,39 @@ fn validate_manifest(
             ));
         }
     }
+    let ticket_world = runtime.world == PLUGIN_COMPONENT_TICKET_TOOL_WORLD;
+    if !ticket_world
+        && (!manifest.data_collections.is_empty()
+            || manifest.requested_grants.iter().any(|g| {
+                matches!(
+                    g,
+                    PluginRequestedGrant::TicketRead
+                        | PluginRequestedGrant::TicketDataRead { .. }
+                        | PluginRequestedGrant::TicketDataWrite { .. }
+                )
+            }))
+    {
+        return Err(reject(
+            PluginDiagnosticKind::Api,
+            "Ticket capabilities require the exact @2.1.0 Ticket world".into(),
+        ));
+    }
+    let mut collections = BTreeSet::new();
+    for c in &manifest.data_collections {
+        if [&c.collection, &c.schema_id, &c.schema_version]
+            .iter()
+            .any(|s| s.is_empty() || s.len() > 128 || s.chars().any(char::is_control))
+            || !collections.insert((&c.collection, &c.schema_id, &c.schema_version))
+        {
+            return Err(reject(
+                PluginDiagnosticKind::Malformed,
+                "invalid or duplicate data collection".into(),
+            ));
+        }
+        schema::validate_data_schema(&c.schema)
+            .map_err(|e| reject(PluginDiagnosticKind::Malformed, e))?;
+    }
+    let mut ticket_grants = BTreeSet::new();
     let mut requested_slots = BTreeSet::new();
     let mut logging = false;
     for grant in &manifest.requested_grants {
@@ -1095,6 +1154,29 @@ fn validate_manifest(
             PluginRequestedGrant::Logging if !logging => logging = true,
             PluginRequestedGrant::Https { slot }
                 if slots.contains(slot) && requested_slots.insert(slot) => {}
+            PluginRequestedGrant::TicketRead
+                if ticket_world && ticket_grants.insert(("read", "", "", "")) => {}
+            PluginRequestedGrant::TicketDataRead {
+                collection,
+                schema_id,
+                schema_version,
+            }
+            | PluginRequestedGrant::TicketDataWrite {
+                collection,
+                schema_id,
+                schema_version,
+            } if ticket_world
+                && collections.contains(&(collection, schema_id, schema_version))
+                && ticket_grants.insert((
+                    if matches!(grant, PluginRequestedGrant::TicketDataWrite { .. }) {
+                        "data-write"
+                    } else {
+                        "data-read"
+                    },
+                    collection.as_str(),
+                    schema_id.as_str(),
+                    schema_version.as_str(),
+                )) => {}
             _ => {
                 return Err(reject(
                     PluginDiagnosticKind::Malformed,
@@ -1121,7 +1203,10 @@ fn validate_manifest(
         .required_imports
         .iter()
         .any(|v| v == "yoi:host/logging@2.0.0");
-    if http != !slots.is_empty() || http != connections || logging != logs {
+    if (!ticket_world && (http != !slots.is_empty() || logging != logs))
+        || (ticket_world && ((!slots.is_empty() && !http) || (logging && !logs)))
+        || http != connections
+    {
         return Err(reject(
             PluginDiagnosticKind::Api,
             "Host imports and requested grants/slots disagree".into(),
@@ -1968,5 +2053,42 @@ output_schema = { type = "object", additionalProperties = false }
                 "ambient Plugin authority returned through {forbidden}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ticket_manifest_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn old_world_cannot_request_ticket_capabilities_or_schema_data() {
+        let mut manifest: PluginPackageManifest = toml::from_str(include_str!(
+            "../../../resources/plugin/templates/rust-component-tool/plugin.toml"
+        ))
+        .unwrap();
+        let files = BTreeMap::from([(manifest.runtime.component.clone(), Vec::new())]);
+        manifest
+            .requested_grants
+            .push(PluginRequestedGrant::TicketRead);
+        let archive = StoredArchive { files };
+        let error = validate_manifest(&manifest, &archive, "fixture", PluginSourceKind::Explicit)
+            .unwrap_err();
+        assert_eq!(error.kind, PluginDiagnosticKind::Api);
+        manifest
+            .requested_grants
+            .retain(|g| !matches!(g, PluginRequestedGrant::TicketRead));
+        manifest.data_collections.push(PluginDataCollection {
+            collection: "notes".into(),
+            schema_id: "note".into(),
+            schema_version: "1".into(),
+            schema: json!({"type":"string"}),
+        });
+        assert_eq!(
+            validate_manifest(&manifest, &archive, "fixture", PluginSourceKind::Explicit)
+                .unwrap_err()
+                .kind,
+            PluginDiagnosticKind::Api
+        );
     }
 }

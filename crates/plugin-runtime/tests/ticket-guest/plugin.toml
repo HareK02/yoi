@@ -1,0 +1,38 @@
+schema_version = 2
+id = "ticket-test"
+name = "Ticket test"
+version = "1.0.0"
+surfaces = ["tool"]
+config_schema = "{}"
+
+[runtime]
+kind = "wasm-component"
+component = "plugin.component.wasm"
+world = "yoi:plugin/ticket-tool-plugin@2.1.0"
+required_imports = ["yoi:host/errors@2.0.0", "yoi:host/objects@2.1.0", "yoi:host/ticket-read@2.1.0", "yoi:host/extension-data@2.1.0"]
+
+[[tools]]
+name = "ticket_test"
+description = "Exercise the typed Ticket extension boundary"
+input_schema = { type = "string" }
+output_schema = { type = "null" }
+error_codes = ["failed"]
+
+[[data_collections]]
+collection = "notes"
+schema_id = "note"
+schema_version = "1"
+schema = { type = "string", maxLength = 64 }
+
+[[requested_grants]]
+kind = "ticket_read"
+[[requested_grants]]
+kind = "ticket_data_read"
+collection = "notes"
+schema_id = "note"
+schema_version = "1"
+[[requested_grants]]
+kind = "ticket_data_write"
+collection = "notes"
+schema_id = "note"
+schema_version = "1"

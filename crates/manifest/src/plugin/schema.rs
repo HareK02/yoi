@@ -508,3 +508,147 @@ mod tests {
         assert!(error.contains("depth limit"), "{error}");
     }
 }
+
+/// Extension cells require a closed typed tree, not a permissive Tool schema.
+/// Restricting composition/ref keywords here prevents an untyped branch or a
+/// boolean schema from admitting undeclared fields. New schema shapes require
+/// deliberate admission changes, never remote retrieval or guest migration.
+pub fn validate_data_schema(schema: &Value) -> Result<(), String> {
+    validate_tool_schema(schema)?;
+    fn closed(node: &Value) -> Result<(), String> {
+        let object = node
+            .as_object()
+            .ok_or("data schema must be a typed object")?;
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or("data schema requires one explicit type")?;
+        let allowed: &[&str] = match kind {
+            "object" => &[
+                "type",
+                "description",
+                "properties",
+                "required",
+                "additionalProperties",
+            ],
+            "array" => &[
+                "type",
+                "description",
+                "items",
+                "minItems",
+                "maxItems",
+                "uniqueItems",
+            ],
+            "string" => &[
+                "type",
+                "description",
+                "enum",
+                "minLength",
+                "maxLength",
+                "pattern",
+            ],
+            "number" | "integer" => &[
+                "type",
+                "description",
+                "enum",
+                "minimum",
+                "maximum",
+                "exclusiveMinimum",
+                "exclusiveMaximum",
+                "multipleOf",
+            ],
+            "boolean" | "null" => &["type", "description", "enum"],
+            _ => return Err("unsupported data schema type".into()),
+        };
+        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err("unsupported data schema keyword".into());
+        }
+        match kind {
+            "object" => {
+                if object.get("additionalProperties") != Some(&Value::Bool(false)) {
+                    return Err("data objects must be closed".into());
+                }
+                let properties = object
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .ok_or("data object requires properties")?;
+                for value in properties.values() {
+                    closed(value)?;
+                }
+                if let Some(required) = object.get("required").and_then(Value::as_array) {
+                    if required
+                        .iter()
+                        .any(|name| name.as_str().is_none_or(|n| !properties.contains_key(n)))
+                    {
+                        return Err("required data field is undeclared".into());
+                    }
+                }
+            }
+            "array" => closed(
+                object
+                    .get("items")
+                    .ok_or("data arrays require typed items")?,
+            )?,
+            _ => {}
+        }
+        Ok(())
+    }
+    closed(schema)
+}
+
+/// Payload validation uses the same offline closed contract as package admission.
+pub fn validate_data_value(schema: &Value, value: &Value) -> Result<(), String> {
+    validate_data_schema(schema)?;
+    if serde_json::to_vec(value)
+        .map_err(|_| "invalid data value")?
+        .len()
+        > 64 * 1024
+    {
+        return Err("data value exceeds 64 KiB".into());
+    }
+    let validator = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .with_retriever(NoRetrieval)
+        .build(schema)
+        .map_err(|_| "invalid data schema")?;
+    if !validator.is_valid(value) {
+        return Err("data value does not match declared schema".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod data_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn closed_data_schema_rejects_open_or_untyped_branches() {
+        for schema in [
+            json!(true),
+            json!({}),
+            json!({"type":"object"}),
+            json!({"type":"object","properties":{"nested":{}},"additionalProperties":false}),
+            json!({"type":"array"}),
+            json!({"type":"array","items":true}),
+            json!({"type":"object","properties":{},"additionalProperties":false,"anyOf":[{}]}),
+            json!({"type":"object","properties":{},"additionalProperties":false,"required":["undeclared"]}),
+        ] {
+            assert!(validate_data_schema(&schema).is_err(), "{schema}");
+        }
+    }
+    #[test]
+    fn closed_data_value_enforces_nested_types_and_size() {
+        let schema = json!({"type":"object","additionalProperties":false,"required":["notes"],"properties":{"notes":{"type":"array","items":{"type":"object","properties":{"text":{"type":"string","maxLength":8}},"required":["text"],"additionalProperties":false}}}});
+        validate_data_schema(&schema).unwrap();
+        validate_data_value(&schema, &json!({"notes":[{"text":"ok"}]})).unwrap();
+        for value in [
+            json!({"notes":[{"text":"ok","extra":true}]}),
+            json!({"notes":[{"text":42}]}),
+            json!({"notes":[{"text":"too long text"}]}),
+            json!({"extra":true}),
+        ] {
+            assert!(validate_data_value(&schema, &value).is_err());
+        }
+        assert!(validate_data_value(&json!({"type":"string"}), &json!("x".repeat(65536))).is_err());
+    }
+}

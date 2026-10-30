@@ -14,7 +14,9 @@ pub use chat_transport::*;
 mod drive;
 mod notification;
 mod plugin;
+pub mod plugin_data;
 pub mod plugin_host;
+pub use plugin_data::*;
 mod plugin_types;
 pub use notification::*;
 pub use plugin::*;
@@ -235,6 +237,9 @@ impl_openapi_schema!(
     PluginAddArtifactRequest,
     PluginRevokeRequest,
     PluginUninstallRequest,
+    PluginDataPurgeState,
+    PluginDataPurgeRequest,
+    PluginDataPurgeResponse,
     PluginListRequest,
     PluginUploadResponse,
     PluginInstallation,
@@ -3071,6 +3076,23 @@ pub trait ServerApi {
         #[path] installation_id: String,
         #[body] request: PluginUninstallRequest,
     ) -> Result<PluginOperationResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/plugins/{installation_id}/data-state", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,503], bearer_auth = true, browser_auth = true)]
+    async fn plugin_data_observe(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] installation_id: String,
+    ) -> Result<PluginDataPurgeState, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/plugins/{installation_id}/data-purge", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_data_purge(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] installation_id: String,
+        #[body] request: PluginDataPurgeRequest,
+    ) -> Result<PluginDataPurgeResponse, RepositoryApiError>;
 
     #[get("/api/w/{workspace_id}/plugin-operations/{operation_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true)]
     async fn plugin_operation(

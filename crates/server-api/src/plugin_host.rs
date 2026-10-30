@@ -39,6 +39,40 @@ pub enum PluginHostRequest {
         invocation_id: String,
         entry: PluginLogEntry,
     },
+    ResolveTicket {
+        invocation_id: String,
+        ticket_ref: String,
+        access: crate::PluginTicketAccess,
+    },
+    ReadTicket {
+        invocation_id: String,
+        ticket_id: String,
+    },
+    DataGet {
+        invocation_id: String,
+        ticket_id: String,
+        address: crate::PluginDataAddress,
+    },
+    DataMutate {
+        invocation_id: String,
+        ticket_id: String,
+        address: crate::PluginDataAddress,
+        operation_key: String,
+        mutation: crate::PluginDataMutation,
+    },
+    DataList {
+        invocation_id: String,
+        ticket_id: String,
+        collection: crate::PluginDataCollection,
+        cursor: Option<String>,
+        limit: u32,
+    },
+    DataLookupMutation {
+        invocation_id: String,
+        ticket_id: String,
+        address: crate::PluginDataAddress,
+        operation_key: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -116,6 +150,24 @@ pub enum PluginHostResponse {
         response: PluginHttpResponse,
     },
     Logged,
+    TicketResolved {
+        ticket_id: String,
+    },
+    TicketRead {
+        snapshot: crate::PluginTicketSnapshot,
+    },
+    DataCell {
+        cell: crate::PluginDataCell,
+    },
+    DataMutated {
+        receipt: crate::PluginDataReceipt,
+    },
+    DataListed {
+        page: crate::PluginDataPage,
+    },
+    DataMutationLookup {
+        outcome: crate::PluginDataMutationLookup,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

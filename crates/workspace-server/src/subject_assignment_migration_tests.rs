@@ -1071,7 +1071,7 @@ mod subject_assignment_migration_tests {
             );
             assert_eq!(history.len(), host.len() + expected.len());
             assert_component14_append(conn, component);
-            crate::plugin_catalog::verify(conn).unwrap();
+            crate::plugin_catalog::verify_with_data(conn).unwrap();
             plugin_plan::verify_plan_schema(conn).unwrap();
             verify(conn).unwrap();
             assert_health(conn);
@@ -1130,6 +1130,10 @@ mod subject_assignment_migration_tests {
             };
             tail.push((109, "Durable Plugin Host invocations and HTTPS effect receipts".into()));
             tail.push((110, "Worker Plugin launch selection associations".into()));
+            tail.push((
+                111,
+                "Typed Plugin Ticket extension data and atomic mutation receipts".into(),
+            ));
             tail
         }
 
@@ -1179,7 +1183,7 @@ mod subject_assignment_migration_tests {
         fn plugin_schema(conn: &Connection) -> Rows {
             fixture_query_rows(
                 conn,
-                "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema WHERE tbl_name LIKE 'plugin_%' AND tbl_name NOT IN ('plugin_invocations','plugin_effect_receipts') ORDER BY type,name",
+                "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema WHERE tbl_name LIKE 'plugin_%' AND tbl_name NOT LIKE 'plugin_data_%' AND tbl_name NOT IN ('plugin_invocations','plugin_effect_receipts','plugin_references') ORDER BY type,name",
             )
         }
 
@@ -1189,6 +1193,9 @@ mod subject_assignment_migration_tests {
             let before = snapshot(&conn);
             let rows = data(&conn, true);
             let plans = plugin_schema(&conn);
+            // Migration111 intentionally rebuilds the reference guard to admit
+            // data owners; its complete row set must still survive unchanged.
+            let references = stored_fixture_rows(&conn, "plugin_references");
             let contracts = principal_table_contracts(&conn);
             let host = host_history(&conn);
             let component = component_history(&conn);
@@ -1205,6 +1212,8 @@ mod subject_assignment_migration_tests {
             assert_data(&conn, &rows);
             assert_final(&conn, 107, &host, &component);
             assert_eq!(plugin_schema(&conn), plans);
+            assert_eq!(stored_fixture_rows(&conn, "plugin_references"), references);
+            verify_plugin_data_schema(&conn).unwrap();
             assert_eq!(principal_table_contracts(&conn), contracts);
             let final_snapshot = snapshot(&conn);
             drop(conn);
