@@ -101,7 +101,18 @@ impl Drop for WorkdirOperationGuard {
     }
 }
 
-fn workdir_operation_busy() -> RuntimeError {
+fn workdir_operation_busy(id: &str, action: &str, blocking: &WorkdirOperation) -> RuntimeError {
+    let (busy_reason, active_use_count) = match blocking {
+        WorkdirOperation::Use(count) => ("active_use", *count),
+        WorkdirOperation::Cleanup => ("cleanup_in_progress", 0),
+    };
+    tracing::warn!(target: "yoi::workdir_cleanup",
+        working_directory_id = id,
+        action,
+        busy_source = "runtime_operation",
+        busy_reason,
+        active_use_count,
+        "Workdir operation blocked by busy resource");
     RuntimeError::WorkingDirectory(
         crate::working_directory::WorkingDirectoryDiagnostic::rejected(
             "working_directory_cleanup_resource_busy",
@@ -1148,8 +1159,12 @@ impl Runtime {
         let backend = {
             let mut state = self.lock()?;
             state.ensure_running()?;
-            if state.workdir_operations.contains_key(working_directory_id) {
-                return Err(workdir_operation_busy());
+            if let Some(blocking) = state.workdir_operations.get(working_directory_id) {
+                return Err(workdir_operation_busy(
+                    working_directory_id,
+                    "cleanup_working_directory",
+                    blocking,
+                ));
             }
             if let Some(worker_id) = state.worker_id_for_workdir(working_directory_id) {
                 return Err(RuntimeError::InvalidRequest(format!(
@@ -6318,11 +6333,8 @@ impl RuntimeState {
     }
 
     fn ensure_workdir_not_removing(&self, id: &str) -> Result<(), RuntimeError> {
-        if matches!(
-            self.workdir_operations.get(id),
-            Some(WorkdirOperation::Cleanup)
-        ) {
-            return Err(workdir_operation_busy());
+        if let Some(blocking @ WorkdirOperation::Cleanup) = self.workdir_operations.get(id) {
+            return Err(workdir_operation_busy(id, "admit_use", blocking));
         }
         Ok(())
     }
@@ -9343,6 +9355,84 @@ mod tests {
             .build()
             .unwrap()
             .block_on(subscription.recv())
+    }
+
+    #[test]
+    fn busy_admission_logs_runtime_use_and_cleanup_blockers() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut output = tempfile::tempfile().unwrap();
+        let writer = output.try_clone().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let (runtime, backend) = runtime_and_backend();
+            let first = runtime.reserve_workdir_use(["workdir-used"]).unwrap();
+            let second = runtime.reserve_workdir_use(["workdir-used"]).unwrap();
+            assert_workdir_busy(
+                runtime
+                    .cleanup_working_directory("workdir-used")
+                    .unwrap_err(),
+            );
+            drop((first, second));
+            assert!(runtime.inner.lock().unwrap().workdir_operations.is_empty());
+
+            let (entered, release) = WorkdirEffectGate::install(&backend.cleanup_gate);
+            let cleanup_runtime = runtime.clone();
+            let cleanup = std::thread::spawn(move || {
+                cleanup_runtime.cleanup_working_directory("workdir-removing")
+            });
+            entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_workdir_busy(
+                runtime
+                    .cleanup_working_directory("workdir-removing")
+                    .unwrap_err(),
+            );
+            assert_workdir_busy(
+                runtime
+                    .reserve_workdir_use(["workdir-removing"])
+                    .unwrap_err(),
+            );
+            release.send(()).unwrap();
+            assert_workdir_busy(cleanup.join().unwrap().unwrap_err());
+            assert!(runtime.inner.lock().unwrap().workdir_operations.is_empty());
+        });
+        output.seek(SeekFrom::Start(0)).unwrap();
+        let mut log = String::new();
+        output.read_to_string(&mut log).unwrap();
+        let events: Vec<_> = log
+            .lines()
+            .filter(|line| line.contains("busy_source="))
+            .collect();
+        assert_eq!(events.len(), 3, "{log}");
+        for (event, (id, action, reason, count)) in events.iter().zip([
+            ("workdir-used", "cleanup_working_directory", "active_use", 2),
+            (
+                "workdir-removing",
+                "cleanup_working_directory",
+                "cleanup_in_progress",
+                0,
+            ),
+            ("workdir-removing", "admit_use", "cleanup_in_progress", 0),
+        ]) {
+            for field in [
+                "WARN".to_string(),
+                "yoi::workdir_cleanup".to_string(),
+                format!("working_directory_id=\"{id}\""),
+                format!("action=\"{action}\""),
+                "busy_source=\"runtime_operation\"".to_string(),
+                format!("busy_reason=\"{reason}\""),
+                format!("active_use_count={count}"),
+            ] {
+                assert!(event.contains(&field), "missing {field}: {event}");
+            }
+        }
     }
 
     #[test]
