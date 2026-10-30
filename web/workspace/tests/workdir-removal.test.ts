@@ -6,6 +6,7 @@ import {
   canRemoveWorkdir,
   removalCause,
   removeWorkdir,
+  WorkdirRemovalRequests,
 } from "../src/lib/workspace/settings/workdir-removal.ts";
 import type {
   CleanupWorkdirCandidate,
@@ -57,6 +58,7 @@ Deno.test("removal wire boundary rejects malformed results and mismatched identi
       "workspace",
       "runtime",
       "dir",
+      "request-1",
     );
   } catch {
     rejected = true;
@@ -72,6 +74,7 @@ Deno.test("removal response size is bounded before decoding provider content", a
       "workspace",
       "runtime",
       "dir",
+      "request-1",
     );
   } catch {
     rejected = true;
@@ -179,7 +182,7 @@ Deno.test("pending unknown cleanup permits ordinary removal while current dirty 
   );
 });
 
-Deno.test("ordinary retries send the same scoped DELETE body and expose only allowlisted HTTP causes", async () => {
+Deno.test("new requests after confirmed failure get distinct IDs and expose only allowlisted HTTP causes", async () => {
   const requests: { path: string; body: string; method: string }[] = [];
   const fetchFn = (async (path: RequestInfo | URL, init?: RequestInit) => {
     requests.push({
@@ -194,8 +197,9 @@ Deno.test("ordinary retries send the same scoped DELETE body and expose only all
       failure_category: "mount_present",
     });
   }) as typeof fetch;
+  const removalRequests = new WorkdirRemovalRequests();
   for (let i = 0; i < 2; i++) {
-    const result = await removeWorkdir(
+    const result = await removalRequests.remove(
       fetchFn,
       "workspace/x",
       "runtime/x",
@@ -204,8 +208,9 @@ Deno.test("ordinary retries send the same scoped DELETE body and expose only all
     assert(result.retryable && result.failure_category === "mount_present");
   }
   assert(
-    JSON.stringify(requests[0]) === JSON.stringify(requests[1]),
-    "retry changed ordinary deletion request",
+    JSON.parse(requests[0].body).operation_id !==
+      JSON.parse(requests[1].body).operation_id,
+    "new explicit request reused a failed request identity",
   );
   assert(
     requests[0].path ===
@@ -213,8 +218,9 @@ Deno.test("ordinary retries send the same scoped DELETE body and expose only all
   );
   assert(
     requests[0].method === "DELETE" &&
-      requests[0].body ===
-        JSON.stringify({ reason: "User requested Workdir deletion" }),
+      JSON.parse(requests[0].body).reason ===
+        "User requested Workdir deletion" &&
+      typeof JSON.parse(requests[0].body).operation_id === "string",
   );
   for (
     const [status, category] of [
@@ -236,6 +242,7 @@ Deno.test("ordinary retries send the same scoped DELETE body and expose only all
         "workspace",
         "runtime",
         "dir",
+        "request-1",
       );
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
@@ -243,6 +250,37 @@ Deno.test("ordinary retries send the same scoped DELETE body and expose only all
     assert(
       message === removalCause(category),
       `HTTP ${status} leaked provider text`,
+    );
+  }
+});
+
+Deno.test("unknown removal outcomes keep the same identity and body until a terminal result", async () => {
+  for (const transportLoss of [false, true]) {
+    const calls: string[] = [];
+    const requester = new WorkdirRemovalRequests();
+    const fetchFn = (async (_path: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(String(init?.body));
+      if (calls.length === 1 && transportLoss) {
+        throw new Error("connection lost");
+      }
+      return Response.json({
+        working_directory_id: "dir",
+        disposition: "attention_required",
+        retryable: calls.length !== 1,
+        failure_category: calls.length === 1
+          ? "provider_cleanup_outcome_unknown"
+          : "resource_busy",
+      });
+    }) as typeof fetch;
+    await requester.remove(fetchFn, "workspace", "runtime", "dir").catch(() =>
+      undefined
+    );
+    await requester.remove(fetchFn, "workspace", "runtime", "dir");
+    await requester.remove(fetchFn, "workspace", "runtime", "dir");
+    assert(calls[0] === calls[1], "unknown outcome changed request identity");
+    assert(
+      calls[1] !== calls[2],
+      "confirmed failure kept old request identity",
     );
   }
 });

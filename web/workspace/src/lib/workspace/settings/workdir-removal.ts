@@ -30,7 +30,9 @@ const causes: Readonly<Record<string, string>> = {
   provider_observation_unknown:
     "The provider could not confirm the remaining Workdir. Restore provider access so the next removal can recheck its current contents.",
   provider_cleanup_outcome_unknown:
-    "The provider has not confirmed deletion. Restore provider access and retry the same removal request to recheck the remaining target. The Workdir stays listed until deletion is confirmed.",
+    "The provider has not confirmed deletion. Restore provider access and reconcile the same request. Recovery only observes the target; it never repeats deletion.",
+  request_interrupted:
+    "The request was interrupted before execution. Submit a new request if removal is still wanted.",
   authority_invalid:
     "The removal authority could not be verified. Ask the Workspace administrator to verify the Workdir target and owning Runtime before requesting removal again.",
   provider_identity_changed:
@@ -125,11 +127,39 @@ async function removalBody(response: Response): Promise<string> {
   }
 }
 
+// 要求IDは結果不明時だけ保持する。確定した失敗の次の明示要求は別IDとなる。
+export class WorkdirRemovalRequests {
+  private readonly unresolved = new Map<string, string>();
+
+  async remove(
+    fetchFn: typeof fetch,
+    workspaceId: string,
+    runtimeId: string,
+    workdirId: string,
+  ): Promise<WorkingDirectoryRemovalResponse> {
+    const key = JSON.stringify([workspaceId, runtimeId, workdirId]);
+    const operationId = this.unresolved.get(key) ?? crypto.randomUUID();
+    this.unresolved.set(key, operationId);
+    const result = await removeWorkdir(
+      fetchFn,
+      workspaceId,
+      runtimeId,
+      workdirId,
+      operationId,
+    );
+    if (result.failure_category !== "provider_cleanup_outcome_unknown") {
+      this.unresolved.delete(key);
+    }
+    return result;
+  }
+}
+
 export async function removeWorkdir(
   fetchFn: typeof fetch,
   workspaceId: string,
   runtimeId: string,
   workdirId: string,
+  operationId: string,
 ): Promise<WorkingDirectoryRemovalResponse> {
   const response = await fetchFn(
     workspaceApiPath(
@@ -141,8 +171,10 @@ export async function removeWorkdir(
     {
       method: "DELETE",
       headers: { "content-type": "application/json" },
-      // An ordinary repeated request uses the existing durable Backend removal authority.
-      body: JSON.stringify({ reason: "User requested Workdir deletion" }),
+      body: JSON.stringify({
+        operation_id: operationId,
+        reason: "User requested Workdir deletion",
+      }),
     },
   );
   if (!response.ok) {

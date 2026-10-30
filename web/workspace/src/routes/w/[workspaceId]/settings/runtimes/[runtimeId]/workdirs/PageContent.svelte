@@ -2,7 +2,7 @@
   import { loadJson, workspaceApiPath } from '#lib/workspace/api/http.ts';
   import { parseRuntimeCleanupPlan } from '#lib/workspace/api/runtime-workers.ts';
   import { parseWorkingDirectoryListResponse } from '#lib/workspace/api/workdirs.ts';
-  import { canRemoveWorkdir, removalCause, removalGuard, removeWorkdir, WorkdirRemovalError } from '#lib/workspace/settings/workdir-removal.ts';
+  import { canRemoveWorkdir, removalCause, removalGuard, WorkdirRemovalRequests, WorkdirRemovalError } from '#lib/workspace/settings/workdir-removal.ts';
   import { formatCurrentWorkdirCheckout } from '#lib/workspace/settings/workdir-checkout.ts';
   import type { CleanupWorkdirCandidate, RuntimeCleanupPlanResponse, WorkingDirectorySummary } from '#lib/workspace/sidebar/types.ts';
   import type { PageData as RouteData } from './$types';
@@ -10,6 +10,7 @@
   type PageProps = { data: ResolvedPageData<RouteData> };
 
   let { data }: PageProps = $props();
+  const removalRequests = new WorkdirRemovalRequests();
   let cleanupBusyTarget = $state<string | null>(null);
   let refreshing = $state(false);
   let refreshError = $state<string | null>(null);
@@ -72,7 +73,7 @@
     cleanupBusyTarget = workdir.working_directory_id;
     feedback = null;
     try {
-      const result = await removeWorkdir(fetch, workspaceId, runtimeId, workdir.working_directory_id);
+      const result = await removalRequests.remove(fetch, workspaceId, runtimeId, workdir.working_directory_id);
       if (workspaceId !== data.workspaceId || runtimeId !== data.runtimeId) return;
       feedback = {
         id: workdir.working_directory_id,

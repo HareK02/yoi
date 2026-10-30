@@ -26932,7 +26932,14 @@ async fn cleanup_runtime_working_directory(
         .host()?
         .run(move || {
             let registered_runtime =
-                registered_workdir_runtime_id(&api, &path.working_directory_id)?;
+                match registered_workdir_runtime_id(&api, &path.working_directory_id) {
+                    Ok(runtime) => runtime,
+                    Err(error) => api
+                        .config_store
+                        .completed_workdir_removal(api.workspace_id(), &path.working_directory_id)?
+                        .map(|removed| removed.runtime_id)
+                        .ok_or(error)?,
+                };
             if registered_runtime != path.runtime_id {
                 return Err(ApiError::from(Error::WorkspacePermissionDenied(
                     "Workdir does not belong to the requested Runtime".to_string(),
@@ -26943,6 +26950,7 @@ async fn cleanup_runtime_working_directory(
                 &path.working_directory_id,
                 &source_actor,
                 &request.reason,
+                &request.operation_id,
             )
             .map_err(ApiError::from)
         })
@@ -28230,6 +28238,7 @@ async fn cleanup_working_directory(
                 &path.working_directory_id,
                 &source_actor,
                 &request.reason,
+                &request.operation_id,
             )
             .map_err(ApiError::from)
         })
@@ -28969,8 +28978,14 @@ fn workdir_removal_failure_guidance(category: &str) -> &'static str {
         "runtime_unavailable" | "provider_unavailable" => {
             "Runtime is unavailable. Reconnect it, then retry deletion; the Workdir registry is retained."
         }
-        "provider_observation_unknown" | "provider_cleanup_outcome_unknown" => {
-            "Runtime has not confirmed deletion. Retry to re-observe the target; the Workdir registry is retained."
+        "provider_cleanup_outcome_unknown" => {
+            "Deletion outcome is unknown. Reconcile the existing request; recovery only observes and never repeats deletion."
+        }
+        "provider_observation_unknown" => {
+            "The target could not be observed before deletion. Restore provider access before a new request."
+        }
+        "request_interrupted" => {
+            "The request was interrupted before execution. A new explicit request is required."
         }
         "unsupported_target" => "This provider does not support Workdir deletion.",
         _ => {
@@ -29006,7 +29021,7 @@ fn current_workdir_removal_attempt_owner() -> Result<WorkdirRemovalAttemptOwner>
 
 fn workdir_removal_attempt_is_orphaned(operation: &WorkdirRemovalOperation) -> Result<bool> {
     let Some(owner) = operation.attempt_owner else {
-        return Ok(operation.attempt_id.is_none());
+        return Ok(true);
     };
     match observe_workdir_removal_owner(owner.process_id) {
         WorkdirRemovalOwnerObservation::Running {
@@ -29112,12 +29127,12 @@ fn execute_reserved_workdir_removal_with_provider(
     recovery: bool,
     provider: &dyn WorkdirRemovalRuntimeProvider,
 ) -> Result<WorkdirRemovalOperation> {
-    if operation.state == WorkdirRemovalOperationState::Completed
-        && operation.disposition == Some(WorkdirRemovalDisposition::Removed)
-    {
+    if operation.state != WorkdirRemovalOperationState::Pending {
         return Ok(operation);
     }
-    let operation = if recovery && operation.state == WorkdirRemovalOperationState::Pending {
+    let unstarted = operation.attempt_id.is_none();
+    let reconcile_only = recovery || !unstarted;
+    let operation = if reconcile_only {
         if !workdir_removal_attempt_is_orphaned(&operation)? {
             return Err(Error::WorkdirAttachmentConflict(format!(
                 "Workdir removal operation `{}` still has a live attempt owner",
@@ -29141,6 +29156,19 @@ fn execute_reserved_workdir_removal_with_provider(
             api.workdir_remove_attempt_owner,
         )?
     };
+    if operation.state != WorkdirRemovalOperationState::Pending {
+        return Ok(operation);
+    }
+    if reconcile_only {
+        if unstarted {
+            return api.config_store.fail_workdir_removal_operation(
+                &operation,
+                "request_interrupted",
+                true,
+            );
+        }
+        return reconcile_workdir_removal(api, &operation, provider);
+    }
     let guards = match api.config_store.workdir_removal_guards(&operation) {
         Ok(guards) => guards,
         Err(
@@ -29232,10 +29260,16 @@ fn execute_reserved_workdir_removal_with_provider(
     let deleted = match deleted {
         Ok(deleted) => deleted,
         Err(error) => {
-            let (category, retryable) = classify_workdir_provider_error(&error);
-            return api
-                .config_store
-                .fail_workdir_removal_operation(&operation, category, retryable);
+            if let RuntimeRegistryError::RuntimeOperationFailed { code, .. } = &error
+                && let Some(category) = workdir_cleanup_diagnostic_category(code)
+            {
+                return api.config_store.fail_workdir_removal_operation(
+                    &operation,
+                    category,
+                    category != "unsupported_target",
+                );
+            }
+            return api.config_store.record_workdir_removal_unknown(&operation);
         }
     };
     let deletion_confirmed = runtime_reports_workdir_not_found(&deleted)
@@ -29257,6 +29291,9 @@ fn execute_reserved_workdir_removal_with_provider(
             category,
             "Runtime did not confirm Workdir removal; registry retained"
         );
+        if deleted.state == InternalWorkerOperationState::Accepted {
+            return api.config_store.record_workdir_removal_unknown(&operation);
+        }
         return api.config_store.fail_workdir_removal_operation(
             &operation,
             category,
@@ -29280,42 +29317,71 @@ fn workdir_removal_execution_lock(
         .clone())
 }
 
+fn reserve_requested_workdir_removal(
+    api: &WorkspaceApi,
+    working_directory_id: &str,
+    source_actor: &str,
+    reason: &str,
+    request_id: &str,
+) -> Result<WorkdirRemovalOperation> {
+    let operation_id = crate::workdir_removal::workdir_removal_request_id(
+        api.workspace_id(),
+        source_actor,
+        request_id,
+    )?;
+    if let Some(existing) = api
+        .config_store
+        .get_workdir_removal_operation(api.workspace_id(), &operation_id)?
+    {
+        if existing.working_directory_id != working_directory_id
+            || existing.source_actor != source_actor
+            || existing.reason != reason
+        {
+            return Err(Error::WorkdirAttachmentConflict(
+                "Workdir removal request ID was reused with different input".into(),
+            ));
+        }
+        return Ok(existing);
+    }
+    let Some(workdir) = api
+        .config_store
+        .get_workdir_registry(api.workspace_id(), working_directory_id)?
+    else {
+        return api
+            .config_store
+            .completed_workdir_removal(api.workspace_id(), working_directory_id)?
+            .ok_or_else(|| {
+                Error::InvalidInput(format!("Unknown Workdir \x60{working_directory_id}\x60"))
+            });
+    };
+    let intent = workdir_removal_intent(&workdir, source_actor, reason, request_id)?;
+    api.config_store.reserve_workdir_removal_operation(&intent)
+}
+
 fn execute_workdir_removal(
     api: &WorkspaceApi,
     working_directory_id: &str,
     source_actor: &str,
     reason: &str,
+    request_id: &str,
 ) -> Result<WorkingDirectoryRemovalResponse> {
     let reason = reason.trim();
-    if reason.is_empty() || reason.len() > 500 {
+    if reason.is_empty() || reason.len() > 500 || reason.chars().any(char::is_control) {
         return Err(Error::InvalidInput(
-            "Workdir removal reason must be between 1 and 500 bytes".to_string(),
+            "Workdir removal reason must be between 1 and 500 bytes without controls".into(),
         ));
     }
     let lock = workdir_removal_execution_lock(api, working_directory_id)?;
     let _guard = lock
         .lock()
-        .map_err(|_| Error::Store("Workdir removal lock was poisoned".to_string()))?;
-
-    let operation = if let Some(existing) =
-        api.config_store.find_workdir_removal_operation_by_intent(
-            api.workspace_id(),
-            working_directory_id,
-            source_actor,
-            reason,
-        )? {
-        existing
-    } else {
-        let workdir = api
-            .config_store
-            .get_workdir_registry(api.workspace_id(), working_directory_id)?
-            .ok_or_else(|| {
-                Error::InvalidInput(format!("Unknown Workdir `{working_directory_id}`"))
-            })?;
-        let intent = workdir_removal_intent(&workdir, source_actor, reason)?;
-        api.config_store
-            .reserve_workdir_removal_operation(&intent)?
-    };
+        .map_err(|_| Error::Store("Workdir removal lock was poisoned".into()))?;
+    let operation = reserve_requested_workdir_removal(
+        api,
+        working_directory_id,
+        source_actor,
+        reason,
+        request_id,
+    )?;
     execute_reserved_workdir_removal(api, operation, false)
         .map(|operation| workdir_removal_response(&operation))
 }
@@ -29326,33 +29392,64 @@ fn execute_workdir_removal_for_workspace_deletion(
     parent_operation_id: &str,
 ) -> Result<WorkdirRemovalOperation> {
     let source_actor = format!("workspace-deletion:{parent_operation_id}");
-    let reason = "Workspace deletion";
+    let request_id = format!("{parent_operation_id}:{working_directory_id}");
     let lock = workdir_removal_execution_lock(api, working_directory_id)?;
     let _guard = lock
         .lock()
-        .map_err(|_| Error::Store("Workdir removal lock was poisoned".to_string()))?;
-    let operation = if let Some(existing) =
-        api.config_store.find_workdir_removal_operation_by_intent(
-            api.workspace_id(),
-            working_directory_id,
-            &source_actor,
-            reason,
-        )? {
-        existing
-    } else {
-        let workdir = api
-            .config_store
-            .get_workdir_registry(api.workspace_id(), working_directory_id)?
-            .ok_or_else(|| {
-                Error::InvalidInput(format!("Unknown Workdir `{working_directory_id}`"))
-            })?;
-        let intent = workdir_removal_intent(&workdir, &source_actor, reason)?;
-        api.config_store
-            .reserve_workdir_removal_operation(&intent)?
-    };
+        .map_err(|_| Error::Store("Workdir removal lock was poisoned".into()))?;
+    let operation = reserve_requested_workdir_removal(
+        api,
+        working_directory_id,
+        &source_actor,
+        "Workspace deletion",
+        &request_id,
+    )?;
     api.config_store
         .append_workspace_deletion_child_operation(parent_operation_id, &operation.operation_id)?;
     execute_reserved_workdir_removal(api, operation, false)
+}
+
+// Recovery may confirm an external effect, but never issues another deletion.
+fn reconcile_workdir_removal(
+    api: &WorkspaceApi,
+    operation: &WorkdirRemovalOperation,
+    provider: &dyn WorkdirRemovalRuntimeProvider,
+) -> Result<WorkdirRemovalOperation> {
+    let current = api
+        .config_store
+        .get_workdir_registry(&operation.workspace_id, &operation.working_directory_id)?;
+    if current.is_none() {
+        if api
+            .config_store
+            .completed_workdir_removal(&operation.workspace_id, &operation.working_directory_id)?
+            .is_some_and(|removed| {
+                removed.materialization_fingerprint == operation.materialization_fingerprint
+            })
+        {
+            return api.config_store.commit_workdir_removal_removed(operation);
+        }
+        return api.config_store.fail_workdir_removal_operation(
+            operation,
+            "authority_changed",
+            false,
+        );
+    }
+    if current.as_ref().is_some_and(|record| {
+        crate::workdir_removal::workdir_materialization_fingerprint(record)
+            != operation.materialization_fingerprint
+    }) {
+        return api.config_store.fail_workdir_removal_operation(
+            operation,
+            "authority_changed",
+            false,
+        );
+    }
+    match provider.observe_workdir(&operation.runtime_id, &operation.working_directory_id) {
+        Ok(observed) if runtime_reports_workdir_not_found(&observed) => {
+            api.config_store.commit_workdir_removal_removed(operation)
+        }
+        _ => api.config_store.record_workdir_removal_unknown(operation),
+    }
 }
 
 fn recover_workdir_removals(api: &WorkspaceApi) -> Result<()> {
@@ -29798,6 +29895,7 @@ async fn execute_runtime_cleanup_with_context(
                             removal_candidate.workdir_id.as_str(),
                             &requester,
                             &format!("cleanup target {}", removal_candidate.target_id),
+                            &uuid::Uuid::now_v7().to_string(),
                         )
                     })
                     .await?;
@@ -33870,8 +33968,7 @@ fn finalize_spawn_compensation_after_worker_delete(
             api,
             workdir_id,
             "backend:worker_spawn_compensation",
-            "remove Workdir created by rejected Worker spawn",
-        ) {
+            "remove Workdir created by rejected Worker spawn", &uuid::Uuid::now_v7().to_string(),) {
             Ok(result) if result.disposition == WorkingDirectoryRemovalDisposition::Removed => {}
             Ok(result) => diagnostics.push(spawn_compensation_diagnostic(
                 "worker_spawn_compensation_workdir_cleanup_failed",
@@ -33907,8 +34004,7 @@ fn cleanup_spawn_created_workdirs(
             api,
             workdir_id,
             "backend:worker_spawn_compensation",
-            "remove Workdir created before rejected Worker spawn",
-        ) {
+            "remove Workdir created before rejected Worker spawn", &uuid::Uuid::now_v7().to_string(),) {
             Ok(result) if result.disposition == WorkingDirectoryRemovalDisposition::Removed => {}
             Ok(result) => diagnostics.push(spawn_compensation_diagnostic(
                 "worker_spawn_compensation_workdir_cleanup_failed",
@@ -60666,7 +60762,8 @@ mod tests {
         let app = build_router(api.clone());
 
         for (workdir_id, path, reason) in fixtures {
-            let body = serde_json::to_vec(&json!({ "reason": reason })).unwrap();
+            let body = serde_json::to_vec(&json!({ "reason": reason, "operation_id": workdir_id }))
+                .unwrap();
             let response = app
                 .clone()
                 .oneshot(runtime_source_request(
@@ -60700,11 +60797,14 @@ mod tests {
             );
             let operation = api
                 .config_store
-                .find_workdir_removal_operation_by_intent(
+                .get_workdir_removal_operation(
                     TEST_WORKSPACE_ID,
-                    workdir_id,
-                    "worker:runtime-source:worker-source",
-                    reason,
+                    &crate::workdir_removal::workdir_removal_request_id(
+                        TEST_WORKSPACE_ID,
+                        "worker:runtime-source:worker-source",
+                        workdir_id,
+                    )
+                    .unwrap(),
                 )
                 .unwrap()
                 .unwrap();
@@ -60712,6 +60812,29 @@ mod tests {
                 operation.source_actor,
                 "worker:runtime-source:worker-source"
             );
+            for request_id in [workdir_id.to_string(), format!("{workdir_id}-fresh")] {
+                let replay = app
+                    .clone()
+                    .oneshot(runtime_source_request(
+                        &identity,
+                        Some("worker-source"),
+                        "DELETE",
+                        &path,
+                        serde_json::to_vec(&json!({"reason": reason, "operation_id": request_id}))
+                            .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(replay.status(), StatusCode::OK);
+                let result: WorkingDirectoryRemovalResponse = serde_json::from_slice(
+                    &to_bytes(replay.into_body(), usize::MAX).await.unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    result.disposition,
+                    WorkingDirectoryRemovalDisposition::Removed
+                );
+            }
             assert_eq!(operation.state, WorkdirRemovalOperationState::Completed);
             assert_eq!(
                 operation.disposition,
@@ -60754,7 +60877,10 @@ mod tests {
                 None,
                 "DELETE",
                 &runtime_only_path,
-                serde_json::to_vec(&json!({ "reason": "runtime only" })).unwrap(),
+                serde_json::to_vec(
+                    &json!({ "reason": "runtime only", "operation_id": "denied-removal" }),
+                )
+                .unwrap(),
             ))
             .await
             .unwrap();
@@ -60773,7 +60899,10 @@ mod tests {
                         worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
                         "not-a-valid-proof",
                     )
-                    .body(Body::from(json!({ "reason": "invalid proof" }).to_string()))
+                    .body(Body::from(
+                        json!({ "reason": "invalid proof", "operation_id": "denied-removal" })
+                            .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -60789,7 +60918,8 @@ mod tests {
                     .uri(&unauthenticated_path)
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        json!({ "reason": "unauthenticated" }).to_string(),
+                        json!({ "reason": "unauthenticated", "operation_id": "denied-removal" })
+                            .to_string(),
                     ))
                     .unwrap(),
             )
@@ -60830,7 +60960,7 @@ mod tests {
             build_router(api.clone()),
             "DELETE",
             &path,
-            Some(json!({ "reason": reason })),
+            Some(json!({ "reason": reason, "operation_id": workdir_id })),
             &token,
             StatusCode::OK,
         )
@@ -60844,11 +60974,14 @@ mod tests {
         );
         let operation = api
             .config_store
-            .find_workdir_removal_operation_by_intent(
+            .get_workdir_removal_operation(
                 TEST_WORKSPACE_ID,
-                workdir_id,
-                &format!("account:account-{TEST_WORKSPACE_ID}"),
-                reason,
+                &crate::workdir_removal::workdir_removal_request_id(
+                    TEST_WORKSPACE_ID,
+                    &format!("account:account-{TEST_WORKSPACE_ID}"),
+                    workdir_id,
+                )
+                .unwrap(),
             )
             .unwrap()
             .unwrap();
@@ -61181,8 +61314,13 @@ mod tests {
             .unwrap();
         record.materialization_status = "pending".into();
         api.store.upsert_workdir_registry(&record).unwrap();
-        let intent =
-            workdir_removal_intent(&record, "account:owner", "remove docs checkout").unwrap();
+        let intent = workdir_removal_intent(
+            &record,
+            "account:owner",
+            "remove docs checkout",
+            "test-removal-request",
+        )
+        .unwrap();
         let pending = api
             .config_store
             .reserve_workdir_removal_operation(&intent)
@@ -61958,6 +62096,7 @@ mod tests {
             &record,
             "account:owner",
             &format!("remove {working_directory_id}"),
+            working_directory_id,
         )
         .unwrap();
         let operation = api
@@ -61965,6 +62104,212 @@ mod tests {
             .reserve_workdir_removal_operation(&intent)
             .unwrap();
         (operation, summary)
+    }
+
+    #[tokio::test]
+    async fn workdir_removal_failure_never_recovers_as_a_job_and_new_request_can_remove() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let (operation, summary) = reserve_removal_fixture(&api, "terminal-busy");
+        let provider = FakeWorkdirRemovalProvider::new(
+            workdir_removal_result(
+                InternalWorkerOperationState::Accepted,
+                Some(summary.clone()),
+                Vec::new(),
+            ),
+            workdir_removal_result(
+                InternalWorkerOperationState::Rejected,
+                None,
+                vec![RuntimeDiagnostic {
+                    code: "working_directory_cleanup_resource_busy".into(),
+                    severity: HostDiagnosticSeverity::Warning,
+                    message: "busy".into(),
+                }],
+            ),
+        );
+        let failed =
+            execute_reserved_workdir_removal_with_provider(&api, operation, false, &provider)
+                .unwrap();
+        assert_eq!(failed.state, WorkdirRemovalOperationState::Failed);
+        for recovery in [false, true] {
+            assert_eq!(
+                execute_reserved_workdir_removal_with_provider(
+                    &api,
+                    failed.clone(),
+                    recovery,
+                    &provider
+                )
+                .unwrap(),
+                failed
+            );
+        }
+        assert_eq!(provider.cleanup_calls(), 1);
+        assert!(
+            api.config_store
+                .recoverable_workdir_removal_operations(api.workspace_id(), 100)
+                .unwrap()
+                .is_empty()
+        );
+        let new_request = reserve_requested_workdir_removal(
+            &api,
+            &failed.working_directory_id,
+            &failed.source_actor,
+            &failed.reason,
+            "new-explicit-request",
+        )
+        .unwrap();
+        assert_ne!(new_request.operation_id, failed.operation_id);
+        assert!(
+            reserve_requested_workdir_removal(
+                &api,
+                &failed.working_directory_id,
+                &failed.source_actor,
+                "changed reason",
+                "new-explicit-request"
+            )
+            .is_err()
+        );
+        assert!(
+            reserve_requested_workdir_removal(
+                &api,
+                "different-workdir",
+                &failed.source_actor,
+                &failed.reason,
+                "new-explicit-request"
+            )
+            .is_err()
+        );
+        let success = FakeWorkdirRemovalProvider::new(
+            workdir_removal_result(
+                InternalWorkerOperationState::Accepted,
+                Some(summary),
+                Vec::new(),
+            ),
+            confirmed_workdir_cleanup_result(),
+        );
+        let removed =
+            execute_reserved_workdir_removal_with_provider(&api, new_request, false, &success)
+                .unwrap();
+        assert_eq!(
+            removed.disposition,
+            Some(WorkdirRemovalDisposition::Removed)
+        );
+        let already_removed = execute_workdir_removal(
+            &api,
+            &failed.working_directory_id,
+            &failed.source_actor,
+            &failed.reason,
+            "another-explicit-request",
+        )
+        .unwrap();
+        assert_eq!(
+            already_removed.disposition,
+            WorkingDirectoryRemovalDisposition::Removed
+        );
+        assert_eq!(
+            execute_reserved_workdir_removal_with_provider(&api, failed.clone(), false, &success)
+                .unwrap(),
+            failed
+        );
+        assert_eq!(success.cleanup_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn workdir_removal_unknown_outcome_recovery_only_observes_and_confirms_absence() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let (operation, summary) = reserve_removal_fixture(&api, "lost-delete-response");
+        let provider = FakeWorkdirRemovalProvider::new(
+            workdir_removal_result(
+                InternalWorkerOperationState::Accepted,
+                Some(summary.clone()),
+                Vec::new(),
+            ),
+            confirmed_workdir_cleanup_result(),
+        );
+        *provider.cleanup.lock().unwrap() =
+            Some(Err(RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: "runtime-test".into(),
+                code: "transport_timeout".into(),
+                message: "response lost".into(),
+            }));
+        let unknown =
+            execute_reserved_workdir_removal_with_provider(&api, operation, false, &provider)
+                .unwrap();
+        assert_eq!(unknown.state, WorkdirRemovalOperationState::Pending);
+        assert_eq!(
+            unknown.failure_category.as_deref(),
+            Some("provider_cleanup_outcome_unknown")
+        );
+        assert!(!unknown.retryable);
+        assert!(
+            reserve_requested_workdir_removal(
+                &api,
+                &unknown.working_directory_id,
+                &unknown.source_actor,
+                &unknown.reason,
+                "do-not-fork-unknown"
+            )
+            .is_err()
+        );
+        *provider.observation.lock().unwrap() = Some(Ok(workdir_removal_result(
+            InternalWorkerOperationState::Accepted,
+            Some(summary),
+            Vec::new(),
+        )));
+        let still_unknown =
+            execute_reserved_workdir_removal_with_provider(&api, unknown, true, &provider).unwrap();
+        assert_eq!(still_unknown.state, WorkdirRemovalOperationState::Pending);
+        assert_eq!(provider.cleanup_calls(), 1);
+        *provider.observation.lock().unwrap() = Some(Ok(confirmed_workdir_cleanup_result()));
+        let removed =
+            execute_reserved_workdir_removal_with_provider(&api, still_unknown, true, &provider)
+                .unwrap();
+        assert_eq!(
+            removed.disposition,
+            Some(WorkdirRemovalDisposition::Removed)
+        );
+        assert_eq!(provider.cleanup_calls(), 1);
+        assert!(
+            api.store
+                .get_workdir_registry(api.workspace_id(), &removed.working_directory_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn workdir_removal_unstarted_request_recovery_does_not_start_deletion() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let (operation, summary) = reserve_removal_fixture(&api, "unstarted-removal");
+        let provider = FakeWorkdirRemovalProvider::new(
+            workdir_removal_result(
+                InternalWorkerOperationState::Accepted,
+                Some(summary),
+                Vec::new(),
+            ),
+            confirmed_workdir_cleanup_result(),
+        );
+        let interrupted =
+            execute_reserved_workdir_removal_with_provider(&api, operation, true, &provider)
+                .unwrap();
+        assert_eq!(interrupted.state, WorkdirRemovalOperationState::Failed);
+        assert_eq!(
+            interrupted.failure_category.as_deref(),
+            Some("request_interrupted")
+        );
+        assert_eq!(provider.cleanup_calls(), 0);
+        assert!(provider.observation.lock().unwrap().is_some());
+        assert!(
+            api.store
+                .get_workdir_registry(api.workspace_id(), &interrupted.working_directory_id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -62089,9 +62434,26 @@ mod tests {
             confirmed_workdir_cleanup_result(),
         );
         let dirty_attempt_id = dirty.attempt_id.clone();
+        let replay = execute_reserved_workdir_removal_with_provider(
+            &api,
+            dirty.clone(),
+            false,
+            &clean_retry_provider,
+        )
+        .unwrap();
+        assert_eq!(replay, dirty);
+        assert_eq!(clean_retry_provider.cleanup_calls(), 0);
+        let new_request = reserve_requested_workdir_removal(
+            &api,
+            &dirty.working_directory_id,
+            &dirty.source_actor,
+            &dirty.reason,
+            "new-clean-request",
+        )
+        .unwrap();
         let removed_after_retry = execute_reserved_workdir_removal_with_provider(
             &api,
-            dirty,
+            new_request,
             false,
             &clean_retry_provider,
         )
@@ -62215,7 +62577,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workdir_removal_retry_rechecks_pending_materialization_changes_and_attachments() {
+    async fn new_workdir_removal_request_rechecks_pending_materialization_changes_and_attachments()
+    {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
@@ -62263,8 +62626,16 @@ mod tests {
             ),
             confirmed_workdir_cleanup_result(),
         );
+        let request = reserve_requested_workdir_removal(
+            &api,
+            &failed.working_directory_id,
+            &failed.source_actor,
+            &failed.reason,
+            "dirty-request",
+        )
+        .unwrap();
         let dirty =
-            execute_reserved_workdir_removal_with_provider(&api, failed, false, &dirty_provider)
+            execute_reserved_workdir_removal_with_provider(&api, request, false, &dirty_provider)
                 .unwrap();
         assert_eq!(dirty.disposition, Some(WorkdirRemovalDisposition::Retained));
         assert!(dirty.retryable);
@@ -62280,9 +62651,21 @@ mod tests {
             ),
             confirmed_workdir_cleanup_result(),
         );
-        let occupied =
-            execute_reserved_workdir_removal_with_provider(&api, dirty, false, &occupied_provider)
-                .unwrap();
+        let request = reserve_requested_workdir_removal(
+            &api,
+            &dirty.working_directory_id,
+            &dirty.source_actor,
+            &dirty.reason,
+            "occupied-request",
+        )
+        .unwrap();
+        let occupied = execute_reserved_workdir_removal_with_provider(
+            &api,
+            request,
+            false,
+            &occupied_provider,
+        )
+        .unwrap();
         assert_eq!(
             occupied.failure_category.as_deref(),
             Some("blocked_by_live_authority")
@@ -62309,14 +62692,18 @@ mod tests {
             ),
             confirmed_workdir_cleanup_result(),
         );
-        let removed = execute_reserved_workdir_removal_with_provider(
+        let request = reserve_requested_workdir_removal(
             &api,
-            occupied.clone(),
-            false,
-            &retry_provider,
+            &occupied.working_directory_id,
+            &occupied.source_actor,
+            &occupied.reason,
+            "final-request",
         )
         .unwrap();
-        assert_eq!(removed.operation_id, occupied.operation_id);
+        let removed =
+            execute_reserved_workdir_removal_with_provider(&api, request, false, &retry_provider)
+                .unwrap();
+        assert_ne!(removed.operation_id, occupied.operation_id);
         assert_ne!(removed.attempt_id, occupied.attempt_id);
         assert_eq!(
             removed.disposition,
@@ -62415,7 +62802,15 @@ mod tests {
             let result =
                 execute_reserved_workdir_removal_with_provider(&api, operation, false, &provider)
                     .unwrap();
-            assert!(result.retryable);
+            assert_eq!(result.retryable, changed_identity);
+            assert_eq!(
+                result.state,
+                if changed_identity {
+                    WorkdirRemovalOperationState::Failed
+                } else {
+                    WorkdirRemovalOperationState::Pending
+                }
+            );
             assert_eq!(
                 result.failure_category.as_deref(),
                 Some(if changed_identity {
@@ -62449,7 +62844,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_orphan_recovery_runs_delayed_provider_cleanup_once() {
+    async fn concurrent_orphan_recovery_observes_once_without_reissuing_cleanup() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
@@ -62504,7 +62899,9 @@ mod tests {
                 .iter()
                 .filter(|result| {
                     result.as_ref().is_ok_and(|operation| {
-                        operation.disposition == Some(WorkdirRemovalDisposition::Removed)
+                        operation.state == WorkdirRemovalOperationState::Pending
+                            && operation.failure_category.as_deref()
+                                == Some("provider_cleanup_outcome_unknown")
                     })
                 })
                 .count(),
@@ -62517,7 +62914,13 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(provider.cleanup_calls(), 1);
+        assert_eq!(provider.cleanup_calls(), 0);
+        assert!(
+            api.store
+                .get_workdir_registry(TEST_WORKSPACE_ID, "orphan-race")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -62546,65 +62949,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_workdir_removal_retries_provider_unavailable_without_deleting_registry() {
+    async fn failed_workdir_removal_replays_without_reexecution_and_new_request_is_distinct() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
         seed_cleanup_workdir(&api, "missing-clean-workdir", "present", "clean");
-
-        let first = execute_workdir_removal(
-            &api,
-            "missing-clean-workdir",
-            "account:owner",
-            "remove stale clean Workdir",
-        )
-        .unwrap();
-        assert_eq!(
-            first.disposition,
-            WorkingDirectoryRemovalDisposition::AttentionRequired
-        );
-        assert!(first.retryable);
+        let request = |id| {
+            execute_workdir_removal(
+                &api,
+                "missing-clean-workdir",
+                "account:owner",
+                "remove stale clean Workdir",
+                id,
+            )
+            .unwrap()
+        };
+        let saved = |id| {
+            api.config_store
+                .get_workdir_removal_operation(
+                    api.workspace_id(),
+                    &crate::workdir_removal::workdir_removal_request_id(
+                        api.workspace_id(),
+                        "account:owner",
+                        id,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let first = request("request-1");
         assert_eq!(
             first.failure_category.as_deref(),
             Some("runtime_unavailable")
         );
+        let first_record = saved("request-1");
+        assert_eq!(request("request-1"), first);
+        assert_eq!(saved("request-1"), first_record);
+        recover_workdir_removals(&api).unwrap();
+        assert_eq!(saved("request-1"), first_record);
         assert!(
-            api.store
-                .get_workdir_registry(&api.config.workspace_id, "missing-clean-workdir")
+            api.config_store
+                .recoverable_workdir_removal_operations(api.workspace_id(), 100)
                 .unwrap()
-                .is_some()
+                .is_empty()
         );
-
-        let first_attempt_id = api
-            .config_store
-            .find_workdir_removal_operation_by_intent(
-                &api.config.workspace_id,
+        assert_eq!(request("request-2"), first);
+        assert_ne!(saved("request-2").operation_id, first_record.operation_id);
+        assert_ne!(saved("request-2").attempt_id, first_record.attempt_id);
+        assert!(
+            execute_workdir_removal(
+                &api,
                 "missing-clean-workdir",
                 "account:owner",
-                "remove stale clean Workdir",
+                "different reason",
+                "request-1"
             )
-            .unwrap()
-            .unwrap()
-            .attempt_id;
-        let retry = execute_workdir_removal(
-            &api,
-            "missing-clean-workdir",
-            "account:owner",
-            "remove stale clean Workdir",
-        )
-        .unwrap();
-        assert_eq!(retry, first);
-        let operation = api
-            .config_store
-            .find_workdir_removal_operation_by_intent(
-                &api.config.workspace_id,
-                "missing-clean-workdir",
-                "account:owner",
-                "remove stale clean Workdir",
-            )
-            .unwrap()
-            .unwrap();
-        assert_ne!(operation.attempt_id, first_attempt_id);
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -62621,6 +63023,7 @@ mod tests {
             "occupied-workdir",
             "account:owner",
             "remove occupied Workdir",
+            &uuid::Uuid::now_v7().to_string(),
         )
         .unwrap();
         assert_eq!(
@@ -62654,6 +63057,7 @@ mod tests {
             &record,
             "account:owner",
             "do not steal a live provider call",
+            "test-removal-request",
         )
         .unwrap();
         let reserved = api
@@ -62696,8 +63100,13 @@ mod tests {
             .get_workdir_registry(&api.config.workspace_id, "recovery-workdir")
             .unwrap()
             .unwrap();
-        let intent =
-            workdir_removal_intent(&record, "account:owner", "recover provider cleanup").unwrap();
+        let intent = workdir_removal_intent(
+            &record,
+            "account:owner",
+            "recover provider cleanup",
+            "test-removal-request",
+        )
+        .unwrap();
         let reserved = api
             .config_store
             .reserve_workdir_removal_operation(&intent)
@@ -62723,12 +63132,12 @@ mod tests {
             .get_workdir_removal_operation(&api.config.workspace_id, &intent.operation_id)
             .unwrap()
             .unwrap();
-        assert_eq!(operation.state, WorkdirRemovalOperationState::Failed);
+        assert_eq!(operation.state, WorkdirRemovalOperationState::Pending);
         assert_ne!(operation.attempt_id, interrupted_attempt.attempt_id);
-        assert!(operation.retryable);
+        assert!(!operation.retryable);
         assert_eq!(
             operation.failure_category.as_deref(),
-            Some("runtime_unavailable")
+            Some("provider_cleanup_outcome_unknown")
         );
         assert!(
             api.store

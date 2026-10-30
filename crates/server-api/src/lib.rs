@@ -7064,6 +7064,8 @@ pub struct WorkingDirectoryCleanupTarget {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryRemovalRequest {
+    /// Stable for an exact resend; a new explicit request uses a new identity.
+    pub operation_id: String,
     pub reason: String,
 }
 

@@ -1,24 +1,15 @@
-//! Persists durable deletion intent and attempts for Repository-backed Workdirs.
+//! Records one Repository-backed Workdir removal request and its result.
 //!
-//! Deletion intent fixes Workspace, Workdir, owning Runtime, Repository/materialization, actor,
-//! and reason. Endpoints, host paths, and provider handles do not grant caller deletion authority.
+//! Caller-generated request identities distinguish an exact resend from a new explicit request;
+//! reason text is audit input, never a replay key. Failed and completed records are terminal,
+//! including legacy failed records marked retryable. Retryability only advises a new explicit
+//! request after resolving its cause; it is not continuing authority to delete.
+//!
+//! Only one unresolved request per Workdir is allowed. Attempts are claimed transactionally and
+//! fenced by process/start marker and attempt identity. Recovery observes uncertain external
+//! effects but never reissues deletion. Confirmed absence and the matching materialization permit
+//! registry removal and the saved result to commit together. Unconfirmed effects remain pending.
 //! External Workdirs follow grant revocation, not this operation.
-//!
-//! Only one pending operation per Workdir is allowed; attempts are claimed transactionally.
-//! Process IDs and startup markers are retained. Recovery reclaims the exact owner/attempt by
-//! compare-and-set only after confirming the previous owner is gone; live or unobservable owners
-//! are not displaced. In-process locks alone are insufficient.
-//!
-//! Server execution revalidates stored materialization and current attachments, reservations,
-//! assignments, retention, and creation operations, then observes occupancy and cleanliness via
-//! Runtime. Dirty resources remain; unknown observations or provider failures retain the registry
-//! and record attention/retryability. Only confirmed deletion or exact working_directory_not_found
-//! is deletion evidence; registry removal and completed/removed commit in the same transaction.
-//!
-//! Normal deletion, Workspace deletion, cleanup, and startup recovery use the same reserved Server
-//! operation execution. Failed DB commits after provider deletion are reobserved through that
-//! operation. Recovery relies on provider identity and results, not an exactly-once guarantee
-//! across all interruption points.
 
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -118,10 +109,22 @@ pub fn workdir_materialization_fingerprint(record: &WorkdirRegistryRecord) -> St
     hex_sha256(&bytes)
 }
 
+pub fn workdir_removal_request_id(
+    workspace_id: &str,
+    source_actor: &str,
+    request_id: &str,
+) -> Result<String> {
+    validate_bounded("operation id", request_id, 256)?;
+    let bytes = serde_json::to_vec(&(workspace_id, source_actor, request_id))
+        .map_err(|error| Error::Store(error.to_string()))?;
+    Ok(format!("wdr_{}", &hex_sha256(&bytes)[..32]))
+}
+
 pub fn workdir_removal_intent(
     record: &WorkdirRegistryRecord,
     source_actor: &str,
     reason: &str,
+    request_id: &str,
 ) -> Result<WorkdirRemovalIntent> {
     validate_bounded("source actor", source_actor, MAX_ACTOR_BYTES)?;
     validate_bounded("reason", reason, MAX_REASON_BYTES)?;
@@ -146,7 +149,7 @@ pub fn workdir_removal_intent(
         ));
     };
     Ok(WorkdirRemovalIntent {
-        operation_id: format!("wdr_{}", &request_fingerprint[..32]),
+        operation_id: workdir_removal_request_id(&record.workspace_id, source_actor, request_id)?,
         request_fingerprint,
         workspace_id: record.workspace_id.clone(),
         working_directory_id: record.workdir_id.clone(),
@@ -285,16 +288,9 @@ impl SqliteWorkspaceStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let operation =
                 require_operation(&tx, workspace_id, operation_id, request_fingerprint)?;
-            if operation.state == WorkdirRemovalOperationState::Completed
-                && operation.disposition == Some(WorkdirRemovalDisposition::Removed)
-            {
+            if operation.state != WorkdirRemovalOperationState::Pending {
                 tx.commit()?;
                 return Ok(operation);
-            }
-            if operation.state == WorkdirRemovalOperationState::Failed && !operation.retryable {
-                return Err(Error::InvalidInput(format!(
-                    "Workdir removal operation `{operation_id}` is not retryable"
-                )));
             }
             if let Some((expected_owner, expected_attempt_id)) = recovery_expected {
                 if operation.state != WorkdirRemovalOperationState::Pending
@@ -473,7 +469,7 @@ impl SqliteWorkspaceStore {
                 &operation.operation_id,
                 &operation.request_fingerprint,
             )?;
-            if current.state == WorkdirRemovalOperationState::Completed {
+            if current.state != WorkdirRemovalOperationState::Pending {
                 tx.commit()?;
                 return Ok(current);
             }
@@ -490,6 +486,39 @@ impl SqliteWorkspaceStore {
                     operation.operation_id,
                     operation.request_fingerprint,
                 ],
+            )?;
+            let updated = require_operation(
+                &tx,
+                &operation.workspace_id,
+                &operation.operation_id,
+                &operation.request_fingerprint,
+            )?;
+            tx.commit()?;
+            Ok(updated)
+        })
+    }
+
+    /// Keep an uncertain external outcome for observation, not automatic re-execution.
+    pub fn record_workdir_removal_unknown(
+        &self,
+        operation: &WorkdirRemovalOperation,
+    ) -> Result<WorkdirRemovalOperation> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = require_operation(
+                &tx,
+                &operation.workspace_id,
+                &operation.operation_id,
+                &operation.request_fingerprint,
+            )?;
+            if current.state != WorkdirRemovalOperationState::Pending {
+                tx.commit()?;
+                return Ok(current);
+            }
+            require_matching_attempt(operation, &current)?;
+            tx.execute(
+                "UPDATE workdir_removal_operations SET retryable=0, disposition='attention_required', failure_category='provider_cleanup_outcome_unknown', attempt_owner_pid=NULL, attempt_owner_start_marker=NULL, updated_at=?1 WHERE workspace_id=?2 AND operation_id=?3",
+                params![Utc::now().to_rfc3339(), operation.workspace_id, operation.operation_id],
             )?;
             let updated = require_operation(
                 &tx,
@@ -531,7 +560,7 @@ impl SqliteWorkspaceStore {
                 &operation.operation_id,
                 &operation.request_fingerprint,
             )?;
-            if current.state == WorkdirRemovalOperationState::Completed {
+            if current.state != WorkdirRemovalOperationState::Pending {
                 tx.commit()?;
                 return Ok(current);
             }
@@ -541,24 +570,29 @@ impl SqliteWorkspaceStore {
                     &tx,
                     &operation.workspace_id,
                     &operation.working_directory_id,
-                )?
-                .ok_or_else(|| Error::RegistryInconsistency(
-                    "Workdir registry row disappeared before durable removal commit".to_string(),
-                ))?;
-                require_operation_materialization(operation, &registry)?;
-                require_no_removal_blockers(
-                    &tx,
-                    &operation.workspace_id,
-                    &operation.working_directory_id,
                 )?;
-                let deleted = tx.execute(
-                    "DELETE FROM workdir_registry WHERE workspace_id=?1 AND workdir_id=?2",
-                    params![operation.workspace_id, operation.working_directory_id],
-                )?;
-                if deleted != 1 {
-                    return Err(Error::RegistryInconsistency(
-                        "Workdir registry deletion did not remove exactly one row".to_string(),
-                    ));
+                if let Some(registry) = registry {
+                    require_operation_materialization(operation, &registry)?;
+                    require_no_removal_blockers(
+                        &tx,
+                        &operation.workspace_id,
+                        &operation.working_directory_id,
+                    )?;
+                    tx.execute(
+                        "DELETE FROM workdir_registry WHERE workspace_id=?1 AND workdir_id=?2",
+                        params![operation.workspace_id, operation.working_directory_id],
+                    )?;
+                } else {
+                    let removed: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM workdir_removal_operations WHERE workspace_id=?1 AND workdir_id=?2 AND materialization_fingerprint=?3 AND state='completed' AND disposition='removed')",
+                        params![operation.workspace_id, operation.working_directory_id, operation.materialization_fingerprint],
+                        |row| row.get(0),
+                    )?;
+                    if !removed {
+                        return Err(Error::RegistryInconsistency(
+                            "Workdir registry disappeared without confirmed removal".to_string(),
+                        ));
+                    }
                 }
             }
             let now = Utc::now().to_rfc3339();
@@ -585,20 +619,18 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    pub fn find_workdir_removal_operation_by_intent(
+    pub fn completed_workdir_removal(
         &self,
         workspace_id: &str,
         working_directory_id: &str,
-        source_actor: &str,
-        reason: &str,
     ) -> Result<Option<WorkdirRemovalOperation>> {
         self.with_conn(|conn| {
             conn.query_row(
                 &format!(
-                    "{} WHERE workspace_id=?1 AND workdir_id=?2 AND source_actor=?3 AND reason=?4 ORDER BY created_at DESC, operation_id DESC LIMIT 1",
+                    "{} WHERE workspace_id=?1 AND workdir_id=?2 AND state='completed' AND disposition='removed' ORDER BY completed_at DESC, operation_id DESC LIMIT 1",
                     operation_select_sql()
                 ),
-                params![workspace_id, working_directory_id, source_actor, reason],
+                params![workspace_id, working_directory_id],
                 read_operation,
             )
             .optional()
@@ -614,7 +646,7 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
                 &format!(
-                    "{} WHERE workspace_id=?1 AND (state='pending' OR (state='failed' AND retryable=1)) ORDER BY updated_at ASC, operation_id ASC LIMIT ?2",
+                    "{} WHERE workspace_id=?1 AND state='pending' ORDER BY updated_at ASC, operation_id ASC LIMIT ?2",
                     operation_select_sql()
                 ),
             )?;
@@ -1007,8 +1039,13 @@ mod tests {
     #[tokio::test]
     async fn exact_replay_reuses_operation_and_conflicting_intent_fails() {
         let (store, workdir) = seeded_store().await;
-        let intent =
-            workdir_removal_intent(&workdir, "worker:W-1", "remove stale Workdir").unwrap();
+        let intent = workdir_removal_intent(
+            &workdir,
+            "worker:W-1",
+            "remove stale Workdir",
+            "test-removal-request",
+        )
+        .unwrap();
         let first = store.reserve_workdir_removal_operation(&intent).unwrap();
         let replay = store.reserve_workdir_removal_operation(&intent).unwrap();
         assert_eq!(replay, first);
@@ -1023,10 +1060,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_attempt_is_retryable_and_completed_retry_replays() {
+    async fn failed_request_is_terminal_and_new_request_has_independent_result() {
         let (store, workdir) = seeded_store().await;
-        let intent =
-            workdir_removal_intent(&workdir, "workspace-api", "remove clean Workdir").unwrap();
+        let intent = workdir_removal_intent(
+            &workdir,
+            "workspace-api",
+            "remove clean Workdir",
+            "test-removal-request",
+        )
+        .unwrap();
         let reserved = store.reserve_workdir_removal_operation(&intent).unwrap();
         let first = store
             .begin_workdir_removal_attempt(
@@ -1049,7 +1091,32 @@ mod tests {
                 attempt_owner(),
             )
             .unwrap();
-        assert_ne!(retry.attempt_id, first.attempt_id);
+        assert_eq!(retry, failed);
+        assert!(
+            store
+                .recoverable_workdir_removal_operations("workspace-a", 100)
+                .unwrap()
+                .is_empty()
+        );
+        let next_intent = workdir_removal_intent(
+            &workdir,
+            "workspace-api",
+            "remove clean Workdir",
+            "new-request",
+        )
+        .unwrap();
+        let next = store
+            .reserve_workdir_removal_operation(&next_intent)
+            .unwrap();
+        let retry = store
+            .begin_workdir_removal_attempt(
+                &next.workspace_id,
+                &next.operation_id,
+                &next.request_fingerprint,
+                attempt_owner(),
+            )
+            .unwrap();
+        assert_ne!(retry.operation_id, failed.operation_id);
         let completed = store.commit_workdir_removal_removed(&retry).unwrap();
         assert_eq!(
             completed.disposition,
@@ -1075,7 +1142,13 @@ mod tests {
     #[tokio::test]
     async fn recovery_and_completion_are_fenced_by_attempt_identity() {
         let (store, workdir) = seeded_store().await;
-        let intent = workdir_removal_intent(&workdir, "workspace-api", "remove Workdir").unwrap();
+        let intent = workdir_removal_intent(
+            &workdir,
+            "workspace-api",
+            "remove Workdir",
+            "test-removal-request",
+        )
+        .unwrap();
         let reserved = store.reserve_workdir_removal_operation(&intent).unwrap();
         let first = store
             .begin_workdir_removal_attempt(
@@ -1130,8 +1203,13 @@ mod tests {
         use std::sync::{Arc, Barrier};
 
         let (store, workdir) = seeded_store().await;
-        let intent =
-            workdir_removal_intent(&workdir, "workspace-api", "remove clean Workdir").unwrap();
+        let intent = workdir_removal_intent(
+            &workdir,
+            "workspace-api",
+            "remove clean Workdir",
+            "test-removal-request",
+        )
+        .unwrap();
         let operation = store.reserve_workdir_removal_operation(&intent).unwrap();
         let barrier = Arc::new(Barrier::new(3));
         let provider_calls = Arc::new(AtomicUsize::new(0));
@@ -1218,8 +1296,13 @@ mod tests {
                 "2",
             )
             .unwrap();
-        let intent =
-            workdir_removal_intent(&workdir, "workspace-api", "remove clean Workdir").unwrap();
+        let intent = workdir_removal_intent(
+            &workdir,
+            "workspace-api",
+            "remove clean Workdir",
+            "test-removal-request",
+        )
+        .unwrap();
         store.reserve_workdir_removal_operation(&intent).unwrap();
 
         let error = store
@@ -1236,8 +1319,13 @@ mod tests {
     #[tokio::test]
     async fn pending_removal_fences_new_attachment_and_retry_rereads_live_reservation() {
         let (store, workdir) = seeded_store().await;
-        let intent =
-            workdir_removal_intent(&workdir, "workspace-api", "remove clean Workdir").unwrap();
+        let intent = workdir_removal_intent(
+            &workdir,
+            "workspace-api",
+            "remove clean Workdir",
+            "test-removal-request",
+        )
+        .unwrap();
         let pending = store.reserve_workdir_removal_operation(&intent).unwrap();
 
         let error = store
@@ -1251,11 +1339,22 @@ mod tests {
         store
             .reserve_worker_workdir_attachment("workspace-a", "workdir-a", "reservation-b", "3")
             .unwrap();
+        let next_intent = workdir_removal_intent(
+            &workdir,
+            "workspace-api",
+            "remove clean Workdir",
+            "new-request",
+        )
+        .unwrap();
+        let next = store
+            .reserve_workdir_removal_operation(&next_intent)
+            .unwrap();
+        assert_ne!(next.operation_id, failed.operation_id);
         let retry = store
             .begin_workdir_removal_attempt(
-                &failed.workspace_id,
-                &failed.operation_id,
-                &failed.request_fingerprint,
+                &next.workspace_id,
+                &next.operation_id,
+                &next.request_fingerprint,
                 attempt_owner(),
             )
             .unwrap();
@@ -1324,7 +1423,13 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-        let intent = workdir_removal_intent(&workdir, "workspace-api", "remove Workdir").unwrap();
+        let intent = workdir_removal_intent(
+            &workdir,
+            "workspace-api",
+            "remove Workdir",
+            "test-removal-request",
+        )
+        .unwrap();
         let operation = store.reserve_workdir_removal_operation(&intent).unwrap();
         let categories = |guards: Vec<WorkdirRemovalGuard>| {
             guards
@@ -1447,8 +1552,13 @@ mod tests {
     #[tokio::test]
     async fn retained_completion_keeps_registry_and_is_auditable() {
         let (store, workdir) = seeded_store().await;
-        let intent =
-            workdir_removal_intent(&workdir, "workspace-api", "inspect dirty Workdir").unwrap();
+        let intent = workdir_removal_intent(
+            &workdir,
+            "workspace-api",
+            "inspect dirty Workdir",
+            "test-removal-request",
+        )
+        .unwrap();
         let operation = store.reserve_workdir_removal_operation(&intent).unwrap();
         let retained = store
             .complete_workdir_removal_retained(
@@ -1477,10 +1587,12 @@ mod tests {
                 attempt_owner(),
             )
             .unwrap();
-        assert_eq!(retry.state, WorkdirRemovalOperationState::Pending);
-        assert!(retry.attempt_id.is_some());
-        assert_eq!(retry.disposition, None);
-        assert_eq!(retry.failure_category, None);
-        assert!(retry.retryable);
+        assert_eq!(retry, retained);
+        assert!(
+            store
+                .recoverable_workdir_removal_operations("workspace-a", 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

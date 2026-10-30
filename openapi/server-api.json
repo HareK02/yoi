@@ -16290,11 +16290,16 @@
       "WorkingDirectoryRemovalRequest": {
         "additionalProperties": false,
         "properties": {
+          "operation_id": {
+            "description": "Stable for an exact resend; a new explicit request uses a new identity.",
+            "type": "string"
+          },
           "reason": {
             "type": "string"
           }
         },
         "required": [
+          "operation_id",
           "reason"
         ],
         "type": "object"
@@ -18302,7 +18307,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:7e640cff6bdcf6dc298cfca695c5cb71a520288b20f4f29ec8df8138724b97c4"
+    "x-yoi-source-digest": "sha256:3436eada52ceea48f4c50f40195cba02bec37fbbff4ea8f5a332133e6fcde962"
   },
   "openapi": "3.1.0",
   "paths": {

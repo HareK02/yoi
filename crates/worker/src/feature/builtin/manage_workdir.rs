@@ -778,7 +778,11 @@ impl WorkspaceHttpWorkdirBackend {
         )
     }
 
-    fn delete(&self, input: WorkdirDeleteInput) -> Result<ToolOutput, ToolError> {
+    fn delete(
+        &self,
+        input: WorkdirDeleteInput,
+        operation_id: String,
+    ) -> Result<ToolOutput, ToolError> {
         let workdir_id = validate_identity(
             &input.working_directory_id,
             DELETE_TOOL,
@@ -790,6 +794,7 @@ impl WorkspaceHttpWorkdirBackend {
             WorkspaceRequestMethod::Delete,
             format!("/api/w/{workspace_id}/working-directories/{workdir_path}"),
             serde_json::to_string(&WorkdirRemovalRequest {
+                operation_id,
                 reason: validate_delete_reason(&input.reason)?.to_string(),
             })
             .map_err(decode_error)?,
@@ -800,7 +805,7 @@ impl WorkspaceHttpWorkdirBackend {
                 response.disposition,
                 removal_guidance(response.failure_category.as_deref()),
                 if response.retryable {
-                    " After resolving the cause, repeat this WorkdirDelete with the same id and reason; current safety conditions will be rechecked."
+                    " After resolving the cause, a new explicit WorkdirDelete request will recheck current safety conditions. This failed request will not be automatically re-executed."
                 } else {
                     ""
                 }
@@ -954,9 +959,10 @@ impl Tool for WorkspaceHttpWorkdirTool {
                 self.backend.detach_managed(&input.alias, None).await
             }
 
-            WorkdirOperation::Delete => self
-                .backend
-                .delete(parse_input::<WorkdirDeleteInput>(input_json)?),
+            WorkdirOperation::Delete => self.backend.delete(
+                parse_input::<WorkdirDeleteInput>(input_json)?,
+                ctx.call_id.to_string(),
+            ),
         }
     }
 }
@@ -1018,8 +1024,14 @@ fn removal_guidance(category: Option<&str>) -> &'static str {
         Some("runtime_unavailable" | "provider_unavailable") => {
             "Restore the Runtime connection; the registry remains until deletion is confirmed."
         }
-        Some("provider_observation_unknown" | "provider_cleanup_outcome_unknown") => {
-            "Deletion is not confirmed. Re-observe with normal removal after restoring provider access; the registry is retained."
+        Some("provider_cleanup_outcome_unknown") => {
+            "Deletion outcome is unknown. Restore provider access and reconcile the existing request; do not submit a fresh deletion intent. Recovery only observes the target and never repeats deletion."
+        }
+        Some("provider_observation_unknown") => {
+            "The target could not be observed before deletion. Restore provider access before a new request."
+        }
+        Some("request_interrupted") => {
+            "The request was interrupted before execution. A new explicit request is required."
         }
         Some("unsupported_target") => {
             "Ask the owner for the provider's supported cleanup operation."
@@ -1337,8 +1349,44 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn delete_call_identity_distinguishes_new_requests_from_exact_resends() {
+        let client = Arc::new(RecordingWorkspaceClient::new(
+            (0..3)
+                .map(|_| {
+                    response(json!({
+                        "working_directory_id": "wd-request",
+                        "disposition": "attention_required",
+                        "retryable": true,
+                        "failure_category": "resource_busy"
+                    }))
+                })
+                .collect(),
+        ));
+        let tool = WorkspaceHttpWorkdirTool {
+            backend: WorkspaceHttpWorkdirBackend::new(client.clone()),
+            operation: WorkdirOperation::Delete,
+        };
+        let input = r#"{"working_directory_id":"wd-request","reason":"remove unused Workdir"}"#;
+        for id in ["delete-1", "delete-1", "delete-2"] {
+            tool.execute(input, ToolExecutionContext::new(id, "batch", 0))
+                .await
+                .unwrap();
+        }
+        let bodies: Vec<serde_json::Value> = client
+            .requests()
+            .iter()
+            .map(|r| serde_json::from_str(r.body.as_deref().unwrap()).unwrap())
+            .collect();
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(bodies[0]["operation_id"], "delete-1");
+        assert_eq!(bodies[2]["operation_id"], "delete-2");
+        assert_eq!(bodies[0]["reason"], bodies[2]["reason"]);
+        assert!(delete_schema()["properties"].get("operation_id").is_none());
+    }
+
     #[test]
-    fn ordinary_workdir_delete_reports_safe_cause_and_exact_retry_guidance() {
+    fn ordinary_workdir_delete_reports_safe_cause_and_new_request_guidance() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
             "working_directory_id": "wd-retry",
             "disposition": "attention_required",
@@ -1347,10 +1395,13 @@ mod tests {
         }))]));
         let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
         let output = backend
-            .delete(WorkdirDeleteInput {
-                working_directory_id: "wd-retry".into(),
-                reason: "remove unused Workdir".into(),
-            })
+            .delete(
+                WorkdirDeleteInput {
+                    working_directory_id: "wd-retry".into(),
+                    reason: "remove unused Workdir".into(),
+                },
+                "delete-call-1".to_string(),
+            )
             .unwrap();
         assert!(output.summary.contains("Confirm its owner"));
         assert!(
@@ -1358,7 +1409,11 @@ mod tests {
                 .summary
                 .contains("Do not recursively delete mounted data")
         );
-        assert!(output.summary.contains("same id and reason"));
+        assert!(
+            output
+                .summary
+                .contains("new explicit WorkdirDelete request")
+        );
         assert!(output.summary.len() <= 600);
         let content: serde_json::Value =
             serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
@@ -1596,10 +1651,13 @@ mod tests {
             .unwrap();
         backend.detach("checkout").unwrap();
         backend
-            .delete(WorkdirDeleteInput {
-                working_directory_id: "wd-created".to_string(),
-                reason: "remove stale Workdir".to_string(),
-            })
+            .delete(
+                WorkdirDeleteInput {
+                    working_directory_id: "wd-created".to_string(),
+                    reason: "remove stale Workdir".to_string(),
+                },
+                "delete-call-1".to_string(),
+            )
             .unwrap();
 
         let requests = client.requests();
@@ -1637,7 +1695,10 @@ mod tests {
         assert_eq!(requests[4].method, WorkspaceRequestMethod::Delete);
         let body: serde_json::Value =
             serde_json::from_str(requests[4].body.as_deref().unwrap()).unwrap();
-        assert_eq!(body, json!({"reason": "remove stale Workdir"}));
+        assert_eq!(
+            body,
+            json!({"reason": "remove stale Workdir", "operation_id": "delete-call-1"})
+        );
     }
 
     #[tokio::test]
