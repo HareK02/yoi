@@ -1480,15 +1480,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
     fn get_unanswered_tool_calls(&self, history: &History<A>) -> (Vec<ToolCall>, Vec<String>) {
         let mut pending_calls = Vec::new();
         let mut started_call_ids = Vec::new();
-        let mut answered_call_ids = std::collections::HashSet::new();
-
-        for item in history.items() {
-            if let Item::ToolResult { call_id, .. } = item {
-                answered_call_ids.insert(call_id.clone());
-            }
-        }
-
-        for item in history.items() {
+        for entry in unanswered_tool_call_entries(history) {
             if let Item::ToolCall {
                 call_id,
                 name,
@@ -1496,8 +1488,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 execution_id,
                 status,
                 ..
-            } = item
-                && !answered_call_ids.contains(call_id)
+            } = &entry.item
             {
                 if execution_id.is_some() || *status == Some(ItemStatus::InProgress) {
                     started_call_ids.push(call_id.clone());
@@ -1639,6 +1630,30 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             } = info;
             tool_call = call;
             context.call_id = tool_call.id.clone();
+            if let PreToolAction::SyntheticResult(result) = &action
+                && result.tool_use_id != expected_tool_use_id
+            {
+                return Err(InterceptorFailure::new(
+                    InterceptorPhase::PreToolCall,
+                    InterceptorError::new(
+                        InterceptorErrorCategory::ContractViolation,
+                        "synthetic tool result changed immutable tool call identity",
+                    ),
+                )
+                .into());
+            }
+            let execution_id = if matches!(action, PreToolAction::Pause) {
+                None
+            } else {
+                Some(context.execution_id())
+            };
+            self.append_early_tool_call(history, annotate, &tool_call, call_index, execution_id)?;
+            // Policy runs before this call exists in history. Only the successful
+            // append's annotation may bind the identity, overriding hook changes.
+            context.logical_call_id = history
+                .entries()
+                .last()
+                .and_then(|entry| self.interceptor.logical_tool_call_id(&entry.annotation));
             batch.call_info_map.insert(
                 tool_call.id.clone(),
                 (tool_call.clone(), meta, tool.clone(), context.clone()),
@@ -1647,13 +1662,6 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
             match action {
                 PreToolAction::Continue => {
                     let attempt_id = context.execution_id();
-                    self.append_early_tool_call(
-                        history,
-                        annotate,
-                        &tool_call,
-                        call_index,
-                        Some(attempt_id.clone()),
-                    )?;
                     batch
                         .attempt_fence
                         .register(tool_call.id.clone(), attempt_id.clone());
@@ -1695,34 +1703,10 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     batch.dispatched_any = true;
                 }
                 PreToolAction::SyntheticResult(result) => {
-                    if result.tool_use_id != expected_tool_use_id {
-                        return Err(InterceptorFailure::new(
-                            InterceptorPhase::PreToolCall,
-                            InterceptorError::new(
-                                InterceptorErrorCategory::ContractViolation,
-                                "synthetic tool result changed immutable tool call identity",
-                            ),
-                        )
-                        .into());
-                    }
-                    self.append_early_tool_call(
-                        history,
-                        annotate,
-                        &tool_call,
-                        call_index,
-                        Some(context.execution_id()),
-                    )?;
                     batch.synthetic_results.push_back(result);
                     batch.dispatched_any = true;
                 }
                 PreToolAction::Skip => {
-                    self.append_early_tool_call(
-                        history,
-                        annotate,
-                        &tool_call,
-                        call_index,
-                        Some(context.execution_id()),
-                    )?;
                     batch.synthetic_results.push_back(ToolResult::error(
                         &tool_call.id,
                         "Tool execution skipped by interceptor",
@@ -1730,13 +1714,6 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     batch.dispatched_any = true;
                 }
                 PreToolAction::Abort(reason) => {
-                    self.append_early_tool_call(
-                        history,
-                        annotate,
-                        &tool_call,
-                        call_index,
-                        Some(context.execution_id()),
-                    )?;
                     batch.synthetic_results.push_back(ToolResult::error(
                         &tool_call.id,
                         format!("Tool execution aborted: {reason}"),
@@ -1745,7 +1722,6 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                     return Err(EngineError::Aborted(reason));
                 }
                 PreToolAction::Pause => {
-                    self.append_early_tool_call(history, annotate, &tool_call, call_index, None)?;
                     batch.dispatched_any = true;
                     return Ok(EarlyToolAdmission::Pause);
                 }
@@ -2010,10 +1986,24 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
         let batch_id = format!("tool-batch-{}", self.tool_execution_batch_count);
         self.tool_execution_batch_count += 1;
 
+        let mut logical_call_ids: HashMap<String, VecDeque<Option<String>>> = HashMap::new();
+        for entry in unanswered_tool_call_entries(history) {
+            if let Item::ToolCall { call_id, .. } = &entry.item {
+                logical_call_ids
+                    .entry(call_id.clone())
+                    .or_default()
+                    .push_back(self.interceptor.logical_tool_call_id(&entry.annotation));
+            }
+        }
+
         // Phase 1: Apply pre_tool_call interceptor (determine skip/abort/synthetic result)
         let mut approved_calls = Vec::new();
         for (call_index, mut tool_call) in tool_calls.into_iter().enumerate() {
             let expected_tool_use_id = tool_call.id.clone();
+            let logical_call_id = logical_call_ids
+                .get_mut(&tool_call.id)
+                .and_then(VecDeque::pop_front)
+                .flatten();
             let context = ToolExecutionContext::new(&tool_call.id, &batch_id, call_index);
             if !tool_call.input.is_object() {
                 synthetic_results.push(ToolResult::error(
@@ -2079,6 +2069,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                         let tool_call = info.call;
                         let mut context = info.context;
                         context.call_id = tool_call.id.clone();
+                        context.logical_call_id = logical_call_id;
                         call_info_map.insert(
                             tool_call.id.clone(),
                             (tool_call, info.meta.clone(), info.tool.clone(), context),
@@ -2098,6 +2089,7 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 tool_call = info.call;
                 let mut context = info.context;
                 context.call_id = tool_call.id.clone();
+                context.logical_call_id = logical_call_id;
 
                 call_info_map.insert(
                     tool_call.id.clone(),
@@ -2111,7 +2103,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                 approved_calls.push((tool_call, context, Some(info.tool)));
             } else {
                 // Unknown tools go into approved list as-is (will error at execution)
-                let context = ToolExecutionContext::new(&tool_call.id, &batch_id, call_index);
+                let mut context = ToolExecutionContext::new(&tool_call.id, &batch_id, call_index);
+                context.logical_call_id = logical_call_id;
                 approved_calls.push((tool_call, context, None));
             }
         }
@@ -4332,6 +4325,38 @@ fn item_kind(item: &Item) -> &'static str {
         Item::Reasoning { .. } => "reasoning",
     }
 }
+
+/// Pair each result with one preceding unanswered occurrence, never with a later
+/// call that happens to reuse the provider ID. Keep the exact annotated entries
+/// so dispatch and restoration resolve the same host-owned identity.
+fn unanswered_tool_call_entries<A>(history: &History<A>) -> Vec<&HistoryEntry<A>> {
+    let mut calls = Vec::new();
+    let mut by_provider_id: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for entry in history.entries() {
+        match &entry.item {
+            Item::ToolCall { call_id, .. } => {
+                by_provider_id
+                    .entry(call_id.as_str())
+                    .or_default()
+                    .push_back(calls.len());
+                calls.push(Some(entry));
+            }
+            Item::ToolResult { call_id, .. } => {
+                if let Some(queue) = by_provider_id.get_mut(call_id.as_str())
+                    && let Some(index) = queue.pop_front()
+                {
+                    calls[index] = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    calls.into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+#[path = "tests/tool_call_identity.rs"]
+mod tool_call_identity_tests;
 
 #[cfg(test)]
 mod tests {

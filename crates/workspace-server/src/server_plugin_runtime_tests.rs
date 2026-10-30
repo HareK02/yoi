@@ -147,7 +147,7 @@ pub(super) mod plugin_runtime_tests {
                 turn
             };
             let events = match turn {
-                0 => vec![
+                0 | 2 => vec![
                     ModelEvent::tool_use_start(0, "https-call", &self.tool_name),
                     ModelEvent::tool_input_delta(
                         0,
@@ -159,7 +159,7 @@ pub(super) mod plugin_runtime_tests {
                     ),
                     ModelEvent::tool_use_stop(0),
                 ],
-                1 => vec![
+                1 | 3 => vec![
                     ModelEvent::text_block_start(0),
                     ModelEvent::text_delta(0, "Observed the HTTPS tool result."),
                     ModelEvent::text_block_stop(0, None),
@@ -175,6 +175,32 @@ pub(super) mod plugin_runtime_tests {
                     .map(Ok),
             )))
         }
+    }
+
+    pub(in crate::server::tests) fn persisted_call_consumers(
+        session: session_store::SessionId,
+        saved: &session_store::RestoredState,
+        public_name: &str,
+    ) -> Vec<String> {
+        saved
+            .annotated_history
+            .iter()
+            .filter_map(|entry| match &entry.item {
+                session_store::LoggedItem::ToolCall { name, .. } if name == public_name => {
+                    let bytes =
+                        serde_json::to_vec(&(session.to_string(), &entry.metadata.entry_id.0))
+                            .unwrap();
+                    Some(format!(
+                        "tool-{}",
+                        Sha256::digest(bytes)
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     pub(in crate::server::tests) fn assert_https_history(items: &[agen::Item], public_name: &str) {
@@ -234,7 +260,19 @@ pub(super) mod plugin_runtime_tests {
         assert_eq!(output["structured"], json!({"status":503,"body_bytes":9}));
     }
 
-    async fn https_through_runtime_and_history(remote: bool) {
+    struct PauseBeforeFirstCall;
+
+    #[async_trait::async_trait]
+    impl worker::hook::Hook<worker::hook::PreToolCall> for PauseBeforeFirstCall {
+        async fn call(
+            &self,
+            _: &worker::hook::ToolCallSummary,
+        ) -> std::result::Result<worker::hook::HookPreToolAction, worker::hook::HookError> {
+            Ok(worker::hook::HookPreToolAction::Pause)
+        }
+    }
+
+    async fn https_through_runtime_and_history(remote: bool, restore_pending: bool) {
         let mut peer = Peer::new(HOST, vec![response(503, &[], b"peer data")]).await;
         let mut f = Fixture::new(Some(peer_binding(&peer))).await;
         f.api.plugin_https_transport = Some(Arc::new(peer.transport()));
@@ -263,17 +301,34 @@ pub(super) mod plugin_runtime_tests {
             tool_name: public_name.clone(),
             requests: Arc::default(),
         };
-        let manifest = worker::WorkerManifest::from_toml(&format!(
+        let mut manifest = worker::WorkerManifest::from_toml(&format!(
             "[worker]\nname=\"{}\"\n[model]\nscheme=\"anthropic\"\nmodel_id=\"scripted\"\n[engine]\n[scope]\nallow=[]\n",
             f.source.worker_id
         ))
         .unwrap();
+        if restore_pending {
+            manifest
+                .plugins
+                .selections
+                .push(manifest::PluginProfileSelection {
+                    installation_id: f.installed.installation.installation_id.clone(),
+                    tools: vec![f.tool.into()],
+                    logging: false,
+                    https_slots: vec!["api".into()],
+                    config: Default::default(),
+                });
+        }
         let store_root = f._directory.path().join("tool-history");
-        let mut host = worker::Worker::new(
-            manifest,
-            agen::Engine::new_annotated(model.clone())
-                .system_prompt("Use the selected HTTPS tool."),
+        let metadata_root = f._directory.path().join("worker-metadata");
+        let store = session_store::CombinedStore::new(
             session_store::FsStore::new(&store_root).unwrap(),
+            session_store::FsWorkerStore::new(&metadata_root).unwrap(),
+        );
+        let mut host = worker::Worker::new(
+            manifest.clone(),
+            agen::Engine::new_annotated(Box::new(model.clone()) as Box<dyn LlmClient>)
+                .system_prompt("Use the selected HTTPS tool."),
+            store,
             worker::WorkerWorkspaceContext::unavailable(
                 Some(worker::WorkspaceId::new(TEST_WORKSPACE_ID).unwrap()),
                 "unrelated Workspace operations are not bound by this fixture",
@@ -330,6 +385,10 @@ pub(super) mod plugin_runtime_tests {
             tools.get_tool(f.tool).is_none(),
             "bare guest names are not public tools"
         );
+        if restore_pending {
+            host.enable_worker_metadata_write_through().unwrap();
+            host.add_pre_tool_call_hook(PauseBeforeFirstCall);
+        }
         host.wire_history_persistence();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -340,7 +399,63 @@ pub(super) mod plugin_runtime_tests {
         .await
         .expect("HTTPS Tool/Engine must finish within the fixture deadline")
         .unwrap();
-        assert!(matches!(result, worker::WorkerRunResult::Finished));
+        if restore_pending {
+            assert!(matches!(result, worker::WorkerRunResult::Paused));
+            assert_eq!(peer.connection_count(), 0);
+            assert_eq!(f.count("plugin_invocations"), 0);
+            let reopened = session_store::FsStore::new(&store_root).unwrap();
+            let segments = reopened.list_segments(session_id).unwrap();
+            let pending = session_store::restore(&reopened, session_id, segments[0]).unwrap();
+            let expected = persisted_call_consumers(session_id, &pending, &public_name);
+            assert_eq!(
+                expected.len(),
+                1,
+                "paused call must already have a durable Host identity"
+            );
+            assert!(
+                !pending
+                    .history
+                    .iter()
+                    .any(|item| matches!(item, agen::Item::ToolResult { .. }))
+            );
+            drop(host);
+            let mut restored = worker::Worker::prepare_restored_from_worker_metadata_with_context_and_model_client(
+                &manifest.worker.name, manifest.clone(), session_store::CombinedStore::new(
+                    reopened, session_store::FsWorkerStore::new(&metadata_root).unwrap(),
+                ),
+                worker::PromptCatalogSource::builtins_only(),
+                worker::WorkerWorkspaceContext::unavailable(Some(worker::WorkspaceId::new(TEST_WORKSPACE_ID).unwrap()), "unrelated Workspace operations unavailable"),
+                worker::WorkerFilesystemAuthority::None, Some(Box::new(model.clone())),
+            ).await.unwrap().activate().await.unwrap();
+            assert_eq!(restored.session_id(), session_id);
+            let reloaded = session_store::restore(
+                &session_store::FsStore::new(&store_root).unwrap(),
+                session_id,
+                segments[0],
+            )
+            .unwrap();
+            assert_eq!(
+                persisted_call_consumers(session_id, &reloaded, &public_name),
+                expected
+            );
+            let feature = bridge
+                .prepare(&worker_ref, &snapshot, &session_id.to_string())
+                .await
+                .unwrap();
+            let report =
+                restored.install_features(FeatureRegistryBuilder::new().with_module(feature));
+            assert!(!report.has_errors(), "{}", report.error_message());
+            restored.wire_history_persistence();
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(30), restored.resume())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(matches!(result, worker::WorkerRunResult::Finished));
+            host = restored;
+        } else {
+            assert!(matches!(result, worker::WorkerRunResult::Finished));
+        }
         assert_https_history(&host.history(), &public_name);
         {
             let requests = model.requests.lock().unwrap();
@@ -371,14 +486,9 @@ pub(super) mod plugin_runtime_tests {
         assert_eq!(segments.len(), 1);
         let saved = session_store::restore(&reopened, session_id, segments[0]).unwrap();
         assert_https_history(&saved.history, &public_name);
-        let identity_bytes = serde_json::to_vec(&(session_id.to_string(), "https-call")).unwrap();
-        let consumer_id = format!(
-            "tool-{}",
-            Sha256::digest(identity_bytes)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        );
+        let consumers = persisted_call_consumers(session_id, &saved, &public_name);
+        assert_eq!(consumers.len(), 1);
+        let consumer_id = consumers[0].clone();
         let (consumer, state, status, body): (String, String, i64, Vec<u8>) = f
             .api
             .config_store
@@ -418,7 +528,8 @@ pub(super) mod plugin_runtime_tests {
                 .call_tool(
                     &public_name,
                     "{}",
-                    ToolExecutionContext::new("denied-call", "denied-batch", 0),
+                    ToolExecutionContext::new("denied-call", "denied-batch", 0)
+                        .with_logical_call_id("denied-persisted-call"),
                 )
                 .await
                 .is_err()
@@ -444,12 +555,17 @@ pub(super) mod plugin_runtime_tests {
 
     #[tokio::test]
     async fn remote_pinned_https_tool_commits_normal_history_and_receipt_then_fences_live_denial() {
-        https_through_runtime_and_history(true).await;
+        https_through_runtime_and_history(true, false).await;
     }
 
     #[tokio::test]
     async fn embedded_pinned_https_tool_commits_normal_history_and_receipt_then_fences_live_denial()
     {
-        https_through_runtime_and_history(false).await;
+        https_through_runtime_and_history(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn pending_tool_call_restores_its_committed_host_identity_before_first_effect() {
+        https_through_runtime_and_history(false, true).await;
     }
 }

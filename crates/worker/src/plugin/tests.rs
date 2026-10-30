@@ -320,6 +320,7 @@ fn install(feature: PluginToolsFeature) -> (Engine<NoLlm, Mutable, ()>, HookRegi
 
 fn context(call: &str, batch: &str) -> ToolExecutionContext {
     ToolExecutionContext::new(call, batch, 0)
+        .with_logical_call_id(format!("persisted-entry-{call}"))
 }
 
 fn stopping() -> WorkerStoppingContext {
@@ -502,15 +503,41 @@ async fn adapter_late_publish_denial_withholds_successful_guest_output() {
 }
 
 #[tokio::test]
-async fn consumer_identity_survives_batch_changes_but_isolates_sessions_and_calls() {
+async fn consumer_identity_uses_host_entry_not_provider_call_or_live_batch() {
     let fixture = Fixture::new();
     let owner = Owner::new(Behavior::Allow);
     // Re-preparation simulates a restored adapter, not just reuse of a live Tool.
-    for (session, call, batch) in [
-        ("session-a", "provider-call", "batch-before-restore"),
-        ("session-a", "provider-call", "batch-after-restore"),
-        ("session-b", "provider-call", "batch-after-restore"),
-        ("session-a", "different-call", "batch-after-restore"),
+    for (session, call, logical, batch) in [
+        (
+            "session-a",
+            "provider-call",
+            "host-entry-a",
+            "batch-before-restore",
+        ),
+        (
+            "session-a",
+            "provider-call",
+            "host-entry-a",
+            "batch-after-restore",
+        ),
+        (
+            "session-b",
+            "provider-call",
+            "host-entry-a",
+            "batch-after-restore",
+        ),
+        (
+            "session-a",
+            "provider-call",
+            "host-entry-b",
+            "batch-after-restore",
+        ),
+        (
+            "session-a",
+            "different-provider-call",
+            "host-entry-a",
+            "different-batch",
+        ),
     ] {
         let feature = fixture
             .prepare(&["installation_a"], owner.clone(), session)
@@ -518,7 +545,11 @@ async fn consumer_identity_survives_batch_changes_but_isolates_sessions_and_call
         let (engine, _) = install(feature);
         engine
             .tool_server_handle()
-            .call_tool(TOOL_A, INPUT, context(call, batch))
+            .call_tool(
+                TOOL_A,
+                INPUT,
+                ToolExecutionContext::new(call, batch, 0).with_logical_call_id(logical),
+            )
             .await
             .unwrap();
     }
@@ -526,6 +557,34 @@ async fn consumer_identity_survives_batch_changes_but_isolates_sessions_and_call
     assert_eq!(consumers[0], consumers[1]);
     assert_ne!(consumers[0], consumers[2]);
     assert_ne!(consumers[0], consumers[3]);
+    assert_eq!(consumers[0], consumers[4]);
+}
+
+#[tokio::test]
+async fn missing_or_empty_logical_identity_refuses_owner_admission() {
+    let fixture = Fixture::new();
+    let owner = Owner::new(Behavior::Allow);
+    let feature = fixture
+        .prepare(&["installation_a"], owner.clone(), "session-a")
+        .await;
+    let (engine, _) = install(feature);
+    let tools = engine.tool_server_handle();
+    for context in [
+        ToolExecutionContext::direct(),
+        ToolExecutionContext::new("provider-call", "batch", 0),
+        ToolExecutionContext::new("provider-call", "batch", 0).with_logical_call_id(""),
+    ] {
+        let error = tools.call_tool(TOOL_A, INPUT, context).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("committed logical Tool-call identity")
+        );
+    }
+    assert!(
+        owner.requests().is_empty(),
+        "identity rejection must precede Begin"
+    );
 }
 
 struct FailInstall;

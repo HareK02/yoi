@@ -309,7 +309,7 @@ pub struct ToolCallInfo<'a, A = ()> {
     pub meta: ToolMeta,
     /// Tool instance (for state access).
     pub tool: Arc<dyn Tool>,
-    /// Response-local execution context for this call.
+    /// Execution context. The Engine binds durable identity after pre-tool policy.
     pub context: ToolExecutionContext,
 }
 
@@ -324,7 +324,7 @@ pub struct ToolResultInfo<'a, A = ()> {
     pub meta: ToolMeta,
     /// Tool instance (for state access).
     pub tool: Arc<dyn Tool>,
-    /// Response-local execution context for this call.
+    /// Execution context. The Engine binds durable identity after pre-tool policy.
     pub context: ToolExecutionContext,
 }
 
@@ -344,6 +344,14 @@ pub struct ToolResultInfo<'a, A = ()> {
 /// flows, permission checks, and other trusted host adaptation.
 #[async_trait]
 pub trait Interceptor<A: Send + Sync = ()>: Send + Sync {
+    /// Pure projection of a committed ToolCall's host annotation into an opaque,
+    /// durable call identity. Agen neither interprets storage metadata nor derives
+    /// this identity from provider IDs. Early pre-tool policy runs before commit;
+    /// the Engine binds this value after policy, before execution.
+    fn logical_tool_call_id(&self, _annotation: &A) -> Option<String> {
+        None
+    }
+
     /// Whether side effects may start before [`Self::on_assistant_turn_end`].
     ///
     /// The conservative default preserves the historical whole-response gate.

@@ -7,7 +7,9 @@
 // Run: cargo test -p yoi-workspace-server --lib plugin_remote_controller_tests
 // Prerequisites: openssl and the existing connected Runtime test environment.
 mod plugin_remote_controller_tests {
-    use super::plugin_host_tests::plugin_runtime_tests::{Model, assert_https_history};
+    use super::plugin_host_tests::plugin_runtime_tests::{
+        Model, assert_https_history, persisted_call_consumers,
+    };
     use super::plugin_tests::request;
     use super::subject_authorization_tests::{CONNECTED_RUNTIME, ConnectedWorkerHarness};
     use super::*;
@@ -15,7 +17,6 @@ mod plugin_remote_controller_tests {
     use crate::plugin_plan::PlanPinState;
     use agen::llm_client::{ClientError, LlmClient, Request as ModelRequest};
     use session_store::Store;
-    use sha2::Digest;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -380,14 +381,9 @@ mod plugin_remote_controller_tests {
                 rusqlite::params![TEST_WORKSPACE_ID, saved.plan_id, worker.worker_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?)
         }).unwrap();
-        let identity = serde_json::to_vec(&(session.to_string(), "https-call")).unwrap();
-        let consumer_id = format!(
-            "tool-{}",
-            sha2::Sha256::digest(identity)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        );
+        let consumers = persisted_call_consumers(session, &history, &public_name);
+        assert_eq!(consumers.len(), 1);
+        let consumer_id = consumers[0].clone();
         assert_eq!(
             serde_json::from_str::<server_api::PluginConsumer>(&consumer).unwrap(),
             server_api::PluginConsumer::ToolCall {

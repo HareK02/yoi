@@ -437,6 +437,10 @@ impl WorkerInterceptor {
 
 #[async_trait]
 impl Interceptor<SessionHistoryMetadata> for WorkerInterceptor {
+    fn logical_tool_call_id(&self, annotation: &SessionHistoryMetadata) -> Option<String> {
+        Some(annotation.entry_id.0.clone())
+    }
+
     fn supports_early_tool_dispatch(&self) -> bool {
         self.registry.on_turn_end.is_empty()
     }

@@ -13,13 +13,14 @@
 // Run: cargo test -p yoi-workspace-server --lib plugin_controller_tests
 // Prerequisites: openssl and the normal connected-restore test environment.
 mod plugin_controller_tests {
-    use super::plugin_host_tests::plugin_runtime_tests::{Model, assert_https_history};
+    use super::plugin_host_tests::plugin_runtime_tests::{
+        Model, assert_https_history, persisted_call_consumers,
+    };
     use super::plugin_tests::request;
     use super::*;
     use crate::plugin_https::test_support::{HOST, Peer, response};
     use crate::plugin_plan::PlanPinState;
     use session_store::Store;
-    use sha2::Digest;
     use std::sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -41,6 +42,10 @@ mod plugin_controller_tests {
 
     impl Fixture {
         async fn new(peer: &Peer) -> Self {
+            Self::with_request_count(peer, 1).await
+        }
+
+        async fn with_request_count(peer: &Peer, request_count: usize) -> Self {
             // Use the established short-path/environment guard for real restore
             // (not a mock controller or a replacement execution backend).
             let directory = super::restored_parent_control_tests::connected_restore_tempdir();
@@ -57,7 +62,7 @@ mod plugin_controller_tests {
             let clients = model_clients.clone();
             let observed = requests.clone();
             let tool = model_tool.clone();
-            let transport = Arc::new(peer.transport());
+            let transport = Arc::new(peer.transport_for_requests(request_count));
             let api = WorkspaceApi::new_with_embedded_configurators(
                 config,
                 store,
@@ -345,6 +350,14 @@ mod plugin_controller_tests {
             &self,
             worker: &RuntimeWorkerRef,
         ) -> (session_store::SessionId, Vec<agen::Item>) {
+            let (session, saved) = self.saved_state(worker);
+            (session, saved.history)
+        }
+
+        fn saved_state(
+            &self,
+            worker: &RuntimeWorkerRef,
+        ) -> (session_store::SessionId, session_store::RestoredState) {
             let reopened =
                 session_store::WorkerSessionStore::new(self.aggregate(worker).join("session"))
                     .unwrap();
@@ -352,7 +365,7 @@ mod plugin_controller_tests {
             let segments = reopened.list_segments(session).unwrap();
             assert_eq!(segments.len(), 1);
             let saved = session_store::restore(&reopened, session, segments[0]).unwrap();
-            (session, saved.history)
+            (session, saved)
         }
 
         fn count(&self, table: &str) -> i64 {
@@ -444,10 +457,14 @@ mod plugin_controller_tests {
     }
 
     async fn submit(connection: &mut WorkspaceWorkerProtocolConnection) {
+        submit_id(connection, "controller-https-submit").await;
+    }
+
+    async fn submit_id(connection: &mut WorkspaceWorkerProtocolConnection, request_id: &str) {
         connection
             .methods
             .send(protocol::Method::Submit {
-                submission_request_id: "controller-https-submit".into(),
+                submission_request_id: request_id.into(),
                 input: vec![protocol::Segment::Text {
                     content: "Check the service status.".into(),
                 }],
@@ -465,6 +482,14 @@ mod plugin_controller_tests {
         connection: &mut WorkspaceWorkerProtocolConnection,
         expected: protocol::RunResult,
     ) {
+        finish_id(connection, expected, "controller-https-submit").await;
+    }
+
+    async fn finish_id(
+        connection: &mut WorkspaceWorkerProtocolConnection,
+        expected: protocol::RunResult,
+        request_id: &str,
+    ) {
         tokio::time::timeout(WATCHDOG, async {
             let mut accepted = false;
             let mut finished = false;
@@ -474,7 +499,7 @@ mod plugin_controller_tests {
                         submission_request_id,
                         ..
                     } => {
-                        assert_eq!(submission_request_id, "controller-https-submit");
+                        assert_eq!(submission_request_id, request_id);
                         accepted = true;
                     }
                     protocol::Event::SubmissionRejected { message, .. } => {
@@ -489,7 +514,7 @@ mod plugin_controller_tests {
                         if finished
                             && snapshot.state == protocol::WorkerState::Idle
                             && snapshot.last_finished_submission_request_id.as_deref()
-                                == Some("controller-https-submit") =>
+                                == Some(request_id) =>
                     {
                         return;
                     }
@@ -499,6 +524,116 @@ mod plugin_controller_tests {
         })
         .await
         .expect("real Controller HTTPS submission did not finish");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_provider_call_id_has_distinct_durable_receipts_and_completed_restore_never_reruns()
+     {
+        // Gemini also reuses a response-local id for the same Tool. Deliberately
+        // emit the identical provider id in two explicit user submissions.
+        let peer = Peer::new(
+            HOST,
+            vec![response(503, &[], b"old"), response(200, &[], b"fresh")],
+        )
+        .await;
+        let f = Fixture::with_request_count(&peer, 2).await;
+        f.install(&peer).await;
+        let worker = f.create(PROFILE).await;
+        let public_name = f.model_tool.lock().unwrap().clone();
+        let mut connection = connect_workspace_worker_protocol(&f.api, &worker, None)
+            .await
+            .unwrap();
+        snapshot(&mut connection).await;
+        for request in ["first-explicit-call", "second-explicit-call"] {
+            submit_id(&mut connection, request).await;
+            finish_id(&mut connection, protocol::RunResult::Finished, request).await;
+        }
+        assert_eq!(
+            peer.connection_count(),
+            2,
+            "a new logical call must not replay the first receipt; model requests: {:?}",
+            f.requests.lock().unwrap().iter().map(|r| &r.items).collect::<Vec<_>>()
+        );
+        assert_eq!(f.count("plugin_invocations"), 2);
+        assert_eq!(f.count("plugin_effect_receipts"), 2);
+        let statuses = |history: &[agen::Item]| -> Vec<u16> {
+            history
+                .iter()
+                .filter_map(|item| match item {
+                    agen::Item::ToolResult {
+                        call_id,
+                        is_error: false,
+                        content: Some(content),
+                        ..
+                    } if call_id == "https-call" => Some(
+                        serde_json::from_str::<Value>(content).unwrap()["structured"]["status"]
+                            .as_u64()
+                            .unwrap() as u16,
+                    ),
+                    _ => None,
+                })
+                .collect()
+        };
+        {
+            let requests = f.requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            assert_eq!(statuses(&requests[3].items), [503, 200]);
+        }
+        drop(connection);
+        f.stop(&worker).await;
+        let (session, saved) = f.saved_state(&worker);
+        assert_eq!(statuses(&saved.history), [503, 200]);
+        let calls: Vec<_> = saved
+            .annotated_history
+            .iter()
+            .filter_map(|entry| match &entry.item {
+                session_store::LoggedItem::ToolCall { call_id, name, .. }
+                    if name == &public_name =>
+                {
+                    Some((call_id, &entry.metadata.entry_id))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].0, calls[1].0,
+            "provider id must actually be reused in the fixture"
+        );
+        assert_ne!(calls[0].1, calls[1].1);
+        let mut expected = persisted_call_consumers(session, &saved, &public_name);
+        expected.sort();
+        let consumers: Vec<String> = f.api.config_store.with_conn(|conn| {
+            let mut statement = conn.prepare("SELECT json_extract(consumer_json,'$.tool_call_id') FROM plugin_invocations WHERE workspace_id=?1 AND worker_id=?2 ORDER BY 1")?;
+            Ok(statement.query_map(rusqlite::params![TEST_WORKSPACE_ID, worker.worker_id], |row| row.get(0))?.collect::<std::result::Result<Vec<_>,_>>()?)
+        }).unwrap();
+        assert_eq!(
+            consumers, expected,
+            "receipts must bind committed Host annotation ids, not response-local ids"
+        );
+        let restored = f.restore(&worker, "completed-reused-id-restore").await;
+        assert_eq!(
+            restored.state,
+            server_api::WorkerRestoreState::Accepted,
+            "{restored:?}"
+        );
+        assert_eq!(f.requests.lock().unwrap().len(), 4);
+        let mut connection = connect_workspace_worker_protocol(&f.api, &worker, None)
+            .await
+            .unwrap();
+        assert!(snapshot(&mut connection).await.tools.contains(&public_name));
+        assert_eq!(peer.connection_count(), 2);
+        assert_eq!(f.count("plugin_invocations"), 2);
+        assert_eq!(f.count("plugin_effect_receipts"), 2);
+        drop(connection);
+        f.stop(&worker).await;
+        let (restored_session, saved) = f.saved_state(&worker);
+        assert_eq!(restored_session, session);
+        let mut restored = persisted_call_consumers(session, &saved, &public_name);
+        restored.sort();
+        assert_eq!(restored, expected);
+        assert_eq!(statuses(&saved.history), [503, 200]);
+        f.close().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -735,14 +870,9 @@ mod plugin_controller_tests {
                 rusqlite::params![TEST_WORKSPACE_ID, saved.plan_id, worker.worker_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?)
         }).unwrap();
-        let identity = serde_json::to_vec(&(session.to_string(), "https-call")).unwrap();
-        let consumer_id = format!(
-            "tool-{}",
-            sha2::Sha256::digest(identity)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        );
+        let consumers = persisted_call_consumers(session, &f.saved_state(&worker).1, &public_name);
+        assert_eq!(consumers.len(), 1);
+        let consumer_id = consumers[0].clone();
         assert_eq!(
             serde_json::from_str::<server_api::PluginConsumer>(&consumer).unwrap(),
             server_api::PluginConsumer::ToolCall {

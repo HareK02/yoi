@@ -291,18 +291,20 @@ impl Tool for PluginTool {
         input_json: &str,
         context: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        if context.call_id.is_empty() || context.call_id == "direct" {
-            return Err(failure("Plugin Tool requires committed Tool-call identity"));
-        }
+        let logical_call_id = context
+            .logical_call_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| failure("Plugin Tool requires committed logical Tool-call identity"))?;
         let _capacity = self
             .capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| failure("Plugin invocation capacity exceeded"))?;
         let lease = self.start(&context)?;
-        // The persisted Session and provider call ID survive Runtime restoration;
-        // the engine-local batch ID identifies only cancellation of a live attempt.
-        let id_bytes = serde_json::to_vec(&(&self.session_id, &context.call_id))
+        // Only the host-owned persisted call identity is durable. Provider IDs may
+        // repeat in a Session; batch/provider IDs identify live attempts only.
+        let id_bytes = serde_json::to_vec(&(&self.session_id, logical_call_id))
             .expect("identity serialization");
         let hex: String = Sha256::digest(&id_bytes)
             .iter()
