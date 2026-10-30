@@ -4674,6 +4674,27 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 }
 
 impl<C: LlmClient + 'static, St: Store + 'static> Worker<C, St> {
+    /// Shared startup/restore boundary, called only by a published Controller.
+    pub(crate) fn start_host_ready_feature_tasks(&self) {
+        if let Err(error) = self
+            .feature_background_tasks
+            .start_host_ready(self.hook_invocation_context(None))
+        {
+            tracing::warn!(error = %error, "HostReady background task start failed");
+        }
+    }
+
+    /// Host management may wake one task after domain-owned recovery succeeds.
+    /// This does not authorize recovery or reactivate any other paused task.
+    pub fn reactivate_host_ready_feature_task(
+        &self,
+        feature_id: &crate::feature::FeatureId,
+        task_name: &str,
+    ) -> Result<crate::feature::background::BackgroundTaskStart, crate::hook::HookError> {
+        self.feature_background_tasks
+            .reactivate_host_ready(feature_id, task_name)
+    }
+
     pub async fn stop_feature_runtime(&mut self, reason: impl Into<String>) {
         if let Some(hooks) = self.hook_registry.clone() {
             let context = WorkerStoppingContext {
@@ -4698,6 +4719,15 @@ impl<C: LlmClient + 'static, St: Store + 'static> Worker<C, St> {
         }
         if let Err(error) = self.feature_background_tasks.shutdown().await {
             tracing::warn!(error = %error, "feature background task shutdown failed");
+        }
+        if let Some(plugins) = &self.plugin_tools {
+            // The registry has joined the drivers, including bounded on-stop.
+            // Do not free scoped resources or acknowledge shutdown while an
+            // uncertain Service lease release still belongs to this Host.
+            while let Err(error) = plugins.reconcile_service_shutdown().await {
+                tracing::warn!(error = %error, "Plugin Service lease release pending; retaining cleanup ownership");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
         }
     }
 }

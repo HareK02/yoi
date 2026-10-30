@@ -95,19 +95,26 @@ pub(super) async fn diagnostics(
                         .plugins()
                         .iter()
                         .map(|pin| {
-                            subject_authorization::authorize_scope(
-                                &api,
-                                &worker_ref,
-                                &OperationAuthorizationRequest {
-                                    operation: "plugin.admit".into(),
-                                    resource: PermissionResource::PluginInstallation {
-                                        workspace_id: w.clone(),
-                                        installation_id: pin.installation_id().into(),
+                            let scope = |operation: &str| {
+                                subject_authorization::authorize_scope(
+                                    &api,
+                                    &worker_ref,
+                                    &OperationAuthorizationRequest {
+                                        operation: operation.into(),
+                                        resource: PermissionResource::PluginInstallation {
+                                            workspace_id: w.clone(),
+                                            installation_id: pin.installation_id().into(),
+                                        },
                                     },
-                                },
-                            )
-                            .map(|_| ())
-                            .map_err(|error| reason(error.error))
+                                )
+                                .map(|_| ())
+                                .map_err(|error| reason(error.error))
+                            };
+                            scope("plugin.admit")?;
+                            if !pin.projection().services.is_empty() {
+                                scope("plugin.service.consume")?;
+                            }
+                            Ok(())
                         })
                         .collect();
                     store.with_conn_mut(|conn| {
@@ -125,17 +132,25 @@ pub(super) async fn diagnostics(
                                     .map_err(|code| *code)
                                     .and_then(|execution| {
                                         scope?;
-                                        policy::authorize(
-                                            &tx,
-                                            &w,
-                                            execution,
-                                            &saved.plan_id,
-                                            pin.installation_id(),
-                                            &pin.projection().tools,
-                                            &PluginHostOperation::Admit,
-                                        )
-                                        .map(|_| ())
-                                        .map_err(reason)
+                                        if !pin.projection().tools.is_empty() || pin.projection().services.is_empty() {
+                                            policy::authorize(
+                                                &tx,
+                                                &w,
+                                                execution,
+                                                &saved.plan_id,
+                                                pin.installation_id(),
+                                                &pin.projection().tools,
+                                                &PluginHostOperation::Admit,
+                                            ).map_err(reason)?;
+                                        }
+                                        for service in &pin.projection().services {
+                                            policy::authorize_service(
+                                                &tx, &w, execution, &saved.plan_id,
+                                                pin.installation_id(), service,
+                                                &PluginHostOperation::Admit,
+                                            ).map_err(reason)?;
+                                        }
+                                        Ok(())
                                     });
                             let admission = match observed {
                                 Ok(()) => PluginDiagnosticAdmission::Admissible,
@@ -165,6 +180,17 @@ pub(super) async fn diagnostics(
                                     }
                                 })
                                 .collect();
+                            let consumers = tx.prepare(
+                                "SELECT consumer_id FROM plugin_service_consumers WHERE workspace_id=?1 AND plan_id=?2 AND installation_id=?3 ORDER BY service_name LIMIT 32"
+                            )?.query_map(rusqlite::params![w, saved.plan_id, pin.installation_id()], |row| row.get::<_, String>(0))?
+                                .collect::<rusqlite::Result<Vec<_>>>()?;
+                            let service_consumers = consumers.into_iter().map(|id| {
+                                let consumer = crate::plugin_service::load(&tx, &w, &id)?;
+                                Ok(PluginServiceConsumerDiagnostics {
+                                    service_name: consumer.service.clone(),
+                                    diagnostics: crate::plugin_service::diagnostics(&tx, &consumer, chrono::Utc::now().timestamp_millis())?,
+                                })
+                            }).collect::<Result<Vec<_>>>()?;
                             plugins.push(PluginWorkerDiagnostic {
                                 installation_id: pin.installation_id().into(),
                                 package_id: pin.package_id().into(),
@@ -180,9 +206,14 @@ pub(super) async fn diagnostics(
                                         crate::plugin_plan::PluginSurface::Tool => {
                                             PluginDiagnosticSurface::Tool
                                         }
+                                        crate::plugin_plan::PluginSurface::Service => {
+                                            PluginDiagnosticSurface::Service
+                                        }
                                     })
                                     .collect(),
                                 selected_tools: pin.projection().tools.clone(),
+                                selected_services: pin.projection().services.clone(),
+                                service_consumers,
                                 admission,
                                 connections,
                             });

@@ -31,6 +31,7 @@ pub struct ArtifactIdentityProjection {
     pub world: String,
     pub required_imports: Vec<String>,
     pub tools: Vec<String>,
+    pub services: Vec<String>,
     pub connections: Vec<String>,
     pub requested_grants: Vec<PluginGrant>,
     pub config_schema: PluginSchemaIdentity,
@@ -89,6 +90,7 @@ pub struct BindingPolicyReference {
 #[serde(rename_all = "snake_case")]
 pub enum PluginSurface {
     Tool,
+    Service,
 }
 
 /// Exact grant identities; new operations are never implied by old pins.
@@ -100,6 +102,7 @@ pub enum PluginGrant {
         slot: String,
     },
     TicketRead,
+    TicketEvents,
     TicketDataRead {
         collection: String,
         schema_id: String,
@@ -130,6 +133,8 @@ pub struct PluginPinProjection {
     pub config: Value,
     pub surfaces: Vec<PluginSurface>,
     pub tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<String>,
     pub grants: Vec<PluginGrant>,
     pub bindings: Vec<BindingPolicyReference>,
 }
@@ -178,6 +183,7 @@ impl WorkerPluginPin {
                     | plugin::PLUGIN_COMPONENT_LOGGED_TOOL_WORLD
                     | plugin::PLUGIN_COMPONENT_HTTPS_LOGGED_TOOL_WORLD
                     | plugin::PLUGIN_COMPONENT_TICKET_TOOL_WORLD
+                    | plugin::PLUGIN_COMPONENT_SERVICE_WORLD
             )
             || !valid_digest(&artifact.config_schema.digest)
             || !valid_identity(&artifact.package_id)
@@ -193,6 +199,8 @@ impl WorkerPluginPin {
         projection.surfaces.dedup();
         projection.tools.sort();
         projection.tools.dedup();
+        projection.services.sort();
+        projection.services.dedup();
         projection.grants.sort();
         projection.grants.dedup();
         projection.bindings.sort();
@@ -200,6 +208,16 @@ impl WorkerPluginPin {
         if (!projection.tools.is_empty() && !projection.surfaces.contains(&PluginSurface::Tool))
             || projection.tools.iter().any(|name| {
                 !valid_identity(name) || !artifact.tools.iter().any(|tool| *tool == *name)
+            })
+            || (!projection.services.is_empty()
+                && !projection.surfaces.contains(&PluginSurface::Service))
+            || (projection.surfaces.contains(&PluginSurface::Service)
+                && (projection.services.is_empty()
+                    || !projection.grants.contains(&PluginGrant::TicketEvents)))
+            || projection.services.iter().any(|name| {
+                !valid_identity(name)
+                    || !artifact.services.contains(name)
+                    || artifact.world != plugin::PLUGIN_COMPONENT_SERVICE_WORLD
             })
             || projection
                 .bindings
@@ -218,8 +236,11 @@ impl WorkerPluginPin {
                 PluginGrant::TicketRead
                 | PluginGrant::TicketDataRead { .. }
                 | PluginGrant::TicketDataWrite { .. } => {
-                    artifact.world != plugin::PLUGIN_COMPONENT_TICKET_TOOL_WORLD
-                        || !artifact.requested_grants.contains(grant)
+                    !matches!(
+                        artifact.world.as_str(),
+                        plugin::PLUGIN_COMPONENT_TICKET_TOOL_WORLD
+                            | plugin::PLUGIN_COMPONENT_SERVICE_WORLD
+                    ) || !artifact.requested_grants.contains(grant)
                         || match grant {
                             PluginGrant::TicketDataRead {
                                 collection,
@@ -235,6 +256,11 @@ impl WorkerPluginPin {
                                 .any(|v| !valid_identity(v) || v.len() > 128),
                             _ => false,
                         }
+                }
+                PluginGrant::TicketEvents => {
+                    artifact.world != plugin::PLUGIN_COMPONENT_SERVICE_WORLD
+                        || !artifact.requested_grants.contains(grant)
+                        || projection.services.is_empty()
                 }
                 PluginGrant::Logging => !artifact.requested_grants.contains(&PluginGrant::Logging),
                 PluginGrant::Https { slot } => {

@@ -118,16 +118,20 @@ pub const RUST_COMPONENT_HTTPS_TOOL_TEMPLATE: &[PluginTemplateResource] = &[
     },
 ];
 
-/// The only supported v2 surface; future surfaces are not success stubs.
+/// Exact supported execution surfaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginSurface {
     Tool,
+    Service,
 }
 
 impl fmt::Display for PluginSurface {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("tool")
+        f.write_str(match self {
+            Self::Tool => "tool",
+            Self::Service => "service",
+        })
     }
 }
 
@@ -140,6 +144,7 @@ pub enum PluginRequestedGrant {
         slot: String,
     },
     TicketRead,
+    TicketEvents,
     TicketDataRead {
         collection: String,
         schema_id: String,
@@ -255,7 +260,10 @@ pub struct PluginPackageManifest {
     pub description: Option<String>,
     pub surfaces: Vec<PluginSurface>,
     pub runtime: PluginRuntimeManifest,
+    #[serde(default)]
     pub tools: Vec<PluginToolManifest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<PluginServiceManifest>,
     /// Closed static DCDL type expression, not JSON Schema or guest code.
     pub config_schema: String,
     #[serde(default)]
@@ -271,6 +279,23 @@ impl PluginPackageManifest {
         self.surfaces.iter().copied().collect()
     }
 }
+
+/// Closed version-1 Ticket event vocabulary; arbitrary subscriptions are rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginTicketEventType {
+    TicketChanged,
+    TicketDeleted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginServiceManifest {
+    pub name: String,
+    pub subscriptions: Vec<PluginTicketEventType>,
+}
+
+pub const PLUGIN_COMPONENT_SERVICE_WORLD: &str = "yoi:plugin/ticket-service-plugin@2.2.0";
 
 pub const PLUGIN_COMPONENT_TICKET_TOOL_WORLD: &str = "yoi:plugin/ticket-tool-plugin@2.1.0";
 
@@ -1047,10 +1072,43 @@ fn validate_manifest(
             "safe id, name and version are required".into(),
         ));
     }
-    if manifest.surfaces != [PluginSurface::Tool] || manifest.tools.is_empty() {
+    let service_world = manifest.runtime.world == PLUGIN_COMPONENT_SERVICE_WORLD;
+    if if service_world {
+        manifest.surfaces != [PluginSurface::Service]
+            || manifest.services.is_empty()
+            || !manifest.tools.is_empty()
+    } else {
+        manifest.surfaces != [PluginSurface::Tool]
+            || manifest.tools.is_empty()
+            || !manifest.services.is_empty()
+    } {
         return Err(reject(
             PluginDiagnosticKind::Surface,
-            "only nonempty Tool packages are supported".into(),
+            "surface and nonempty declarations must match the exact Tool or Service world".into(),
+        ));
+    }
+    let mut service_names = BTreeSet::new();
+    for service in &manifest.services {
+        if !is_safe_id(&service.name)
+            || !service_names.insert(&service.name)
+            || service.subscriptions.is_empty()
+            || service.subscriptions.iter().collect::<BTreeSet<_>>().len()
+                != service.subscriptions.len()
+        {
+            return Err(reject(
+                PluginDiagnosticKind::Malformed,
+                "invalid or duplicate Service/subscription".into(),
+            ));
+        }
+    }
+    if service_world
+        && !manifest
+            .requested_grants
+            .contains(&PluginRequestedGrant::TicketEvents)
+    {
+        return Err(reject(
+            PluginDiagnosticKind::Api,
+            "Service requires TicketEvents request".into(),
         ));
     }
     let runtime = &manifest.runtime;
@@ -1114,7 +1172,7 @@ fn validate_manifest(
             ));
         }
     }
-    let ticket_world = runtime.world == PLUGIN_COMPONENT_TICKET_TOOL_WORLD;
+    let ticket_world = runtime.world == PLUGIN_COMPONENT_TICKET_TOOL_WORLD || service_world;
     if !ticket_world
         && (!manifest.data_collections.is_empty()
             || manifest.requested_grants.iter().any(|g| {
@@ -1128,7 +1186,7 @@ fn validate_manifest(
     {
         return Err(reject(
             PluginDiagnosticKind::Api,
-            "Ticket capabilities require the exact @2.1.0 Ticket world".into(),
+            "Ticket capabilities require an exact Ticket world".into(),
         ));
     }
     let mut collections = BTreeSet::new();
@@ -1154,6 +1212,8 @@ fn validate_manifest(
             PluginRequestedGrant::Logging if !logging => logging = true,
             PluginRequestedGrant::Https { slot }
                 if slots.contains(slot) && requested_slots.insert(slot) => {}
+            PluginRequestedGrant::TicketEvents
+                if service_world && ticket_grants.insert(("events", "", "", "")) => {}
             PluginRequestedGrant::TicketRead
                 if ticket_world && ticket_grants.insert(("read", "", "", "")) => {}
             PluginRequestedGrant::TicketDataRead {

@@ -101,6 +101,7 @@ pub enum PluginGrantMetadata {
         slot: String,
     },
     TicketRead,
+    TicketEvents,
     TicketDataRead {
         collection: String,
         schema_id: String,
@@ -124,6 +125,15 @@ pub struct PluginDataSchemaMetadata {
     pub schema: serde_json::Value,
 }
 
+/// Exact artifact subscription declarations; selection and current permission are separate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginServiceMetadata {
+    pub name: String,
+    pub subscriptions: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
@@ -139,6 +149,8 @@ pub struct PluginArtifact {
     pub world: String,
     pub required_imports: Vec<String>,
     pub tools: Vec<PluginToolMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<PluginServiceMetadata>,
     pub connections: Vec<PluginConnectionMetadata>,
     pub requested_grants: Vec<PluginGrantMetadata>,
     #[serde(default)]
@@ -160,6 +172,11 @@ impl plugin_plan::ArtifactDescriptor for PluginArtifact {
             world: self.world.clone(),
             required_imports: self.required_imports.clone(),
             tools: self.tools.iter().map(|tool| tool.name.clone()).collect(),
+            services: self
+                .services
+                .iter()
+                .map(|service| service.name.clone())
+                .collect(),
             connections: self
                 .connections
                 .iter()
@@ -174,6 +191,7 @@ impl plugin_plan::ArtifactDescriptor for PluginArtifact {
                         plugin_plan::PluginGrant::Https { slot: slot.clone() }
                     }
                     PluginGrantMetadata::TicketRead => plugin_plan::PluginGrant::TicketRead,
+                    PluginGrantMetadata::TicketEvents => plugin_plan::PluginGrant::TicketEvents,
                     PluginGrantMetadata::TicketDataRead {
                         collection,
                         schema_id,
@@ -337,6 +355,7 @@ pub enum PluginDiagnosticPinState {
 #[serde(rename_all = "snake_case")]
 pub enum PluginDiagnosticSurface {
     Tool,
+    Service,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -351,8 +370,18 @@ pub struct PluginWorkerDiagnostic {
     pub artifact_size: u32,
     pub surfaces: Vec<PluginDiagnosticSurface>,
     pub selected_tools: Vec<String>,
+    pub selected_services: Vec<String>,
+    pub service_consumers: Vec<PluginServiceConsumerDiagnostics>,
     pub admission: PluginDiagnosticAdmission,
     pub connections: Vec<PluginDiagnosticConnection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginServiceConsumerDiagnostics {
+    pub service_name: String,
+    pub diagnostics: crate::PluginServiceDiagnostics,
 }
 
 /// A successful observation is not retained admission authority.

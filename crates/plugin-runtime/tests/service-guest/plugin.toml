@@ -1,0 +1,47 @@
+schema_version = 2
+id = "service-test"
+name = "Service test"
+version = "1.0.0"
+surfaces = ["service"]
+config_schema = "{ mode = String }"
+
+[runtime]
+kind = "wasm-component"
+component = "plugin.component.wasm"
+world = "yoi:plugin/ticket-service-plugin@2.2.0"
+required_imports = ["yoi:host/errors@2.0.0", "yoi:host/connections@2.0.0", "yoi:host/http@2.0.0", "yoi:host/logging@2.0.0", "yoi:host/objects@2.1.0", "yoi:host/ticket-read@2.1.0", "yoi:host/extension-data@2.1.0"]
+
+[[services]]
+name = "ticket_events"
+subscriptions = ["ticket_changed", "ticket_deleted"]
+
+[[connections]]
+name = "api"
+methods = ["POST"]
+path_prefixes = ["/events"]
+
+[[data_collections]]
+collection = "notes"
+schema_id = "note"
+schema_version = "1"
+schema = { type = "string", maxLength = 64 }
+
+[[requested_grants]]
+kind = "logging"
+[[requested_grants]]
+kind = "https"
+slot = "api"
+[[requested_grants]]
+kind = "ticket_events"
+[[requested_grants]]
+kind = "ticket_read"
+[[requested_grants]]
+kind = "ticket_data_read"
+collection = "notes"
+schema_id = "note"
+schema_version = "1"
+[[requested_grants]]
+kind = "ticket_data_write"
+collection = "notes"
+schema_id = "note"
+schema_version = "1"

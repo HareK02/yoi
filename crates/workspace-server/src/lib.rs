@@ -20,6 +20,7 @@ pub mod plugin_host;
 pub mod plugin_https;
 pub mod plugin_plan;
 pub mod plugin_receipt;
+pub mod plugin_service;
 pub mod plugin_settings;
 pub mod profile_settings;
 pub mod prompt_settings;

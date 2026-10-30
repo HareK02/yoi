@@ -45,6 +45,7 @@ fn plan(workspace: &str, installation: &str, id: &str) -> StoredPluginPlan {
         PluginPinProjection {
             config: serde_json::json!({}),
             surfaces: vec![PluginSurface::Tool],
+            services: vec![],
             tools: vec!["echo".into()],
             grants: vec![],
             bindings: vec![],

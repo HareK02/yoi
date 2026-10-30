@@ -32,6 +32,7 @@ pub struct Grants {
     pub logging: bool,
     pub connection_slots: BTreeSet<String>,
     pub ticket_read: bool,
+    pub ticket_events: bool,
     pub ticket_data_read: BTreeSet<(String, String, String)>,
     pub ticket_data_write: BTreeSet<(String, String, String)>,
 }

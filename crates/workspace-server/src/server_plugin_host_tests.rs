@@ -332,7 +332,17 @@ impl Fixture {
     }
 
     fn count(&self, table: &str) -> i64 {
-        assert!(["plugin_invocations", "plugin_effect_receipts", "plugin_data_cells", "plugin_data_receipts", "plugin_data_purges"].contains(&table));
+        assert!(
+            [
+                "plugin_invocations",
+                "plugin_effect_receipts",
+                "plugin_data_cells",
+                "plugin_data_receipts",
+                "plugin_data_purges",
+                "plugin_service_released_proofs",
+            ]
+            .contains(&table)
+        );
         self.api
             .config_store
             .with_conn(|conn| {
@@ -379,6 +389,7 @@ fn set_policy(api: &WorkspaceApi, subject: &str, installation: &str, granted: bo
             "plugin.connection.open",
             "plugin.http.send",
             "plugin.log",
+            "plugin.service.consume",
         ]
         .into_iter()
         .map(|operation| ScopedPermission {

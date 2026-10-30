@@ -998,7 +998,7 @@ fn historical_composition_verifies_actual_current_contract_without_downgrade_or_
 }
 
 #[test]
-fn bounded_content13_reopens_after_failed_subject_upgrade_then_migrates_atomically_to14() {
+fn bounded_content13_reopens_after_failed_subject_upgrade_then_migrates_atomically_to_latest() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("retained-content13.db");
     let (receipts, history, old_table);
@@ -1061,7 +1061,7 @@ fn bounded_content13_reopens_after_failed_subject_upgrade_then_migrates_atomical
         .unwrap();
     migrate_sqlite_ticket_schema(&conn).unwrap();
     verify_sqlite_ticket_schema(&conn).unwrap();
-    assert_eq!(max_component(&conn), 14);
+    assert_eq!(max_component(&conn), 15);
     assert_eq!(
         &rows(&conn, "ticket_schema_migrations")[..receipts.len()],
         receipts.as_slice()
@@ -1075,5 +1075,74 @@ fn bounded_content13_reopens_after_failed_subject_upgrade_then_migrates_atomical
     let applied14 = rows(&conn, "ticket_schema_migrations");
     compose_historical(&conn, HistoricalTicketSchemaTarget::Content13);
     assert_eq!(rows(&conn, "ticket_schema_migrations"), applied14);
+    verify_sqlite_ticket_schema(&conn).unwrap();
+}
+
+#[test]
+fn service_outbox_upgrade_is_empty_preserves_old_facts_and_matches_fresh_schema() {
+    let conn = Connection::open_in_memory().unwrap();
+    compose_historical(&conn, HistoricalTicketSchemaTarget::Subjects14);
+    conn.execute_batch("INSERT INTO typed_tickets(workspace_id,ticket_id,slug,title,status,kind,priority,workflow_state,workflow_state_explicit) VALUES('workspace','old','old','Private title','open','task','P2','open',1);
+        INSERT INTO typed_ticket_events(workspace_id,ticket_id,event_index,event_ref,kind,body) VALUES('workspace','old',-1,'old:-1','comment','Private body');
+        INSERT INTO typed_ticket_content_changes VALUES('old-change','workspace','old','content_edit','Private actor','old-time',1,0,0,NULL);").unwrap();
+    let events = rows(&conn, "typed_ticket_events");
+    let facts = rows(&conn, "typed_ticket_content_changes");
+    let receipts = rows(&conn, "ticket_schema_migrations");
+    migrate_sqlite_ticket_schema(&conn).unwrap();
+    verify_sqlite_ticket_schema(&conn).unwrap();
+    assert_eq!(rows(&conn, "typed_ticket_events"), events);
+    assert_eq!(rows(&conn, "typed_ticket_content_changes"), facts);
+    assert_eq!(
+        &rows(&conn, "ticket_schema_migrations")[..receipts.len()],
+        receipts.as_slice()
+    );
+    assert!(rows(&conn, "typed_ticket_service_outbox").is_empty());
+    let fresh = Connection::open_in_memory().unwrap();
+    migrate_sqlite_ticket_schema(&fresh).unwrap();
+    let ddl = |db: &Connection| {
+        db.prepare("SELECT type,name,sql FROM sqlite_master WHERE name LIKE 'typed_ticket_service_outbox%' ORDER BY name").unwrap()
+        .query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    };
+    assert_eq!(ddl(&conn), ddl(&fresh));
+    let all_receipts = rows(&conn, "ticket_schema_migrations");
+    migrate_sqlite_ticket_schema(&conn).unwrap();
+    assert_eq!(rows(&conn, "ticket_schema_migrations"), all_receipts);
+    assert!(rows(&conn, "typed_ticket_service_outbox").is_empty());
+    conn.execute_batch("DROP INDEX typed_ticket_service_outbox_workspace_sequence")
+        .unwrap();
+    assert!(
+        verify_sqlite_ticket_schema(&conn)
+            .unwrap_err()
+            .to_string()
+            .contains("Ticket Service outbox")
+    );
+    assert!(
+        migrate_sqlite_ticket_schema(&conn).is_err(),
+        "current schema must not repair missing objects"
+    );
+}
+
+#[test]
+fn failed_service_outbox_migration_rolls_back_component_and_retains_host_transaction() {
+    let conn = Connection::open_in_memory().unwrap();
+    compose_historical(&conn, HistoricalTicketSchemaTarget::Subjects14);
+    let before = rows(&conn, "ticket_schema_migrations");
+    conn.execute_batch(
+        "CREATE TABLE typed_ticket_service_outbox_workspace_sequence(value TEXT);
+        BEGIN IMMEDIATE; CREATE TABLE host_work(value TEXT); INSERT INTO host_work VALUES('keep');",
+    )
+    .unwrap();
+    assert!(migrate_sqlite_ticket_schema_in_transaction(&conn).is_err());
+    assert!(!conn.is_autocommit());
+    assert_eq!(rows(&conn, "ticket_schema_migrations"), before);
+    assert!(!conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='typed_ticket_service_outbox')", [], |r| r.get::<_,bool>(0)).unwrap());
+    conn.execute_batch("COMMIT; DROP TABLE typed_ticket_service_outbox_workspace_sequence;")
+        .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT value FROM host_work", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "keep"
+    );
+    migrate_sqlite_ticket_schema(&conn).unwrap();
     verify_sqlite_ticket_schema(&conn).unwrap();
 }

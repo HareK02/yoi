@@ -1,3 +1,5 @@
+mod service;
+pub use service::{CompiledService, ServiceInvocationResult, ServiceOutput};
 mod ticket;
 use crate::sandbox::SandboxLimits;
 use crate::{
@@ -283,6 +285,8 @@ impl Executor {
             log_bytes: 0,
             dropped_logs: 0,
             store_limits: SandboxLimits::new(limits),
+            logging_only: false,
+            effects: Arc::new(service::Effects::default()),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.store_limits);
@@ -452,6 +456,8 @@ struct State {
     log_bytes: usize,
     dropped_logs: u64,
     store_limits: SandboxLimits,
+    logging_only: bool,
+    effects: Arc<service::Effects>,
 }
 fn check_current(context: &InvocationContext) -> Result<(), errors::HostError> {
     if context.cancellation.is_cancelled() {
@@ -470,9 +476,18 @@ impl State {
         let context = self
             .context
             .as_ref()
-            .ok_or_else(|| wasmtime::Error::msg("Host import outside Tool export context"))?;
+            .ok_or_else(|| wasmtime::Error::msg("Host import outside export context"))?;
         check_current(context).map_err(|_| wasmtime::Error::msg("invocation no longer active"))?;
         Ok(context.clone())
+    }
+    fn protected_current(&self) -> wasmtime::Result<InvocationContext> {
+        let context = self.current()?;
+        if self.logging_only {
+            return Err(wasmtime::Error::msg(
+                "Service lifecycle permits logging only",
+            ));
+        }
+        Ok(context)
     }
     fn operation(&mut self) -> Result<(), errors::HostError> {
         if self.operations >= self.limits.host_operations {
@@ -498,7 +513,7 @@ impl bindings::yoi::host::connections::Host for State {
         &mut self,
         slot: String,
     ) -> wasmtime::Result<Result<Resource<Connection>, errors::HostError>> {
-        let context = self.current()?;
+        let context = self.protected_current()?;
         if let Err(e) = self.operation() {
             return Ok(Err(e));
         }
@@ -539,7 +554,7 @@ impl bindings::yoi::host::http::Host for State {
         target: Resource<Connection>,
         mut input: http::Request,
     ) -> wasmtime::Result<Result<http::Response, errors::HostError>> {
-        let context = self.current()?;
+        let context = self.protected_current()?;
         if let Err(e) = self.operation() {
             return Ok(Err(e));
         }
@@ -628,6 +643,7 @@ impl bindings::yoi::host::http::Host for State {
                 "HTTP deadline exceeded before dispatch",
             )));
         }
+        let effect = self.effects.begin();
         let response = match tokio::time::timeout_at(
             send_deadline,
             self.provider.send(&context, binding.as_ref(), input),
@@ -642,6 +658,7 @@ impl bindings::yoi::host::http::Host for State {
                 effect: errors::EffectObservation::Indeterminate,
             }),
         };
+        effect.finish(&response);
         check_current(&context).map_err(|_| wasmtime::Error::msg("late HTTP result"))?;
         Ok(response.and_then(|response| {
             if response.body.len() > self.limits.http_body_bytes

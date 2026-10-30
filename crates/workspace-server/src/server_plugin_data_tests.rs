@@ -106,7 +106,7 @@ fn create_ticket_with_slug(f: &Fixture, body: &str, slug: Option<&str>) -> ticke
 
 // Keep the real installation policy and change only concrete Ticket permissions.
 // A cached resolve or receipt must not bypass these subsequent live changes.
-fn ticket_policy(f: &Fixture, tickets: &[(&str, bool, bool)]) {
+pub(super) fn ticket_policy(f: &Fixture, tickets: &[(&str, bool, bool)]) {
     let store = open_subjektiv_store(&f.api).unwrap();
     let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
     let mut execution: Vec<_> = previous
@@ -166,6 +166,7 @@ async fn host_for_plan(
                 context.grants.connection_slots.insert(slot.clone());
             }
             PluginGrant::TicketRead => context.grants.ticket_read = true,
+            PluginGrant::TicketEvents => (),
             PluginGrant::TicketDataRead {
                 collection,
                 schema_id,

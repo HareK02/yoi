@@ -12,7 +12,7 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
     assert!(!table_exists(&conn, "plugin_invocations").unwrap());
     let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
     assert_eq!(plan.current_schema_version, 108);
-    assert_eq!(plan.migrations.iter().map(|step| step.version).collect::<Vec<_>>(), [109, 110, 111]);
+    assert_eq!(plan.migrations.iter().map(|step| step.version).collect::<Vec<_>>(), [109, 110, 111, 112]);
     assert_eq!(current_schema_version(&conn).unwrap(), 108);
     drop(conn);
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();

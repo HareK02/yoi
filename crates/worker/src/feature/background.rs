@@ -6,7 +6,7 @@
 //! feature was explicitly granted at install time.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,6 +25,9 @@ const MAX_TASK_ATTEMPTS: u16 = 16;
 const MAX_TASK_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_RETAINED_DIAGNOSTICS: usize = 128;
 const TASK_SETTLE_TIMEOUT_MS: u64 = 30_000;
+const TASK_CLEANUP_TIMEOUT_MS: u64 = 5_000;
+const MAX_HOST_READY_INTERVAL_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_HOST_READY_RUN_MS: u64 = 30_000;
 const TASK_SCOPE_ACCEPTING: u8 = 0;
 const TASK_SCOPE_REWRITING: u8 = 1;
 const TASK_SCOPE_STOPPING: u8 = 2;
@@ -56,6 +59,12 @@ pub enum BackgroundTaskRetryPolicy {
 pub enum BackgroundTaskTrigger {
     Manual,
     RunCommitted,
+    /// The registry repeats bounded runs after successful Controller publication.
+    /// Failures pause this task until explicit activation; rewrite only resumes
+    /// tasks that were still active. The interval follows completion, not start.
+    HostReady {
+        interval_ms: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +109,20 @@ impl BackgroundTaskSpec {
         {
             return Err(FeatureInstallError::InvalidDescriptor(format!(
                 "background task `{}` max_attempts must be within 1..={MAX_TASK_ATTEMPTS}",
+                self.declaration.name
+            )));
+        }
+        if let BackgroundTaskTrigger::HostReady { interval_ms } = self.trigger
+            && (interval_ms == 0
+                || interval_ms > MAX_HOST_READY_INTERVAL_MS
+                || self.max_concurrency != 1
+                || self.timeout_ms > MAX_HOST_READY_RUN_MS
+                || self.retry != BackgroundTaskRetryPolicy::Never
+                || self.rewrite != BackgroundTaskRewritePolicy::CancelAndWait
+                || self.shutdown != BackgroundTaskShutdownPolicy::CancelAndWait)
+        {
+            return Err(FeatureInstallError::InvalidDescriptor(format!(
+                "HostReady task `{}` requires interval_ms within 1..={MAX_HOST_READY_INTERVAL_MS}, single-flight runs of at most {MAX_HOST_READY_RUN_MS}ms, no automatic retry, and cancel-and-wait barriers",
                 self.declaration.name
             )));
         }
@@ -202,12 +225,22 @@ pub trait FeatureBackgroundTask: Send + Sync {
         context: BackgroundTaskContext,
         cancellation: BackgroundTaskCancellation,
     ) -> Result<(), HookError>;
+
+    /// Runs once after this registry-owned driver stops, including cancellation
+    /// and timeout, with no `run` future alive. HostReady normal completions do
+    /// not stop the driver. Cleanup is awaited even when cancellation is set,
+    /// with a separate five-second host deadline; implementors must make lease
+    /// release cancellation-safe if their on-stop work fails or times out.
+    async fn stopped(&self, _context: BackgroundTaskContext) -> Result<(), HookError> {
+        Ok(())
+    }
 }
 
 struct Registration {
     feature_id: FeatureId,
     spec: BackgroundTaskSpec,
     task: Arc<dyn FeatureBackgroundTask>,
+    host_ready_active: AtomicBool,
 }
 
 #[derive(Default)]
@@ -236,6 +269,7 @@ impl FeatureBackgroundTaskRegistryBuilder {
                 feature_id,
                 spec,
                 task: Arc::new(task),
+                host_ready_active: AtomicBool::new(false),
             },
         );
         Ok(())
@@ -258,10 +292,12 @@ impl FeatureBackgroundTaskRegistryBuilder {
             inner: Arc::new(RegistryInner {
                 registrations: self.registrations,
                 running: Mutex::new(BTreeMap::new()),
+                settlement: tokio::sync::Mutex::new(()),
                 diagnostics: Mutex::new(Vec::new()),
                 next_execution_id: AtomicU64::new(1),
                 session_generation: Arc::new(AtomicU64::new(1)),
                 lifecycle: AtomicU8::new(TASK_SCOPE_ACCEPTING),
+                host_ready_invocation: Mutex::new(None),
                 #[cfg(test)]
                 start_race_probe: Mutex::new(None),
             }),
@@ -273,7 +309,28 @@ struct RunningTask {
     feature_id: FeatureId,
     task_name: String,
     cancellation: BackgroundTaskCancellation,
-    handle: JoinHandle<()>,
+    force_stop: BackgroundTaskCancellation,
+    handle: JoinHandle<Result<(), HookError>>,
+}
+
+struct SettlingTask {
+    inner: Arc<RegistryInner>,
+    execution_id: u64,
+    task: Option<RunningTask>,
+}
+
+impl Drop for SettlingTask {
+    fn drop(&mut self) {
+        // A cancelled settlement must not detach its still-owned driver or
+        // cleanup. A later rewrite/shutdown can continue joining the same task.
+        if let Some(task) = self.task.take() {
+            self.inner
+                .running
+                .lock()
+                .expect("background tasks poisoned")
+                .insert(self.execution_id, task);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -285,10 +342,12 @@ struct StartRaceProbe {
 struct RegistryInner {
     registrations: BTreeMap<(FeatureId, String), Registration>,
     running: Mutex<BTreeMap<u64, RunningTask>>,
+    settlement: tokio::sync::Mutex<()>,
     diagnostics: Mutex<Vec<BackgroundTaskDiagnostic>>,
     next_execution_id: AtomicU64,
     session_generation: Arc<AtomicU64>,
     lifecycle: AtomicU8,
+    host_ready_invocation: Mutex<Option<HookInvocationContext>>,
     #[cfg(test)]
     start_race_probe: Mutex<Option<StartRaceProbe>>,
 }
@@ -311,9 +370,12 @@ pub struct FeatureBackgroundTaskRegistry {
 }
 
 /// Holds the task registry quiescent across the entire Session rewrite. Drop
-/// reopens starts only when shutdown has not moved the scope to Stopping.
+/// reopens starts only when shutdown has not moved the scope to Stopping. Only
+/// completed settlement rearms HostReady tasks; cancelled preparation retains
+/// joins in the registry for an explicit retry, without overlapping cleanup.
 pub struct BackgroundTaskRewriteGuard {
     inner: Arc<RegistryInner>,
+    settled: bool,
 }
 
 impl std::fmt::Debug for BackgroundTaskRewriteGuard {
@@ -326,12 +388,24 @@ impl std::fmt::Debug for BackgroundTaskRewriteGuard {
 
 impl Drop for BackgroundTaskRewriteGuard {
     fn drop(&mut self) {
-        let _ = self.inner.lifecycle.compare_exchange(
-            TASK_SCOPE_REWRITING,
-            TASK_SCOPE_ACCEPTING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if self
+            .inner
+            .lifecycle
+            .compare_exchange(
+                TASK_SCOPE_REWRITING,
+                TASK_SCOPE_ACCEPTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let registry = FeatureBackgroundTaskRegistry {
+                inner: Arc::clone(&self.inner),
+            };
+            if self.settled {
+                registry.resume_host_ready();
+            }
+        }
     }
 }
 
@@ -378,6 +452,8 @@ pub enum BackgroundTaskOutcome {
     Failed(HookError),
     JoinFailed,
     StaleGenerationDiscarded,
+    CleanupFailed(HookError),
+    CleanupTimedOut,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -423,6 +499,21 @@ impl FeatureBackgroundTaskRegistry {
                 format!("unknown background task `{feature_id}/{task_name}`"),
             )
         })?;
+        if matches!(
+            registration.spec.trigger,
+            BackgroundTaskTrigger::HostReady { .. }
+        ) && self
+            .inner
+            .host_ready_invocation
+            .lock()
+            .expect("HostReady context poisoned")
+            .is_none()
+        {
+            return Err(HookError::new(
+                HookErrorCategory::Dependency,
+                "Controller has not published Host readiness",
+            ));
+        }
 
         let mut running = self
             .inner
@@ -456,6 +547,8 @@ impl FeatureBackgroundTaskRegistry {
         };
         let cancellation = BackgroundTaskCancellation::default();
         let task_cancellation = cancellation.clone();
+        let force_stop = BackgroundTaskCancellation::default();
+        let task_force_stop = force_stop.clone();
         let task = Arc::clone(&registration.task);
         let spec = registration.spec.clone();
         let feature_id = registration.feature_id.clone();
@@ -463,19 +556,84 @@ impl FeatureBackgroundTaskRegistry {
         let weak_inner = Arc::downgrade(&self.inner);
         let task_feature_id = feature_id.clone();
         let task_task_name = task_name.clone();
+        if matches!(spec.trigger, BackgroundTaskTrigger::HostReady { .. }) {
+            registration
+                .host_ready_active
+                .store(true, Ordering::Release);
+        }
         let handle = tokio::spawn(async move {
-            let (attempts, outcome) = execute_task(
-                task,
-                spec,
+            let mut attempts;
+            let mut outcome;
+            loop {
+                (attempts, outcome) = execute_task(
+                    Arc::clone(&task),
+                    spec.clone(),
+                    invocation.clone(),
+                    task_feature_id.clone(),
+                    task_task_name.clone(),
+                    execution_id,
+                    generation_fence.clone(),
+                    task_cancellation.clone(),
+                    task_force_stop.clone(),
+                )
+                .await;
+                let BackgroundTaskTrigger::HostReady { interval_ms } = spec.trigger else {
+                    break;
+                };
+                if outcome != BackgroundTaskOutcome::Completed || task_cancellation.is_cancelled() {
+                    break;
+                }
+                tokio::select! {
+                    () = task_cancellation.cancelled() => {
+                        outcome = BackgroundTaskOutcome::Cancelled;
+                        break;
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
+                }
+            }
+            // execute_task drops the run future before returning. Cleanup must
+            // not be selected against the already-cancelled driver token.
+            let context = BackgroundTaskContext {
                 invocation,
-                task_feature_id.clone(),
-                task_task_name.clone(),
+                feature_id: task_feature_id.clone(),
+                task_name: task_task_name.clone(),
                 execution_id,
-                generation_fence.clone(),
-                task_cancellation,
+                generation_fence: generation_fence.clone(),
+                attempt: attempts,
+            };
+            let cleanup = tokio::time::timeout(
+                Duration::from_millis(TASK_CLEANUP_TIMEOUT_MS),
+                task.stopped(context),
             )
             .await;
+            let cleanup_error = match cleanup {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => {
+                    outcome = BackgroundTaskOutcome::CleanupFailed(error.clone());
+                    Some(error)
+                }
+                Err(_) => {
+                    outcome = BackgroundTaskOutcome::CleanupTimedOut;
+                    Some(HookError::new(
+                        HookErrorCategory::Timeout,
+                        "background task cleanup exceeded its host deadline",
+                    ))
+                }
+            };
             if let Some(inner) = weak_inner.upgrade() {
+                if matches!(spec.trigger, BackgroundTaskTrigger::HostReady { .. })
+                    && !matches!(
+                        outcome,
+                        BackgroundTaskOutcome::Completed | BackgroundTaskOutcome::Cancelled
+                    )
+                {
+                    inner
+                        .registrations
+                        .get(&(task_feature_id.clone(), task_task_name.clone()))
+                        .expect("running task retains registration")
+                        .host_ready_active
+                        .store(false, Ordering::Release);
+                }
                 let outcome = if generation_fence.ensure_current().is_ok() {
                     outcome
                 } else {
@@ -494,6 +652,7 @@ impl FeatureBackgroundTaskRegistry {
                     diagnostics.drain(..remove);
                 }
             }
+            cleanup_error.map_or(Ok(()), Err)
         });
         running.insert(
             execution_id,
@@ -501,6 +660,7 @@ impl FeatureBackgroundTaskRegistry {
                 feature_id,
                 task_name,
                 cancellation,
+                force_stop,
                 handle,
             },
         );
@@ -524,6 +684,98 @@ impl FeatureBackgroundTaskRegistry {
             let _ = self.start(&feature_id, &task_name, invocation.clone())?;
         }
         Ok(())
+    }
+
+    /// Called only after required feature installation and Controller publication
+    /// succeed, for both startup and restore. Repeated publication is idempotent:
+    /// paused tasks require task-key-specific reactivation, never a global rearm.
+    pub fn start_host_ready(&self, invocation: HookInvocationContext) -> Result<(), HookError> {
+        if self.inner.lifecycle.load(Ordering::Acquire) != TASK_SCOPE_ACCEPTING {
+            return Err(HookError::new(
+                HookErrorCategory::ScopeDisposed,
+                "background task scope is stopping",
+            ));
+        }
+        {
+            let mut published = self
+                .inner
+                .host_ready_invocation
+                .lock()
+                .expect("HostReady context poisoned");
+            if published.is_some() {
+                return Ok(());
+            }
+            *published = Some(invocation.clone());
+        }
+        for ((feature_id, task_name), registration) in &self.inner.registrations {
+            if matches!(
+                registration.spec.trigger,
+                BackgroundTaskTrigger::HostReady { .. }
+            ) {
+                let _ = self.start(feature_id, task_name, invocation.clone())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Explicitly reactivates only this HostReady task after domain management
+    /// has authorized resume. Readiness, rewrite/shutdown admission and the
+    /// existing singleflight limit still apply. AtCapacity does not queue a wake:
+    /// callers must retry if the previous driver's cleanup is not yet joined.
+    pub fn reactivate_host_ready(
+        &self,
+        feature_id: &FeatureId,
+        task_name: &str,
+    ) -> Result<BackgroundTaskStart, HookError> {
+        let registration = self
+            .inner
+            .registrations
+            .get(&(feature_id.clone(), task_name.to_owned()))
+            .filter(|registration| {
+                matches!(
+                    registration.spec.trigger,
+                    BackgroundTaskTrigger::HostReady { .. }
+                )
+            })
+            .ok_or_else(|| {
+                HookError::new(
+                    HookErrorCategory::InvalidInput,
+                    format!("unknown HostReady task `{feature_id}/{task_name}`"),
+                )
+            })?;
+        let invocation = self
+            .inner
+            .host_ready_invocation
+            .lock()
+            .expect("HostReady context poisoned")
+            .clone()
+            .ok_or_else(|| {
+                HookError::new(
+                    HookErrorCategory::Dependency,
+                    "Controller has not published Host readiness",
+                )
+            })?;
+        self.start(&registration.feature_id, task_name, invocation)
+    }
+
+    fn resume_host_ready(&self) {
+        let invocation = self
+            .inner
+            .host_ready_invocation
+            .lock()
+            .expect("HostReady context poisoned")
+            .clone();
+        let Some(invocation) = invocation else {
+            return;
+        };
+        for ((feature_id, task_name), registration) in &self.inner.registrations {
+            if registration.host_ready_active.load(Ordering::Acquire)
+                && let Err(error) = self.start(feature_id, task_name, invocation.clone())
+            {
+                // Shutdown may win after the guard released admission.
+                tracing::debug!(error = %error, "HostReady task not rearmed");
+            }
+        }
     }
 
     pub fn diagnostics(&self) -> Vec<BackgroundTaskDiagnostic> {
@@ -555,10 +807,13 @@ impl FeatureBackgroundTaskRegistry {
                 ));
             }
         }
-        let guard = BackgroundTaskRewriteGuard {
+        let mut guard = BackgroundTaskRewriteGuard {
             inner: Arc::clone(&self.inner),
+            settled: false,
         };
-        self.settle(false).await?;
+        let settlement = self.settle(false).await;
+        guard.settled = true;
+        settlement?;
         if self.inner.lifecycle.load(Ordering::Acquire) != TASK_SCOPE_REWRITING {
             return Err(HookError::new(
                 HookErrorCategory::ScopeDisposed,
@@ -577,6 +832,7 @@ impl FeatureBackgroundTaskRegistry {
     }
 
     async fn settle(&self, shutdown: bool) -> Result<(), HookError> {
+        let _settlement = self.inner.settlement.lock().await;
         let mut waiting = Vec::new();
         {
             let mut running = self
@@ -623,38 +879,60 @@ impl FeatureBackgroundTaskRegistry {
                 if cancel {
                     task.cancellation.cancel();
                 }
-                waiting.push((
-                    id,
-                    task.feature_id.clone(),
-                    task.task_name.clone(),
-                    task.handle,
-                ));
+                waiting.push(SettlingTask {
+                    inner: Arc::clone(&self.inner),
+                    execution_id: id,
+                    task: Some(task),
+                });
             }
         }
 
         let settle_deadline =
             tokio::time::Instant::now() + Duration::from_millis(TASK_SETTLE_TIMEOUT_MS);
         let mut join_failed = false;
-        for (execution_id, feature_id, task_name, mut handle) in waiting {
-            let outcome = match tokio::time::timeout_at(settle_deadline, &mut handle).await {
-                Ok(Ok(())) => None,
+        let cancellations = waiting
+            .iter()
+            .map(|waiting| {
+                waiting
+                    .task
+                    .as_ref()
+                    .expect("settling task retained")
+                    .force_stop
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        for mut waiting in waiting {
+            let task = waiting.task.as_mut().expect("settling task retained");
+            let outcome = match tokio::time::timeout_at(settle_deadline, &mut task.handle).await {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(_))) => {
+                    // The runner already retained the cleanup failure diagnostic.
+                    join_failed = true;
+                    None
+                }
                 Ok(Err(_)) => {
                     join_failed = true;
                     Some(BackgroundTaskOutcome::JoinFailed)
                 }
                 Err(_) => {
                     join_failed = true;
-                    handle.abort();
-                    let _ = handle.await;
+                    // Stop all remaining drivers together. Cancelling the run
+                    // future leaves the runner alive to await bounded cleanup;
+                    // aborting its JoinHandle here would skip on-stop entirely.
+                    for cancellation in &cancellations {
+                        cancellation.cancel();
+                    }
+                    let _ = (&mut task.handle).await;
                     Some(BackgroundTaskOutcome::TimedOut)
                 }
             };
+            let task = waiting.task.take().expect("joined task retained");
             if let Some(outcome) = outcome {
                 let mut diagnostics = self.inner.diagnostics.lock().expect("diagnostics poisoned");
                 diagnostics.push(BackgroundTaskDiagnostic {
-                    execution_id,
-                    feature_id,
-                    task_name,
+                    execution_id: waiting.execution_id,
+                    feature_id: task.feature_id,
+                    task_name: task.task_name,
                     attempts: 0,
                     outcome,
                 });
@@ -683,6 +961,7 @@ async fn execute_task(
     execution_id: u64,
     generation_fence: BackgroundTaskGenerationFence,
     cancellation: BackgroundTaskCancellation,
+    force_stop: BackgroundTaskCancellation,
 ) -> (u16, BackgroundTaskOutcome) {
     let (max_attempts, delay_ms) = match spec.retry {
         BackgroundTaskRetryPolicy::Never => (1, 0),
@@ -707,11 +986,19 @@ async fn execute_task(
             generation_fence: generation_fence.clone(),
             attempt,
         };
-        let result =
-            tokio::time::timeout_at(deadline, task.run(context, cancellation.clone())).await;
+        let result = tokio::select! {
+            biased;
+            result = tokio::time::timeout_at(deadline, task.run(context, cancellation.clone())) => result,
+            () = cancellation.cancelled(), if matches!(spec.trigger, BackgroundTaskTrigger::HostReady { .. }) => return (attempt, BackgroundTaskOutcome::Cancelled),
+            () = force_stop.cancelled() => return (attempt, BackgroundTaskOutcome::Cancelled),
+        };
         match result {
             Ok(Ok(())) => return (attempt, BackgroundTaskOutcome::Completed),
-            Ok(Err(_error)) if cancellation.is_cancelled() => {
+            Ok(Err(error))
+                if cancellation.is_cancelled()
+                    && (!matches!(spec.trigger, BackgroundTaskTrigger::HostReady { .. })
+                        || error.category == HookErrorCategory::Cancelled) =>
+            {
                 return (attempt, BackgroundTaskOutcome::Cancelled);
             }
             Ok(Err(error)) if attempt == max_attempts => {
@@ -732,6 +1019,9 @@ async fn execute_task(
                     }
                 }
                 () = cancellation.cancelled() => {
+                    return (attempt, BackgroundTaskOutcome::Cancelled);
+                }
+                () = force_stop.cancelled() => {
                     return (attempt, BackgroundTaskOutcome::Cancelled);
                 }
             }
@@ -1158,5 +1448,543 @@ mod tests {
         assert_eq!(error.category, HookErrorCategory::Dependency);
         registry.shutdown().await.unwrap();
         assert_eq!(registry.diagnostics().len(), 1);
+    }
+    struct LiveRun(Arc<AtomicUsize>);
+
+    impl Drop for LiveRun {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ControlledTask {
+        runs: tokio::sync::mpsc::UnboundedSender<BackgroundTaskContext>,
+        stops: tokio::sync::mpsc::UnboundedSender<BackgroundTaskContext>,
+        release_run: Arc<tokio::sync::Semaphore>,
+        release_stop: Option<Arc<tokio::sync::Semaphore>>,
+        live: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
+        cleanup_fails: bool,
+        cleanup_dropped: Arc<AtomicBool>,
+    }
+
+    struct CleanupDrop(Arc<AtomicBool>);
+    impl Drop for CleanupDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl FeatureBackgroundTask for ControlledTask {
+        async fn run(
+            &self,
+            context: BackgroundTaskContext,
+            _cancellation: BackgroundTaskCancellation,
+        ) -> Result<(), HookError> {
+            assert_eq!(
+                self.live.fetch_add(1, Ordering::SeqCst),
+                0,
+                "runs must not overlap"
+            );
+            let _live = LiveRun(self.live.clone());
+            self.runs.send(context).unwrap();
+            self.release_run.acquire().await.unwrap().forget();
+            if self.fail.load(Ordering::SeqCst) {
+                Err(HookError::new(
+                    HookErrorCategory::Dependency,
+                    "consumer paused",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn stopped(&self, context: BackgroundTaskContext) -> Result<(), HookError> {
+            assert_eq!(
+                self.live.load(Ordering::SeqCst),
+                0,
+                "on-stop cannot overlap run"
+            );
+            let _cleanup = CleanupDrop(self.cleanup_dropped.clone());
+            self.stops.send(context).unwrap();
+            if let Some(release) = &self.release_stop {
+                release.acquire().await.unwrap().forget();
+            }
+            if self.cleanup_fails {
+                Err(HookError::new(
+                    HookErrorCategory::Dependency,
+                    "on-stop failed",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn controlled_task() -> (
+        ControlledTask,
+        tokio::sync::mpsc::UnboundedReceiver<BackgroundTaskContext>,
+        tokio::sync::mpsc::UnboundedReceiver<BackgroundTaskContext>,
+    ) {
+        let (runs_tx, runs) = tokio::sync::mpsc::unbounded_channel();
+        let (stops_tx, stops) = tokio::sync::mpsc::unbounded_channel();
+        (
+            ControlledTask {
+                runs: runs_tx,
+                stops: stops_tx,
+                release_run: Arc::new(tokio::sync::Semaphore::new(0)),
+                release_stop: None,
+                live: Arc::new(AtomicUsize::new(0)),
+                fail: Arc::new(AtomicBool::new(false)),
+                cleanup_fails: false,
+                cleanup_dropped: Arc::new(AtomicBool::new(false)),
+            },
+            runs,
+            stops,
+        )
+    }
+
+    fn host_ready_spec(name: &str) -> BackgroundTaskSpec {
+        let mut spec = BackgroundTaskSpec::single_flight(
+            BackgroundTaskDeclaration::worker_managed(name, name),
+            Duration::from_secs(1),
+        );
+        spec.trigger = BackgroundTaskTrigger::HostReady { interval_ms: 1 };
+        spec
+    }
+
+    async fn next_context(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<BackgroundTaskContext>,
+    ) -> BackgroundTaskContext {
+        tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn host_ready_repeats_only_completed_runs_without_overlap_or_install_effects() {
+        let feature = FeatureId::builtin("recurring");
+        let (task, mut runs, mut stops) = controlled_task();
+        let release = task.release_run.clone();
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(feature.clone(), host_ready_spec("service"), task)
+            .unwrap();
+        let registry = builder.build();
+        registry.start_run_committed(invocation()).unwrap();
+        assert!(runs.try_recv().is_err());
+        assert_eq!(
+            registry
+                .start(&feature, "service", invocation())
+                .unwrap_err()
+                .category,
+            HookErrorCategory::Dependency
+        );
+        registry.start_host_ready(invocation()).unwrap();
+        let first = next_context(&mut runs).await;
+        registry.start_host_ready(invocation()).unwrap();
+        assert_eq!(
+            registry.start(&feature, "service", invocation()).unwrap(),
+            BackgroundTaskStart::AtCapacity
+        );
+        assert!(runs.try_recv().is_err());
+        release.add_permits(1);
+        let second = next_context(&mut runs).await;
+        assert_eq!(first.execution_id, second.execution_id);
+        assert!(
+            stops.try_recv().is_err(),
+            "normal completion must not dispose the driver"
+        );
+        registry.shutdown().await.unwrap();
+        next_context(&mut stops).await;
+        assert!(runs.try_recv().is_err());
+        assert!(registry.inner.running.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn host_ready_failure_stays_paused_across_rewrite_until_explicit_reactivation() {
+        let feature = FeatureId::builtin("paused");
+        let (task, mut runs, mut stops) = controlled_task();
+        let release = task.release_run.clone();
+        let fail = task.fail.clone();
+        fail.store(true, Ordering::SeqCst);
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(feature.clone(), host_ready_spec("service"), task)
+            .unwrap();
+        let registry = builder.build();
+        registry.start_host_ready(invocation()).unwrap();
+        let first = next_context(&mut runs).await;
+        release.add_permits(1);
+        next_context(&mut stops).await;
+        let guard = registry.begin_session_rewrite().await.unwrap();
+        assert!(matches!(
+            registry.diagnostics()[0].outcome,
+            BackgroundTaskOutcome::Failed(HookError {
+                category: HookErrorCategory::Dependency,
+                ..
+            })
+        ));
+        drop(guard);
+        assert!(registry.inner.running.lock().unwrap().is_empty());
+        assert!(runs.try_recv().is_err());
+        fail.store(false, Ordering::SeqCst);
+        registry.reactivate_host_ready(&feature, "service").unwrap();
+        let reactivated = next_context(&mut runs).await;
+        assert_ne!(first.execution_id, reactivated.execution_id);
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_ready_rearms_only_after_full_rewrite_guard_with_fresh_generation() {
+        let feature = FeatureId::builtin("rewrite-recurring");
+        let (task, mut runs, mut stops) = controlled_task();
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(feature.clone(), host_ready_spec("service"), task)
+            .unwrap();
+        let registry = builder.build();
+        registry.start_host_ready(invocation()).unwrap();
+        let old = next_context(&mut runs).await;
+        let guard = registry.begin_session_rewrite().await.unwrap();
+        let stopped = next_context(&mut stops).await;
+        assert_eq!(old.execution_id, stopped.execution_id);
+        assert!(registry.inner.running.lock().unwrap().is_empty());
+        assert!(runs.try_recv().is_err());
+        assert_eq!(
+            registry
+                .start(&feature, "service", invocation())
+                .unwrap_err()
+                .category,
+            HookErrorCategory::ScopeDisposed
+        );
+        assert!(old.generation_fence.ensure_current().is_err());
+        // The caller still owns the guard throughout its hooks and storage rewrite.
+        drop(guard);
+        let fresh = next_context(&mut runs).await;
+        assert_ne!(old.execution_id, fresh.execution_id);
+        assert_eq!(
+            fresh.generation_fence.generation(),
+            old.generation_fence.generation() + 1
+        );
+        fresh.generation_fence.ensure_current().unwrap();
+        let guard = registry.begin_session_rewrite().await.unwrap();
+        registry.shutdown().await.unwrap();
+        drop(guard);
+        assert!(registry.inner.running.lock().unwrap().is_empty());
+        assert!(runs.try_recv().is_err(), "shutdown must prevent rearm");
+    }
+
+    #[tokio::test]
+    async fn shutdown_awaits_post_driver_cleanup_and_isolates_cleanup_failure() {
+        let feature = FeatureId::builtin("cleanup-isolation");
+        let (mut failed, mut failed_runs, mut failed_stops) = controlled_task();
+        let (healthy, mut healthy_runs, mut healthy_stops) = controlled_task();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        failed.release_stop = Some(release.clone());
+        failed.cleanup_fails = true;
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(feature.clone(), host_ready_spec("failed"), failed)
+            .unwrap();
+        builder
+            .register(feature, host_ready_spec("healthy"), healthy)
+            .unwrap();
+        let registry = builder.build();
+        registry.start_host_ready(invocation()).unwrap();
+        next_context(&mut failed_runs).await;
+        next_context(&mut healthy_runs).await;
+        let shutdown_registry = registry.clone();
+        let shutdown = tokio::spawn(async move { shutdown_registry.shutdown().await });
+        next_context(&mut failed_stops).await;
+        next_context(&mut healthy_stops).await;
+        assert!(
+            !shutdown.is_finished(),
+            "join must include cleanup, not just run stop"
+        );
+        release.add_permits(1);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), shutdown)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        let diagnostics = registry.diagnostics();
+        assert!(diagnostics.iter().any(|d| d.task_name == "failed"
+            && matches!(d.outcome, BackgroundTaskOutcome::CleanupFailed(_))));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.task_name == "healthy" && d.outcome == BackgroundTaskOutcome::Cancelled)
+        );
+        assert!(registry.inner.running.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hung_cleanup_has_separate_host_deadline_and_drops_before_shutdown_returns() {
+        let feature = FeatureId::builtin("cleanup-timeout");
+        let (mut task, mut runs, mut stops) = controlled_task();
+        task.release_stop = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+        let dropped = task.cleanup_dropped.clone();
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(feature, host_ready_spec("service"), task)
+            .unwrap();
+        let registry = builder.build();
+        registry.start_host_ready(invocation()).unwrap();
+        next_context(&mut runs).await;
+        let error = tokio::time::timeout(Duration::from_secs(7), registry.shutdown())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.category, HookErrorCategory::Internal);
+        next_context(&mut stops).await;
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(
+            registry.diagnostics()[0].outcome,
+            BackgroundTaskOutcome::CleanupTimedOut
+        );
+        assert!(registry.inner.running.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn host_ready_registration_rejects_unbounded_or_zero_interval_and_retry() {
+        for interval_ms in [0, MAX_HOST_READY_INTERVAL_MS + 1] {
+            let mut spec = host_ready_spec("service");
+            spec.trigger = BackgroundTaskTrigger::HostReady { interval_ms };
+            assert!(spec.validate().is_err());
+        }
+        let mut spec = host_ready_spec("service");
+        spec.retry = BackgroundTaskRetryPolicy::Bounded {
+            max_attempts: 2,
+            delay_ms: 1,
+        };
+        assert!(spec.validate().is_err());
+        let mut spec = host_ready_spec("service");
+        spec.timeout_ms = MAX_HOST_READY_RUN_MS + 1;
+        assert!(spec.validate().is_err());
+    }
+    #[tokio::test]
+    async fn host_ready_run_timeout_pauses_only_that_task_and_joins_cleanup() {
+        let feature = FeatureId::builtin("run-timeout-isolation");
+        let (timed, mut timed_runs, mut timed_stops) = controlled_task();
+        let (healthy, mut healthy_runs, _healthy_stops) = controlled_task();
+        let healthy_release = healthy.release_run.clone();
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        let mut short = host_ready_spec("timed");
+        short.timeout_ms = 10;
+        builder.register(feature.clone(), short, timed).unwrap();
+        builder
+            .register(feature, host_ready_spec("healthy"), healthy)
+            .unwrap();
+        let registry = builder.build();
+        registry.start_host_ready(invocation()).unwrap();
+        next_context(&mut timed_runs).await;
+        let first_healthy = next_context(&mut healthy_runs).await;
+        next_context(&mut timed_stops).await;
+        healthy_release.add_permits(1);
+        let second_healthy = next_context(&mut healthy_runs).await;
+        assert_eq!(first_healthy.execution_id, second_healthy.execution_id);
+        assert!(timed_runs.try_recv().is_err());
+        let guard = registry.begin_session_rewrite().await.unwrap();
+        drop(guard);
+        next_context(&mut healthy_runs).await;
+        assert!(
+            timed_runs.try_recv().is_err(),
+            "rewrite cannot retry timed-out task"
+        );
+        assert!(
+            registry
+                .diagnostics()
+                .iter()
+                .any(|d| d.task_name == "timed" && d.outcome == BackgroundTaskOutcome::TimedOut)
+        );
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_rewrite_waits_for_the_inflight_cleanup_without_rearming() {
+        let feature = FeatureId::builtin("rewrite-shutdown-cleanup");
+        let (mut task, mut runs, mut stops) = controlled_task();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        task.release_stop = Some(release.clone());
+        let dropped = task.cleanup_dropped.clone();
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(feature, host_ready_spec("service"), task)
+            .unwrap();
+        let registry = builder.build();
+        registry.start_host_ready(invocation()).unwrap();
+        next_context(&mut runs).await;
+        let rewriting = registry.clone();
+        let rewrite = tokio::spawn(async move { rewriting.begin_session_rewrite().await });
+        next_context(&mut stops).await;
+        let stopping = registry.clone();
+        let shutdown = tokio::spawn(async move { stopping.shutdown().await });
+        // Confirm shutdown has closed admission before allowing cleanup to end.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while registry.inner.lifecycle.load(Ordering::Acquire) != TASK_SCOPE_STOPPING {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!shutdown.is_finished());
+        assert!(!dropped.load(Ordering::SeqCst));
+        release.add_permits(1);
+        assert_eq!(
+            rewrite.await.unwrap().unwrap_err().category,
+            HookErrorCategory::ScopeDisposed
+        );
+        shutdown.await.unwrap().unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(runs.try_recv().is_err());
+        assert!(registry.inner.running.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn cancelled_rewrite_preparation_retains_cleanup_join_until_explicit_retry() {
+        let feature = FeatureId::builtin("cancelled-rewrite");
+        let (mut task, mut runs, mut stops) = controlled_task();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        task.release_stop = Some(release.clone());
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(feature.clone(), host_ready_spec("service"), task)
+            .unwrap();
+        let registry = builder.build();
+        registry.start_host_ready(invocation()).unwrap();
+        let old = next_context(&mut runs).await;
+        let rewriting = registry.clone();
+        let rewrite = tokio::spawn(async move { rewriting.begin_session_rewrite().await });
+        next_context(&mut stops).await;
+        rewrite.abort();
+        assert!(rewrite.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            registry.inner.running.lock().unwrap().len(),
+            1,
+            "cancelled join stays owned"
+        );
+        old.generation_fence.ensure_current().unwrap();
+        assert_eq!(
+            registry.start(&feature, "service", invocation()).unwrap(),
+            BackgroundTaskStart::AtCapacity
+        );
+        assert!(runs.try_recv().is_err());
+        release.add_permits(1);
+        let guard = registry.begin_session_rewrite().await.unwrap();
+        assert!(registry.inner.running.lock().unwrap().is_empty());
+        drop(guard);
+        let fresh = next_context(&mut runs).await;
+        assert_eq!(
+            fresh.generation_fence.generation(),
+            old.generation_fence.generation() + 1
+        );
+        release.add_permits(1);
+        registry.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn task_key_reactivation_resumes_only_selected_failure_and_respects_barriers() {
+        let feature = FeatureId::builtin("targeted-reactivation");
+        let (selected, mut selected_runs, mut selected_stops) = controlled_task();
+        let (other, mut other_runs, mut other_stops) = controlled_task();
+        let selected_fail = selected.fail.clone();
+        selected_fail.store(true, Ordering::SeqCst);
+        other.fail.store(true, Ordering::SeqCst);
+        let selected_release = selected.release_run.clone();
+        let other_release = other.release_run.clone();
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(feature.clone(), host_ready_spec("selected"), selected)
+            .unwrap();
+        builder
+            .register(feature.clone(), host_ready_spec("other"), other)
+            .unwrap();
+        builder
+            .register(
+                feature.clone(),
+                BackgroundTaskSpec::single_flight(
+                    BackgroundTaskDeclaration::worker_managed("manual", "manual"),
+                    Duration::from_secs(1),
+                ),
+                WaitForCancellation,
+            )
+            .unwrap();
+        let registry = builder.build();
+        assert_eq!(
+            registry
+                .reactivate_host_ready(&feature, "selected")
+                .unwrap_err()
+                .category,
+            HookErrorCategory::Dependency
+        );
+        registry.start_host_ready(invocation()).unwrap();
+        next_context(&mut selected_runs).await;
+        next_context(&mut other_runs).await;
+        selected_release.add_permits(1);
+        other_release.add_permits(1);
+        next_context(&mut selected_stops).await;
+        next_context(&mut other_stops).await;
+        let guard = registry.begin_session_rewrite().await.unwrap();
+        assert_eq!(
+            registry
+                .reactivate_host_ready(&feature, "selected")
+                .unwrap_err()
+                .category,
+            HookErrorCategory::ScopeDisposed
+        );
+        drop(guard);
+        registry.start_host_ready(invocation()).unwrap();
+        assert!(
+            registry.inner.running.lock().unwrap().is_empty(),
+            "repeat publication cannot globally reactivate failures"
+        );
+        assert_eq!(
+            registry
+                .reactivate_host_ready(&feature, "manual")
+                .unwrap_err()
+                .category,
+            HookErrorCategory::InvalidInput
+        );
+        assert_eq!(
+            registry
+                .reactivate_host_ready(&feature, "unknown")
+                .unwrap_err()
+                .category,
+            HookErrorCategory::InvalidInput
+        );
+        selected_fail.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            registry
+                .reactivate_host_ready(&feature, "selected")
+                .unwrap(),
+            BackgroundTaskStart::Started { .. }
+        ));
+        next_context(&mut selected_runs).await;
+        assert_eq!(
+            registry
+                .reactivate_host_ready(&feature, "selected")
+                .unwrap(),
+            BackgroundTaskStart::AtCapacity
+        );
+        assert!(other_runs.try_recv().is_err());
+        let guard = registry.begin_session_rewrite().await.unwrap();
+        drop(guard);
+        next_context(&mut selected_runs).await;
+        assert!(
+            other_runs.try_recv().is_err(),
+            "only reactivated tasks may rearm after rewrite"
+        );
+        registry.shutdown().await.unwrap();
+        assert_eq!(
+            registry
+                .reactivate_host_ready(&feature, "selected")
+                .unwrap_err()
+                .category,
+            HookErrorCategory::ScopeDisposed
+        );
+        assert!(other_runs.try_recv().is_err());
     }
 }

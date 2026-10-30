@@ -219,6 +219,7 @@ impl OwnerHost {
             || context.invocation_id != bound.invocation_id
             || context.artifact != bound.artifact
             || context.tool_name != bound.tool_name
+            || context.grants.ticket_events != bound.grants.ticket_events
             || context.grants.ticket_read != bound.grants.ticket_read
             || context.grants.ticket_data_read != bound.grants.ticket_data_read
             || context.grants.ticket_data_write != bound.grants.ticket_data_write
@@ -609,6 +610,12 @@ mod tests {
                 });
             }
             Ok(match request {
+                PluginHostRequest::Service { .. } => {
+                    return Err(local_error(
+                        PluginHostErrorCode::Unsupported,
+                        PluginEffectObservation::NotDispatched,
+                    ));
+                }
                 PluginHostRequest::Prepare { .. } => PluginHostResponse::Authorized,
                 PluginHostRequest::Begin { .. } => PluginHostResponse::Invocation {
                     invocation_id: "owner-issued".into(),

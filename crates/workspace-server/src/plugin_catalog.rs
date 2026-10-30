@@ -258,6 +258,7 @@ fn artifact_metadata(
                 external_write: t.external_write,
             })
             .collect(),
+        services: decode(&encode(&m.services)?)?,
         connections: decode(&encode(&m.connections)?)?,
         requested_grants: decode(&encode(&m.requested_grants)?)?,
         data_collections: decode(&encode(&m.data_collections)?)?,

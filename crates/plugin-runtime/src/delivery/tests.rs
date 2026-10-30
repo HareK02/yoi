@@ -44,6 +44,7 @@ fn fixture() -> (CanonicalPluginArtifact, PluginArtifact) {
         world: m.runtime.world,
         required_imports: m.runtime.required_imports,
         tools: serde_json::from_value(serde_json::to_value(m.tools).unwrap()).unwrap(),
+        services: vec![],
         connections: vec![],
         requested_grants: vec![],
         data_collections: vec![],

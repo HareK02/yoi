@@ -16,6 +16,13 @@ use crate::{Error, Result};
 /// Explicit domain-owned purge inventory. The deletion operation tombstone is intentionally
 /// excluded so retries and audit remain available after the Workspace row is gone.
 const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
+    "plugin_service_recovery_audit",
+    // Consumer deletion cascades its released proofs. Their retention guard stays
+    // installed: deleting proofs directly while the consumer exists is forbidden.
+    "plugin_service_consumers",
+    "plugin_service_released_proofs",
+    "plugin_service_retention",
+    "typed_ticket_service_outbox",
     "plugin_data_receipts",
     "plugin_data_purges",
     "plugin_data_holders",
@@ -507,16 +514,17 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             }
             let workspace_id = operation.response.workspace_id.clone();
 
-            // Ticket case/assignment judgments and their operation receipts are
-            // immutable under ordinary domain operations, including Ticket
-            // deletion and FK cascades. Only this owner-authorized whole-Workspace
-            // purge may discard them.
+            // Service recovery audit, Ticket case/assignment judgments and their
+            // operation receipts are immutable under ordinary domain operations,
+            // including Ticket deletion and FK cascades. Only this owner-authorized
+            // whole-Workspace purge may discard them.
             // SQLite transactional DDL holds the writer lock: no concurrent writer
             // can observe the suspended guards, and any error rolls back both
             // data and schema. Restore the exact schema-owned definitions before
             // commit; update guards remain installed throughout.
             let mut ticket_delete_guards = Vec::new();
             for (table, trigger) in [
+                ("plugin_service_recovery_audit", "plugin_service_audit_retained"),
                 ("plugin_data_receipts", "plugin_data_receipt_retained"),
                 ("plugin_data_purges", "plugin_data_purge_retained"),
                 ("plugin_effect_receipts", "plugin_effect_retained"),
@@ -1305,6 +1313,16 @@ mod tests {
 
     #[test]
     fn workspace_purge_removes_plugin_references_and_catalog_without_cross_workspace_loss() {
+        let position = |table| {
+            WORKSPACE_DELETION_PURGE_TABLES
+                .iter()
+                .position(|name| *name == table)
+                .unwrap()
+        };
+        assert!(position("plugin_service_recovery_audit") < position("plugin_service_consumers"));
+        assert!(position("plugin_service_consumers") < position("plugin_service_released_proofs"));
+        assert!(position("plugin_service_consumers") < position("plugin_execution_plans"));
+        assert!(position("plugin_service_consumers") < position("plugin_installations"));
         let (store, owner, workspace_id) = setup();
         for workspace in ["workspace-a", "workspace-b"] {
             store.with_conn(|conn| {
@@ -1319,6 +1337,11 @@ mod tests {
                 conn.execute("INSERT INTO plugin_execution_plans VALUES(?1,'plan','actor','create',?2,'{}','active')", params![workspace,digest])?;
                 conn.execute("INSERT INTO plugin_invocations(workspace_id,invocation_id,plan_id,plan_fingerprint,installation_id,runtime_id,worker_id,execution_json,consumer_key,consumer_json,created_at_ms,expires_at_ms) VALUES(?1,'invocation','plan',?2,'installation','runtime','worker','{}','[\"tool_call\",\"call\"]','{}',1,1000)", params![workspace,digest])?;
                 conn.execute("INSERT INTO plugin_effect_receipts(workspace_id,invocation_id,effect_key,fingerprint,admitted_at_ms,state,error_json) VALUES(?1,'invocation','key',?2,2,'pending',?3)", params![workspace,digest,r#"{"code":"indeterminate","effect":"indeterminate","diagnostic_id":"safe"}"#])?;
+                conn.execute("INSERT INTO plugin_service_consumers(workspace_id,consumer_id,runtime_id,worker_id,installation_id,plan_id,service_name,subscriptions_json,cursor) VALUES(?1,'consumer','runtime','worker','installation','plan','service','[\"changed\",\"deleted\"]',1)", [workspace])?;
+                conn.execute("INSERT INTO plugin_service_released_proofs(workspace_id,consumer_id,lease_token,released_at_ms) VALUES(?1,'consumer','released-token',2)", [workspace])?;
+                conn.execute("INSERT INTO plugin_service_recovery_audit(workspace_id,operation_key,consumer_id,fingerprint,actor,reason,action_json,at_ms) VALUES(?1,'recovery','consumer','fingerprint','owner','Explicit recovery','{}',3)", [workspace])?;
+                conn.execute("INSERT INTO plugin_service_retention(workspace_id,removed_through) VALUES(?1,1)", [workspace])?;
+                conn.execute("INSERT INTO typed_ticket_service_outbox(event_id,workspace_id,ticket_id,event_type,occurred_at,domain_event_ref,content_digest,correlation_id,causation_id) VALUES(?1,?2,'deleted-ticket','deleted','2026-01-01T00:00:00Z','deleted-ticket:0',?3,'correlation','causation')", params![if workspace == "workspace-a" { "a".repeat(32) } else { "b".repeat(32) },workspace,"c".repeat(64)])?;
                 for table in ["plugin_effect_receipts", "plugin_invocations", "plugin_execution_plans"] {
                     assert!(conn.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1"), [workspace]).is_err());
                 }
@@ -1329,6 +1352,11 @@ mod tests {
             store
                 .with_conn(|conn| {
                     [
+                        "plugin_service_recovery_audit",
+                        "plugin_service_consumers",
+                        "plugin_service_released_proofs",
+                        "plugin_service_retention",
+                        "typed_ticket_service_outbox",
                         "plugin_effect_receipts",
                         "plugin_invocations",
                         "plugin_execution_plans",
@@ -1350,8 +1378,93 @@ mod tests {
                 })
                 .unwrap()
         };
+        let service_rows = |workspace: &str| {
+            store
+                .with_conn(|conn| {
+                    [
+                        "plugin_service_recovery_audit",
+                        "plugin_service_consumers",
+                        "plugin_service_released_proofs",
+                        "plugin_service_retention",
+                        "typed_ticket_service_outbox",
+                    ]
+                    .map(|table| {
+                        let mut statement = conn.prepare(&format!(
+                            "SELECT * FROM {table} WHERE workspace_id=?1 ORDER BY 1"
+                        ))?;
+                        let columns = statement.column_count();
+                        let rows = statement
+                            .query_map([workspace], |row| {
+                                (0..columns)
+                                    .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                                    .collect::<rusqlite::Result<Vec<_>>>()
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        Ok(rows)
+                    })
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()
+                })
+                .unwrap()
+        };
+        let service_guards = || {
+            store
+                .with_conn(|conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT name,sql FROM sqlite_schema WHERE type='trigger'
+                         AND tbl_name IN ('plugin_service_consumers',
+                             'plugin_service_released_proofs','plugin_service_recovery_audit')
+                         ORDER BY name",
+                    )?;
+                    let guards = statement
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(guards)
+                })
+                .unwrap()
+        };
+        let assert_service_retained = |workspace: &str| {
+            store
+                .with_conn(|conn| {
+                    for (table, column) in [
+                        ("plugin_service_recovery_audit", "actor"),
+                        ("plugin_service_released_proofs", "released_at_ms"),
+                    ] {
+                        assert!(
+                            conn.execute(
+                                &format!("DELETE FROM {table} WHERE workspace_id=?1"),
+                                [workspace],
+                            )
+                            .is_err(),
+                            "ordinary deletion must retain {table}"
+                        );
+                        assert!(
+                            conn.execute(
+                                &format!(
+                                    "UPDATE {table} SET {column}={column} WHERE workspace_id=?1"
+                                ),
+                                [workspace],
+                            )
+                            .is_err(),
+                            "ordinary updates must not rewrite {table}"
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        };
+        let guards_before = service_guards();
+        let target_service_before = service_rows("workspace-a");
+        let other_service_before = service_rows("workspace-b");
+        assert_service_retained("workspace-a");
+        assert_service_retained("workspace-b");
         let other = counts("workspace-b");
-        assert_eq!(counts("workspace-a"), vec![1, 1, 1, 4, 1, 1, 1, 1]);
+        assert_eq!(
+            counts("workspace-a"),
+            vec![1, 1, 1, 1, 1, 1, 1, 1, 4, 1, 1, 1, 1]
+        );
         let preflight = store
             .workspace_deletion_preflight(&owner, &workspace_id)
             .unwrap();
@@ -1371,13 +1484,23 @@ mod tests {
             conn.execute_batch("CREATE TRIGGER plugin_purge_failure BEFORE DELETE ON workspaces WHEN OLD.workspace_id='workspace-a' BEGIN SELECT RAISE(ABORT,'injected purge failure'); END;")?;
             Ok(())
         }).unwrap();
+        let error = store
+            .finalize_workspace_deletion(&operation.operation_id)
+            .unwrap_err();
         assert!(
-            store
-                .finalize_workspace_deletion(&operation.operation_id)
-                .is_err()
+            error.to_string().contains("injected purge failure"),
+            "{error}"
         );
-        assert_eq!(counts("workspace-a"), vec![1, 1, 1, 4, 1, 1, 1, 1]);
+        assert_eq!(
+            counts("workspace-a"),
+            vec![1, 1, 1, 1, 1, 1, 1, 1, 4, 1, 1, 1, 1]
+        );
         assert_eq!(counts("workspace-b"), other);
+        assert_eq!(service_rows("workspace-a"), target_service_before);
+        assert_eq!(service_rows("workspace-b"), other_service_before);
+        assert_eq!(service_guards(), guards_before);
+        assert_service_retained("workspace-a");
+        assert_service_retained("workspace-b");
         store
             .with_conn(|conn| {
                 crate::plugin_host::verify_receipt_schema(conn)?;
@@ -1385,15 +1508,21 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        let completed = store
+            .finalize_workspace_deletion(&operation.operation_id)
+            .unwrap();
+        assert_eq!(completed.state, WorkspaceDeletionState::Succeeded);
         assert_eq!(
             store
                 .finalize_workspace_deletion(&operation.operation_id)
-                .unwrap()
-                .state,
-            WorkspaceDeletionState::Succeeded
+                .unwrap(),
+            completed
         );
-        assert_eq!(counts("workspace-a"), vec![0; 8]);
+        assert_eq!(counts("workspace-a"), vec![0; 13]);
         assert_eq!(counts("workspace-b"), other);
+        assert_eq!(service_rows("workspace-b"), other_service_before);
+        assert_eq!(service_guards(), guards_before);
+        assert_service_retained("workspace-b");
         store
             .with_conn(|conn| {
                 crate::plugin_host::verify_receipt_schema(conn)?;

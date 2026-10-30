@@ -126,7 +126,7 @@ world tool-plugin {
 
 Tool worldは呼出しごとにfresh Store/instanceとし、compiled Componentは共有できる。Toolのglobal/static memoryを永続化や他呼出しとの通信に使えない。v2初期Toolは応答一回のbounded callとし、guestがmodelへ直接streamを注入するAPIは設けない。
 
-Service/event worldには`on-start(config) -> result`、`on-event(envelope) -> event-result`、`on-stop(reason) -> result`を設ける。いずれもfresh Storeで呼び、HostがWorker/installation/planに束縛したService resourceを保持する。ToolとServiceで共有する状態はHost経由の明示dataとし、guest memoryの残存を契約にしない。`status()`を呼んで診断のためにguestを実行せず、Hostが実行・接続・失敗の観測を返す。
+Service/eventの機械的契約は[独立した`@2.2.0` world](wit-service/yoi-plugin-v2.2.wit)とする。既存`@2.0.0` HTTPS/loggingと`@2.1.0` Ticket/dataをexact importし、旧world/pinへの追加はしない。Service/event worldには`on-start(config) -> result`、`on-event(envelope) -> event-result`、`on-stop(reason) -> result`を設ける。いずれもfresh Storeで呼び、HostがWorker/installation/planに束縛したService resourceを保持する。ToolとServiceで共有する状態はHost経由の明示dataとし、guest memoryの残存を契約にしない。`status()`を呼んで診断のためにguestを実行せず、Hostが実行・接続・失敗の観測を返す。
 
 `on-start`は設定検証とローカル初期化だけを行い、logging以外のHost作用を認めない。GETも副作用を持ち得るため、汎用HTTPや付随data書込みを初期化中に許可しない。外部event sourceの接続は全required Pluginの検証・導入成功後にHostが開始する。initialization失敗時に外部効果のrollbackを装わない。`on-stop`もloggingだけのbest effort通知で、resource解放の前提にしない。
 

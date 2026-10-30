@@ -24,6 +24,7 @@ pub struct AdmittedPluginOperation {
     pub pin: WorkerPluginPin,
     pub binding: Option<PluginConnectionBinding>,
     pub data_collections: Vec<PluginDataSchemaMetadata>,
+    pub services: Vec<PluginServiceMetadata>,
 }
 
 /// `execution` is derived by the authenticated Host boundary from current Worker
@@ -39,6 +40,47 @@ pub fn authorize(
     tools: &[String],
     operation: &PluginHostOperation,
 ) -> Result<AdmittedPluginOperation> {
+    authorize_selected(
+        tx,
+        workspace,
+        execution,
+        plan_id,
+        installation,
+        tools,
+        None,
+        operation,
+    )
+}
+pub fn authorize_service(
+    tx: &Transaction<'_>,
+    workspace: &str,
+    execution: &HostExecutionIdentity,
+    plan_id: &str,
+    installation: &str,
+    service: &str,
+    operation: &PluginHostOperation,
+) -> Result<AdmittedPluginOperation> {
+    authorize_selected(
+        tx,
+        workspace,
+        execution,
+        plan_id,
+        installation,
+        &[],
+        Some(service),
+        operation,
+    )
+}
+fn authorize_selected(
+    tx: &Transaction<'_>,
+    workspace: &str,
+    execution: &HostExecutionIdentity,
+    plan_id: &str,
+    installation: &str,
+    tools: &[String],
+    service: Option<&str>,
+    operation: &PluginHostOperation,
+) -> Result<AdmittedPluginOperation> {
     let plan = plugin_plan_load(tx, workspace, plan_id)?;
     if plan.plan.execution() != execution || plan.pin_state == PlanPinState::Released {
         return Err(failure(PluginHostErrorCode::Denied));
@@ -50,20 +92,31 @@ pub fn authorize(
         .find(|pin| pin.installation_id() == installation)
         .cloned()
         .ok_or_else(|| failure(PluginHostErrorCode::Denied))?;
-    if tools.is_empty()
-        || tools.len() > 256
-        || tools
-            .iter()
-            .any(|tool| tool.is_empty() || tool.len() > 512 || tool.chars().any(char::is_control))
-        || tools
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            != tools.len()
+    if service.is_none()
+        && (tools.is_empty()
+            || tools.len() > 256
+            || tools.iter().any(|tool| {
+                tool.is_empty() || tool.len() > 512 || tool.chars().any(char::is_control)
+            })
+            || tools
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != tools.len())
     {
         return Err(failure(PluginHostErrorCode::InvalidInput));
     }
-    if !pin.projection().surfaces.contains(&PluginSurface::Tool)
+    if let Some(service) = service {
+        if service.is_empty()
+            || service.len() > 512
+            || service.chars().any(char::is_control)
+            || !pin.projection().surfaces.contains(&PluginSurface::Service)
+            || !pin.projection().services.iter().any(|s| s == service)
+            || !pin.projection().grants.contains(&PluginGrant::TicketEvents)
+        {
+            return Err(failure(PluginHostErrorCode::Denied));
+        }
+    } else if !pin.projection().surfaces.contains(&PluginSurface::Tool)
         || tools
             .iter()
             .any(|tool| !pin.projection().tools.contains(tool))
@@ -137,6 +190,7 @@ pub fn authorize(
         pin,
         binding,
         data_collections: artifact.data_collections,
+        services: artifact.services,
     })
 }
 

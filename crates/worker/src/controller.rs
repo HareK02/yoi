@@ -1068,6 +1068,7 @@ where
         let notify_buffer = worker.notify_buffer_handle();
 
         worker.finish_startup_feature_cleanup_capture();
+        worker.start_host_ready_feature_tasks();
         let controller_task = tokio::spawn(controller_loop(
             worker,
             method_rx,
@@ -4068,6 +4069,147 @@ mod tests {
             assert!(endpoint.protocol_is_closed());
             assert!(!endpoint.runtime_dir.path().join("sock").exists());
             assert!(requests.lock().unwrap().is_empty());
+        }
+
+        #[derive(Clone)]
+        struct PublicationTask {
+            entered: Arc<tokio::sync::Notify>,
+            stopped: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::feature::background::FeatureBackgroundTask for PublicationTask {
+            async fn run(
+                &self,
+                _: crate::feature::background::BackgroundTaskContext,
+                _: crate::feature::background::BackgroundTaskCancellation,
+            ) -> Result<(), crate::hook::HookError> {
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+            async fn stopped(
+                &self,
+                _: crate::feature::background::BackgroundTaskContext,
+            ) -> Result<(), crate::hook::HookError> {
+                self.stopped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        impl crate::feature::FeatureModule for PublicationTask {
+            fn descriptor(&self) -> crate::feature::FeatureDescriptor {
+                crate::feature::FeatureDescriptor::builtin("publication-task", "Publication task")
+                    .with_background_task(
+                        crate::feature::BackgroundTaskDeclaration::worker_managed(
+                            "observe", "observe",
+                        ),
+                    )
+            }
+            fn install(
+                &self,
+                context: &mut crate::feature::FeatureInstallContext<'_>,
+            ) -> Result<(), crate::feature::FeatureInstallError> {
+                let mut spec = crate::feature::background::BackgroundTaskSpec::single_flight(
+                    crate::feature::BackgroundTaskDeclaration::worker_managed("observe", "observe"),
+                    Duration::from_secs(30),
+                );
+                spec.trigger =
+                    crate::feature::background::BackgroundTaskTrigger::HostReady { interval_ms: 1 };
+                context.background_tasks().register(spec, self.clone())
+            }
+        }
+
+        // Real Worker/Store, required Feature installation and Controller
+        // publication. The test task observes the final gate; the model is inert.
+        // The non-canonical branch is shared with restore after head recovery.
+        #[tokio::test]
+        async fn host_ready_tasks_wait_for_start_in_fresh_and_restore_controller_routes() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            for (canonical, publish) in [(true, false), (true, true), (false, true)] {
+                let root = TempDir::new().unwrap();
+                let manifest = manifest::WorkerManifest::from_toml(
+                    "[worker]\nname = 'publication'\n[model]\nscheme = 'anthropic'\nmodel_id = 'test'\n[engine]\n[scope]\n").unwrap();
+                let engine =
+                    Engine::<_, agen::state::Mutable, crate::SessionHistoryMetadata>::new_annotated(
+                        ScriptedClient::new(vec![]),
+                    );
+                let store = session_store::CombinedStore::new(
+                    session_store::FsStore::new(root.path().join("sessions")).unwrap(),
+                    session_store::FsWorkerStore::new(root.path().join("workers")).unwrap(),
+                );
+                let mut worker = Worker::new(
+                    manifest,
+                    engine,
+                    store,
+                    crate::worker::WorkerWorkspaceContext::local_filesystem(None),
+                    crate::worker::WorkerFilesystemAuthority::None,
+                    manifest::Scope::empty(),
+                )
+                .await
+                .unwrap();
+                worker.set_system_prompt_template(
+                    crate::SystemPromptTemplate::parse(
+                        "default",
+                        crate::PromptCatalogSource::builtins_only(),
+                    )
+                    .unwrap(),
+                );
+                if !canonical {
+                    worker.materialize_durable_session_head().await.unwrap();
+                }
+                let mut initialized =
+                    WorkerController::initialize_inner(worker, root.path(), None, canonical)
+                        .await
+                        .unwrap();
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let stopped = Arc::new(AtomicBool::new(false));
+                let report = initialized.worker.install_features(
+                    crate::feature::FeatureRegistryBuilder::new().with_module(PublicationTask {
+                        entered: entered.clone(),
+                        stopped: stopped.clone(),
+                    }),
+                );
+                assert!(!report.has_errors());
+                let publication = initialized.prepare_publication().await.unwrap();
+                assert!(!stopped.load(Ordering::SeqCst));
+                assert!(
+                    futures::FutureExt::now_or_never(entered.notified()).is_none(),
+                    "preparation cannot start tasks"
+                );
+                if !publish {
+                    drop(publication);
+                    drop(initialized);
+                    assert!(futures::FutureExt::now_or_never(entered.notified()).is_none());
+                    assert!(
+                        !stopped.load(Ordering::SeqCst),
+                        "unstarted task has no on-stop effects"
+                    );
+                    continue;
+                }
+                let (handle, shutdown, controller) = initialized.start(publication);
+                tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                    .await
+                    .unwrap();
+                handle
+                    .send(Method::Shutdown {
+                        command: WorkerCommandEnvelope { command_id: 1 },
+                    })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), shutdown)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), controller)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    stopped.load(Ordering::SeqCst),
+                    "Controller shutdown joins task cleanup"
+                );
+            }
         }
 
         #[tokio::test]

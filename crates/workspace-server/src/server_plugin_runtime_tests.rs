@@ -311,6 +311,8 @@ pub(super) mod plugin_runtime_tests {
                 .plugins
                 .selections
                 .push(manifest::PluginProfileSelection {
+                    services: vec![],
+                    ticket_events: false,
                     ticket_read: false,
                     ticket_data_read: vec![],
                     ticket_data_write: vec![],
@@ -837,9 +839,11 @@ pub(super) mod plugin_runtime_tests {
             .plugins
             .selections
             .push(manifest::PluginProfileSelection {
-                    ticket_read: false,
-                    ticket_data_read: vec![],
-                    ticket_data_write: vec![],
+                services: vec![],
+                ticket_events: false,
+                ticket_read: false,
+                ticket_data_read: vec![],
+                ticket_data_write: vec![],
                 installation_id: f.installed.installation.installation_id.clone(),
                 tools: vec![f.tool.into()],
                 logging: false,
@@ -1188,4 +1192,5 @@ pub(super) mod plugin_runtime_tests {
     async fn pending_tool_call_restores_its_committed_host_identity_before_first_effect() {
         https_through_runtime_and_history(false, true).await;
     }
+    include!("server_plugin_service_runtime_tests.rs");
 }

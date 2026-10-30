@@ -15,6 +15,7 @@ fn artifact() -> ArtifactIdentityProjection {
         schema_version: 2,
         world: plugin::PLUGIN_COMPONENT_HTTPS_LOGGED_TOOL_WORLD.into(),
         required_imports: vec!["logging".into(), "https".into(), "logging".into()],
+        services: vec![],
         tools: vec!["other".into(), "echo".into()],
         connections: vec!["api".into()],
         requested_grants: vec![
@@ -35,6 +36,7 @@ fn projection() -> PluginPinProjection {
     PluginPinProjection {
         config: serde_json::from_str(r#"{"z":{"b":2,"a":1},"a":[{"z":0,"a":false}]}"#).unwrap(),
         surfaces: vec![PluginSurface::Tool, PluginSurface::Tool],
+        services: vec![],
         tools: vec!["other".into(), "echo".into(), "other".into()],
         grants: vec![
             PluginGrant::Https { slot: "api".into() },
@@ -237,4 +239,48 @@ fn ticket_grants_require_exact_world_request_and_schema_namespace() {
     assert_eq!(pin(&a, selected), Err(PlanError::Invalid));
     a.requested_grants.retain(|g| g != &write);
     assert_eq!(exact.matches_artifact(&a), Err(PlanError::Invalid));
+}
+
+#[test]
+fn service_selection_needs_exact_new_world_declared_name_and_explicit_event_grant() {
+    let mut artifact = artifact();
+    let mut selected = projection();
+    selected.tools.clear();
+    selected.bindings.clear();
+    selected.grants = vec![PluginGrant::TicketEvents];
+    selected.surfaces = vec![PluginSurface::Service];
+    selected.services = vec!["watch".into()];
+    artifact.services = vec!["watch".into()];
+    artifact.requested_grants.push(PluginGrant::TicketEvents);
+    assert_eq!(pin(&artifact, selected.clone()), Err(PlanError::Invalid));
+    artifact.world = plugin::PLUGIN_COMPONENT_SERVICE_WORLD.into();
+    let exact = pin(&artifact, selected.clone()).unwrap();
+    selected.services.push("undeclared".into());
+    assert_eq!(pin(&artifact, selected), Err(PlanError::Invalid));
+    artifact.services.clear();
+    assert_eq!(exact.matches_artifact(&artifact), Err(PlanError::Invalid));
+}
+
+#[test]
+fn old_serialized_pin_does_not_acquire_service_selection_or_event_grant() {
+    let plan: WorkerPluginExecutionPlan =
+        serde_json::from_str(include_str!("fixtures/canonical-plan.json")).unwrap();
+    assert!(plan.plugins()[0].projection().services.is_empty());
+    assert!(
+        !plan.plugins()[0]
+            .projection()
+            .surfaces
+            .contains(&PluginSurface::Service)
+    );
+    assert!(
+        !plan.plugins()[0]
+            .projection()
+            .grants
+            .contains(&PluginGrant::TicketEvents)
+    );
+    // Additive default-off fields cannot mutate the exact old plan fingerprint.
+    assert_eq!(
+        plan.fingerprint().unwrap(),
+        "sha256:00ee15d79098f4afa137da5d4b0b9b78acde48a6157fdda0f3327d8c122bd889"
+    );
 }
