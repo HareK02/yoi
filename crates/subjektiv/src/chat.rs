@@ -47,6 +47,11 @@ pub(crate) fn migrate(tx: &Transaction<'_>) -> feature_storage::Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_references(tx: &Transaction<'_>) -> feature_storage::Result<()> {
+    tx.execute_batch(include_str!("chat/references.sql"))?;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum Principal<'a> {
     Account(&'a str),
@@ -68,6 +73,19 @@ impl Principal<'_> {
 }
 
 impl SubjektivStore {
+    /// Presentation only: resolving a reference still checks the authenticated principal.
+    pub fn chat_conversation_reference(&self, subject: &str, id: &str) -> Result<String> {
+        self.database.try_transaction(|tx| {
+            let conversation = conversation(tx, Principal::Subject(subject), id)?;
+            let number: i64 = tx.query_row(
+                "SELECT number FROM chat_conversation_references WHERE conversation_id=?1",
+                [&conversation.id],
+                |r| r.get(0),
+            )?;
+            Ok(format!("C-{number}"))
+        })
+    }
+
     /// Exact account-scoped replay returns the original creation result (no user input).
     pub fn chat_create_conversation(
         &self,
@@ -187,6 +205,7 @@ impl SubjektivStore {
         self.database.try_transaction(|tx| {
             check_authorization(tx, principal, expected_permission_change_id)?;
             let conversation = conversation(tx, principal, conversation_id)?;
+            let conversation_id = &conversation.id;
             let after = query.after_sequence.unwrap_or(0) as i64;
             let mut messages = tx.prepare(&format!("SELECT {MESSAGE_COLUMNS} FROM chat_messages WHERE conversation_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3"))?
                 .query_map(params![conversation_id, after, limit+1], message_row)?
@@ -280,6 +299,8 @@ impl SubjektivStore {
         self.database.try_transaction(|tx| {
             check_authorization(tx, principal, expected_permission_change_id)?;
             let mut conversation = conversation(tx, principal, conversation_id)?;
+            let canonical_id = conversation.id.clone();
+            let conversation_id = canonical_id.as_str();
             let (kind, sender_id) = principal.sender();
             let saved = tx.query_row(&format!("SELECT {MESSAGE_COLUMNS} FROM chat_messages
                 WHERE conversation_id=?1 AND sender_kind=?2 AND sender_id=?3 AND operation_id=?4"),
@@ -369,7 +390,24 @@ fn conversation(
     principal: Principal<'_>,
     id: &str,
 ) -> Result<ChatConversation> {
-    let conversation = tx.query_row("SELECT id,subject_id,participant_account_id,last_user_message_id FROM chat_conversations WHERE id=?1", [id], conversation_row).optional()?
+    let resolved = if let Some(number) = id.strip_prefix("C-") {
+        let number: i64 = number
+            .parse()
+            .ok()
+            .filter(|n| *n > 0)
+            .filter(|n| format!("C-{n}") == id)
+            .ok_or(ChatError::ConversationNotFound)?;
+        tx.query_row(
+            "SELECT conversation_id FROM chat_conversation_references WHERE number=?1",
+            [number],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or(ChatError::ConversationNotFound)?
+    } else {
+        id.to_owned()
+    };
+    let conversation = tx.query_row("SELECT id,subject_id,participant_account_id,last_user_message_id FROM chat_conversations WHERE id=?1", [&resolved], conversation_row).optional()?
         .filter(|c| principal.member_of(c)).ok_or(ChatError::ConversationNotFound)?;
     require_active_subject(tx, &conversation.subject_id)?;
     Ok(conversation)

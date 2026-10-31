@@ -23,7 +23,7 @@ use crate::subjektiv::SubjektivHostConnection;
 
 const READ_TOOL: &str = "ConversationRead";
 const SEND_TOOL: &str = "ConversationSend";
-const READ_DESCRIPTION: &str = "Read a bounded page of committed text-only messages in an authorized conversation for the explicitly connected Subject. Returns the current last_user_message_id; use after_sequence for continuation. This reads public messages, not internal Worker logs or notification-delivery evidence.";
+const READ_DESCRIPTION: &str = "Read a bounded page of committed text-only messages in an authorized conversation for the explicitly connected Subject. conversation_id accepts the short C-* reference from a conversation notification or a canonical ID. Returns the current last_user_message_id; use after_sequence for continuation. This reads public messages, not internal Worker logs or notification-delivery evidence.";
 const SEND_DESCRIPTION: &str = "Explicitly send one text-only public message as the connected Subject to an authorized conversation. Use a stable operation_id and the observed expected_last_user_message_id. Sender identity is Host-bound. Exact retries retain the full request and operation_id; conflicts require rereading and reconsideration, while a lost response is not proof of failure. This is the only operation here that publishes assistant text; turn completion and background WorkerNotify reports do not send messages. No attachments or file-path attachment substitution.";
 const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 

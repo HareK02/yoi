@@ -945,3 +945,145 @@ fn policy_replacement_and_read_serialize_across_sqlite_connections() {
         vec![input]
     );
 }
+
+#[test]
+fn conversation_references_preserve_authorization_replay_and_input_fences() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
+    let subject = store.create_subject(role()).unwrap().id;
+    let foreign = store.create_subject(role()).unwrap().id;
+    let c = create(&store, "alice", &subject, "create");
+    let reference = store.chat_conversation_reference(&subject, &c.id).unwrap();
+    assert_eq!(reference, "C-1");
+    let first = store
+        .chat_append_user_message("alice", &reference, &user("input", "hello"))
+        .unwrap();
+    assert_eq!(first.conversation_id, c.id);
+    let query = ChatMessagePageQuery::default();
+    assert_eq!(
+        store
+            .chat_messages_for_subject(&subject, &reference, &query)
+            .unwrap(),
+        page(&store, &c)
+    );
+    assert!(matches!(
+        store.chat_messages_for_subject(&foreign, &reference, &query),
+        Err(ChatError::ConversationNotFound)
+    ));
+    assert!(matches!(
+        store.chat_messages_for_account("bob", &reference, &query),
+        Err(ChatError::ConversationNotFound)
+    ));
+    for invalid in ["C-0", "C-01", "C--1", "C-2", "C-999999999999999999999999"] {
+        assert!(matches!(
+            store.chat_messages_for_subject(&subject, invalid, &query),
+            Err(ChatError::ConversationNotFound)
+        ));
+    }
+    let mut request = send(&c, "reply", Some(&first.id));
+    request.conversation_id = reference.clone();
+    request.reply_to = Some(first.id.clone());
+    let answer = store.chat_send_message(&subject, &request).unwrap();
+    store
+        .chat_append_user_message("alice", &c.id, &user("next", "new input"))
+        .unwrap();
+    request.conversation_id = c.id.clone();
+    assert_eq!(store.chat_send_message(&subject, &request).unwrap(), answer);
+    request.conversation_id = reference.clone();
+    request.operation_id = "stale-new-send".into();
+    assert!(matches!(
+        store.chat_send_message(&subject, &request),
+        Err(ChatError::UserInputChanged { .. })
+    ));
+    let (_reopen_manager, _reopen_scope, reopened) = open_store(temp.path(), "workspace-a");
+    assert_eq!(
+        reopened
+            .chat_conversation_reference(&subject, &c.id)
+            .unwrap(),
+        reference
+    );
+    reopened.begin_subject_deletion(&subject, "erase").unwrap();
+    reopened.finish_subject_deletion(&subject, "erase").unwrap();
+    assert!(matches!(
+        reopened.chat_messages_for_subject(&subject, &reference, &query),
+        Err(ChatError::ConversationNotFound)
+    ));
+    let next = create(&reopened, "alice", &foreign, "new");
+    assert_ne!(
+        reopened
+            .chat_conversation_reference(&foreign, &next.id)
+            .unwrap(),
+        reference
+    );
+    assert!(matches!(
+        reopened.chat_messages_for_subject(&foreign, &reference, &query),
+        Err(ChatError::ConversationNotFound)
+    ));
+}
+
+#[test]
+fn conversation_reference_upgrade_backfills_existing_messages_without_rewriting_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let (c, input) = {
+        let manager = FeatureStorage::new(temp.path());
+        let scope = manager.workspace("upgraded").unwrap();
+        let registered = scope
+            .register(FeatureRegistration::new(
+                crate::SUBJEKTIV_FEATURE_ID,
+                &crate::MIGRATIONS[..16],
+            ))
+            .unwrap();
+        let old = SubjektivStore::open(&scope, &registered).unwrap();
+        let subject = old.create_subject(role()).unwrap().id;
+        let c = create(&old, "alice", &subject, "create");
+        let input = old
+            .chat_append_user_message("alice", &c.id, &user("input", "retained"))
+            .unwrap();
+        (c, input)
+    };
+    let (_manager, _scope, store) = open_store(temp.path(), "upgraded");
+    let reference = store
+        .chat_conversation_reference(&c.subject_id, &c.id)
+        .unwrap();
+    assert_eq!(
+        store
+            .chat_messages_for_subject(&c.subject_id, &reference, &ChatMessagePageQuery::default())
+            .unwrap()
+            .messages,
+        vec![input]
+    );
+    let (_fresh_manager, _fresh_scope, fresh) = open_store(temp.path(), "fresh");
+    assert_eq!(schema(&store), schema(&fresh));
+}
+
+#[test]
+fn failed_conversation_reference_migration_rolls_back_and_retries() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE chat_conversations(id TEXT PRIMARY KEY); INSERT INTO chat_conversations VALUES ('existing'); CREATE TRIGGER chat_conversation_reference_insert AFTER INSERT ON chat_conversations BEGIN SELECT 1; END;").unwrap();
+    {
+        let tx = connection.unchecked_transaction().unwrap();
+        assert!(migrate_references(&tx).is_err());
+    }
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='chat_conversation_references')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!exists);
+    connection
+        .execute_batch("DROP TRIGGER chat_conversation_reference_insert;")
+        .unwrap();
+    let tx = connection.unchecked_transaction().unwrap();
+    migrate_references(&tx).unwrap();
+    tx.commit().unwrap();
+    let id: String = connection
+        .query_row(
+            "SELECT conversation_id FROM chat_conversation_references WHERE number=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(id, "existing");
+}

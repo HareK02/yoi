@@ -666,6 +666,11 @@ static MIGRATIONS: &[FeatureMigration] = &[
         "retain replayable Subject creation receipts",
         subject_creation::migrate,
     ),
+    FeatureMigration::new(
+        17,
+        "add stable conversation presentation references",
+        chat::migrate_references,
+    ),
 ];
 
 pub const REGISTRATION: FeatureRegistration =
