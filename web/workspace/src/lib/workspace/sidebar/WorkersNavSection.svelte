@@ -143,8 +143,8 @@
       if (!scope.isCurrent()) return;
       await refreshWorkspaceWorkers(scope.workspaceId);
       if (!scope.isCurrent()) return;
-      pushWorkspaceAlert('info', `${worker.display_name || worker.label} stopped`, {
-        title: 'Worker stopped',
+      pushWorkspaceAlert('info', `Stop accepted for ${worker.display_name || worker.label}. Check the refreshed Worker state for confirmation.`, {
+        title: 'Stop accepted',
       });
     } catch (cause) {
       if (!scope.isCurrent()) return;

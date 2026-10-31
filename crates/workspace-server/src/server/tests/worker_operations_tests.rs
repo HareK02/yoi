@@ -12,6 +12,7 @@ fn operation_input(kind: WorkerInputKind) -> WorkerInputRequest {
 
 fn operation_lifecycle() -> WorkerLifecycleRequest {
     WorkerLifecycleRequest {
+        stop_intent: None,
         reason: Some("operation-boundary-test".into()),
         ticket_assignment: None,
     }
@@ -718,6 +719,7 @@ async fn generic_management_aliases_cannot_bypass_worker_grants_or_target_bound_
             .is_err()
     );
     let lifecycle = || server_api::RuntimeWorkerLifecycleRequest {
+        stop_intent: None,
         reason: None,
         ticket_assignment: None,
     };

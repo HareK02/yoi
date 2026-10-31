@@ -224,7 +224,7 @@
               <div>
                 <dt>Worker connection</dt>
                 <dd>
-                  <strong>{subject.current_worker ? 'Connected' : 'Not connected'}</strong>
+                  <strong>{subject.current_worker_diagnostics?.length ? 'Body observation unavailable' : subject.current_body ? 'Current body assigned' : 'No current body'}</strong>
                   {#if subject.current_worker}<span>{subject.current_worker.display_name}</span>{/if}
                 </dd>
               </div>

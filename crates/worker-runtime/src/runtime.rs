@@ -2140,9 +2140,20 @@ impl Runtime {
         RuntimeError,
     > {
         let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
-        let _operation_guard = operation_lock
-            .lock()
-            .map_err(|_| RuntimeError::StatePoisoned)?;
+        let _operation_guard = if coordinate {
+            // Admission may run under a Backend gate needed by in-flight
+            // lifecycle callbacks; never wait for their Worker lock here.
+            operation_lock.try_lock().map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => RuntimeError::RestoreAdmissionBusy {
+                    worker_id: worker_ref.worker_id,
+                },
+                std::sync::TryLockError::Poisoned(_) => RuntimeError::StatePoisoned,
+            })?
+        } else {
+            operation_lock
+                .lock()
+                .map_err(|_| RuntimeError::StatePoisoned)?
+        };
         self.lock()?
             .ensure_subject_not_reserved(worker_ref, false)?;
         if let Some(scope) = scope {
@@ -3881,7 +3892,14 @@ impl Runtime {
         worker_ref: &WorkerRef,
         reason: Option<String>,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
-        self.stop_worker_with_scope(worker_ref, reason, Some(scope))
+        self.stop_worker_request_scoped(
+            scope,
+            worker_ref,
+            runtime_api::WorkerLifecycleRequest {
+                reason,
+                ..Default::default()
+            },
+        )
     }
 
     /// Stop a Worker. Repeated stops are idempotent. The per-Worker lifecycle
@@ -3892,24 +3910,246 @@ impl Runtime {
         worker_ref: &WorkerRef,
         reason: Option<String>,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
-        self.stop_worker_with_scope(worker_ref, reason, None)
+        self.stop_worker_request(
+            worker_ref,
+            runtime_api::WorkerLifecycleRequest {
+                reason,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Stop with durable caller identity and an observation fence. Exact replay
+    /// returns only the historical receipt, even after a subsequent Restore.
+    pub fn stop_worker_request_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+        request: runtime_api::WorkerLifecycleRequest,
+    ) -> Result<WorkerLifecycleAck, RuntimeError> {
+        self.stop_worker_with_scope(worker_ref, request, Some(scope))
+    }
+
+    pub fn stop_worker_request(
+        &self,
+        worker_ref: &WorkerRef,
+        request: runtime_api::WorkerLifecycleRequest,
+    ) -> Result<WorkerLifecycleAck, RuntimeError> {
+        self.stop_worker_with_scope(worker_ref, request, None)
+    }
+
+    /// Look up an exact stop intent without admitting it, reconciling backend
+    /// cleanup, rotating observations, or changing lifecycle state. Canonical
+    /// reads may refresh an earlier uncertain write; errors remain unknown.
+    pub fn worker_stop_outcome(
+        &self,
+        worker_ref: &WorkerRef,
+        request: runtime_api::WorkerLifecycleRequest,
+    ) -> Result<crate::catalog::WorkerStopOutcome, RuntimeError> {
+        self.worker_stop_outcome_with_scope(worker_ref, request, None)
+    }
+
+    pub fn worker_stop_outcome_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+        request: runtime_api::WorkerLifecycleRequest,
+    ) -> Result<crate::catalog::WorkerStopOutcome, RuntimeError> {
+        self.worker_stop_outcome_with_scope(worker_ref, request, Some(scope))
+    }
+
+    fn worker_stop_outcome_with_scope(
+        &self,
+        worker_ref: &WorkerRef,
+        request: runtime_api::WorkerLifecycleRequest,
+        scope: Option<&RuntimeWorkspaceScope>,
+    ) -> Result<crate::catalog::WorkerStopOutcome, RuntimeError> {
+        let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+        if let Some(scope) = scope {
+            let mut state = self.lock()?;
+            if !state
+                .worker(worker_ref)?
+                .belongs_to_workspace(&scope.workspace_id)
+            {
+                return Err(RuntimeError::WorkerNotFound {
+                    worker_id: worker_ref.worker_id,
+                });
+            }
+            state.ensure_workspace_owner(scope, false)?;
+        }
+        let intent = validate_stop_intent(&request)?.ok_or_else(|| {
+            RuntimeError::InvalidRequest("stop outcome requires stop_intent".into())
+        })?;
+        let mut state = self.lock()?;
+        state.refresh_uncertain_worker_write(worker_ref)?;
+        let worker = state.worker(worker_ref)?;
+        let Some(owner) = worker.restore_guard.stop_owners.get(&intent.request_id) else {
+            return Ok(crate::catalog::WorkerStopOutcome::NotFound);
+        };
+        owner.ensure_request(worker_ref, &request)?;
+        if let Some(ack) = &owner.receipt {
+            return Ok(crate::catalog::WorkerStopOutcome::Stopped {
+                ack: ack.historical_stop_receipt(),
+            });
+        }
+        owner.ensure_pending(worker_ref, worker.pending_stop)?;
+        Ok(crate::catalog::WorkerStopOutcome::Pending)
+    }
+
+    /// Admit the exact stop under the Worker lifecycle lock without invoking
+    /// backend cleanup. Callers must release their own lifecycle gates before
+    /// dispatching the same request through stop_worker_request.
+    pub fn coordinate_worker_stop(
+        &self,
+        worker_ref: &WorkerRef,
+        request: runtime_api::WorkerLifecycleRequest,
+    ) -> Result<crate::catalog::WorkerStopOutcome, RuntimeError> {
+        self.coordinate_worker_stop_with_scope(worker_ref, request, None)
+    }
+
+    pub fn coordinate_worker_stop_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+        request: runtime_api::WorkerLifecycleRequest,
+    ) -> Result<crate::catalog::WorkerStopOutcome, RuntimeError> {
+        self.coordinate_worker_stop_with_scope(worker_ref, request, Some(scope))
+    }
+
+    fn coordinate_worker_stop_with_scope(
+        &self,
+        worker_ref: &WorkerRef,
+        request: runtime_api::WorkerLifecycleRequest,
+        scope: Option<&RuntimeWorkspaceScope>,
+    ) -> Result<crate::catalog::WorkerStopOutcome, RuntimeError> {
+        if validate_stop_intent(&request)?.is_none() {
+            return Err(RuntimeError::InvalidRequest(
+                "stop admission requires stop_intent".into(),
+            ));
+        }
+        if let Some(scope) = scope {
+            let mut state = self.lock()?;
+            if !state
+                .worker(worker_ref)?
+                .belongs_to_workspace(&scope.workspace_id)
+            {
+                return Err(RuntimeError::WorkerNotFound {
+                    worker_id: worker_ref.worker_id,
+                });
+            }
+            state.ensure_workspace_owner(scope, false)?;
+        }
+        let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
+        // A caller may hold a Backend gate needed by an in-flight cleanup's
+        // callbacks. Never wait for that cleanup while retaining the gate.
+        let _operation_guard = operation_lock.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => RuntimeError::StopAdmissionBusy {
+                worker_id: worker_ref.worker_id,
+            },
+            std::sync::TryLockError::Poisoned(_) => RuntimeError::StatePoisoned,
+        })?;
+        match self.admit_worker_stop_under_lock(worker_ref, request, scope)? {
+            StopAdmission::Pending(_) => Ok(crate::catalog::WorkerStopOutcome::Pending),
+            StopAdmission::Stopped(ack) => Ok(crate::catalog::WorkerStopOutcome::Stopped {
+                ack: ack.historical_stop_receipt(),
+            }),
+        }
     }
 
     fn stop_worker_with_scope(
         &self,
         worker_ref: &WorkerRef,
-        reason: Option<String>,
+        request: runtime_api::WorkerLifecycleRequest,
         scope: Option<&RuntimeWorkspaceScope>,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
         let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
         let _operation_guard = operation_lock
             .lock()
             .map_err(|_| RuntimeError::StatePoisoned)?;
+        let operation_id = match self.admit_worker_stop_under_lock(worker_ref, request, scope)? {
+            StopAdmission::Stopped(ack) => return Ok(ack),
+            StopAdmission::Pending(operation_id) => operation_id,
+        };
+        let backend = self.lock()?.execution_backend.clone().ok_or_else(|| {
+            RuntimeError::WorkerExecutionUnavailable {
+                worker_id: worker_ref.worker_id,
+                message: "runtime has no execution backend".into(),
+            }
+        })?;
+        let result = backend.stop_worker_operation(WorkerExecutionStopRequest {
+            operation_id,
+            worker_ref: worker_ref.clone(),
+        });
+        if !result.is_accepted() {
+            return Err(RuntimeError::WorkerExecutionRejected {
+                worker_id: worker_ref.worker_id,
+                operation: result.operation,
+                outcome: result.outcome,
+                message: result.message_or_default(),
+                result,
+            });
+        }
+        self.commit_stopped_worker(worker_ref, operation_id)
+    }
+
+    fn admit_worker_stop_under_lock(
+        &self,
+        worker_ref: &WorkerRef,
+        request: runtime_api::WorkerLifecycleRequest,
+        scope: Option<&RuntimeWorkspaceScope>,
+    ) -> Result<StopAdmission, RuntimeError> {
         if let Some(scope) = scope {
-            self.ensure_worker_in_workspace(scope, worker_ref)?;
+            let mut state = self.lock()?;
+            if !state
+                .worker(worker_ref)?
+                .belongs_to_workspace(&scope.workspace_id)
+            {
+                return Err(RuntimeError::WorkerNotFound {
+                    worker_id: worker_ref.worker_id,
+                });
+            }
+            // Replays and rejected fences do not bind ownership or write snapshots.
+            state.ensure_workspace_owner(scope, false)?;
         }
 
         self.lock()?.refresh_uncertain_worker_write(worker_ref)?;
+        let intent = validate_stop_intent(&request)?;
+        if let Some(intent) = intent {
+            let state = self.lock()?;
+            let worker = state.worker(worker_ref)?;
+            if let Some(owner) = worker.restore_guard.stop_owners.get(&intent.request_id) {
+                owner.ensure_request(worker_ref, &request)?;
+                if let Some(ack) = &owner.receipt {
+                    return Ok(StopAdmission::Stopped(ack.historical_stop_receipt()));
+                }
+                owner.ensure_pending(worker_ref, worker.pending_stop)?;
+            } else {
+                if intent.expected_observation_token != worker.restore_guard.observation_token {
+                    return Err(RuntimeError::StopObservationConflict {
+                        worker_id: worker_ref.worker_id,
+                    });
+                }
+                // A public caller may recover a legacy pending stop, but cannot
+                // steal another public intent's pending operation.
+                if worker.pending_stop.is_some_and(|pending| {
+                    worker
+                        .restore_guard
+                        .stop_owners
+                        .values()
+                        .any(|owner| owner.operation_id == pending.operation_id)
+                }) {
+                    return Err(RuntimeError::StopRequestConflict {
+                        worker_id: worker_ref.worker_id,
+                    });
+                }
+            }
+        }
+        if let Some(scope) = scope {
+            self.ensure_worker_in_workspace(scope, worker_ref)?;
+        }
         self.lock()?.ensure_subject_not_reserved(worker_ref, true)?;
         let (backend, pending_stop, pending_restore, status) = {
             let state = self.lock()?;
@@ -3929,44 +4169,67 @@ impl Runtime {
             worker
                 .restore_guard
                 .finish(RuntimeWorkerRestoreResult::superseded_by_stop(None));
-            state.persist_worker_record(&worker)?;
             let ack = WorkerLifecycleAck {
+                replayed: false,
                 worker_ref: worker_ref.clone(),
                 status: worker.status,
                 worker_state: worker.worker_state.clone(),
             };
+            if let Some(intent) = intent {
+                worker.restore_guard.stop_owners.insert(
+                    intent.request_id.clone(),
+                    StopRequestOwner {
+                        request: request.clone(),
+                        operation_id: WorkerLifecycleOperationId::new(),
+                        receipt: Some(ack.clone()),
+                    },
+                );
+            }
+            state.persist_stop_worker_record(&worker)?;
             state.workers.insert(worker_ref.worker_id, worker);
             state.publish_worker_upsert(worker_ref.worker_id)?;
-            return Ok(ack);
+            return Ok(StopAdmission::Stopped(ack));
         }
-        let backend = backend.ok_or_else(|| RuntimeError::WorkerExecutionUnavailable {
+        let _backend = backend.ok_or_else(|| RuntimeError::WorkerExecutionUnavailable {
             worker_id: worker_ref.worker_id,
             message: "runtime has no execution backend".to_string(),
         })?;
         let operation_id = match pending_stop {
-            Some(pending) => pending.operation_id,
+            Some(pending) => {
+                if let Some(intent) = intent {
+                    let mut state = self.lock()?;
+                    let mut candidate = state.worker(worker_ref)?.clone();
+                    if !candidate
+                        .restore_guard
+                        .stop_owners
+                        .contains_key(&intent.request_id)
+                    {
+                        candidate.restore_guard.stop_owners.insert(
+                            intent.request_id.clone(),
+                            StopRequestOwner {
+                                request: request.clone(),
+                                operation_id: pending.operation_id,
+                                receipt: None,
+                            },
+                        );
+                        state.preflight_stop_owner_growth(&candidate)?;
+                        state.persist_stop_worker_record(&candidate)?;
+                        state.workers.insert(worker_ref.worker_id, candidate);
+                    }
+                }
+                pending.operation_id
+            }
             None => {
                 let operation_id = WorkerLifecycleOperationId::new();
-                self.begin_stop_operation(worker_ref, operation_id)?;
+                self.begin_stop_operation_request(
+                    worker_ref,
+                    operation_id,
+                    intent.map(|_| request.clone()),
+                )?;
                 operation_id
             }
         };
-        let result = backend.stop_worker_operation(WorkerExecutionStopRequest {
-            operation_id,
-            worker_ref: worker_ref.clone(),
-        });
-        if !result.is_accepted() {
-            return Err(RuntimeError::WorkerExecutionRejected {
-                worker_id: worker_ref.worker_id,
-                operation: result.operation,
-                outcome: result.outcome,
-                message: result.message_or_default(),
-                result,
-            });
-        }
-        let ack = self.commit_stopped_worker(worker_ref, operation_id)?;
-        let _ = reason;
-        Ok(ack)
+        Ok(StopAdmission::Pending(operation_id))
     }
 
     /// Cancel a Worker through a workspace-scoped Runtime authorization context.
@@ -4013,6 +4276,7 @@ impl Runtime {
             }
             if worker.status == WorkerStatus::Stopped {
                 return Ok(WorkerLifecycleAck {
+                    replayed: false,
                     worker_ref: worker_ref.clone(),
                     status: WorkerStatus::Stopped,
                     worker_state: None,
@@ -4024,6 +4288,7 @@ impl Runtime {
         let state = self.lock()?;
         let worker = state.worker(worker_ref)?;
         Ok(WorkerLifecycleAck {
+            replayed: false,
             worker_ref: worker_ref.clone(),
             status: worker.status,
             worker_state: worker.worker_state.clone(),
@@ -4584,6 +4849,15 @@ impl Runtime {
         worker_ref: &WorkerRef,
         operation_id: WorkerLifecycleOperationId,
     ) -> Result<(), RuntimeError> {
+        self.begin_stop_operation_request(worker_ref, operation_id, None)
+    }
+
+    fn begin_stop_operation_request(
+        &self,
+        worker_ref: &WorkerRef,
+        operation_id: WorkerLifecycleOperationId,
+        request: Option<runtime_api::WorkerLifecycleRequest>,
+    ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         let mut candidate = state.worker(worker_ref)?.clone();
         if candidate.pending_stop.is_some() {
@@ -4603,7 +4877,19 @@ impl Runtime {
             operation_id,
             last_settled_status: candidate.status,
         });
-        match state.persist_worker_record(&candidate) {
+        if let Some(request) = request {
+            let intent = request.stop_intent.as_ref().expect("validated stop intent");
+            candidate.restore_guard.stop_owners.insert(
+                intent.request_id.clone(),
+                StopRequestOwner {
+                    request,
+                    operation_id,
+                    receipt: None,
+                },
+            );
+        }
+        state.preflight_stop_owner_growth(&candidate)?;
+        match state.persist_stop_worker_record(&candidate) {
             Ok(()) => {
                 state.workers.insert(worker_ref.worker_id, candidate);
                 Ok(())
@@ -4632,26 +4918,11 @@ impl Runtime {
                 worker_ref.worker_id
             )));
         }
-        let restore_receipt =
-            RuntimeWorkerRestoreResult::superseded_by_stop(candidate.pending_restore);
-        candidate.pending_stop = None;
-        candidate.pending_restore = None;
         if let Some(context) = candidate.restore_candidate_context.take() {
             context.discard_candidate();
         }
-        candidate.restore_guard.rotate();
-        candidate.status = WorkerStatus::Stopped;
-        candidate.worker_state = None;
-        candidate.restore_intent = WorkerRestoreIntent::Explicit;
-
-        candidate.restore_guard.finish(restore_receipt);
-        candidate.internal_workers.clear();
-        state.persist_worker_record(&candidate)?;
-        let ack = WorkerLifecycleAck {
-            worker_ref: worker_ref.clone(),
-            status: candidate.status,
-            worker_state: None,
-        };
+        let (candidate, ack) = candidate.stopped_candidate(operation_id);
+        state.persist_stop_worker_record(&candidate)?;
         state.workers.insert(worker_ref.worker_id, candidate);
         state.publish_worker_upsert(worker_ref.worker_id)?;
         if let Err(error) = state.persist_runtime_snapshot() {
@@ -5859,6 +6130,30 @@ impl RuntimeState {
         Ok(())
     }
 
+    fn preflight_stop_owner_growth(&self, worker: &WorkerRecord) -> Result<(), RuntimeError> {
+        #[cfg(feature = "fs-store")]
+        if let Some(store) = self.fs_store() {
+            store.validate_worker_record_size(&worker.persisted_record())?;
+            if let Some(pending) = worker.pending_stop {
+                // Reserve the receipt and any superseded Restore receipt too,
+                // not merely the smaller pending admission representation.
+                let (settled, _) = worker.stopped_candidate(pending.operation_id);
+                store.validate_worker_record_size(&settled.persisted_record())?;
+            }
+        }
+        let _ = worker;
+        Ok(())
+    }
+
+    /// An unknown Stop write fences later mutations until a canonical reread.
+    fn persist_stop_worker_record(&mut self, worker: &WorkerRecord) -> Result<(), RuntimeError> {
+        let result = self.persist_worker_record(worker);
+        if matches!(&result, Err(RuntimeError::StoreCommitOutcomeUnknown { .. })) {
+            self.unreconciled_worker_writes.insert(worker.worker_id);
+        }
+        result
+    }
+
     /// An uncertain Restore write is resolved only from the locked canonical
     /// aggregate and a successful durability barrier, never a second blind write.
     fn persist_restore_worker_record(&mut self, worker: &WorkerRecord) -> Result<(), RuntimeError> {
@@ -6788,10 +7083,69 @@ struct PendingWorkerRestore {
     last_settled_status: WorkerStatus,
 }
 
+enum StopAdmission {
+    Pending(WorkerLifecycleOperationId),
+    Stopped(WorkerLifecycleAck),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingWorkerStop {
     operation_id: WorkerLifecycleOperationId,
     last_settled_status: WorkerStatus,
+}
+
+fn validate_stop_intent(
+    request: &runtime_api::WorkerLifecycleRequest,
+) -> Result<Option<&runtime_api::WorkerStopIntent>, RuntimeError> {
+    if let Some(intent) = &request.stop_intent
+        && (intent.request_id.trim().is_empty()
+            || intent.request_id.len() > 512
+            || intent.expected_observation_token.is_empty()
+            || intent.expected_observation_token.len() > 256)
+    {
+        return Err(RuntimeError::InvalidRequest(
+            "Stop requires a nonempty request_id (max 512 bytes) and expected_observation_token (max 256 bytes)".into(),
+        ));
+    }
+    Ok(request.stop_intent.as_ref())
+}
+
+/// Stop ownership is part of the same canonical lifecycle aggregate as Restore.
+/// Full typed input equality binds reason as well as the observation and ID.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopRequestOwner {
+    request: runtime_api::WorkerLifecycleRequest,
+    operation_id: WorkerLifecycleOperationId,
+    receipt: Option<WorkerLifecycleAck>,
+}
+
+impl StopRequestOwner {
+    fn ensure_request(
+        &self,
+        worker_ref: &WorkerRef,
+        request: &runtime_api::WorkerLifecycleRequest,
+    ) -> Result<(), RuntimeError> {
+        if self.request != *request {
+            return Err(RuntimeError::StopRequestConflict {
+                worker_id: worker_ref.worker_id,
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_pending(
+        &self,
+        worker_ref: &WorkerRef,
+        pending: Option<PendingWorkerStop>,
+    ) -> Result<(), RuntimeError> {
+        if pending.is_none_or(|pending| pending.operation_id != self.operation_id) {
+            return Err(RuntimeError::StopRequestConflict {
+                worker_id: worker_ref.worker_id,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Durable Restore admission/replay metadata. Never discard receipts on stop.
@@ -6848,6 +7202,12 @@ pub(crate) struct RestoreGuard {
     observation_token: String,
     active_request_id: Option<String>,
     owners: BTreeMap<String, RestoreRequestOwner>,
+    // Older aggregates have no public stop owner. Existing pending_stop remains
+    // their recovery authority; do not synthesize public request receipts.
+    // Like Restore owners, retain these for the Worker aggregate's lifetime:
+    // eviction would forget request-ID conflicts and historical receipts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    stop_owners: BTreeMap<String, StopRequestOwner>,
 }
 
 impl Default for RestoreGuard {
@@ -6856,6 +7216,7 @@ impl Default for RestoreGuard {
             observation_token: uuid::Uuid::now_v7().to_string(),
             active_request_id: None,
             owners: BTreeMap::new(),
+            stop_owners: BTreeMap::new(),
         }
     }
 }
@@ -6917,6 +7278,38 @@ struct WorkerRecord {
 }
 
 impl WorkerRecord {
+    // Pure projection shared by terminal commit and stop-owner capacity preflight.
+    // Resource cleanup is deliberately outside this method.
+    fn stopped_candidate(
+        &self,
+        operation_id: WorkerLifecycleOperationId,
+    ) -> (Self, WorkerLifecycleAck) {
+        let mut candidate = self.clone();
+        let restore_receipt =
+            RuntimeWorkerRestoreResult::superseded_by_stop(candidate.pending_restore);
+        candidate.pending_stop = None;
+        candidate.pending_restore = None;
+        candidate.restore_candidate_context = None;
+        candidate.restore_guard.rotate();
+        candidate.status = WorkerStatus::Stopped;
+        candidate.worker_state = None;
+        candidate.restore_intent = WorkerRestoreIntent::Explicit;
+        candidate.restore_guard.finish(restore_receipt);
+        candidate.internal_workers.clear();
+        let ack = WorkerLifecycleAck {
+            replayed: false,
+            worker_ref: candidate.worker_ref.clone(),
+            status: candidate.status,
+            worker_state: None,
+        };
+        for owner in candidate.restore_guard.stop_owners.values_mut() {
+            if owner.operation_id == operation_id && owner.receipt.is_none() {
+                owner.receipt = Some(ack.clone());
+            }
+        }
+        (candidate, ack)
+    }
+
     fn ensure_restore_rollback_allowed(&self) -> Result<(), RuntimeError> {
         if self.pending_restore.is_some_and(|pending| {
             pending.commit != RestoreCommitFact::NotCommitted || pending.source_repair_possible
@@ -7567,6 +7960,10 @@ fn runtime_worker_create_failure_fields(
         RuntimeError::RestoreObservationConflict { .. } => {
             ("restore_observation_conflict", None, None)
         }
+        RuntimeError::RestoreAdmissionBusy { .. } => ("restore_admission_busy", None, None),
+        RuntimeError::StopObservationConflict { .. } => ("stop_observation_conflict", None, None),
+        RuntimeError::StopRequestConflict { .. } => ("stop_request_conflict", None, None),
+        RuntimeError::StopAdmissionBusy { .. } => ("stop_admission_busy", None, None),
         RuntimeError::RuntimeStopped => ("runtime_stopped", None, None),
         RuntimeError::RuntimeStoreAlreadyOpen { .. } => ("runtime_store_already_open", None, None),
         RuntimeError::InvalidInitialInputKind { .. } => ("invalid_initial_input_kind", None, None),
@@ -10904,6 +11301,735 @@ mod tests {
         }
     }
 
+    fn test_stop_request(
+        runtime: &Runtime,
+        worker_ref: &WorkerRef,
+        id: &str,
+    ) -> runtime_api::WorkerLifecycleRequest {
+        runtime_api::WorkerLifecycleRequest {
+            reason: Some("normal stop".into()),
+            stop_intent: Some(runtime_api::WorkerStopIntent {
+                expected_observation_token: runtime
+                    .worker_detail(worker_ref)
+                    .unwrap()
+                    .restore_observation_token
+                    .unwrap(),
+                request_id: id.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn coordinate_stop_admits_without_cleanup_and_dispatches_the_same_operation() {
+        let (runtime, backend) = runtime_and_backend();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("two-phase stop"))
+            .unwrap();
+        let request = test_stop_request(&runtime, &worker.worker_ref, "admit-then-dispatch");
+        assert!(matches!(
+            runtime.coordinate_worker_stop(
+                &worker.worker_ref,
+                runtime_api::WorkerLifecycleRequest::default()
+            ),
+            Err(RuntimeError::InvalidRequest(_))
+        ));
+        assert_eq!(
+            runtime
+                .coordinate_worker_stop(&worker.worker_ref, request.clone())
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Pending
+        );
+        let operation_id = runtime
+            .lock()
+            .unwrap()
+            .worker(&worker.worker_ref)
+            .unwrap()
+            .pending_stop
+            .unwrap()
+            .operation_id;
+        let admitted_token = runtime
+            .worker_detail(&worker.worker_ref)
+            .unwrap()
+            .restore_observation_token;
+        assert_eq!(
+            runtime
+                .coordinate_worker_stop(&worker.worker_ref, request.clone())
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Pending
+        );
+        assert_eq!(
+            runtime
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .restore_observation_token,
+            admitted_token
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        assert_eq!(
+            runtime.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Idle
+        );
+        let mut changed = request.clone();
+        changed.reason = Some("changed admission input".into());
+        assert!(matches!(
+            runtime.coordinate_worker_stop(&worker.worker_ref, changed),
+            Err(RuntimeError::StopRequestConflict { .. })
+        ));
+        let ack = runtime
+            .stop_worker_request(&worker.worker_ref, request.clone())
+            .unwrap();
+        assert!(!ack.replayed);
+        assert_eq!(
+            backend.stop_operation_ids.lock().unwrap().as_slice(),
+            &[operation_id]
+        );
+        runtime
+            .restore_worker(
+                &worker.worker_ref,
+                runtime.test_restore_request(&worker.worker_ref),
+            )
+            .unwrap();
+        let restored_token = runtime
+            .worker_detail(&worker.worker_ref)
+            .unwrap()
+            .restore_observation_token;
+        assert!(
+            matches!(runtime.coordinate_worker_stop(&worker.worker_ref, request.clone()).unwrap(), crate::catalog::WorkerStopOutcome::Stopped { ack } if ack.replayed)
+        );
+        let mut unseen_old = request;
+        unseen_old.stop_intent.as_mut().unwrap().request_id = "unseen-old-generation".into();
+        assert!(matches!(
+            runtime.coordinate_worker_stop(&worker.worker_ref, unseen_old),
+            Err(RuntimeError::StopObservationConflict { .. })
+        ));
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+        assert_eq!(
+            runtime
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .restore_observation_token,
+            restored_token
+        );
+    }
+
+    #[test]
+    fn coordinate_stop_never_waits_for_cleanup_while_a_caller_gate_may_be_held() {
+        let (runtime, backend) = runtime_and_backend();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("stop admission busy"))
+            .unwrap();
+        let request = test_stop_request(&runtime, &worker.worker_ref, "busy-stop");
+        let operation_lock = runtime.worker_operation_lock(worker.worker_id).unwrap();
+        let guard = operation_lock.lock().unwrap();
+        assert!(matches!(
+            runtime.coordinate_worker_stop(&worker.worker_ref, request.clone()),
+            Err(RuntimeError::StopAdmissionBusy { .. })
+        ));
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .worker(&worker.worker_ref)
+                .unwrap()
+                .restore_guard
+                .stop_owners
+                .is_empty()
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        drop(guard);
+        assert_eq!(
+            runtime
+                .coordinate_worker_stop(&worker.worker_ref, request)
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Pending
+        );
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn coordinate_stop_unknown_admission_is_reobserved_without_backend_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::fs_store::FsRuntimeStoreOptions {
+            root: dir.path().join("runtime"),
+            runtime_id: "stop-admit-unknown".into(),
+            display_name: None,
+        };
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("unknown stop admission"))
+            .unwrap();
+        let request = test_stop_request(&runtime, &worker.worker_ref, "unknown-admission");
+        runtime_store(&runtime)
+            .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
+        assert!(matches!(
+            runtime.coordinate_worker_stop(&worker.worker_ref, request.clone()),
+            Err(RuntimeError::StoreCommitOutcomeUnknown { .. })
+        ));
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        runtime_store(&runtime).fail_next_worker_reconcile_read();
+        assert!(matches!(
+            runtime.coordinate_worker_stop(&worker.worker_ref, request.clone()),
+            Err(RuntimeError::StoreCommitOutcomeUnknown { .. })
+        ));
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        assert_eq!(
+            runtime
+                .coordinate_worker_stop(&worker.worker_ref, request.clone())
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Pending
+        );
+        let operation_id = runtime
+            .lock()
+            .unwrap()
+            .worker(&worker.worker_ref)
+            .unwrap()
+            .pending_stop
+            .unwrap()
+            .operation_id;
+        drop(runtime);
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options, backend.clone()).unwrap();
+        assert_eq!(
+            backend.stop_operation_ids.lock().unwrap().as_slice(),
+            &[operation_id]
+        );
+        assert!(
+            matches!(runtime.coordinate_worker_stop(&worker.worker_ref, request).unwrap(), crate::catalog::WorkerStopOutcome::Stopped { ack } if ack.replayed)
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn stop_owner_capacity_rejects_admission_before_mutation_or_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: dir.path().join("runtime"),
+                runtime_id: "stop-admit-capacity".into(),
+                display_name: None,
+            },
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("stop admission capacity"))
+            .unwrap();
+        let mut request = test_stop_request(&runtime, &worker.worker_ref, "oversized-stop-owner");
+        request.reason = Some("x".repeat(8 * 1024 * 1024));
+        for result in [
+            runtime
+                .coordinate_worker_stop(&worker.worker_ref, request.clone())
+                .map(|_| ()),
+            runtime
+                .stop_worker_request(&worker.worker_ref, request.clone())
+                .map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(RuntimeError::InvalidRequest(message)) if message.contains("canonical reader limit"))
+            );
+        }
+        let observed = runtime_store(&runtime)
+            .read_worker_record(&worker.worker_ref)
+            .unwrap();
+        assert_eq!(observed.status, WorkerStatus::Idle);
+        let state = runtime.lock().unwrap();
+        let record = state.worker(&worker.worker_ref).unwrap();
+        assert!(record.pending_stop.is_none());
+        assert!(record.restore_guard.stop_owners.is_empty());
+        assert_eq!(
+            Some(record.restore_guard.observation_token.clone()),
+            worker.restore_observation_token
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn stop_intent_rejects_unseen_old_observation_after_restore_and_replays_historical_receipt() {
+        let (runtime, backend) = runtime_and_backend();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime.create_worker(task_request("fenced stop")).unwrap();
+        let old = test_stop_request(&runtime, &worker.worker_ref, "late-unseen");
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let restore = runtime.test_restore_request(&worker.worker_ref);
+        runtime
+            .restore_worker(&worker.worker_ref, restore.clone())
+            .unwrap();
+        assert!(matches!(
+            runtime.stop_worker_request(&worker.worker_ref, old.clone()),
+            Err(RuntimeError::StopObservationConflict { .. })
+        ));
+        assert_eq!(
+            runtime
+                .worker_stop_outcome(&worker.worker_ref, old)
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::NotFound
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+
+        let stop = test_stop_request(&runtime, &worker.worker_ref, "owned-stop");
+        let mut receipt = runtime
+            .stop_worker_request(&worker.worker_ref, stop.clone())
+            .unwrap();
+        assert!(!receipt.replayed, "first stop is not a historical receipt");
+        receipt.replayed = true; // Expected transport evidence on replay/query only.
+        // A stop must preserve the earlier Restore receipt as historical only.
+        runtime.restore_worker(&worker.worker_ref, restore).unwrap();
+        assert_eq!(
+            runtime.worker_detail(&worker.worker_ref).unwrap().status,
+            WorkerStatus::Stopped
+        );
+        runtime
+            .restore_worker(
+                &worker.worker_ref,
+                runtime.test_restore_request(&worker.worker_ref),
+            )
+            .unwrap();
+        let before = runtime.worker_detail(&worker.worker_ref).unwrap();
+        assert_eq!(
+            runtime
+                .stop_worker_request(&worker.worker_ref, stop.clone())
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            runtime
+                .worker_stop_outcome(&worker.worker_ref, stop)
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Stopped { ack: receipt }
+        );
+        let after = runtime.worker_detail(&worker.worker_ref).unwrap();
+        assert_eq!(after.status, WorkerStatus::Idle);
+        assert_eq!(
+            after.restore_observation_token,
+            before.restore_observation_token
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 2);
+        assert_eq!(*backend.restore_count.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn current_stopped_status_and_cancel_are_not_historical_stop_receipts() {
+        let (runtime, backend) = runtime_and_backend();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("current lifecycle ack"))
+            .unwrap();
+        assert!(
+            !runtime
+                .cancel_worker(&worker.worker_ref, None)
+                .unwrap()
+                .replayed
+        );
+        assert!(
+            !runtime
+                .stop_worker(&worker.worker_ref, None)
+                .unwrap()
+                .replayed
+        );
+        assert!(
+            !runtime
+                .cancel_worker(&worker.worker_ref, None)
+                .unwrap()
+                .replayed
+        );
+        let request = test_stop_request(&runtime, &worker.worker_ref, "already-stopped");
+        let current = runtime
+            .stop_worker_request(&worker.worker_ref, request.clone())
+            .unwrap();
+        assert!(
+            !current.replayed,
+            "new stop intent on current stopped status is fresh"
+        );
+        assert!(
+            runtime
+                .stop_worker_request(&worker.worker_ref, request.clone())
+                .unwrap()
+                .replayed
+        );
+        assert!(
+            matches!(runtime.worker_stop_outcome(&worker.worker_ref, request).unwrap(), crate::catalog::WorkerStopOutcome::Stopped { ack } if ack.replayed)
+        );
+        assert!(
+            !runtime
+                .stop_worker(&worker.worker_ref, None)
+                .unwrap()
+                .replayed
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn stop_intent_same_id_binds_reason_and_observation_for_stop_and_lookup() {
+        let (runtime, backend) = runtime_and_backend();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("stop input binding"))
+            .unwrap();
+        let request = test_stop_request(&runtime, &worker.worker_ref, "bound-stop");
+        runtime
+            .stop_worker_request(&worker.worker_ref, request.clone())
+            .unwrap();
+        let mut changed_reason = request.clone();
+        changed_reason.reason = None;
+        let mut changed_token = request.clone();
+        changed_token
+            .stop_intent
+            .as_mut()
+            .unwrap()
+            .expected_observation_token
+            .push_str("-changed");
+        for changed in [changed_reason, changed_token] {
+            assert!(matches!(
+                runtime.stop_worker_request(&worker.worker_ref, changed.clone()),
+                Err(RuntimeError::StopRequestConflict { .. })
+            ));
+            assert!(matches!(
+                runtime.worker_stop_outcome(&worker.worker_ref, changed),
+                Err(RuntimeError::StopRequestConflict { .. })
+            ));
+        }
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn stop_intent_pending_replay_and_legacy_recovery_keep_one_operation_and_owner() {
+        let (runtime, backend) = runtime_and_backend();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("pending typed stop"))
+            .unwrap();
+        let request = test_stop_request(&runtime, &worker.worker_ref, "pending-stop");
+        backend.set_stop_result(WorkerExecutionResult::errored(
+            WorkerExecutionOperation::Stop,
+            "cleanup unknown",
+        ));
+        assert!(matches!(
+            runtime.stop_worker_request(&worker.worker_ref, request.clone()),
+            Err(RuntimeError::WorkerExecutionRejected { .. })
+        ));
+        assert_eq!(
+            runtime
+                .worker_stop_outcome(&worker.worker_ref, request.clone())
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Pending
+        );
+        assert_eq!(
+            *backend.stop_count.lock().unwrap(),
+            1,
+            "lookup must not perform cleanup"
+        );
+        let thief = test_stop_request(&runtime, &worker.worker_ref, "another-request");
+        assert!(matches!(
+            runtime.stop_worker_request(&worker.worker_ref, thief),
+            Err(RuntimeError::StopRequestConflict { .. })
+        ));
+        let mut altered = request.clone();
+        altered.reason = Some("changed pending input".into());
+        assert!(matches!(
+            runtime.stop_worker_request(&worker.worker_ref, altered),
+            Err(RuntimeError::StopRequestConflict { .. })
+        ));
+        let mut receipt = runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        assert!(!receipt.replayed, "internal cleanup is a fresh stop");
+        receipt.replayed = true;
+        assert_eq!(
+            runtime
+                .stop_worker_request(&worker.worker_ref, request)
+                .unwrap(),
+            receipt
+        );
+        let ids = backend.stop_operation_ids.lock().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn stop_intent_can_bind_existing_legacy_pending_stop_without_new_operation() {
+        let (runtime, backend) = runtime_and_backend();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("legacy pending stop"))
+            .unwrap();
+        backend.set_stop_result(WorkerExecutionResult::errored(
+            WorkerExecutionOperation::Stop,
+            "cleanup unknown",
+        ));
+        runtime.stop_worker(&worker.worker_ref, None).unwrap_err();
+        let request = test_stop_request(&runtime, &worker.worker_ref, "legacy-recovery");
+        let mut receipt = runtime
+            .stop_worker_request(&worker.worker_ref, request.clone())
+            .unwrap();
+        assert!(
+            !receipt.replayed,
+            "settling legacy pending cleanup is fresh"
+        );
+        receipt.replayed = true;
+        assert_eq!(
+            runtime
+                .worker_stop_outcome(&worker.worker_ref, request)
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Stopped { ack: receipt }
+        );
+        let ids = backend.stop_operation_ids.lock().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1]);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn legacy_restore_guard_without_stop_owners_reopens_without_losing_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::fs_store::FsRuntimeStoreOptions {
+            root: dir.path().join("runtime"),
+            runtime_id: "legacy-stop-guard".into(),
+            display_name: None,
+        };
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            options.clone(),
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("legacy stop guard"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let observed = runtime
+            .worker_detail(&worker.worker_ref)
+            .unwrap()
+            .restore_observation_token;
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                options
+                    .root
+                    .join("workers")
+                    .join(worker.worker_id.to_string())
+                    .join("worker.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(document["restore_guard"].get("stop_owners").is_none());
+        drop(runtime);
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            options,
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .restore_observation_token,
+            observed
+        );
+        let request = test_stop_request(&runtime, &worker.worker_ref, "never-admitted");
+        assert_eq!(
+            runtime
+                .worker_stop_outcome(&worker.worker_ref, request)
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::NotFound
+        );
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn stop_intent_unknown_admission_reopens_with_same_owner_and_historical_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = crate::fs_store::FsRuntimeStoreOptions {
+            root: dir.path().join("runtime"),
+            runtime_id: "stop-intent-reopen".into(),
+            display_name: None,
+        };
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("persist stop owner"))
+            .unwrap();
+        let request = test_stop_request(&runtime, &worker.worker_ref, "persisted-stop");
+        runtime_store(&runtime)
+            .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
+        assert!(matches!(
+            runtime.stop_worker_request(&worker.worker_ref, request.clone()),
+            Err(RuntimeError::StoreCommitOutcomeUnknown { .. })
+        ));
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        assert_eq!(
+            runtime
+                .worker_stop_outcome(&worker.worker_ref, request.clone())
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Pending
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        let operation_id = runtime
+            .lock()
+            .unwrap()
+            .worker(&worker.worker_ref)
+            .unwrap()
+            .pending_stop
+            .unwrap()
+            .operation_id;
+        drop(runtime);
+
+        let backend = Arc::new(TestExecutionBackend::default());
+        let reopened =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        assert_eq!(
+            backend.stop_operation_ids.lock().unwrap().as_slice(),
+            &[operation_id]
+        );
+        let receipt = reopened
+            .stop_worker_request(&worker.worker_ref, request.clone())
+            .unwrap();
+        assert!(
+            receipt.replayed,
+            "startup already settled the retained stop"
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+        reopened
+            .restore_worker(
+                &worker.worker_ref,
+                reopened.test_restore_request(&worker.worker_ref),
+            )
+            .unwrap();
+        drop(reopened);
+        let backend = Arc::new(TestExecutionBackend::default());
+        let reopened =
+            Runtime::with_fs_store_and_execution_backend(options, backend.clone()).unwrap();
+        let before = reopened.worker_detail(&worker.worker_ref).unwrap();
+        assert_eq!(
+            reopened
+                .stop_worker_request(&worker.worker_ref, request.clone())
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            reopened
+                .worker_stop_outcome(&worker.worker_ref, request)
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Stopped { ack: receipt }
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        assert_eq!(
+            reopened
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .restore_observation_token,
+            before.restore_observation_token
+        );
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn stop_intent_failed_admission_does_not_bind_id_or_rotate_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: dir.path().join("runtime"),
+                runtime_id: "stop-intent-failed-write".into(),
+                display_name: None,
+            },
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("failed stop admission"))
+            .unwrap();
+        let request = test_stop_request(&runtime, &worker.worker_ref, "retry-admission");
+        runtime_store(&runtime)
+            .fail_next_worker_write(crate::fs_store::AtomicWriteFault::BeforeRename);
+        assert!(
+            runtime
+                .stop_worker_request(&worker.worker_ref, request.clone())
+                .is_err()
+        );
+        assert_eq!(
+            runtime
+                .worker_stop_outcome(&worker.worker_ref, request.clone())
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::NotFound
+        );
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        assert_eq!(
+            runtime
+                .worker_detail(&worker.worker_ref)
+                .unwrap()
+                .restore_observation_token,
+            worker.restore_observation_token
+        );
+        runtime
+            .stop_worker_request(&worker.worker_ref, request)
+            .unwrap();
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn stop_intent_terminal_unknown_lookup_recovers_receipt_without_restop() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime = Arc::new(
+            Runtime::with_fs_store_and_execution_backend(
+                crate::fs_store::FsRuntimeStoreOptions {
+                    root: dir.path().join("runtime"),
+                    runtime_id: "stop-intent-terminal-unknown".into(),
+                    display_name: None,
+                },
+                backend.clone(),
+            )
+            .unwrap(),
+        );
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("terminal stop unknown"))
+            .unwrap();
+        let request = test_stop_request(&runtime, &worker.worker_ref, "terminal-unknown");
+        let gate = Arc::new(RestoreGate::default());
+        *backend.stop_gate.lock().unwrap() = Some(gate.clone());
+        let stopping = {
+            let runtime = runtime.clone();
+            let worker_ref = worker.worker_ref.clone();
+            let request = request.clone();
+            std::thread::spawn(move || runtime.stop_worker_request(&worker_ref, request))
+        };
+        let entered = gate.wait_for_entered(1, std::time::Duration::from_secs(2));
+        if entered {
+            runtime_store(&runtime)
+                .fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
+        }
+        gate.release();
+        let result = stopping.join().unwrap();
+        assert!(entered, "backend stop did not reach the test gate");
+        assert!(matches!(
+            result,
+            Err(RuntimeError::StoreCommitOutcomeUnknown { .. })
+        ));
+        assert!(matches!(
+            runtime
+                .worker_stop_outcome(&worker.worker_ref, request.clone())
+                .unwrap(),
+            crate::catalog::WorkerStopOutcome::Stopped { ack } if ack.replayed
+        ));
+        let replay = runtime
+            .stop_worker_request(&worker.worker_ref, request)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+    }
+
     #[test]
     fn failed_stop_cleanup_retains_execution_for_retry() {
         let (runtime, backend) = runtime_and_backend();
@@ -11302,6 +12428,85 @@ mod tests {
         assert_eq!(restored[0].worker_ref, restored[1].worker_ref);
         assert_eq!(restored[0].worker_state, restored[1].worker_state);
         assert!(runtime.worker_operations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_coordination_busy_preserves_pending_stop_and_retained_receipts() {
+        let (runtime, backend) = runtime_and_backend();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("restore admission busy"))
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        runtime
+            .restore_worker(
+                &worker.worker_ref,
+                runtime.test_restore_request(&worker.worker_ref),
+            )
+            .unwrap();
+        let stop = test_stop_request(&runtime, &worker.worker_ref, "admitted-stop");
+        runtime
+            .coordinate_worker_stop(&worker.worker_ref, stop)
+            .unwrap();
+        let snapshot = || {
+            let state = runtime.lock().unwrap();
+            let record = state.worker(&worker.worker_ref).unwrap();
+            assert!(
+                record
+                    .restore_guard
+                    .owners
+                    .values()
+                    .any(|owner| owner.receipt.is_some())
+            );
+            (
+                serde_json::to_value(&record.restore_guard).unwrap(),
+                record.pending_stop,
+                record.pending_restore,
+                record.status,
+            )
+        };
+        let before = snapshot();
+        for preparation in [Some(runtime_api::WorkerRestorePreparation::default()), None] {
+            let operation_lock = runtime.worker_operation_lock(worker.worker_id).unwrap();
+            let guard = operation_lock.lock().unwrap();
+            let request = runtime_api::WorkerRestoreCoordinationRequest {
+                expected_observation_token: runtime
+                    .worker_detail(&worker.worker_ref)
+                    .unwrap()
+                    .restore_observation_token
+                    .unwrap(),
+                request_id: "busy-restore".into(),
+                preparation,
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let coordinating = {
+                let runtime = runtime.clone();
+                let worker_ref = worker.worker_ref.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(runtime.coordinate_worker_restore_operation(
+                        &worker_ref,
+                        request,
+                        None,
+                    ));
+                })
+            };
+            let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+            // Release before joining even on regression, so a blocking lock
+            // produces a test failure rather than leaving the test hung.
+            drop(guard);
+            coordinating.join().unwrap();
+            assert!(matches!(
+                result,
+                Ok(Err(RuntimeError::RestoreAdmissionBusy { .. }))
+            ));
+            assert_eq!(
+                snapshot(),
+                before,
+                "busy coordination changed lifecycle ownership or receipts"
+            );
+        }
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+        assert_eq!(*backend.restore_count.lock().unwrap(), 1);
     }
 
     #[test]

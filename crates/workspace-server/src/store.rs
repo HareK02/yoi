@@ -3668,6 +3668,20 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    pub(crate) fn reserved_worker_create_runtime(
+        &self,
+        workspace_id: &str,
+        allocation_key: &str,
+    ) -> Result<Option<String>> {
+        self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT runtime_id FROM worker_create_reservations WHERE workspace_id = ?1 AND allocation_key = ?2",
+                params![workspace_id, allocation_key],
+                |row| row.get(0),
+            ).optional()?)
+        })
+    }
+
     pub(crate) fn current_worker_singleton_owner(
         &self,
         workspace_id: &str,

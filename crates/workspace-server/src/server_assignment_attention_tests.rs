@@ -376,6 +376,7 @@ async fn orchestrator_attention_input_rechecks_reserved_noop_before_and_after_co
             .stop_worker(
                 &worker,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: None,
                     ticket_assignment: None,
                 },
@@ -479,6 +480,7 @@ async fn orchestrator_attention_restore_keeps_pending_unknown_delivery_and_id() 
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: None,
                 ticket_assignment: None,
             },
@@ -1023,6 +1025,7 @@ async fn real_attention_worker_start_restore(lose_response: bool) {
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: None,
                 ticket_assignment: None,
             },
@@ -1131,6 +1134,7 @@ async fn real_attention_worker_start_restore(lose_response: bool) {
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: None,
                 ticket_assignment: None,
             },
@@ -1151,6 +1155,7 @@ async fn orchestrator_attention_restore_and_replacement_do_not_resend_acknowledg
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: None,
                 ticket_assignment: None,
             },

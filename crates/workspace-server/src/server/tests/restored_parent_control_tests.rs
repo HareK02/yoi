@@ -442,6 +442,7 @@ async fn restored_runtime_parent_lists_and_inputs_existing_child() {
             .stop_worker(
                 &parent,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("restart parent".into()),
                     ticket_assignment: None,
                 },

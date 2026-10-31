@@ -623,9 +623,29 @@ pub struct WorkerDeleteResponse {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerLifecycleRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_intent: Option<WorkerStopIntent>,
+}
+
+/// Fences a normal Worker stop to the observed lifecycle, not a Subject ledger.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerStopIntent {
+    pub expected_observation_token: String,
+    pub request_id: String,
+}
+
+/// Historical stop evidence. Stopped does not describe the current execution.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerStopOutcome {
+    NotFound,
+    Pending,
+    Stopped { ack: WorkerLifecycleAck },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -633,6 +653,10 @@ pub struct EmptyObjectRequest {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerLifecycleAck {
+    /// Historical typed stop receipt, not a fresh stop of the current execution.
+    /// Consumers must not repeat cleanup of current resources when this is true.
+    #[serde(default)]
+    pub replayed: bool,
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1410,12 +1434,28 @@ pub trait RuntimeApi {
         #[body] input: WorkerInput,
     ) -> Result<WorkerInputResponse, RuntimeApiError>;
 
-    #[post("/v1/workers/{worker_id}/stop", status = 200, error_status = 400)]
+    #[post("/v1/workers/{worker_id}/stop", status = 200, error_status = 400, additional_error_statuses = [409])]
     async fn stop_worker(
         &self,
         #[path] worker_id: String,
         #[body] request: WorkerLifecycleRequest,
     ) -> Result<WorkerLifecycleResponse, RuntimeApiError>;
+
+    /// Admit the same fenced stop without backend cleanup; requires stop_intent.
+    #[post("/v1/workers/{worker_id}/stop/admit", status = 200, error_status = 400, additional_error_statuses = [409])]
+    async fn coordinate_worker_stop(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerLifecycleRequest,
+    ) -> Result<WorkerStopOutcome, RuntimeApiError>;
+
+    /// Read-only exact-identity lookup; never initiates backend stop cleanup.
+    #[post("/v1/workers/{worker_id}/stop/outcome", status = 200, error_status = 400, additional_error_statuses = [409])]
+    async fn worker_stop_outcome(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerLifecycleRequest,
+    ) -> Result<WorkerStopOutcome, RuntimeApiError>;
 
     #[post("/v1/workers/{worker_id}/cancel", status = 200, error_status = 400)]
     async fn cancel_worker(
@@ -1665,6 +1705,47 @@ mod tests {
         let roundtrip: BackendJobExecutionBinding =
             serde_json::from_value(serde_json::to_value(&binding).unwrap()).unwrap();
         assert_eq!(roundtrip, binding);
+    }
+
+    #[test]
+    fn lifecycle_ack_legacy_default_and_replay_marker_round_trip() {
+        let mut value = serde_json::json!({
+            "worker_ref": {"worker_id": WorkerId::now_v7()}, "status": "stopped"
+        });
+        let legacy: WorkerLifecycleAck = serde_json::from_value(value.clone()).unwrap();
+        assert!(!legacy.replayed);
+        value["replayed"] = serde_json::json!(false);
+        assert_eq!(serde_json::to_value(legacy).unwrap(), value);
+        value["replayed"] = serde_json::json!(true);
+        let replay: WorkerLifecycleAck = serde_json::from_value(value.clone()).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(serde_json::to_value(replay).unwrap(), value);
+    }
+
+    #[test]
+    fn lifecycle_stop_intent_defaults_and_strict_external_fields() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"reason": "cancel"}),
+        ] {
+            let request: WorkerLifecycleRequest = serde_json::from_value(value.clone()).unwrap();
+            assert!(request.stop_intent.is_none());
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+        let value = serde_json::json!({"reason":"stop", "stop_intent": {
+            "expected_observation_token":"observed", "request_id":"same-request"
+        }});
+        let request: WorkerLifecycleRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        for invalid in [
+            serde_json::json!({"unknown":true}),
+            serde_json::json!({"stop_intent":{}}),
+            serde_json::json!({"stop_intent":{"request_id":"r"}}),
+            serde_json::json!({"stop_intent":{"expected_observation_token":"t"}}),
+            serde_json::json!({"stop_intent":{"expected_observation_token":"t", "request_id":"r", "unknown":true}}),
+        ] {
+            assert!(serde_json::from_value::<WorkerLifecycleRequest>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -1972,6 +2053,20 @@ mod tests {
             _worker_id: String,
             _request: WorkerLifecycleRequest,
         ) -> Result<WorkerLifecycleResponse, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn coordinate_worker_stop(
+            &self,
+            _worker_id: String,
+            _request: WorkerLifecycleRequest,
+        ) -> Result<WorkerStopOutcome, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn worker_stop_outcome(
+            &self,
+            _worker_id: String,
+            _request: WorkerLifecycleRequest,
+        ) -> Result<WorkerStopOutcome, RuntimeApiError> {
             Err(test_error(501))
         }
         async fn cancel_worker(

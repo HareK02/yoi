@@ -443,6 +443,7 @@ mod plugin_controller_tests {
                 api.runtime.stop_worker(
                     &worker,
                     WorkerLifecycleRequest {
+                        stop_intent: None,
                         reason: None,
                         ticket_assignment: None,
                     },

@@ -523,11 +523,7 @@ pub type RuntimeHttpWorkerCompletionsRequest = runtime_api::CompletionRequest;
 pub type RuntimeHttpWorkerCompletionsResponse = runtime_api::CompletionResponse;
 
 /// Worker lifecycle request body used by stop/cancel endpoints.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeHttpWorkerLifecycleRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
+pub type RuntimeHttpWorkerLifecycleRequest = runtime_api::WorkerLifecycleRequest;
 
 /// Worker lifecycle acknowledgement response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1902,8 +1898,8 @@ async fn stop_worker(
     let ack = match auth_workspace_scope(&state, auth.as_ref())? {
         Some(scope) => state
             .runtime
-            .stop_worker_scoped(&scope, &worker_ref, request.reason),
-        None => state.runtime.stop_worker(&worker_ref, request.reason),
+            .stop_worker_request_scoped(&scope, &worker_ref, request),
+        None => state.runtime.stop_worker_request(&worker_ref, request),
     }
     .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerLifecycleResponse { ack }))
@@ -1918,6 +1914,7 @@ async fn cancel_worker(
 ) -> RestResult<RuntimeHttpWorkerLifecycleResponse> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
     let request = parse_optional_lifecycle_request(body)?;
+    validate_cancel_request(&request)?;
     let ack = match auth_workspace_scope(&state, auth.as_ref())? {
         Some(scope) => state
             .runtime
@@ -1940,6 +1937,19 @@ fn worker_ref_for(
         )
     })?;
     Ok(WorkerRef::new(worker_id))
+}
+
+fn validate_cancel_request(
+    request: &runtime_api::WorkerLifecycleRequest,
+) -> Result<(), RuntimeHttpRestError> {
+    if request.stop_intent.is_some() {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "stop_intent is only valid for stop, not cancel",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_optional_lifecycle_request(
@@ -2160,6 +2170,8 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
         return Some("workers:delete");
     }
     if path.ends_with("/stop")
+        || path.ends_with("/stop/outcome")
+        || path.ends_with("/stop/admit")
         || path.ends_with("/cancel")
         || (path == "/v1/subject-release" && *method == Method::POST)
     {
@@ -2432,6 +2444,10 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         }
         RuntimeError::RuntimeStopped
         | RuntimeError::RestoreObservationConflict { .. }
+        | RuntimeError::RestoreAdmissionBusy { .. }
+        | RuntimeError::StopObservationConflict { .. }
+        | RuntimeError::StopRequestConflict { .. }
+        | RuntimeError::StopAdmissionBusy { .. }
         | RuntimeError::RuntimeStoreAlreadyOpen { .. }
         | RuntimeError::WorkerExecutionUnavailable { .. }
         | RuntimeError::ExecutionBackendUnavailable { .. }
@@ -2459,6 +2475,10 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
         RuntimeError::RestoreObservationConflict { .. } => {
             "restore_observation_conflict".to_string()
         }
+        RuntimeError::RestoreAdmissionBusy { .. } => "restore_admission_busy".to_string(),
+        RuntimeError::StopObservationConflict { .. } => "stop_observation_conflict".to_string(),
+        RuntimeError::StopRequestConflict { .. } => "stop_request_conflict".to_string(),
+        RuntimeError::StopAdmissionBusy { .. } => "stop_admission_busy".to_string(),
         RuntimeError::RuntimeStoreAlreadyOpen { .. } => "runtime_store_already_open".to_string(),
         RuntimeError::WorkerNotFound { .. } => "worker_not_found".to_string(),
         RuntimeError::WorkerExecutionUnavailable { .. } => {
@@ -3728,13 +3748,80 @@ mod tests {
                 input.submission_request_id
             );
         }
-        client
-            .stop_worker(
+        let stop_request = runtime_api::WorkerLifecycleRequest {
+            reason: Some("generated fenced stop".into()),
+            stop_intent: Some(runtime_api::WorkerStopIntent {
+                expected_observation_token: client
+                    .get_worker(generated_worker_id.clone())
+                    .await
+                    .unwrap()
+                    .worker
+                    .restore_observation_token
+                    .unwrap(),
+                request_id: "generated-stop".into(),
+            }),
+        };
+        assert_eq!(
+            client
+                .worker_stop_outcome(generated_worker_id.clone(), stop_request.clone())
+                .await
+                .unwrap(),
+            runtime_api::WorkerStopOutcome::NotFound
+        );
+        let invalid_cancel = client
+            .cancel_worker(generated_worker_id.clone(), stop_request.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(invalid_cancel, runtime_api::client_support::ClientError::Public { status, .. } if status == StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            client
+                .coordinate_worker_stop(generated_worker_id.clone(), stop_request.clone())
+                .await
+                .unwrap(),
+            runtime_api::WorkerStopOutcome::Pending
+        );
+        assert_eq!(
+            client
+                .coordinate_worker_stop(generated_worker_id.clone(), stop_request.clone())
+                .await
+                .unwrap(),
+            runtime_api::WorkerStopOutcome::Pending
+        );
+        assert_eq!(
+            client
+                .get_worker(generated_worker_id.clone())
+                .await
+                .unwrap()
+                .worker
+                .status,
+            runtime_api::WorkerStatus::Idle
+        );
+        let mut stop_receipt = client
+            .stop_worker(generated_worker_id.clone(), stop_request.clone())
+            .await
+            .unwrap()
+            .ack;
+        let cancelled = client
+            .cancel_worker(
                 generated_worker_id.clone(),
                 runtime_api::WorkerLifecycleRequest::default(),
             )
             .await
             .unwrap();
+        assert!(!cancelled.ack.replayed);
+        assert!(!stop_receipt.replayed);
+        stop_receipt.replayed = true; // Outcome and retry return historical evidence.
+        assert_eq!(
+            client
+                .worker_stop_outcome(generated_worker_id.clone(), stop_request.clone())
+                .await
+                .unwrap(),
+            runtime_api::WorkerStopOutcome::Stopped {
+                ack: stop_receipt.clone()
+            }
+        );
         client
             .restore_worker(
                 generated_worker_id.clone(),
@@ -3752,6 +3839,32 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            client
+                .stop_worker(generated_worker_id.clone(), stop_request.clone())
+                .await
+                .unwrap()
+                .ack,
+            stop_receipt
+        );
+        assert_eq!(
+            client
+                .get_worker(generated_worker_id.clone())
+                .await
+                .unwrap()
+                .worker
+                .status,
+            runtime_api::WorkerStatus::Idle
+        );
+        let mut changed_stop = stop_request.clone();
+        changed_stop.reason = Some("different request input".into());
+        let conflict = client
+            .stop_worker(generated_worker_id.clone(), changed_stop)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(conflict, runtime_api::client_support::ClientError::Public { status, .. } if status == StatusCode::CONFLICT)
+        );
         let conflict = client.create_worker(conflicting_request).await.unwrap_err();
         assert!(
             matches!(

@@ -9,6 +9,8 @@ pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, Web
 pub mod authorization;
 mod chat;
 pub use chat::*;
+mod subject_body;
+pub use subject_body::*;
 mod chat_transport;
 pub use chat_transport::*;
 mod drive;
@@ -250,6 +252,11 @@ impl_openapi_schema!(
     PluginArtifactDeliveryRequest,
     PluginArtifactDeliveryMetadata,
     PluginWorkerDiagnostics,
+    SubjectBodyResponse,
+    SubjectBodyStartRequest,
+    SubjectBodyStopRequest,
+    SubjectBodyMutationResponse,
+    SubjectBodyStopOutcomeResponse,
     SubjectPermissionsResponse,
     SubjectPermissionsMutationResponse,
     SubjectPermissionInterruption,
@@ -1540,6 +1547,45 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] subject_id: String,
     ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
+    #[get("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body", status = 200, error_status = 404,
+        additional_error_statuses = [400, 401, 403, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn subjektiv_subject_body_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+    ) -> Result<SubjectBodyResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body/start", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn subjektiv_subject_body_start(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjectBodyStartRequest,
+    ) -> Result<SubjectBodyMutationResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body/stop", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn subjektiv_subject_body_stop(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjectBodyStopRequest,
+    ) -> Result<SubjectBodyMutationResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body/stop/outcome", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502], bearer_auth = true, browser_auth = true)]
+    async fn subjektiv_subject_body_stop_outcome(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjectBodyStopRequest,
+    ) -> Result<SubjectBodyStopOutcomeResponse, RepositoryApiError>;
+
     #[patch(
         "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/behavior",
         status = 200,
@@ -5687,8 +5733,12 @@ pub struct SubjektivSubjectResponse {
     pub memory_fingerprint: String,
     pub created_at: String,
     pub updated_at: String,
-    /// Current keyed-singleton owner, when one exists. This is a live Yoi
-    /// projection, not state duplicated in the subjektiv store.
+    /// Current owner remains present even when its Runtime cannot be observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_body: Option<SubjectBodyRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_worker_diagnostics: Vec<Diagnostic>,
+    /// Available launch metadata, not evidence of absence when observation failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_worker: Option<WorkerLaunchWorkerSummary>,
 }
@@ -9676,9 +9726,18 @@ pub struct RuntimeWorkerInputResult {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerStopIntent {
+    pub expected_observation_token: String,
+    pub request_id: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerLifecycleRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_intent: Option<WorkerStopIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9688,6 +9747,9 @@ pub struct RuntimeWorkerLifecycleRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerLifecycleResult {
+    /// Historical receipt replay, not a new stop or evidence of current state.
+    #[serde(default)]
+    pub replayed: bool,
     pub state: WorkerOperationState,
     pub runtime_id: String,
     pub worker_id: String,
@@ -11261,7 +11323,7 @@ export type SubjektivSubjectDeleteResponse = { subject_id: string, operation_id:
 
 export type SubjektivSubjectBehaviorUpdateRequest = { expected_behavior_md: string, behavior_md: string, };
 
-export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, state: SubjektivSubjectState, memory_fingerprint: string, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
+export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, state: SubjektivSubjectState, memory_fingerprint: string, created_at: string, updated_at: string, current_body?: import("./subject-body-api").SubjectBodyRef | null, current_worker_diagnostics?: Array<Diagnostic>, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
 
 export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, next_cursor?: string | null, has_more: boolean, };
 

@@ -278,11 +278,27 @@ impl FsRuntimeStore {
         atomic_write_json(&self.runtime_path(), &snapshot, "write runtime snapshot")
     }
 
+    /// Use the canonical pretty-JSON representation, including its final newline,
+    /// to refuse writes that our bounded canonical reader could not reopen.
+    pub(crate) fn validate_worker_record_size(
+        &self,
+        worker: &PersistedWorkerRecord,
+    ) -> Result<(), RuntimeError> {
+        let bytes = worker_record_serialized_size(worker)?;
+        if bytes > MAX_WORKER_RECORD_BYTES {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "Worker aggregate requires {bytes} bytes, exceeding canonical reader limit {MAX_WORKER_RECORD_BYTES}; retained lifecycle owners cannot be evicted"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_worker_record(
         &self,
         worker: &PersistedWorkerRecord,
     ) -> Result<(), RuntimeError> {
         self.ensure_worker_ref(&worker.worker_ref)?;
+        self.validate_worker_record_size(worker)?;
         let worker_dir = self.worker_dir(&worker.worker_id);
         fs::create_dir_all(&worker_dir).map_err(|source| RuntimeError::StoreIo {
             operation: "create Worker store",
@@ -3033,6 +3049,33 @@ where
     })
 }
 
+// Count rather than allocate a second aggregate-sized buffer during admission.
+// This is the same serializer and trailing newline as atomic_write_json_with_fault.
+fn worker_record_serialized_size(worker: &PersistedWorkerRecord) -> Result<u64, RuntimeError> {
+    struct ByteCount(u64);
+    impl Write for ByteCount {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("Worker aggregate size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = ByteCount(0);
+    serde_json::to_writer_pretty(&mut count, &WorkerAggregateRecord::from_persisted(worker))
+        .map_err(|error| {
+            RuntimeError::InvalidRequest(format!("serialize Worker aggregate: {error}"))
+        })?;
+    count
+        .write_all(b"\n")
+        .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?;
+    Ok(count.0)
+}
+
 fn atomic_write_json<T>(path: &Path, value: &T, operation: &'static str) -> Result<(), RuntimeError>
 where
     T: Serialize,
@@ -4022,6 +4065,42 @@ mod tests {
 
         assert!(matches!(error, RuntimeError::StoreCorrupt { .. }));
         assert!(error.to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn canonical_worker_writer_enforces_reader_byte_limit_including_final_newline() {
+        let (_temp, store, mut worker, path) = canonical_worker_store();
+        worker.execution_state = PersistedWorkerExecutionState::Unavailable;
+        worker.status = WorkerStatus::Stopped;
+        worker.display_name = Some(String::new());
+        let base = worker_record_serialized_size(&worker).unwrap();
+        worker.display_name = Some("x".repeat((MAX_WORKER_RECORD_BYTES - base) as usize));
+        store.write_worker_record(&worker).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_WORKER_RECORD_BYTES);
+        assert_eq!(
+            worker_record_serialized_size(&worker).unwrap(),
+            MAX_WORKER_RECORD_BYTES
+        );
+        store.read_worker_record(&worker.worker_ref).unwrap();
+        let before = fs::read(&path).unwrap();
+        worker.display_name.as_mut().unwrap().push('x');
+        assert_eq!(
+            worker_record_serialized_size(&worker).unwrap(),
+            MAX_WORKER_RECORD_BYTES + 1
+        );
+        assert!(
+            matches!(store.write_worker_record(&worker), Err(RuntimeError::InvalidRequest(message)) if message.contains("canonical reader limit"))
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            store
+                .read_worker_record(&worker.worker_ref)
+                .unwrap()
+                .display_name
+                .unwrap()
+                .len(),
+            (MAX_WORKER_RECORD_BYTES - base) as usize
+        );
     }
 
     #[test]

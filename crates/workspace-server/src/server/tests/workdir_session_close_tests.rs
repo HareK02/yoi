@@ -653,6 +653,140 @@ async fn attachment_close_cancellation_restores_remote_session_for_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_stop_close_failure_retains_old_command_without_replacing_new_attachment() {
+    let fixture = Fixture::new().await;
+    let worker = fixture.registry_owner();
+    let old = fixture.open().await;
+    let new = fixture.open().await;
+    let handle = fixture
+        .api()
+        .workdir_sessions
+        .lock()
+        .unwrap()
+        .register_command(
+            worker.clone(),
+            "checkout".into(),
+            old.clone(),
+            CommandHandle("observed-provider-command".into()),
+        );
+    let observed = fixture
+        .api()
+        .workdir_sessions
+        .lock()
+        .unwrap()
+        .observe_worker(&worker);
+    fixture
+        .api()
+        .workdir_sessions
+        .lock()
+        .unwrap()
+        .insert_attachment(worker.clone(), new.clone());
+    *fixture.transport.fault.lock().unwrap() = Some(CloseFault::Reject);
+    let _guard = current_worker_session_lock(fixture.api(), &worker)
+        .lock_owned()
+        .await;
+    assert!(
+        close_observed_worker_workdir_sessions(&fixture.api().workdir_sessions, &observed)
+            .await
+            .is_err()
+    );
+    {
+        let registry = fixture.api().workdir_sessions.lock().unwrap();
+        assert!(Arc::ptr_eq(
+            registry.attachments.get(&worker).unwrap(),
+            &new
+        ));
+        assert!(Arc::ptr_eq(
+            &registry
+                .command(&worker, "checkout", &handle)
+                .unwrap()
+                .source,
+            &old
+        ));
+    }
+    fixture.assert_live(&old).await;
+    fixture.assert_live(&new).await;
+    close_observed_worker_workdir_sessions(&fixture.api().workdir_sessions, &observed)
+        .await
+        .unwrap();
+    assert_eq!(fixture.transport.attempts().len(), 2);
+    assert_eq!(
+        fixture.transport.attempts()[0],
+        fixture.transport.attempts()[1]
+    );
+    fixture.assert_live(&new).await;
+    assert!(
+        fixture
+            .api()
+            .workdir_sessions
+            .lock()
+            .unwrap()
+            .command(&worker, "checkout", &handle)
+            .is_none()
+    );
+    close_worker_workdir_sessions(&fixture.api().workdir_sessions, &worker)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_projection_does_not_follow_a_rebound_connection_with_identical_worker_alias_and_workdir()
+ {
+    let fixture = Fixture::new().await;
+    let api = fixture.api();
+    let worker = fixture.registry_owner();
+    let link = WorkerWorkdirLinkRecord {
+        connection_id: String::new(),
+        workspace_id: TEST_WORKSPACE_ID.into(),
+        worker: worker.clone(),
+        workdir_id: fixture.workdir_id.clone(),
+        alias: "checkout".into(),
+        capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+        linked_at: TEST_CREATED_AT.into(),
+        unlinked_at: None,
+    };
+    let _guard = current_worker_session_lock(api, &worker).lock_owned().await;
+    let old = api.store.attach_worker_workdir(&link).unwrap();
+    api.store
+        .detach_worker_workdir_connection(
+            TEST_WORKSPACE_ID,
+            &worker,
+            &old.alias,
+            &old.connection_id,
+            TEST_CREATED_AT,
+        )
+        .unwrap();
+    let new = api.store.attach_worker_workdir(&link).unwrap();
+    assert_ne!(old.connection_id, new.connection_id);
+    let mut record = api
+        .store
+        .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.workdir_id)
+        .unwrap()
+        .unwrap();
+    record.display_name = "new binding not owned by old stop".into();
+    api.store.upsert_workdir_registry(&record).unwrap();
+    sync_linked_workdir_after_worker_stop(api, &worker, &[old]).unwrap();
+    assert_eq!(
+        api.store
+            .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.workdir_id)
+            .unwrap()
+            .unwrap()
+            .display_name,
+        record.display_name
+    );
+    sync_linked_workdir_after_worker_stop(api, &worker, &[new]).unwrap();
+    assert_ne!(
+        api.store
+            .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.workdir_id)
+            .unwrap()
+            .unwrap()
+            .display_name,
+        record.display_name,
+        "the same current connection still projects normally"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_removal_close_failure_retains_attachment_and_retry_releases_runtime_lease() {
     let fixture = Fixture::new().await;
     let api = fixture.api();
@@ -680,6 +814,7 @@ async fn worker_removal_close_failure_retains_attachment_and_retry_releases_runt
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: Some("prepare removal".into()),
                 ticket_assignment: None,
             },

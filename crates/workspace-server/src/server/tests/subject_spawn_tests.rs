@@ -1,5 +1,59 @@
 use super::*;
 
+#[tokio::test]
+async fn subject_current_worker_lookup_failure_is_not_reported_as_no_body() {
+    let workspace = tempfile::tempdir().unwrap();
+    let api = test_api(workspace.path()).await;
+    let subject = open_subjektiv_store(&api)
+        .unwrap()
+        .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+        .unwrap();
+    assert!(
+        subjektiv_subject_response(&api, subject.clone())
+            .unwrap()
+            .current_worker
+            .is_none()
+    );
+    let singleton_key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
+    let memory = api
+        .config_store
+        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+        .unwrap();
+    // Real reservation SQL owns the body, but no Runtime Worker exists yet.
+    // This is an unavailable observation, not evidence that another launch is safe.
+    api.config_store
+        .reserve_worker_create(
+            TEST_WORKSPACE_ID,
+            "runtime-test",
+            "subject-start",
+            &"f".repeat(64),
+            Some(&singleton_key),
+            &memory,
+        )
+        .unwrap();
+    assert!(
+        api.store
+            .current_worker_singleton_owner(TEST_WORKSPACE_ID, &singleton_key)
+            .unwrap()
+            .is_some()
+    );
+    let projection = subjektiv_subject_response(&api, subject.clone()).unwrap();
+    assert!(projection.current_body.is_some());
+    assert!(projection.current_worker.is_none());
+    assert!(
+        projection
+            .current_worker_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "subject_body_observation_unavailable")
+    );
+    let body = subject_body::snapshot(&api, &subject.id).unwrap();
+    assert_eq!(body.current, projection.current_body);
+    assert!(matches!(
+        body.observation,
+        server_api::SubjectBodyObservation::Unavailable { .. }
+    ));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn subject_callbacks_finish_before_waiting_host_parents_release_capacity() {
     let workspace = tempfile::tempdir().unwrap();

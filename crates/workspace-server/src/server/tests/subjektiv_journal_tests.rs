@@ -858,6 +858,7 @@ impl RuntimeFixture {
             .stop_worker(
                 &self.source,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("settle original source before permanent erase".into()),
                     ticket_assignment: None,
                 },
@@ -1488,6 +1489,7 @@ async fn stopped_source_pin_releases_after_saved_completion_and_removal() {
         .stop_worker(
             &f.source,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: Some("archive original".into()),
                 ticket_assignment: None,
             },
@@ -1763,6 +1765,7 @@ async fn stopped_partial_journal_recovery_fences_old_attempt_and_resumes_same_im
         .stop_worker(
             worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: Some("definitive stop before checkpoint".into()),
                 ticket_assignment: None,
             },
@@ -2130,6 +2133,7 @@ impl SubjectRemovalFixture {
             .stop_worker(
                 &target,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("test stopped Subject removal".into()),
                     ticket_assignment: None,
                 },

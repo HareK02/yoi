@@ -116,6 +116,7 @@ async fn restore_keeps_offline_external_and_unmaterialized_repository_attachment
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: None,
                 ticket_assignment: None,
             },
@@ -186,6 +187,7 @@ async fn restore_keeps_offline_external_and_unmaterialized_repository_attachment
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: None,
                 ticket_assignment: None,
             },

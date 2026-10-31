@@ -29,6 +29,7 @@ mod backend_job_profile;
 mod chat;
 mod external_operation_audit;
 mod subject_authorization;
+mod subject_body;
 mod subjektiv_deletion;
 mod subjektiv_job;
 mod subjektiv_journal;
@@ -659,6 +660,77 @@ impl WorkdirSessionRegistry {
             .collect()
     }
 
+    // Stop owns the concrete provider sessions observed before dispatch, not
+    // every session later registered under the same restored Worker identity.
+    fn observe_worker(&self, worker: &RuntimeWorkerRef) -> Vec<RegisteredWorkdirSession> {
+        let mut observed = Vec::new();
+        if let Some(session) = self.attachments.get(worker) {
+            observed.push(RegisteredWorkdirSession::Attachment {
+                worker: worker.clone(),
+                session: session.clone(),
+            });
+        }
+        observed.extend(
+            self.commands
+                .iter()
+                .filter_map(|((owner, handle), session)| {
+                    (owner == worker).then(|| RegisteredWorkdirSession::Command {
+                        worker: worker.clone(),
+                        external_handle: handle.clone(),
+                        session: session.clone(),
+                    })
+                }),
+        );
+        observed
+    }
+
+    fn take_observed(
+        &mut self,
+        observed: &[RegisteredWorkdirSession],
+    ) -> Vec<RegisteredWorkdirSession> {
+        observed
+            .iter()
+            .filter_map(|item| match item {
+                RegisteredWorkdirSession::Attachment { worker, session } => self
+                    .attachments
+                    .get(worker)
+                    .is_some_and(|current| Arc::ptr_eq(current, session))
+                    .then(|| {
+                        self.attachments.remove(worker).map(|session| {
+                            RegisteredWorkdirSession::Attachment {
+                                worker: worker.clone(),
+                                session,
+                            }
+                        })
+                    })
+                    .flatten(),
+                RegisteredWorkdirSession::Command {
+                    worker,
+                    external_handle,
+                    session,
+                } => {
+                    let key = (worker.clone(), external_handle.clone());
+                    self.commands
+                        .get(&key)
+                        .is_some_and(|current| {
+                            Arc::ptr_eq(&current.source, &session.source)
+                                && current.provider_handle == session.provider_handle
+                        })
+                        .then(|| {
+                            self.commands.remove(&key).map(|session| {
+                                RegisteredWorkdirSession::Command {
+                                    worker: worker.clone(),
+                                    external_handle: external_handle.clone(),
+                                    session,
+                                }
+                            })
+                        })
+                        .flatten()
+                }
+            })
+            .collect()
+    }
+
     fn take_worker(&mut self, worker: &RuntimeWorkerRef) -> Vec<RegisteredWorkdirSession> {
         let mut sessions = Vec::new();
         if let Some(session) = self.attachments.remove(worker) {
@@ -757,6 +829,17 @@ async fn close_registered_workdir_sessions(
     } else {
         Err(errors.join("; "))
     }
+}
+
+async fn close_observed_worker_workdir_sessions(
+    registry: &Arc<Mutex<WorkdirSessionRegistry>>,
+    observed: &[RegisteredWorkdirSession],
+) -> std::result::Result<(), String> {
+    let registered = registry
+        .lock()
+        .map_err(|_| "Workdir session registry was poisoned".to_string())?
+        .take_observed(observed);
+    close_registered_workdir_sessions(registry, registered).await
 }
 
 async fn close_worker_workdir_sessions(
@@ -2220,6 +2303,7 @@ impl WorkerRemovalService {
             return (false, diagnostics);
         };
         let lifecycle_request = WorkerLifecycleRequest {
+            stop_intent: None,
             reason: Some("Backend spawn finalize failed; compensating Runtime Worker".to_string()),
             ticket_assignment: None,
         };
@@ -5513,6 +5597,7 @@ impl WorkspaceApi {
             match self.runtime.stop_worker(
                 &worker,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some(format!(
                         "Backend Job attempt {attempt_id} reached terminal state"
                     )),
@@ -6581,6 +6666,15 @@ impl WorkspaceApi {
         worker: &RuntimeWorkerRef,
         request: server_api::WorkerRestoreRequest,
     ) -> ApiResult<InternalWorkerRestoreResult> {
+        self.restore_workspace_worker_with_subject(worker, request, None)
+    }
+
+    fn restore_workspace_worker_with_subject(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: server_api::WorkerRestoreRequest,
+        expected_subject: Option<(&str, &server_api::SubjectBodyRef)>,
+    ) -> ApiResult<InternalWorkerRestoreResult> {
         if request.request_id.trim().is_empty()
             || request.request_id.len() > 512
             || request.expected_observation_token.is_empty()
@@ -6590,6 +6684,19 @@ impl WorkspaceApi {
                 "Restore requires a bounded request_id and expected_observation_token".into(),
             )
             .into());
+        }
+        let subject_gate = expected_subject
+            .map(|(subject, _)| subjektiv_journal::lifecycle_lock(self, subject))
+            .transpose()?;
+        let subject_guard = subject_gate
+            .as_ref()
+            .map(|gate| {
+                gate.lock()
+                    .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))
+            })
+            .transpose()?;
+        if let Some((subject, expected)) = expected_subject {
+            subject_body::require_expected(self, subject, Some(expected))?;
         }
         // Auth is checked by WorkspaceWorker before this read-only owner dispatch.
         // Existing owners reach receipts/reconciliation before NEW launch eligibility.
@@ -6607,6 +6714,24 @@ impl WorkspaceApi {
         if let Some(mut result) = recovered {
             result.worker = self.current_restore_summary(worker, result.worker.is_some());
             return Ok(result);
+        }
+        if expected_subject.is_some() && owned_preparation.is_none() {
+            let live = self
+                .runtime
+                .worker(worker)
+                .map_err(RuntimeRegistryError::into_error)?;
+            if live.restore_observation_token.as_deref()
+                == Some(request.expected_observation_token.as_str())
+                && live.availability
+                    == protocol::subscription::SubscriptionWorkerAvailability::Observed
+                && live.worker_state.is_some()
+            {
+                return Ok(InternalWorkerRestoreResult {
+                    state: server_api::WorkerRestoreState::Accepted,
+                    worker: Some(live),
+                    diagnostics: Vec::new(),
+                });
+            }
         }
         let preparation = if let Some(preparation) = owned_preparation {
             preparation
@@ -6642,6 +6767,10 @@ impl WorkspaceApi {
                 Error::Config("Runtime did not retain admitted Restore preparation".into())
             })?
         };
+        // Runtime has retained the exact Restore owner/preparation. Release the
+        // Subject gate before execution can call back into Session/Journal APIs.
+        drop(subject_guard);
+        drop(subject_gate);
         let mut restored = self
             .runtime
             .restore_worker(
@@ -7703,6 +7832,16 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::subjektiv_subject_get(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::subjektiv_subject_body_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_subject_body_start(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_subject_body_stop(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_subject_body_stop_outcome(service.clone()))
         .merge(server_api::server_api_axum::subjektiv_subject_behavior_update(service.clone()))
         .merge(server_api::server_api_axum::subjektiv_resident_surface(
             service.clone(),
@@ -8335,6 +8474,12 @@ fn worker_lifecycle_request_from_api(
     request: server_api::RuntimeWorkerLifecycleRequest,
 ) -> WorkerLifecycleRequest {
     WorkerLifecycleRequest {
+        stop_intent: request
+            .stop_intent
+            .map(|intent| runtime_api::WorkerStopIntent {
+                expected_observation_token: intent.expected_observation_token,
+                request_id: intent.request_id,
+            }),
         reason: request.reason,
         ticket_assignment: request
             .ticket_assignment
@@ -8443,6 +8588,7 @@ fn worker_lifecycle_result_to_api(
     result: WorkerLifecycleResult,
 ) -> server_api::RuntimeWorkerLifecycleResult {
     server_api::RuntimeWorkerLifecycleResult {
+        replayed: result.replayed,
         state: result.state.into(),
         runtime_id: result.worker.runtime_id,
         worker_id: result.worker.worker_id,
@@ -10071,6 +10217,81 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_subject_body_get(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        subject_id: String,
+    ) -> std::result::Result<server_api::SubjectBodyResponse, server_api::RepositoryApiError> {
+        subject_body::get(
+            self.workspace_api()?.clone(),
+            context,
+            workspace_id,
+            subject_id,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_subject_body_start(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        subject_id: String,
+        request: server_api::SubjectBodyStartRequest,
+    ) -> std::result::Result<server_api::SubjectBodyMutationResponse, server_api::RepositoryApiError>
+    {
+        subject_body::start(
+            self.workspace_api()?.clone(),
+            context,
+            workspace_id,
+            subject_id,
+            request,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_subject_body_stop(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        subject_id: String,
+        request: server_api::SubjectBodyStopRequest,
+    ) -> std::result::Result<server_api::SubjectBodyMutationResponse, server_api::RepositoryApiError>
+    {
+        subject_body::stop(
+            self.workspace_api()?.clone(),
+            context,
+            workspace_id,
+            subject_id,
+            request,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_subject_body_stop_outcome(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        subject_id: String,
+        request: server_api::SubjectBodyStopRequest,
+    ) -> std::result::Result<
+        server_api::SubjectBodyStopOutcomeResponse,
+        server_api::RepositoryApiError,
+    > {
+        subject_body::stop_outcome(
+            self.workspace_api()?.clone(),
+            context,
+            workspace_id,
+            subject_id,
+            request,
+        )
+        .await
         .map_err(ApiError::into_repository_api_error)
     }
 
@@ -16266,6 +16487,7 @@ async fn compensate_manual_ticket_worker_binding(
         match api.runtime.stop_worker(
             worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: Some(
                     "roll back failed manual Worker assignment capability binding".to_string(),
                 ),
@@ -16595,6 +16817,7 @@ async fn start_manual_ticket_worker_assignment_on_host(
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: Some(format!(
                     "bind authoritative Workdir capabilities for Ticket {} manual Worker assignment",
                     record.ticket_id
@@ -17329,6 +17552,7 @@ async fn cancel_ticket_worker(
     match api.runtime.cancel_worker(
         worker,
         WorkerLifecycleRequest {
+            stop_intent: None,
             reason: Some(format!("Ticket implementation cancelled: {reason}")),
             ticket_assignment: None,
         },
@@ -23815,16 +24039,28 @@ fn subjektiv_subject_response(
     let memory_fingerprint = open_subjektiv_store(api)?
         .memory_fingerprint(&subject.id)
         .map_err(subjektiv_store_error)?;
-    let current_worker = crate::subjektiv::subject_worker_singleton_key(&subject.id)
-        .ok()
-        .and_then(|key| {
-            api.store
-                .current_worker_singleton_owner(&api.config.workspace_id, &key)
-                .ok()
-                .flatten()
-        })
-        .and_then(|lease| api.runtime.worker(&lease.worker).ok())
-        .map(worker_launch_worker_summary);
+    let singleton_key = crate::subjektiv::subject_worker_singleton_key(&subject.id)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    // Only an authoritative absent owner means no body. A failed lookup must
+    // not invite a second launch by presenting an occupied singleton as empty.
+    let owner = api
+        .store
+        .current_worker_singleton_owner(&api.config.workspace_id, &singleton_key)?;
+    let current_body = owner.as_ref().map(subject_body::reference);
+    let (current_worker, current_worker_diagnostics) = match owner {
+        None => (None, vec![]),
+        Some(lease) => match api.runtime.worker(&lease.worker) {
+            Ok(worker) => (Some(worker_launch_worker_summary(worker)), vec![]),
+            Err(error) => (
+                None,
+                vec![server_api::Diagnostic {
+                    code: "subject_body_observation_unavailable".into(),
+                    severity: server_api::DiagnosticSeverity::Warning,
+                    message: sanitize_backend_error(&error.message()),
+                }],
+            ),
+        },
+    };
     Ok(server_api::SubjektivSubjectResponse {
         id: subject.id,
         role: subject.role.as_str().to_string(),
@@ -23838,6 +24074,8 @@ fn subjektiv_subject_response(
         },
         created_at: subject.created_at,
         updated_at: subject.updated_at,
+        current_body,
+        current_worker_diagnostics,
         current_worker,
     })
 }
@@ -37515,13 +37753,24 @@ fn sync_all_runtime_workdir_observations(api: &WorkspaceApi) -> Vec<RuntimeDiagn
 
 fn sync_linked_workdir_after_worker_stop(
     api: &WorkspaceApi,
-    runtime_id: &str,
-    worker_record: &WorkerRegistryRecord,
+    worker: &RuntimeWorkerRef,
+    observed_links: &[WorkerWorkdirLinkRecord],
 ) -> ApiResult<()> {
-    let links = api
+    // The caller holds the Worker session fence. Rebinding may have won before
+    // that fence was reacquired; never project its new connection for an old stop.
+    let current = api
         .store
-        .list_worker_workdir_links(&api.config.workspace_id, &worker_record.worker)?;
-    for link in links {
+        .list_worker_workdir_links(api.workspace_id(), worker)?;
+    for link in observed_links.iter().filter(|observed| {
+        observed.unlinked_at.is_none()
+            && current.iter().any(|current| {
+                current.unlinked_at.is_none()
+                    && current.connection_id == observed.connection_id
+                    && current.alias == observed.alias
+                    && current.workdir_id == observed.workdir_id
+            })
+    }) {
+        let runtime_id = &worker.runtime_id;
         let result = api
             .runtime
             .working_directory(runtime_id, link.workdir_id.as_str())
@@ -42274,6 +42523,7 @@ mod tests {
                 callback();
             }
             WorkerLifecycleResult {
+                replayed: false,
                 state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(Self::RUNTIME_ID, worker_id),
                 diagnostics: Vec::new(),
@@ -42286,6 +42536,7 @@ mod tests {
             _request: WorkerLifecycleRequest,
         ) -> WorkerLifecycleResult {
             WorkerLifecycleResult {
+                replayed: false,
                 state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(Self::RUNTIME_ID, worker_id),
                 diagnostics: Vec::new(),
@@ -42955,15 +43206,23 @@ mod tests {
         register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
         let stopped = Arc::new(tokio::sync::Notify::new());
         let notification = stopped.clone();
-        let runtime = WorkdirlessFixtureRuntime {
-            stop_callback: Some(Arc::new(move || notification.notify_one())),
-            ..Default::default()
-        };
-        api.runtime.register_or_replace(runtime.clone());
         let identity = RuntimeWorkerRef::new(
             WorkdirlessFixtureRuntime::RUNTIME_ID,
             Uuid::now_v7().to_string(),
         );
+        let cleanup_lock = current_worker_session_lock(&api, &identity);
+        let session_guard = Arc::new(Mutex::new(None));
+        let held_guard = session_guard.clone();
+        let runtime = WorkdirlessFixtureRuntime {
+            stop_callback: Some(Arc::new(move || {
+                // Capture finished before dispatch. Hold the same fence only
+                // after admission, so cancellation still precedes cleanup.
+                *held_guard.lock().unwrap() = Some(cleanup_lock.clone().try_lock_owned().unwrap());
+                notification.notify_one();
+            })),
+            ..Default::default()
+        };
+        api.runtime.register_or_replace(runtime.clone());
         api.store
             .upsert_worker_registry(&WorkerRegistryRecord {
                 workspace_id: TEST_WORKSPACE_ID.into(),
@@ -42997,11 +43256,8 @@ mod tests {
             .lock()
             .unwrap()
             .insert_attachment(identity.clone(), session);
-        // An actual session fence prevents cleanup until after cancellation;
+        // The callback takes the session fence after capture and before ACK;
         // the Runtime receipt is the synchronization event, not an elapsed delay.
-        let session_guard = current_worker_session_lock(&api, &identity)
-            .lock_owned()
-            .await;
         let worker =
             WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
         let waiter = tokio::spawn(async move {
@@ -43009,6 +43265,7 @@ mod tests {
                 .stop(
                     &WorkerOperationContext::Backend,
                     WorkerLifecycleRequest {
+                        stop_intent: None,
                         reason: None,
                         ticket_assignment: None,
                     },
@@ -43033,7 +43290,7 @@ mod tests {
                 .attachments
                 .contains_key(&identity)
         );
-        drop(session_guard);
+        drop(session_guard.lock().unwrap().take());
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             api.host_executors.host().unwrap().drain(),
@@ -43050,6 +43307,145 @@ mod tests {
                 .contains_key(&identity),
             "accepted Runtime stop must own session cleanup after the waiter disappears"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_stop_does_not_close_sessions_rebound_before_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("alive"), "retained").unwrap();
+        let api = test_api(directory.path()).await;
+        api.worker_projection.shutdown_async().await;
+        api.store.db_executor().drain().await.unwrap();
+        register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+        let identity = RuntimeWorkerRef::new(
+            WorkdirlessFixtureRuntime::RUNTIME_ID,
+            Uuid::now_v7().to_string(),
+        );
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                worker: identity.clone(),
+                display_name: "fresh stop resource lifetime".into(),
+                profile: None,
+                retention_state: "normal".into(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .unwrap();
+        let session = || -> WorkdirSessionHandle {
+            Arc::new(workdir::LocalWorkdirSession::new(
+                manifest::Scope::writable(directory.path()).unwrap(),
+                directory.path().to_path_buf(),
+            ))
+        };
+        let old_attachment = session();
+        let old_command = session();
+        let new_attachment = session();
+        let new_command = session();
+        let old_handle = {
+            let mut registry = api.workdir_sessions.lock().unwrap();
+            registry.insert_attachment(identity.clone(), old_attachment.clone());
+            registry.register_command(
+                identity.clone(),
+                "checkout".into(),
+                old_command.clone(),
+                CommandHandle("old-provider".into()),
+            )
+        };
+        let dispatched = Arc::new(tokio::sync::Notify::new());
+        let notification = dispatched.clone();
+        let cleanup_lock = current_worker_session_lock(&api, &identity);
+        let held = Arc::new(Mutex::new(None));
+        let held_by_callback = held.clone();
+        api.runtime.register_or_replace(WorkdirlessFixtureRuntime {
+            stop_callback: Some(Arc::new(move || {
+                // A genuine fresh-ACK path, not historical receipt replay. Capture
+                // must release this fence before Runtime dispatch/callbacks.
+                *held_by_callback.lock().unwrap() =
+                    Some(cleanup_lock.clone().try_lock_owned().unwrap());
+                notification.notify_one();
+            })),
+            ..Default::default()
+        });
+        let worker =
+            WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
+        let waiter = tokio::spawn(async move {
+            worker
+                .stop(
+                    &WorkerOperationContext::Backend,
+                    WorkerLifecycleRequest::default(),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), dispatched.notified())
+            .await
+            .unwrap();
+        let guard = held.lock().unwrap().take().unwrap();
+        // The same fence and registry mutations used by restore's first Workdir
+        // operation/rebind win before the old stop's delayed cleanup.
+        let new_handle = {
+            let mut registry = api.workdir_sessions.lock().unwrap();
+            let replaced = registry
+                .insert_attachment(identity.clone(), new_attachment.clone())
+                .unwrap();
+            assert!(Arc::ptr_eq(&replaced, &old_attachment));
+            registry.register_command(
+                identity.clone(),
+                "checkout".into(),
+                new_command.clone(),
+                CommandHandle("new-provider".into()),
+            )
+        };
+        old_attachment.close().await.unwrap();
+        drop(guard);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.state, InternalWorkerOperationState::Accepted);
+        assert!(!result.replayed);
+        {
+            let registry = api.workdir_sessions.lock().unwrap();
+            assert!(Arc::ptr_eq(
+                registry.attachments.get(&identity).unwrap(),
+                &new_attachment
+            ));
+            assert!(
+                registry
+                    .command(&identity, "checkout", &old_handle)
+                    .is_none()
+            );
+            assert!(
+                registry
+                    .command(&identity, "checkout", &new_handle)
+                    .is_some()
+            );
+        }
+        for session in [&new_attachment, &new_command] {
+            session
+                .stat(workdir::StatRequest {
+                    path: workdir::WorkdirPath::new("alive").unwrap(),
+                })
+                .await
+                .unwrap();
+        }
+        assert!(
+            old_command
+                .stat(workdir::StatRequest {
+                    path: workdir::WorkdirPath::new("alive").unwrap()
+                })
+                .await
+                .is_err()
+        );
+        // Ordinary revocation still releases the surviving current resources.
+        close_worker_workdir_sessions(&api.workdir_sessions, &identity)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -45270,6 +45666,7 @@ mod tests {
             .stop_worker(
                 &worker,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("exercise logical attachment reconciliation".to_string()),
                     ticket_assignment: None,
                 },
@@ -45407,6 +45804,7 @@ mod tests {
             .stop_worker(
                 &worker,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("production Orchestrator restore regression test".to_string()),
                     ticket_assignment: None,
                 },
@@ -46511,6 +46909,7 @@ mod tests {
             .stop_worker(
                 &worker,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("singleton restore test".to_string()),
                     ticket_assignment: None,
                 },
@@ -46968,6 +47367,7 @@ mod tests {
             .stop_worker(
                 &target,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("prepare archive revocation regression".to_string()),
                     ticket_assignment: None,
                 },
@@ -48063,6 +48463,7 @@ mod tests {
             .stop_worker(
                 &worker,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("test subject Worker restart".to_string()),
                     ticket_assignment: None,
                 },
@@ -49820,6 +50221,7 @@ mod tests {
             .stop_worker(
                 &forged_internal.worker,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("remove forged Orchestrator claimant".to_string()),
                     ticket_assignment: None,
                 },
@@ -57300,6 +57702,7 @@ mod tests {
             .stop_worker(
                 &singleton_worker,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("replace completed Memory singleton".to_string()),
                     ticket_assignment: None,
                 },
@@ -61626,6 +62029,7 @@ mod tests {
             .stop_worker(
                 &target,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("prepare WorkerRemove regression".to_string()),
                     ticket_assignment: None,
                 },
@@ -65258,6 +65662,7 @@ mod tests {
             .stop_worker(
                 &worker,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("prepare singleton cleanup".to_string()),
                     ticket_assignment: None,
                 },
@@ -65383,6 +65788,7 @@ mod tests {
             .stop_worker(
                 &worker,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("prepare cleanup projection regression".to_string()),
                     ticket_assignment: None,
                 },
@@ -69006,6 +69412,7 @@ mod tests {
             .stop_worker(
                 &worker_ref,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("retire Worker after rejected automatic restore".to_string()),
                     ticket_assignment: None,
                 },

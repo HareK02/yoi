@@ -138,6 +138,7 @@ fn delivery_stop(api: &WorkspaceApi, worker: &RuntimeWorkerRef) {
         .stop_worker(
             worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: None,
                 ticket_assignment: None,
             },

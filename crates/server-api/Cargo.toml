@@ -44,6 +44,10 @@ name = "generate_worker_launch_api_types"
 name = "generate_companion_api_types"
 
 [[example]]
+name = "generate_subject_body_api_types"
+required-features = ["typescript"]
+
+[[example]]
 name = "generate_memory_api_types"
 required-features = ["typescript"]
 

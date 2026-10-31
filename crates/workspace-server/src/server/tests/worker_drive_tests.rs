@@ -714,6 +714,7 @@ async fn worker_removal_preserves_drive_reference_for_explicitly_granted_replace
         .stop(
             &WorkerOperationContext::Backend,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: Some("Drive lifetime test".into()),
                 ticket_assignment: None,
             },
@@ -816,6 +817,7 @@ async fn worker_removal_preserves_drive_reference_for_explicitly_granted_replace
             .stop_worker(
                 target,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: None,
                     ticket_assignment: None,
                 },

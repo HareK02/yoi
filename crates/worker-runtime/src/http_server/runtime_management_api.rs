@@ -678,11 +678,12 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         let ack = match auth_workspace_scope(&self.state, auth_extension().as_ref())
             .map_err(api_error)?
         {
-            Some(scope) => self
-                .state
-                .runtime
-                .stop_worker_scoped(&scope, &worker_ref, value.reason),
-            None => self.state.runtime.stop_worker(&worker_ref, value.reason),
+            Some(scope) => {
+                self.state
+                    .runtime
+                    .stop_worker_request_scoped(&scope, &worker_ref, value)
+            }
+            None => self.state.runtime.stop_worker_request(&worker_ref, value),
         }
         .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
@@ -690,11 +691,57 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         Ok(runtime_api::WorkerLifecycleResponse { ack })
     }
 
+    async fn coordinate_worker_stop(
+        &self,
+        worker_id: String,
+        value: runtime_api::WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, runtime_api::RuntimeApiError> {
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let outcome = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => {
+                self.state
+                    .runtime
+                    .coordinate_worker_stop_scoped(&scope, &worker_ref, value)
+            }
+            None => self
+                .state
+                .runtime
+                .coordinate_worker_stop(&worker_ref, value),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
+        .map_err(api_error)?;
+        response(outcome)
+    }
+
+    async fn worker_stop_outcome(
+        &self,
+        worker_id: String,
+        value: runtime_api::WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, runtime_api::RuntimeApiError> {
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let outcome = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => {
+                self.state
+                    .runtime
+                    .worker_stop_outcome_scoped(&scope, &worker_ref, value)
+            }
+            None => self.state.runtime.worker_stop_outcome(&worker_ref, value),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
+        .map_err(api_error)?;
+        response(outcome)
+    }
+
     async fn cancel_worker(
         &self,
         worker_id: String,
         value: runtime_api::WorkerLifecycleRequest,
     ) -> Result<runtime_api::WorkerLifecycleResponse, runtime_api::RuntimeApiError> {
+        validate_cancel_request(&value).map_err(api_error)?;
         let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
         let ack = match auth_workspace_scope(&self.state, auth_extension().as_ref())
             .map_err(api_error)?

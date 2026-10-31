@@ -397,15 +397,56 @@ pub struct WorkerDetail {
 /// Acknowledgement returned by stop/cancel lifecycle operations.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerLifecycleAck {
+    /// Historical typed stop receipt; never authorizes cleanup of current resources.
+    #[serde(default)]
+    pub replayed: bool,
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<protocol::WorkerStateSnapshot>,
 }
 
+impl WorkerLifecycleAck {
+    pub(crate) fn historical_stop_receipt(&self) -> Self {
+        Self {
+            replayed: true,
+            ..self.clone()
+        }
+    }
+}
+
+/// Retained stop evidence, independent of the Worker's current execution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerStopOutcome {
+    NotFound,
+    Pending,
+    Stopped { ack: WorkerLifecycleAck },
+}
+
 #[cfg(test)]
 mod tests {
     use super::WorkspaceApiRef;
+
+    #[test]
+    fn legacy_stop_receipt_without_marker_is_marked_only_when_returned_as_history() {
+        let value = serde_json::json!({
+            "worker_ref": {"worker_id": crate::identity::WorkerId::now_v7()}, "status":"stopped"
+        });
+        let receipt: super::WorkerLifecycleAck = serde_json::from_value(value).unwrap();
+        assert!(!receipt.replayed);
+        let returned = receipt.historical_stop_receipt();
+        assert!(returned.replayed);
+        assert!(
+            !receipt.replayed,
+            "the retained receipt must not be rewritten"
+        );
+        let wire = serde_json::to_value(&returned).unwrap();
+        let external: runtime_api::WorkerLifecycleAck =
+            serde_json::from_value(wire.clone()).unwrap();
+        assert!(external.replayed);
+        assert_eq!(serde_json::to_value(external).unwrap(), wire);
+    }
 
     #[test]
     fn workspace_api_ref_public_schema_contains_no_source_credentials_or_claim_choices() {

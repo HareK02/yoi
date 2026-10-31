@@ -885,6 +885,7 @@ pub(super) async fn interrupt_subject_workers(
         let cancellation = match api.host_executors.host() {
             Ok(host) => host.run(move || -> ApiResult<_> {
                 Ok(cancellation_api.runtime.cancel_worker(&cancellation_worker, WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("Subject permission assignment changed; new operations are fenced".into()), ticket_assignment: None,
                 }).map_err(RuntimeRegistryError::into_error)?)
             }).await,

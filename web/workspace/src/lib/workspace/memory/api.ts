@@ -607,9 +607,11 @@ export function parseSubjektivSubjectResponse(
       "created_at",
       "updated_at",
       "current_worker",
+      "current_body",
+      "current_worker_diagnostics",
     ],
     "Subject response",
-    ["current_worker"],
+    ["current_worker", "current_body", "current_worker_diagnostics"],
   );
   const id = requiredIdentifier(record, "id");
   if (expectedSubjectId !== undefined && id !== expectedSubjectId) {
@@ -637,6 +639,33 @@ export function parseSubjektivSubjectResponse(
         record.current_worker,
         "Subject current worker",
       );
+  }
+  if ("current_body" in record) {
+    if (record.current_body === null) result.current_body = null;
+    else {
+      const body = strictRecord(record.current_body, [
+        "runtime_id",
+        "worker_id",
+        "generation",
+      ], "Subject body owner");
+      const generation = requiredString(body, "generation", 20);
+      if (
+        !/^[1-9][0-9]{0,19}$/.test(generation) ||
+        BigInt(generation) > 18446744073709551615n
+      ) invalid("invalid Subject body generation");
+      result.current_body = {
+        runtime_id: requiredIdentifier(body, "runtime_id"),
+        worker_id: requiredIdentifier(body, "worker_id"),
+        generation,
+      };
+    }
+  }
+  if ("current_worker_diagnostics" in record) {
+    result.current_worker_diagnostics = boundedArray(
+      record.current_worker_diagnostics,
+      100,
+      "current worker diagnostics",
+    ).map(parseDiagnostic);
   }
   return result;
 }

@@ -196,13 +196,23 @@ export function canDeleteSidebarWorker(worker: WorkerActionTarget): boolean {
 
 export async function stopSidebarWorker(
   workspaceId: string,
-  worker: WorkerActionTarget,
+  worker: WorkerActionTarget & { restore_observation_token?: string | null },
   fetchFn: FetchFn = fetch,
 ): Promise<void> {
   const response = await fetchFn(`${workerPath(workspaceId, worker)}/stop`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ reason: "stopped from Workspace sidebar" }),
+    body: JSON.stringify({
+      reason: "stopped from Workspace sidebar",
+      ...(worker.restore_observation_token
+        ? {
+          stop_intent: {
+            request_id: crypto.randomUUID(),
+            expected_observation_token: worker.restore_observation_token,
+          },
+        }
+        : {}),
+    }),
   });
   if (!response.ok) throw new Error(await responseError(response));
 
@@ -239,7 +249,6 @@ export async function deleteSidebarWorker(
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-
         expected_plan_digest: plan.digest,
         worker_target_ids: [candidate.target_id],
         workdir_target_ids: [],

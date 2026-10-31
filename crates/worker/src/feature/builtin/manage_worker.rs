@@ -275,6 +275,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                             runtime_id,
                             worker_id,
                             request: server_api::RuntimeWorkerLifecycleRequest {
+                                stop_intent: None,
                                 reason,
                                 ticket_assignment: None,
                             },
@@ -285,6 +286,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                             runtime_id,
                             worker_id,
                             request: server_api::RuntimeWorkerLifecycleRequest {
+                                stop_intent: None,
                                 reason,
                                 ticket_assignment: None,
                             },

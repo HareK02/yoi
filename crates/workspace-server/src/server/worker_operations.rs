@@ -48,6 +48,42 @@ pub(crate) enum WorkerOperationContext {
 }
 
 impl WorkerOperationContext {
+    fn bind_stop_intent(
+        &self,
+        workspace: &str,
+        request: &mut WorkerLifecycleRequest,
+    ) -> ApiResult<()> {
+        let Some(intent) = request.stop_intent.as_mut() else {
+            return Ok(());
+        };
+        if intent.request_id.trim().is_empty()
+            || intent.request_id.len() > 512
+            || intent.request_id.chars().any(char::is_control)
+        {
+            return Err(Error::InvalidInput(
+                "Stop request_id must be nonempty bounded text".into(),
+            )
+            .into());
+        }
+        let source = match self {
+            Self::Browser { source, .. } => source.clone(),
+            Self::WorkerControl { controller } => protocol::AuthenticatedInputSource::Worker {
+                runtime_id: controller.runtime_id.clone(),
+                worker_id: controller.worker_id.clone(),
+            },
+            #[cfg(test)]
+            Self::Backend => return Ok(()),
+        };
+        let canonical = serde_json::to_vec(&(workspace, source.namespace(), &intent.request_id))
+            .expect("stop identity contains only strings");
+        let digest = Sha256::digest(canonical)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        intent.request_id = format!("runtime-stop:{digest}");
+        Ok(())
+    }
+
     fn bind_input(&self, request: &mut WorkerInputRequest) {
         // Public adapters cannot choose provenance or consume another input path's
         // receipt IDs. Bind these only after the current caller is authorized.
@@ -443,42 +479,179 @@ impl WorkspaceWorker {
         self.api.restore_workspace_worker(&self.identity, request)
     }
 
+    pub(super) async fn restore_current_subject(
+        &self,
+        context: &WorkerOperationContext,
+        request: server_api::WorkerRestoreRequest,
+        subject: String,
+        expected: server_api::SubjectBodyRef,
+    ) -> ApiResult<InternalWorkerRestoreResult> {
+        let guard = self.authorize_operation(context, "restore").await?;
+        let worker = self.clone();
+        self.api
+            .host_executors
+            .host()?
+            .run(move || {
+                let _control = guard;
+                worker.current_record()?;
+                worker.api.restore_workspace_worker_with_subject(
+                    &worker.identity,
+                    request,
+                    Some((&subject, &expected)),
+                )
+            })
+            .await
+    }
+
+    pub(super) async fn stop_outcome_current_subject(
+        &self,
+        context: &WorkerOperationContext,
+        mut request: WorkerLifecycleRequest,
+        subject: String,
+        expected: server_api::SubjectBodyRef,
+    ) -> ApiResult<runtime_api::WorkerStopOutcome> {
+        let control = self.authorize_operation(context, "stop").await?;
+        context.bind_stop_intent(self.api.workspace_id(), &mut request)?;
+        let worker = self.clone();
+        self.api
+            .host_executors
+            .host()?
+            .run(move || {
+                let _control = control;
+                {
+                    let gate = subjektiv_journal::lifecycle_lock(&worker.api, &subject)?;
+                    let _subject = gate
+                        .lock()
+                        .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))?;
+                    subject_body::require_expected(&worker.api, &subject, Some(&expected))?;
+                }
+                // Read-only receipt lookup may wait for an ongoing cleanup callback;
+                // never retain the Subject gate while waiting for the Worker lock.
+                worker
+                    .api
+                    .runtime
+                    .worker_stop_outcome(&worker.identity, request)
+                    .map_err(|error| error.into_error().into())
+            })
+            .await
+    }
+
+    pub(super) async fn stop_current_subject(
+        &self,
+        context: &WorkerOperationContext,
+        request: WorkerLifecycleRequest,
+        subject: String,
+        expected: server_api::SubjectBodyRef,
+    ) -> ApiResult<WorkerLifecycleResult> {
+        self.stop_impl(context, request, Some((subject, expected)))
+            .await
+    }
+
     pub(super) async fn stop(
         &self,
         context: &WorkerOperationContext,
         request: WorkerLifecycleRequest,
     ) -> ApiResult<WorkerLifecycleResult> {
+        self.stop_impl(context, request, None).await
+    }
+
+    async fn stop_impl(
+        &self,
+        context: &WorkerOperationContext,
+        mut request: WorkerLifecycleRequest,
+        expected_subject: Option<(String, server_api::SubjectBodyRef)>,
+    ) -> ApiResult<WorkerLifecycleResult> {
         let guard = self.authorize_operation(context, "stop").await?;
+        context.bind_stop_intent(self.api.workspace_id(), &mut request)?;
         let worker = self.clone();
         // Once admitted, Runtime stop, session close and linked Workdir
         // publication have one owner. Never hand an accepted stop's guards
         // back to its cancellable waiter or acquire this Host lane again.
         run_host_workflow(self.api.host_executors.host()?, async move {
             let _control = guard;
+            let mut expected_subject = expected_subject;
+            if expected_subject.is_none() {
+                if let Some(lease) = worker
+                    .api
+                    .store
+                    .retained_worker_singleton_lease(worker.api.workspace_id(), &worker.identity)?
+                {
+                    if let Some(subject) = lease.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX) {
+                        expected_subject =
+                            Some((subject.to_owned(), subject_body::reference(&lease)));
+                    }
+                }
+            }
+            if expected_subject.is_some() && request.stop_intent.is_none() {
+                return Err(Error::InvalidInput(
+                    "Subject body stop requires request identity and its observed Runtime token"
+                        .into(),
+                )
+                .into());
+            }
+            // Observe concrete resource lifetimes under the existing session
+            // fence, then release it before Runtime/cleanup can call back here.
+            let (observed_sessions, observed_links) = {
+                let _session = current_worker_session_lock(&worker.api, &worker.identity)
+                    .lock_owned()
+                    .await;
+                let links = worker
+                    .api
+                    .store
+                    .list_worker_workdir_links(worker.api.workspace_id(), &worker.identity)?;
+                let sessions = worker
+                    .api
+                    .workdir_sessions
+                    .lock()
+                    .map_err(|_| Error::Store("Workdir session registry was poisoned".into()))?
+                    .observe_worker(&worker.identity);
+                (sessions, links)
+            };
+            if let Some((subject, expected)) = expected_subject.as_ref() {
+                let gate = subjektiv_journal::lifecycle_lock(&worker.api, subject)?;
+                let _subject = gate
+                    .lock()
+                    .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))?;
+                subject_body::require_expected(&worker.api, subject, Some(expected))?;
+                worker
+                    .api
+                    .runtime
+                    .coordinate_worker_stop(&worker.identity, request.clone())
+                    .map_err(RuntimeRegistryError::into_error)?;
+            }
+            // Admission owns the exact pending stop before releasing the Subject
+            // gate. Execution may call back into Session/Journal/Subject services.
             let result = worker
                 .api
                 .runtime
                 .stop_worker(&worker.identity, request)
-                .map_err(|error| error.into_error())?;
-            if result.state != InternalWorkerOperationState::Accepted {
+                .map_err(RuntimeRegistryError::into_error)?;
+            if let Some(conflict) = result.diagnostics.iter().find(|diagnostic| {
+                matches!(
+                    diagnostic.code.as_str(),
+                    "stop_observation_conflict" | "stop_request_conflict"
+                )
+            }) {
+                return Err(Error::RepositoryConflict(conflict.message.clone()).into());
+            }
+            if result.state != InternalWorkerOperationState::Accepted || result.replayed {
                 return Ok(result);
             }
             parse_runtime_worker_id_for_registry(&worker.identity.worker_id)?;
             let _session = current_worker_session_lock(&worker.api, &worker.identity)
                 .lock_owned()
                 .await;
-            close_current_worker_session_locked(&worker.api, &worker.identity).await?;
-            if let Some(record) = worker
-                .api
-                .store
-                .get_worker_registry(worker.api.workspace_id(), &worker.identity)?
-            {
-                sync_linked_workdir_after_worker_stop(
-                    &worker.api,
-                    &worker.identity.runtime_id,
-                    &record,
-                )?;
-            }
+            close_observed_worker_workdir_sessions(
+                &worker.api.workdir_sessions,
+                &observed_sessions,
+            )
+            .await
+            .map_err(|message| Error::RuntimeOperationFailed {
+                runtime_id: worker.identity.runtime_id.clone(),
+                code: "workdir_session_close_failed".into(),
+                message,
+            })?;
+            sync_linked_workdir_after_worker_stop(&worker.api, &worker.identity, &observed_links)?;
             Ok(result)
         })
         .await
@@ -489,6 +662,9 @@ impl WorkspaceWorker {
         context: &WorkerOperationContext,
         request: WorkerLifecycleRequest,
     ) -> ApiResult<WorkerLifecycleResult> {
+        if request.stop_intent.is_some() {
+            return Err(Error::InvalidInput("stop_intent is not valid for Cancel".into()).into());
+        }
         let guard = self.authorize_operation(context, "cancel").await?;
         let worker = self.clone();
         self.api
@@ -888,6 +1064,58 @@ mod input_binding_tests {
             submission_request_id: Some(client_id.into()),
             segments: None,
         }
+    }
+
+    #[test]
+    fn stop_identity_is_bound_to_authenticated_account_and_workspace_without_replacing_the_observation()
+     {
+        let context = |account: &str| WorkerOperationContext::Browser {
+            headers: HeaderMap::new(),
+            source: protocol::AuthenticatedInputSource::Account {
+                account_id: account.into(),
+            },
+        };
+        let request = || WorkerLifecycleRequest {
+            stop_intent: Some(runtime_api::WorkerStopIntent {
+                request_id: "same-request".into(),
+                expected_observation_token: "observed-lifecycle".into(),
+            }),
+            ..Default::default()
+        };
+        let mut first = request();
+        context("account-a")
+            .bind_stop_intent("workspace-a", &mut first)
+            .unwrap();
+        let mut retry = request();
+        context("account-a")
+            .bind_stop_intent("workspace-a", &mut retry)
+            .unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(
+            first
+                .stop_intent
+                .as_ref()
+                .unwrap()
+                .expected_observation_token,
+            "observed-lifecycle"
+        );
+        for (account, workspace) in [("account-b", "workspace-a"), ("account-a", "workspace-b")] {
+            let mut other = request();
+            context(account)
+                .bind_stop_intent(workspace, &mut other)
+                .unwrap();
+            assert_ne!(
+                first.stop_intent.as_ref().unwrap().request_id,
+                other.stop_intent.as_ref().unwrap().request_id
+            );
+        }
+        let mut empty = request();
+        empty.stop_intent.as_mut().unwrap().request_id.clear();
+        assert!(
+            context("account-a")
+                .bind_stop_intent("workspace-a", &mut empty)
+                .is_err()
+        );
     }
 
     #[test]

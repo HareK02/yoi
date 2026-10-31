@@ -336,6 +336,7 @@ mod plugin_remote_controller_tests {
                 api.runtime.stop_worker(
                     &stopped,
                     WorkerLifecycleRequest {
+                        stop_intent: None,
                         reason: None,
                         ticket_assignment: None,
                     },
