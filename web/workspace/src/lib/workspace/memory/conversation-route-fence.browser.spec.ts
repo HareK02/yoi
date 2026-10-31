@@ -62,6 +62,9 @@ for (const status of [401, 403, 404]) {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: string, init?: RequestInit) => {
+        if (String(input) === "/api/auth/whoami" && browserSession.snapshot.kind === "ready") {
+          return Response.json(browserSession.snapshot.value);
+        }
         if (String(input).endsWith("/conversations")) return Response.json(conversation("s"));
         if (init?.method === "POST") {
           posted = true;
@@ -84,7 +87,9 @@ for (const status of [401, 403, 404]) {
     const attempt = readConversationAttempt(sessionStorage, props)!;
     denied = true;
     await fireEvent.click(screen.getByRole("button", { name: "Refresh history" }));
-    await screen.findByRole("alert");
+    const deniedMessage = (await screen.findByRole("alert")).textContent;
+    await browserSession.refresh();
+    expect(screen.getByRole("alert").textContent).toBe(deniedMessage);
     expect(screen.queryByText("retained private text")).toBeNull();
     expect(screen.queryByRole("textbox")).toBeNull();
     release(Response.json({

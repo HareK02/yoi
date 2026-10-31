@@ -74,7 +74,6 @@ try {
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1000 },
     colorScheme: "light",
-    extraHTTPHeaders: { Origin: origin.origin },
   });
   const sessionCookie = (value: string) => ({
     name: "yoi_workspace_session",
@@ -212,7 +211,10 @@ try {
   const retry = posts[2];
   const conflict = await context.request.post(
     `${origin.origin}${base}/${encodeURIComponent(input.conversation_id)}/messages`,
-    { data: { ...retry, text: "changed payload under original operation" } },
+    {
+      headers: { Origin: origin.origin },
+      data: { ...retry, text: "changed payload under original operation" },
+    },
   );
   assertEquals(conflict.status(), 409);
   await page.goto(`${origin.origin}${legacy}/conversation${suffix}`);
@@ -365,6 +367,7 @@ try {
     .json();
   assert(ownerIdentity.actor.account_id !== foreignIdentity.actor.account_id);
   const denied = await context.request.post(deniedPath, {
+    headers: { Origin: origin.origin },
     data: { operation_id: "foreign-cannot-post", text: "must not append" },
   });
   assertEquals(denied.status(), 403);

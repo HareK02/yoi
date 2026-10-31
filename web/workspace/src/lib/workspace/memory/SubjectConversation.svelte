@@ -74,6 +74,8 @@
       window.addEventListener('online', reconnect);
       document.addEventListener('visibilitychange', reconnect);
       const unsubscribe = browserSession.subscribe(() => {
+        // A withdrawn request keeps its actual failure; an aborted fetch is not an Account change.
+        if (active !== context || context.controller.signal.aborted) return;
         if (!current(context)) {
           withdrawAccess(context);
           sendError = null;

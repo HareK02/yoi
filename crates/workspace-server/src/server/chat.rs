@@ -29,6 +29,16 @@ async fn account_context(
     context: &ServerRequestContext,
     workspace: &str,
 ) -> ApiResult<(String, WorkerOperationContext)> {
+    let (account, authority) = read_context(api, context, workspace).await?;
+    authority.authorize_workspace(api).await?;
+    Ok((account, authority))
+}
+
+async fn read_context(
+    api: &WorkspaceApi,
+    context: &ServerRequestContext,
+    workspace: &str,
+) -> ApiResult<(String, WorkerOperationContext)> {
     if context.runtime_source.is_some() || context.worker_source.is_some() {
         return Err(Error::WorkspacePermissionDenied(
             "chat user input requires an authenticated Account, not a Worker".into(),
@@ -42,7 +52,7 @@ async fn account_context(
     let authority = WorkerOperationContext::from_request_async(api, context)
         .await
         .map_err(|error| Error::WorkspacePermissionDenied(error.message))?;
-    authority.authorize_workspace(api).await?;
+    authority.authorize_workspace_read(api).await?;
     Ok((actor.account_id.clone(), authority))
 }
 
@@ -70,7 +80,7 @@ pub(super) async fn messages(
     conversation: String,
     query: ChatMessagePageQuery,
 ) -> ApiResult<ChatMessagePage> {
-    let (account, _) = account_context(&api, &context, &workspace).await?;
+    let (account, _) = read_context(&api, &context, &workspace).await?;
     api.store
         .db_executor()
         .run(move || -> ApiResult<_> {

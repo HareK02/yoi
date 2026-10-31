@@ -142,13 +142,23 @@ async fn account_context(
     context: &server_api::ServerRequestContext,
     workspace: &str,
 ) -> ApiResult<(String, WorkerOperationContext)> {
+    let (account, authority) = read_context(api, context, workspace).await?;
+    authority.authorize_workspace(api).await?;
+    Ok((account, authority))
+}
+
+async fn read_context(
+    api: &WorkspaceApi,
+    context: &server_api::ServerRequestContext,
+    workspace: &str,
+) -> ApiResult<(String, WorkerOperationContext)> {
     validate_workspace_scope(api, workspace)?;
     let actor = subject_authorization::administration_actor(context)?;
     require_workspace_owner(api, workspace, actor, "Subject body lifecycle").await?;
     let authority = WorkerOperationContext::from_request_async(api, context)
         .await
         .map_err(|error| Error::WorkspacePermissionDenied(error.message))?;
-    authority.authorize_workspace(api).await?;
+    authority.authorize_workspace_read(api).await?;
     Ok((actor.account_id.clone(), authority))
 }
 
@@ -158,7 +168,7 @@ pub(super) async fn get(
     workspace: String,
     subject: String,
 ) -> ApiResult<SubjectBodyResponse> {
-    account_context(&api, &context, &workspace).await?;
+    read_context(&api, &context, &workspace).await?;
     api.host_executors
         .host()?
         .run(move || {

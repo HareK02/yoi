@@ -87,6 +87,113 @@ impl BodyFixture {
 }
 
 #[tokio::test]
+async fn browser_subject_and_conversation_reads_allow_missing_origin_but_mutations_do_not() {
+    let f = BodyFixture::new().await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {}", f.owner).parse().unwrap(),
+    );
+    let actor = resolve_actor(&ServerAuthApi::from(&f.api), &headers)
+        .await
+        .unwrap()
+        .unwrap();
+    let token = "subject-read-browser-session";
+    f.api
+        .store
+        .create_browser_session(&BrowserSessionRecord {
+            token_hash: crate::auth::token_hash(token),
+            session_id: "subject-read-session".into(),
+            user_id: actor.user_id,
+            created_at: now_registry_timestamp(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            revoked_at: None,
+        })
+        .unwrap();
+    let AuthConfig::Passkey {
+        cookie_name,
+        origin,
+        ..
+    } = &f.api.config.auth;
+    let browser_request = |method: &str, path: &str, body: Option<Value>, origin: Option<&str>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(axum::http::header::COOKIE, format!("{cookie_name}={token}"))
+            .header(CONTENT_TYPE, "application/json");
+        if let Some(origin) = origin {
+            request = request.header(ORIGIN, origin);
+        }
+        request
+            .body(Body::from(body.map(|v| v.to_string()).unwrap_or_default()))
+            .unwrap()
+    };
+    let conversations = format!("/api/w/{TEST_WORKSPACE_ID}/chat/conversations");
+    let create = json!({"operation_id":"browser-read-conversation", "subject_id":f.subject});
+    let (status, conversation) = response(
+        &f.api,
+        browser_request("POST", &conversations, Some(create.clone()), Some(origin)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{conversation}");
+    let messages = format!(
+        "{conversations}/{}/messages",
+        conversation["id"].as_str().unwrap()
+    );
+    for path in [f.path(), messages.clone()] {
+        for origin in [None, Some(origin.as_str())] {
+            let (status, body) =
+                response(&f.api, browser_request("GET", &path, None, origin)).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        }
+        let (status, body) = response(
+            &f.api,
+            browser_request("GET", &path, None, Some("https://foreign.example")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
+    let expected =
+        json!({"runtime_id":"runtime-test", "worker_id":"not-started", "generation":"1"});
+    for (path, body) in [
+        (conversations, create),
+        (
+            messages.clone(),
+            json!({"operation_id":"must-not-send", "text":"must not be saved"}),
+        ),
+        (
+            format!("{}/start", f.path()),
+            json!({"request_id":"must-not-start", "expected_current":null, "expected_observation_token":null}),
+        ),
+        (
+            format!("{}/stop", f.path()),
+            json!({"request_id":"must-not-stop", "expected_current":expected, "expected_observation_token":"not-observed"}),
+        ),
+    ] {
+        for origin in [None, Some("https://foreign.example")] {
+            let (status, error) = response(
+                &f.api,
+                browser_request("POST", &path, Some(body.clone()), origin),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {error}");
+        }
+    }
+    let (status, page) = response(&f.api, browser_request("GET", &messages, None, None)).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["messages"], json!([]));
+    assert!(f.read().await["current"].is_null());
+    f.api
+        .store
+        .revoke_browser_session(&crate::auth::token_hash(token), &now_registry_timestamp())
+        .unwrap();
+    for path in [f.path(), messages] {
+        let (status, body) = response(&f.api, browser_request("GET", &path, None, None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    }
+}
+
+#[tokio::test]
 async fn body_read_retains_an_occupied_owner_when_runtime_observation_is_unavailable() {
     let f = BodyFixture::new().await;
     let absent = f.read().await;

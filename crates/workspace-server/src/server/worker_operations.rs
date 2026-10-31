@@ -121,6 +121,20 @@ impl WorkerOperationContext {
     }
 
     pub(super) async fn authorize_workspace(&self, api: &WorkspaceApi) -> ApiResult<()> {
+        self.authorize_workspace_request(api, true).await
+    }
+
+    /// Read-only snapshots revalidate the caller without requiring the Origin header
+    /// that browsers omit on same-origin GETs. An explicit foreign Origin still fails.
+    pub(super) async fn authorize_workspace_read(&self, api: &WorkspaceApi) -> ApiResult<()> {
+        self.authorize_workspace_request(api, false).await
+    }
+
+    async fn authorize_workspace_request(
+        &self,
+        api: &WorkspaceApi,
+        require_origin: bool,
+    ) -> ApiResult<()> {
         if let Self::Browser { headers, source } = self {
             let actor = resolve_actor(&ServerAuthApi::from(api), headers)
                 .await?
@@ -129,7 +143,9 @@ impl WorkerOperationContext {
                         "Worker connection credentials were revoked".into(),
                     )
                 })?;
-            if matches!(actor.auth_method, ActorAuthMethod::BrowserSession) {
+            if matches!(actor.auth_method, ActorAuthMethod::BrowserSession)
+                && (require_origin || headers.contains_key(ORIGIN))
+            {
                 let AuthConfig::Passkey { origin, .. } = &api.config.auth;
                 if headers.get(ORIGIN).and_then(|value| value.to_str().ok())
                     != Some(origin.as_str())
