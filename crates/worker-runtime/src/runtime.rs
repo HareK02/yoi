@@ -3567,7 +3567,10 @@ impl Runtime {
         if matches!(&method, Method::Shutdown { .. }) {
             self.stop_worker_with_scope(
                 worker_ref,
-                Some("worker protocol shutdown".to_string()),
+                runtime_api::WorkerLifecycleRequest {
+                    reason: Some("worker protocol shutdown".to_string()),
+                    stop_intent: None,
+                },
                 scope,
             )?;
             return Ok(Vec::new());

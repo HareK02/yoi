@@ -43362,7 +43362,7 @@ mod tests {
         let cleanup_lock = current_worker_session_lock(&api, &identity);
         let held = Arc::new(Mutex::new(None));
         let held_by_callback = held.clone();
-        api.runtime.register_or_replace(WorkdirlessFixtureRuntime {
+        let runtime = WorkdirlessFixtureRuntime {
             stop_callback: Some(Arc::new(move || {
                 // A genuine fresh-ACK path, not historical receipt replay. Capture
                 // must release this fence before Runtime dispatch/callbacks.
@@ -43371,7 +43371,18 @@ mod tests {
                 notification.notify_one();
             })),
             ..Default::default()
-        });
+        };
+        runtime
+            .workers
+            .lock()
+            .unwrap()
+            .push(worker_summary_from_registry(
+                &api.store
+                    .get_worker_registry(TEST_WORKSPACE_ID, &identity)
+                    .unwrap()
+                    .unwrap(),
+            ));
+        api.runtime.register_or_replace(runtime);
         let worker =
             WorkspaceWorker::resolve(&api, &identity.runtime_id, &identity.worker_id).unwrap();
         let waiter = tokio::spawn(async move {

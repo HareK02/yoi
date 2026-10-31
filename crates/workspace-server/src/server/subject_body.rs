@@ -171,6 +171,12 @@ fn operation_id(account: &str, workspace: &str, subject: &str, request: &str) ->
     format!("subject-body-start:{digest}")
 }
 
+fn failure_diagnostics(code: &str, error: ApiError) -> Vec<server_api::Diagnostic> {
+    let mut diagnostics = vec![diagnostic(code, error.error.to_string())];
+    diagnostics.extend(error.diagnostics.into_iter().map(Into::into));
+    diagnostics
+}
+
 async fn finish(
     api: WorkspaceApi,
     context: server_api::ServerRequestContext,
@@ -305,10 +311,7 @@ pub(super) async fn stop(
         // A post-dispatch failure may have followed a real stop. Keep the exact intent.
         Err(error) => (
             SubjectBodyDisposition::Unknown,
-            vec![diagnostic(
-                "subject_body_stop_outcome_unknown",
-                error.error.to_string(),
-            )],
+            failure_diagnostics("subject_body_stop_outcome_unknown", error),
         ),
     };
     Ok(finish(
@@ -398,10 +401,7 @@ pub(super) async fn start(
             }
             Err(error) => (
                 SubjectBodyDisposition::Unknown,
-                vec![diagnostic(
-                    "subject_body_restore_outcome_unknown",
-                    error.error.to_string(),
-                )],
+                failure_diagnostics("subject_body_restore_outcome_unknown", error),
             ),
         };
         return Ok(finish(
@@ -470,7 +470,7 @@ pub(super) async fn start(
                 runtime_id,
                 display_name: subject_record.role.as_str().into(),
                 singleton_key: None,
-                profile: Some("builtin:async-chat".into()),
+                profile: Some(server_api::authorization::SUBJECT_CONVERSATION_PROFILE.into()),
                 ticket_assignment: None,
                 initial_submit: vec![],
                 workdir_attachments: vec![],
@@ -496,17 +496,16 @@ pub(super) async fn start(
         Err(error)
             if matches!(
                 error.error,
-                Error::RepositoryConflict(_) | Error::WorkspacePermissionDenied(_)
+                Error::RepositoryConflict(_)
+                    | Error::WorkspacePermissionDenied(_)
+                    | Error::SubjektivSubjectNotFound(_)
             ) =>
         {
             return Err(error);
         }
         Err(error) => (
             SubjectBodyDisposition::Unknown,
-            vec![diagnostic(
-                "subject_body_start_outcome_unknown",
-                error.error.to_string(),
-            )],
+            failure_diagnostics("subject_body_start_outcome_unknown", error),
         ),
     };
     Ok(finish(

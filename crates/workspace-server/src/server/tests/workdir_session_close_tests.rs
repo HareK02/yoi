@@ -277,6 +277,29 @@ impl Fixture {
         RuntimeWorkerRef::new(&self.runtime_id, "registry-close-owner")
     }
 
+    async fn create_worker(&self) -> RuntimeWorkerRef {
+        self.source.publish_profile("builtin:companion");
+        let Json(created) = create_workspace_worker(
+            State(self.api().clone()),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: self.runtime_id.clone(),
+                display_name: "session-close Worker".into(),
+                singleton_key: None,
+                profile: Some("builtin:companion".into()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachments: Vec::new(),
+                feature_connections: Default::default(),
+                control_operation_id: None,
+                execution_grant: None,
+            }),
+        )
+        .await
+        .unwrap();
+        RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
+    }
+
     async fn open(&self) -> WorkdirSessionHandle {
         self.api()
             .runtime
@@ -734,7 +757,7 @@ async fn stop_projection_does_not_follow_a_rebound_connection_with_identical_wor
  {
     let fixture = Fixture::new().await;
     let api = fixture.api();
-    let worker = fixture.registry_owner();
+    let worker = fixture.create_worker().await;
     let link = WorkerWorkdirLinkRecord {
         connection_id: String::new(),
         workspace_id: TEST_WORKSPACE_ID.into(),
@@ -763,7 +786,7 @@ async fn stop_projection_does_not_follow_a_rebound_connection_with_identical_wor
         .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.workdir_id)
         .unwrap()
         .unwrap();
-    record.display_name = "new binding not owned by old stop".into();
+    record.display_name = Some("new binding not owned by old stop".into());
     api.store.upsert_workdir_registry(&record).unwrap();
     sync_linked_workdir_after_worker_stop(api, &worker, &[old]).unwrap();
     assert_eq!(
@@ -790,26 +813,7 @@ async fn stop_projection_does_not_follow_a_rebound_connection_with_identical_wor
 async fn worker_removal_close_failure_retains_attachment_and_retry_releases_runtime_lease() {
     let fixture = Fixture::new().await;
     let api = fixture.api();
-    fixture.source.publish_profile("builtin:companion");
-    let Json(created) = create_workspace_worker(
-        State(api.clone()),
-        HeaderMap::new(),
-        Json(CreateWorkspaceWorkerRequest {
-            runtime_id: fixture.runtime_id.clone(),
-            display_name: "session-close removal".into(),
-            singleton_key: None,
-            profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
-            initial_submit: Vec::new(),
-            workdir_attachments: Vec::new(),
-            feature_connections: Default::default(),
-            control_operation_id: None,
-            execution_grant: None,
-        }),
-    )
-    .await
-    .unwrap();
-    let worker = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
+    let worker = fixture.create_worker().await;
     api.runtime
         .stop_worker(
             &worker,

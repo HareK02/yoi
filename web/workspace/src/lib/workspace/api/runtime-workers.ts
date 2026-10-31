@@ -319,7 +319,7 @@ export function parseRuntimeWorkerLifecycleResult(
   const item = object(value, "Runtime Worker lifecycle result");
   exactKeys(
     item,
-    ["state", "runtime_id", "worker_id", "diagnostics", "replayed"],
+    ["state", "runtime_id", "worker_id", "diagnostics"],
     ["replayed"],
     "Runtime Worker lifecycle result",
   );

@@ -1208,7 +1208,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         Err(diagnostic(
             "worker_stop_admission_unsupported",
             HostDiagnosticSeverity::Error,
-            "Runtime does not support fenced stop admission".into(),
+            "Runtime does not support fenced stop admission",
         ))
     }
 
@@ -1220,7 +1220,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         Err(diagnostic(
             "worker_stop_outcome_unsupported",
             HostDiagnosticSeverity::Error,
-            "Runtime does not support stop outcome queries".into(),
+            "Runtime does not support stop outcome queries",
         ))
     }
 
@@ -3304,7 +3304,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             diagnostic(
                 "embedded_worker_id_invalid",
                 HostDiagnosticSeverity::Error,
-                "Worker ID could not be resolved".into(),
+                "Worker ID could not be resolved",
             )
         })?;
         let outcome = self
@@ -3329,7 +3329,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             diagnostic(
                 "embedded_worker_id_invalid",
                 HostDiagnosticSeverity::Error,
-                "Worker ID could not be resolved".into(),
+                "Worker ID could not be resolved",
             )
         })?;
         let outcome = self
@@ -4456,6 +4456,8 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
         return "workers:input";
     }
     if path.ends_with("/stop")
+        || path.ends_with("/stop/admit")
+        || path.ends_with("/stop/outcome")
         || path.ends_with("/cancel")
         || (path == "/v1/subject-release" && method == "POST")
     {
@@ -6656,22 +6658,22 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
         EmbeddedRuntimeError::RestoreAdmissionBusy { .. } => diagnostic(
             "restore_admission_busy",
             HostDiagnosticSeverity::Warning,
-            "Worker lifecycle admission is busy; retry the same Restore intent".into(),
+            "Worker lifecycle admission is busy; retry the same Restore intent",
         ),
         EmbeddedRuntimeError::StopAdmissionBusy { .. } => diagnostic(
             "stop_admission_busy",
             HostDiagnosticSeverity::Warning,
-            "Worker lifecycle admission is busy; retry the same stop intent".into(),
+            "Worker lifecycle admission is busy; retry the same stop intent",
         ),
         EmbeddedRuntimeError::StopObservationConflict { .. } => diagnostic(
             "stop_observation_conflict",
             HostDiagnosticSeverity::Warning,
-            "Stop observation changed; reload before a new intent".into(),
+            "Stop observation changed; reload before a new intent",
         ),
         EmbeddedRuntimeError::StopRequestConflict { .. } => diagnostic(
             "stop_request_conflict",
             HostDiagnosticSeverity::Warning,
-            "Stop request ID was already used with different input".into(),
+            "Stop request ID was already used with different input",
         ),
         EmbeddedRuntimeError::RestoreObservationConflict { .. } => diagnostic(
             "restore_observation_conflict",
@@ -8810,6 +8812,12 @@ mod tests {
             ),
             "workers:read"
         );
+        for suffix in ["stop", "stop/admit", "stop/outcome"] {
+            assert_eq!(
+                workspace_runtime_operation("POST", &format!("/v1/workers/{worker_id}/{suffix}")),
+                "workers:stop"
+            );
+        }
         assert_eq!(
             workspace_runtime_operation("POST", "/v1/session-public/material/retention/erase"),
             "workers:delete"

@@ -6,7 +6,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/svelte";
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { tick } from "svelte";
 import SubjectBody from "./SubjectBody.svelte";
 import {
@@ -73,6 +73,23 @@ function savedStop(accountId = props.accountId) {
   };
 }
 
+// Happy DOM does not update bodyUsed when the production bounded reader consumes a stream.
+// Observe releaseLock instead, so late-response assertions run after actual consumption.
+function afterBodyRead(response: Response): Promise<void> {
+  return new Promise((resolve) => {
+    const getReader = response.body!.getReader.bind(response.body);
+    vi.spyOn(response.body!, "getReader").mockImplementation(() => {
+      const reader = getReader();
+      const release = reader.releaseLock.bind(reader);
+      vi.spyOn(reader, "releaseLock").mockImplementation(() => {
+        release();
+        resolve();
+      });
+      return reader;
+    });
+  });
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((accept) => {
@@ -80,6 +97,17 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
+// Happy DOM Storage is a Proxy with bound own methods; spy on a plain adapter
+// rather than its unrelated Storage.prototype or non-restorable proxy properties.
+beforeEach(() => {
+  const storage = sessionStorage;
+  vi.stubGlobal("sessionStorage", {
+    getItem: storage.getItem.bind(storage),
+    setItem: storage.setItem.bind(storage),
+    removeItem: storage.removeItem.bind(storage),
+    clear: storage.clear.bind(storage),
+  });
+});
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -337,7 +365,7 @@ test("storage write failure sends nothing and exposes a recovery diagnostic", as
   const start = await screen.findByRole("button", {
     name: "Start conversation body",
   });
-  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+  vi.spyOn(sessionStorage, "setItem").mockImplementation(() => {
     throw new Error("storage denied");
   });
   await fireEvent.click(start);
@@ -366,8 +394,9 @@ test("late GET for an old route cannot overwrite the selected Subject", async ()
   await view.rerender({ ...props, subjectId: "other" });
   await screen.findByText(/You do not have permission to start or stop/);
   const response = Response.json(available());
+  const consumed = afterBodyRead(response);
   old.resolve(response);
-  await waitFor(() => expect(response.bodyUsed).toBe(true));
+  await consumed;
   await tick();
   await waitFor(() =>
     expect(screen.getByText("No current conversation body."))
@@ -414,8 +443,9 @@ test("late old-route mutation receipt cannot update new route or discard old rec
     diagnostics: [],
     body: available(),
   });
+  const consumed = afterBodyRead(response);
   pending.resolve(response);
-  await waitFor(() => expect(response.bodyUsed).toBe(true));
+  await consumed;
   await tick();
   await waitFor(() =>
     expect(screen.getByText("No current conversation body."))
@@ -753,8 +783,9 @@ test("late stop outcome cannot settle an old route request after navigation", as
     outcome: "stopped",
     body: available(),
   });
+  const consumed = afterBodyRead(response);
   pending.resolve(response);
-  await waitFor(() => expect(response.bodyUsed).toBe(true));
+  await consumed;
   await tick();
   expect(screen.queryByText("Historical stop confirmed.")).toBeNull();
   expect(screen.queryByRole("button", { name: "Check stop outcome" }))
@@ -805,7 +836,7 @@ test("account switch hides old body and retry input while same-account reload pr
   const view = render(SubjectBody, props);
   await screen.findByText("Body stopped.");
   await screen.findByText(/An unresolved stop request is retained/);
-  const reads = vi.spyOn(Storage.prototype, "getItem");
+  const reads = vi.spyOn(sessionStorage, "getItem");
   reads.mockClear();
   account = accountB.accountId;
   await view.rerender(accountB);
@@ -875,8 +906,9 @@ test("late GET from another account cannot replace the same route's new observat
   await view.rerender({ ...props, accountId: account });
   await screen.findByText(/You do not have permission to start or stop/);
   const oldResponse = Response.json(available());
+  const consumed = afterBodyRead(oldResponse);
   pendingA.resolve(oldResponse);
-  await waitFor(() => expect(oldResponse.bodyUsed).toBe(true));
+  await consumed;
   await tick();
   expect(screen.getByText("No current conversation body.")).toBeTruthy();
   expect(screen.queryByText("Body stopped.")).toBeNull();
@@ -962,7 +994,7 @@ test.each([false, true])(
         ).toBe(false)
       );
     }
-    const removals = vi.spyOn(Storage.prototype, "removeItem");
+    const removals = vi.spyOn(sessionStorage, "removeItem");
     const getsBeforeResponse = gets;
     const oldResponse = Response.json({
       request_id: requestA,
@@ -970,8 +1002,9 @@ test.each([false, true])(
       diagnostics: [],
       body: available(),
     });
+    const consumed = afterBodyRead(oldResponse);
     pendingA.resolve(oldResponse);
-    await waitFor(() => expect(oldResponse.bodyUsed).toBe(true));
+    await consumed;
     await tick();
     expect(screen.queryByText("Request accepted.")).toBeNull();
     expect(screen.queryByText("Body stopped.")).toBeNull();
@@ -1024,14 +1057,15 @@ test("late stop outcome from another account cannot settle or clear either accou
   expect(
     screen.queryByText("Checking saved stop outcome… No stop request is sent."),
   ).toBeNull();
-  const removals = vi.spyOn(Storage.prototype, "removeItem");
+  const removals = vi.spyOn(sessionStorage, "removeItem");
   const oldResponse = Response.json({
     request_id: first.request.request_id,
     outcome: "stopped",
     body: available(),
   });
+  const consumed = afterBodyRead(oldResponse);
   pending.resolve(oldResponse);
-  await waitFor(() => expect(oldResponse.bodyUsed).toBe(true));
+  await consumed;
   await tick();
   expect(screen.queryByText("Historical stop confirmed.")).toBeNull();
   expect(screen.queryByText("Body stopped.")).toBeNull();
@@ -1057,7 +1091,7 @@ test("signout hides body and request details and never falls back to a dummy ide
   const view = render(SubjectBody, props);
   await screen.findByText("Body stopped.");
   expect(screen.getByText(first.request.request_id)).toBeTruthy();
-  const reads = vi.spyOn(Storage.prototype, "getItem");
+  const reads = vi.spyOn(sessionStorage, "getItem");
   reads.mockClear();
   await view.rerender({ ...props, accountId: "" });
   await screen.findByText("Sign in to view this conversation body.");
@@ -1070,4 +1104,228 @@ test("signout hides body and request details and never falls back to a dummy ide
   expect(reads).not.toHaveBeenCalled();
   expect(fetch).toHaveBeenCalledTimes(1);
   expect(sessionStorage.getItem(key)).toBe(raw);
+});
+
+test("Workspace switch fences late mutation even when the Subject ID is identical", async () => {
+  const pending = deferred<Response>();
+  let requestId = "";
+  const other = { ...props, workspaceId: "other-workspace" };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (path: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        requestId = JSON.parse(init.body as string).request_id;
+        return pending.promise;
+      }
+      return Response.json(
+        path.includes("/other-workspace/")
+          ? {
+            ...absent(),
+            workspace_id: other.workspaceId,
+            can_start: false,
+            can_stop: false,
+          }
+          : absent(),
+      );
+    }),
+  );
+  const view = render(SubjectBody, props);
+  await fireEvent.click(
+    await screen.findByRole("button", { name: "Start conversation body" }),
+  );
+  const key = subjectBodyStorageKey(
+    props.accountId,
+    props.workspaceId,
+    props.subjectId,
+  );
+  const retained = sessionStorage.getItem(key);
+  await view.rerender(other);
+  await screen.findByText(/You do not have permission to start or stop/);
+  const response = Response.json({
+    request_id: requestId,
+    disposition: "accepted",
+    diagnostics: [],
+    body: available(),
+  });
+  const consumed = afterBodyRead(response);
+  pending.resolve(response);
+  await consumed;
+  await tick();
+  expect(screen.queryByText("Request accepted.")).toBeNull();
+  expect(screen.queryByText("Body stopped.")).toBeNull();
+  expect(sessionStorage.getItem(key)).toBe(retained);
+  expect(
+    readSubjectBodyAttempt(
+      sessionStorage,
+      props.accountId,
+      other.workspaceId,
+      props.subjectId,
+    ),
+  ).toBeNull();
+  await view.rerender(props);
+  await screen.findByText(/An unresolved start request is retained/);
+});
+
+test("double click sends only one retained request, never a conversation ACK", async () => {
+  const pending = deferred<Response>();
+  const posts: string[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_path: string, init?: RequestInit) => {
+      if (init?.method !== "POST") return Response.json(absent());
+      posts.push(init.body as string);
+      return pending.promise;
+    }),
+  );
+  render(SubjectBody, props);
+  const start = await screen.findByRole("button", {
+    name: "Start conversation body",
+  });
+  await fireEvent.click(start);
+  await fireEvent.click(start);
+  expect(posts).toHaveLength(1);
+  // A chat-submit acknowledgement is not a body mutation receipt.
+  const response = Response.json({
+    command_id: "chat-command",
+    state: "accepted",
+  });
+  const consumed = afterBodyRead(response);
+  pending.resolve(response);
+  await consumed;
+  await screen.findByText(/Request outcome unknown\. The request may/);
+  expect(
+    readSubjectBodyAttempt(
+      sessionStorage,
+      props.accountId,
+      props.workspaceId,
+      props.subjectId,
+    )?.request,
+  )
+    .toEqual(JSON.parse(posts[0]));
+  expect(screen.queryByText("Request accepted.")).toBeNull();
+});
+
+test("old generation rejection stays distinct from fresh body and requires a fresh explicit stop", async () => {
+  let observation = available("idle");
+  const posts: {
+    expected_current: typeof owner;
+    expected_observation_token: string;
+  }[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (_path: string, init?: RequestInit) => {
+      if (init?.method !== "POST") return Response.json(observation);
+      const request = JSON.parse(init.body as string);
+      posts.push(request);
+      observation = available("idle", "generation-18-token");
+      observation.current = { ...owner, generation: "18" };
+      return Response.json({
+        request_id: request.request_id,
+        disposition: "rejected",
+        diagnostics: [{
+          code: "stale_owner",
+          severity: "warning",
+          message:
+            "The current body generation changed. Refresh before acting.",
+        }],
+        body: observation,
+      });
+    }),
+  );
+  render(SubjectBody, props);
+  await fireEvent.click(
+    await screen.findByRole("button", { name: "Stop conversation body" }),
+  );
+  await screen.findByText("Request rejected.");
+  await screen.findByText(
+    "The current body generation changed. Refresh before acting.",
+  );
+  await waitFor(() =>
+    expect(
+      (screen.getByRole("button", {
+        name: "Stop conversation body",
+      }) as HTMLButtonElement).disabled,
+    ).toBe(false)
+  );
+  expect(posts).toHaveLength(1);
+  expect(posts[0].expected_current.generation).toBe("17");
+  expect(screen.queryByText("Body stopped.")).toBeNull();
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Stop conversation body" }),
+  );
+  await waitFor(() => expect(posts).toHaveLength(2));
+  expect(posts[1].expected_current.generation).toBe("18");
+  expect(posts[1].expected_observation_token).toBe("generation-18-token");
+});
+
+test("unknown stop cannot restart on GET alone; confirmed outcome permits restart with fresh token", async () => {
+  let observation = available("idle");
+  let outcome = "pending";
+  const posts: { path: string; body: string }[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (path: string, init?: RequestInit) => {
+      if (init?.method !== "POST") return Response.json(observation);
+      posts.push({ path, body: init.body as string });
+      const request = JSON.parse(init.body as string);
+      if (path.endsWith("/outcome")) {
+        return Response.json({
+          request_id: request.request_id,
+          outcome,
+          body: null,
+        });
+      }
+      return Response.json({
+        request_id: request.request_id,
+        disposition: "unknown",
+        diagnostics: [],
+        body: null,
+      });
+    }),
+  );
+  render(SubjectBody, props);
+  await fireEvent.click(
+    await screen.findByRole("button", { name: "Stop conversation body" }),
+  );
+  await screen.findByText("Request outcome unknown.");
+  await waitFor(() =>
+    expect(
+      (screen.getByRole("button", {
+        name: "Refresh body state",
+      }) as HTMLButtonElement).disabled,
+    ).toBe(false)
+  );
+  observation = available("stopped", "after-confirmed-stop");
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Refresh body state" }),
+  );
+  await screen.findByText("Body stopped.");
+  expect(screen.queryByRole("button", { name: "Restart conversation body" }))
+    .toBeNull();
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Check stop outcome" }),
+  );
+  await screen.findByText("Stop outcome pending.");
+  expect(screen.queryByRole("button", { name: "Restart conversation body" }))
+    .toBeNull();
+  outcome = "stopped";
+  await fireEvent.click(
+    screen.getByRole("button", { name: "Check stop outcome" }),
+  );
+  await screen.findByText("Historical stop confirmed.");
+  const restart = await screen.findByRole("button", {
+    name: "Restart conversation body",
+  });
+  await waitFor(() =>
+    expect((restart as HTMLButtonElement).disabled).toBe(false)
+  );
+  await fireEvent.click(restart);
+  await waitFor(() => expect(posts).toHaveLength(4));
+  expect(posts[1].body).toBe(posts[0].body);
+  expect(posts[2].body).toBe(posts[0].body);
+  const request = JSON.parse(posts[3].body);
+  expect(posts[3].path).toMatch(/\/start$/);
+  expect(request.expected_current).toEqual(owner);
+  expect(request.expected_observation_token).toBe("after-confirmed-stop");
+  expect(request.request_id).not.toBe(JSON.parse(posts[0].body).request_id);
 });

@@ -131,6 +131,10 @@ async fn body_operations_reject_nonowners_and_cross_workspace_targets() {
 async fn body_stop_and_outcome_reject_a_target_from_another_subject_before_runtime_dispatch() {
     let f = BodyFixture::new().await;
     let lease = f.reserve();
+    let permissions = open_subjektiv_store(&f.api)
+        .unwrap()
+        .subject_permissions(&f.subject)
+        .unwrap();
     let other = open_subjektiv_store(&f.api)
         .unwrap()
         .create_subject(crate::subjektiv::SubjectRole::new("other-companion").unwrap())
@@ -157,12 +161,12 @@ async fn body_stop_and_outcome_reject_a_target_from_another_subject_before_runti
         f.read().await["current"]["worker_id"],
         lease.worker.worker_id
     );
-    assert!(
+    assert_eq!(
         open_subjektiv_store(&f.api)
             .unwrap()
             .subject_permissions(&f.subject)
-            .unwrap()
-            .is_none()
+            .unwrap(),
+        permissions
     );
 }
 
@@ -235,13 +239,13 @@ async fn body_operations_reject_a_subject_with_deletion_already_admitted() {
             "{status}: {body}"
         );
     }
-    assert!(
-        open_subjektiv_store(&f.api)
-            .unwrap()
-            .subject(&f.subject)
-            .unwrap()
-            .is_some()
-    );
+    let deletion = open_subjektiv_store(&f.api)
+        .unwrap()
+        .subject_deletion(&f.subject)
+        .unwrap()
+        .unwrap();
+    assert_eq!(deletion.operation_id, "delete-body-fixture");
+    assert!(!deletion.completed);
     assert_eq!(
         f.api
             .store

@@ -297,3 +297,25 @@ Deno.test("Restore parser bounds diagnostics, validates wrapper/summary identity
     "wire contract",
   );
 });
+
+Deno.test("lifecycle replay metadata is optional but validated when present", () => {
+  const receipt = {
+    state: "accepted",
+    runtime_id: "runtime-a",
+    worker_id: "worker-1",
+    diagnostics: [],
+  };
+  assert(
+    parseRuntimeWorkerLifecycleResult(receipt).replayed === false,
+    "missing replay is not a replay",
+  );
+  assert(
+    parseRuntimeWorkerLifecycleResult({ ...receipt, replayed: true })
+      .replayed === true,
+    "replay flag lost",
+  );
+  assertThrows(
+    () => parseRuntimeWorkerLifecycleResult({ ...receipt, replayed: "true" }),
+    "must be a boolean",
+  );
+});

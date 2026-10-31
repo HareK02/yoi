@@ -9,6 +9,10 @@ use super::*;
 mod chat_delegation_connected;
 #[path = "chat_tests.rs"]
 mod chat_tests;
+#[path = "subject_body_cleanup_connected_tests.rs"]
+mod subject_body_cleanup_connected;
+#[path = "subject_body_connected_tests.rs"]
+mod subject_body_connected;
 #[path = "subject_body_tests.rs"]
 mod subject_body_tests;
 #[path = "subject_job_model_supply_tests.rs"]
