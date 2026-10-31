@@ -3,7 +3,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let check = std::env::args()
         .skip(1)
         .any(|argument| argument == "--check");
-    let outputs = [
+    let mut outputs = vec![
         (
             protocol::typescript::generated_typescript_path(),
             protocol::typescript::generated_protocol_types(),
@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             protocol::typescript::generated_protocol_validator(),
         ),
     ];
+    outputs.extend(protocol::typescript::generated_failure_contract_artifacts());
 
     for (path, expected) in outputs {
         if check {

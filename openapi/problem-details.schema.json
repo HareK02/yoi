@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProblemDetails",
+  "description": "Untrusted wire DTO. Unknown RFC extensions are ignored; yoi_failure is mandatory here.",
+  "type": "object",
+  "properties": {
+    "detail": {
+      "type": "string",
+      "maxLength": 2048,
+      "minLength": 1
+    },
+    "instance": {
+      "type": "string",
+      "maxLength": 2048,
+      "minLength": 1
+    },
+    "status": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 599,
+      "minimum": 400
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 2048,
+      "minLength": 1
+    },
+    "type": {
+      "type": "string",
+      "maxLength": 2048,
+      "minLength": 1
+    },
+    "yoi_failure": {
+      "$ref": "#/$defs/FailureEnvelope"
+    }
+  },
+  "required": [
+    "type",
+    "title",
+    "status",
+    "detail",
+    "instance",
+    "yoi_failure"
+  ],
+  "$defs": {
+    "Category": {
+      "type": "string",
+      "enum": [
+        "authorization",
+        "invalid_input",
+        "conflict",
+        "dependency",
+        "internal",
+        "unknown"
+      ]
+    },
+    "CausalLink": {
+      "description": "Only explicit causal references belong here. Cleanup/audit failures stay in domain results.",
+      "type": "object",
+      "properties": {
+        "correlation": {
+          "$ref": "#/$defs/CorrelationRef"
+        },
+        "domain": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        }
+      },
+      "required": [
+        "domain",
+        "reason",
+        "correlation"
+      ]
+    },
+    "CorrelationRef": {
+      "description": "Correlation is deliberately a distinct field/type from operation identity.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
+    },
+    "Diagnostic": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "explanation": {
+          "type": "string",
+          "maxLength": 2048,
+          "minLength": 1
+        }
+      },
+      "required": [
+        "code",
+        "explanation"
+      ]
+    },
+    "FailureContext": {
+      "description": "Common metadata is untrusted after deserialization. No audience label confers trust.",
+      "type": "object",
+      "properties": {
+        "causes": {
+          "description": "Ordered immediate-to-root chain, at most four references; never recursive payloads.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CausalLink"
+          },
+          "maxItems": 4
+        },
+        "correlation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CorrelationRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Diagnostic"
+          },
+          "maxItems": 8
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OperationContext"
+          },
+          "maxItems": 8
+        },
+        "supplementary_omitted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "operations",
+        "causes",
+        "diagnostics",
+        "supplementary_omitted"
+      ]
+    },
+    "FailureEnvelope": {
+      "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
+      "type": "object",
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/Category"
+        },
+        "context": {
+          "$ref": "#/$defs/FailureContext"
+        },
+        "details": true,
+        "details_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "domain": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "explanation": {
+          "type": "string",
+          "maxLength": 2048,
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "required_extensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 8
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        }
+      },
+      "required": [
+        "version",
+        "required_extensions",
+        "domain",
+        "reason",
+        "category",
+        "details_version",
+        "details",
+        "explanation",
+        "context"
+      ]
+    },
+    "OperationContext": {
+      "type": "object",
+      "properties": {
+        "operation": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "operation_ref": {
+          "description": "A reference, not an idempotency/retry grant. Disclosure remains domain-owned.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "stage": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        }
+      },
+      "required": [
+        "operation",
+        "stage"
+      ]
+    }
+  }
+}

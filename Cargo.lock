@@ -1515,6 +1515,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "error-contract"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "ts-rs",
+]
+
+[[package]]
 name = "euclid"
 version = "0.20.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3798,6 +3809,7 @@ version = "0.1.0"
 name = "protocol"
 version = "0.1.0"
 dependencies = [
+ "error-contract",
  "schemars",
  "serde",
  "serde_json",
