@@ -424,6 +424,28 @@ impl SqliteWorkspaceAuthority {
         })
     }
 
+    fn normalize_parent_filter(
+        &self,
+        parent: &mut Option<ticket::TicketParentFilter>,
+    ) -> Result<()> {
+        if let Some(ticket::TicketParentFilter::Parent { ticket }) = parent {
+            if ticket.trim().is_empty() {
+                return Err(Error::InvalidInput(
+                    "parent Ticket must not be blank".into(),
+                ));
+            }
+            *ticket = self
+                .store
+                .resolve_resource_reference(
+                    &self.workspace_id,
+                    WorkspaceResourceKind::Ticket,
+                    ticket,
+                )?
+                .ok_or_else(|| Error::Ticket(ticket::TicketError::NotFound(ticket.clone())))?;
+        }
+        Ok(())
+    }
+
     fn query_ticket_candidate_ids(
         &self,
         query: &TicketQueryRequest,
@@ -437,6 +459,15 @@ impl SqliteWorkspaceAuthority {
             values.push(value);
             format!("?{}", values.len())
         };
+        if let Some(parent) = &query.parent {
+            match parent {
+                ticket::TicketParentFilter::None {} => predicates.push("NOT EXISTS (SELECT 1 FROM typed_ticket_parent_links p WHERE p.workspace_id=t.workspace_id AND p.ticket_id=t.ticket_id AND p.parent_ticket_id IS NOT NULL)".into()),
+                ticket::TicketParentFilter::Parent { ticket } => {
+                    let parent = bind(SqlValue::Text(ticket.clone()));
+                    predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_parent_links p WHERE p.workspace_id=t.workspace_id AND p.ticket_id=t.ticket_id AND p.parent_ticket_id={parent})"));
+                }
+            }
+        }
         if !query.states.is_empty() {
             let states = query
                 .states
@@ -933,6 +964,9 @@ impl SqliteWorkspaceAuthority {
         }
         let action_blockers = Vec::new();
         let action_eligibility = TicketActionEligibility {
+            // The HTTP request boundary projects owner eligibility; the authority
+            // cannot infer a caller or permission from Ticket contents.
+            can_set_parent: false,
             // Case openness is not readiness. These are explicit operations;
             // occupancy remains an independent resource constraint.
             // Delegation neither occupies nor transfers existing Worker work.
@@ -1036,7 +1070,11 @@ impl SqliteWorkspaceAuthority {
         let assignment_tracking = self
             .store
             .list_current_ticket_assignment_tracking(&self.workspace_id, &ticket.meta.id)?;
+        let parent_link = self
+            .ticket_backend
+            .get_ticket_parent(ticket.meta.id.clone().into())?;
         Ok(TicketDetail {
+            parent_link,
             initial_post,
             created_by: ticket.meta.created_by,
             assignment_tracking,
@@ -1209,7 +1247,8 @@ impl TicketAuthority for SqliteWorkspaceAuthority {
         })
     }
 
-    fn query_tickets(&self, query: TicketQueryRequest) -> Result<TicketQueryResponse> {
+    fn query_tickets(&self, mut query: TicketQueryRequest) -> Result<TicketQueryResponse> {
+        self.normalize_parent_filter(&mut query.parent)?;
         validate_ticket_query(&query)?;
         let limit = query.limit.unwrap_or(50).clamp(1, 100);
         let sort = normalize_ticket_sort(query.sort.as_deref(), query.query.is_some())?;
@@ -2375,6 +2414,16 @@ fn ticket_matches_query(
     authoritative_case_history: &[ticket::TicketCaseHistoryEntry],
     query: &TicketQueryRequest,
 ) -> bool {
+    if let Some(parent) = &query.parent {
+        let actual = detail.parent_link.observation.parent_ticket_id.as_deref();
+        match parent {
+            ticket::TicketParentFilter::None {} if actual.is_some() => return false,
+            ticket::TicketParentFilter::Parent { ticket } if actual != Some(ticket.as_str()) => {
+                return false;
+            }
+            _ => {}
+        }
+    }
     let has_tag = |id: &String| detail.tags.iter().any(|tag| &tag.id == id);
     if !query.tag_ids.iter().all(has_tag)
         || (!query.tag_ids_any.is_empty() && !query.tag_ids_any.iter().any(has_tag))

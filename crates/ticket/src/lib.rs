@@ -30,6 +30,11 @@ pub use assignment_answer::*;
 mod assignment_tracking;
 pub mod config;
 mod content_changes;
+mod parent_links;
+pub use parent_links::{
+    TicketChildrenPage, TicketChildrenRequest, TicketLinkSummary, TicketParentFilter,
+    TicketParentLink, TicketParentObservation, TicketParentSetRequest,
+};
 pub mod service_outbox;
 mod sqlite_schema;
 mod subject_assignment;
@@ -372,6 +377,7 @@ pub enum TicketEventKind {
     ImplementationReport,
     StateChanged,
     TagsChanged,
+    ParentChanged,
     IntakeSummary,
     StatusChanged,
     Close,
@@ -388,6 +394,7 @@ impl TicketEventKind {
             Self::ImplementationReport => "implementation_report",
             Self::StateChanged => "state_changed",
             Self::TagsChanged => "tags_changed",
+            Self::ParentChanged => "parent_changed",
             Self::IntakeSummary => "intake_summary",
             Self::StatusChanged => "status_changed",
             Self::Close => "close",
@@ -404,6 +411,7 @@ impl TicketEventKind {
             Self::ImplementationReport => "Implementation report".to_string(),
             Self::StateChanged => "State changed".to_string(),
             Self::TagsChanged => "Tags changed".to_string(),
+            Self::ParentChanged => "Parent changed".to_string(),
             Self::IntakeSummary => "Intake summary".to_string(),
             Self::StatusChanged => "Status changed".to_string(),
             Self::Close => "Closed".to_string(),
@@ -423,6 +431,7 @@ impl From<&str> for TicketEventKind {
             "review" => Self::Comment,
             "state_changed" => Self::StateChanged,
             "tags_changed" => Self::TagsChanged,
+            "parent_changed" => Self::ParentChanged,
             "intake_summary" => Self::IntakeSummary,
             "status_changed" => Self::StatusChanged,
             "close" | "closed" => Self::Close,
@@ -1777,6 +1786,17 @@ pub struct TicketPostEdit {
 }
 
 pub trait TicketBackend {
+    fn get_ticket_parent(&self, id: TicketIdOrSlug) -> Result<TicketParentLink>;
+    fn set_ticket_parent(
+        &self,
+        id: TicketIdOrSlug,
+        request: TicketParentSetRequest,
+    ) -> Result<TicketParentLink>;
+    fn query_ticket_children(
+        &self,
+        id: TicketIdOrSlug,
+        request: TicketChildrenRequest,
+    ) -> Result<TicketChildrenPage>;
     fn edit_post_with_snapshots(
         &self,
         id: TicketIdOrSlug,
@@ -1862,6 +1882,17 @@ pub trait TicketBackend {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum TicketBackendOperation {
+    ParentLink {
+        id: TicketIdOrSlug,
+    },
+    SetParentLink {
+        id: TicketIdOrSlug,
+        request: TicketParentSetRequest,
+    },
+    ChildrenPage {
+        id: TicketIdOrSlug,
+        request: TicketChildrenRequest,
+    },
     ListWorkspaceTags {
         request: TagListRequest,
     },
@@ -1951,6 +1982,8 @@ pub enum TicketBackendOperation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", content = "value", rename_all = "snake_case")]
 pub enum TicketBackendOperationResult {
+    ParentLink(TicketParentLink),
+    ChildrenPage(TicketChildrenPage),
     WorkspaceTags(Vec<WorkspaceTag>),
     WorkspaceTag(WorkspaceTag),
     Text(String),
@@ -1977,6 +2010,15 @@ where
     B: TicketBackend + ?Sized,
 {
     Ok(match operation {
+        TicketBackendOperation::ParentLink { id } => {
+            TicketBackendOperationResult::ParentLink(backend.get_ticket_parent(id)?)
+        }
+        TicketBackendOperation::SetParentLink { id, request } => {
+            TicketBackendOperationResult::ParentLink(backend.set_ticket_parent(id, request)?)
+        }
+        TicketBackendOperation::ChildrenPage { id, request } => {
+            TicketBackendOperationResult::ChildrenPage(backend.query_ticket_children(id, request)?)
+        }
         TicketBackendOperation::ListWorkspaceTags { request } => {
             TicketBackendOperationResult::WorkspaceTags(backend.list_workspace_tags(request)?)
         }
@@ -3110,6 +3152,23 @@ fn finish_sqlite_transaction<R>(conn: &Connection, result: Result<R>) -> Result<
 }
 
 impl TicketBackend for SqliteTicketBackend {
+    fn get_ticket_parent(&self, id: TicketIdOrSlug) -> Result<TicketParentLink> {
+        self.parent_link(id)
+    }
+    fn set_ticket_parent(
+        &self,
+        id: TicketIdOrSlug,
+        request: TicketParentSetRequest,
+    ) -> Result<TicketParentLink> {
+        self.set_parent_link(id, request)
+    }
+    fn query_ticket_children(
+        &self,
+        id: TicketIdOrSlug,
+        request: TicketChildrenRequest,
+    ) -> Result<TicketChildrenPage> {
+        self.children_page(id, request)
+    }
     fn edit_post_with_snapshots(
         &self,
         id: TicketIdOrSlug,

@@ -312,17 +312,17 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
             (
                 "ticket.relation.read",
                 "Read Ticket relations",
-                "Read selected Ticket relations.",
+                "Read selected Ticket relation and bounded parent/children link metadata; grants no access to relative Ticket bodies.",
             ),
             (
                 "ticket.relation.record",
                 "Record Ticket relation",
-                "Record an explicit relation from this Ticket.",
+                "Record an explicit relation or parent link on the authorized endpoints; reparenting also requires removal authority for the old link.",
             ),
             (
                 "ticket.relation.remove",
                 "Remove Ticket relation",
-                "Remove an exact relation from this Ticket.",
+                "Remove an exact relation or observed parent link on the authorized endpoints.",
             ),
             (
                 "ticket.orchestration_plan.record",

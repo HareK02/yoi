@@ -70,6 +70,12 @@ pub(super) fn declaration(operation: &str, item: bool) -> Option<ReturnDeclarati
             field("next_cursor", false, TypeExpr::String),
             field("has_more", true, TypeExpr::Boolean),
         ]),
+        "children_query" => record(vec![
+            field("entry", true, TypeExpr::Entry),
+            field("items", true, list(item_type(true))),
+            field("next_cursor", false, TypeExpr::String),
+            field("has_more", true, TypeExpr::Boolean),
+        ]),
         "create" => item_type(true),
         "notification_diagnostics" => item_type(false),
         _ if item => item_type(true),
@@ -148,6 +154,9 @@ impl References {
         let mut refs = Self::default();
         match operation {
             "query" | "read" => {
+                if let Some(parent) = data.get("parent_link").and_then(|link| link.get("parent")) {
+                    add(&mut refs.tickets, parent, "resource_key");
+                }
                 // ModelTicketQueryItem/ModelTicketDetail contain redacted, bounded relationships.
                 if let Some(relations) = data.get("relations") {
                     for kind in ["outgoing", "incoming", "blockers"] {
@@ -186,6 +195,11 @@ impl References {
                             add(&mut refs.tickets, relation, field);
                         }
                     }
+                }
+            }
+            "parent_set" => {
+                if let Some(parent) = data.get("parent") {
+                    add(&mut refs.tickets, parent, "resource_key");
                 }
             }
             "record_relation" | "remove_relation" => {
@@ -313,14 +327,15 @@ pub(super) fn project(
     objective_root: &str,
 ) -> Result<WipValue, WipOperationError> {
     match operation {
-        "query" => {
+        "query" | "children_query" => {
+            let children = operation == "children_query";
             let items = data
-                .get("tickets")
+                .get(if children { "items" } else { "tickets" })
                 .and_then(Value::as_array)
                 .ok_or_else(|| failure("missing bounded items"))?
                 .iter()
                 .map(|data| {
-                    let id = leaf(data, "ticket")
+                    let id = leaf(data, if children { "resource_key" } else { "ticket" })
                         .filter(|id| is_canonical_ticket_resource_key(id))
                         .ok_or_else(|| failure("missing canonical subject"))?;
                     envelope(
@@ -343,6 +358,15 @@ pub(super) fn project(
             ]);
             if let Some(cursor) = leaf(&data, "next_cursor") {
                 fields.insert("next_cursor".into(), WipValue::String(cursor));
+            }
+            if children {
+                let parent = bound
+                    .filter(|id| ticket_leaf(id))
+                    .ok_or_else(|| failure("missing children parent subject"))?;
+                fields.insert(
+                    "entry".into(),
+                    WipValue::String(format!("{ticket_root}/{parent}")),
+                );
             }
             Ok(WipValue::Record(fields))
         }

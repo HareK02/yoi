@@ -1061,7 +1061,7 @@ fn bounded_content13_reopens_after_failed_subject_upgrade_then_migrates_atomical
         .unwrap();
     migrate_sqlite_ticket_schema(&conn).unwrap();
     verify_sqlite_ticket_schema(&conn).unwrap();
-    assert_eq!(max_component(&conn), 15);
+    assert_eq!(max_component(&conn), 16);
     assert_eq!(
         &rows(&conn, "ticket_schema_migrations")[..receipts.len()],
         receipts.as_slice()

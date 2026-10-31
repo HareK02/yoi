@@ -19,6 +19,8 @@ mod subject_body_tests;
 mod subject_job_model_supply;
 #[path = "subject_permission_management_tests.rs"]
 mod subject_permission_management;
+#[path = "ticket_parent_connected_tests.rs"]
+mod ticket_parent_connected;
 #[path = "ticket_worker_messaging_connected_tests.rs"]
 mod ticket_worker_messaging_connected;
 #[path = "worker_messaging_connected_tests.rs"]

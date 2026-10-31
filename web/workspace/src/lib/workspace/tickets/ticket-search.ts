@@ -2,6 +2,7 @@ import type {
   TicketAssignmentPrincipalSnapshot,
   TicketBrowseQueryRequest,
   TicketClosureReason,
+  TicketParentFilter,
   WorkspaceTag,
 } from "../../generated/ticket-api.ts";
 
@@ -136,7 +137,7 @@ export function compileTicketSearch(
   const tagIds = new Set<string>();
   const singletons = new Map<string, string>();
   for (const token of tokens(input)) {
-    const match = /^(state|tag|assignee|reason):(.*)$/s.exec(token);
+    const match = /^(state|tag|assignee|reason|parent):(.*)$/s.exec(token);
     if (!match) {
       // 未知のqualifierやURLはそのまま残す。引用された通常文もfilterとして解釈しない。
       text.push(
@@ -163,6 +164,19 @@ export function compileTicketSearch(
         canonical = value;
         request.states = value === "all" ? [] : [value];
         break;
+      case "parent": {
+        if (value !== "none" && !/^T-[1-9][0-9]*$/.test(value)) {
+          throw new Error(
+            "Invalid parent: value; use none or a Ticket key such as T-804.",
+          );
+        }
+        const parent: TicketParentFilter = value === "none"
+          ? { kind: "none" }
+          : { kind: "parent", ticket: value };
+        request.parent = parent;
+        canonical = JSON.stringify(parent);
+        break;
+      }
       case "assignee":
         request.assigned_principal = principal(value);
         canonical = JSON.stringify(request.assigned_principal);

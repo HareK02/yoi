@@ -439,6 +439,34 @@ fn validate_ticket_browser_operations(
 ) -> Result<BTreeSet<String>, GenerationError> {
     let operations = [
         OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/link-summary",
+            method: "get",
+            operation_id: "ticket_link_summary_get",
+            request: None,
+            successes: &[("200", "TicketLinkSummary")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/parent",
+            method: "get",
+            operation_id: "ticket_parent_get",
+            request: None,
+            successes: &[("200", "TicketParentLink")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/parent",
+            method: "put",
+            operation_id: "ticket_parent_set",
+            request: Some("TicketParentSetRequest"),
+            successes: &[("200", "TicketParentLink")],
+        },
+        OperationContract {
+            path: "/api/w/{workspace_id}/tickets/{id}/children",
+            method: "get",
+            operation_id: "ticket_children_query",
+            request: None,
+            successes: &[("200", "TicketChildrenPage")],
+        },
+        OperationContract {
             path: "/api/w/{workspace_id}/ticket-tags",
             method: "get",
             operation_id: "workspace_ticket_tag_list",

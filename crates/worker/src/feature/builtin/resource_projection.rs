@@ -47,6 +47,7 @@ struct ModelTicketTarget {
 
 #[derive(Debug, Serialize)]
 pub(super) struct ModelTicketDetail {
+    parent_link: ticket::TicketParentLink,
     ticket: String,
     content_digest: String,
     title: String,
@@ -351,6 +352,7 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(ModelTicketDetail {
+        parent_link: typed_field(root, "parent_link")?,
         ticket: resource_ref(root, "resource_key", "T-")?,
         content_digest: string_field(root, "content_digest")?,
         title: string_field(root, "title")?,
@@ -850,6 +852,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn parent_fixture() -> Value {
+        json!({"ticket_id":"fixture-ticket", "observation":{"parent_ticket_id":null,"last_operation_key":null},"parent":null})
+    }
+
     fn post_fixture(initial: bool, body: &str) -> Value {
         json!({
             "sequence": if initial { 0 } else { 1 },
@@ -864,7 +870,7 @@ mod tests {
     #[test]
     fn mrless_evidence_is_inapplicable_not_missing_or_vacuously_approved() {
         for state in ["open", "closed"] {
-            let projected = project_ticket_detail(json!({
+            let projected = project_ticket_detail(json!({ "parent_link": parent_fixture(),
                 "resource_key": "T-718", "assignment_tracking": [], "tags": [], "content_digest": "rev-1", "title": "No Git required", "body": "Decision", "body_truncated": false, "targets": [], "initial_post": post_fixture(true, "Decision"),
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
                 "state": state, "events": [post_fixture(false, "No Git needed")],
@@ -907,6 +913,7 @@ mod tests {
             "queued_by": "workspace-user:alice", "queued_at": "2025-12-31T00:00:00Z", "resolution": null
         });
         let response = json!({
+            "parent_link": parent_fixture(),
             "assignment_tracking": [], "tags": [{"workspace_id":"ws", "id":"tag-1", "name":"closed", "last_operation_key":"tag-create", "deleted":false}],
             "resource_key": "T-739", "content_digest": "content-digest", "title": "Case", "body": "Requirements", "body_truncated": false, "targets": [], "initial_post": post_fixture(true, "Requirements"),
             "state": "open", "closure_operation_key": "close-1", "current_closure": null,
@@ -1053,7 +1060,7 @@ mod tests {
 
     #[test]
     fn ticket_detail_projection_accepts_current_blocker_shape() {
-        let projected = project_ticket_detail(json!({
+        let projected = project_ticket_detail(json!({ "parent_link": parent_fixture(),
             "id": "internal-ticket",
             "resource_key": "T-588", "assignment_tracking": [], "tags": [],
             "content_digest": "ticket-content-digest",
@@ -1158,7 +1165,7 @@ mod tests {
                 "integration_evidence_error": integration_error,
                 "review_excerpt": "Reviewed source"
             });
-            let projected = project_ticket_detail(json!({
+            let projected = project_ticket_detail(json!({ "parent_link": parent_fixture(),
                 "resource_key": "T-716", "assignment_tracking": [], "tags": [],
                 "content_digest": "current-ticket-content-digest",
                 "closure_operation_key": null, "current_closure": null, "closure_history": [], "legacy_handoff": null,
@@ -1346,7 +1353,7 @@ mod tests {
         let tag = json!({"workspace_id":"ws", "id":"tag-1", "name":"closed", "last_operation_key":"tag-create", "deleted":false});
         let closure = json!({"operation_key":"close-1", "reason":"not_planned", "explanation":"Not proceeding", "references":[{"kind":"ticket", "target":"T-12"}], "author":"workspace-user:alice", "at":"2026-01-01T00:00:00Z"});
         let history = json!([{"operation_key":"close-1", "previous_closure_operation_key":null, "action":{"action":"close", "reason":"not_planned"}, "explanation":"Not proceeding", "references":[{"kind":"ticket", "target":"T-12"}], "author":"workspace-user:alice", "at":"2026-01-01T00:00:00Z"}]);
-        let detail = json!({
+        let detail = json!({ "parent_link": parent_fixture(),
             "resource_key":"T-739", "title":"Case", "body":"Requirements", "body_truncated":false, "targets":[], "initial_post":post_fixture(true, "Requirements"), "created_by":"workspace-user:creator", "content_digest":"content-1",
             "state":"closed", "assignment_tracking": [tracking], "tags":[tag], "closure_operation_key":"close-1", "current_closure":closure,
             "legacy_handoff":null, "closure_history":history, "events":[], "linked_objectives":[], "assignments":[], "implementation_reports":[], "merge_requests":[]

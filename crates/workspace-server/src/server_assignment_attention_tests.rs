@@ -57,6 +57,7 @@ fn grant_test_assignment_ticket(api: &WorkspaceApi, subject_id: &str, ticket_id:
         ticket_id,
         &[
             "ticket.read",
+            "ticket.relation.read",
             "ticket.assignment.query",
             "ticket.assignment.history",
             "ticket.implementation_result.write",

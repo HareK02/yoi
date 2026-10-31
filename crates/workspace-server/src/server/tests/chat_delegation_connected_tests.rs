@@ -718,6 +718,7 @@ async fn connected_chat_delegation(scenario: Scenario) {
         let other_assignment = assigned["assignment"]["assignment_id"].clone();
         for (id, name) in [
             (&ticket, "ticket.read"),
+            (&ticket, "ticket.relation.read"),
             (&ticket, "ticket.assignment.assign"),
             (&ticket, "ticket.implementation_result.read"),
             (&other_ticket, "ticket.assignment.assign"),
@@ -730,7 +731,11 @@ async fn connected_chat_delegation(scenario: Scenario) {
                 },
             });
         }
-        for name in ["ticket.read", "ticket.implementation_result.write"] {
+        for name in [
+            "ticket.read",
+            "ticket.relation.read",
+            "ticket.implementation_result.write",
+        ] {
             child_permissions.push(ScopedPermission {
                 operation: name.into(),
                 resource: PermissionResource::Ticket {

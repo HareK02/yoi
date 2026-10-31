@@ -128,6 +128,10 @@ mod schema_convergence {
                             version: 112,
                             name: "Ticket Service outbox and fenced consumers".into(),
                         },
+                        WorkspaceSchemaMigrationStep {
+                            version: 113,
+                            name: "Ticket work-decomposition parent links".into(),
+                        },
                     ]
                 );
                 assert_eq!(
@@ -151,6 +155,7 @@ mod schema_convergence {
                     expected.push((110, "Worker Plugin launch selection associations".into()));
                     expected.push((111, "Typed Plugin Ticket extension data and atomic mutation receipts".into()));
                     expected.push((112, "Ticket Service outbox and fenced consumers".into()));
+                    expected.push((113, "Ticket work-decomposition parent links".into()));
                     assert_eq!(workspace_schema_migration_history(conn)?, expected);
                     for table in ["passkey_credentials", "passkey_metadata", "passkey_addition_receipts", "backend_jobs", "backend_job_attempts"] {
                         assert_eq!(state_contract_schema_signature(conn, table), fresh.with_conn(|c| Ok(state_contract_schema_signature(c, table)))?, "{table}");

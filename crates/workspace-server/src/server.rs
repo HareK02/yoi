@@ -8094,6 +8094,18 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::workspace_ticket_tag_mutate(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::ticket_link_summary_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_parent_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_parent_set(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::ticket_children_query(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::ticket_tags_set(
             service.clone(),
         ))
@@ -12290,11 +12302,20 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn ticket_get_alias(
         &self,
+        context: server_api::ServerRequestContext,
         id: String,
     ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
-        let Json(response) = get_ticket(State(self.workspace_api()?.clone()), AxumPath(id))
+        let Json(mut response) = get_ticket(State(self.workspace_api()?.clone()), AxumPath(id))
             .await
             .map_err(ApiError::into_repository_api_error)?;
+        project_ticket_parent_eligibility(
+            self.workspace_api()?,
+            &self.workspace_api()?.config.workspace_id,
+            &context,
+            &mut response,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
         Ok(response)
     }
 
@@ -12858,6 +12879,114 @@ impl server_api::ServerApi for ServerApiContractService {
         Ok(server_api::WorkspaceTicketTag(value))
     }
 
+    async fn ticket_link_summary_get(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+    ) -> std::result::Result<server_api::TicketLinkSummaryResponse, server_api::RepositoryApiError>
+    {
+        let api = self.workspace_api()?.clone();
+        let headers = contract_request_headers(&context)?;
+        api.host_executors
+            .host()
+            .map_err(ApiError::from)
+            .map_err(ApiError::into_repository_api_error)?
+            .run(move || {
+                validate_workspace_scope(&api, &workspace_id)?;
+                let id = resolve_workspace_ticket_reference(&api, &workspace_id, &id)?;
+                if let Some(source) = authenticated_ticket_worker_source(&headers, &context)? {
+                    authorize_ticket_relation_read(&api, &workspace_id, &source, &id)?;
+                }
+                let summary = browser_ticket_backend(&api)?
+                    .read_link_summary(TicketIdOrSlug::Id(id))
+                    .map_err(Error::from)?;
+                Ok::<_, ApiError>(server_api::TicketLinkSummaryResponse(summary))
+            })
+            .await
+            .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn ticket_parent_get(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+    ) -> std::result::Result<server_api::TicketParentResponse, server_api::RepositoryApiError> {
+        let result = execute_ticket_rest_operation_with_context(
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            Some(&context),
+            TicketBackendOperation::ParentLink {
+                id: TicketIdOrSlug::Query(id),
+            },
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        let Json(value) = ticket_rest_result(result, |result| match result {
+            TicketBackendOperationResult::ParentLink(value) => Some(value),
+            _ => None,
+        })
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketParentResponse(value))
+    }
+
+    async fn ticket_parent_set(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketParentRequest,
+    ) -> std::result::Result<server_api::TicketParentResponse, server_api::RepositoryApiError> {
+        let result = execute_ticket_rest_operation_with_context(
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            Some(&context),
+            TicketBackendOperation::SetParentLink {
+                id: TicketIdOrSlug::Query(id),
+                request: request.0,
+            },
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        let Json(value) = ticket_rest_result(result, |result| match result {
+            TicketBackendOperationResult::ParentLink(value) => Some(value),
+            _ => None,
+        })
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketParentResponse(value))
+    }
+
+    async fn ticket_children_query(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        id: String,
+        request: server_api::TicketChildrenQuery,
+    ) -> std::result::Result<server_api::TicketChildrenResponse, server_api::RepositoryApiError>
+    {
+        let result = execute_ticket_rest_operation_with_context(
+            self.workspace_api()?,
+            &workspace_id,
+            contract_request_headers(&context)?,
+            Some(&context),
+            TicketBackendOperation::ChildrenPage {
+                id: TicketIdOrSlug::Query(id),
+                request: request.0,
+            },
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        let Json(value) = ticket_rest_result(result, |result| match result {
+            TicketBackendOperationResult::ChildrenPage(value) => Some(value),
+            _ => None,
+        })
+        .map_err(ApiError::into_repository_api_error)?;
+        Ok(server_api::TicketChildrenResponse(value))
+    }
+
     async fn ticket_tags_set(
         &self,
         context: server_api::ServerRequestContext,
@@ -12962,12 +13091,24 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn ticket_get(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         id: String,
     ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
-        let Json(response) = scoped_get_ticket(
+        let Json(mut response) = scoped_get_ticket(
             State(self.workspace_api()?.clone()),
-            AxumPath(ScopedRecordPath { workspace_id, id }),
+            AxumPath(ScopedRecordPath {
+                workspace_id: workspace_id.clone(),
+                id,
+            }),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_ticket_parent_eligibility(
+            self.workspace_api()?,
+            &workspace_id,
+            &context,
+            &mut response,
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
@@ -12981,11 +13122,22 @@ impl server_api::ServerApi for ServerApiContractService {
         id: String,
         request: server_api::BrowserEditTicketRequest,
     ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
-        let Json(response) = scoped_edit_ticket_item(
+        let Json(mut response) = scoped_edit_ticket_item(
             State(self.workspace_api()?.clone()),
             &context,
-            AxumPath(ScopedRecordPath { workspace_id, id }),
+            AxumPath(ScopedRecordPath {
+                workspace_id: workspace_id.clone(),
+                id,
+            }),
             Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_ticket_parent_eligibility(
+            self.workspace_api()?,
+            &workspace_id,
+            &context,
+            &mut response,
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
@@ -13011,13 +13163,21 @@ impl server_api::ServerApi for ServerApiContractService {
         event_ref: String,
         request: server_api::TicketPostEditRequest,
     ) -> std::result::Result<TicketDetail, server_api::RepositoryApiError> {
-        let Json(detail) = scoped_edit_ticket_post(
+        let Json(mut detail) = scoped_edit_ticket_post(
             self.workspace_api()?.clone(),
-            context,
-            workspace_id,
+            context.clone(),
+            workspace_id.clone(),
             id,
             event_ref,
             request,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_ticket_parent_eligibility(
+            self.workspace_api()?,
+            &workspace_id,
+            &context,
+            &mut detail,
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
@@ -13026,14 +13186,26 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn ticket_show(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         id: String,
         request: server_api::TicketShowRequest,
     ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
-        let Json(response) = scoped_show_ticket(
+        let Json(mut response) = scoped_show_ticket(
             State(self.workspace_api()?.clone()),
-            AxumPath(ScopedRecordPath { workspace_id, id }),
+            AxumPath(ScopedRecordPath {
+                workspace_id: workspace_id.clone(),
+                id,
+            }),
             Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_ticket_parent_eligibility(
+            self.workspace_api()?,
+            &workspace_id,
+            &context,
+            &mut response,
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
@@ -13479,14 +13651,26 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn ticket_implementation_cancel(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         id: String,
         request: server_api::CancelTicketImplementationRequest,
     ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
-        let Json(response) = scoped_cancel_ticket_implementation(
+        let Json(mut response) = scoped_cancel_ticket_implementation(
             State(self.workspace_api()?.clone()),
-            AxumPath(ScopedRecordPath { workspace_id, id }),
+            AxumPath(ScopedRecordPath {
+                workspace_id: workspace_id.clone(),
+                id,
+            }),
             Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_ticket_parent_eligibility(
+            self.workspace_api()?,
+            &workspace_id,
+            &context,
+            &mut response,
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
@@ -13505,11 +13689,22 @@ impl server_api::ServerApi for ServerApiContractService {
             reason: request.reason,
             intake_summary: request.intake_summary,
         };
-        let Json(response) = scoped_mark_ticket_ready_from_browser(
+        let Json(mut response) = scoped_mark_ticket_ready_from_browser(
             State(self.workspace_api()?.clone()),
             contract_request_headers(&context)?,
-            AxumPath(ScopedRecordPath { workspace_id, id }),
+            AxumPath(ScopedRecordPath {
+                workspace_id: workspace_id.clone(),
+                id,
+            }),
             Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_ticket_parent_eligibility(
+            self.workspace_api()?,
+            &workspace_id,
+            &context,
+            &mut response,
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
@@ -13523,11 +13718,22 @@ impl server_api::ServerApi for ServerApiContractService {
         id: String,
         request: server_api::BrowserAppendTicketEventRequest,
     ) -> std::result::Result<server_api::TicketDetail, server_api::RepositoryApiError> {
-        let Json(response) = scoped_append_ticket_event(
+        let Json(mut response) = scoped_append_ticket_event(
             State(self.workspace_api()?.clone()),
             &context,
-            AxumPath(ScopedRecordPath { workspace_id, id }),
+            AxumPath(ScopedRecordPath {
+                workspace_id: workspace_id.clone(),
+                id,
+            }),
             Json(request),
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)?;
+        project_ticket_parent_eligibility(
+            self.workspace_api()?,
+            &workspace_id,
+            &context,
+            &mut response,
         )
         .await
         .map_err(ApiError::into_repository_api_error)?;
@@ -18603,6 +18809,9 @@ fn execute_ticket_rest_operation_on_host(
             _ => unreachable!(),
         }
     }
+    if let Some(source) = source.as_ref() {
+        authorize_ticket_parent_operation(api, workspace_id, source, &operation)?;
+    }
     validate_ticket_repository_operation(api, &operation)?;
     let before = target.as_ref().and_then(|id| backend.show(id.clone()).ok());
     let mut ticket_item_check = source
@@ -18748,6 +18957,19 @@ fn execute_ticket_rest_operation_on_host(
             None,
         ),
     };
+    if !is_mutation && let Some(source) = source.as_ref() {
+        match &result {
+            TicketBackendOperationResult::ParentLink(link) => {
+                authorize_ticket_parent_metadata(api, workspace_id, source, link)?;
+            }
+            TicketBackendOperationResult::ChildrenPage(page) => {
+                for child in &page.items {
+                    authorize_ticket_relation_read(api, workspace_id, source, &child.id)?;
+                }
+            }
+            _ => {}
+        }
+    }
     // All committed facts enter the same routing policy, including reasons for
     // non-notification. Waking the dispatcher is not itself a request to a Worker.
     if is_mutation {
@@ -21078,6 +21300,130 @@ async fn scoped_ticket_doctor(
 
 type WorkerMutationSource = RuntimeWorkerRef;
 
+async fn project_ticket_parent_eligibility(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    context: &server_api::ServerRequestContext,
+    detail: &mut server_api::TicketDetail,
+) -> ApiResult<()> {
+    let headers =
+        contract_request_headers(context).map_err(|error| Error::Config(error.message))?;
+    if let Some(source) = authenticated_ticket_worker_source(&headers, context)? {
+        let executor = api.host_executors.host()?;
+        let api = api.clone();
+        let workspace_id = workspace_id.to_owned();
+        let link = detail.parent_link.clone();
+        executor
+            .run(move || authorize_ticket_parent_metadata(&api, &workspace_id, &source, &link))
+            .await?;
+    }
+    detail.action_eligibility.can_set_parent = match context.actor.as_ref() {
+        Some(actor) if context.runtime_source.is_none() && context.worker_source.is_none() => api
+            .store
+            .get_workspace(workspace_id)
+            .await?
+            .is_some_and(|workspace| {
+                workspace.owner_account_id == actor.account_id && workspace.state == "active"
+            }),
+        _ => false,
+    };
+    Ok(())
+}
+
+fn authorize_ticket_relation_read(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    source: &RuntimeWorkerRef,
+    id: &str,
+) -> ApiResult<()> {
+    subject_authorization::authorize(
+        api,
+        source,
+        &server_api::authorization::OperationAuthorizationRequest {
+            operation: "ticket.relation.read".into(),
+            resource: server_api::authorization::PermissionResource::Ticket {
+                workspace_id: workspace_id.into(),
+                ticket_id: id.into(),
+            },
+        },
+    )?;
+    Ok(())
+}
+
+fn authorize_ticket_parent_metadata(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    source: &RuntimeWorkerRef,
+    link: &ticket::TicketParentLink,
+) -> ApiResult<()> {
+    authorize_ticket_relation_read(api, workspace_id, source, &link.ticket_id)?;
+    if let Some(parent) = &link.parent {
+        authorize_ticket_relation_read(api, workspace_id, source, &parent.id)?;
+    }
+    Ok(())
+}
+
+// Parent links reuse relation permissions on the actual edge endpoints. A link
+// never grants body-read, mutation, assignment or execution rights to relatives.
+fn authorize_ticket_parent_operation(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    source: &RuntimeWorkerRef,
+    operation: &TicketBackendOperation,
+) -> ApiResult<()> {
+    fn reference(id: &TicketIdOrSlug) -> &str {
+        match id {
+            TicketIdOrSlug::Id(id) | TicketIdOrSlug::Slug(id) | TicketIdOrSlug::Query(id) => id,
+        }
+    }
+    let authorize = |name: &str, reference: &str| -> ApiResult<String> {
+        let ticket_id = resolve_workspace_ticket_reference(api, workspace_id, reference)?;
+        subject_authorization::authorize(
+            api,
+            source,
+            &server_api::authorization::OperationAuthorizationRequest {
+                operation: name.into(),
+                resource: server_api::authorization::PermissionResource::Ticket {
+                    workspace_id: workspace_id.into(),
+                    ticket_id: ticket_id.clone(),
+                },
+            },
+        )?;
+        Ok(ticket_id)
+    };
+    match operation {
+        TicketBackendOperation::ParentLink { id }
+        | TicketBackendOperation::ChildrenPage { id, .. } => {
+            authorize("ticket.relation.read", reference(id))?;
+        }
+        TicketBackendOperation::SetParentLink { id, request } => {
+            let desired = request
+                .parent
+                .as_deref()
+                .map(|parent| authorize("ticket.relation.record", parent))
+                .transpose()?;
+            // The receipt projects the desired parent's metadata. Check read access
+            // before committing, never return a new denial after a successful write.
+            authorize("ticket.relation.read", reference(id))?;
+            if let Some(parent) = desired.as_deref() {
+                authorize("ticket.relation.read", parent)?;
+                authorize("ticket.relation.record", reference(id))?;
+            }
+            if desired.is_none()
+                || (request.expected.parent_ticket_id.is_some()
+                    && request.expected.parent_ticket_id != desired)
+            {
+                authorize("ticket.relation.remove", reference(id))?;
+                if let Some(old) = request.expected.parent_ticket_id.as_deref() {
+                    authorize("ticket.relation.remove", old)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn ticket_mutation_target(operation: &TicketBackendOperation) -> Option<&TicketIdOrSlug> {
     match operation {
         TicketBackendOperation::EditItem { id, .. }
@@ -21088,6 +21434,7 @@ fn ticket_mutation_target(operation: &TicketBackendOperation) -> Option<&TicketI
         | TicketBackendOperation::MarkReady { id, .. }
         | TicketBackendOperation::QueueReady { id, .. }
         | TicketBackendOperation::SetTicketTags { id, .. }
+        | TicketBackendOperation::SetParentLink { id, .. }
         | TicketBackendOperation::AddTicketRelation { id, .. }
         | TicketBackendOperation::RemoveTicketRelation { id, .. }
         | TicketBackendOperation::AddOrchestrationPlanRecord { id, .. } => Some(id),
@@ -21155,6 +21502,7 @@ fn ticket_mutation_operation_kind(operation: &TicketBackendOperation) -> &'stati
         TicketBackendOperation::QueueReady { .. } => "queue_ready",
         TicketBackendOperation::MutateWorkspaceTag { .. } => "mutate_workspace_tag",
         TicketBackendOperation::SetTicketTags { .. } => "set_ticket_tags",
+        TicketBackendOperation::SetParentLink { .. } => "set_parent",
         TicketBackendOperation::AddTicketRelation { .. } => "add_relation",
         TicketBackendOperation::RemoveTicketRelation { .. } => "remove_relation",
         TicketBackendOperation::AddOrchestrationPlanRecord { .. } => "add_plan_record",
@@ -39395,6 +39743,9 @@ mod tests {
 
     mod ticket_tags_tests {
         include!("server_ticket_tags_tests.rs");
+        mod parent_link_tests {
+            include!("server_ticket_parent_tests.rs");
+        }
     }
 
     mod ticket_browse_tests {

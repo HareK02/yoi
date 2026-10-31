@@ -473,7 +473,7 @@ async fn reviewer_reads_saved_related_tickets_by_key_and_id_and_pages_their_thre
             &api,
             &ensure_test_assignment_subject(&api),
             &related.id,
-            &["ticket.read"],
+            &["ticket.read", "ticket.relation.read"],
         );
         for (reference, expected_key, expected_title, expected_body) in [
             (

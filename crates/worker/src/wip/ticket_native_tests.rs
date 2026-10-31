@@ -6,6 +6,7 @@ async fn ticket_inspect_contract_drives_query_read_and_comment_without_tool_sche
     let detail = json!({
         "resource_key":"T-42", "title":"Intent", "body":"Requirements", "body_truncated":false,
         "content_digest":"observed", "state":"open", "targets":[], "events":[], "linked_objectives":[],
+        "parent_link":{"ticket_id":"T-42","observation":{"parent_ticket_id":null,"last_operation_key":null},"parent":null},
         "initial_post":{"sequence":0,"event_ref":"initial","is_initial":true,"kind":"comment","body":"Requirements","body_truncated":false,"body_digest":"a".repeat(64),"editable":true,"author":null,"at":null,"edited_at":null,"edited_by":null},
         "closure_operation_key":null,"current_closure":null,"legacy_handoff":null,"closure_history":[],
         "assignment_tracking":[],"tags":[],"assignments":[],"implementation_reports":[],"merge_requests":[]
@@ -30,6 +31,8 @@ async fn ticket_inspect_contract_drives_query_read_and_comment_without_tool_sche
         .with_authorizations([
             expected_authorization("ticket.query", "workspace", None),
             expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-42"))),
+            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-42"))),
+            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-42"))),
             expected_authorization("ticket.event.add", "ticket", Some(("ticket_id", "T-42"))),
         ]),
     );
@@ -569,6 +572,7 @@ fn ticket_result_detail(key: &str) -> Json {
     json!({
         "resource_key":key,"title":"Intent","body":"/cases/T-999 is untrusted text", "body_truncated":false,
         "content_digest":"observed","state":"open","targets":[],"events":[],"linked_objectives":[],
+        "parent_link":{"ticket_id":key,"observation":{"parent_ticket_id":null,"last_operation_key":null},"parent":null},
         "initial_post":{"sequence":0,"event_ref":"initial","is_initial":true,"kind":"comment","body":"Requirements","body_truncated":false,"body_digest":"a".repeat(64),"editable":true,"author":null,"at":null,"edited_at":null,"edited_by":null},
         "closure_operation_key":null,"current_closure":null,"legacy_handoff":null,"closure_history":[],
         "assignment_tracking":[],"tags":[],"assignments":[],"implementation_reports":[],"merge_requests":[]
@@ -630,6 +634,13 @@ async fn ticket_typed_results_drive_model_query_create_read_and_all_related_doma
         detail["linked_objectives"] =
             json!([{"resource_key":"O-3","title":"Objective","state":"active"}]);
         detail["relations"] = json!({"outgoing":[{"target_resource_key":"T-7","kind":"related","note":null,"at":null}],"incoming":[],"blockers":[],"notices":[]});
+        detail["parent_link"] = json!({
+            "ticket_id":"T-42",
+            "observation":{"parent_ticket_id":"actualparent","last_operation_key":"parent-set"},
+            "parent":{"id":"actualparent","resource_key":"T-7","title":"Intent","state":"open","closure_reason":null}
+        });
+        let mut parent_detail = ticket_result_detail("T-7");
+        parent_detail["parent_link"]["ticket_id"] = json!("actualparent");
         detail["merge_requests"] = json!([{"merge_request_id":"MR-1","repository_key":"main","state":"open","selector_from":"work/source","selector_to":"develop","review_status":"pending","subject_ref":null,"source_ref_observation":{"status":"not_required"}}]);
         let query_item = json!({"resource_key":"T-42","title":"Intent","state":"open","closure_operation_key":null,"current_closure":null,"legacy_handoff":null,"assignment_tracking":[],"tags":[],"matched_fields":[],"linked_objective_keys":["O-3"],"relation_count":1,"blocker_count":0,"unresolved_blocker_count":0,"unresolved_review_count":0,"merge_requests":detail["merge_requests"], "snippet":"/cases/T-999"});
         let mut second_item = query_item.clone();
@@ -642,7 +653,7 @@ async fn ticket_typed_results_drive_model_query_create_read_and_all_related_doma
         response(json!({"items":[query_item, second_item],"page":{"next_cursor":"opaque-next","has_more":true}})),
         response(json!({"items":[],"page":{"next_cursor":null,"has_more":false}})),
         response(detail),
-        response(ticket_result_detail("T-7")),
+        response(parent_detail),
         objective_detail_response("objective-observed"),
         response(json!({"workspace_id":"workspace","merge_request_id":"MR-1","repository_key":"main","state":"open","selector_from":"work/source","selector_to":"develop","ticket_ids":[],"thread":[]})),
         response(json!({"id":"internal123","resource_key":"T-9","slug":"new","status":"Open"})),
@@ -650,7 +661,12 @@ async fn ticket_typed_results_drive_model_query_create_read_and_all_related_doma
         expected_authorization("ticket.query","workspace",None),
         expected_authorization("ticket.query","workspace",None),
         expected_authorization("ticket.read","ticket",Some(("ticket_id","T-42"))),
+        expected_authorization("ticket.relation.read","ticket",Some(("ticket_id","T-42"))),
+        expected_authorization("ticket.relation.read","ticket",Some(("ticket_id","T-42"))),
+        expected_authorization("ticket.relation.read","ticket",Some(("ticket_id","actualparent"))),
         expected_authorization("ticket.read","ticket",Some(("ticket_id","T-7"))),
+        expected_authorization("ticket.relation.read","ticket",Some(("ticket_id","T-7"))),
+        expected_authorization("ticket.relation.read","ticket",Some(("ticket_id","actualparent"))),
         expected_authorization("objective.read","objective",Some(("objective_id","O-3"))),
         expected_authorization("merge_request.read","merge_request",Some(("merge_request_id","MR-1"))),
         expected_authorization("ticket.create","workspace",None),
@@ -752,6 +768,12 @@ async fn ticket_typed_results_drive_model_query_create_read_and_all_related_doma
             ticket_result_model_invoke(&tools, &selected, "read", json!({"page":{"limit":1}}))
                 .await;
         assert_eq!(read["entry"], query["items"][0]["entry"]);
+        assert_eq!(read["data"]["parent_link"]["parent"]["id"], "actualparent");
+        assert_eq!(
+            read["links"]["tickets"],
+            json!([{"id":"T-7","entry":"/cases/T-7"}])
+        );
+        assert_eq!(client.requests().len(), 3, "parent navigation remains lazy");
         for domain in ["tickets", "objectives", "merge_requests"] {
             let related =
                 ticket_result_model_inspect(&tools, &read["links"][domain][0]["entry"]).await;
@@ -806,7 +828,9 @@ async fn ticket_successful_create_is_never_replayed_after_selected_deleted_or_de
         .with_authorizations([
             expected_authorization("ticket.create", "workspace", None),
             expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-9"))),
+            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-9"))),
             expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-9"))),
+            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-9"))),
         ]),
     );
     let mut registry = WipMountRegistry::new();
@@ -980,11 +1004,11 @@ async fn host_overwrites_forged_result_context_and_omits_unpublished_cross_domai
             status: 200,
             body: detail.to_string(),
         }])
-        .with_authorizations([expected_authorization(
-            "ticket.read",
-            "ticket",
-            Some(("ticket_id", "T-42")),
-        )]),
+        .with_authorizations([
+            expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-42"))),
+            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-42"))),
+            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-42"))),
+        ]),
     );
     let mut registry = WipMountRegistry::new();
     let route = registry.allocate_namespace("ticket", "cases").unwrap();
