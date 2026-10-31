@@ -942,13 +942,17 @@ async fn restore_guard_rejects_stale_list_and_stopped_restored_stopped_aba() {
         .restore(&WorkerOperationContext::Backend, stale_list.clone())
         .await
         .unwrap_err();
-    assert!(matches!(conflict.error, Error::RestoreObservationConflict));
-    let typed = conflict.into_repository_api_error();
-    assert_eq!(
-        api_error_status(&Error::RestoreObservationConflict),
-        StatusCode::CONFLICT
+    assert!(
+        matches!(conflict.error, Error::WorkerLifecycleObservationStale),
+        "{conflict:?}"
     );
-    assert_eq!(typed.error, "restore_observation_conflict");
+    assert_eq!(api_error_status(&conflict.error), StatusCode::CONFLICT);
+    let typed = conflict.into_repository_api_error();
+    assert_eq!(typed.error, "Conflict");
+    assert_eq!(
+        typed.message,
+        "Worker lifecycle observation is stale; this request was not accepted"
+    );
     handle
         .stop(&WorkerOperationContext::Backend, operation_lifecycle())
         .await
@@ -967,7 +971,7 @@ async fn restore_guard_rejects_stale_list_and_stopped_restored_stopped_aba() {
             .await
             .unwrap_err()
             .error,
-        Error::RestoreObservationConflict
+        Error::WorkerLifecycleObservationStale
     ));
     assert_eq!(api.runtime.worker(&identity).unwrap().state, "stopped");
     assert!(
@@ -1153,7 +1157,10 @@ async fn restore_guard_stale_ssh_intent_does_not_issue_workspace_resource() {
         .restore(&WorkerOperationContext::Backend, stale)
         .await
         .unwrap_err();
-    assert!(matches!(conflict.error, Error::RestoreObservationConflict));
+    assert!(
+        matches!(conflict.error, Error::WorkerLifecycleObservationStale),
+        "{conflict:?}"
+    );
     assert_eq!(
         api.resource_broker.repository_ssh_access_handle_count(),
         before
@@ -1330,7 +1337,10 @@ async fn restore_guard_internal_stale_conflict_retires_intent_for_later_explicit
             .unwrap();
         let count = execution.restore_operations.lock().unwrap().len();
         let error = restore_internal_worker_intent(&api, &identity, domain.into()).unwrap_err();
-        assert!(matches!(error.error, Error::RestoreObservationConflict));
+        assert!(
+            matches!(error.error, Error::WorkerLifecycleObservationStale),
+            "{error:?}"
+        );
         assert_eq!(
             execution.restore_operations.lock().unwrap().len(),
             count,
@@ -1439,7 +1449,10 @@ async fn restore_guard_internal_conflict_same_generation_has_distinct_fresh_inte
                 );
             }
             let error = restore_internal_worker_intent(&api, &identity, domain.into()).unwrap_err();
-            assert!(matches!(error.error, Error::RestoreObservationConflict));
+            assert!(
+                matches!(error.error, Error::RestoreObservationConflict),
+                "{error:?}"
+            );
             assert_eq!(execution.restore_operations.lock().unwrap().len(), count);
         }
     }
