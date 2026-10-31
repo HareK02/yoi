@@ -54,7 +54,8 @@ impl agen::llm_client::LlmClient for ConfigNoopLlmClient {
 // No fake config provider, copied tree, or fabricated attachment ledger is used.
 #[derive(Clone)]
 struct ConfigRouterClient {
-    api: WorkspaceApi,
+    // Reuse routing setup as serve() does; authentication and store reads still run per request.
+    router: Router,
     worker: RuntimeWorkerRef,
     identity: Arc<RuntimeIdentityMaterial>,
     runtime: tokio::runtime::Handle,
@@ -95,7 +96,7 @@ impl worker::WorkspaceClient for ConfigRouterClient {
             .unwrap()
             .push(format!("{method} {}", request.path));
         let is_commit = request.path.ends_with("/commit");
-        let api = self.api.clone();
+        let router = self.router.clone();
         let identity = self.identity.clone();
         let worker = self.worker.clone();
         let runtime = self.runtime.clone();
@@ -111,7 +112,7 @@ impl worker::WorkspaceClient for ConfigRouterClient {
                     &request.path,
                     body,
                 );
-                let response = build_router(api)
+                let response = router
                     .oneshot(signed)
                     .await
                     .map_err(|_| Failure::Request("router dispatch failed".into()))?;
@@ -304,7 +305,7 @@ impl ConfigBatchWipFixture {
         grant(&backend.api, &backend.worker, Access::ReadWrite).await;
         attach(&backend.api, &backend.worker).await;
         let client = Arc::new(ConfigRouterClient {
-            api: backend.api.clone(),
+            router: build_router(backend.api.clone()),
             worker: backend.worker.clone(),
             identity: Arc::new(identity),
             runtime: tokio::runtime::Handle::current(),
@@ -873,7 +874,7 @@ async fn workspace_config_real_selected_invoke_backend_wip_edit_create_delete_im
     configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
     let granted = grant(&fixture.api, &fixture.worker, Access::ReadWrite).await;
     let client = Arc::new(ConfigRouterClient {
-        api: fixture.api.clone(),
+        router: build_router(fixture.api.clone()),
         worker: fixture.worker.clone(),
         identity: Arc::new(identity),
         runtime: tokio::runtime::Handle::current(),
