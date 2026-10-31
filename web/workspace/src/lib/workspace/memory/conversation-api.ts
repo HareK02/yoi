@@ -224,7 +224,8 @@ async function request(
     throw new ConversationApiError(response.status);
   }
   try {
-    return await readBoundedJson(response, 2 * 1024 * 1024);
+    // 100件×16KiBの有効な本文はJSON escapeで6倍になり得る。
+    return await readBoundedJson(response, 16 * 1024 * 1024);
   } catch {
     throw new ConversationApiError(null);
   }

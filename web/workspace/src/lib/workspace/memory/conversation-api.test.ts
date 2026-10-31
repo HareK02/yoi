@@ -141,6 +141,29 @@ Deno.test("revisit uses the same account-scoped create input then reads authorit
   );
 });
 
+Deno.test("a full page of maximum-size JSON-escaped text fits the bounded public response reader", async () => {
+  const text = "x" + "\u0001".repeat(CHAT_LIMITS.maxTextBytes - 1);
+  const messages = Array.from(
+    { length: CHAT_LIMITS.maxPageLimit },
+    (_, index) => ({
+      ...message(index + 1),
+      text,
+    }),
+  );
+  const wire = JSON.stringify(page(messages));
+  assert(new TextEncoder().encode(wire).length > 2 * 1024 * 1024);
+  const fetchFn: typeof fetch = () => Promise.resolve(new Response(wire));
+  const result = await getConversationPage(
+    fetchFn,
+    scope,
+    conversation.id,
+    0,
+    new AbortController().signal,
+  );
+  assert(result.messages.length === CHAT_LIMITS.maxPageLimit);
+  assert(result.messages.at(-1)?.text === text);
+});
+
 Deno.test("ACK loss retains exact request bytes for explicit replay and accepted is not a reply", async () => {
   const saved = new Map<string, string>();
   const storage = {
