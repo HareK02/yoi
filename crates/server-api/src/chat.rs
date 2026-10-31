@@ -129,10 +129,52 @@ pub struct ChatMessagePage {
     pub has_more: bool,
 }
 
+#[cfg(feature = "typescript")]
+pub fn chat_api_typescript() -> String {
+    use crate::{ChatDelivery, ChatReceiveResponse};
+    use ts_rs::TS;
+
+    let config = ts_rs::Config::default();
+    let declarations = [
+        ChatConversation::decl(&config),
+        ChatMessageSender::decl(&config),
+        ChatMessage::decl(&config),
+        ChatCreateConversationRequest::decl(&config),
+        ChatUserMessageRequest::decl(&config),
+        ChatMessagePageQuery::decl(&config),
+        ChatMessagePage::decl(&config),
+        ChatDelivery::decl(&config),
+        ChatReceiveResponse::decl(&config),
+    ]
+    .into_iter()
+    .map(|declaration| format!("export {declaration}"))
+    .collect::<Vec<_>>()
+    .join("\n\n");
+    format!(
+        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_chat_api_types > web/workspace/src/lib/generated/chat-api.ts\n\nexport const CHAT_LIMITS = {{ maxTextBytes: {CHAT_MAX_TEXT_BYTES}, maxPageLimit: {CHAT_MAX_PAGE_LIMIT}, maxCounter: {CHAT_MAX_COUNTER} }} as const;\n\n{declarations}\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(feature = "typescript")]
+    #[test]
+    fn generated_chat_browser_contract_is_current() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../web/workspace/src/lib/generated/chat-api.ts");
+        let actual = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let normalize = |value: &str| {
+            value
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+        };
+        assert_eq!(normalize(&actual), normalize(&chat_api_typescript()));
+    }
 
     #[test]
     fn text_only_requests_reject_attachments_and_claimed_sender() {
