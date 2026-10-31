@@ -880,14 +880,16 @@ impl RuntimeRegistryError {
                 code,
                 message,
             } => {
-                if code == "restore_observation_conflict" {
+                if matches!(
+                    code.as_str(),
+                    "restore_observation_stale" | "stop_observation_conflict"
+                ) {
+                    Error::WorkerLifecycleObservationStale
+                } else if code == "restore_observation_conflict" {
                     Error::RestoreObservationConflict
                 } else if matches!(
                     code.as_str(),
-                    "stop_observation_conflict"
-                        | "stop_request_conflict"
-                        | "stop_admission_busy"
-                        | "restore_admission_busy"
+                    "stop_request_conflict" | "stop_admission_busy" | "restore_admission_busy"
                 ) {
                     Error::RepositoryConflict(message)
                 } else {
@@ -6674,6 +6676,11 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             "stop_request_conflict",
             HostDiagnosticSeverity::Warning,
             "Stop request ID was already used with different input",
+        ),
+        EmbeddedRuntimeError::RestoreObservationStale { .. } => diagnostic(
+            "restore_observation_stale",
+            HostDiagnosticSeverity::Warning,
+            "Restore observation changed; this request was not accepted",
         ),
         EmbeddedRuntimeError::RestoreObservationConflict { .. } => diagnostic(
             "restore_observation_conflict",

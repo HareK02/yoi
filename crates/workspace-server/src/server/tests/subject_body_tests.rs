@@ -4,6 +4,27 @@
 //! by the connected suites, not inferred from this projection/admission fixture.
 use super::*;
 
+pub(super) fn assert_failed_request(body: &Value, subject: &str, request: &str, resolution: &str) {
+    assert!(body["error"].is_string(), "{body}");
+    assert!(body["message"].is_string(), "{body}");
+    assert!(body["diagnostics"].is_array(), "{body}");
+    assert!(
+        body.get("status").is_none(),
+        "HTTP status is not a body field: {body}"
+    );
+    serde_json::from_value::<server_api::SubjectBodyApiError>(body.clone())
+        .expect("the actual HTTP error must satisfy the dedicated typed shape");
+    assert_eq!(
+        body["request"],
+        json!({
+            "workspace_id": TEST_WORKSPACE_ID,
+            "subject_id": subject,
+            "request_id": request,
+            "resolution": resolution,
+        })
+    );
+}
+
 struct BodyFixture {
     api: WorkspaceApi,
     owner: String,
@@ -120,6 +141,10 @@ async fn body_operations_reject_nonowners_and_cross_workspace_targets() {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body["request"].is_null(),
+            "authorization before action admission supplies no request resolution: {body}"
+        );
     }
     let path = f.path().replace(TEST_WORKSPACE_ID, "another-workspace");
     let (status, body) = response(&f.api, human_request(&f.owner, "GET", &path, None)).await;
@@ -196,11 +221,17 @@ async fn body_mutations_reject_an_old_generation_without_releasing_its_owner() {
                 &f.owner,
                 "POST",
                 &format!("{}{suffix}", f.path()),
-                Some(payload),
+                Some(payload.clone()),
             ),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_failed_request(
+            &body,
+            &f.subject,
+            payload["request_id"].as_str().unwrap(),
+            "superseded",
+        );
     }
     assert_eq!(
         f.read().await["current"],
@@ -279,4 +310,26 @@ async fn body_mutation_json_requires_explicit_identity_and_fences() {
         assert!(status.is_client_error(), "{status}: {body}");
     }
     assert!(f.read().await["current"].is_null());
+}
+
+#[tokio::test]
+async fn body_action_payload_rejection_cannot_claim_request_resolution() {
+    let f = BodyFixture::new().await;
+    for suffix in ["/start", "/stop", "/stop/outcome"] {
+        let (status, body) = response(
+            &f.api,
+            human_request(
+                &f.owner,
+                "POST",
+                &format!("{}{suffix}", f.path()),
+                Some(json!({"request_id":"unbound-malformed"})),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body["request"].is_null(),
+            "unparsed intent is not evidence: {body}"
+        );
+    }
 }

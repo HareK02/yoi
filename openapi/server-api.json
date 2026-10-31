@@ -14799,6 +14799,40 @@
         ],
         "type": "object"
       },
+      "SubjectBodyApiError": {
+        "additionalProperties": false,
+        "description": "Only action handlers with a causally bound request may provide resolution evidence.",
+        "properties": {
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "error": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "request": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SubjectBodyFailedRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "error",
+          "message",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
       "SubjectBodyDisposition": {
         "enum": [
           "accepted",
@@ -14806,6 +14840,30 @@
           "unknown"
         ],
         "type": "string"
+      },
+      "SubjectBodyFailedRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "request_id": {
+            "type": "string"
+          },
+          "resolution": {
+            "$ref": "#/components/schemas/SubjectBodyRequestResolution"
+          },
+          "subject_id": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "subject_id",
+          "request_id",
+          "resolution"
+        ],
+        "type": "object"
       },
       "SubjectBodyMutationResponse": {
         "additionalProperties": false,
@@ -14916,6 +14974,15 @@
           "generation"
         ],
         "type": "object"
+      },
+      "SubjectBodyRequestResolution": {
+        "description": "Resolution of this screen's intent, not a judgment about historical operation success.",
+        "enum": [
+          "not_accepted",
+          "superseded",
+          "unresolved"
+        ],
+        "type": "string"
       },
       "SubjectBodyResponse": {
         "additionalProperties": false,
@@ -23026,7 +23093,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:efcd8fd0911bdafcde6cebdb812649166e043377995a75d9cb9305af6294c28a"
+    "x-yoi-source-digest": "sha256:83296655378ab00d5b7d4ab344879bbae5069cec5853407c44ee0d562449134a"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -42368,7 +42435,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42378,7 +42445,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42388,7 +42455,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42398,7 +42465,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42408,7 +42475,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42418,7 +42485,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42485,7 +42552,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42495,7 +42562,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42505,7 +42572,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42515,7 +42582,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42525,7 +42592,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42535,7 +42602,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42602,7 +42669,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42612,7 +42679,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42622,7 +42689,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42632,7 +42699,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42642,7 +42709,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42652,7 +42719,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },
@@ -42662,7 +42729,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },

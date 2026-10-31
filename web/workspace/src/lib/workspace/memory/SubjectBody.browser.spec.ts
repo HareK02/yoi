@@ -9,6 +9,10 @@ import {
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { tick } from "svelte";
 import SubjectBody from "./SubjectBody.svelte";
+import type {
+  SubjectBodyApiError as BodyErrorResponse,
+  SubjectBodyFailedRequest,
+} from "#lib/generated/subject-body-api.ts";
 import {
   readSubjectBodyAttempt,
   subjectBodyStorageKey,
@@ -59,6 +63,31 @@ function available(state = "stopped", observationToken = "observation-1") {
     },
   };
 }
+function failedRequest(
+  request_id: string,
+  resolution: SubjectBodyFailedRequest["resolution"] | null,
+  status = 409,
+) {
+  const body: BodyErrorResponse = {
+    error: "Conflict",
+    message: "Body admission could not use the saved observation",
+    diagnostics: [{
+      code: "body_conflict",
+      severity: "warning",
+      message: "Refresh the current body observation",
+    }],
+    request: resolution
+      ? {
+        workspace_id: props.workspaceId,
+        subject_id: props.subjectId,
+        request_id,
+        resolution,
+      }
+      : null,
+  };
+  return Response.json(body, { status });
+}
+
 function savedStop(accountId = props.accountId) {
   return {
     accountId,
@@ -1220,26 +1249,39 @@ test("old generation rejection stays distinct from fresh body and requires a fre
       observation = available("idle", "generation-18-token");
       observation.current = { ...owner, generation: "18" };
       return Response.json({
-        request_id: request.request_id,
-        disposition: "rejected",
+        error: "Conflict",
+        message: "The current body generation changed",
         diagnostics: [{
           code: "stale_owner",
           severity: "warning",
           message:
             "The current body generation changed. Refresh before acting.",
         }],
-        body: observation,
-      });
+        request: {
+          workspace_id: props.workspaceId,
+          subject_id: props.subjectId,
+          request_id: request.request_id,
+          resolution: "superseded",
+        },
+      }, { status: 409 });
     }),
   );
   render(SubjectBody, props);
   await fireEvent.click(
     await screen.findByRole("button", { name: "Stop conversation body" }),
   );
-  await screen.findByText("Request rejected.");
+  await screen.findByText(/^Request superseded\./);
   await screen.findByText(
-    "The current body generation changed. Refresh before acting.",
+    /The current body generation changed\. Refresh before acting\./,
   );
+  expect(
+    readSubjectBodyAttempt(
+      sessionStorage,
+      props.accountId,
+      props.workspaceId,
+      props.subjectId,
+    ),
+  ).toBeNull();
   await waitFor(() =>
     expect(
       (screen.getByRole("button", {
@@ -1328,4 +1370,196 @@ test("unknown stop cannot restart on GET alone; confirmed outcome permits restar
   expect(request.expected_current).toEqual(owner);
   expect(request.expected_observation_token).toBe("after-confirmed-stop");
   expect(request.request_id).not.toBe(JSON.parse(posts[0].body).request_id);
+});
+
+test.each(["stale-token", "concurrent-absent-start"])(
+  "%s terminal admission permits only a new explicit action after refresh",
+  async (scenario) => {
+    let observation = scenario === "stale-token"
+      ? available("idle", "old-token")
+      : absent();
+    const posts: { path: string; body: string }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (path: string, init?: RequestInit) => {
+        if (init?.method !== "POST") return Response.json(observation);
+        posts.push({ path, body: init.body as string });
+        const request = JSON.parse(init.body as string);
+        observation = available("idle", "fresh-token");
+        return failedRequest(
+          request.request_id,
+          scenario === "stale-token" ? "not_accepted" : "superseded",
+        );
+      }),
+    );
+    const view = render(SubjectBody, props);
+    await fireEvent.click(
+      await screen.findByRole("button", {
+        name: scenario === "stale-token"
+          ? "Stop conversation body"
+          : "Start conversation body",
+      }),
+    );
+    await screen.findByText(
+      scenario === "stale-token"
+        ? /^Request not accepted\./
+        : /^Request superseded\./,
+    );
+    const stop = await screen.findByRole("button", {
+      name: "Stop conversation body",
+    });
+    await waitFor(() =>
+      expect((stop as HTMLButtonElement).disabled).toBe(false)
+    );
+    expect(posts).toHaveLength(1);
+    expect(
+      readSubjectBodyAttempt(
+        sessionStorage,
+        props.accountId,
+        props.workspaceId,
+        props.subjectId,
+      ),
+    ).toBeNull();
+    // 再読込みで未確定要求は復元されず、新しい操作も自動送信しない。
+    view.unmount();
+    render(SubjectBody, props);
+    const reloaded = await screen.findByRole("button", {
+      name: "Stop conversation body",
+    });
+    expect(posts).toHaveLength(1);
+    await fireEvent.click(reloaded);
+    await waitFor(() => expect(posts).toHaveLength(2));
+    const oldInput = JSON.parse(posts[0].body);
+    const nextInput = JSON.parse(posts[1].body);
+    expect(oldInput.expected_observation_token).toBe(
+      scenario === "stale-token" ? "old-token" : null,
+    );
+    expect(nextInput.expected_observation_token).toBe("fresh-token");
+    expect(nextInput.expected_current).toEqual(owner);
+    expect(nextInput.request_id).not.toBe(oldInput.request_id);
+    expect(posts[1].path.endsWith("/stop")).toBe(true);
+  },
+);
+
+test.each(["busy", "generic-conflict", "foreign-request", "unauthorized"])(
+  "%s does not settle or replace a saved request on refresh or reload",
+  async (scenario) => {
+    const posts: string[] = [];
+    let observation = available("idle", "old-token");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_path: string, init?: RequestInit) => {
+        if (init?.method !== "POST") return Response.json(observation);
+        const raw = init.body as string;
+        posts.push(raw);
+        const { request_id } = JSON.parse(raw);
+        observation = available("idle", "new-token");
+        return failedRequest(
+          scenario === "foreign-request" ? "foreign" : request_id,
+          scenario === "busy"
+            ? "unresolved"
+            : scenario === "generic-conflict"
+            ? null
+            : "not_accepted",
+          scenario === "unauthorized" ? 401 : 409,
+        );
+      }),
+    );
+    const view = render(SubjectBody, props);
+    await fireEvent.click(
+      await screen.findByRole("button", { name: "Stop conversation body" }),
+    );
+    await screen.findByText(/Request outcome unknown\. The request may/);
+    const key = subjectBodyStorageKey(
+      props.accountId,
+      props.workspaceId,
+      props.subjectId,
+    );
+    const saved = sessionStorage.getItem(key);
+    expect(saved).not.toBeNull();
+    const retry = await screen.findByRole("button", {
+      name: "Retry same stop request",
+    });
+    await waitFor(() =>
+      expect((retry as HTMLButtonElement).disabled).toBe(false)
+    );
+    await fireEvent.click(retry);
+    await waitFor(() => expect(posts).toHaveLength(2));
+    expect(posts[1]).toBe(posts[0]);
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("button", {
+          name: "Refresh body state",
+        }) as HTMLButtonElement).disabled,
+      ).toBe(false)
+    );
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Refresh body state" }),
+    );
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("button", {
+          name: "Refresh body state",
+        }) as HTMLButtonElement).disabled,
+      ).toBe(false)
+    );
+    expect(sessionStorage.getItem(key)).toBe(saved);
+    view.unmount();
+    render(SubjectBody, props);
+    await screen.findByRole("button", { name: "Retry same stop request" });
+    expect(screen.queryByRole("button", { name: "Stop conversation body" }))
+      .toBeNull();
+    expect(sessionStorage.getItem(key)).toBe(saved);
+    expect(posts).toHaveLength(2);
+  },
+);
+
+test("lost stop stays unknown until an identity-bound supersession from outcome permits a fresh explicit action", async () => {
+  let observation = available("idle");
+  const posts: { path: string; body: string }[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (path: string, init?: RequestInit) => {
+      if (init?.method !== "POST") return Response.json(observation);
+      posts.push({ path, body: init.body as string });
+      const { request_id } = JSON.parse(init.body as string);
+      if (path.endsWith("/outcome")) {
+        return failedRequest(request_id, "superseded");
+      }
+      observation = available("idle", "generation-18-token");
+      observation.current = { ...owner, generation: "18" };
+      throw new Error("response lost");
+    }),
+  );
+  render(SubjectBody, props);
+  await fireEvent.click(
+    await screen.findByRole("button", { name: "Stop conversation body" }),
+  );
+  await screen.findByText(/Request outcome unknown\. The request may/);
+  const key = subjectBodyStorageKey(
+    props.accountId,
+    props.workspaceId,
+    props.subjectId,
+  );
+  expect(sessionStorage.getItem(key)).not.toBeNull();
+  expect(screen.queryByRole("button", { name: "Stop conversation body" }))
+    .toBeNull();
+  await fireEvent.click(
+    await screen.findByRole("button", { name: "Check stop outcome" }),
+  );
+  await screen.findByText(/^Request superseded\./);
+  expect(sessionStorage.getItem(key)).toBeNull();
+  expect(posts).toHaveLength(2);
+  expect(posts[1].body).toBe(posts[0].body);
+  expect(screen.queryByText("Historical stop confirmed.")).toBeNull();
+  const stop = await screen.findByRole("button", {
+    name: "Stop conversation body",
+  });
+  await waitFor(() => expect((stop as HTMLButtonElement).disabled).toBe(false));
+  await fireEvent.click(stop);
+  await waitFor(() => expect(posts).toHaveLength(3));
+  expect(JSON.parse(posts[2].body).expected_current.generation).toBe("18");
+  expect(JSON.parse(posts[2].body).request_id).not.toBe(
+    JSON.parse(posts[0].body).request_id,
+  );
 });

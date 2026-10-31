@@ -169,6 +169,10 @@ pub enum Error {
         "restore_observation_conflict: Restore observation changed; refresh before a new intent"
     )]
     RestoreObservationConflict,
+    #[error("Subject body changed; reload before a new lifecycle intent")]
+    SubjectBodySuperseded,
+    #[error("Worker lifecycle observation is stale; this request was not accepted")]
+    WorkerLifecycleObservationStale,
     #[error("Repository conflict: {0}")]
     RepositoryConflict(String),
     #[error("Registry inconsistency: {0}")]

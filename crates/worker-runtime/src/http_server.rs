@@ -2443,6 +2443,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
             StatusCode::CONFLICT
         }
         RuntimeError::RuntimeStopped
+        | RuntimeError::RestoreObservationStale { .. }
         | RuntimeError::RestoreObservationConflict { .. }
         | RuntimeError::RestoreAdmissionBusy { .. }
         | RuntimeError::StopObservationConflict { .. }
@@ -2472,6 +2473,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
 fn code_for_runtime_error(error: &RuntimeError) -> String {
     match error {
         RuntimeError::RuntimeStopped => "runtime_stopped".to_string(),
+        RuntimeError::RestoreObservationStale { .. } => "restore_observation_stale".to_string(),
         RuntimeError::RestoreObservationConflict { .. } => {
             "restore_observation_conflict".to_string()
         }
@@ -4013,14 +4015,15 @@ mod tests {
             request_id: "stale-http-restore".into(),
             preparation: None,
         };
-        let response =
-            authed_json_request(app.clone(), Method::POST, &restore_uri, token, &stale).await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let conflict: RuntimeHttpErrorResponse = read_json(response).await;
-        assert_eq!(conflict.error.code, "restore_observation_conflict");
+        let coordinate_uri = format!("{restore_uri}/coordinate");
+        for uri in [&restore_uri, &coordinate_uri] {
+            let response = authed_json_request(app.clone(), Method::POST, uri, token, &stale).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let conflict: RuntimeHttpErrorResponse = read_json(response).await;
+            assert_eq!(conflict.error.code, "restore_observation_stale");
+        }
 
         let mut restore_request = runtime.test_restore_request(&created.worker.worker_ref);
-        let coordinate_uri = format!("{restore_uri}/coordinate");
         let mut coordination = runtime_api::WorkerRestoreCoordinationRequest {
             expected_observation_token: restore_request.expected_observation_token.clone(),
             request_id: restore_request.request_id.clone(),
@@ -4064,6 +4067,20 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let admitted: runtime_api::WorkerRestoreCoordinationResponse = read_json(response).await;
         assert!(admitted.result.is_none() && admitted.preparation.is_some());
+        let admitted_observation = runtime.worker_detail(&created.worker.worker_ref).unwrap();
+        let mut mismatched_owner = restore_request.clone();
+        mismatched_owner.expected_observation_token = "different-owner-input".into();
+        for uri in [&restore_uri, &coordinate_uri] {
+            let response =
+                authed_json_request(app.clone(), Method::POST, uri, token, &mismatched_owner).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let conflict: RuntimeHttpErrorResponse = read_json(response).await;
+            assert_eq!(conflict.error.code, "restore_observation_conflict");
+        }
+        assert_eq!(
+            runtime.worker_detail(&created.worker.worker_ref).unwrap(),
+            admitted_observation
+        );
         assert_eq!(
             runtime
                 .worker_detail(&created.worker.worker_ref)

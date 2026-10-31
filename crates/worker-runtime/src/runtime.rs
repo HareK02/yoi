@@ -2246,7 +2246,12 @@ impl Runtime {
                 if coordinate && request.preparation.is_none() && !recovering_pending {
                     if candidate.restore_guard.observation_token
                         != request.expected_observation_token
-                        || candidate.restore_guard.active_request_id.is_some()
+                    {
+                        return Err(RuntimeError::RestoreObservationStale {
+                            worker_id: worker_ref.worker_id,
+                        });
+                    }
+                    if candidate.restore_guard.active_request_id.is_some()
                         || candidate.has_pending_lifecycle_operation()
                     {
                         return Err(conflict());
@@ -2264,8 +2269,12 @@ impl Runtime {
                     ));
                 }
                 state.ensure_running()?;
-                if candidate.restore_guard.observation_token != request.expected_observation_token
-                    || candidate.restore_guard.active_request_id.is_some()
+                if candidate.restore_guard.observation_token != request.expected_observation_token {
+                    return Err(RuntimeError::RestoreObservationStale {
+                        worker_id: worker_ref.worker_id,
+                    });
+                }
+                if candidate.restore_guard.active_request_id.is_some()
                     || (candidate.has_pending_lifecycle_operation() && !recovering_pending)
                 {
                     return Err(conflict());
@@ -7960,6 +7969,7 @@ fn runtime_worker_create_failure_fields(
     error: &RuntimeError,
 ) -> (&'static str, Option<String>, Option<String>) {
     match error {
+        RuntimeError::RestoreObservationStale { .. } => ("restore_observation_stale", None, None),
         RuntimeError::RestoreObservationConflict { .. } => {
             ("restore_observation_conflict", None, None)
         }
@@ -12280,7 +12290,7 @@ mod tests {
         stopping.join().unwrap().unwrap();
         assert!(matches!(
             restoring.join().unwrap(),
-            Err(RuntimeError::RestoreObservationConflict { .. })
+            Err(RuntimeError::RestoreObservationStale { .. })
         ));
         assert_eq!(*backend.stop_count.lock().unwrap(), 1);
         assert_eq!(*backend.restore_count.lock().unwrap(), 0);
@@ -12572,6 +12582,49 @@ mod tests {
                 .1
                 .is_some()
         );
+        let admitted_observation = runtime.worker_detail(&worker.worker_ref).unwrap();
+        for preparation in [None, Some(runtime_api::WorkerRestorePreparation::default())] {
+            for (request_id, token, expected_code) in [
+                (
+                    "unseen-owner",
+                    coordination.expected_observation_token.clone(),
+                    "restore_observation_stale",
+                ),
+                (
+                    "unseen-owner",
+                    admitted_observation
+                        .restore_observation_token
+                        .clone()
+                        .unwrap(),
+                    "restore_observation_conflict",
+                ),
+                (
+                    coordination.request_id.as_str(),
+                    "different-owner-input".into(),
+                    "restore_observation_conflict",
+                ),
+            ] {
+                let error = runtime
+                    .coordinate_worker_restore_operation(
+                        &worker.worker_ref,
+                        runtime_api::WorkerRestoreCoordinationRequest {
+                            expected_observation_token: token,
+                            request_id: request_id.into(),
+                            preparation: preparation.clone(),
+                        },
+                        Some(&scope),
+                    )
+                    .unwrap_err();
+                assert_eq!(
+                    runtime_worker_create_failure_fields(&error).0,
+                    expected_code
+                );
+                assert_eq!(
+                    runtime.worker_detail(&worker.worker_ref).unwrap(),
+                    admitted_observation
+                );
+            }
+        }
         let operation_id = runtime
             .lock()
             .unwrap()
@@ -12706,7 +12759,7 @@ mod tests {
         let before = runtime.worker_detail(&worker.worker_ref).unwrap();
         assert!(matches!(
             runtime.restore_worker_operation(&worker.worker_ref, stale),
-            Err(RuntimeError::RestoreObservationConflict { .. })
+            Err(RuntimeError::RestoreObservationStale { .. })
         ));
         assert_eq!(runtime.worker_detail(&worker.worker_ref).unwrap(), before);
         let state = runtime.lock().unwrap();
@@ -12732,7 +12785,7 @@ mod tests {
         runtime.stop_worker(&worker.worker_ref, None).unwrap();
         assert!(matches!(
             runtime.restore_worker_operation(&worker.worker_ref, other_intent),
-            Err(RuntimeError::RestoreObservationConflict { .. })
+            Err(RuntimeError::RestoreObservationStale { .. })
         ));
         let stopped = runtime.worker_detail(&worker.worker_ref).unwrap();
         assert_ne!(
@@ -12786,7 +12839,7 @@ mod tests {
         );
         assert!(matches!(
             runtime.restore_worker_operation(&worker.worker_ref, request),
-            Err(RuntimeError::RestoreObservationConflict { .. })
+            Err(RuntimeError::RestoreObservationStale { .. })
         ));
         assert_eq!(*backend.restore_count.lock().unwrap(), 0);
     }
@@ -12824,7 +12877,7 @@ mod tests {
         );
         assert!(matches!(
             second.join().unwrap(),
-            Err(RuntimeError::RestoreObservationConflict { .. })
+            Err(RuntimeError::RestoreObservationStale { .. })
         ));
         assert_eq!(*backend.restore_count.lock().unwrap(), 1);
         assert!(
@@ -13158,7 +13211,7 @@ mod tests {
         competitor.request_id = "different-intent".into();
         assert!(matches!(
             resumed.coordinate_worker_restore_operation(&worker.worker_ref, competitor, None),
-            Err(RuntimeError::RestoreObservationConflict { .. })
+            Err(RuntimeError::RestoreObservationStale { .. })
         ));
         assert_eq!(*backend.restore_count.lock().unwrap(), count);
         *backend.restore_result.lock().unwrap() = None;
@@ -13570,7 +13623,7 @@ mod tests {
         stale.request_id = "stale-after-restart".into();
         assert!(matches!(
             restarted.restore_worker_operation(&worker.worker_ref, stale),
-            Err(RuntimeError::RestoreObservationConflict { .. })
+            Err(RuntimeError::RestoreObservationStale { .. })
         ));
         assert_eq!(
             restarted.worker_detail(&worker.worker_ref).unwrap().status,
@@ -17040,7 +17093,7 @@ mod tests {
             stale.request_id = "new-intent-with-old-token".into();
             assert!(matches!(
                 restarted.restore_worker_operation(&worker.worker_ref, stale),
-                Err(RuntimeError::RestoreObservationConflict { .. })
+                Err(RuntimeError::RestoreObservationStale { .. })
             ));
         }
     }

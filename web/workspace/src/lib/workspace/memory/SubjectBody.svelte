@@ -90,6 +90,24 @@
     }
   }
 
+  function settleFailedAttempt(cause: unknown, frozen: SubjectBodyAttempt): string | null {
+    if (!(cause instanceof SubjectBodyApiError) || !cause.request || (cause.request.resolution !== 'not_accepted' && cause.request.resolution !== 'superseded')) return null;
+    const rejected = cause.request;
+    if (rejected.workspace_id !== frozen.workspaceId || rejected.subject_id !== frozen.subjectId || rejected.request_id !== frozen.request.request_id) return null;
+    receipt = null;
+    stopOutcome = null;
+    try {
+      clearSubjectBodyAttempt(sessionStorage, accountId, frozen);
+      attempt = null;
+    } catch {
+      storageError = 'The request rejection was confirmed, but its saved input could not be cleared. Restore session storage access and reload before another action.';
+    }
+    return (rejected.resolution === 'superseded'
+      ? 'Request superseded. The body target changed, so this saved intent can no longer act on the current body. This does not determine whether an earlier operation took effect. '
+      : 'Request not accepted. The saved observation was stale and this request was not admitted. ')
+      + cause.message + '. Refresh the current body before choosing a new explicit action.';
+  }
+
   async function submit(action?: 'start' | 'stop'): Promise<void> {
     if (!visible || sending || checkingOutcome || loading || storageError || !fresh || !snapshot) return;
     if (attempt ? !retryAuthorized : (!action || !controls[action])) return;
@@ -132,7 +150,7 @@
       }
     } catch (cause) {
       if (!current(generation, account, workspace, subject)) return;
-      operationError = (cause instanceof SubjectBodyApiError ? `${cause.message}. ` : '') + 'Request outcome unknown. The request may already have taken effect. Its exact input is retained; refresh observations and explicitly retry the same request to reconcile.';
+      operationError = settleFailedAttempt(cause, frozen) ?? ((cause instanceof SubjectBodyApiError ? `${cause.message}. ` : '') + 'Request outcome unknown. The request may already have taken effect. Its exact input is retained; refresh observations and explicitly retry the same request to reconcile.');
     } finally {
       if (current(generation, account, workspace, subject)) {
         sending = false;
@@ -170,7 +188,9 @@
       void refresh();
     } catch (cause) {
       if (!current(generation, account, workspace, subject)) return;
-      outcomeError = (cause instanceof SubjectBodyApiError ? `${cause.message}. ` : '') + 'Stop outcome could not be checked. This is not a missing receipt or a confirmed stop. The exact request is retained; try the read-only check again.';
+      const settled = settleFailedAttempt(cause, frozen);
+      outcomeError = settled ?? ((cause instanceof SubjectBodyApiError ? `${cause.message}. ` : '') + 'Stop outcome could not be checked. This is not a missing receipt or a confirmed stop. The exact request is retained; try the read-only check again.');
+      if (settled) { operationError = null; void refresh(); }
     } finally {
       if (current(generation, account, workspace, subject)) checkingOutcome = false;
     }

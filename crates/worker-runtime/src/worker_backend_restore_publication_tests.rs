@@ -1231,7 +1231,7 @@ mod publication {
         let mut stale = request;
         stale.request_id = "vertical-new-stale-intent".into();
         assert!(
-            matches!(runtime.restore_worker_operation_scoped(&scope, &worker_ref, stale), Err(crate::error::RuntimeError::RestoreObservationConflict { worker_id }) if worker_id == worker_ref.worker_id)
+            matches!(runtime.restore_worker_operation_scoped(&scope, &worker_ref, stale), Err(crate::error::RuntimeError::RestoreObservationStale { worker_id }) if worker_id == worker_ref.worker_id)
         );
         runtime
             .stop_worker_scoped(&scope, &worker_ref, None)

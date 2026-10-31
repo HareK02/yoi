@@ -1,4 +1,5 @@
 import type {
+  SubjectBodyFailedRequest,
   SubjectBodyMutationResponse,
   SubjectBodyObservation,
   SubjectBodyRef,
@@ -224,26 +225,86 @@ function bodyPath(workspaceId: string, subjectId: string): string {
   );
 }
 
-export class SubjectBodyApiError extends Error {}
+export class SubjectBodyApiError extends Error {
+  constructor(
+    message: string,
+    readonly request: SubjectBodyFailedRequest | null = null,
+  ) {
+    super(message);
+    this.name = "SubjectBodyApiError";
+  }
+}
 
-async function checkedJson(response: Response): Promise<unknown> {
+type RequestIdentity = {
+  workspaceId: string;
+  subjectId: string;
+  requestId: string;
+};
+
+function failedRequest(
+  value: unknown,
+  expected: RequestIdentity,
+): SubjectBodyFailedRequest {
+  const item = record(value, [
+    "workspace_id",
+    "subject_id",
+    "request_id",
+    "resolution",
+  ]);
+  const workspace_id = text(item.workspace_id);
+  const subject_id = text(item.subject_id);
+  const request_id = parseRequestId(item.request_id);
+  if (
+    workspace_id !== expected.workspaceId ||
+    subject_id !== expected.subjectId ||
+    request_id !== expected.requestId
+  ) {
+    throw new Error("Subject body rejection does not match the frozen request");
+  }
+  const resolution = item.resolution;
+  if (
+    resolution !== "not_accepted" && resolution !== "superseded" &&
+    resolution !== "unresolved"
+  ) {
+    throw new Error("Subject body request resolution is invalid");
+  }
+  return { workspace_id, subject_id, request_id, resolution };
+}
+
+async function checkedJson(
+  response: Response,
+  expected?: RequestIdentity,
+): Promise<unknown> {
   if (!response.ok) {
-    // 生のerror bodyを表示せず、公開Diagnosticだけを境界で検査する。
+    // GETやHTTP statusだけを、保存済み依頼の決済根拠にしない。
     let detail = "";
+    let request: SubjectBodyFailedRequest | null = null;
     try {
       const error = record(
         await readBoundedJson(response, MAX_RESPONSE_BYTES),
-        ["error", "message", "diagnostics"],
+        ["error", "message", "diagnostics", "request"],
       );
-      if (error.diagnostics !== undefined) {
-        detail = diagnostics(error.diagnostics).map((item) => item.message)
-          .join("; ").slice(0, 1024);
+      text(error.error);
+      const message = text(error.message, 65536);
+      const publicDiagnostics = diagnostics(error.diagnostics);
+      detail = (publicDiagnostics.map((item) =>
+        item.message
+      ).join("; ") || message)
+        .slice(0, 1024);
+      if (expected && error.request != null) {
+        const bound = failedRequest(error.request, expected);
+        // terminalなstale拒否は専用409契約だけ。未認可/別statusには流用しない。
+        if (response.status === 409) request = bound;
       }
-    } catch { /* HTTP分類はbodyのdecode失敗でも保持する。 */ }
+    } catch {
+      // 不正なbodyやidentity不一致は決済せず、元の正確な入力を保持する。
+      request = null;
+    }
     throw new SubjectBodyApiError(
       `Subject body request failed with HTTP ${response.status}${
         detail ? `: ${detail}` : ""
       }`,
+      request,
     );
   }
   return readBoundedJson(response, MAX_RESPONSE_BYTES);
@@ -280,7 +341,7 @@ async function mutateSubjectBody(
     },
   );
   return parseSubjectBodyMutationResponse(
-    await checkedJson(response),
+    await checkedJson(response, { workspaceId, subjectId, requestId }),
     workspaceId,
     subjectId,
     requestId,
@@ -324,7 +385,7 @@ export async function getSubjectBodyStopOutcome(
   );
   // 認可拒否・通信失敗・不正な応答をnot_foundに読み替えない。
   return parseSubjectBodyStopOutcomeResponse(
-    await checkedJson(response),
+    await checkedJson(response, { workspaceId, subjectId, requestId }),
     workspaceId,
     subjectId,
     requestId,

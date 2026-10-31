@@ -11,6 +11,7 @@
 //! `tests/support/restore_environment.rs` before any fixture starts. This module
 //! never sets process environment, installs tools, or contacts a live model.
 //! Resource races and Workdir rebinding belong to the separate lifecycle suite.
+use super::subject_body_tests::assert_failed_request;
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -460,6 +461,7 @@ async fn body_same_request_concurrent_start_stop_outcome_and_restore_preserve_su
             StatusCode::CONFLICT,
             "old Runtime observation: {result}"
         );
+        assert_failed_request(&result, &subject, "body-old-observation", "not_accepted");
     }
 
     // Reopen authority rather than treating an earlier model callback as durable evidence.
@@ -534,11 +536,24 @@ async fn body_distinct_concurrent_starts_keep_one_owner_and_reject_foreign_targe
             .any(|(status, body)| *status == StatusCode::OK && body["disposition"] == "accepted"),
         "one request must start the body: {a:?}, {b:?}"
     );
-    for (status, body) in [&a, &b] {
-        assert!(
-            matches!(*status, StatusCode::OK | StatusCode::CONFLICT),
-            "{status}: {body}"
-        );
+    assert_eq!(
+        [&a, &b]
+            .iter()
+            .filter(|(status, _)| *status == StatusCode::CONFLICT)
+            .count(),
+        1,
+        "a distinct absent-start loser is terminal, not an unknown accepted operation: {a:?}, {b:?}"
+    );
+    for (request_id, (status, body)) in [("body-click-a", &a), ("body-click-b", &b)] {
+        if *status == StatusCode::CONFLICT {
+            assert_failed_request(body, &subject, request_id, "superseded");
+            let (retry_status, retry) = f.request("POST", &path, absent_start(request_id)).await;
+            assert_eq!(retry_status, StatusCode::CONFLICT, "{retry}");
+            assert_failed_request(&retry, &subject, request_id, "superseded");
+        } else {
+            assert_eq!(*status, StatusCode::OK, "{body}");
+            assert_eq!(body["disposition"], "accepted", "{body}");
+        }
     }
     assert_eq!(f.worker_count(), 1);
     let current = f.read(&subject).await;
@@ -556,6 +571,7 @@ async fn body_distinct_concurrent_starts_keep_one_owner_and_reject_foreign_targe
             StatusCode::CONFLICT,
             "cross-Subject {suffix}: {result}"
         );
+        assert_failed_request(&result, &other, "body-foreign-intent", "superseded");
     }
     let mut old_generation = foreign.clone();
     old_generation["expected_current"]["generation"] = json!(
@@ -580,6 +596,7 @@ async fn body_distinct_concurrent_starts_keep_one_owner_and_reject_foreign_targe
             StatusCode::CONFLICT,
             "stale generation {suffix}: {result}"
         );
+        assert_failed_request(&result, &subject, "body-foreign-intent", "superseded");
     }
     let reader = seed_test_api_token(f.connected.api.store.as_ref(), "connected-body-reader");
     for (method, suffix, body) in [
@@ -602,6 +619,10 @@ async fn body_distinct_concurrent_starts_keep_one_owner_and_reject_foreign_targe
             status,
             StatusCode::FORBIDDEN,
             "non-owner {suffix}: {result}"
+        );
+        assert!(
+            result["request"].is_null(),
+            "authorization before action admission supplies no request resolution: {result}"
         );
     }
     let wrong_workspace = body_path(&subject).replace(TEST_WORKSPACE_ID, "not-this-workspace");
@@ -703,4 +724,127 @@ async fn body_start_and_restore_do_not_repair_missing_session_record_permission(
         f.read(&subject).await["observation"]["worker"]["state"],
         "stopped"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn body_retained_stop_and_restore_input_mismatches_remain_unresolved() {
+    let f = ConnectedBody::new().await;
+    let subject = f.subject("body-input-mismatch-subject").await;
+    f.mutate(
+        &subject,
+        "/start",
+        absent_start("body-input-mismatch-start"),
+    )
+    .await;
+    let original_stop = f.stop(&subject, "body-owned-stop").await;
+    let mut changed_stop = original_stop.clone();
+    changed_stop["expected_observation_token"] = json!("different-input-same-stop-id");
+    for suffix in ["/stop", "/stop/outcome"] {
+        let (status, error) = f
+            .request(
+                "POST",
+                &format!("{}{suffix}", body_path(&subject)),
+                changed_stop.clone(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        assert_failed_request(&error, &subject, "body-owned-stop", "unresolved");
+    }
+    let stopped = f.read(&subject).await;
+    let original_restore = intent("body-owned-restore", &stopped);
+    let restored = f.mutate(&subject, "/start", original_restore.clone()).await;
+    assert_eq!(restored["disposition"], "accepted", "{restored}");
+    let mut changed_restore = original_restore.clone();
+    changed_restore["expected_observation_token"] = json!("different-input-same-restore-id");
+    let (status, error) = f
+        .request(
+            "POST",
+            &format!("{}/start", body_path(&subject)),
+            changed_restore,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_failed_request(&error, &subject, "body-owned-restore", "unresolved");
+    let replay = f.mutate(&subject, "/start", original_restore).await;
+    assert_eq!(replay["request_id"], "body-owned-restore");
+    assert_eq!(replay["disposition"], "accepted", "{replay}");
+    assert_eq!(f.read(&subject).await["current"], stopped["current"]);
+    assert_eq!(f.worker_count(), 1);
+    f.stop(&subject, "body-input-mismatch-cleanup").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn body_pending_lifecycle_conflicts_do_not_claim_stale_request_nonacceptance() {
+    let f = ConnectedBody::new().await;
+    let subject = f.subject("body-busy-subject").await;
+    f.mutate(&subject, "/start", absent_start("body-busy-start"))
+        .await;
+    let running = f.read(&subject).await;
+    let pending = intent("body-pending-stop", &running);
+    let source = RuntimeWorkerRef::new(
+        CONNECTED_RUNTIME,
+        running["current"]["worker_id"].as_str().unwrap(),
+    );
+    let api = f.connected.api.clone();
+    let token = pending["expected_observation_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let runtime_request = WorkerLifecycleRequest {
+        reason: Some("Stopped from the Subject screen; Subject data is retained".into()),
+        ticket_assignment: None,
+        stop_intent: Some(runtime_api::WorkerStopIntent {
+            expected_observation_token: token,
+            request_id: "body-pending-stop".into(),
+        }),
+    };
+    let admission_source = source.clone();
+    let admission_request = runtime_request.clone();
+    // Use the production signed Runtime admission, without executing cleanup yet.
+    // The raw Runtime intent is not in the browser caller's hashed namespace.
+    let admission = tokio::task::spawn_blocking(move || {
+        api.runtime
+            .coordinate_worker_stop(&admission_source, admission_request)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(admission, runtime_api::WorkerStopOutcome::Pending);
+    let occupied = f.read(&subject).await;
+    let request = intent("body-busy-restore", &occupied);
+    for _ in 0..2 {
+        let (status, error) = f
+            .request(
+                "POST",
+                &format!("{}/start", body_path(&subject)),
+                request.clone(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        assert_failed_request(&error, &subject, "body-busy-restore", "unresolved");
+    }
+    assert_eq!(f.read(&subject).await["current"], running["current"]);
+    assert_eq!(f.worker_count(), 1);
+    let api = f.connected.api.clone();
+    tokio::task::spawn_blocking(move || {
+        assert_eq!(
+            api.runtime
+                .worker_stop_outcome(&source, runtime_request.clone())
+                .unwrap(),
+            runtime_api::WorkerStopOutcome::Pending
+        );
+        let completed = api
+            .runtime
+            .stop_worker(&source, runtime_request.clone())
+            .unwrap();
+        assert_eq!(completed.state, InternalWorkerOperationState::Accepted);
+        assert!(matches!(
+            api.runtime
+                .worker_stop_outcome(&source, runtime_request)
+                .unwrap(),
+            runtime_api::WorkerStopOutcome::Stopped { .. }
+        ));
+    })
+    .await
+    .unwrap();
 }
