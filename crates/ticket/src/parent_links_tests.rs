@@ -336,6 +336,24 @@ fn parent_wire_contract_requires_explicit_nullable_observation_and_desired_paren
     }
     let input = r#"{"expected":{"parent_ticket_id":null,"last_operation_key":null},"parent":null,"operation_key":"key"}"#;
     assert!(serde_json::from_str::<TicketParentSetRequest>(input).is_ok());
+    let schema = serde_json::to_value(schemars::schema_for!(TicketParentSetRequest)).unwrap();
+    assert_eq!(
+        schema["properties"]["parent"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    let observation = &schema["$defs"]["TicketParentObservation"];
+    for field in ["parent_ticket_id", "last_operation_key"] {
+        assert!(
+            observation["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(field))
+        );
+        assert_eq!(
+            observation["properties"][field]["type"],
+            serde_json::json!(["string", "null"])
+        );
+    }
 }
 
 fn outbox_schema_preimage() -> Connection {

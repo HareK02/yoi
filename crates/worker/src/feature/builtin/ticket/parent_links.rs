@@ -22,10 +22,14 @@ struct SetInput {
     expected: ticket::TicketParentObservation,
     /// Desired parent reference, or explicit null to unlink. Never omit.
     #[serde(deserialize_with = "deserialize_required_parent")]
-    #[schemars(required)]
+    #[schemars(required, schema_with = "nullable_string_schema")]
     parent: Option<String>,
     /// Stable exact-replay key; retain the full original selectors and input on retry.
     operation_key: String,
+}
+
+fn nullable_string_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    Option::<String>::json_schema(generator)
 }
 
 fn deserialize_required_parent<'de, D: serde::Deserializer<'de>>(
@@ -63,8 +67,12 @@ impl ParentToolKind {
 
 pub(super) fn description(name: &str) -> &'static str {
     match name {
-        "TicketParentSet" => "Atomically set, replace or unlink this Ticket's parent. Reread ShowTicket.parent_link and supply its complete expected observation, including explicit nullable parent_ticket_id and last_operation_key; the retained key fences ABA even after unlink. parent must be a Ticket reference or explicit null. Exact replay retains the same operation_key, selectors and full input and returns a historical receipt, not a fresh observation. On stale/CAS conflict reread and reconcile; on unknown outcome reconcile saved authority and retry only the exact original request, never automatically mint a new key. Requires relation.read on child and desired parent metadata before mutation, independently of mutation grants. Setting requires relation.record on child and desired parent. Unlinking, or replacing an existing old parent with a different resolved canonical ID, additionally requires relation.remove on child and expected old parent when present. First attachment and the same canonical parent require no remove grant. Links do not grant resources, inherit authority, change case/assignment, start Workers or imply parent fulfillment.",
-        "TicketChildrenQuery" => "Read a bounded stable page of this Ticket's direct children, with case state and closure reason (closed is not necessarily success). Defaults to 50, maximum 100; has_more/next_cursor explicitly mark truncation. Continue with the opaque cursor and unchanged parent/scope/limit. Requires relation.read on the addressed parent and actual returned child Tickets; collection permission grants no linked-Ticket authority. No recursive expansion, inherited grants, case/assignment changes or execution rights.",
+        "TicketParentSet" => {
+            "Atomically set, replace or unlink this Ticket's parent. Reread ShowTicket.parent_link and supply its complete expected observation, including explicit nullable parent_ticket_id and last_operation_key; the retained key fences ABA even after unlink. parent must be a Ticket reference or explicit null. Exact replay retains the same operation_key, selectors and full input and returns a historical receipt, not a fresh observation. On stale/CAS conflict reread and reconcile; on unknown outcome reconcile saved authority and retry only the exact original request, never automatically mint a new key. Requires relation.read on child and desired parent metadata before mutation, independently of mutation grants. Setting requires relation.record on child and desired parent. Unlinking, or replacing an existing old parent with a different resolved canonical ID, additionally requires relation.remove on child and expected old parent when present. First attachment and the same canonical parent require no remove grant. Links do not grant resources, inherit authority, change case/assignment, start Workers or imply parent fulfillment."
+        }
+        "TicketChildrenQuery" => {
+            "Read a bounded stable page of this Ticket's direct children, with case state and closure reason (closed is not necessarily success). Defaults to 50, maximum 100; has_more/next_cursor explicitly mark truncation. Continue with the opaque cursor and unchanged parent/scope/limit. Requires relation.read on the addressed parent and actual returned child Tickets; collection permission grants no linked-Ticket authority. No recursive expansion, inherited grants, case/assignment changes or execution rights."
+        }
         _ => unreachable!("unknown parent link tool"),
     }
 }
@@ -110,11 +118,16 @@ fn resolve_id(
     let summary: ticket::TicketLinkSummary = WorkspaceHttpTicketBackend::request_unprojected(
         client,
         WorkspaceRequestMethod::Get,
-        format!("{base}/{}/link-summary", WorkspaceHttpTicketBackend::ticket_path(reference)),
+        format!(
+            "{base}/{}/link-summary",
+            WorkspaceHttpTicketBackend::ticket_path(reference),
+        ),
         None,
     )?;
     if summary.id.is_empty() {
-        return Err(TicketError::Conflict("resolved Ticket identity is unavailable".into()));
+        return Err(TicketError::Conflict(
+            "resolved Ticket identity is unavailable".into(),
+        ));
     }
     Ok(summary.id)
 }
@@ -189,9 +202,9 @@ pub(super) fn children_endpoint(
     if let Some(cursor) = &request.cursor {
         required("cursor", cursor)?;
         endpoint.push_str("&cursor=");
-        endpoint.push_str(&WorkspaceHttpTicketBackend::ticket_path(&TicketIdOrSlug::Id(
-            cursor.clone(),
-        )));
+        endpoint.push_str(&WorkspaceHttpTicketBackend::ticket_path(
+            &TicketIdOrSlug::Id(cursor.clone()),
+        ));
     }
     Ok(endpoint)
 }
@@ -215,25 +228,21 @@ pub(super) fn authorize_link(
     Ok(())
 }
 
-#[derive(Serialize)]
-struct DetailProjection {
-    #[serde(flatten)]
-    detail: super::super::resource_projection::ModelTicketDetail,
-    parent_link: ticket::TicketParentLink,
-}
-
-pub(super) fn project_detail(client: &dyn WorkspaceClient, value: Value) -> Result<Value, ToolError> {
-    let parent_link: ticket::TicketParentLink = serde_json::from_value(
-        value.get("parent_link").cloned().ok_or_else(|| {
+pub(super) fn project_detail(
+    client: &dyn WorkspaceClient,
+    value: Value,
+) -> Result<Value, ToolError> {
+    let parent_link: ticket::TicketParentLink =
+        serde_json::from_value(value.get("parent_link").cloned().ok_or_else(|| {
             ToolError::ExecutionFailed("Ticket detail is missing parent_link".into())
-        })?,
-    )
-    .map_err(|error| ToolError::ExecutionFailed(format!("decode Ticket parent_link: {error}")))?;
+        })?)
+        .map_err(|error| {
+            ToolError::ExecutionFailed(format!("decode Ticket parent_link: {error}"))
+        })?;
     authorize_link(client, &parent_link)
         .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
     let detail = project_ticket_detail(value).map_err(ToolError::ExecutionFailed)?;
-    serde_json::to_value(DetailProjection { detail, parent_link })
-        .map_err(|error| ToolError::Internal(error.to_string()))
+    serde_json::to_value(detail).map_err(|error| ToolError::Internal(error.to_string()))
 }
 
 #[derive(Clone)]
@@ -294,7 +303,9 @@ pub(super) fn execute_value(
                 };
                 let id = TicketIdOrSlug::from(input.ticket.as_str());
                 children_endpoint("", &id, &request).map_err(invalid)?;
-                let result = backend.query_ticket_children(id, request).map_err(failure)?;
+                let result = backend
+                    .query_ticket_children(id, request)
+                    .map_err(failure)?;
                 Ok(json!(result))
             }
             _ => unreachable!(),

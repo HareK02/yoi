@@ -51,7 +51,11 @@ export function fixtureDetail(key = "T-101") {
   const { workspace_action_priority: _, ...ticket } = summary;
   return {
     ...ticket,
-    parent_link: { ticket_id: ticket.id, observation: { parent_ticket_id: null, last_operation_key: null }, parent: null },
+    parent_link: {
+      ticket_id: ticket.id,
+      observation: { parent_ticket_id: null, last_operation_key: null },
+      parent: null,
+    },
     closure_history: [],
     content_digest: "a".repeat(64),
     created_at: updated(1),

@@ -461,7 +461,7 @@ impl SqliteWorkspaceAuthority {
         };
         if let Some(parent) = &query.parent {
             match parent {
-                ticket::TicketParentFilter::None => predicates.push("NOT EXISTS (SELECT 1 FROM typed_ticket_parent_links p WHERE p.workspace_id=t.workspace_id AND p.ticket_id=t.ticket_id AND p.parent_ticket_id IS NOT NULL)".into()),
+                ticket::TicketParentFilter::None {} => predicates.push("NOT EXISTS (SELECT 1 FROM typed_ticket_parent_links p WHERE p.workspace_id=t.workspace_id AND p.ticket_id=t.ticket_id AND p.parent_ticket_id IS NOT NULL)".into()),
                 ticket::TicketParentFilter::Parent { ticket } => {
                     let parent = bind(SqlValue::Text(ticket.clone()));
                     predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_parent_links p WHERE p.workspace_id=t.workspace_id AND p.ticket_id=t.ticket_id AND p.parent_ticket_id={parent})"));
@@ -2417,7 +2417,7 @@ fn ticket_matches_query(
     if let Some(parent) = &query.parent {
         let actual = detail.parent_link.observation.parent_ticket_id.as_deref();
         match parent {
-            ticket::TicketParentFilter::None if actual.is_some() => return false,
+            ticket::TicketParentFilter::None {} if actual.is_some() => return false,
             ticket::TicketParentFilter::Parent { ticket } if actual != Some(ticket.as_str()) => {
                 return false;
             }

@@ -21,6 +21,14 @@ mod tests;
 
 pub(crate) const SCHEMA_SQL: &str = include_str!("parent_links.sql");
 
+// Schemars' required validator unwraps Option unless schema generation stays explicit.
+// Wire presence and nullability are independent: null is an observed domain value.
+fn nullable_schema<T: schemars::JsonSchema>(
+    generator: &mut schemars::SchemaGenerator,
+) -> schemars::Schema {
+    <Option<T> as schemars::JsonSchema>::json_schema(generator)
+}
+
 fn deserialize_observed_parent<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error> {
@@ -39,10 +47,10 @@ fn deserialize_desired_parent<'de, D: serde::Deserializer<'de>>(
 #[serde(deny_unknown_fields)]
 pub struct TicketParentObservation {
     #[serde(deserialize_with = "deserialize_observed_parent")]
-    #[schemars(required)]
+    #[schemars(required, schema_with = "nullable_schema::<String>")]
     pub parent_ticket_id: Option<String>,
     #[serde(deserialize_with = "deserialize_observed_parent")]
-    #[schemars(required)]
+    #[schemars(required, schema_with = "nullable_schema::<String>")]
     pub last_operation_key: Option<String>,
 }
 
@@ -52,7 +60,7 @@ pub struct TicketParentSetRequest {
     pub expected: TicketParentObservation,
     /// Null unlinks; references are resolved only inside the scoped write transaction.
     #[serde(deserialize_with = "deserialize_desired_parent")]
-    #[schemars(required)]
+    #[schemars(required, schema_with = "nullable_schema::<String>")]
     pub parent: Option<String>,
     pub operation_key: String,
 }
@@ -61,6 +69,7 @@ pub struct TicketParentSetRequest {
 pub struct TicketParentLink {
     pub ticket_id: String,
     pub observation: TicketParentObservation,
+    #[schemars(required, schema_with = "nullable_schema::<TicketLinkSummary>")]
     pub parent: Option<TicketLinkSummary>,
 }
 
@@ -71,13 +80,14 @@ pub struct TicketLinkSummary {
     pub resource_key: String,
     pub title: String,
     pub state: TicketState,
+    #[schemars(required, schema_with = "nullable_schema::<TicketClosureReason>")]
     pub closure_reason: Option<TicketClosureReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TicketParentFilter {
-    None,
+    None {},
     Parent { ticket: String },
 }
 
@@ -104,6 +114,7 @@ pub struct TicketChildrenRequest {
 pub struct TicketChildrenPage {
     pub parent_ticket_id: String,
     pub items: Vec<TicketLinkSummary>,
+    #[schemars(required, schema_with = "nullable_schema::<String>")]
     pub next_cursor: Option<String>,
     pub has_more: bool,
 }

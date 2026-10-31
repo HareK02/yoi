@@ -7948,6 +7948,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::workspace_ticket_tag_mutate(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::ticket_link_summary_get(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::ticket_parent_get(
             service.clone(),
         ))

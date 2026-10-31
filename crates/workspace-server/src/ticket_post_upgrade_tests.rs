@@ -83,13 +83,14 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
         assert_eq!(stored_fixture_rows(conn,"typed_ticket_event_references"),old_references);
         let markers = stored_fixture_rows(conn,"ticket_schema_migrations");
         assert_eq!(&markers[..old_markers.len()],old_markers.as_slice());
-        assert_eq!(markers.len(),old_markers.len()+4);
+        assert_eq!(markers.len(),old_markers.len()+5);
         let new_markers: Vec<(i64,String)> = conn.prepare("SELECT version,name FROM ticket_schema_migrations WHERE version>11 ORDER BY version")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         assert_eq!(new_markers,vec![
             (12,"Canonical Ticket posts".into()),
             (13,"Ticket content change facts".into()),
             (14,"Subject Ticket responsibility".into()),
             (15,"Ticket Service transactional outbox".into()),
+            (16,"Ticket work-decomposition parent links".into()),
         ]);
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM typed_ticket_service_outbox",[],|r|r.get::<_,i64>(0))?,0,"migration does not invent Service delivery facts");
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM typed_ticket_content_changes",[],|r|r.get::<_,i64>(0))?,0,"migration does not invent content change facts");

@@ -1072,11 +1072,30 @@ mod subject_assignment_migration_tests {
             assert_eq!(history.len(), host.len() + expected.len());
             let history = component_history(conn);
             assert_eq!(&history[..component.len()], component, "owner receipt prefix is preserved");
-            assert_eq!(history.len(), component.len() + 2);
+            assert_eq!(history.len(), component.len() + 3);
             let tail: Vec<(i64, String, String)> = conn.prepare("SELECT version,name,applied_at FROM ticket_schema_migrations WHERE version>=14 ORDER BY version").unwrap()
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-            assert_eq!(tail.iter().map(|(v,name,_)| (*v,name.as_str())).collect::<Vec<_>>(), [(14,"Subject Ticket responsibility"), (15,"Ticket Service transactional outbox")]);
+            assert_eq!(
+                tail.iter()
+                    .map(|(v, name, _)| (*v, name.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    (14, "Subject Ticket responsibility"),
+                    (15, "Ticket Service transactional outbox"),
+                    (16, "Ticket work-decomposition parent links"),
+                ]
+            );
             assert!(tail.iter().all(|(_,_,at)| !at.is_empty()));
+            for table in ["typed_ticket_parent_links", "typed_ticket_parent_operations"] {
+                assert_eq!(
+                    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                    0,
+                    "migration must not create parent links or parent-operation receipts in {table}"
+                );
+            }
             ticket::verify_sqlite_ticket_schema(conn).unwrap();
             crate::plugin_catalog::verify_with_data(conn).unwrap();
             plugin_plan::verify_plan_schema(conn).unwrap();
@@ -1142,6 +1161,7 @@ mod subject_assignment_migration_tests {
                 "Typed Plugin Ticket extension data and atomic mutation receipts".into(),
             ));
             tail.push((112, "Ticket Service outbox and fenced consumers".into()));
+            tail.push((113, "Ticket work-decomposition parent links".into()));
             tail
         }
 

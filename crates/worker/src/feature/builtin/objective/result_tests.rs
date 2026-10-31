@@ -136,6 +136,7 @@ fn ticket_detail() -> crate::worker::WorkspaceResponse {
     response(json!({
         "resource_key":"T-7","title":"Linked","body":"Requirements","body_truncated":false,
         "content_digest":"observed","state":"open","targets":[],"events":[],"linked_objectives":[],
+        "parent_link":{"ticket_id":"T-7","observation":{"parent_ticket_id":null,"last_operation_key":null},"parent":null},
         "initial_post":{"sequence":0,"event_ref":"initial","is_initial":true,"kind":"comment",
             "body":"Requirements","body_truncated":false,"body_digest":"a".repeat(64),
             "editable":true,"author":null,"at":null,"edited_at":null,"edited_by":null},

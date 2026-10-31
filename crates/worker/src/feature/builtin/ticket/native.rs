@@ -219,10 +219,20 @@ pub(super) fn contract(op: &str) -> Contract {
                         ),
                         rename("related", "related_ticket_id", false, ticket_ref()),
                         p("relation_kind", false, relation()),
-                        p("parent", false, union("kind", vec![
-                            case("none", None),
-                            case("parent", Some(record(vec![p("ticket", true, ticket_ref())]))),
-                        ])),
+                        p(
+                            "parent",
+                            false,
+                            union(
+                                "kind",
+                                vec![
+                                    case("none", None),
+                                    case(
+                                        "parent",
+                                        Some(record(vec![p("ticket", true, ticket_ref())])),
+                                    ),
+                                ],
+                            ),
+                        ),
                         p("tag_ids", false, strings()),
                         p("tag_ids_any", false, strings()),
                         p("tag_ids_none", false, strings()),
@@ -274,10 +284,14 @@ pub(super) fn contract(op: &str) -> Contract {
             "parent_set",
             parent_links::description("TicketParentSet"),
             vec![
-                p("expected", true, record(vec![
-                    p("parent_ticket_id", true, nullable(Shape::String)),
-                    p("last_operation_key", true, nullable(Shape::String)),
-                ])),
+                p(
+                    "expected",
+                    true,
+                    record(vec![
+                        p("parent_ticket_id", true, nullable(Shape::String)),
+                        p("last_operation_key", true, nullable(Shape::String)),
+                    ]),
+                ),
                 p("parent", true, nullable(ticket_ref())),
                 p("operation_key", true, Shape::String),
             ],

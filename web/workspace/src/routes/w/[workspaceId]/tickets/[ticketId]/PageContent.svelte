@@ -590,7 +590,11 @@
       {/key}
 
       <BevelLine decorative />
-      <TicketHierarchy workspaceId={data.workspaceId} routeTicketId={data.ticketId} {ticket} />
+      <TicketHierarchy
+        workspaceId={data.workspaceId}
+        routeTicketId={data.ticketId}
+        {ticket}
+      />
       <BevelLine decorative />
       <section class="ticket-detail-section ticket-relations">
         <div class="ticket-section-heading">

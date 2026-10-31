@@ -221,6 +221,7 @@ async fn inspect_open_entry_read_and_linked_ticket_use_published_contract_withou
     for ticket_first in [true, false] {
         let detail = json!({"resource_key":"T-1", "title":"Intent", "body":"Requirements", "body_truncated":false,
         "content_digest":"observed", "state":"open", "targets":[], "events":[], "linked_objectives":[],
+        "parent_link":{"ticket_id":"T-1","observation":{"parent_ticket_id":null,"last_operation_key":null},"parent":null},
         "initial_post":{"sequence":0,"event_ref":"initial","is_initial":true,"kind":"comment","body":"Requirements","body_truncated":false,"body_digest":"a".repeat(64),"editable":true,"author":null,"at":null,"edited_at":null,"edited_by":null},
         "closure_operation_key":null,"current_closure":null,"legacy_handoff":null,"closure_history":[],
         "assignment_tracking":[],"tags":[],"assignments":[],"implementation_reports":[],"merge_requests":[]});

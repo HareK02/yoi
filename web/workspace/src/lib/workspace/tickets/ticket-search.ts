@@ -166,7 +166,9 @@ export function compileTicketSearch(
         break;
       case "parent": {
         if (value !== "none" && !/^T-[1-9][0-9]*$/.test(value)) {
-          throw new Error("Invalid parent: value; use none or a Ticket key such as T-804.");
+          throw new Error(
+            "Invalid parent: value; use none or a Ticket key such as T-804.",
+          );
         }
         const parent: TicketParentFilter = value === "none"
           ? { kind: "none" }

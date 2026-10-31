@@ -252,17 +252,34 @@ export function parseTicketParentLink(
   const item = object(value, label);
   exact(item, ["ticket_id", "observation", "parent"], label);
   const observation = object(item.observation, `${label}.observation`);
-  exact(observation, ["parent_ticket_id", "last_operation_key"], `${label}.observation`);
+  exact(
+    observation,
+    ["parent_ticket_id", "last_operation_key"],
+    `${label}.observation`,
+  );
   const result: TicketParentLink = {
     ticket_id: string(item.ticket_id, `${label}.ticket_id`),
     observation: {
-      parent_ticket_id: nullableString(observation.parent_ticket_id, `${label}.observation.parent_ticket_id`),
-      last_operation_key: nullableString(observation.last_operation_key, `${label}.observation.last_operation_key`),
+      parent_ticket_id: nullableString(
+        observation.parent_ticket_id,
+        `${label}.observation.parent_ticket_id`,
+      ),
+      last_operation_key: nullableString(
+        observation.last_operation_key,
+        `${label}.observation.last_operation_key`,
+      ),
     },
-    parent: item.parent === null ? null : parseTicketLinkSummary(item.parent, `${label}.parent`),
+    parent: item.parent === null
+      ? null
+      : parseTicketLinkSummary(item.parent, `${label}.parent`),
   };
-  if (result.parent !== null && result.parent.id !== result.observation.parent_ticket_id) {
-    throw new TicketBrowserContractError(`${label}.parent does not match observation`);
+  if (
+    result.parent !== null &&
+    result.parent.id !== result.observation.parent_ticket_id
+  ) {
+    throw new TicketBrowserContractError(
+      `${label}.parent does not match observation`,
+    );
   }
   return result;
 }
@@ -272,14 +289,19 @@ export function parseTicketChildrenPage(value: unknown): TicketChildrenPage {
   const item = object(value, label);
   exact(item, ["parent_ticket_id", "items", "next_cursor", "has_more"], label);
   const items = array(item.items, `${label}.items`, parseTicketLinkSummary);
-  if (items.length > 100) throw new TicketBrowserContractError(`${label} exceeds its page limit`);
+  if (items.length > 100) {
+    throw new TicketBrowserContractError(`${label} exceeds its page limit`);
+  }
   const result: TicketChildrenPage = {
     parent_ticket_id: string(item.parent_ticket_id, `${label}.parent_ticket_id`),
     items,
     next_cursor: nullableString(item.next_cursor, `${label}.next_cursor`),
     has_more: boolean(item.has_more, `${label}.has_more`),
   };
-  if (result.has_more !== (result.next_cursor !== null && result.next_cursor.length > 0)) {
+  if (
+    result.has_more !==
+      (result.next_cursor !== null && result.next_cursor.length > 0)
+  ) {
     throw new TicketBrowserContractError(`${label} has inconsistent pagination`);
   }
   return result;
@@ -1215,9 +1237,14 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "title",
     "updated_at",
   ], label);
-  const parentLink = parseTicketParentLink(item.parent_link, `${label}.parent_link`);
+  const parentLink = parseTicketParentLink(
+    item.parent_link,
+    `${label}.parent_link`,
+  );
   if (parentLink.ticket_id !== item.id) {
-    throw new TicketBrowserContractError(`${label}.parent_link has the wrong Ticket identity`);
+    throw new TicketBrowserContractError(
+      `${label}.parent_link has the wrong Ticket identity`,
+    );
   }
   return {
     ...caseProjection(item, label),

@@ -317,7 +317,11 @@ function ticketDetailFixture() {
       unresolved_request_changes: false,
     },
     id: "ticket-id",
-    parent_link: { ticket_id: "ticket-id", observation: { parent_ticket_id: null, last_operation_key: null }, parent: null },
+    parent_link: {
+      ticket_id: "ticket-id",
+      observation: { parent_ticket_id: null, last_operation_key: null },
+      parent: null,
+    },
     implementation_reports: [],
     content_digest: "a".repeat(64),
     linked_objectives: [],

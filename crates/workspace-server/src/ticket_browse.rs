@@ -190,7 +190,7 @@ fn page_sql(
     };
     if let Some(parent) = &query.parent {
         match parent {
-            ticket::TicketParentFilter::None => predicates.push("NOT EXISTS (SELECT 1 FROM typed_ticket_parent_links p WHERE p.workspace_id=t.workspace_id AND p.ticket_id=t.ticket_id AND p.parent_ticket_id IS NOT NULL)".into()),
+            ticket::TicketParentFilter::None {} => predicates.push("NOT EXISTS (SELECT 1 FROM typed_ticket_parent_links p WHERE p.workspace_id=t.workspace_id AND p.ticket_id=t.ticket_id AND p.parent_ticket_id IS NOT NULL)".into()),
             ticket::TicketParentFilter::Parent { ticket } => {
                 let parent = bind(ticket.clone());
                 predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_parent_links p WHERE p.workspace_id=t.workspace_id AND p.ticket_id=t.ticket_id AND p.parent_ticket_id={parent})"));

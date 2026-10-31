@@ -216,16 +216,20 @@ async fn signed_parent_routes_reject_missing_wire_and_scoped_cursor_without_part
         json!({"expected":{},"parent":null,"operation_key":"bad"}),
         json!({"expected":{"parent_ticket_id":null,"last_operation_key":null},"operation_key":"bad"}),
     ] {
-        runtime_tag_json(
-            app.clone(),
-            &identity,
-            "linker",
-            "PUT",
-            &path,
-            body,
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
+        let response = app
+            .clone()
+            .oneshot(runtime_source_request(
+                &identity,
+                Some("linker"),
+                "PUT",
+                &path,
+                serde_json::to_vec(&body).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let rejection = to_bytes(response.into_body(), 16_384).await.unwrap();
+        assert!(String::from_utf8_lossy(&rejection).contains("missing field"));
     }
     let page_path = format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{parent}/children?limit=1");
     let page = runtime_tag_json(

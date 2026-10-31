@@ -700,7 +700,7 @@ async fn parent_filters_match_browse_and_authoritative_queries_and_bind_cursor_s
         )
         .unwrap();
     let mut roots = ids(&f.run(TicketBrowseQueryRequest {
-        parent: Some(ticket::TicketParentFilter::None),
+        parent: Some(ticket::TicketParentFilter::None {}),
         ..Default::default()
     }));
     roots.sort();

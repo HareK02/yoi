@@ -360,9 +360,13 @@ pub(super) fn project(
                 fields.insert("next_cursor".into(), WipValue::String(cursor));
             }
             if children {
-                let parent = bound.filter(|id| ticket_leaf(id))
+                let parent = bound
+                    .filter(|id| ticket_leaf(id))
                     .ok_or_else(|| failure("missing children parent subject"))?;
-                fields.insert("entry".into(), WipValue::String(format!("{ticket_root}/{parent}")));
+                fields.insert(
+                    "entry".into(),
+                    WipValue::String(format!("{ticket_root}/{parent}")),
+                );
             }
             Ok(WipValue::Record(fields))
         }

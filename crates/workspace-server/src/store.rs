@@ -19837,6 +19837,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:110, name:"Worker Plugin launch selection associations".into()},
                 WorkspaceSchemaMigrationStep {version:111, name:"Typed Plugin Ticket extension data and atomic mutation receipts".into()},
                 WorkspaceSchemaMigrationStep {version:112, name:"Ticket Service outbox and fenced consumers".into()},
+                WorkspaceSchemaMigrationStep {version:113, name:"Ticket work-decomposition parent links".into()},
             ]
         );
 
@@ -19959,6 +19960,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (110, "Worker Plugin launch selection associations".to_string()),
 (111, "Typed Plugin Ticket extension data and atomic mutation receipts".to_string()),
 (112, "Ticket Service outbox and fenced consumers".to_string()),
+(113, "Ticket work-decomposition parent links".to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -23252,7 +23254,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (109, "Durable Plugin Host invocations and HTTPS effect receipts".into()),
                          (110, "Worker Plugin launch selection associations".into()),
                          (111, "Typed Plugin Ticket extension data and atomic mutation receipts".into()),
-                         (112, "Ticket Service outbox and fenced consumers".into())]);
+                         (112, "Ticket Service outbox and fenced consumers".into()),
+                         (113, "Ticket work-decomposition parent links".into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

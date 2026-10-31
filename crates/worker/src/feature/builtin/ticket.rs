@@ -300,7 +300,8 @@ impl WorkspaceTicketReadTool {
                         self.client.as_ref(),
                         "ticket.relation.query",
                         &TicketIdOrSlug::from(ticket.as_str()),
-                    ).map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                    )
+                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
                 }
                 for (name, ids) in [
                     ("tag_ids", &input.tag_ids),
@@ -338,7 +339,7 @@ impl WorkspaceTicketReadTool {
                 authorize_ticket_item(self.client.as_ref(), "ticket.read", &id)
                     .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
                 authorize_ticket_item(self.client.as_ref(), "ticket.relation.read", &id)
-            },
+            }
             None => authorize_ticket_operation(self.client.as_ref(), "ticket.query"),
         }
         .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
@@ -713,9 +714,11 @@ impl TicketFeatureAccess {
                     }),
             )
             .chain(std::iter::once(notification_diagnostics::NAME))
-            .chain(parent_links::TOOL_NAMES.iter().copied().filter(|name| {
-                *name == "TicketChildrenQuery" || self.authoring || self.workflow
-            }))
+            .chain(
+                parent_links::TOOL_NAMES.iter().copied().filter(|name| {
+                    *name == "TicketChildrenQuery" || self.authoring || self.workflow
+                }),
+            )
             .collect()
     }
 
@@ -1143,8 +1146,10 @@ impl WorkspaceHttpTicketBackend {
             TicketBackendOperation::ParentLink { id } => {
                 authorize_ticket_item(client.as_ref(), "ticket.relation.read", &id)?;
                 let link: ticket::TicketParentLink = Self::request_unprojected(
-                    client.clone(), WorkspaceRequestMethod::Get,
-                    format!("{base}/{}/parent", Self::ticket_path(&id)), None,
+                    client.clone(),
+                    WorkspaceRequestMethod::Get,
+                    format!("{base}/{}/parent", Self::ticket_path(&id)),
+                    None,
                 )?;
                 parent_links::authorize_link(client.as_ref(), &link)?;
                 Ok(TicketBackendOperationResult::ParentLink(link))
@@ -1153,8 +1158,10 @@ impl WorkspaceHttpTicketBackend {
                 parent_links::validate_set(&request)?;
                 parent_links::authorize_set(client.clone(), &base, &id, &request)?;
                 let link: ticket::TicketParentLink = Self::request_unprojected(
-                    client, WorkspaceRequestMethod::Put,
-                    format!("{base}/{}/parent", Self::ticket_path(&id)), Some(json!(request)),
+                    client,
+                    WorkspaceRequestMethod::Put,
+                    format!("{base}/{}/parent", Self::ticket_path(&id)),
+                    Some(json!(request)),
                 )?;
                 // Return the exact typed receipt, not a follow-up observation; CAS IDs stay intact.
                 Ok(TicketBackendOperationResult::ParentLink(link))
@@ -1163,10 +1170,15 @@ impl WorkspaceHttpTicketBackend {
                 let endpoint = parent_links::children_endpoint(&base, &id, &request)?;
                 authorize_ticket_item(client.as_ref(), "ticket.relation.read", &id)?;
                 let page: ticket::TicketChildrenPage = Self::request_unprojected(
-                    client.clone(), WorkspaceRequestMethod::Get, endpoint, None,
+                    client.clone(),
+                    WorkspaceRequestMethod::Get,
+                    endpoint,
+                    None,
                 )?;
                 if page.items.len() > request.limit.unwrap_or(50) {
-                    return Err(TicketError::Conflict("Ticket children response exceeds requested bound".into()));
+                    return Err(TicketError::Conflict(
+                        "Ticket children response exceeds requested bound".into(),
+                    ));
                 }
                 authorize_ticket_item(
                     client.as_ref(),
@@ -1174,7 +1186,11 @@ impl WorkspaceHttpTicketBackend {
                     &TicketIdOrSlug::from(page.parent_ticket_id.as_str()),
                 )?;
                 for child in &page.items {
-                    authorize_ticket_item(client.as_ref(), "ticket.relation.read", &TicketIdOrSlug::from(child.id.as_str()))?;
+                    authorize_ticket_item(
+                        client.as_ref(),
+                        "ticket.relation.read",
+                        &TicketIdOrSlug::from(child.id.as_str()),
+                    )?;
                 }
                 Ok(TicketBackendOperationResult::ChildrenPage(page))
             }
@@ -1537,15 +1553,32 @@ macro_rules! expect_ticket_result {
 
 impl TicketBackend for WorkspaceHttpTicketBackend {
     fn get_ticket_parent(&self, id: TicketIdOrSlug) -> TicketResult<ticket::TicketParentLink> {
-        expect_ticket_result!(self.invoke(TicketBackendOperation::ParentLink { id }), TicketBackendOperationResult::ParentLink)
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::ParentLink { id }),
+            TicketBackendOperationResult::ParentLink
+        )
     }
 
-    fn set_ticket_parent(&self, id: TicketIdOrSlug, request: ticket::TicketParentSetRequest) -> TicketResult<ticket::TicketParentLink> {
-        expect_ticket_result!(self.invoke(TicketBackendOperation::SetParentLink { id, request }), TicketBackendOperationResult::ParentLink)
+    fn set_ticket_parent(
+        &self,
+        id: TicketIdOrSlug,
+        request: ticket::TicketParentSetRequest,
+    ) -> TicketResult<ticket::TicketParentLink> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::SetParentLink { id, request }),
+            TicketBackendOperationResult::ParentLink
+        )
     }
 
-    fn query_ticket_children(&self, id: TicketIdOrSlug, request: ticket::TicketChildrenRequest) -> TicketResult<ticket::TicketChildrenPage> {
-        expect_ticket_result!(self.invoke(TicketBackendOperation::ChildrenPage { id, request }), TicketBackendOperationResult::ChildrenPage)
+    fn query_ticket_children(
+        &self,
+        id: TicketIdOrSlug,
+        request: ticket::TicketChildrenRequest,
+    ) -> TicketResult<ticket::TicketChildrenPage> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::ChildrenPage { id, request }),
+            TicketBackendOperationResult::ChildrenPage
+        )
     }
 
     fn edit_post_with_snapshots(
@@ -2049,7 +2082,10 @@ pub(crate) fn enabled_ticket_definitions(
     if allowed.contains(&notification_diagnostics::NAME) {
         definitions.push(notification_diagnostics::definition(client.clone()));
     }
-    for kind in [parent_links::ParentToolKind::Set, parent_links::ParentToolKind::Children] {
+    for kind in [
+        parent_links::ParentToolKind::Set,
+        parent_links::ParentToolKind::Children,
+    ] {
         if allowed.contains(&kind.name()) {
             definitions.push(parent_links::definition(client.clone(), kind));
         }
@@ -2320,8 +2356,11 @@ impl WipOperationHandler for TicketItemWipHandler {
             // Old-parent CAS IDs may not have a locally observed canonical alias. A receipt
             // is not a fresh representation; conservatively invalidate rather than leave a
             // previously read parent/children view attested by a stale route validator.
-            self.observations.lock().unwrap_or_else(|error| error.into_inner())
-                .content_digests.clear();
+            self.observations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .content_digests
+                .clear();
         }
         // Partial pages and classification receipts are not full item observations.
         if !matches!(operation, "tags_set" | "children_query") {
@@ -2353,7 +2392,8 @@ async fn execute_native_ticket_tool(
     context: WipCallContext,
 ) -> Result<Value, WipOperationError> {
     authorize_native_ticket(permissions, &tool.name, &input)?;
-    if let Some(value) = parent_links::execute_value(tool.client.clone(), &tool.name, input.clone()) {
+    if let Some(value) = parent_links::execute_value(tool.client.clone(), &tool.name, input.clone())
+    {
         return value.map_err(map_ticket_tool_error);
     }
     if let Some(value) = assignment_public::execute_native_value(
@@ -2454,7 +2494,9 @@ async fn execute_ticket_domain(
 ) -> Result<ToolOutput, ToolError> {
     if let Some(result) = parent_links::execute_value(client.clone(), name, command.clone()) {
         return result.map(|value| ToolOutput {
-            summary: name.into(), content: Some(value.to_string()), attachments: Vec::new(),
+            summary: name.into(),
+            content: Some(value.to_string()),
+            attachments: Vec::new(),
         });
     }
     if name == "QueryTicket" || name == "ShowTicket" {

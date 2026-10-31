@@ -62,15 +62,26 @@ const tags: readonly WorkspaceTag[] = Object.freeze([
 ]);
 
 Deno.test("parent filters compose with standard filters without leaking into free text", () => {
-  const request = compileTicketSearch('parent:T-804 state:closed reason:duplicate tag:Ready assignee:orchestrator retain words', tags);
+  const request = compileTicketSearch(
+    "parent:T-804 state:closed reason:duplicate tag:Ready assignee:orchestrator retain words",
+    tags,
+  );
   assertEquals(request.parent, { kind: "parent", ticket: "T-804" });
   assertEquals(request.states, ["closed"]);
   assertEquals(request.closure_reason, "duplicate");
   assertEquals(request.tag_ids, ["tag-1"]);
-  assertEquals(request.assigned_principal, { kind: "workspace_agent", agent_key: "workspace-orchestrator" });
+  assertEquals(request.assigned_principal, {
+    kind: "workspace_agent",
+    agent_key: "workspace-orchestrator",
+  });
   assertEquals(request.query, "retain words");
-  assertEquals(compileTicketSearch("parent:none parent:none", tags).parent, { kind: "none" });
-  assertEquals(compileTicketSearch('"parent:none" other:field', tags).query, "parent:none other:field");
+  assertEquals(compileTicketSearch("parent:none parent:none", tags).parent, {
+    kind: "none",
+  });
+  assertEquals(
+    compileTicketSearch('"parent:none" other:field', tags).query,
+    "parent:none other:field",
+  );
   assertEquals(compileTicketSearch("ordinary text", tags).parent, undefined);
 });
 

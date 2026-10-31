@@ -3537,7 +3537,7 @@ pub trait ServerApi {
         #[path] id: String,
     ) -> Result<TicketParentResponse, RepositoryApiError>;
 
-    #[put("/api/w/{workspace_id}/tickets/{id}/parent", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    #[put("/api/w/{workspace_id}/tickets/{id}/parent", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_parent_set(
         &self,
         #[extension] context: ServerRequestContext,
@@ -12558,7 +12558,7 @@ mod tests {
         );
         let eligibility = serde_json::json!({
             "can_assign_orchestrator": false, "can_unassign_orchestrator": false,
-            "can_queue": true, "can_start_manual_worker": true, "queue_tickets": [], "blockers": []
+            "can_queue": true, "can_start_manual_worker": true, "can_set_parent": false, "queue_tickets": [], "blockers": []
         });
         let parsed: TicketActionEligibility = serde_json::from_value(eligibility.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), eligibility);

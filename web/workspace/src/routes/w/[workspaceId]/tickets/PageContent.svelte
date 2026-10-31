@@ -309,7 +309,10 @@
       <summary>Search syntax</summary>
       <p>Combine text with <code>state:open</code> or <code>state:closed</code>. Omit state to search both.</p>
       <p><code>tag:"UI bug"</code> · <code>assignee:subject:SUBJECT_ID</code> · <code>reason:completed</code></p>
-      <p><code>parent:none</code> finds Tickets without a parent; <code>parent:T-804</code> finds direct children.</p>
+      <p>
+        <code>parent:none</code> finds Tickets without a parent;
+        <code>parent:T-804</code> finds direct children.
+      </p>
       <p>Other principals: <code>assignee:user/account-id</code> or <code>assignee:worker/runtime-id/worker-id</code>.
         Custom close reason: <code>reason:"Superseded plan"</code>.</p>
     </details>
