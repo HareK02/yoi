@@ -226,7 +226,12 @@ fn deletion_identity_conflicts_are_scope_wide_but_do_not_cross_workspaces() {
     assert_eq!(store.list_memories(&b).unwrap().len(), 1);
     let fresh = store.create_subject(role()).unwrap().id;
     assert!(store.list_memories(&fresh).unwrap().is_empty());
-    assert!(store.subject_permissions(&fresh).unwrap().is_none());
+    let fresh_source = store.subject_permissions(&fresh).unwrap().unwrap();
+    assert_eq!(
+        fresh_source.execution,
+        server_api::authorization::subject_conversation_permissions(store.scope_id(), &fresh)
+    );
+    assert!(fresh_source.delegation.is_empty());
 }
 
 #[test]
@@ -259,8 +264,14 @@ fn concurrent_begin_and_write_serialize_and_exact_finish_is_replayable() {
 fn every_subject_owned_table_has_old_and_new_sql_fences_and_retention_is_scoped() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
-    let a = store.create_subject(role()).unwrap().id;
-    let b = store.create_subject(role()).unwrap().id;
+    let a = store
+        .create_subject_idempotent(role(), "private behavior a".into(), "create-a")
+        .unwrap()
+        .id;
+    let b = store
+        .create_subject_idempotent(role(), "private behavior b".into(), "create-b")
+        .unwrap()
+        .id;
     store
         .stage_candidate(candidate(&a, "a", store.workspace_id()))
         .unwrap();
@@ -268,11 +279,18 @@ fn every_subject_owned_table_has_old_and_new_sql_fences_and_retention_is_scoped(
         .stage_candidate(candidate(&b, "b", store.workspace_id()))
         .unwrap();
     store.begin_subject_deletion(&a, "delete").unwrap();
-    store.database.try_with_connection::<_, SubjektivError>(|c| {
+    let creation_receipts = store.database.try_with_connection::<_, SubjektivError>(|c| {
         let tables = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?.query_map([], |r| r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
         for table in tables {
             let columns = c.prepare(&format!("PRAGMA table_info({table})"))?.query_map([], |r| r.get::<_,String>(1))?.collect::<std::result::Result<Vec<_>,_>>()?;
             if !columns.iter().any(|v| v == "subject_id") || table.starts_with("subject_delet") { continue; }
+            if table == "subject_creation_receipts" {
+                // Retained non-content identity tombstones prevent duplicate recreation after erase.
+                // They have no Subject FK or content to purge, and intentionally need no deletion fence.
+                assert_eq!(columns, ["operation_id", "subject_id", "request_fingerprint"]);
+                assert!(c.prepare("PRAGMA foreign_key_list(subject_creation_receipts)")?.query([])?.next()?.is_none());
+                continue;
+            }
             assert!(DIRECT.contains(&table.as_str()) || table == "journal_erased_sessions" || table == "chat_conversations", "unclassified Subject table: {table}");
         }
         for table in DIRECT.iter().copied().chain(INDIRECT.iter().map(|v| v.0)).chain(["journal_erased_sessions"]) {
@@ -289,9 +307,22 @@ fn every_subject_owned_table_has_old_and_new_sql_fences_and_retention_is_scoped(
         assert!(c.execute("DELETE FROM staging_records WHERE subject_id=?1", [&b]).is_err());
         assert!(c.execute("DELETE FROM subject_deletions WHERE subject_id=?1", [&a]).is_err());
         assert!(c.execute("UPDATE subject_deletions SET operation_id='changed' WHERE subject_id=?1", [&a]).is_err());
-        Ok(())
+        Ok(c.prepare("SELECT operation_id,subject_id,request_fingerprint FROM subject_creation_receipts ORDER BY operation_id")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }).unwrap();
+    assert_eq!(creation_receipts.len(), 2);
+    assert_eq!(creation_receipts[0].1, a);
+    assert_eq!(creation_receipts[1].1, b);
     store.finish_subject_deletion(&a, "delete").unwrap();
+    let retained = store.database.try_with_connection::<_, SubjektivError>(|c| {
+        Ok(c.prepare("SELECT operation_id,subject_id,request_fingerprint FROM subject_creation_receipts ORDER BY operation_id")?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }).unwrap();
+    assert_eq!(retained, creation_receipts);
+    assert!(store.subject(&a).unwrap().is_none());
+    assert!(store.subject(&b).unwrap().is_some());
     assert!(store.staging_candidate(&b, "b").unwrap().is_some());
 }
 

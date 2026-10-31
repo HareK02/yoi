@@ -9,6 +9,7 @@ pub mod journal;
 mod legacy_migrations;
 pub mod permissions;
 mod schema;
+mod subject_creation;
 use legacy_migrations::{
     add_candidate_decision_receipts, add_subject_behavior, add_subject_session_attribution,
     add_surface_generation_state, add_surface_job_provenance, create_schema,
@@ -54,6 +55,8 @@ pub enum SubjektivError {
     InvalidRecord(String),
     #[error("subject `{0}` was not found in this Workspace")]
     SubjectNotFound(String),
+    #[error("Subject creation request `{0}` was reused with different input")]
+    SubjectCreationConflict(String),
     #[error("Subject deletion request `{0}` conflicts with a saved deletion")]
     SubjectDeletionConflict(String),
     #[error("subject `{0}` is legacy-retired")]
@@ -658,6 +661,11 @@ static MIGRATIONS: &[FeatureMigration] = &[
         deletion::migrate,
     ),
     FeatureMigration::new(15, "add retained text-only conversations", chat::migrate),
+    FeatureMigration::new(
+        16,
+        "retain replayable Subject creation receipts",
+        subject_creation::migrate,
+    ),
 ];
 
 pub const REGISTRATION: FeatureRegistration =
@@ -754,34 +762,21 @@ impl SubjektivStore {
         role: SubjectRole,
         behavior_md: String,
     ) -> Result<SubjectRecord> {
-        validate_subject_behavior(&behavior_md)?;
-        let timestamp = now();
-        let record = SubjectRecord {
-            schema_version: SUBJEKTIV_SCHEMA_VERSION,
-            id: issued_id("subject"),
-            role,
-            behavior_md,
-            state: SubjectState::Active,
-            created_at: timestamp.clone(),
-            updated_at: timestamp,
-        };
-        let raw = serde_json::to_string(&record)?;
-        self.database.try_transaction(|transaction| {
-            transaction.execute(
-                "INSERT INTO subjects (
-                    subject_id, role, behavior_md, state, record_json, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6)",
-                params![
-                    record.id,
-                    record.role.as_str(),
-                    record.behavior_md,
-                    raw,
-                    record.created_at,
-                    record.updated_at
-                ],
-            )?;
-            Ok(record)
-        })
+        self.create_subject_request(role, behavior_md, None)
+    }
+
+    /// Replays the original creation without reissuing permissions or changing the Subject.
+    /// The Host authenticates the administrator before calling. Keep the same operation ID
+    /// and full input after an unknown outcome; different input is a conflict.
+    pub fn create_subject_idempotent(
+        &self,
+        role: SubjectRole,
+        behavior_md: String,
+        operation_id: &str,
+    ) -> Result<SubjectRecord> {
+        server_api::authorization::validate_authorization_identifier(operation_id)
+            .map_err(SubjektivError::InvalidRecord)?;
+        self.create_subject_request(role, behavior_md, Some(operation_id))
     }
 
     pub fn subject(&self, subject_id: &str) -> Result<Option<SubjectRecord>> {

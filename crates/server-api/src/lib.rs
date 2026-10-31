@@ -5686,6 +5686,8 @@ pub struct SubjektivSubjectDeleteResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSubjectCreateRequest {
+    /// Stable across exact retries; changed input with the same ID conflicts.
+    pub operation_id: String,
     pub role: String,
     #[serde(default)]
     pub behavior_md: String,
@@ -11315,7 +11317,7 @@ pub fn memory_api_typescript() -> String {
     // `ts-rs` solely for this read-only projection.
     let subjektiv_browser_declarations = r#"export type SubjektivSubjectState = "active" | "retired";
 
-export type SubjektivSubjectCreateRequest = { role: string, behavior_md?: string, };
+export type SubjektivSubjectCreateRequest = { operation_id: string, role: string, behavior_md?: string, };
 
 export type SubjektivSubjectDeleteRequest = { operation_id: string, };
 

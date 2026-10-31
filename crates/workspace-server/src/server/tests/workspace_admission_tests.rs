@@ -826,7 +826,13 @@ async fn create_and_restore_session_callbacks_finish_while_deletion_start_waits(
             &subject.id,
             &server_api::authorization::SubjectPermissionsUpdate {
                 operation_id: "session-callback-grant".into(),
-                expected_change_id: None,
+                expected_change_id: Some(
+                    subjektiv
+                        .subject_permissions(&subject.id)
+                        .unwrap()
+                        .unwrap()
+                        .change_id,
+                ),
                 execution: vec![server_api::authorization::ScopedPermission {
                     operation: "session.record".into(),
                     resource: server_api::authorization::PermissionResource::Subject {

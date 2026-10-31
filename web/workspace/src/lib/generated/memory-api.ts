@@ -68,7 +68,7 @@ export type SubjectPermissionInterruption = { runtime_id: string, worker_id: str
 
 export type SubjektivSubjectState = "active" | "retired";
 
-export type SubjektivSubjectCreateRequest = { role: string, behavior_md?: string, };
+export type SubjektivSubjectCreateRequest = { operation_id: string, role: string, behavior_md?: string, };
 
 export type SubjektivSubjectDeleteRequest = { operation_id: string, };
 

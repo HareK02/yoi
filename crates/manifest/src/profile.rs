@@ -1751,7 +1751,7 @@ mod tests {
         assert!(feature.subjektiv.profile.enabled);
         assert!(feature.subjektiv.profile.chat.enabled);
         assert!(!feature.subjektiv.profile.consolidation_tools);
-        assert!(!feature.subjektiv.profile.extraction.enabled);
+        assert!(feature.subjektiv.profile.extraction.enabled);
         assert!(feature.subjektiv.workspace_settings.is_none());
         assert!(!feature.subjektiv.execution_enabled());
         assert!(!feature.memory.profile.enabled);
@@ -1823,6 +1823,8 @@ mod tests {
                 "SubjektivMemoryQuery",
                 "SubjektivMemoryRead",
                 "SubjektivMemoryListChanges",
+                "SubjektivMemoryRemember",
+                "SubjektivMemoryProposeChange",
                 "QueryObjective",
                 "ShowObjective",
                 "QueryTicket",

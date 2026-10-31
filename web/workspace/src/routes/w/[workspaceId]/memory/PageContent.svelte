@@ -6,7 +6,7 @@
     createSubjektivSubject,
     SubjektivSubjectCreateError,
   } from '#lib/workspace/memory/api.ts';
-  import type { SubjektivSubjectResponse } from '#lib/generated/memory-api.ts';
+  import type { SubjektivSubjectCreateRequest, SubjektivSubjectResponse } from '#lib/generated/memory-api.ts';
   import type { ResolvedPageData } from '#lib/workspace/navigation/deferred.ts';
   import type { PageData as RouteData } from './$types';
 
@@ -23,6 +23,7 @@
   let roleInvalid = $state(false);
   let behaviorInvalid = $state(false);
   let createOutcomeUnknown = $state(false);
+  let createRequest = $state<SubjektivSubjectCreateRequest | null>(null);
   let createdSubject = $state<SubjektivSubjectResponse | null>(null);
   let createButton = $state<HTMLButtonElement>();
   let roleInput = $state<HTMLInputElement>();
@@ -42,12 +43,14 @@
   }
 
   async function openCreateForm(): Promise<void> {
+    if (submitting || createExpanded) return;
     createExpanded = true;
-    createError = null;
-    roleInvalid = false;
-    behaviorInvalid = false;
-    createOutcomeUnknown = false;
-    createdSubject = null;
+    if (!createOutcomeUnknown) {
+      createError = null;
+      roleInvalid = false;
+      behaviorInvalid = false;
+      createdSubject = null;
+    }
     await tick();
     roleInput?.focus();
   }
@@ -55,13 +58,16 @@
   async function cancelCreate(): Promise<void> {
     if (submitting) return;
     createExpanded = false;
-    role = '';
-    behaviorMd = '';
-    createError = null;
-    roleInvalid = false;
-    behaviorInvalid = false;
-    createOutcomeUnknown = false;
-    createdSubject = null;
+    // 結果不明の要求は閉じても破棄せず、再度開いたときも厳密に再送する。
+    if (!createOutcomeUnknown) {
+      role = '';
+      behaviorMd = '';
+      createRequest = null;
+      createError = null;
+      roleInvalid = false;
+      behaviorInvalid = false;
+      createdSubject = null;
+    }
     await tick();
     createButton?.focus();
   }
@@ -72,13 +78,15 @@
     createError = null;
     roleInvalid = false;
     behaviorInvalid = false;
-    createOutcomeUnknown = false;
     try {
-      const subject = await createSubjektivSubject(fetch, data.workspaceId, {
+      createRequest ??= {
+        operation_id: crypto.randomUUID(),
         role,
         behavior_md: behaviorMd,
-      });
+      };
+      const subject = await createSubjektivSubject(fetch, data.workspaceId, createRequest);
       createdSubject = subject;
+      createOutcomeUnknown = false;
       try {
         await goto(subjectHref(subject.id));
       } catch {
@@ -88,7 +96,8 @@
       if (error instanceof SubjektivSubjectCreateError) {
         roleInvalid = error.kind === 'validation' && error.message.startsWith('Subject role');
         behaviorInvalid = error.kind === 'validation' && error.message.startsWith('Subject behavior');
-        createOutcomeUnknown = error.kind === 'unknown_outcome';
+        // 再送の拒否だけでは、先の結果不明な作成が未実行だったとは確認できない。
+        createOutcomeUnknown ||= error.kind === 'unknown_outcome';
         createError = error.status === 401 || error.status === 403
           ? 'You do not have permission to create Subjects in this Workspace.'
           : error.message;
@@ -102,6 +111,7 @@
         createError = 'The request outcome is unknown. A Subject may have been created.';
       }
     } finally {
+      if (!createOutcomeUnknown && !createdSubject) createRequest = null;
       submitting = false;
     }
   }
@@ -161,7 +171,7 @@
           type="text"
           autocomplete="off"
           required
-          disabled={submitting || createdSubject !== null}
+          disabled={submitting || createOutcomeUnknown || createdSubject !== null}
           onkeydown={createFormKeydown}
           aria-invalid={roleInvalid ? 'true' : undefined}
           aria-describedby={createError && roleInvalid ? 'subject-role-help subject-create-error' : 'subject-role-help'}
@@ -173,7 +183,7 @@
           bind:this={behaviorInput}
           bind:value={behaviorMd}
           rows="7"
-          disabled={submitting || createdSubject !== null}
+          disabled={submitting || createOutcomeUnknown || createdSubject !== null}
           onkeydown={createFormKeydown}
           aria-invalid={behaviorInvalid ? 'true' : undefined}
           aria-describedby={createError && behaviorInvalid ? 'subject-behavior-help subject-create-error' : 'subject-behavior-help'}

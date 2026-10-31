@@ -132,7 +132,12 @@ async fn deletion_owner_scope_exact_retry_and_subject_isolation() {
         .create_subject(crate::subjektiv::SubjectRole::new("fresh").unwrap())
         .unwrap();
     assert_ne!(fresh.id, subject.id);
-    assert!(store.subject_permissions(&fresh.id).unwrap().is_none());
+    let source = store.subject_permissions(&fresh.id).unwrap().unwrap();
+    assert_eq!(
+        source.execution,
+        server_api::authorization::subject_conversation_permissions(TEST_WORKSPACE_ID, &fresh.id)
+    );
+    assert!(source.delegation.is_empty());
     assert_eq!(
         store
             .pending_staging_candidates(&fresh.id, 100)

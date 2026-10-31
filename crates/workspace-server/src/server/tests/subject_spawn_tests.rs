@@ -77,7 +77,13 @@ async fn subject_callbacks_finish_before_waiting_host_parents_release_capacity()
                 &subject.id,
                 &server_api::authorization::SubjectPermissionsUpdate {
                     operation_id: format!("subject-callback-grant-{index}"),
-                    expected_change_id: None,
+                    expected_change_id: Some(
+                        subjektiv
+                            .subject_permissions(&subject.id)
+                            .unwrap()
+                            .unwrap()
+                            .change_id,
+                    ),
                     execution: [
                         "memory.resident.read",
                         "session.record",

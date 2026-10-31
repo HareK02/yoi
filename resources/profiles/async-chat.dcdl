@@ -14,7 +14,7 @@
             enabled = true;
             chat = { enabled = true; };
             consolidation_tools = false;
-            extraction = { enabled = false; };
+            extraction = { enabled = true; threshold = 50000; };
         };
         web = { enabled = false; };
         image = { enabled = false; };
@@ -54,6 +54,8 @@
             { tool = "SubjektivMemoryQuery"; pattern = "*"; action = "allow"; },
             { tool = "SubjektivMemoryRead"; pattern = "*"; action = "allow"; },
             { tool = "SubjektivMemoryListChanges"; pattern = "*"; action = "allow"; },
+            { tool = "SubjektivMemoryRemember"; pattern = "*"; action = "allow"; },
+            { tool = "SubjektivMemoryProposeChange"; pattern = "*"; action = "allow"; },
             { tool = "QueryObjective"; pattern = "*"; action = "allow"; },
             { tool = "ShowObjective"; pattern = "*"; action = "allow"; },
             { tool = "QueryTicket"; pattern = "*"; action = "allow"; },

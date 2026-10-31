@@ -55,6 +55,8 @@ use serde::{Deserialize, Serialize};
 
 mod catalog;
 pub use catalog::*;
+mod subject_defaults;
+pub use subject_defaults::*;
 
 pub const MAX_SCOPED_PERMISSIONS: usize = 256;
 

@@ -175,9 +175,13 @@ test("creates one Subject with the exact role and navigates to its generated det
   ];
   expect(path).toBe("/api/w/workspace-1/subjektiv/subjects");
   expect(init.method).toBe("POST");
-  expect(init.body).toBe(
-    '{"role":"  Review lead  ","behavior_md":"Challenge unsupported assumptions."}',
-  );
+  const request = JSON.parse(init.body as string);
+  expect(request).toEqual({
+    operation_id: expect.any(String),
+    role: "  Review lead  ",
+    behavior_md: "Challenge unsupported assumptions.",
+  });
+  expect(request.operation_id).not.toBe("");
 });
 
 test("keeps creation available for an empty list and restores focus on cancel", async () => {
