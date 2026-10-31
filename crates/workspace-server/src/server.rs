@@ -21944,16 +21944,22 @@ async fn open_current_worker_workdir_session_locked(
             .lock()
             .expect("External Workdir provider registry poisoned")
             .connection(grant_id)
-            .filter(|connection| {
-                connection.generation == grant.generation
-                    && connection.provider_instance_id == grant.provider_instance_id
-                    && connection.workdir_id == workdir.workdir_id
-            })
             .ok_or_else(|| Error::RuntimeOperationFailed {
                 runtime_id: "workspace-backend".to_string(),
-                code: "external_workdir_provider_offline".to_string(),
+                code: "external_workdir_provider_connection_missing".to_string(),
                 message: "External Workdir provider connection is unavailable".to_string(),
             })?;
+        if connection.generation != grant.generation
+            || connection.provider_instance_id != grant.provider_instance_id
+            || connection.workdir_id != workdir.workdir_id
+        {
+            return Err(Error::RuntimeOperationFailed {
+                runtime_id: "workspace-backend".to_string(),
+                code: "external_workdir_provider_identity_mismatch".to_string(),
+                message: "External Workdir provider connection does not match the current grant"
+                    .to_string(),
+            });
+        }
         let source: WorkdirSessionHandle = Arc::new(ExternalProviderWorkdirSession::new(
             connection,
             Some(ExternalProviderAuditContext {
@@ -39386,10 +39392,38 @@ impl ApiErrorLog {
         log.denial_reason = error.denial_reason;
         log.failure_reason = error.failure_reason;
         if log.workdir_log.is_some() {
-            // Public classification and arbitrary diagnostic text are not safe
-            // operational causes. Keep only the separately typed reason/stage;
-            // never infer a reason by parsing request- or provider-authored text.
-            log.kind = format!("workdir_session_operation_api_{}", status.as_u16());
+            // Keep bounded Backend codes as well as typed provider reasons. Never
+            // log arbitrary codes/messages or infer causes from diagnostic prose.
+            const BACKEND_CODES: &[&str] = &[
+                "db_capacity_exceeded",
+                "db_executor_unavailable",
+                "db_operation_outcome_unknown",
+                "working_directory_not_found",
+                "external_workdir_grant_not_found",
+                "external_workdir_provider_pending",
+                "external_workdir_provider_offline",
+                "external_workdir_provider_revoked",
+                "external_workdir_provider_expired",
+                "external_workdir_provider_unavailable",
+                "external_workdir_provider_connection_missing",
+                "external_workdir_provider_identity_mismatch",
+                "duplicate_workdir_session_close_failed",
+                "workdir_session_registration_failed",
+            ];
+            let backend_code = error
+                .diagnostics
+                .as_deref()
+                .and_then(|diagnostics| diagnostics.first())
+                .and_then(|diagnostic| {
+                    BACKEND_CODES
+                        .iter()
+                        .copied()
+                        .find(|code| diagnostic.code == *code)
+                });
+            log.kind = match backend_code {
+                Some(code) => format!("workdir_session_operation_{code}"),
+                None => format!("workdir_session_operation_api_{}", status.as_u16()),
+            };
             // This can also fail after a command was dispatched. Do not claim
             // a pre-dispatch refusal or absence of effects in the safe message.
             log.message = "Workdir operation failed".to_string();

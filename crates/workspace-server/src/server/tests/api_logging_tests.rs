@@ -1,3 +1,5 @@
+mod workdir_open;
+
 use super::*;
 use std::io::Write;
 use tracing::instrument::WithSubscriber;
