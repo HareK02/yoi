@@ -626,12 +626,18 @@ impl WorkspaceWorker {
                 .runtime
                 .stop_worker(&worker.identity, request)
                 .map_err(RuntimeRegistryError::into_error)?;
-            if let Some(conflict) = result.diagnostics.iter().find(|diagnostic| {
-                matches!(
-                    diagnostic.code.as_str(),
-                    "stop_observation_conflict" | "stop_request_conflict"
-                )
-            }) {
+            if result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "stop_observation_conflict")
+            {
+                return Err(Error::WorkerLifecycleObservationStale.into());
+            }
+            if let Some(conflict) = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "stop_request_conflict")
+            {
                 return Err(Error::RepositoryConflict(conflict.message.clone()).into());
             }
             if result.state != InternalWorkerOperationState::Accepted || result.replayed {

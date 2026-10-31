@@ -10,6 +10,7 @@ import {
   saveSubjectBodyAttempt,
   startSubjectBody,
   stopSubjectBody,
+  SubjectBodyApiError,
   subjectBodyControls,
   subjectBodyStorageKey,
 } from "./subject-body.ts";
@@ -718,4 +719,122 @@ Deno.test("accountless legacy keys are neither discovered migrated nor cleared f
   rejects(() =>
     createSubjectBodyAttempt("", parse(absent()), "start", "no-account")
   );
+});
+
+Deno.test("mutation failures expose only identity-bound dedicated 409 request resolutions", async () => {
+  const identity = {
+    workspace_id: "workspace",
+    subject_id: "subject",
+    request_id: "frozen-request",
+  };
+  const errorBody = (request: unknown) => ({
+    error: "Conflict",
+    message: "The saved observation is stale",
+    diagnostics: [{
+      code: "stale_observation",
+      severity: "warning",
+      message: "Refresh before a new explicit action",
+    }],
+    request,
+  });
+  const input = Object.freeze({
+    request_id: identity.request_id,
+    expected_current: owner,
+    expected_observation_token: "frozen-token",
+  });
+  const cases: { status: number; body: unknown; resolution: string | null }[] =
+    [
+      ...["not_accepted", "superseded", "unresolved"].map((resolution) => ({
+        status: 409,
+        body: errorBody({ ...identity, resolution }),
+        resolution,
+      })),
+      ...["workspace_id", "subject_id", "request_id"].map((field) => ({
+        status: 409,
+        body: errorBody({
+          ...identity,
+          [field]: "foreign",
+          resolution: "superseded",
+        }),
+        resolution: null,
+      })),
+      ...[401, 403, 500, 502].map((status) => ({
+        status,
+        body: errorBody({ ...identity, resolution: "not_accepted" }),
+        resolution: null,
+      })),
+      { status: 409, body: errorBody(null), resolution: null },
+      {
+        status: 409,
+        body: { error: "Conflict", message: "busy", diagnostics: [] },
+        resolution: null,
+      },
+      {
+        status: 409,
+        body: errorBody({ ...identity, resolution: "rejected" }),
+        resolution: null,
+      },
+      {
+        status: 409,
+        body: errorBody({ ...identity, resolution: "superseded", extra: true }),
+        resolution: null,
+      },
+      {
+        status: 409,
+        body: {
+          ...errorBody({ ...identity, resolution: "not_accepted" }),
+          diagnostics: "invalid",
+        },
+        resolution: null,
+      },
+    ];
+  for (const item of cases) {
+    for (
+      const invoke of [
+        startSubjectBody,
+        stopSubjectBody,
+        getSubjectBodyStopOutcome,
+      ]
+    ) {
+      let sent = "";
+      const fetchFn = ((_path: string, init?: RequestInit) => {
+        sent = init?.body as string;
+        return Promise.resolve(
+          Response.json(item.body, { status: item.status }),
+        );
+      }) as typeof fetch;
+      let failure: unknown;
+      try {
+        await invoke(fetchFn, "workspace", "subject", input);
+      } catch (cause) {
+        failure = cause;
+      }
+      assert(failure instanceof SubjectBodyApiError);
+      assert((failure.request?.resolution ?? null) === item.resolution);
+      assert(sent === JSON.stringify(input));
+    }
+  }
+});
+
+Deno.test("GET cannot supply a mutation resolution even when its error claims the saved request", async () => {
+  const fetchFn = (() =>
+    Promise.resolve(Response.json({
+      error: "Conflict",
+      message: "stale",
+      diagnostics: [],
+      request: {
+        workspace_id: "workspace",
+        subject_id: "subject",
+        request_id: "saved",
+        resolution: "superseded",
+      },
+    }, { status: 409 }))) as typeof fetch;
+  let failure: unknown;
+  try {
+    await getSubjectBody(fetchFn, "workspace", "subject");
+  } catch (cause) {
+    failure = cause;
+  }
+  assert(failure instanceof SubjectBodyApiError);
+  assert(failure.request === null);
 });

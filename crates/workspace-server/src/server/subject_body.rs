@@ -6,6 +6,28 @@ use server_api::{
     SubjectBodyResponse, SubjectBodyStartRequest, SubjectBodyStopRequest,
 };
 
+pub(super) fn api_error(
+    error: ApiError,
+    workspace_id: String,
+    subject_id: String,
+    request_id: String,
+) -> server_api::SubjectBodyApiError {
+    use server_api::SubjectBodyRequestResolution;
+    let resolution = match &error.error {
+        Error::SubjectBodySuperseded => SubjectBodyRequestResolution::Superseded,
+        Error::WorkerLifecycleObservationStale => SubjectBodyRequestResolution::NotAccepted,
+        _ => SubjectBodyRequestResolution::Unresolved,
+    };
+    let mut response = server_api::SubjectBodyApiError::from(error.into_repository_api_error());
+    response.request = Some(server_api::SubjectBodyFailedRequest {
+        workspace_id,
+        subject_id,
+        request_id,
+        resolution,
+    });
+    response
+}
+
 fn diagnostic(code: &str, message: String) -> server_api::Diagnostic {
     server_api::Diagnostic {
         code: code.into(),
@@ -61,10 +83,7 @@ pub(super) fn require_expected(
 ) -> ApiResult<Option<crate::store::WorkerSingletonLease>> {
     let lease = current(api, subject)?;
     if lease.as_ref().map(reference).as_ref() != expected {
-        return Err(Error::RepositoryConflict(
-            "Subject body changed; reload before a new lifecycle intent".into(),
-        )
-        .into());
+        return Err(Error::SubjectBodySuperseded.into());
     }
     Ok(lease)
 }
@@ -222,11 +241,8 @@ pub(super) async fn stop_outcome(
         .store
         .db_executor()
         .run(move || {
-            require_expected(&lookup_api, &lookup_subject, Some(&expected))?.ok_or_else(|| {
-                ApiError::from(Error::RepositoryConflict(
-                    "Subject has no current body".into(),
-                ))
-            })
+            require_expected(&lookup_api, &lookup_subject, Some(&expected))?
+                .ok_or_else(|| ApiError::from(Error::SubjectBodySuperseded))
         })
         .await?;
     let worker =
@@ -271,11 +287,8 @@ pub(super) async fn stop(
         .store
         .db_executor()
         .run(move || {
-            require_expected(&lookup_api, &lookup_subject, Some(&expected))?.ok_or_else(|| {
-                ApiError::from(Error::RepositoryConflict(
-                    "Subject has no current body".into(),
-                ))
-            })
+            require_expected(&lookup_api, &lookup_subject, Some(&expected))?
+                .ok_or_else(|| ApiError::from(Error::SubjectBodySuperseded))
         })
         .await?;
     let worker =
@@ -301,7 +314,9 @@ pub(super) async fn stop(
         Err(error)
             if matches!(
                 error.error,
-                Error::RepositoryConflict(_)
+                Error::SubjectBodySuperseded
+                    | Error::WorkerLifecycleObservationStale
+                    | Error::RepositoryConflict(_)
                     | Error::WorkspacePermissionDenied(_)
                     | Error::RestoreObservationConflict
             ) =>
@@ -344,9 +359,7 @@ pub(super) async fn start(
         )
         .await?;
         if observed.current.as_ref() != Some(expected) {
-            return Err(
-                Error::RepositoryConflict("Subject body changed before start".into()).into(),
-            );
+            return Err(Error::SubjectBodySuperseded.into());
         }
         let SubjectBodyObservation::Available { .. } = observed.observation else {
             return Err(Error::RepositoryConflict(
@@ -392,7 +405,9 @@ pub(super) async fn start(
             Err(error)
                 if matches!(
                     error.error,
-                    Error::RepositoryConflict(_)
+                    Error::SubjectBodySuperseded
+                        | Error::WorkerLifecycleObservationStale
+                        | Error::RepositoryConflict(_)
                         | Error::WorkspacePermissionDenied(_)
                         | Error::RestoreObservationConflict
                 ) =>
@@ -426,6 +441,7 @@ pub(super) async fn start(
     let create_workspace = workspace.clone();
     let request_id = request.request_id.clone();
     let operation = operation_id(&account, &workspace, &subject, &request_id);
+    let check_operation = operation.clone();
     let result = run_host_workflow(api.host_executors.host()?, async move {
         let subject_record = require_subject(&create_api, &create_subject)?;
         // An exact creation retry uses the same ordinary reservation, including its
@@ -496,11 +512,35 @@ pub(super) async fn start(
         Err(error)
             if matches!(
                 error.error,
-                Error::RepositoryConflict(_)
+                Error::SubjectBodySuperseded
+                    | Error::WorkerLifecycleObservationStale
+                    | Error::RepositoryConflict(_)
                     | Error::WorkspacePermissionDenied(_)
                     | Error::SubjektivSubjectNotFound(_)
             ) =>
         {
+            // A racing absent intent may lose after its initial observation but
+            // before allocation. Only absence of its own reservation proves that
+            // this screen's intent cannot affect the now-current body.
+            if matches!(error.error, Error::RepositoryConflict(_)) {
+                let lookup_api = api.clone();
+                let lookup_workspace = workspace.clone();
+                let lookup_subject = subject.clone();
+                let superseded = api
+                    .store
+                    .db_executor()
+                    .run(move || -> ApiResult<bool> {
+                        Ok(lookup_api
+                            .config_store
+                            .reserved_worker_create_runtime(&lookup_workspace, &check_operation)?
+                            .is_none()
+                            && current(&lookup_api, &lookup_subject)?.is_some())
+                    })
+                    .await?;
+                if superseded {
+                    return Err(Error::SubjectBodySuperseded.into());
+                }
+            }
             return Err(error);
         }
         Err(error) => (

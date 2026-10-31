@@ -252,6 +252,9 @@ impl_openapi_schema!(
     PluginArtifactDeliveryRequest,
     PluginArtifactDeliveryMetadata,
     PluginWorkerDiagnostics,
+    SubjectBodyApiError,
+    SubjectBodyFailedRequest,
+    SubjectBodyRequestResolution,
     SubjectBodyResponse,
     SubjectBodyStartRequest,
     SubjectBodyStopRequest,
@@ -1564,7 +1567,7 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] subject_id: String,
         #[body] request: SubjectBodyStartRequest,
-    ) -> Result<SubjectBodyMutationResponse, RepositoryApiError>;
+    ) -> Result<SubjectBodyMutationResponse, SubjectBodyApiError>;
 
     #[post("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body/stop", status = 200, error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
@@ -1574,7 +1577,7 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] subject_id: String,
         #[body] request: SubjectBodyStopRequest,
-    ) -> Result<SubjectBodyMutationResponse, RepositoryApiError>;
+    ) -> Result<SubjectBodyMutationResponse, SubjectBodyApiError>;
 
     #[post("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body/stop/outcome", status = 200, error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502], bearer_auth = true, browser_auth = true)]
@@ -1584,7 +1587,7 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] subject_id: String,
         #[body] request: SubjectBodyStopRequest,
-    ) -> Result<SubjectBodyStopOutcomeResponse, RepositoryApiError>;
+    ) -> Result<SubjectBodyStopOutcomeResponse, SubjectBodyApiError>;
 
     #[patch(
         "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/behavior",

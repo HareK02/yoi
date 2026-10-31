@@ -6785,6 +6785,13 @@ impl WorkspaceApi {
         if restored
             .diagnostics
             .iter()
+            .any(|d| d.code == "restore_observation_stale")
+        {
+            return Err(Error::WorkerLifecycleObservationStale.into());
+        }
+        if restored
+            .diagnostics
+            .iter()
             .any(|d| d.code == "restore_observation_conflict")
         {
             return Err(Error::RestoreObservationConflict.into());
@@ -10242,17 +10249,19 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
         subject_id: String,
         request: server_api::SubjectBodyStartRequest,
-    ) -> std::result::Result<server_api::SubjectBodyMutationResponse, server_api::RepositoryApiError>
+    ) -> std::result::Result<server_api::SubjectBodyMutationResponse, server_api::SubjectBodyApiError>
     {
         subject_body::start(
             self.workspace_api()?.clone(),
             context,
-            workspace_id,
-            subject_id,
-            request,
+            workspace_id.clone(),
+            subject_id.clone(),
+            request.clone(),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(|error| {
+            subject_body::api_error(error, workspace_id, subject_id, request.request_id)
+        })
     }
 
     async fn subjektiv_subject_body_stop(
@@ -10261,17 +10270,19 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
         subject_id: String,
         request: server_api::SubjectBodyStopRequest,
-    ) -> std::result::Result<server_api::SubjectBodyMutationResponse, server_api::RepositoryApiError>
+    ) -> std::result::Result<server_api::SubjectBodyMutationResponse, server_api::SubjectBodyApiError>
     {
         subject_body::stop(
             self.workspace_api()?.clone(),
             context,
-            workspace_id,
-            subject_id,
-            request,
+            workspace_id.clone(),
+            subject_id.clone(),
+            request.clone(),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(|error| {
+            subject_body::api_error(error, workspace_id, subject_id, request.request_id)
+        })
     }
 
     async fn subjektiv_subject_body_stop_outcome(
@@ -10282,17 +10293,19 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::SubjectBodyStopRequest,
     ) -> std::result::Result<
         server_api::SubjectBodyStopOutcomeResponse,
-        server_api::RepositoryApiError,
+        server_api::SubjectBodyApiError,
     > {
         subject_body::stop_outcome(
             self.workspace_api()?.clone(),
             context,
-            workspace_id,
-            subject_id,
-            request,
+            workspace_id.clone(),
+            subject_id.clone(),
+            request.clone(),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(|error| {
+            subject_body::api_error(error, workspace_id, subject_id, request.request_id)
+        })
     }
 
     async fn subjektiv_subject_behavior_update(
@@ -34932,7 +34945,10 @@ fn resume_internal_worker_restore_intent(
             // A definitive non-admission conflict is not unknown delivery. Retire
             // only this pinned intent, without retrying it or exchanging its
             // observation. A later deliberate invocation may observe anew.
-            if matches!(error.error, Error::RestoreObservationConflict) {
+            if matches!(
+                error.error,
+                Error::RestoreObservationConflict | Error::WorkerLifecycleObservationStale
+            ) {
                 api.config_store.settle_internal_worker_restore_intent(
                     api.workspace_id(),
                     worker,
@@ -39169,6 +39185,8 @@ fn api_error_status(error: &Error) -> StatusCode {
         | Error::RuntimeBindingIdConflict { .. }
         | Error::RuntimeBindingFingerprintConflict { .. }
         | Error::RepositoryConflict(_)
+        | Error::SubjectBodySuperseded
+        | Error::WorkerLifecycleObservationStale
         | Error::RestoreObservationConflict => StatusCode::CONFLICT,
         Error::WorkerSourceIdentity(_) => StatusCode::BAD_REQUEST,
         Error::InvalidInput(message)
