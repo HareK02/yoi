@@ -347,6 +347,9 @@ fn append_trailing_section(
     }
     out.push('\n');
 
+    let notifications = prompts.render_name("common.notifications", Value::UNDEFINED)?;
+    out.push_str(notifications.trim_end());
+    out.push_str("\n\n");
     if ctx.workdir_sessions.is_empty() {
         let boundaries = prompts.working_boundaries_section(&scope.summary())?;
         out.push_str(boundaries.trim_end_matches(&['\n', ' '][..]));
@@ -478,6 +481,25 @@ mod tests {
             })
             .unwrap();
         (rendered, metas)
+    }
+
+    #[test]
+    fn notification_guidance_is_in_system_prompt_not_repeated_in_each_message() {
+        let catalog = PromptCatalog::builtins_only().unwrap();
+        let guidance = catalog
+            .render_name("common.notifications", Value::UNDEFINED)
+            .unwrap();
+        for role in ["default", "role.async_chat", "role.coder"] {
+            let (prompt, _) = ticket_workflow_fixture(role, MergeRequestFeatureConfig::default());
+            assert_eq!(prompt.matches(guidance.trim()).count(), 1, "{role}");
+        }
+        let notice = catalog
+            .notify_wrapper("conversation: C-1\nsender: user\ntext: hi\n")
+            .unwrap();
+        assert_eq!(
+            notice.trim(),
+            "[Notification]\nconversation: C-1\nsender: user\ntext: hi"
+        );
     }
 
     #[test]
