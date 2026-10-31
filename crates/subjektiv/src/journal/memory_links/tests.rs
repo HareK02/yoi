@@ -35,9 +35,13 @@ impl Fixture {
             ))
             .unwrap();
         let store = SubjektivStore::open(&workspace, &registration).unwrap();
-        let subject = store
-            .create_subject(SubjectRole::new("companion").unwrap())
-            .unwrap();
+        let subject = if migrations.last().unwrap().version() < 12 {
+            crate::journal::tests::pre_permissions_subject_fixture(&store, "companion", "")
+        } else {
+            store
+                .create_subject(SubjectRole::new("companion").unwrap())
+                .unwrap()
+        };
         let attr =
             SubjectSessionAttribution::new(&subject.id, "runtime", "worker", "session").unwrap();
         store.record_session_attribution(attr.clone()).unwrap();

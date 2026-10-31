@@ -15451,11 +15451,16 @@
             "default": "",
             "type": "string"
           },
+          "operation_id": {
+            "description": "Stable across exact retries; changed input with the same ID conflicts.",
+            "type": "string"
+          },
           "role": {
             "type": "string"
           }
         },
         "required": [
+          "operation_id",
           "role"
         ],
         "type": "object"
@@ -22720,7 +22725,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:2ac605f7ea70d0c725f9993a5c59c4a8c4266cf69184902db7b3ea7fd5932224"
+    "x-yoi-source-digest": "sha256:85593527d939626a32b88d9b2760b531681b087d95fefa5119901fe86d60d76c"
   },
   "openapi": "3.1.0",
   "paths": {

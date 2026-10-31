@@ -23856,7 +23856,7 @@ async fn scoped_create_subjektiv_subject(
             crate::subjektiv::validate_subject_behavior(&request.behavior_md)
                 .map_err(|error| Error::InvalidInput(error.to_string()))?;
             let subject = open_subjektiv_store(&api)?
-                .create_subject_with_behavior(role, request.behavior_md)
+                .create_subject_idempotent(role, request.behavior_md, &request.operation_id)
                 .map_err(subjektiv_store_error)?;
             Ok((
                 StatusCode::CREATED,
@@ -25752,6 +25752,7 @@ fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
             Error::WorkspacePermissionDenied(error.to_string())
         }
         crate::subjektiv::SubjektivError::SubjectPermissionsConflict(_)
+        | crate::subjektiv::SubjektivError::SubjectCreationConflict(_)
         | crate::subjektiv::SubjektivError::SubjectDeletionConflict(_)
         | crate::subjektiv::SubjektivError::PermissionOperationConflict(_)
         | crate::subjektiv::SubjektivError::WorkerExecutionGrantConflict(_) => {
@@ -45318,7 +45319,10 @@ mod tests {
                 &subject_id,
                 &SubjectPermissionsUpdate {
                     operation_id: "completion-grant".into(),
-                    expected_change_id: None,
+                    expected_change_id: store
+                        .subject_permissions(&subject_id)
+                        .unwrap()
+                        .map(|p| p.change_id),
                     execution: vec![ScopedPermission {
                         operation: "merge_request.complete".into(),
                         resource: PermissionResource::MergeRequest {
@@ -47388,7 +47392,7 @@ mod tests {
             app.clone(),
             "POST",
             &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
-            Some(serde_json::json!({ "role": "Browser author" })),
+            Some(serde_json::json!({ "operation_id":"browser-unauthorized", "role": "Browser author" })),
             StatusCode::UNAUTHORIZED,
         )
         .await;
@@ -47397,6 +47401,7 @@ mod tests {
             "POST",
             &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
             Some(serde_json::json!({
+                "operation_id":"browser-create",
                 "role": "  Browser author  ",
                 "behavior_md": "Prefer explicit evidence.\nAsk when uncertain."
             })),
@@ -47483,7 +47488,7 @@ mod tests {
             app.clone(),
             "POST",
             &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
-            Some(serde_json::json!({ "role": "   " })),
+            Some(serde_json::json!({ "operation_id":"invalid-role", "role": "   " })),
             &owner_token,
             StatusCode::BAD_REQUEST,
         )
@@ -47496,7 +47501,9 @@ mod tests {
             app.clone(),
             "POST",
             "/api/w/another-workspace/subjektiv/subjects",
-            Some(serde_json::json!({ "role": "Cross Workspace" })),
+            Some(
+                serde_json::json!({ "operation_id":"cross-workspace", "role": "Cross Workspace" }),
+            ),
             &owner_token,
             StatusCode::NOT_FOUND,
         )
@@ -47581,6 +47588,7 @@ mod tests {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
             Json(server_api::SubjektivSubjectCreateRequest {
+                operation_id: format!("create-subject-{}", uuid::Uuid::now_v7()),
                 role: "companion".to_string(),
                 behavior_md: "Prefer explicit evidence.".to_string(),
             }),
@@ -47644,6 +47652,7 @@ mod tests {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
             Json(server_api::SubjektivSubjectCreateRequest {
+                operation_id: format!("create-subject-{}", uuid::Uuid::now_v7()),
                 role: "reviewer".to_string(),
                 behavior_md: "x".repeat(server_api::SUBJEKTIV_MAX_BEHAVIOR_BYTES + 1),
             }),
@@ -48139,6 +48148,18 @@ mod tests {
                 serde_json::to_vec(&body).unwrap(),
             )
         };
+        let initial = store.subject_permissions(&subject.id).unwrap().unwrap();
+        store
+            .set_subject_permissions(
+                &subject.id,
+                &SubjectPermissionsUpdate {
+                    operation_id: "bound-authorization-revoke".into(),
+                    expected_change_id: Some(initial.change_id),
+                    execution: vec![],
+                    delegation: vec![],
+                },
+            )
+            .unwrap();
         let denied = build_router(api.clone())
             .oneshot(check(subject_request.clone()))
             .await
@@ -48158,7 +48179,10 @@ mod tests {
                 &subject.id,
                 &SubjectPermissionsUpdate {
                     operation_id: Uuid::now_v7().to_string(),
-                    expected_change_id: None,
+                    expected_change_id: store
+                        .subject_permissions(&subject.id)
+                        .unwrap()
+                        .map(|p| p.change_id),
                     execution: vec![
                         ScopedPermission {
                             operation: "memory.resident.supply".into(),
@@ -48287,7 +48311,11 @@ mod tests {
                 &subject.id,
                 &SubjectPermissionsUpdate {
                     operation_id: "staging-scope-fixture".into(),
-                    expected_change_id: None,
+                    expected_change_id: open_subjektiv_store(&api)
+                        .unwrap()
+                        .subject_permissions(&subject.id)
+                        .unwrap()
+                        .map(|p| p.change_id),
                     execution,
                     delegation: vec![],
                 },

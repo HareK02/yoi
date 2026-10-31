@@ -68,16 +68,71 @@ fn open_version(
     (manager, scope, store)
 }
 
+fn legacy_unset_source_fixture(store: &SubjektivStore, subject: &str) {
+    // Model an unset legacy source without deleting immutable permission history or receipts.
+    store
+        .database
+        .try_transaction::<_, SubjektivError>(|tx| {
+            assert_eq!(
+                tx.execute(
+                    "DELETE FROM subject_permissions WHERE subject_id=?1",
+                    [subject]
+                )?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(store.subject_permissions(subject).unwrap().is_none());
+}
+
+fn pre_permissions_subject_fixture(store: &SubjektivStore, behavior: &str) -> SubjectRecord {
+    // Freeze the version-11 row/record shape rather than invoking today's initializing create API.
+    assert_eq!(store.database.schema_version().unwrap(), 11);
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "id": "legacy-subject",
+        "role": role().as_str(),
+        "behavior_md": behavior,
+        "state": "active",
+        "created_at": "2026-09-28T10:00:00.000Z",
+        "updated_at": "2026-09-28T10:00:00.000Z"
+    });
+    store
+        .database
+        .try_transaction::<_, SubjektivError>(|tx| {
+            tx.execute(
+                "INSERT INTO subjects(subject_id,role,behavior_md,state,record_json,created_at,updated_at)
+                 VALUES(?1,?2,?3,'active',?4,?5,?5)",
+                params![
+                    "legacy-subject",
+                    role().as_str(),
+                    behavior,
+                    record.to_string(),
+                    "2026-09-28T10:00:00.000Z",
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    serde_json::from_value(record).unwrap()
+}
+
 #[test]
 fn replacements_are_cas_fenced_replayable_and_never_restore_old_permissions() {
     let temp = tempfile::tempdir().unwrap();
     let subject;
     let first;
-    let first_update = update("allow", None, vec![permission("file.read", ".", true)]);
+    let first_update;
     {
         let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
         subject = store.create_subject(role()).unwrap().id;
-        assert!(store.subject_permissions(&subject).unwrap().is_none());
+        let initial = store.subject_permissions(&subject).unwrap().unwrap();
+        first_update = update(
+            "allow",
+            Some(&initial.change_id),
+            vec![permission("file.read", ".", true)],
+        );
         first = store
             .set_subject_permissions(&subject, &first_update)
             .unwrap();
@@ -144,8 +199,12 @@ fn failed_receipt_insert_rolls_back_source_history_and_projection() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
+    let initial = store.subject_permissions(&subject).unwrap().unwrap();
     let first = store
-        .set_subject_permissions(&subject, &update("first", None, Vec::new()))
+        .set_subject_permissions(
+            &subject,
+            &update("first", Some(&initial.change_id), Vec::new()),
+        )
         .unwrap();
     store.database.try_transaction::<_, SubjektivError>(|tx| {
         tx.execute_batch("CREATE TRIGGER fail_permission_receipt BEFORE INSERT ON subject_permission_receipts BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;")?;
@@ -164,7 +223,7 @@ fn failed_receipt_insert_rolls_back_source_history_and_projection() {
     assert_eq!(store.subject_permissions(&subject).unwrap(), Some(first));
     store.database.try_transaction::<_, SubjektivError>(|tx| {
         let counts: (u32, u32) = tx.query_row("SELECT (SELECT count(*) FROM subject_permission_changes),(SELECT count(*) FROM subject_permission_receipts)", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        assert_eq!(counts, (1, 1));
+        assert_eq!(counts, (2, 1));
         tx.execute_batch("DROP TRIGGER fail_permission_receipt")?;
         Ok(())
     }).unwrap();
@@ -181,6 +240,7 @@ fn scope_and_validation_rejections_do_not_issue_permission_sources() {
     let (_a_manager, _a_scope, a) = open_store(&temp.path().join("a"), "workspace-a");
     let (_b_manager, _b_scope, b) = open_store(&temp.path().join("b"), "workspace-b");
     let subject = a.create_subject(role()).unwrap().id;
+    legacy_unset_source_fixture(&a, &subject);
     assert!(
         b.set_subject_permissions(&subject, &update("cross-subject", None, Vec::new()))
             .is_err()
@@ -220,10 +280,15 @@ fn child_grants_are_immutable_bounded_and_do_not_create_subject_ownership() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
+    let initial = store.subject_permissions(&subject).unwrap().unwrap();
     let source = store
         .set_subject_permissions(
             &subject,
-            &update("allow", None, vec![permission("file.read", "src", true)]),
+            &update(
+                "allow",
+                Some(&initial.change_id),
+                vec![permission("file.read", "src", true)],
+            ),
         )
         .unwrap();
     let child = grant(&subject, &source.change_id, "child");
@@ -278,10 +343,15 @@ fn redelegation_requires_current_source_and_explicit_retained_parent_ceiling() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
+    let initial = store.subject_permissions(&subject).unwrap().unwrap();
     let source = store
         .set_subject_permissions(
             &subject,
-            &update("allow", None, vec![permission("file.read", ".", true)]),
+            &update(
+                "allow",
+                Some(&initial.change_id),
+                vec![permission("file.read", ".", true)],
+            ),
         )
         .unwrap();
     let mut child = grant(&subject, &source.change_id, "child");
@@ -325,10 +395,15 @@ fn journal_state_neither_authenticates_roots_nor_bypasses_retained_child_ceiling
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
+    let initial = store.subject_permissions(&subject).unwrap().unwrap();
     let source = store
         .set_subject_permissions(
             &subject,
-            &update("allow", None, vec![permission("file.read", ".", true)]),
+            &update(
+                "allow",
+                Some(&initial.change_id),
+                vec![permission("file.read", ".", true)],
+            ),
         )
         .unwrap();
     // The Host has authenticated root ownership outside this store. No Journal record is
@@ -369,10 +444,15 @@ fn retained_origins_reject_cycles_foreign_subjects_and_stale_parent_sources() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
+    let initial = store.subject_permissions(&subject).unwrap().unwrap();
     let source = store
         .set_subject_permissions(
             &subject,
-            &update("allow", None, vec![permission("file.read", ".", true)]),
+            &update(
+                "allow",
+                Some(&initial.change_id),
+                vec![permission("file.read", ".", true)],
+            ),
         )
         .unwrap();
     let mut child = grant(&subject, &source.change_id, "child");
@@ -386,8 +466,16 @@ fn retained_origins_reject_cycles_foreign_subjects_and_stale_parent_sources() {
         Err(SubjektivError::AuthorizationDenied(_))
     ));
     let other = store.create_subject(role()).unwrap().id;
+    let other_initial = store.subject_permissions(&other).unwrap().unwrap();
     let other_source = store
-        .set_subject_permissions(&other, &update("other", None, source.delegation.clone()))
+        .set_subject_permissions(
+            &other,
+            &update(
+                "other",
+                Some(&other_initial.change_id),
+                source.delegation.clone(),
+            ),
+        )
         .unwrap();
     let mut foreign = grant(&other, &other_source.change_id, "foreign-child");
     foreign.origin_worker_id = "child".into();
@@ -414,10 +502,15 @@ fn failed_grant_insert_leaves_no_binding_and_can_retry_same_grant() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
+    let initial = store.subject_permissions(&subject).unwrap().unwrap();
     let source = store
         .set_subject_permissions(
             &subject,
-            &update("allow", None, vec![permission("file.read", ".", true)]),
+            &update(
+                "allow",
+                Some(&initial.change_id),
+                vec![permission("file.read", ".", true)],
+            ),
         )
         .unwrap();
     let child = grant(&subject, &source.change_id, "child");
@@ -470,9 +563,7 @@ fn current_schema_migration_preserves_subject_and_matches_new_database() {
     let original;
     {
         let (_old_manager, _old_scope, old) = open_version(&root, 11);
-        original = old
-            .create_subject_with_behavior(role(), "Keep behavior separate".into())
-            .unwrap();
+        original = pre_permissions_subject_fixture(&old, "Keep behavior separate");
     }
     let (_migrated_manager, _migrated_scope, migrated) = open_store(&root, "workspace-a");
     assert_eq!(
@@ -502,6 +593,7 @@ fn unset_or_execution_only_source_cannot_issue_child_grants_and_saved_grants_sur
     {
         let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
         let subject = store.create_subject(role()).unwrap().id;
+        legacy_unset_source_fixture(&store, &subject);
         assert!(
             store
                 .bind_worker_execution_grant(&grant(&subject, "unset", "child"))
@@ -556,14 +648,27 @@ fn subject_grant_listing_is_scoped_retained_ordered_and_fails_on_overflow() {
             .unwrap()
             .is_empty()
     );
+    let initial = store.subject_permissions(&subject).unwrap().unwrap();
     let source = store
         .set_subject_permissions(
             &subject,
-            &update("allow", None, vec![permission("file.read", ".", true)]),
+            &update(
+                "allow",
+                Some(&initial.change_id),
+                vec![permission("file.read", ".", true)],
+            ),
         )
         .unwrap();
+    let other_initial = store.subject_permissions(&other).unwrap().unwrap();
     let other_source = store
-        .set_subject_permissions(&other, &update("other", None, source.delegation.clone()))
+        .set_subject_permissions(
+            &other,
+            &update(
+                "other",
+                Some(&other_initial.change_id),
+                source.delegation.clone(),
+            ),
+        )
         .unwrap();
     let other_grant = grant(&other, &other_source.change_id, "other-child");
     store.bind_worker_execution_grant(&other_grant).unwrap();
@@ -631,7 +736,7 @@ fn failed_schema_migration_rolls_back_new_tables_and_preserves_old_data() {
     let original;
     {
         let (_old_manager, _old_scope, old) = open_version(temp.path(), 11);
-        original = old.create_subject(role()).unwrap();
+        original = pre_permissions_subject_fixture(&old, "");
         old.database
             .try_transaction::<_, SubjektivError>(|tx| {
                 tx.execute_batch("CREATE TABLE subject_permissions (collision TEXT)")?;
@@ -660,7 +765,12 @@ fn deletion_fences_source_and_child_grant_replays_and_never_falls_back_after_pur
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
-    let replacement = update("allow", None, vec![permission("file.read", ".", true)]);
+    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let replacement = update(
+        "allow",
+        Some(&initial.change_id),
+        vec![permission("file.read", ".", true)],
+    );
     let source = store
         .set_subject_permissions(&subject, &replacement)
         .unwrap();
@@ -688,7 +798,12 @@ fn deletion_fences_source_and_child_grant_replays_and_never_falls_back_after_pur
             .is_none()
     );
     let fresh = store.create_subject(role()).unwrap().id;
-    assert!(store.subject_permissions(&fresh).unwrap().is_none());
+    let fresh_source = store.subject_permissions(&fresh).unwrap().unwrap();
+    assert_eq!(
+        fresh_source.execution,
+        server_api::authorization::subject_conversation_permissions("workspace-a", &fresh)
+    );
+    assert!(fresh_source.delegation.is_empty());
     assert!(
         store
             .record_session_attribution(

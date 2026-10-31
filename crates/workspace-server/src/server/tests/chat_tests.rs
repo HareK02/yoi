@@ -670,7 +670,10 @@ impl agen::llm_client::LlmClient for ChatModel {
                 is_error, content, ..
             } = item
             {
-                assert!(!is_error, "real connected chat Tool failed: {content:?}");
+                assert!(
+                    !is_error,
+                    "real connected chat Tool failed: {item:?}; detail={content:?}"
+                );
             }
         }
         let events = match phase {
@@ -712,11 +715,33 @@ impl agen::llm_client::LlmClient for ChatModel {
                     request.tools.iter().any(|tool| tool.name == name),
                     "builtin:async-chat must expose {name}"
                 );
-                vec![
+                let mut events = vec![
                     Event::tool_use_start(0, format!("chat-tool-{phase}"), name),
                     Event::tool_input_delta(0, input.to_string()),
                     Event::tool_use_stop(0),
-                ]
+                ];
+                if phase == 3 {
+                    for (index, name, input) in [
+                        (1, "SubjektivMemoryQuery", json!({})),
+                        (
+                            2,
+                            "SubjektivMemoryRemember",
+                            json!({"kind":"lesson","claim":"The connected chat path supports explicit remembering.","why_useful":"Retain tested conversation behavior."}),
+                        ),
+                        (3, "SubjektivSessionList", json!({})),
+                    ] {
+                        assert!(
+                            request.tools.iter().any(|tool| tool.name == name),
+                            "default profile must expose {name}"
+                        );
+                        events.extend([
+                            Event::tool_use_start(index, format!("default-memory-{index}"), name),
+                            Event::tool_input_delta(index, input.to_string()),
+                            Event::tool_use_stop(index),
+                        ]);
+                    }
+                }
+                events
             }
             4..=6 => vec![
                 Event::text_block_start(0),
@@ -743,37 +768,10 @@ struct ConnectedChat {
     owner: String,
     url: String,
     lose_next_input_ack: Arc<std::sync::atomic::AtomicBool>,
+    identity: RuntimeIdentityMaterial,
     _backend: AuthorizationCallbackServer,
     _runtime_server: ConnectedRuntimeServer,
     _dir: tempfile::TempDir,
-}
-fn publish_chat_fixture_profile(api: &WorkspaceApi) {
-    // A bundled Profile is not automatically a Backend-published candidate.
-    // Publish the actual built-in without copying or widening its capabilities.
-    let state = api
-        .config_store
-        .load_workspace_config(TEST_WORKSPACE_ID)
-        .unwrap()
-        .unwrap();
-    let main = state
-        .snapshot
-        .get(&config_source::VirtualPath::parse("main.dcdl").unwrap())
-        .unwrap();
-    let content = r#"{ profile = { default_profile = "project:connected-chat"; entries = [{ selector = "project:connected-chat"; label = "Connected chat"; description = "Real built-in async chat fixture"; profile = import "$builtin/profiles/async-chat.dcdl"; }]; }; }"#;
-    commit_workspace_config_tree(
-        api,
-        TEST_WORKSPACE_ID,
-        &ConfigCommitRequest {
-            base_digest: state.snapshot.digest.clone(),
-            entrypoints: state.contract.entrypoints.clone(),
-            changes: vec![config_source::ConfigTreeChange::Update {
-                path: main.path.clone(),
-                expected_digest: main.content_digest.clone(),
-                content: content.into(),
-            }],
-        },
-    )
-    .unwrap();
 }
 
 impl ConnectedChat {
@@ -943,7 +941,6 @@ impl ConnectedChat {
             )
             .unwrap(),
         );
-        publish_chat_fixture_profile(&api);
         seed_test_delivery_binding(&api);
         let owner =
             seed_test_workspace_owner_token(api.store.as_ref(), "connected-chat-owner").await;
@@ -957,6 +954,7 @@ impl ConnectedChat {
             owner,
             url,
             lose_next_input_ack,
+            identity,
             _backend: backend,
             _runtime_server: runtime_server,
             _dir: dir,
@@ -978,6 +976,54 @@ impl ConnectedChat {
         assert!(status.is_success(), "{path}: {status} {body}");
         body
     }
+}
+
+fn connected_source_request(
+    f: &ConnectedChat,
+    worker: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> Request<Body> {
+    let proof = worker_runtime::auth::RuntimeRequestSourceSigner::from_identity(&f.identity)
+        .issue(
+            &f.url,
+            TEST_WORKSPACE_ID,
+            Some(worker),
+            worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+            "POST",
+            path,
+            &body,
+            i64::try_from(worker_runtime::auth::unix_now_seconds()).unwrap(),
+            30,
+        )
+        .unwrap();
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(CONTENT_TYPE, "application/json")
+        .header(
+            worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER,
+            proof,
+        )
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn worker_chat_connected(
+    f: &ConnectedChat,
+    worker: &str,
+    operation: Value,
+) -> (StatusCode, Value) {
+    response(
+        &f.api,
+        connected_source_request(
+            f,
+            worker,
+            &chat_worker_path(),
+            serde_json::to_vec(&json!({"operation":operation})).unwrap(),
+        ),
+    )
+    .await
 }
 
 async fn next_chat_input(
@@ -1049,22 +1095,44 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
     })
     .await;
     let store = open_subjektiv_store(&f.api).unwrap();
-    let subject = store
-        .create_subject(crate::subjektiv::SubjectRole::new("connected-chat").unwrap())
+    let create_wire =
+        json!({"operation_id":"connected-subject-create","role":"connected-chat","behavior_md":""});
+    let subject = f
+        .post(
+            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
+            create_wire.clone(),
+        )
+        .await["id"]
+        .as_str()
         .unwrap()
-        .id;
-    let operations = [
-        "session.record",
-        "memory.resident.read",
-        "memory.resident.supply",
-        "journal.startup.read",
-        "journal.startup.supply",
-        // Restore uses the ordinary fail-closed recording hook as well.
-        "journal.recording.request",
-        "chat.read",
-        "chat.send",
-    ];
-    f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),json!({"operation_id":"connected-chat-policy","expected_change_id":null,"execution":operations.into_iter().map(|op|subject_permission(&subject,op)).collect::<Vec<_>>(),"delegation":[]})).await;
+        .to_owned();
+    assert_eq!(
+        f.post(
+            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
+            create_wire.clone()
+        )
+        .await["id"],
+        subject
+    );
+    let (status, managed) = account(
+        &f.api,
+        &f.owner,
+        "GET",
+        &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{managed}");
+    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    assert_eq!(
+        managed["permissions"],
+        serde_json::to_value(&initial).unwrap()
+    );
+    assert_eq!(
+        initial.execution,
+        server_api::authorization::subject_conversation_permissions(TEST_WORKSPACE_ID, &subject)
+    );
+    assert!(initial.delegation.is_empty());
     let conversation = f
         .post(
             &conversations_path(),
@@ -1073,7 +1141,7 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         .await;
     let c = conversation["id"].as_str().unwrap();
     *conversation_id.lock().unwrap() = c.into();
-    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Connected async chat","profile":"project:connected-chat","initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
+    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Connected async chat","profile":"builtin:async-chat","initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
     let worker = created["worker_id"].as_str().unwrap();
     let mut events = f.runtime.subscribe_worker_observation().unwrap();
     let first_wire = json!({"operation_id":"connected-first","text":"CHAT_FIRST_USER_CONTENT"});
@@ -1170,6 +1238,19 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         "three user messages and two explicit Sends, not internal output"
     );
     assert!(!public.to_string().contains("INTERNAL_ASSISTANT"));
+    let staged = store.pending_staging_candidates(&subject, 20).unwrap();
+    assert!(
+        staged
+            .iter()
+            .any(|candidate| candidate.claim
+                == "The connected chat path supports explicit remembering."),
+        "Remember must reach real authorized SQLite staging, not just return a fixture receipt: {staged:?}"
+    );
+    assert_eq!(
+        store.subject_permissions(&subject).unwrap(),
+        Some(initial.clone()),
+        "composition and memory operations never reissue policy"
+    );
     let idle_wire = json!({"operation_id":"connected-idle","text":"CHAT_IDLE_USER_CONTENT"});
     let idle = f.post(&messages_path(c), idle_wire.clone()).await;
     assert_eq!(idle["delivery"]["state"], "accepted");
@@ -1272,6 +1353,88 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         "explicit retry after restore preserves one public User message"
     );
     assert!(!public.to_string().contains("INTERNAL_ASSISTANT"));
+    let other = f
+        .post(
+            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
+            json!({"operation_id":"foreign-default-subject","role":"foreign"}),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for permission in [
+        subject_permission(&other, "chat.read"),
+        ScopedPermission {
+            operation: "filesystem.read".into(),
+            resource: PermissionResource::Workdir {
+                working_directory_id: "outside".into(),
+                path: ".".into(),
+                recursive: true,
+            },
+        },
+    ] {
+        let (status, body) = response(
+            &f.api,
+            connected_source_request(
+                &f,
+                worker,
+                &authorization_path(),
+                serde_json::to_vec(&permission).unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "initial self source must not cover foreign resources: {body}"
+        );
+    }
+    let revoked = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"), json!({"operation_id":"revoke-chat-defaults","expected_change_id":initial.change_id,"execution":[],"delegation":[]})).await;
+    assert_eq!(
+        f.post(
+            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
+            create_wire
+        )
+        .await["id"],
+        subject
+    );
+    let (status, body) = worker_chat_connected(&f, worker, read(c)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "revocation cannot be repaired by profile or create replay: {body}"
+    );
+    f.post(&format!("{lifecycle_path}/stop"), json!({})).await;
+    let token = f
+        .api
+        .runtime
+        .worker(&worker_ref)
+        .unwrap()
+        .restore_observation_token
+        .unwrap();
+    let restored = f
+        .post(
+            &format!("{lifecycle_path}/restore"),
+            json!({"request_id":"restore-revoked-defaults","expected_observation_token":token}),
+        )
+        .await;
+    assert_ne!(
+        restored["result"]["state"], "accepted",
+        "required startup authorization must refuse revoked source: {restored}"
+    );
+    let (status, managed) = account(
+        &f.api,
+        &f.owner,
+        "GET",
+        &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        managed["permissions"], revoked["permissions"],
+        "restore never reissues the initial policy"
+    );
 }
 
 #[derive(Clone)]
@@ -1302,21 +1465,15 @@ impl agen::llm_client::LlmClient for NotifyObservationModel {
 async fn browser_notify_preserves_ack_id_limits_retry_and_console_next_draft() {
     let (tx, mut inputs) = tokio::sync::mpsc::channel(32);
     let f = ConnectedChat::new(NotifyObservationModel(tx), |router| router).await;
-    let subject = open_subjektiv_store(&f.api)
+    let subject = f
+        .post(
+            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
+            json!({"operation_id":"notify-console-subject","role":"notify-console"}),
+        )
+        .await["id"]
+        .as_str()
         .unwrap()
-        .create_subject(crate::subjektiv::SubjectRole::new("notify-console").unwrap())
-        .unwrap()
-        .id;
-    let operations = [
-        "session.record",
-        "memory.resident.read",
-        "memory.resident.supply",
-        "journal.startup.read",
-        "journal.startup.supply",
-        "chat.read",
-        "chat.send",
-    ];
-    f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),json!({"operation_id":"notify-console-policy","expected_change_id":null,"execution":operations.into_iter().map(|op|subject_permission(&subject,op)).collect::<Vec<_>>(),"delegation":[]})).await;
+        .to_owned();
     let conversation = f
         .post(
             &conversations_path(),
@@ -1324,7 +1481,7 @@ async fn browser_notify_preserves_ack_id_limits_retry_and_console_next_draft() {
         )
         .await;
     let c = conversation["id"].as_str().unwrap();
-    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Notify Console","profile":"project:connected-chat","initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
+    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Notify Console","profile":"builtin:async-chat","initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
     let worker = created["worker_id"].as_str().unwrap();
     let chat = f
         .post(

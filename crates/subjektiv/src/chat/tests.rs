@@ -640,12 +640,21 @@ fn policy(
     operation: &str,
     expected: Option<&str>,
 ) -> String {
+    // Initial test replacement observes the source installed by normal Subject creation.
+    // Keep explicit expectations unchanged so replacement races still use their pinned CAS.
+    let expected = expected.map(str::to_owned).unwrap_or_else(|| {
+        store
+            .subject_permissions(subject)
+            .unwrap()
+            .unwrap()
+            .change_id
+    });
     store
         .set_subject_permissions(
             subject,
             &server_api::authorization::SubjectPermissionsUpdate {
                 operation_id: operation.into(),
-                expected_change_id: expected.map(str::to_owned),
+                expected_change_id: Some(expected),
                 execution: Vec::new(),
                 delegation: Vec::new(),
             },
