@@ -6,6 +6,8 @@
 //! is scripted. All endpoints and storage are ephemeral; no live model is used.
 use super::*;
 use server_api::{ChatConversation, ChatMessagePage, ChatReceiveResponse};
+#[path = "chat_web_connected.rs"]
+mod web_connected;
 
 fn conversations_path() -> String {
     format!("/api/w/{TEST_WORKSPACE_ID}/chat/conversations")
@@ -922,6 +924,14 @@ impl ConnectedChat {
         model: impl agen::llm_client::LlmClient + Clone + 'static,
         app_layer: impl FnOnce(Router) -> Router,
     ) -> Self {
+        Self::with_web_assets(model, app_layer, None).await
+    }
+
+    async fn with_web_assets(
+        model: impl agen::llm_client::LlmClient + Clone + 'static,
+        app_layer: impl FnOnce(Router) -> Router,
+        assets: Option<PathBuf>,
+    ) -> Self {
         const RUNTIME: &str = "connected-chat";
         let dir = tempfile::tempdir().unwrap();
         let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -957,6 +967,7 @@ impl ConnectedChat {
         .unwrap();
         let mut config = test_server_config(dir.path());
         config.backend_base_url = Some(url.clone());
+        config.static_assets_dir = assets.clone();
         let control = Arc::new(test_control_store(&config));
         seed_test_registered_workspace(control.as_ref(), &config)
             .await
@@ -1087,10 +1098,23 @@ impl ConnectedChat {
         seed_test_delivery_binding(&api);
         let owner =
             seed_test_workspace_owner_token(api.store.as_ref(), "connected-chat-owner").await;
-        let backend = AuthorizationCallbackServer::start(
-            backend_listener,
-            app_layer(build_router(api.clone())),
-        );
+        let router = if assets.is_some() {
+            let server = WorkspaceServerApi::new_for_test(api.config.clone(), api.store.clone());
+            server
+                .apis
+                .lock()
+                .await
+                .insert(TEST_WORKSPACE_ID.into(), api.clone());
+            server
+                .routers
+                .lock()
+                .await
+                .insert(TEST_WORKSPACE_ID.into(), build_inner_router(api.clone()));
+            workspace_server_router(server)
+        } else {
+            build_router(api.clone())
+        };
+        let backend = AuthorizationCallbackServer::start(backend_listener, app_layer(router));
         Self {
             api,
             runtime,
