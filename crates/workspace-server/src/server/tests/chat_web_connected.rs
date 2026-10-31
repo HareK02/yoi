@@ -1,8 +1,9 @@
 //! Explicit browser/component connection, not a separate product-process launcher.
 //! Reuses ConnectedChat's real server/auth/storage/Runtime/installed chat Feature.
 //! The browser uses the actual static Web build and Account API-token auth; only
-//! the external model and response-loss/Busy timing are controlled. T807 Body and
-//! T817 canonical navigation are integrated separately once their refs arrive.
+//! the external model and response-loss/Busy timing are controlled. Shared Body
+//! start/stop/restore and canonical/legacy Subject navigation stay real. Restore
+//! requires the runner-owned isolation checked before either server starts.
 //! Build `web/workspace` first, then explicitly select:
 //! `cargo test -p yoi-workspace-server --lib chat_web_connected -- --ignored --test-threads=1`.
 //! Uses the installed tools/web-ux Deno lock/Chromium; no browser download occurs.
@@ -11,9 +12,34 @@ use super::*;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 
+#[derive(Clone)]
+struct BrowserModel {
+    model: ChatModel,
+    resumed: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl agen::llm_client::LlmClient for BrowserModel {
+    fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
+        Box::new(self.clone())
+    }
+
+    async fn stream(
+        &self,
+        request: agen::llm_client::Request,
+    ) -> std::result::Result<agen::llm_client::ResponseStream, agen::llm_client::ClientError> {
+        let stream = self.model.stream(request).await?;
+        if self.model.calls.load(std::sync::atomic::Ordering::SeqCst) == 6 {
+            self.resumed.add_permits(1);
+        }
+        Ok(stream)
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "explicit Web build, Deno and installed Playwright Chromium required"]
 async fn chat_web_connected_busy_unknown_replay_and_authorization_use_real_runtime_publications() {
+    crate::restore_test_environment::require_restore_test_environment();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let assets = root.join("web/workspace/build");
     assert!(
@@ -29,6 +55,11 @@ async fn chat_web_connected_busy_unknown_replay_and_authorization_use_real_runti
         after_busy_boundary: Arc::new(tokio::sync::Semaphore::new(1)),
     };
     let calls = model.calls.clone();
+    let resumed = Arc::new(tokio::sync::Semaphore::new(0));
+    let model = BrowserModel {
+        model,
+        resumed: resumed.clone(),
+    };
     let public_posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let read_started = Arc::new(tokio::sync::Semaphore::new(0));
     let (release, wait) = tokio::sync::oneshot::channel::<()>();
@@ -37,6 +68,22 @@ async fn chat_web_connected_busy_unknown_replay_and_authorization_use_real_runti
     let f = ConnectedChat::with_web_assets(
         model,
         move |router| {
+            // Observe the substituted model only. An accepted Notify or an Idle
+            // snapshot alone cannot prove this new no-public-reply turn ran.
+            let router = router.route(
+                "/__fixture/model-resumed",
+                axum::routing::get(move || {
+                    let resumed = resumed.clone();
+                    async move {
+                        tokio::time::timeout(std::time::Duration::from_secs(30), resumed.acquire())
+                            .await
+                            .expect("restored input must reach the model")
+                            .unwrap()
+                            .forget();
+                        axum::Json(json!({"observed":true}))
+                    }
+                }),
+            );
             router.layer(axum::middleware::from_fn(
                 move |request: axum::extract::Request, next: axum::middleware::Next| {
                     let public_posts = public_posts.clone();
@@ -89,9 +136,15 @@ async fn chat_web_connected_busy_unknown_replay_and_authorization_use_real_runti
     let conversation = f.post(&conversations_path(), json!({"operation_id":format!("web-subject-conversation/v1/{subject}"),"subject_id":subject})).await;
     let c = conversation["id"].as_str().unwrap();
     *conversation_id.lock().unwrap() = c.into();
-    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"), json!({"runtime_id":"connected-chat","display_name":"Browser connected chat","profile":"builtin:async-chat","initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
-    let worker = created["worker_id"].as_str().unwrap();
-    let mut events = f.runtime.subscribe_worker_observation().unwrap();
+    // Let the browser use normal Body admission, including its default profile.
+    // Remove only the unused fixture Runtime so the real signed HTTP path wins.
+    assert!(matches!(
+        f.api
+            .runtime
+            .unregister_if_idle(EMBEDDED_WORKER_RUNTIME_ID, 100)
+            .unwrap(),
+        crate::hosts::RuntimeRegistryUnregisterResult::Removed
+    ));
     f.lose_next_input_ack
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let foreign = seed_test_api_token(f.api.store.as_ref(), "chat-connected-foreign");
@@ -111,7 +164,8 @@ async fn chat_web_connected_busy_unknown_replay_and_authorization_use_real_runti
         .kill_on_drop(true)
         .spawn()
         .expect("explicit browser test requires Deno");
-    let wire = serde_json::to_vec(&json!({"origin":f.url,"workspace_id":TEST_WORKSPACE_ID,"subject_id":subject,"subject_name":"Web connected companion","conversation_id":c,"owner_token":f.owner,"foreign_token":foreign})).unwrap();
+    let artifacts = root.join("target/t808-validation/body-connected");
+    let wire = serde_json::to_vec(&json!({"origin":f.url,"workspace_id":TEST_WORKSPACE_ID,"subject_id":subject,"subject_name":"Web connected companion","conversation_id":c,"owner_token":f.owner,"foreign_token":foreign,"artifact_dir":artifacts})).unwrap();
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(&wire).await.unwrap();
     drop(stdin);
@@ -145,19 +199,28 @@ async fn chat_web_connected_busy_unknown_replay_and_authorization_use_real_runti
     for phase in 2..=4 {
         next_chat_input(&mut inputs, phase).await;
     }
-    chat_idle(&mut events, worker).await;
+    let resumed = next_chat_input(&mut inputs, 5).await;
+    assert!(resumed.contains("WEB_CONNECTED_AFTER_RESTART"));
+    assert!(resumed.contains("WEB_CONNECTED_FIRST_INPUT"));
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
-        5,
-        "exact retry must not reactivate the model"
+        6,
+        "only the new post-restore input may reactivate the model"
     );
     let (status, public) = account(&f.api, &f.owner, "GET", &messages_path(c), None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(public["messages"].as_array().unwrap().len(), 4);
+    assert_eq!(public["messages"].as_array().unwrap().len(), 5);
     assert!(!public.to_string().contains("INTERNAL_ASSISTANT"));
-    f.post(
-        &format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/connected-chat/workers/{worker}/stop"),
-        json!({}),
+    assert!(!public.to_string().contains("edited next draft"));
+    let (status, body) = account(
+        &f.api,
+        &f.owner,
+        "GET",
+        &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/body"),
+        None,
     )
     .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["current"]["runtime_id"], "connected-chat");
+    assert_eq!(body["observation"]["worker"]["state"], "stopped");
 }
