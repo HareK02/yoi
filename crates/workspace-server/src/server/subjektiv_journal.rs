@@ -545,9 +545,42 @@ pub(super) fn check_start_allowed(api: &WorkspaceApi, subject: &str) -> Result<(
     Ok(())
 }
 
+/// Read-only eligibility, not proof of Runtime absence or permission to replace a body.
+pub(super) fn failed_subject_create_is_unpublished(
+    api: &WorkspaceApi,
+    subject: &str,
+    lease: &crate::store::WorkerSingletonLease,
+) -> Result<bool> {
+    Ok(api
+        .config_store
+        .subject_create_recovery_candidate(api.workspace_id(), lease)?
+        .is_some()
+        && store(api)?
+            .journal_body_is_unpublished(subject, &lease.worker.runtime_id, &lease.worker.worker_id)
+            .map_err(domain)?)
+}
+
 /// Explicit creation can reconcile an earlier failed, never-published body.
 /// No missing catalog/status observation is treated as a Runtime fencing receipt.
 pub(super) fn recover_failed_subject_create(api: &WorkspaceApi, subject: &str) -> Result<()> {
+    let key = crate::subjektiv::subject_worker_singleton_key(subject)
+        .map_err(|e| Error::InvalidInput(e.to_string()))?;
+    if let Some(lease) = api
+        .config_store
+        .current_worker_singleton_owner(api.workspace_id(), &key)?
+        && failed_subject_create_is_unpublished(api, subject, &lease)?
+    {
+        recover_subject_create_reservation(api, subject, &lease)?;
+    }
+    Ok(())
+}
+
+/// Compensation and explicit recovery fence only the observed reservation, never a successor.
+pub(super) fn recover_subject_create_reservation(
+    api: &WorkspaceApi,
+    subject: &str,
+    expected: &crate::store::WorkerSingletonLease,
+) -> Result<()> {
     let continuation = lifecycle_lock(api, &format!("release-continuation:{subject}"))?;
     let _continuation = continuation
         .lock()
@@ -560,25 +593,16 @@ pub(super) fn recover_failed_subject_create(api: &WorkspaceApi, subject: &str) -
         let _guard = gate
             .lock()
             .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
-        let Some(lease) = api
+        let lease = api
             .config_store
             .current_worker_singleton_owner(api.workspace_id(), &subject_key)?
-        else {
-            return Ok(());
-        };
-        if api
-            .config_store
-            .subject_create_recovery_candidate(api.workspace_id(), &lease)?
-            .is_none()
-        {
-            return Ok(());
-        }
-        if !store
-            .journal_body_is_unpublished(subject, &lease.worker.runtime_id, &lease.worker.worker_id)
-            .map_err(domain)?
-        {
-            // Published history must go through the ordinary continuity release.
-            return Ok(());
+            .filter(|lease| lease == expected)
+            .ok_or(Error::SubjectBodySuperseded)?;
+        if !failed_subject_create_is_unpublished(api, subject, &lease)? {
+            return Err(Error::RepositoryConflict(
+                "Only a failed, unpublished Subject creation can be recovered; retain occupancy"
+                    .into(),
+            ));
         }
         let operation_id = format!(
             "subject-create-recovery:{}:{}",

@@ -27,6 +27,7 @@ pub(super) fn assert_failed_request(body: &Value, subject: &str, request: &str, 
 
 struct BodyFixture {
     api: WorkspaceApi,
+    backend: Arc<DeterministicExecutionBackend>,
     owner: String,
     subject: String,
     _dir: tempfile::TempDir,
@@ -35,7 +36,7 @@ struct BodyFixture {
 impl BodyFixture {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let api = test_api(dir.path()).await;
+        let (api, backend) = test_api_with_recording_backend(dir.path()).await;
         let owner = seed_test_workspace_owner_token(api.store.as_ref(), "body-owner").await;
         let subject = open_subjektiv_store(&api)
             .unwrap()
@@ -44,6 +45,7 @@ impl BodyFixture {
             .id;
         Self {
             api,
+            backend,
             owner,
             subject,
             _dir: dir,
@@ -63,6 +65,35 @@ impl BodyFixture {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         body
+    }
+    fn failed_reservation(&self) -> crate::store::WorkerSingletonLease {
+        let key = crate::subjektiv::subject_worker_singleton_key(&self.subject).unwrap();
+        let reservation = self
+            .api
+            .config_store
+            .reserve_worker_create(
+                TEST_WORKSPACE_ID,
+                EMBEDDED_RUNTIME_ID,
+                "failed-body-create",
+                &"f".repeat(64),
+                Some(&key),
+                &self
+                    .api
+                    .config_store
+                    .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+                    .unwrap(),
+            )
+            .unwrap();
+        self.api
+            .config_store
+            .fail_worker_create_reservation(
+                TEST_WORKSPACE_ID,
+                EMBEDDED_RUNTIME_ID,
+                reservation.worker_id,
+                &reservation.create_fingerprint,
+            )
+            .unwrap();
+        reservation.singleton.unwrap()
     }
     fn reserve(&self) -> crate::store::WorkerSingletonLease {
         let key = crate::subjektiv::subject_worker_singleton_key(&self.subject).unwrap();
@@ -166,6 +197,10 @@ async fn browser_subject_and_conversation_reads_allow_missing_origin_but_mutatio
             json!({"request_id":"must-not-start", "expected_current":null, "expected_observation_token":null}),
         ),
         (
+            format!("{}/recover", f.path()),
+            json!({"request_id":"must-not-recover", "expected_current":expected}),
+        ),
+        (
             format!("{}/stop", f.path()),
             json!({"request_id":"must-not-stop", "expected_current":expected, "expected_observation_token":"not-observed"}),
         ),
@@ -233,6 +268,13 @@ async fn body_operations_reject_nonowners_and_cross_workspace_targets() {
     let f = BodyFixture::new().await;
     let reader = seed_test_api_token(f.api.store.as_ref(), "body-reader");
     for (method, suffix, payload) in [
+        (
+            "POST",
+            "/recover",
+            Some(
+                json!({"request_id":"forbidden-recovery", "expected_current":{"runtime_id":"r", "worker_id":"w", "generation":"1"}}),
+            ),
+        ),
         ("GET", "", None),
         (
             "POST",
@@ -310,6 +352,10 @@ async fn body_mutations_reject_an_old_generation_without_releasing_its_owner() {
     old.generation = (lease.generation + 1).to_string();
     for (suffix, payload) in [
         (
+            "/recover",
+            json!({"request_id":"old-recover", "expected_current":old}),
+        ),
+        (
             "/start",
             json!({"request_id":"old-start", "expected_current":old, "expected_observation_token":"old-token"}),
         ),
@@ -362,6 +408,13 @@ async fn body_operations_reject_a_subject_with_deletion_already_admitted() {
             "/start",
             Some(
                 json!({"request_id":"start", "expected_current":null, "expected_observation_token":null}),
+            ),
+        ),
+        (
+            "POST",
+            "/recover",
+            Some(
+                json!({"request_id":"recover-deleted", "expected_current":subject_body::reference(&lease)}),
             ),
         ),
         ("POST", "/stop", Some(stop.clone())),
@@ -438,5 +491,126 @@ async fn body_action_payload_rejection_cannot_claim_request_resolution() {
             body["request"].is_null(),
             "unparsed intent is not evidence: {body}"
         );
+    }
+}
+
+#[tokio::test]
+async fn failed_body_reservation_can_be_recovered_without_starting_a_worker() {
+    let f = BodyFixture::new().await;
+    let lease = f.failed_reservation();
+    let before = f.read().await;
+    assert_eq!(before["observation"]["kind"], "failed_create");
+    assert!(
+        f.backend.recovery_requests.lock().unwrap().is_empty(),
+        "GET must not recover"
+    );
+    let request = json!({"request_id":"recover-failed", "expected_current":before["current"]});
+    *f.backend.recovery_failure.lock().unwrap() = Some("Runtime absence unconfirmed".into());
+    let (status, unknown) = response(
+        &f.api,
+        human_request(
+            &f.owner,
+            "POST",
+            &format!("{}/recover", f.path()),
+            Some(request.clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{unknown}");
+    assert_eq!(unknown["disposition"], "unknown");
+    assert_eq!(f.read().await["current"], before["current"]);
+    let (status, recovered) = response(
+        &f.api,
+        human_request(
+            &f.owner,
+            "POST",
+            &format!("{}/recover", f.path()),
+            Some(request.clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recovered}");
+    assert_eq!(recovered["disposition"], "accepted");
+    assert_eq!(recovered["body"]["observation"]["kind"], "absent");
+    let requests = f.backend.recovery_requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert!(
+        f.api
+            .runtime
+            .list_workers_for_runtime(EMBEDDED_RUNTIME_ID, 100)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let successor = f.reserve();
+    assert_ne!(successor.worker, lease.worker);
+    let (status, stale) = response(
+        &f.api,
+        human_request(
+            &f.owner,
+            "POST",
+            &format!("{}/recover", f.path()),
+            Some(request),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    assert_failed_request(&stale, &f.subject, "recover-failed", "superseded");
+    assert_eq!(
+        f.read().await["current"],
+        serde_json::to_value(subject_body::reference(&successor)).unwrap()
+    );
+    assert_eq!(f.backend.recovery_requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn body_recovery_rejects_unfinished_or_published_creation() {
+    for publication in ["reserved", "writer", "session"] {
+        let f = BodyFixture::new().await;
+        let lease = if publication == "reserved" {
+            f.reserve()
+        } else {
+            f.failed_reservation()
+        };
+        let store = open_subjektiv_store(&f.api).unwrap();
+        if publication == "writer" {
+            store
+                .claim_journal_writer(
+                    &f.subject,
+                    &lease.worker.runtime_id,
+                    &lease.worker.worker_id,
+                )
+                .unwrap();
+        } else if publication == "session" {
+            store
+                .record_session_attribution(
+                    crate::subjektiv::SubjectSessionAttribution::new(
+                        &f.subject,
+                        &lease.worker.runtime_id,
+                        &lease.worker.worker_id,
+                        session_store::new_session_id().to_string(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let before = f.read().await;
+        assert_eq!(before["observation"]["kind"], "unavailable");
+        let request =
+            json!({"request_id":"must-not-recover", "expected_current":before["current"]});
+        let (status, error) = response(
+            &f.api,
+            human_request(
+                &f.owner,
+                "POST",
+                &format!("{}/recover", f.path()),
+                Some(request),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        assert_eq!(f.read().await["current"], before["current"]);
+        assert!(f.backend.recovery_requests.lock().unwrap().is_empty());
     }
 }

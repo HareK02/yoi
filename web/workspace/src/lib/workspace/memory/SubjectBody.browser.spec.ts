@@ -1563,3 +1563,87 @@ test("lost stop stays unknown until an identity-bound supersession from outcome 
     JSON.parse(posts[0].body).request_id,
   );
 });
+
+test("failed creation offers fenced recovery, retaining exact input across reload and never starting a replacement", async () => {
+  let snapshot: Omit<ReturnType<typeof absent>, "current"> & { current: typeof owner | null } = {
+    ...absent(),
+    current: owner,
+    observation: { kind: "failed_create" },
+  };
+  const posts: Array<{ path: string; body: unknown }> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        const request = JSON.parse(String(init.body));
+        posts.push({ path: String(url), body: request });
+        if (posts.length === 1) throw new Error("lost recovery response");
+        snapshot = absent();
+        return Response.json({
+          request_id: request.request_id,
+          disposition: "accepted",
+          diagnostics: [],
+          body: snapshot,
+        });
+      }
+      return Response.json(snapshot);
+    }),
+  );
+  const view = render(SubjectBody, { props });
+  await fireEvent.click(
+    await screen.findByRole("button", {
+      name: "Release failed start reservation",
+    }),
+  );
+  await screen.findByRole("button", { name: "Retry same recover request" });
+  expect(screen.queryByRole("button", { name: "Start conversation body" }))
+    .toBeNull();
+  const saved = readSubjectBodyAttempt(
+    sessionStorage,
+    props.accountId,
+    props.workspaceId,
+    props.subjectId,
+  )!;
+  expect(saved.action).toBe("recover");
+  expect(saved.request.expected_current).toEqual(owner);
+  expect(saved.request).not.toHaveProperty("expected_observation_token");
+  view.unmount();
+  render(SubjectBody, { props });
+  const retry = await screen.findByRole("button", {
+    name: "Retry same recover request",
+  });
+  await waitFor(() => expect(retry.hasAttribute("disabled")).toBe(false));
+  await fireEvent.click(retry);
+  await screen.findByRole("button", { name: "Start conversation body" });
+  expect(posts).toHaveLength(2);
+  expect(posts[1]).toEqual(posts[0]);
+  expect(posts[0].path).toMatch(/\/body\/recover$/);
+  expect(
+    readSubjectBodyAttempt(
+      sessionStorage,
+      props.accountId,
+      props.workspaceId,
+      props.subjectId,
+    ),
+  ).toBeNull();
+});
+
+test("failed creation without authority exposes no recovery control", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () =>
+      Response.json({
+        ...absent(),
+        current: owner,
+        observation: { kind: "failed_create" },
+        can_start: false,
+        can_stop: false,
+      })
+    ),
+  );
+  render(SubjectBody, { props });
+  await screen.findByText("Body creation failed; reservation retained.");
+  expect(
+    screen.queryByRole("button", { name: "Release failed start reservation" }),
+  ).toBeNull();
+});

@@ -5,7 +5,7 @@
   import {
     clearSubjectBodyAttempt, createSubjectBodyAttempt, getSubjectBody, getSubjectBodyStopOutcome,
     readSubjectBodyAttempt, saveSubjectBodyAttempt, startSubjectBody,
-    stopSubjectBody, subjectBodyControls, SubjectBodyApiError, type SubjectBodyAttempt,
+    recoverSubjectBody, stopSubjectBody, subjectBodyControls, SubjectBodyApiError, type SubjectBodyAttempt,
   } from './subject-body.ts';
 
   let { accountId, workspaceId, subjectId }: { accountId: string; workspaceId: string; subjectId: string } = $props();
@@ -29,8 +29,8 @@
   let hasAccount = $derived(typeof accountId === 'string' && accountId.length > 0);
   let visible = $derived(hasAccount && activeRoute === identityKey(accountId, workspaceId, subjectId));
   let snapshot = $derived(visible ? body : null);
-  let controls = $derived(snapshot ? subjectBodyControls(snapshot) : { start: false, stop: false });
-  let retryAuthorized = $derived(snapshot && attempt && (attempt.action === 'start' ? snapshot.can_start : snapshot.can_stop));
+  let controls = $derived(snapshot ? subjectBodyControls(snapshot) : { start: false, stop: false, recover: false });
+  let retryAuthorized = $derived(snapshot && attempt && (attempt.action === 'stop' ? snapshot.can_stop : snapshot.can_start));
   let worker = $derived(snapshot?.observation.kind === 'available' ? snapshot.observation.worker : null);
   let workerDiagnostics = $derived(worker?.diagnostics ?? []);
 
@@ -108,7 +108,7 @@
       + cause.message + '. Refresh the current body before choosing a new explicit action.';
   }
 
-  async function submit(action?: 'start' | 'stop'): Promise<void> {
+  async function submit(action?: 'start' | 'stop' | 'recover'): Promise<void> {
     if (!visible || sending || checkingOutcome || loading || storageError || !fresh || !snapshot) return;
     if (attempt ? !retryAuthorized : (!action || !controls[action])) return;
     const generation = routeGeneration;
@@ -135,6 +135,8 @@
     try {
       const result = frozen.action === 'start'
         ? await startSubjectBody(fetch, workspace, subject, frozen.request)
+        : frozen.action === 'recover'
+        ? await recoverSubjectBody(fetch, workspace, subject, frozen.request)
         : await stopSubjectBody(fetch, workspace, subject, frozen.request);
       if (!current(generation, account, workspace, subject)) return;
       receipt = result;
@@ -210,6 +212,8 @@
     {#if !fresh}<p class="muted">{loading ? 'Updating body state…' : 'Last confirmed observation; refresh before acting.'}</p>{/if}
     {#if snapshot.observation.kind === 'absent'}
       <p>No current conversation body.</p>
+    {:else if snapshot.observation.kind === 'failed_create'}
+      <p><strong>Body creation failed; reservation retained.</strong> Confirm Runtime cleanup to release this reservation. This does not start a new body or change Subject permissions.</p>
     {:else if snapshot.observation.kind === 'unavailable'}
       <p><strong>Body owner present; observation unavailable.</strong> This is not an absent or stopped body. A replacement will not be started.</p>
       {#each snapshot.observation.diagnostics as diagnostic}
@@ -239,6 +243,9 @@
       <div class="actions">
         {#if controls.start}
           <button type="button" class="workspace-secondary-button" disabled={!fresh || loading || sending || !!storageError} onclick={() => { void submit('start'); }}>{snapshot.current ? 'Restart conversation body' : 'Start conversation body'}</button>
+        {/if}
+        {#if controls.recover}
+          <button type="button" class="workspace-secondary-button" disabled={!fresh || loading || sending || !!storageError} onclick={() => { void submit('recover'); }}>Release failed start reservation</button>
         {/if}
         {#if controls.stop}
           <button type="button" class="workspace-secondary-button" disabled={!fresh || loading || sending || !!storageError} onclick={() => { void submit('stop'); }}>Stop conversation body</button>

@@ -3673,6 +3673,18 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    /// Terminal create evidence for a specific allocation, independent of retained Subject occupancy.
+    pub(crate) fn worker_create_allocation_removed(
+        &self,
+        workspace_id: &str,
+        allocation_key: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM worker_create_reservations WHERE workspace_id=?1 AND allocation_key=?2 AND state='removed')",
+            params![workspace_id, allocation_key], |row| row.get(0),
+        )?))
+    }
+
     pub(crate) fn reserved_worker_create_runtime(
         &self,
         workspace_id: &str,

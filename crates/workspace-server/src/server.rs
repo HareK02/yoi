@@ -6272,8 +6272,8 @@ impl WorkspaceApi {
             Ok(binding) => binding,
             Err(error) => {
                 let mut diagnostics = cleanup_spawn_created_workdirs(self, &spawned_workdir_ids);
-                if let Err(cleanup) = self.config_store.fail_worker_create_reservation(
-                    &self.config.workspace_id,
+                if let Err(cleanup) = terminalize_failed_worker_create(
+                    self,
                     runtime_id,
                     worker_id,
                     &reservation.create_fingerprint,
@@ -6308,8 +6308,8 @@ impl WorkspaceApi {
             ) {
                 let mut diagnostics =
                     release_worker_workdir_attachment_reservations(self, &reserved_attachments);
-                if let Err(cleanup_error) = self.config_store.fail_worker_create_reservation(
-                    &self.config.workspace_id,
+                if let Err(cleanup_error) = terminalize_failed_worker_create(
+                    self,
                     runtime_id,
                     worker_id,
                     &reservation_fingerprint,
@@ -6394,8 +6394,8 @@ impl WorkspaceApi {
                     // uncertain singleton generation forever.
                     let mut diagnostics =
                         release_worker_workdir_attachment_reservations(self, &reserved_attachments);
-                    if let Err(cleanup_error) = self.config_store.fail_worker_create_reservation(
-                        &self.config.workspace_id,
+                    if let Err(cleanup_error) = terminalize_failed_worker_create(
+                        self,
                         runtime_id,
                         worker_id,
                         &reservation_fingerprint,
@@ -7840,6 +7840,9 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
             service.clone(),
         ))
         .merge(server_api::server_api_axum::subjektiv_subject_body_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_subject_body_recover(
             service.clone(),
         ))
         .merge(server_api::server_api_axum::subjektiv_subject_body_start(
@@ -10264,6 +10267,27 @@ impl server_api::ServerApi for ServerApiContractService {
     ) -> std::result::Result<server_api::SubjectBodyMutationResponse, server_api::SubjectBodyApiError>
     {
         subject_body::start(
+            self.workspace_api()?.clone(),
+            context,
+            workspace_id.clone(),
+            subject_id.clone(),
+            request.clone(),
+        )
+        .await
+        .map_err(|error| {
+            subject_body::api_error(error, workspace_id, subject_id, request.request_id)
+        })
+    }
+
+    async fn subjektiv_subject_body_recover(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        subject_id: String,
+        request: server_api::SubjectBodyRecoverRequest,
+    ) -> std::result::Result<server_api::SubjectBodyMutationResponse, server_api::SubjectBodyApiError>
+    {
+        subject_body::recover(
             self.workspace_api()?.clone(),
             context,
             workspace_id.clone(),
@@ -35640,6 +35664,36 @@ fn release_worker_workdir_attachment_reservations(
     diagnostics
 }
 
+// Complete the failed creation lifecycle, including Subject occupancy. A removed
+// catalog entry alone is not a fence against delayed Runtime admission.
+fn terminalize_failed_worker_create(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    worker_id: WorkerId,
+    create_fingerprint: &str,
+) -> Result<()> {
+    api.config_store.fail_worker_create_reservation(
+        api.workspace_id(),
+        runtime_id,
+        worker_id,
+        create_fingerprint,
+    )?;
+    let worker = RuntimeWorkerRef::new(runtime_id, worker_id.to_string());
+    if let Some(lease) = api
+        .config_store
+        .retained_worker_singleton_lease(api.workspace_id(), &worker)?
+        && let Some(subject) = lease.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX)
+        && api
+            .config_store
+            .current_worker_singleton_owner(api.workspace_id(), &lease.key)?
+            .as_ref()
+            == Some(&lease)
+    {
+        subjektiv_journal::recover_subject_create_reservation(api, subject, &lease)?;
+    }
+    Ok(())
+}
+
 fn compensate_failed_workspace_worker_create(
     api: &WorkspaceApi,
     runtime_id: &str,
@@ -35689,8 +35743,8 @@ fn compensate_failed_workspace_worker_create(
         attachment_reservations,
     ));
     if reserved_worker_absent {
-        if let Err(error) = api.config_store.fail_worker_create_reservation(
-            &api.config.workspace_id,
+        if let Err(error) = terminalize_failed_worker_create(
+            api,
             runtime_id,
             reservation_worker_id,
             create_fingerprint,

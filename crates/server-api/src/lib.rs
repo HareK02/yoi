@@ -257,6 +257,7 @@ impl_openapi_schema!(
     SubjectBodyRequestResolution,
     SubjectBodyResponse,
     SubjectBodyStartRequest,
+    SubjectBodyRecoverRequest,
     SubjectBodyStopRequest,
     SubjectBodyMutationResponse,
     SubjectBodyStopOutcomeResponse,
@@ -1572,6 +1573,16 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] subject_id: String,
         #[body] request: SubjectBodyStartRequest,
+    ) -> Result<SubjectBodyMutationResponse, SubjectBodyApiError>;
+
+    #[post("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body/recover", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502], bearer_auth = true, browser_auth = true)]
+    async fn subjektiv_subject_body_recover(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjectBodyRecoverRequest,
     ) -> Result<SubjectBodyMutationResponse, SubjectBodyApiError>;
 
     #[post("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body/stop", status = 200, error_status = 400,

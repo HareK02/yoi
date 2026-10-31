@@ -76,6 +76,8 @@ pub struct SubjectBodyRef {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SubjectBodyObservation {
     Absent,
+    /// Failed create reservation, not a published body. Runtime fencing is still required.
+    FailedCreate,
     Available {
         worker: WorkerSummary,
     },
@@ -123,6 +125,15 @@ pub struct SubjectBodyStopRequest {
     pub request_id: String,
     pub expected_current: SubjectBodyRef,
     pub expected_observation_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct SubjectBodyRecoverRequest {
+    pub request_id: String,
+    /// Recovery releases only this failed reservation; it never starts a replacement.
+    pub expected_current: SubjectBodyRef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -176,6 +187,7 @@ pub fn subject_body_api_typescript() -> String {
         SubjectBodyObservation::decl(&config),
         SubjectBodyResponse::decl(&config),
         SubjectBodyStartRequest::decl(&config),
+        SubjectBodyRecoverRequest::decl(&config),
         SubjectBodyStopRequest::decl(&config),
         SubjectBodyDisposition::decl(&config),
         SubjectBodyMutationResponse::decl(&config),

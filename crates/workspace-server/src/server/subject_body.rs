@@ -92,6 +92,11 @@ pub(super) fn snapshot(api: &WorkspaceApi, subject: &str) -> ApiResult<SubjectBo
     let lease = current(api, subject)?;
     let observation = match lease.as_ref() {
         None => SubjectBodyObservation::Absent,
+        Some(lease)
+            if subjektiv_journal::failed_subject_create_is_unpublished(api, subject, lease)? =>
+        {
+            SubjectBodyObservation::FailedCreate
+        }
         Some(lease) => {
             let observe = || -> ApiResult<server_api::WorkerSummary> {
                 let live = api
@@ -351,6 +356,62 @@ pub(super) async fn stop(
     .await)
 }
 
+pub(super) async fn recover(
+    api: WorkspaceApi,
+    context: server_api::ServerRequestContext,
+    workspace: String,
+    subject: String,
+    request: server_api::SubjectBodyRecoverRequest,
+) -> ApiResult<SubjectBodyMutationResponse> {
+    validate_request_id(&request.request_id)?;
+    account_context(&api, &context, &workspace).await?;
+    let recovery_api = api.clone();
+    let recovery_subject = subject.clone();
+    let expected = request.expected_current;
+    let result = api
+        .host_executors
+        .host()?
+        .run(move || -> ApiResult<()> {
+            let lease = require_expected(&recovery_api, &recovery_subject, Some(&expected))?
+                .ok_or(Error::SubjectBodySuperseded)?;
+            subjektiv_journal::recover_subject_create_reservation(
+                &recovery_api,
+                &recovery_subject,
+                &lease,
+            )?;
+            Ok(())
+        })
+        .await;
+    let (disposition, diagnostics) = match result {
+        Ok(()) => (SubjectBodyDisposition::Accepted, vec![]),
+        Err(error)
+            if matches!(
+                error.error,
+                Error::SubjectBodySuperseded
+                    | Error::RepositoryConflict(_)
+                    | Error::WorkspacePermissionDenied(_)
+                    | Error::SubjektivSubjectNotFound(_)
+            ) =>
+        {
+            return Err(error);
+        }
+        Err(error) => (
+            SubjectBodyDisposition::Unknown,
+            failure_diagnostics("subject_body_recovery_unconfirmed", error),
+        ),
+    };
+    Ok(finish(
+        api,
+        context,
+        workspace,
+        subject,
+        request.request_id,
+        disposition,
+        diagnostics,
+    )
+    .await)
+}
+
 pub(super) async fn start(
     api: WorkspaceApi,
     context: server_api::ServerRequestContext,
@@ -517,7 +578,24 @@ pub(super) async fn start(
         .await
     })
     .await;
+    // A failed allocation is terminal even if its occupancy still awaits Runtime proof.
+    // Settle only this request; GET observations never settle a retained start intent.
+    let removed = if result.is_err() {
+        let store = api.config_store.clone();
+        let workspace = workspace.clone();
+        let operation = check_operation.clone();
+        api.store
+            .db_executor()
+            .run(move || store.worker_create_allocation_removed(&workspace, &operation))
+            .await?
+    } else {
+        false
+    };
     let (disposition, diagnostics) = match result {
+        Err(error) if removed => (
+            SubjectBodyDisposition::Rejected,
+            failure_diagnostics("subject_body_create_failed", error),
+        ),
         Ok(Json(result)) => (SubjectBodyDisposition::Accepted, result.diagnostics),
         Err(error)
             if matches!(

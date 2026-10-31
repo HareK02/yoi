@@ -14916,6 +14916,20 @@
           },
           {
             "additionalProperties": false,
+            "description": "Failed create reservation, not a published body. Runtime fencing is still required.",
+            "properties": {
+              "kind": {
+                "const": "failed_create",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
             "properties": {
               "kind": {
                 "const": "available",
@@ -14953,6 +14967,23 @@
             "type": "object"
           }
         ]
+      },
+      "SubjectBodyRecoverRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_current": {
+            "$ref": "#/components/schemas/SubjectBodyRef",
+            "description": "Recovery releases only this failed reservation; it never starts a replacement."
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "expected_current"
+        ],
+        "type": "object"
       },
       "SubjectBodyRef": {
         "additionalProperties": false,
@@ -23317,7 +23348,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:6a3d9c468ff204b44fc0b11d47e45f153b8131b9ec99c54ba2ebfdf2c0d14580"
+    "x-yoi-source-digest": "sha256:28ee9c6c6e2a4eb71829386849b508fcee758fbd7ecdbc0cdcc72cd3b86be321"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -42593,6 +42624,133 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body/recover": {
+      "post": {
+        "operationId": "subjektiv_subject_body_recover",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "subject_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubjectBodyRecoverRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjectBodyMutationResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubjectBodyApiError"
                 }
               }
             },

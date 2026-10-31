@@ -848,3 +848,58 @@ async fn body_pending_lifecycle_conflicts_do_not_claim_stale_request_nonacceptan
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn denied_session_registration_releases_failed_body_and_allows_a_new_start() {
+    let f = ConnectedBody::new().await;
+    let subject = f.subject("failed-session-registration").await;
+    let store = open_subjektiv_store(&f.connected.api).unwrap();
+    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let permissions =
+        format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions");
+    f.ok(
+        "POST",
+        &permissions,
+        json!({
+            "operation_id":"deny-session-registration", "expected_change_id":initial.change_id,
+            "execution":[], "delegation":[],
+        }),
+    )
+    .await;
+    let denied = store.subject_permissions(&subject).unwrap().unwrap();
+    let request = absent_start("failed-body-start");
+    let failed = f.mutate(&subject, "/start", request.clone()).await;
+    assert_eq!(failed["disposition"], "rejected", "{failed}");
+    assert_eq!(failed["body"]["observation"]["kind"], "absent", "{failed}");
+    assert_eq!(f.worker_count(), 0);
+    assert!(
+        store
+            .subject_session_attributions(&subject)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.subject_permissions(&subject).unwrap().unwrap(),
+        denied
+    );
+    // A terminal allocation retry must settle, never allocate a second Worker.
+    let replay = f.mutate(&subject, "/start", request).await;
+    assert_eq!(replay["disposition"], "rejected", "{replay}");
+    assert_eq!(f.worker_count(), 0);
+    f.ok(
+        "POST",
+        &permissions,
+        json!({
+            "operation_id":"allow-session-registration", "expected_change_id":denied.change_id,
+            "execution":initial.execution, "delegation":initial.delegation,
+        }),
+    )
+    .await;
+    let started = f
+        .mutate(&subject, "/start", absent_start("new-body-start"))
+        .await;
+    assert_eq!(started["disposition"], "accepted", "{started}");
+    assert_eq!(f.read(&subject).await["current"]["generation"], "2");
+    assert_eq!(f.worker_count(), 1);
+    f.stop(&subject, "stop-new-body").await;
+}

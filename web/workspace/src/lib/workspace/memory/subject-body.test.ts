@@ -240,6 +240,7 @@ Deno.test("durable retry input is frozen complete account-and-route-scoped and n
     Object.isFrozen(restored) && Object.isFrozen(restored.request) &&
       Object.isFrozen(restored.request.expected_current),
   );
+  assert(restored.action === "start");
   assert(restored.request.expected_observation_token === "observation-1");
   assert(
     readSubjectBodyAttempt(saved, "account", "workspace", "other") === null,
@@ -837,4 +838,31 @@ Deno.test("GET cannot supply a mutation resolution even when its error claims th
   }
   assert(failure instanceof SubjectBodyApiError);
   assert(failure.request === null);
+});
+
+Deno.test("failed create has a recovery-only control and a frozen token-free reservation intent", () => {
+  const body = parse({
+    ...absent(),
+    current: owner,
+    observation: { kind: "failed_create" },
+  });
+  const controls = subjectBodyControls(body);
+  assert(controls.recover && !controls.start && !controls.stop);
+  const attempt = createSubjectBodyAttempt(
+    "account",
+    body,
+    "recover",
+    "recover-1",
+  );
+  const saved = storage();
+  saveSubjectBodyAttempt(saved, "account", attempt);
+  assert(
+    JSON.stringify(
+      readSubjectBodyAttempt(saved, "account", "workspace", "subject"),
+    ) === JSON.stringify(attempt),
+  );
+  assert(!("expected_observation_token" in attempt.request));
+  rejects(() => createSubjectBodyAttempt("account", body, "start", "no-replacement"));
+  rejects(() => parse({ ...absent(), observation: { kind: "failed_create" } }));
+  assert(!subjectBodyControls({ ...body, can_start: false }).recover);
 });

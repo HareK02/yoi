@@ -2,6 +2,7 @@ import type {
   SubjectBodyFailedRequest,
   SubjectBodyMutationResponse,
   SubjectBodyObservation,
+  SubjectBodyRecoverRequest,
   SubjectBodyRef,
   SubjectBodyResponse,
   SubjectBodyStartRequest,
@@ -121,6 +122,13 @@ export function parseSubjectBodyResponse(
       record(observed, ["kind"]);
       if (current !== null) throw new Error("Absent body cannot have an owner");
       observation = { kind: "absent" };
+      break;
+    case "failed_create":
+      record(observed, ["kind"]);
+      if (current === null) {
+        throw new Error("Failed creation must retain its reservation");
+      }
+      observation = { kind: "failed_create" };
       break;
     case "unavailable":
       record(observed, ["kind", "diagnostics"]);
@@ -328,8 +336,11 @@ async function mutateSubjectBody(
   fetchFn: typeof fetch,
   workspaceId: string,
   subjectId: string,
-  action: "start" | "stop",
-  request: SubjectBodyStartRequest | SubjectBodyStopRequest,
+  action: "start" | "stop" | "recover",
+  request:
+    | SubjectBodyStartRequest
+    | SubjectBodyStopRequest
+    | SubjectBodyRecoverRequest,
 ): Promise<SubjectBodyMutationResponse> {
   const requestId = parseRequestId(request.request_id);
   const response = await fetchFn(
@@ -355,6 +366,15 @@ export function startSubjectBody(
   request: SubjectBodyStartRequest,
 ): Promise<SubjectBodyMutationResponse> {
   return mutateSubjectBody(fetchFn, workspaceId, subjectId, "start", request);
+}
+
+export function recoverSubjectBody(
+  fetchFn: typeof fetch,
+  workspaceId: string,
+  subjectId: string,
+  request: SubjectBodyRecoverRequest,
+): Promise<SubjectBodyMutationResponse> {
+  return mutateSubjectBody(fetchFn, workspaceId, subjectId, "recover", request);
 }
 
 export function stopSubjectBody(
@@ -394,17 +414,21 @@ export async function getSubjectBodyStopOutcome(
 
 export function subjectBodyControls(
   body: SubjectBodyResponse,
-): { start: boolean; stop: boolean } {
+): { start: boolean; stop: boolean; recover: boolean } {
+  if (body.observation.kind === "failed_create") {
+    return { start: false, stop: false, recover: body.can_start };
+  }
   if (body.observation.kind === "absent") {
-    return { start: body.can_start, stop: false };
+    return { start: body.can_start, stop: false, recover: false };
   }
   if (body.observation.kind !== "available") {
-    return { start: false, stop: false };
+    return { start: false, stop: false, recover: false };
   }
   const worker = body.observation.worker;
   const observed = worker.availability === "observed" &&
     Boolean(worker.restore_observation_token);
   return {
+    recover: false,
     start: body.can_start && observed && worker.state === "stopped" &&
       worker.worker_state == null,
     stop: body.can_stop && observed && worker.worker_state != null &&
@@ -422,6 +446,7 @@ export type SubjectBodyAttempt =
   & (
     | { action: "start"; request: SubjectBodyStartRequest }
     | { action: "stop"; request: SubjectBodyStopRequest }
+    | { action: "recover"; request: SubjectBodyRecoverRequest }
   );
 
 export function subjectBodyStorageKey(
@@ -466,6 +491,16 @@ function parseAttempt(
   const expected_current = input.expected_current === null
     ? null
     : Object.freeze(bodyRef(input.expected_current));
+  if (item.action === "recover" && expected_current !== null) {
+    record(input, ["request_id", "expected_current"]);
+    return Object.freeze({
+      accountId,
+      workspaceId,
+      subjectId,
+      action: "recover",
+      request: Object.freeze({ request_id, expected_current }),
+    });
+  }
   const expected_observation_token = input.expected_observation_token === null
     ? null
     : token(input.expected_observation_token);
@@ -509,7 +544,7 @@ function parseAttempt(
 export function createSubjectBodyAttempt(
   accountId: string,
   body: SubjectBodyResponse,
-  action: "start" | "stop",
+  action: "start" | "stop" | "recover",
   requestId: string,
 ): SubjectBodyAttempt {
   if (!subjectBodyControls(body)[action]) {
@@ -521,13 +556,15 @@ export function createSubjectBodyAttempt(
       workspaceId: body.workspace_id,
       subjectId: body.subject_id,
       action,
-      request: {
-        request_id: requestId,
-        expected_current: body.current,
-        expected_observation_token: body.observation.kind === "available"
-          ? body.observation.worker.restore_observation_token
-          : null,
-      },
+      request: action === "recover"
+        ? { request_id: requestId, expected_current: body.current }
+        : {
+          request_id: requestId,
+          expected_current: body.current,
+          expected_observation_token: body.observation.kind === "available"
+            ? body.observation.worker.restore_observation_token
+            : null,
+        },
     },
     accountId,
     body.workspace_id,

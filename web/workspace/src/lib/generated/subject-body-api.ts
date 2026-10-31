@@ -31,10 +31,11 @@ export type SubjectBodyRef = {
   generation: string;
 };
 
-export type SubjectBodyObservation = { "kind": "absent" } | {
-  "kind": "available";
-  worker: WorkerSummary;
-} | { "kind": "unavailable"; diagnostics: Array<Diagnostic> };
+export type SubjectBodyObservation =
+  | { "kind": "absent" }
+  | { "kind": "failed_create" }
+  | { "kind": "available"; worker: WorkerSummary }
+  | { "kind": "unavailable"; diagnostics: Array<Diagnostic> };
 
 export type SubjectBodyResponse = {
   workspace_id: string;
@@ -55,6 +56,14 @@ export type SubjectBodyStartRequest = {
    */
   expected_current: SubjectBodyRef | null;
   expected_observation_token: string | null;
+};
+
+export type SubjectBodyRecoverRequest = {
+  request_id: string;
+  /**
+   * Recovery releases only this failed reservation; it never starts a replacement.
+   */
+  expected_current: SubjectBodyRef;
 };
 
 export type SubjectBodyStopRequest = {
