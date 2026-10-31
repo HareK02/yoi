@@ -28,8 +28,7 @@ const captures: Record<string, unknown>[] = [],
   failures: string[] = [],
   faults: Record<string, unknown>[] = [];
 const manifest = {
-  evidence:
-    "actual-static-Web-build / synthetic-HTTP / NOT-real-Backend-auth-or-Runtime",
+  evidence: "actual-static-Web-build / synthetic-HTTP / NOT-real-Backend-auth-or-Runtime",
   source: new TextDecoder().decode(
     (await new Deno.Command("git", { args: ["rev-parse", "HEAD"], cwd: root })
       .output()).stdout,
@@ -128,24 +127,23 @@ try {
         "**/api/w/memory-review/chat/conversations**",
         (route) =>
           route.fulfill({
-            json:
-              new URL(route.request().url()).pathname.endsWith("/conversations")
-                ? {
+            json: new URL(route.request().url()).pathname.endsWith("/conversations")
+              ? {
+                id: "conversation",
+                subject_id: "empty-subject",
+                participant_account_id: "owner",
+                last_user_message_id: null,
+              }
+              : {
+                conversation: {
                   id: "conversation",
                   subject_id: "empty-subject",
                   participant_account_id: "owner",
                   last_user_message_id: null,
-                }
-                : {
-                  conversation: {
-                    id: "conversation",
-                    subject_id: "empty-subject",
-                    participant_account_id: "owner",
-                    last_user_message_id: null,
-                  },
-                  messages: [],
-                  has_more: false,
                 },
+                messages: [],
+                has_more: false,
+              },
           }),
       );
       async function direct(path: string, selector: string, canonical = path) {
@@ -185,6 +183,10 @@ try {
         );
       }
       async function capture(id: string) {
+        if (id === "detail" || id === "chat") {
+          await page.locator(".subject-body .actions").waitFor();
+          assertEquals(await page.locator(".subject-body [role=alert]").count(), 0);
+        }
         const image = `${colorScheme}-${width}-${id}.png`;
         await page.screenshot({ path: join(output, image) });
         const overflow = await page.evaluate(
@@ -205,9 +207,7 @@ try {
           route: page.url(),
           colorScheme,
           width,
-          mainWidth: await page.locator("main").evaluate((el) =>
-            el.clientWidth
-          ),
+          mainWidth: await page.locator("main").evaluate((el) => el.clientWidth),
           overflow,
           alerts: await page.getByRole("alert").allTextContents(),
           snapshot: await page.locator("body").ariaSnapshot(),
@@ -374,9 +374,7 @@ try {
           "This legacy path has no corresponding Subject page.",
         ).waitFor();
         assertEquals(
-          requests.slice(beforeUnknown).filter((p) =>
-            p.includes("/subjektiv/subjects/")
-          ),
+          requests.slice(beforeUnknown).filter((p) => p.includes("/subjektiv/subjects/")),
           [],
         );
         // 読取り拒否を空一覧/新権限付与へ変えず、UIがBackend失敗をそのまま示す。

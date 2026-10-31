@@ -154,7 +154,7 @@ function subject(
     memory_fingerprint: memoryFingerprint,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-02T03:04:05Z",
-    ...(currentWorker ? { current_worker: currentWorker } : {}),
+    ...(currentWorker ? { current_worker: currentWorker, current_body: { runtime_id: currentWorker.runtime_id, worker_id: currentWorker.worker_id, generation: "17" } } : {}),
   };
 }
 
@@ -596,6 +596,22 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     const foundSubject = subjects.find((item) => item.id === subjectId);
     if (!foundSubject) return json({}, 404);
 
+    // 合成HTTPでもBody GETを明示する。未対応APIへのHTML fallbackを観測成功にしない。
+    // mutationはこのfixtureでは提供せず、IA検証で起動停止の成功を偽装しない。
+    if (parts.length === 2 && parts[1] === "body" && request.method === "GET") {
+      const worker = foundSubject.current_worker;
+      return json({
+        workspace_id: workspaceId,
+        subject_id: subjectId,
+        current: worker ? { runtime_id: worker.runtime_id, worker_id: worker.worker_id, generation: "17" } : null,
+        observation: worker ? {
+          kind: "available",
+          worker: { ...worker, resource_key: "W-fixture", availability: "observed", worker_state: { last_command_id: 1, state: { kind: "idle" } }, restore_observation_token: "synthetic-body-observation" },
+        } : { kind: "absent" },
+        can_start: foundSubject.state === "active",
+        can_stop: foundSubject.state === "active",
+      });
+    }
     if (parts.length === 2 && parts[1] === "journal-browser") {
       return await journalBrowserFixture(request, subjectId);
     }

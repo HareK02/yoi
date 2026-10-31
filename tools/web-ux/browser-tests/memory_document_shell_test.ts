@@ -337,7 +337,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
         await paginationPage.getByText("Memory fingerprint", { exact: true }).count(),
         0,
       );
-      assert((await paginationPage.getByText("Not connected", { exact: true }).count()) > 0);
+      assert((await paginationPage.getByText("No current body", { exact: true }).count()) > 0);
       assertEquals(await paginationPage.getByText("Subject on the next page").count(), 0);
       await paginationPage.getByRole("navigation", { name: "Subject pages" }).getByRole(
         "link",
@@ -451,10 +451,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
         await createPage.locator("code.subject-id", { hasText: "created-subject-0001" }).count(),
         1,
       );
-      const currentWorker = createPage.getByText("Worker connection", { exact: true }).locator(
-        "..",
-      );
-      assert((await currentWorker.textContent())?.includes("Not connected"));
+      await createPage.locator(".subject-body").getByText("No current conversation body.", { exact: true }).waitFor();
       await createPage.getByText("Resident context has not been generated.").waitFor();
       await createPage.getByText("No committed Memories yet.").waitFor();
       await createPage.getByRole("button", { name: "Edit" }).click();

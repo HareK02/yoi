@@ -8,7 +8,10 @@
   import type { PageData as RouteData } from './$types';
   let { data }: { data: ResolvedPageData<RouteData> } = $props();
   const subject = $derived(data.subject.data);
-  let accountConfirmed = $state(false);
+  // route再利用の描画はeffectより先に進むため、確認済みboolを別identityへ持ち越さない。
+  let confirmedIdentity = $state<string | null>(null);
+  const identity = $derived(JSON.stringify([data.accountId, data.workspaceId, data.subjectId]));
+  const accountConfirmed = $derived(confirmedIdentity === identity);
   $effect(() => {
     const accountId = data.accountId;
     const workspaceId = data.workspaceId;
@@ -17,10 +20,11 @@
       const generation = browserSession.authenticationGeneration;
       const stamp = browserSession.authenticationStamp;
       return browserSession.subscribe((snapshot) => {
-        accountConfirmed = data.workspaceId === workspaceId && data.subjectId === subjectId &&
+        confirmedIdentity = data.workspaceId === workspaceId && data.subjectId === subjectId &&
           browserSession.authenticationGeneration === generation && browserSession.authenticationStamp === stamp &&
           snapshot.kind === 'ready' && snapshot.value.session.kind === 'authenticated' &&
-          snapshot.value.actor?.account_id === accountId;
+          snapshot.value.actor?.account_id === accountId
+          ? JSON.stringify([accountId, workspaceId, subjectId]) : null;
       });
     });
   });
