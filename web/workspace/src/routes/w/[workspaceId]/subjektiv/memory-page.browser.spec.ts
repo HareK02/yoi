@@ -51,7 +51,7 @@ vi.mock("$app/navigation", () => ({ goto: gotoMock }));
 
 import SubjectIndexPage from "./PageContent.svelte";
 import SubjectPage from "./[subjectId]/PageContent.svelte";
-import MemoryDetailPage from "./[subjectId]/[memoryId]/PageContent.svelte";
+import MemoryDetailPage from "./[subjectId]/memories/[memoryId]/PageContent.svelte";
 
 afterEach(() => {
   cleanup();
@@ -114,7 +114,7 @@ test("renders the subject index as the Memory product entry", () => {
   expect(screen.queryByText("Memory fingerprint", { exact: true })).toBeNull();
   expect(screen.getByText("1 shown · more available")).not.toBeNull();
   expect(screen.getByRole("link", { name: "First page" }).getAttribute("href"))
-    .toBe("/w/workspace-1/memory");
+    .toBe("/w/workspace-1/subjektiv");
   expect(screen.getByRole("link", { name: /Next page/ }).getAttribute("href"))
     .toContain("cursor=subject-next");
   expect(screen.queryByText("Staging")).toBeNull();
@@ -165,7 +165,7 @@ test("creates one Subject with the exact role and navigates to its generated det
   }, { status: 201 }));
   await waitFor(() => {
     expect(gotoMock).toHaveBeenCalledWith(
-      "/w/workspace-1/memory/generated-subject-1",
+      "/w/workspace-1/subjektiv/generated-subject-1",
     );
   });
 
@@ -1039,7 +1039,7 @@ test("renders committed Memory detail, provenance, derivation, and immutable cha
   });
   expect(historicalLink.getAttribute("aria-current")).toBe("page");
   expect(historicalLink.getAttribute("href")).toBe(
-    "/w/workspace-1/memory/subject-1/memory-1?change_id=z%2Fearlier%20%26%20context",
+    "/w/workspace-1/subjektiv/subject-1/memories/memory-1?change_id=z%2Fearlier%20%26%20context",
   );
   const currentLink = screen.getByRole("link", {
     name: /Memory change a\/current/,
@@ -1049,7 +1049,7 @@ test("renders committed Memory detail, provenance, derivation, and immutable cha
   expect(
     screen.getByRole("link", { name: /memory-parent/ }).getAttribute("href"),
   ).toBe(
-    "/w/workspace-1/memory/subject-1/memory-parent?change_id=parent%2Fsource%20%26%20context",
+    "/w/workspace-1/subjektiv/subject-1/memories/memory-parent?change_id=parent%2Fsource%20%26%20context",
   );
   const bodyHref = screen.getByRole("link", { name: "View next body segment" })
     .getAttribute("href");

@@ -438,53 +438,44 @@ Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async ()
   );
   const subjectIndexLoad = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/memory/+page.ts",
+      "./../../../routes/w/[workspaceId]/subjektiv/+page.ts",
       import.meta.url,
     ),
   );
   const subjectIndexPage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/memory/PageContent.svelte",
+      "./../../../routes/w/[workspaceId]/subjektiv/PageContent.svelte",
       import.meta.url,
     ),
   );
   const subjectPageLoad = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/memory/[subjectId]/+page.ts",
+      "./../../../routes/w/[workspaceId]/subjektiv/[subjectId]/+page.ts",
       import.meta.url,
     ),
   );
   const subjectPage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/memory/[subjectId]/PageContent.svelte",
+      "./../../../routes/w/[workspaceId]/subjektiv/[subjectId]/PageContent.svelte",
       import.meta.url,
     ),
   );
   const memoryDetailLoad = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/memory/[subjectId]/[memoryId]/+page.ts",
+      "./../../../routes/w/[workspaceId]/subjektiv/[subjectId]/memories/[memoryId]/+page.ts",
       import.meta.url,
     ),
   );
   const memoryDetailPage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/memory/[subjectId]/[memoryId]/PageContent.svelte",
+      "./../../../routes/w/[workspaceId]/subjektiv/[subjectId]/memories/[memoryId]/PageContent.svelte",
       import.meta.url,
     ),
   );
 
   assert(
-    memoryNav.includes('workspaceRoute(workspaceId, "/memory")') &&
-      memoryNav.includes(
-        '<h2 class="sidebar-nav-section__header">Memory</h2>',
-      ) &&
-      memoryNav.includes("Subjects</a>") &&
-      memoryNav.includes("currentPath.startsWith(`${subjectsHref}/`)") &&
-      memoryNav.includes("sidebar-nav-section--category") &&
-      memoryNav.includes('class="sidebar-link"') &&
-      !memoryNav.includes("Staging</a>") &&
-      !memoryNav.includes("Document</a>"),
-    "Memory sidebar section should expose one Subjects link for the full nested route tree",
+    memoryNav.includes('"/memory/staging"') && !memoryNav.includes('>Subjects</a>'),
+    "Memory navigation keeps staging separate from Subjects",
   );
   assert(
     subjectIndexLoad.includes('"/subjektiv/subjects"') &&

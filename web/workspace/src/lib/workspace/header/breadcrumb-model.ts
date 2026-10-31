@@ -1,3 +1,5 @@
+import { subjectHref, subjectsHref } from "#lib/workspace/subjektiv/routes.ts";
+
 export type WorkspaceBreadcrumb = {
   label: string;
   href?: string;
@@ -22,6 +24,31 @@ export function buildWorkspaceBreadcrumbs(
     .split("/")
     .filter(Boolean)
     .map(decodeURIComponent);
+
+  if (segments[0] === "memory" && segments[1] === "staging") {
+    return [{ label: "Memory" }, { label: "Staging" }];
+  }
+
+  if (segments[0] === "subjektiv") {
+    const crumbs: WorkspaceBreadcrumb[] = [{ label: "Subjects" }];
+    if (!segments[1]) return crumbs;
+    crumbs[0].href = subjectsHref(workspaceId);
+    crumbs.push({ label: segments[1] });
+    if (!segments[2]) return crumbs;
+    crumbs[1].href = subjectHref(workspaceId, segments[1]);
+    // memoriesは詳細URLのnamespaceであり、存在しない一覧へリンクしない。
+    if (segments[2] === "memories" && segments[3]) {
+      crumbs.push({ label: segments[3] });
+    } else {
+      const label = {
+        permissions: "Operation permissions",
+        journal: "Journal",
+        chat: "Conversation",
+      }[segments[2]];
+      crumbs.push({ label: label ?? segments[2] });
+    }
+    return crumbs;
+  }
 
   if (
     segments[0] === "workers" &&

@@ -1,9 +1,9 @@
 <script lang="ts">
+  import { subjectsHref } from '#lib/workspace/subjektiv/routes.ts';
   import { untrack } from 'svelte';
   import { deleteSubjektivSubject, SubjektivSubjectDeleteError } from './api.ts';
   import { clearSubjectDeleteAttempt, readSubjectDeleteAttempt, saveSubjectDeleteAttempt, type SubjectDeleteAttempt } from './subject-delete.ts';
   import type { SubjektivSubjectResponse } from '#lib/generated/memory-api.ts';
-  import { workspaceRoute } from '#lib/workspace/api/http.ts';
 
   let { workspaceId, subjectId, subject, onstarted }: {
     workspaceId: string;
@@ -108,7 +108,7 @@
       <p role="alert"><strong>Deletion request rejected.</strong> Completion is not confirmed. Resolve the reported condition, then retry the same request.</p>
     {:else if phase === 'completed'}
       <p role="status"><strong>Subject deletion completed.</strong> Backend confirmed stopping and deletion of Subject-owned data. Separately retained Worker/Session text, archives, Workdirs, and Tickets remain.</p>
-      <a href={workspaceRoute(workspaceId, '/memory')}>Back to subjects →</a>
+      <a href={subjectsHref(workspaceId)}>Back to subjects →</a>
     {/if}
     {#if error}<p class="workspace-callout is-error" role="alert">{error}</p>{/if}
     {#if attempt && phase !== 'completed'}

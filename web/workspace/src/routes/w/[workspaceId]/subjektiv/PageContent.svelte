@@ -1,7 +1,8 @@
 <script lang="ts">
+  import { subjectsHref, subjectHref as subjectDetailHref } from '#lib/workspace/subjektiv/routes.ts';
   import { goto } from '$app/navigation';
   import { tick } from 'svelte';
-  import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';
+  import { formatDate } from '#lib/workspace/api/http.ts';
   import {
     createSubjektivSubject,
     SubjektivSubjectCreateError,
@@ -30,11 +31,11 @@
   let behaviorInput = $state<HTMLTextAreaElement>();
 
   function subjectHref(subjectId: string): string {
-    return workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(subjectId)}`);
+    return subjectDetailHref(data.workspaceId, subjectId);
   }
 
   function pageHref(cursor?: string | null): string {
-    const path = workspaceRoute(data.workspaceId, '/memory');
+    const path = subjectsHref(data.workspaceId);
     return cursor ? `${path}?cursor=${encodeURIComponent(cursor)}` : path;
   }
 
@@ -125,16 +126,15 @@
 </script>
 
 <svelte:head>
-  <title>Subjects · Memory · Yoi Workspace</title>
-  <meta name="description" content="Workspace Memory subjects" />
+  <title>Subjects · Yoi Workspace</title>
+  <meta name="description" content="Workspace Subjects" />
 </svelte:head>
 
 <section class="memory-page memory-subject-index" aria-labelledby="memory-subjects-heading" data-memory-view="subjects">
   <header class="memory-page-header">
     <div>
-      <p class="memory-eyebrow">Memory</p>
       <h1 id="memory-subjects-heading">Subjects</h1>
-      <p>Durable context, organized by explicit subject.</p>
+      <p>Choose a Subject to view its activity, conversation, and Memory.</p>
     </div>
     <div class="memory-header-actions">
       {#if data.subjects.data}
@@ -222,7 +222,7 @@
         {#if data.cursor}<p><a href={pageHref()}>Return to the first page</a></p>{/if}
       </div>
     {:else}
-      <div class="subject-list" aria-label="Memory subjects">
+      <div class="subject-list" aria-label="Subjects">
         {#each subjects as subject (subject.id)}
           <a class="subject-row" href={subjectHref(subject.id)}>
             <div class="subject-copy">

@@ -194,7 +194,7 @@ async function capturePoint(page: Page, id: string, expectedErrors: string[] = [
   await assertNoPageWideOverflow(page);
 }
 async function open(page: Page, base: string, id: string, state = "ready") {
-  await page.goto(`${base}/w/memory-review/memory/${id}/permissions`);
+  await page.goto(`${base}/w/memory-review/subjektiv/${id}/permissions`);
   await page.locator(`[data-permission-state=${state}][aria-busy=false]`).waitFor();
 }
 async function add(
@@ -268,7 +268,7 @@ try {
         const page = await context.newPage();
         observe(page);
         // 通常のSubject詳細から管理導線へ進む。
-        await page.goto(`${base}/w/memory-review/memory/permissions-empty`);
+        await page.goto(`${base}/w/memory-review/subjektiv/permissions-empty`);
         await page.locator(".subject-overview").waitFor();
         await page.locator('main a[href$="/permissions"]').click();
         await page.locator("[data-permission-state=ready]").waitFor();

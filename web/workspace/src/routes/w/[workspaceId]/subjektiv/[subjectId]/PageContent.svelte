@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { subjectsHref as subjectListHref, subjectHref, subjectMemoryHref, subjectJournalHref, subjectPermissionsHref, subjectChatHref } from '#lib/workspace/subjektiv/routes.ts';
   // identity、current Worker、Committed Memory、生成contextの利用可否を先に示す。
   // current WorkerはBackend singleton projectionであり、過去のSession帰属から推測しない。
   // behaviorは利用者が管理する本文、surfaceはMemoryからの生成物として分ける。
@@ -7,7 +8,7 @@
   import { untrack } from 'svelte';
   import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
   import SubjectDelete from '#lib/workspace/memory/SubjectDelete.svelte';
-  import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';
+  import { formatDate } from '#lib/workspace/api/http.ts';
   import {
     SubjektivSubjectCreateError,
     updateSubjektivSubjectBehavior,
@@ -110,22 +111,16 @@
   const memories = $derived(data.memories.data?.items ?? []);
 
   function subjectsHref(): string {
-    return workspaceRoute(data.workspaceId, '/memory');
+    return subjectListHref(data.workspaceId);
   }
 
   function memoryHref(memoryId: string, changeId?: string): string {
-    const path = workspaceRoute(
-      data.workspaceId,
-      `/memory/${encodeURIComponent(data.subjectId)}/${encodeURIComponent(memoryId)}`,
-    );
+    const path = subjectMemoryHref(data.workspaceId, data.subjectId, memoryId);
     return changeId ? `${path}?change_id=${encodeURIComponent(changeId)}` : path;
   }
 
   function memoryPageHref(cursor?: string | null): string {
-    const path = workspaceRoute(
-      data.workspaceId,
-      `/memory/${encodeURIComponent(data.subjectId)}`,
-    );
+    const path = subjectHref(data.workspaceId, data.subjectId);
     return cursor ? `${path}?cursor=${encodeURIComponent(cursor)}` : path;
   }
 
@@ -157,7 +152,7 @@
 </script>
 
 <svelte:head>
-  <title>{subject?.role ?? data.subjectId} · Memory · Yoi Workspace</title>
+  <title>{subject?.role ?? data.subjectId} · Subjects · Yoi Workspace</title>
   <meta name="description" content="Subject resident surface and current committed Memories" />
 </svelte:head>
 
@@ -166,7 +161,7 @@
 
   <header class="memory-page-header">
     <div>
-      <p class="memory-eyebrow">Memory subject</p>
+      <p class="memory-eyebrow">Subject</p>
       <h1 id="subject-heading">{subject?.role ?? data.subjectId}</h1>
       <code class="subject-id" title={data.subjectId}>{data.subjectId}</code>
     </div>
@@ -180,7 +175,11 @@
   {/if}
 
   {#if !deletionStarted}
-  <nav aria-label="Subjectの記録と管理">{#if subject?.state === 'active'}<a href={workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}/conversation`)}>Open conversation</a> · {/if}<a href={workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}/journal`)}>Journal · 最近の出来事とSessionを探す →</a> · <a href={workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}/permissions`)}>Operation permissions · 直接操作と委譲上限 →</a></nav>
+  <nav class="subject-navigation" aria-label="Subjectの記録と管理">
+    {#if subject?.state === 'active'}<a href={subjectChatHref(data.workspaceId, data.subjectId)}>Open conversation</a>{/if}
+    <a href={subjectJournalHref(data.workspaceId, data.subjectId)}>Journal · 最近の出来事とSessionを探す →</a>
+    <a href={subjectPermissionsHref(data.workspaceId, data.subjectId)}>Operation permissions · 直接操作と委譲上限 →</a>
+  </nav>
 
   {#if subject}
     <section class="subject-overview" aria-label="Subject status">
@@ -402,6 +401,7 @@
 </section>
 
 <style>
+  .subject-navigation { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-4); }
   .memory-page {
     display: grid;
     flex: 0 0 auto;

@@ -2,7 +2,7 @@
 import { cleanup, render, screen, within } from "@testing-library/svelte";
 import { afterEach, expect, test } from "vitest";
 import JournalPage from "./[subjectId]/journal/PageContent.svelte";
-import MemoryPage from "./[subjectId]/[memoryId]/PageContent.svelte";
+import MemoryPage from "./[subjectId]/memories/[memoryId]/PageContent.svelte";
 
 afterEach(cleanup);
 const result = <T>(data: T | null, error: string | null = null) => ({
@@ -205,7 +205,7 @@ test("deleted originals do not hide saved entry, correction links or titled immu
     screen.getByRole("link", { name: "復旧経路を先に確認する →" }).getAttribute(
       "href",
     ),
-  ).toBe("/w/workspace-1/memory/subject-1/memory-1?change_id=change-1");
+  ).toBe("/w/workspace-1/subjektiv/subject-1/memories/memory-1?change_id=change-1");
   expect(
     screen.getByRole("link", { name: "復旧経路を先に確認する →" }).getAttribute(
       "target",

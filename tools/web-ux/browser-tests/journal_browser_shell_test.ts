@@ -17,10 +17,10 @@ import {
 
 const root = join(dirname(fromFileUrl(import.meta.url)), "../../..");
 const artifacts = join(root, "target/web-ux/t-737-browser-interactions");
-const subjectPath = `/w/${fixture.workspaceId}/memory/${fixture.subjectId}`;
+const subjectPath = `/w/${fixture.workspaceId}/subjektiv/${fixture.subjectId}`;
 const journalPath = `${subjectPath}/journal`;
 const memoryPath =
-  `${subjectPath}/${fixture.memoryId}?change_id=change-current`;
+  `${subjectPath}/memories/${fixture.memoryId}?change_id=change-current`;
 const claim = "Keep subject Memory provenance typed and visible";
 const entryTitle = "Release milestone 00 · release [a+b] %_";
 const detailPath = `${journalPath}?journal=journal-release&entry=entry-00`;
@@ -262,7 +262,7 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
               .waitFor();
             assertEquals(
               new URL(page.url()).pathname,
-              `${subjectPath}/${fixture.memoryId}`,
+              `${subjectPath}/memories/${fixture.memoryId}`,
             );
             assertEquals(
               new URL(page.url()).searchParams.get("change_id"),
@@ -539,7 +539,7 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
             const state of [
               {
                 path:
-                  `/w/${fixture.workspaceId}/memory/empty-subject/journal?view=sessions`,
+                  `/w/${fixture.workspaceId}/subjektiv/empty-subject/journal?view=sessions`,
                 text: "Journalはまだありません。",
                 role: "status" as const,
               },
@@ -570,7 +570,7 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
             await assertNoPageWideOverflow(page);
           }
           await page.goto(
-            `${base}${subjectPath}/memory-resolved-0002?change_id=change-earlier`,
+            `${base}${subjectPath}/memories/memory-resolved-0002?change_id=change-earlier`,
           );
           await page.locator("#related-journal").getByText(
             "対応するJournalは未接続",
@@ -591,7 +591,7 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
             r.payload.selector.candidate_id === fixture.candidateId
           ));
           await page.goto(
-            `${base}${subjectPath}/memory-sources-failure?change_id=change-current`,
+            `${base}${subjectPath}/memories/memory-sources-failure?change_id=change-current`,
           );
           await page.getByRole("alert").filter({
             hasText: "Journal参照を取得できません。",

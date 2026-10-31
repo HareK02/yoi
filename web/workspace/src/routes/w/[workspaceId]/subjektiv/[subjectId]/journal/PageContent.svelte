@@ -1,8 +1,9 @@
 <script lang="ts">
+  import { subjectHref, subjectMemoryHref } from '#lib/workspace/subjektiv/routes.ts';
   import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
   import OriginalSource from '#lib/workspace/memory/OriginalSource.svelte';
   import { journalHref, type JournalEntry, type TextPage } from '#lib/workspace/memory/journal-api.ts';
-  import { formatDate, workspaceRoute, type ApiResult } from '#lib/workspace/api/http.ts';
+  import { formatDate, type ApiResult } from '#lib/workspace/api/http.ts';
   import type { ResolvedPageData } from '#lib/workspace/navigation/deferred.ts';
   import type { PageData as RouteData } from './$types';
   let { data }: { data: ResolvedPageData<RouteData> } = $props();
@@ -18,7 +19,7 @@
   function entryHref(e: JournalEntry) { return journalHref(data.workspaceId, data.subjectId, { journal: e.journal_id, entry: e.id }); }
   function nextText(key: string, page: TextPage) { return href({ [`${key}_byte`]: String(page.next_byte), [`${key}_token`]: page.content_token }); }
   function memoryHref(memoryId: string, changeId: string) {
-    return workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}/${encodeURIComponent(memoryId)}?change_id=${encodeURIComponent(changeId)}`);
+    return `${subjectMemoryHref(data.workspaceId, data.subjectId, memoryId)}?change_id=${encodeURIComponent(changeId)}`;
   }
 </script>
 <svelte:head><title>{entry?.title ?? 'Journal'} · Yoi Workspace</title></svelte:head>
@@ -47,7 +48,7 @@
 {/snippet}
 
 <section class="journal-page" aria-labelledby="journal-title" data-journal-view={data.mode}>
-  <a href={workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}`)}>← SubjectのMemory</a>
+  <a href={subjectHref(data.workspaceId, data.subjectId)}>← Subject details</a>
   <header><h1 id="journal-title">{entry?.title ?? 'Journal'}</h1>{#if entry}<p>{entry.state} · 出来事 {entry.position} · <time datetime={entry.created_at}>{formatDate(entry.created_at)}</time></p>{/if}</header>
   <p class="muted">Journalは活動の経緯を記録した文章です。原発言・tool結果そのものではなく、Memoryの直接の抽出元や主張の証明ではありません。</p>
   {#if data.mode === 'detail'}

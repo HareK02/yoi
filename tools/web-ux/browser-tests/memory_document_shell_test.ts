@@ -45,7 +45,7 @@ async function openSubjectPage(
   baseUrl: string,
   mobile = false,
 ): Promise<void> {
-  await page.goto(`${baseUrl}/w/${workspaceId}/memory/${encodeURIComponent(subjectId)}`);
+  await page.goto(`${baseUrl}/w/${workspaceId}/subjektiv/${encodeURIComponent(subjectId)}`);
   const heading = page.locator("h1", { hasText: "Release coordination" });
   await heading.waitFor({ state: "attached" });
   if (mobile) {
@@ -189,10 +189,10 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
         await assertNoPageWideOverflow(page);
         await assertMainOwnsVerticalScroll(page);
         assertEquals(
-          await page.locator('aside a[href$="/memory"]', { hasText: "Subjects" }).count(),
+          await page.locator('aside a[href$="/subjektiv"]', { hasText: "Subjects" }).count(),
           1,
         );
-        assertEquals(await page.locator("aside a", { hasText: "Staging" }).count(), 0);
+        assertEquals(await page.locator("aside a", { hasText: "Staging" }).count(), 1);
 
         if (scenario.label === "wheel") {
           assertEquals(
@@ -269,7 +269,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
       const detailContext = await browser.newContext({ viewport: { width: 1440, height: 900 } });
       const detailPage = await detailContext.newPage();
       await detailPage.goto(
-        `${baseUrl}/w/${workspaceId}/memory/${encodeURIComponent(subjectId)}/${
+        `${baseUrl}/w/${workspaceId}/subjektiv/${encodeURIComponent(subjectId)}/memories/${
           encodeURIComponent(memoryId)
         }`,
       );
@@ -324,7 +324,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
 
       const paginationContext = await browser.newContext({ viewport: { width: 768, height: 900 } });
       const paginationPage = await paginationContext.newPage();
-      await paginationPage.goto(`${baseUrl}/w/${workspaceId}/memory`);
+      await paginationPage.goto(`${baseUrl}/w/${workspaceId}/subjektiv`);
       await paginationPage.getByRole("heading", { name: "Subjects", level: 1 }).waitFor();
       assertEquals(
         await paginationPage.getByText(
@@ -354,7 +354,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
       );
 
       await paginationPage.goto(
-        `${baseUrl}/w/${workspaceId}/memory/${encodeURIComponent(subjectId)}`,
+        `${baseUrl}/w/${workspaceId}/subjektiv/${encodeURIComponent(subjectId)}`,
       );
       await paginationPage.getByRole("heading", { name: "Current Memories", level: 2 }).waitFor();
       await paginationPage.getByRole("navigation", { name: "Current Memory pages" }).getByRole(
@@ -382,7 +382,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
         }
         await route.continue();
       });
-      await emptyPage.goto(`${baseUrl}/w/${workspaceId}/memory`);
+      await emptyPage.goto(`${baseUrl}/w/${workspaceId}/subjektiv`);
       await emptyPage.getByText("No Memory subjects.").waitFor();
       await emptyPage.getByRole("button", { name: "New Subject" }).click();
       const emptyRole = emptyPage.getByRole("textbox", { name: "Role" });
@@ -415,7 +415,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
           mutationPaths.push(new URL(request.url()).pathname);
         }
       });
-      await createPage.goto(`${baseUrl}/w/${workspaceId}/memory?cursor=${subjectPageCursor}`);
+      await createPage.goto(`${baseUrl}/w/${workspaceId}/subjektiv?cursor=${subjectPageCursor}`);
       await createPage.getByText("Subject on the next page").waitFor();
       await createPage.getByRole("button", { name: "New Subject" }).click();
       const createRole = createPage.getByRole("textbox", { name: "Role" });
@@ -436,7 +436,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
         "Challenge unsupported assumptions before release.",
       );
       await createPage.getByRole("button", { name: "Create Subject" }).click();
-      await createPage.waitForURL("**/memory/created-subject-0001");
+      await createPage.waitForURL("**/subjektiv/created-subject-0001");
       await createPage.getByRole("heading", { name: "Release steward", level: 1 }).waitFor();
       assertEquals(
         await createPage.getByRole("article", { name: "User-managed Subject behavior" }).count(),
@@ -539,7 +539,7 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
       ];
       for (const stateCase of stateCases) {
         const page = await stateContext.newPage();
-        await page.goto(`${baseUrl}/w/${workspaceId}/memory/${stateCase.id}`);
+        await page.goto(`${baseUrl}/w/${workspaceId}/subjektiv/${stateCase.id}`);
         const state = page.getByRole(stateCase.role).filter({ hasText: stateCase.text });
         await state.waitFor();
         assert((await state.textContent())?.includes(stateCase.text));
