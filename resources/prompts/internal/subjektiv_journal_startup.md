@@ -1,5 +1,3 @@
 ## Prior Journal context
 
-```json
-{{ snapshot_json }}
-```
+{{ context_yaml }}

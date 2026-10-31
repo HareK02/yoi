@@ -1482,13 +1482,25 @@ enabled = true
                     prompt_provenance.logical_name,
                     "internal.subjektiv_journal_startup"
                 );
-                assert_eq!(
-                    body.trim_end(),
-                    format!(
-                        "## Prior Journal context\n\n```json\n{}\n```",
-                        serde_json::to_string(&saved).unwrap()
-                    )
-                );
+                let yaml = body.strip_prefix("## Prior Journal context\n\n").unwrap();
+                let view: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+                if empty {
+                    assert_eq!(view["omitted"].as_bool(), Some(true));
+                } else {
+                    assert_eq!(
+                        view["journals"][0]["current_position"].as_str(),
+                        Some(snapshot.journals[0].current_position.as_str())
+                    );
+                }
+                for hidden in [
+                    "consistent-token",
+                    "previous-session",
+                    "state_token",
+                    "subject_id",
+                    "process_order",
+                ] {
+                    assert!(!body.contains(hidden));
+                }
                 body.as_str()
             });
             assert!(

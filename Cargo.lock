@@ -7279,6 +7279,7 @@ dependencies = [
  "secrets",
  "serde",
  "serde_json",
+ "serde_yaml",
  "serial_test",
  "server-api",
  "session-metrics",

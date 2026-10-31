@@ -10,6 +10,8 @@
 //! material so fallback can recover information intentionally omitted from an earlier
 //! complementary summary, without accumulating stale references in the next segment.
 
+mod context_view;
+
 use crate::feature::{
     FeatureDescriptor, FeatureHookPoint, FeatureInstallContext, FeatureInstallError, FeatureModule,
     HookDeclaration, ToolContribution, ToolDeclaration,
@@ -185,9 +187,8 @@ impl crate::worker::SessionContextSource for JournalContextSource {
             .host
             .journal_startup_context()
             .map_err(|e| e.to_string())?;
-        // A successful empty read contributes no model context. Keep an omitted
-        // snapshot even when empty: truncation is not evidence of absence.
-        let empty = snapshot.journals.is_empty() && !snapshot.omitted;
+        // Empty journals add no context; omission must still remain visible.
+        let context_yaml = context_view::yaml(&snapshot).map_err(|e| e.to_string())?;
         // Hash the same canonical JSON value retained by SystemItem, so replay
         // can verify provenance without depending on domain struct field order.
         let snapshot_value = serde_json::to_value(&snapshot).map_err(|e| e.to_string())?;
@@ -195,12 +196,12 @@ impl crate::worker::SessionContextSource for JournalContextSource {
         if snapshot_json.len() > subjektiv::journal::startup::STARTUP_MAX_BYTES {
             return Err("Host Journal startup snapshot exceeds independent byte budget".into());
         }
-        if empty {
+        let Some(context_yaml) = context_yaml else {
             return Ok(Vec::new());
-        }
+        };
         let prompts = self.prompts.load();
         let body = prompts
-            .subjektiv_journal_startup(&snapshot_json)
+            .subjektiv_journal_startup(&context_yaml)
             .map_err(|e| e.to_string())?;
         if body.len() > subjektiv::journal::startup::STARTUP_MAX_BYTES + 4096 {
             return Err("Journal startup prompt exceeds rendered byte budget".into());
@@ -332,13 +333,8 @@ pub(crate) fn freeze_compaction_journal(
     };
     let snapshot = read.as_ref().and_then(|read| read.as_ref().ok()).cloned();
     let prepared = match read {
-        None => Ok((Disabled, String::new())),
+        None => Ok((Disabled, String::new(), String::new())),
         Some(Ok(snapshot)) => {
-            let status = if snapshot.journals.is_empty() {
-                Absent
-            } else {
-                Available
-            };
             // The current snapshot has only derived, JSON-safe fields (strings,
             // integers, vectors, enums and a UUID). There is no known serialization
             // failure fixture; retain this guard if the domain type changes.
@@ -346,7 +342,14 @@ pub(crate) fn freeze_compaction_journal(
                 .map_err(|_| JournalCompactionFailure::Serialization)
                 .and_then(|json| {
                     if json.len() <= subjektiv::journal::startup::STARTUP_MAX_BYTES {
-                        Ok((status, json))
+                        let yaml = context_view::yaml(&snapshot)
+                            .map_err(|_| JournalCompactionFailure::Serialization)?;
+                        let status = if yaml.is_some() { Available } else { Absent };
+                        let yaml = yaml.unwrap_or_default();
+                        if yaml.len() > subjektiv::journal::startup::STARTUP_MAX_BYTES + 4096 {
+                            return Err(JournalCompactionFailure::ByteBudget);
+                        }
+                        Ok((status, json, yaml))
                     } else {
                         Err(JournalCompactionFailure::ByteBudget)
                     }
@@ -354,13 +357,13 @@ pub(crate) fn freeze_compaction_journal(
         }
         Some(Err(failure)) => Err(failure),
     };
-    let (status, json) = prepared.unwrap_or_else(|failure| {
+    let (status, json, context_yaml) = prepared.unwrap_or_else(|failure| {
         tracing::warn!(
             stage = failure.stage(),
             reason = failure.reason(),
             "Journal compaction snapshot unavailable; continuing without Journal"
         );
-        (Unavailable, String::new())
+        (Unavailable, String::new(), String::new())
     });
     use sha2::{Digest, Sha256};
     let snapshot_sha256: Option<String> = (!json.is_empty()).then(|| {
@@ -370,12 +373,7 @@ pub(crate) fn freeze_compaction_journal(
             .collect()
     });
     let body = prompts
-        .subjektiv_journal_compaction(
-            status.as_str(),
-            &json,
-            snapshot_sha256.as_deref(),
-            workspace_id.as_deref(),
-        )
+        .subjektiv_journal_compaction(status.as_str(), &context_yaml)
         .map_err(|e| e.to_string())?;
     let payload = session_store::FeatureInputPayload::encode(
         "journal:compaction",

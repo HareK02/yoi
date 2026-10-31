@@ -549,27 +549,21 @@ impl PromptCatalog {
     pub(crate) fn subjektiv_journal_compaction(
         &self,
         status: &str,
-        snapshot_json: &str,
-        snapshot_sha256: Option<&str>,
-        workspace_id: Option<&str>,
+        context_yaml: &str,
     ) -> Result<String, CatalogError> {
         self.render(
             WorkerPrompt::SubjektivJournalCompaction,
             minijinja::context! {
                 status => status,
-                snapshot_json => snapshot_json,
-                snapshot_sha256 => snapshot_sha256,
-                workspace_id => workspace_id,
-                source_digest => self.projection.source_digest,
-                projection_digest => self.projection.catalog_digest,
+                context_yaml => context_yaml,
             },
         )
     }
-    pub fn subjektiv_journal_startup(&self, snapshot_json: &str) -> Result<String, CatalogError> {
+    pub fn subjektiv_journal_startup(&self, context_yaml: &str) -> Result<String, CatalogError> {
         self.render(
             WorkerPrompt::SubjektivJournalStartup,
             minijinja::context! {
-                snapshot_json => snapshot_json,
+                context_yaml => context_yaml,
             },
         )
     }
