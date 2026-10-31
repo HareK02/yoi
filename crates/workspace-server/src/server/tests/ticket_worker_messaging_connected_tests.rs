@@ -551,7 +551,7 @@ async fn public_two_subject_ticket_spawn_notify_edit_result_retry_and_fences() {
         ]);
         let (status, policy) = harness.human(reqwest::Method::POST,
             &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
-            json!({"operation_id":format!("public-{label}-policy"),"expected_change_id":null,"execution":execution,"delegation":delegation})).await;
+            json!({"operation_id":format!("public-{label}-policy"),"expected_change_id":subjects.subject_permissions(&subject).unwrap().unwrap().change_id,"execution":execution,"delegation":delegation})).await;
         assert_eq!(status, StatusCode::OK, "{policy}");
         let change = subjects
             .subject_permissions(&subject)

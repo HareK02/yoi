@@ -45,7 +45,13 @@ impl Fixture {
                 subject_id,
                 &server_api::authorization::SubjectPermissionsUpdate {
                     operation_id: format!("memory-journal-fixture-grant-{subject_id}"),
-                    expected_change_id: None,
+                    expected_change_id: Some(
+                        store
+                            .subject_permissions(subject_id)
+                            .unwrap()
+                            .unwrap()
+                            .change_id,
+                    ),
                     execution: [
                         "journal.memory.links.reconcile",
                         "journal.memory.links.read",
@@ -83,6 +89,19 @@ impl Fixture {
             .unwrap();
         if granted {
             Self::grant_permissions(&store, &subject.id);
+        } else {
+            // Model an existing Subject with unset policy, retaining creation history.
+            api.feature_storage
+                .open(&api.subjektiv_registration)
+                .unwrap()
+                .with_connection(|connection| {
+                    connection.execute(
+                        "DELETE FROM subject_permissions WHERE subject_id = ?1",
+                        [&subject.id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
         }
         let worker = Self::body_worker(&api, &subject.id);
         let source_worker = RuntimeWorkerRef::new(RUNTIME, Uuid::new_v4().to_string());
@@ -802,6 +821,8 @@ async fn memory_journal_unset_or_revoked_permissions_deny_every_route_without_li
                     },
                 )
                 .unwrap();
+        } else {
+            assert!(f.store.subject_permissions(&subject).unwrap().is_none());
         }
         let count_links = || {
             f.api

@@ -432,37 +432,10 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     let subject = store
         .create_subject(crate::subjektiv::SubjectRole::new("connected-handoff").unwrap())
         .unwrap();
-    let owner =
-        seed_test_workspace_owner_token(api.store.as_ref(), "connected-journal-owner").await;
-    // This fixture exercises Journal continuity, not unset-policy refusal. Assign
-    // the companion's required Subject operations through authenticated administration;
-    // no filesystem, shell or delegation permission is granted to its body.
-    let update = server_api::authorization::SubjectPermissionsUpdate {
-        operation_id: "connected-journal-activation".into(),
-        expected_change_id: None,
-        execution: connected_subject_permissions(&subject.id),
-        delegation: Vec::new(),
-    };
-    let response = build_router(api.clone())
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri(format!(
-                    "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions",
-                    subject.id
-                ))
-                .header("authorization", format!("Bearer {owner}"))
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::to_vec(&update).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    // Exercise creation-time authority through real recording and startup callbacks,
+    // without a management grant or an execution/delegation policy replacement.
+    let initial_policy = store.subject_permissions(&subject.id).unwrap().unwrap();
+    assert!(initial_policy.delegation.is_empty());
     let old = connected_create(&api, &subject.id, "connected-old-body").await;
     let old_attr = store
         .subject_session_attributions(&subject.id)
@@ -765,6 +738,11 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
             )
             .unwrap(),
         before
+    );
+    assert_eq!(
+        store.subject_permissions(&subject.id).unwrap(),
+        Some(initial_policy),
+        "recording and startup must not rewrite the initial policy"
     );
     for (worker, session) in [
         (&old, old_attr.session_id.as_str()),
@@ -1622,7 +1600,13 @@ async fn connected_restore_fixture_with_pending_head(
         seed_test_workspace_owner_token(api.store.as_ref(), "restore-host-auth-owner").await;
     let update = server_api::authorization::SubjectPermissionsUpdate {
         operation_id: "restore-host-auth-permissions".into(),
-        expected_change_id: None,
+        expected_change_id: Some(
+            store
+                .subject_permissions(&subject.id)
+                .unwrap()
+                .unwrap()
+                .change_id,
+        ),
         execution: connected_subject_permissions(&subject.id),
         delegation: vec![],
     };

@@ -482,11 +482,25 @@ Deno.test("production subject Memory and Worker launch shells preserve exact sco
       ]);
       const createEvidence = await (await fetch(`${baseUrl}/fixture/subject-create-requests`))
         .json();
+      const operationIds = createEvidence.requests.map((request: { operation_id: string }) =>
+        request.operation_id
+      );
+      for (const operationId of operationIds) {
+        assert(
+          typeof operationId === "string" &&
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+              operationId,
+            ),
+          "Each new creation attempt must carry a UUID operation_id",
+        );
+      }
+      assert(operationIds[0] !== operationIds[1], "A resolved rejection must allow a new attempt");
       assertEquals(createEvidence, {
         count: 2,
         requests: [
-          { role: "Permission denied", behavior_md: "" },
+          { operation_id: operationIds[0], role: "Permission denied", behavior_md: "" },
           {
+            operation_id: operationIds[1],
             role: "  Release steward  ",
             behavior_md: "Challenge unsupported assumptions before release.",
           },

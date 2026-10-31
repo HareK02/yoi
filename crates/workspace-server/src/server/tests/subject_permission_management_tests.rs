@@ -74,7 +74,9 @@ fn update(screen: &Value, operation: &str, execution: Value, delegation: Value) 
 async fn management_read_exposes_operation_use_without_duplicate_worker_target_grants() {
     let f = ManagementFixture::new().await;
     let screen = f.read().await;
-    assert!(screen["permissions"].is_null());
+    assert!(screen["permissions"]["change_id"].is_string());
+    assert_eq!(screen["permissions"]["delegation"], json!([]));
+    f.assert_current(&screen["permissions"]);
     assert_eq!(screen["can_manage"], true);
     let operations = screen["operations"].as_array().expect("management catalog");
     let create = operations
@@ -348,7 +350,7 @@ async fn read_only_account_cannot_save_or_replay_an_owner_permission_change() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    f.assert_current(&Value::Null);
+    f.assert_current(&initial["permissions"]);
     let saved = f.save(input.clone()).await;
     let (status, body) = response(
         &f.api,
@@ -398,8 +400,8 @@ async fn new_unknown_legacy_unavailable_and_operation_resource_mismatch_are_reje
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{name}/{lane}: {body}");
             assert!(body["message"].is_string(), "{body}");
-            f.assert_current(&Value::Null);
-            assert!(f.read().await["permissions"].is_null());
+            f.assert_current(&screen["permissions"]);
+            assert_eq!(f.read().await["permissions"], screen["permissions"]);
         }
     }
 }
@@ -417,7 +419,14 @@ async fn unsupported_saved_entries_can_only_be_retained_in_the_same_lane_or_remo
             &f.subject,
             &SubjectPermissionsUpdate {
                 operation_id: "seed-pre-catalog-policy".into(),
-                expected_change_id: None,
+                expected_change_id: Some(
+                    open_subjektiv_store(&f.api)
+                        .unwrap()
+                        .subject_permissions(&f.subject)
+                        .unwrap()
+                        .unwrap()
+                        .change_id,
+                ),
                 execution: execution.clone(),
                 delegation: delegation.clone(),
             },

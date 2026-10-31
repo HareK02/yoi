@@ -496,6 +496,11 @@ pub fn sanitize_workspace_display_name(value: &str) -> Result<String> {
 fn builtin_profile_summaries(default_profile: Option<&str>) -> Vec<WorkspaceProfileSummary> {
     let labels = [
         (
+            server_api::authorization::SUBJECT_CONVERSATION_PROFILE,
+            "Subject conversation",
+            "Default Subject conversation and memory profile; requires an explicit Subject connection",
+        ),
+        (
             "builtin:companion",
             "Companion",
             "Bundled Companion role profile",
@@ -541,7 +546,8 @@ pub fn selector_for_builtin_candidate(
     id: &str,
 ) -> Option<worker_runtime::catalog::ProfileSelector> {
     match id {
-        "builtin:companion"
+        "builtin:async-chat"
+        | "builtin:companion"
         | "builtin:intake"
         | "builtin:orchestrator"
         | "builtin:coder"

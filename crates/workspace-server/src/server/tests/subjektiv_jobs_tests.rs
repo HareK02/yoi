@@ -1011,6 +1011,18 @@ async fn unset_subject_consolidation_denies_before_job_dispatch() {
         .create_subject(SubjectRole::new("unset-job-policy").unwrap())
         .unwrap();
     let source = attach_memory_job_source(&api, &subject.id).await;
+    // A legacy unset policy has no source pointer; retain the initial history fixture.
+    api.feature_storage
+        .open(&api.subjektiv_registration)
+        .unwrap()
+        .with_connection(|c| {
+            c.execute(
+                "DELETE FROM subject_permissions WHERE subject_id=?1",
+                [&subject.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
     assert!(store.subject_permissions(&subject.id).unwrap().is_none());
     stage(&store, &subject.id, "untouched");
     let error = start_subjektiv_staging_consolidation(

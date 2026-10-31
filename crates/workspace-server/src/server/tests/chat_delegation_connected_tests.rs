@@ -775,7 +775,7 @@ async fn connected_chat_delegation(scenario: Scenario) {
         ];
         foreign = Some((other_subject, other_ticket));
     }
-    account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),Some(json!({"operation_id":"chat-policy","expected_change_id":null,"execution":execution,"delegation":delegation}))).await;
+    account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),Some(json!({"operation_id":"chat-policy","expected_change_id":store.subject_permissions(&subject).unwrap().unwrap().change_id,"execution":execution,"delegation":delegation}))).await;
     let original_policy = store.subject_permissions(&subject).unwrap().unwrap();
     for (name, target) in [("conversation-a", true), ("conversation-b", false)] {
         let c = account_request(
