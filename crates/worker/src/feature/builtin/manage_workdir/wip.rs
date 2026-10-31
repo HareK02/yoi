@@ -914,7 +914,7 @@ impl WipOperationHandler for ItemHandler {
                     let mut result = raw;
                     result["workdir_path"] = json!(item_path(Domain::Workdir, &self.id));
                     result["attachments_path"] = json!(ATTACHMENTS);
-                    result["attachment"] = input
+                    result["attachment"] = result
                         .get("alias")
                         .and_then(Json::as_str)
                         .and_then(|alias| self.provider.attached_reference(alias, &self.id))
@@ -1421,10 +1421,19 @@ pub(crate) mod tests {
                     json!({"workspace_id":"test-workspace", "runtime_id":"runtime", "item":raw, "diagnostics":[]})
                 }
                 (WorkspaceRequestMethod::Post, "workers/self/workdir-attachments") => {
-                    state.generation += 1;
-                    let raw = json!({"alias":body["alias"], "working_directory_id":body["working_directory_id"], "connection_id":format!("connection-{}", state.generation), "capabilities":{"bits":63}});
-                    state.attachments.push(raw);
-                    json!({"workspace_id":"test-workspace", "alias":body["alias"], "working_directory_id":body["working_directory_id"], "capabilities":{"bits":63}, "environment":workdir::WorkdirSessionEnvironment::root(workdir::WorkdirSessionCapabilities::ALL), "attached":true})
+                    let existing = state
+                        .attachments
+                        .iter()
+                        .find(|raw| raw["working_directory_id"] == body["working_directory_id"])
+                        .cloned();
+                    let already_attached = existing.is_some();
+                    let raw = existing.unwrap_or_else(|| {
+                        state.generation += 1;
+                        let raw = json!({"alias":body["alias"], "working_directory_id":body["working_directory_id"], "connection_id":format!("connection-{}", state.generation), "capabilities":{"bits":63}});
+                        state.attachments.push(raw.clone());
+                        raw
+                    });
+                    json!({"workspace_id":"test-workspace", "alias":raw["alias"], "working_directory_id":raw["working_directory_id"], "capabilities":{"bits":63}, "environment":workdir::WorkdirSessionEnvironment::root(workdir::WorkdirSessionCapabilities::ALL), "attached":true, "already_attached":already_attached})
                 }
                 (WorkspaceRequestMethod::Delete, p)
                     if p.starts_with("workers/self/workdir-attachments/") =>

@@ -202,6 +202,29 @@ impl SubjektivStore {
         })
     }
 
+    /// End a body after the Host has confirmed its Runtime removal. This is not a
+    /// completed Journal handoff: source coverage, positions and saved receipts stay
+    /// unchanged. Revocation and closing generations are atomic, so no retained Job
+    /// can write after deletion even while Backend Job cleanup is being retried.
+    pub fn release_removed_journal_body(&self, host: &JournalHostContext) -> JournalResult<()> {
+        self.database.try_transaction(|tx| {
+            super::store::check_session_host(self, tx, host)?;
+            let attr = host.attribution.as_ref().expect("checked Session authority");
+            let binding: Option<String> = tx.query_row(
+                "SELECT binding_id FROM journal_writer_bindings WHERE subject_id=?1 AND runtime_id=?2 AND worker_id=?3 ORDER BY rowid DESC LIMIT 1",
+                params![host.subject_id, attr.runtime_id, attr.worker_id], |r| r.get(0),
+            ).optional()?;
+            let binding = binding.unwrap_or_else(|| crate::issued_id("journal-removed-body"));
+            tx.execute("INSERT OR IGNORE INTO journal_writer_bindings(binding_id,subject_id,runtime_id,worker_id,active) VALUES(?1,?2,?3,?4,0)",params![binding,host.subject_id,attr.runtime_id,attr.worker_id])?;
+            tx.execute("UPDATE journal_writer_bindings SET active=0 WHERE subject_id=?1 AND runtime_id=?2 AND worker_id=?3",params![host.subject_id,attr.runtime_id,attr.worker_id])?;
+            // Bind legacy attributed Sessions to an inactive lifetime, never to the
+            // successor. Retained unfinished history is not an active writer.
+            tx.execute("INSERT OR IGNORE INTO journal_session_bindings(session_id,binding_id) SELECT session_id,?4 FROM subject_session_attributions WHERE subject_id=?1 AND runtime_id=?2 AND worker_id=?3",params![host.subject_id,attr.runtime_id,attr.worker_id,binding])?;
+            tx.execute("UPDATE journal_generations SET active=0 WHERE journal_id IN (SELECT j.id FROM journals j JOIN subject_session_attributions a ON a.session_id=j.source_session_id WHERE a.subject_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3)",params![host.subject_id,attr.runtime_id,attr.worker_id])?;
+            Ok(())
+        })
+    }
+
     /// The Host must hold its lifecycle fence, confirm Idle, reconcile all committed original
     /// Sessions (including the save/notification gap), and exclude queued/running/Unknown Jobs.
     /// This transaction rejects retained writers, pending source bytes and active generations.

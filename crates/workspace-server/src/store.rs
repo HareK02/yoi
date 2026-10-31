@@ -3253,8 +3253,8 @@ impl SqliteWorkspaceStore {
                         },
                     )
                     .optional()?;
-                // Subject occupancy survives removal until an explicit release
-                // proof. It must not resurrect the removed creation reservation:
+                // An unconfirmed legacy removal cannot release Subject occupancy.
+                // Completed removal or explicit release does; never resurrect a reservation:
                 // Runtime callbacks require a live reservation or catalog member.
                 if stored.as_ref().is_some_and(|row| row.6 == "removed") {
                     return Err(Error::RepositoryConflict(format!(
@@ -11443,49 +11443,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.workdir_id
                 )));
             }
-            let active_for_alias = tx
-                .query_row(
-                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
-                       FROM worker_workdir_links
-                       WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
-                         AND alias = ?4 AND unlinked_at IS NULL"#,
-                    params![
-                        record.workspace_id,
-                        record.worker.runtime_id,
-                        record.worker.worker_id,
-                        record.alias,
-                    ],
-                    read_worker_workdir_link_record,
-                )
-                .optional()?;
-            if let Some(mut active) = active_for_alias {
-                if active.workdir_id == record.workdir_id {
-                    let capabilities = active.capabilities.intersection(record.capabilities);
-                    if capabilities != active.capabilities {
-                        tx.execute(
-                            r#"UPDATE worker_workdir_links
-                               SET capabilities = ?1
-                               WHERE workspace_id = ?2 AND runtime_id = ?3 AND worker_id = ?4
-                                 AND workdir_id = ?5 AND alias = ?6 AND unlinked_at IS NULL"#,
-                            params![
-                                encode_workdir_link_capabilities(capabilities)?,
-                                record.workspace_id,
-                                record.worker.runtime_id,
-                                record.worker.worker_id,
-                                record.workdir_id,
-                                record.alias,
-                            ],
-                        )?;
-                        active.capabilities = capabilities;
-                    }
-                    tx.commit()?;
-                    return Ok(active);
-                }
-                return Err(Error::WorkdirAttachmentConflict(format!(
-                    "Worker {}:{} attachment alias `{}` is already bound to Workdir {}",
-                    record.worker.runtime_id, record.worker.worker_id, record.alias, active.workdir_id
-                )));
-            }
+            // Ownership is keyed by Workdir, not by the requested local name.
             let active_for_workdir = tx
                 .query_row(
                     r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
@@ -11495,10 +11453,45 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     read_worker_workdir_link_record,
                 )
                 .optional()?;
-            if let Some(active) = active_for_workdir {
+            if let Some(mut active) = active_for_workdir {
+                if active.worker != record.worker {
+                    return Err(Error::WorkdirOccupied {
+                        workdir_id: record.workdir_id.clone(),
+                        runtime_id: active.worker.runtime_id,
+                        worker_id: active.worker.worker_id,
+                    });
+                }
+                let capabilities = active.capabilities.intersection(record.capabilities);
+                if capabilities != active.capabilities {
+                    tx.execute(
+                        r#"UPDATE worker_workdir_links SET capabilities = ?1
+                           WHERE workspace_id = ?2 AND runtime_id = ?3 AND worker_id = ?4
+                             AND workdir_id = ?5 AND alias = ?6 AND unlinked_at IS NULL"#,
+                        params![
+                            encode_workdir_link_capabilities(capabilities)?,
+                            active.workspace_id, active.worker.runtime_id, active.worker.worker_id,
+                            active.workdir_id, active.alias,
+                        ],
+                    )?;
+                    active.capabilities = capabilities;
+                }
+                tx.commit()?;
+                return Ok(active);
+            }
+            let active_for_alias = tx
+                .query_row(
+                    r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
+                       FROM worker_workdir_links
+                       WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3
+                         AND alias = ?4 AND unlinked_at IS NULL"#,
+                    params![record.workspace_id, record.worker.runtime_id, record.worker.worker_id, record.alias],
+                    read_worker_workdir_link_record,
+                )
+                .optional()?;
+            if let Some(active) = active_for_alias {
                 return Err(Error::WorkdirAttachmentConflict(format!(
-                    "Workdir {} is already attached to Worker {}:{}",
-                    record.workdir_id, active.worker.runtime_id, active.worker.worker_id
+                    "Worker {}:{} attachment alias `{}` is already bound to Workdir {}",
+                    record.worker.runtime_id, record.worker.worker_id, record.alias, active.workdir_id
                 )));
             }
             // Direct attachments (including ordinary recovery/reconnection)
@@ -16746,7 +16739,7 @@ fn current_worker_singleton_owner(
                     WHEN substr(owner.singleton_key,1,10)='subjektiv:' AND reservation.state='removed' \
                       AND NOT EXISTS(SELECT 1 FROM subject_worker_releases r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.completed=1) \
                       AND NOT EXISTS(SELECT 1 FROM subject_create_recoveries r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.create_fingerprint=reservation.create_fingerprint AND r.completed=1) \
-                      AND NOT EXISTS(SELECT 1 FROM worker_removal_operations r JOIN subject_deletion_workers d ON d.workspace_id=r.workspace_id AND d.runtime_id=r.runtime_id AND d.worker_id=r.worker_id WHERE r.workspace_id=owner.workspace_id AND r.runtime_id=owner.runtime_id AND r.worker_id=owner.worker_id AND r.state='succeeded' AND owner.singleton_key='subjektiv:'||d.subject_id AND (d.prior_removal_operation_id=r.operation_id OR (d.prior_removal_operation_id IS NULL AND d.is_job=0 AND r.session_disposition='archive' AND r.archive_retention_kind='forever' AND r.metadata_disposition='tombstone'))) \
+                    AND NOT EXISTS(SELECT 1 FROM worker_removal_operations r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.state='succeeded') \
                       AND NOT EXISTS(SELECT 1 FROM subject_deletion_workers d WHERE d.workspace_id=owner.workspace_id AND d.runtime_id=owner.runtime_id AND d.worker_id=owner.worker_id AND owner.singleton_key='subjektiv:'||d.subject_id AND d.originals_absent=1) \
                     THEN 'created' ELSE reservation.state END \
              FROM worker_singleton_owners owner \
@@ -26065,6 +26058,24 @@ INSERT INTO worker_registry (
             2
         );
 
+        for alias in ["another-name", "docs"] {
+            let requested = WorkerWorkdirLinkRecord {
+                alias: alias.into(),
+                ..link.clone()
+            };
+            assert_eq!(
+                store.attach_worker_workdir(&requested).unwrap(),
+                downgraded_link
+            );
+            assert_eq!(
+                store
+                    .list_worker_workdir_links("local-dev", &worker.worker)
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+
         let second_worker = WorkerRegistryRecord {
             worker: RuntimeWorkerRef::new("embedded", "2"),
             display_name: "Browser 2".to_string(),
@@ -26080,7 +26091,7 @@ INSERT INTO worker_registry (
         };
         assert!(matches!(
             store.attach_worker_workdir(&workdir_conflict),
-            Err(Error::WorkdirAttachmentConflict(_))
+            Err(Error::WorkdirOccupied { .. })
         ));
         assert!(matches!(
             store.detach_worker_workdir("local-dev", &worker.worker, Some("wrong-workdir"), "6",),

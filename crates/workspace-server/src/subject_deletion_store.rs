@@ -1289,8 +1289,9 @@ mod tests {
         reservation(&s, &body, "body", Some("subjektiv:subject"));
         receipt(&s, &body, "succeeded", "purge", "purge");
         let body_receipt = format!("receipt-{}-succeeded", body.worker_id);
-        // A different Subject's already-removed body remains occupied until its
-        // own deletion/release. Deleting a delegating Subject must not release it.
+        // Another Subject's completed removal already releases its occupancy.
+        // Deleting the delegating Subject must preserve that independent outcome
+        // and must not erase the other Subject's Job.
         let other_body = worker(33);
         reservation(&s, &other_body, "other-body", Some("subjektiv:another"));
         receipt(&s, &other_body, "succeeded", "purge", "purge");
@@ -1307,6 +1308,11 @@ mod tests {
         }).unwrap();
         let archive_before = s.worker_session_archive("w", &jw, "session").unwrap();
         assert!(archive_before.is_some());
+        assert!(
+            s.current_worker_singleton_owner("w", "subjektiv:another")
+                .unwrap()
+                .is_none()
+        );
         s.prepare_subject_deletion("w", "subject", "delete", std::slice::from_ref(&other_body))
             .unwrap();
         assert_eq!(saved_prior(&s, "subject", &jw), Some(job_receipt.clone()));
@@ -1352,7 +1358,7 @@ mod tests {
         assert!(
             s.current_worker_singleton_owner("w", "subjektiv:another")
                 .unwrap()
-                .is_some()
+                .is_none()
         );
         s.with_conn(|c| {
             let old:(String,String,String)=c.query_row("SELECT state,session_disposition,metadata_disposition FROM worker_removal_operations WHERE operation_id=?1",[&job_receipt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;

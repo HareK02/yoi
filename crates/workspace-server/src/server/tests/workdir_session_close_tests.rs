@@ -314,6 +314,7 @@ impl Fixture {
                 &workdir_id,
                 "account:close-test",
                 "remove normally after session close",
+                &uuid::Uuid::now_v7().to_string(),
             )
         })
         .await

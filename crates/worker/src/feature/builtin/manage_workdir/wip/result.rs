@@ -132,6 +132,7 @@ pub(super) fn attached() -> TypeExpr {
         field("capabilities", true, TypeExpr::Json),
         field("environment", true, TypeExpr::Json),
         field("attached", true, TypeExpr::Boolean),
+        field("already_attached", true, TypeExpr::Boolean),
         field("workdir_path", true, TypeExpr::Entry),
         field("attachments_path", true, TypeExpr::Entry),
         field("attachment", true, TypeExpr::Union { cases: vec![

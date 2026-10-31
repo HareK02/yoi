@@ -7348,6 +7348,8 @@ pub struct WorkingDirectoryCleanupTarget {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkingDirectoryRemovalRequest {
+    /// Stable for an exact resend; a new explicit request uses a new identity.
+    pub operation_id: String,
     pub reason: String,
 }
 
@@ -7886,6 +7888,9 @@ pub struct CurrentWorkerWorkdirAttachmentResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<workdir::WorkdirSessionEnvironment>,
     pub attached: bool,
+    /// The Workdir was already attached to this Worker; alias is its existing name.
+    #[serde(default)]
+    pub already_attached: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -13691,9 +13696,11 @@ mod tests {
             capabilities: workdir::WorkdirSessionCapabilities::EMPTY,
             environment: None,
             attached: false,
+            already_attached: false,
         };
         let value = serde_json::to_value(&response).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 5);
+        assert_eq!(value.as_object().unwrap().len(), 6);
+        assert_eq!(value["already_attached"], false);
         assert!(value.get("connection_id").is_none());
         assert_eq!(
             serde_json::from_value::<CurrentWorkerWorkdirAttachmentResponse>(value).unwrap(),

@@ -819,6 +819,7 @@ mod workspace_config_integration {
                 },
                 "owner".into(),
                 WorkingDirectoryRemovalRequest {
+                    operation_id: "unsupported-logical-cleanup".into(),
                     reason: "unsupported logical cleanup".into()
                 }
             )

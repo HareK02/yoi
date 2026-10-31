@@ -652,6 +652,7 @@ async fn source_workdir_removal_keeps_published_drive_bytes_and_receipt() {
             &removal_id,
             "account:drive-test",
             "source no longer needed",
+            "drive-source-removal",
         )
     })
     .await

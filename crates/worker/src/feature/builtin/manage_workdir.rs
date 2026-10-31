@@ -776,25 +776,39 @@ impl WorkspaceHttpWorkdirBackend {
             ATTACH_TOOL,
             "working_directory_id",
         )?;
-        let alias_key = workdir::WorkdirAttachmentAlias::new(alias)
-            .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
-        if self.session_router.session(&alias_key).is_some() {
-            return Err(ToolError::InvalidArgument(format!(
-                "attachment alias `{alias}` already exists"
-            )));
-        }
         let response = self.attach_response(alias, working_directory_id)?;
-        if let Err(error) = self.session_router.attach(
-            alias_key.clone(),
+        if !response.attachment.attached
+            || response.attachment.working_directory_id != working_directory_id
+        {
+            return Err(ToolError::ExecutionFailed(
+                "Workdir attachment response does not match the target".into(),
+            ));
+        }
+        // Backend ownership decides the name. A requested alias cannot rename
+        // an existing attachment or create a second route to the same Workdir.
+        let attached_alias = &response.attachment.alias;
+        let alias_key = workdir::WorkdirAttachmentAlias::new(attached_alias.clone())
+            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+        if let Some(session) = self.session_router.session(&alias_key) {
+            if session.workdir().id().as_str() != working_directory_id {
+                return Err(ToolError::ExecutionFailed("Local Workdir attachment differs from Backend; refresh attachments before retrying".into()));
+            }
+        } else if let Err(error) = self.session_router.attach(
+            alias_key,
             WorkspaceAttachedWorkdirSession::handle_for_workdir_with_environment(
                 self.client.clone(),
-                alias,
+                attached_alias,
                 working_directory_id,
                 response.attachment.capabilities,
                 response.environment.clone(),
             ),
         ) {
-            let rollback = self.detach(alias);
+            if response.attachment.already_attached {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "attach Workdir session route: {error}; existing Backend attachment preserved"
+                )));
+            }
+            let rollback = self.detach(attached_alias);
             return Err(ToolError::ExecutionFailed(match rollback {
                 Ok(_) => {
                     format!("attach Workdir session route: {error}; Backend attachment rolled back")
@@ -805,7 +819,11 @@ impl WorkspaceHttpWorkdirBackend {
             }));
         }
         workdir_output(
-            format!("Attached Workdir {working_directory_id} as {alias}"),
+            if response.attachment.already_attached {
+                format!("Workdir {working_directory_id} is already attached as {attached_alias}")
+            } else {
+                format!("Attached Workdir {working_directory_id} as {attached_alias}")
+            },
             &response,
         )
     }
@@ -817,15 +835,31 @@ impl WorkspaceHttpWorkdirBackend {
     ) -> Result<WorkdirSessionAttachmentResponse, ToolError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
         self.authorize_workdir("workdir.attach", working_directory_id)?;
-        self.execute_json::<WorkdirSessionAttachmentResponse>(WorkspaceRequest::json(
-            WorkspaceRequestMethod::Post,
-            format!("/api/w/{workspace_id}/workers/self/workdir-attachments"),
-            serde_json::to_string(&WorkdirAttachRequest {
-                alias: alias.to_string(),
-                working_directory_id: working_directory_id.to_string(),
-            })
-            .map_err(decode_error)?,
-        ))
+        let response = self
+            .client
+            .execute(WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                format!("/api/w/{workspace_id}/workers/self/workdir-attachments"),
+                serde_json::to_string(&WorkdirAttachRequest {
+                    alias: alias.to_string(),
+                    working_directory_id: working_directory_id.to_string(),
+                })
+                .map_err(decode_error)?,
+            ))
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("Workspace Workdir request failed: {error}"))
+            })?;
+        if response.status == 409
+            && let Ok(error) =
+                serde_json::from_str::<server_api::RepositoryApiError>(&response.body)
+            && error.error == "workdir_occupied"
+        {
+            return Err(ToolError::StructuredConflict {
+                code: "workdir_occupied".into(),
+                message: "Workdir is occupied by another Worker".into(),
+            });
+        }
+        decode_response(response)
     }
 
     fn detach(&self, alias: &str) -> Result<ToolOutput, ToolError> {
@@ -860,7 +894,11 @@ impl WorkspaceHttpWorkdirBackend {
         )
     }
 
-    fn delete(&self, input: WorkdirDeleteInput) -> Result<ToolOutput, ToolError> {
+    fn delete(
+        &self,
+        input: WorkdirDeleteInput,
+        operation_id: String,
+    ) -> Result<ToolOutput, ToolError> {
         let workdir_id = validate_identity(
             &input.working_directory_id,
             DELETE_TOOL,
@@ -874,6 +912,7 @@ impl WorkspaceHttpWorkdirBackend {
             WorkspaceRequestMethod::Delete,
             format!("/api/w/{workspace_id}/working-directories/{workdir_path}"),
             serde_json::to_string(&WorkdirRemovalRequest {
+                operation_id,
                 reason: reason.to_string(),
             })
             .map_err(decode_error)?,
@@ -884,7 +923,7 @@ impl WorkspaceHttpWorkdirBackend {
                 response.disposition,
                 removal_guidance(response.failure_category.as_deref()),
                 if response.retryable {
-                    " After resolving the cause, repeat this WorkdirDelete with the same id and reason; current safety conditions will be rechecked."
+                    " After resolving the cause, a new explicit WorkdirDelete request will recheck current safety conditions. This failed request will not be automatically re-executed."
                 } else {
                     ""
                 }
@@ -1047,9 +1086,10 @@ impl Tool for WorkspaceHttpWorkdirTool {
                 self.backend.detach_managed(&input.alias, None).await
             }
 
-            WorkdirOperation::Delete => self
-                .backend
-                .delete(parse_input::<WorkdirDeleteInput>(input_json)?),
+            WorkdirOperation::Delete => self.backend.delete(
+                parse_input::<WorkdirDeleteInput>(input_json)?,
+                ctx.call_id.to_string(),
+            ),
         }
     }
 }
@@ -1111,8 +1151,14 @@ fn removal_guidance(category: Option<&str>) -> &'static str {
         Some("runtime_unavailable" | "provider_unavailable") => {
             "Restore the Runtime connection; the registry remains until deletion is confirmed."
         }
-        Some("provider_observation_unknown" | "provider_cleanup_outcome_unknown") => {
-            "Deletion is not confirmed. Re-observe with normal removal after restoring provider access; the registry is retained."
+        Some("provider_cleanup_outcome_unknown") => {
+            "Deletion outcome is unknown. Restore provider access and reconcile the existing request; do not submit a fresh deletion intent. Recovery only observes the target and never repeats deletion."
+        }
+        Some("provider_observation_unknown") => {
+            "The target could not be observed before deletion. Restore provider access before a new request."
+        }
+        Some("request_interrupted") => {
+            "The request was interrupted before execution. A new explicit request is required."
         }
         Some("unsupported_target") => {
             "Ask the owner for the provider's supported cleanup operation."
@@ -1312,6 +1358,8 @@ struct WorkdirAttachmentResponse {
     working_directory_id: String,
     capabilities: WorkdirSessionCapabilities,
     attached: bool,
+    #[serde(default)]
+    already_attached: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1467,8 +1515,44 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn delete_call_identity_distinguishes_new_requests_from_exact_resends() {
+        let client = Arc::new(RecordingWorkspaceClient::new(
+            (0..3)
+                .map(|_| {
+                    response(json!({
+                        "working_directory_id": "wd-request",
+                        "disposition": "attention_required",
+                        "retryable": true,
+                        "failure_category": "resource_busy"
+                    }))
+                })
+                .collect(),
+        ));
+        let tool = WorkspaceHttpWorkdirTool {
+            backend: WorkspaceHttpWorkdirBackend::new(client.clone()),
+            operation: WorkdirOperation::Delete,
+        };
+        let input = r#"{"working_directory_id":"wd-request","reason":"remove unused Workdir"}"#;
+        for id in ["delete-1", "delete-1", "delete-2"] {
+            tool.execute(input, ToolExecutionContext::new(id, "batch", 0))
+                .await
+                .unwrap();
+        }
+        let bodies: Vec<serde_json::Value> = client
+            .requests()
+            .iter()
+            .map(|r| serde_json::from_str(r.body.as_deref().unwrap()).unwrap())
+            .collect();
+        assert_eq!(bodies[0], bodies[1]);
+        assert_eq!(bodies[0]["operation_id"], "delete-1");
+        assert_eq!(bodies[2]["operation_id"], "delete-2");
+        assert_eq!(bodies[0]["reason"], bodies[2]["reason"]);
+        assert!(delete_schema()["properties"].get("operation_id").is_none());
+    }
+
     #[test]
-    fn ordinary_workdir_delete_reports_safe_cause_and_exact_retry_guidance() {
+    fn ordinary_workdir_delete_reports_safe_cause_and_new_request_guidance() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
             "working_directory_id": "wd-retry",
             "disposition": "attention_required",
@@ -1477,10 +1561,13 @@ mod tests {
         }))]));
         let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
         let output = backend
-            .delete(WorkdirDeleteInput {
-                working_directory_id: "wd-retry".into(),
-                reason: "remove unused Workdir".into(),
-            })
+            .delete(
+                WorkdirDeleteInput {
+                    working_directory_id: "wd-retry".into(),
+                    reason: "remove unused Workdir".into(),
+                },
+                "delete-call-1".to_string(),
+            )
             .unwrap();
         assert!(output.summary.contains("Confirm its owner"));
         assert!(
@@ -1488,7 +1575,11 @@ mod tests {
                 .summary
                 .contains("Do not recursively delete mounted data")
         );
-        assert!(output.summary.contains("same id and reason"));
+        assert!(
+            output
+                .summary
+                .contains("new explicit WorkdirDelete request")
+        );
         assert!(output.summary.len() <= 600);
         let content: serde_json::Value =
             serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
@@ -1726,10 +1817,13 @@ mod tests {
             .unwrap();
         backend.detach("checkout").unwrap();
         backend
-            .delete(WorkdirDeleteInput {
-                working_directory_id: "wd-created".to_string(),
-                reason: "remove stale Workdir".to_string(),
-            })
+            .delete(
+                WorkdirDeleteInput {
+                    working_directory_id: "wd-created".to_string(),
+                    reason: "remove stale Workdir".to_string(),
+                },
+                "delete-call-1".to_string(),
+            )
             .unwrap();
 
         let requests = client.requests();
@@ -1767,7 +1861,102 @@ mod tests {
         assert_eq!(requests[4].method, WorkspaceRequestMethod::Delete);
         let body: serde_json::Value =
             serde_json::from_str(requests[4].body.as_deref().unwrap()).unwrap();
-        assert_eq!(body, json!({"reason": "remove stale Workdir"}));
+        assert_eq!(
+            body,
+            json!({"reason": "remove stale Workdir", "operation_id": "delete-call-1"})
+        );
+    }
+
+    #[test]
+    fn attach_reports_other_worker_occupancy_without_exposing_backend_details() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![WorkspaceResponse {
+            status: 409,
+            body: serde_json::to_string(&server_api::RepositoryApiError::new(
+                409,
+                "workdir_occupied",
+                "private backend detail",
+                Vec::new(),
+            ))
+            .unwrap(),
+        }]));
+        let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
+        let error = backend
+            .attach(WorkdirAttachInput {
+                alias: "work".into(),
+                working_directory_id: "occupied".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::StructuredConflict { code, message } if code == "workdir_occupied" && message == "Workdir is occupied by another Worker")
+        );
+        assert_eq!(client.requests().len(), 1);
+    }
+
+    #[test]
+    fn attach_reuses_backend_alias_without_duplicate_routes_or_detach() {
+        let client = Arc::new(RecordingWorkspaceClient::new((0..3).map(|_| response(json!({
+            "workspace_id": "workspace/test", "alias": "existing", "working_directory_id": "wd-existing",
+            "capabilities": {"bits": 63}, "attached": true, "already_attached": true,
+            "environment": workdir::WorkdirSessionEnvironment::root(WorkdirSessionCapabilities::ALL)
+        }))).collect()));
+        let backend = WorkspaceHttpWorkdirBackend::new(client.clone());
+        let occupied_alias = workdir::WorkdirAttachmentAlias::new("other").unwrap();
+        backend
+            .session_router
+            .attach(
+                occupied_alias.clone(),
+                WorkspaceAttachedWorkdirSession::handle_for_workdir(
+                    client.clone(),
+                    "other",
+                    "wd-other",
+                ),
+            )
+            .unwrap();
+        for alias in ["new-name", "existing", "other"] {
+            let output = backend
+                .attach(WorkdirAttachInput {
+                    alias: alias.into(),
+                    working_directory_id: "wd-existing".into(),
+                })
+                .unwrap();
+            assert_eq!(
+                output.summary,
+                "Workdir wd-existing is already attached as existing"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+            assert_eq!(body["alias"], "existing");
+            assert_eq!(body["already_attached"], true);
+        }
+        assert!(
+            backend
+                .session_router
+                .session(&workdir::WorkdirAttachmentAlias::new("new-name").unwrap())
+                .is_none()
+        );
+        assert_eq!(
+            backend
+                .session_router
+                .session(&occupied_alias)
+                .unwrap()
+                .workdir()
+                .id()
+                .as_str(),
+            "wd-other"
+        );
+        assert!(
+            backend
+                .session_router
+                .session(&workdir::WorkdirAttachmentAlias::new("existing").unwrap())
+                .is_some()
+        );
+        assert_eq!(client.requests().len(), 3);
+        assert!(
+            client
+                .requests()
+                .iter()
+                .all(|request| request.method == WorkspaceRequestMethod::Post)
+        );
     }
 
     #[tokio::test]
@@ -2377,10 +2566,13 @@ mod tests {
         );
         assert!(
             backend
-                .delete(WorkdirDeleteInput {
-                    working_directory_id: "wd".into(),
-                    reason: "remove unused".into()
-                })
+                .delete(
+                    WorkdirDeleteInput {
+                        working_directory_id: "wd".into(),
+                        reason: "remove unused".into(),
+                    },
+                    "delete-intent".into(),
+                )
                 .is_err()
         );
         assert!(backend.detach_managed("checkout", None).await.is_err());

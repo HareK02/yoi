@@ -653,6 +653,32 @@ impl SubjektivStore {
             Ok(())
         })
     }
+    /// Read the exact retained Job/attempt snapshot without granting writer
+    /// authority or creating a generation. Used for outcome recovery after removal.
+    pub fn retained_journal_generation(
+        &self,
+        host: &JournalHostContext,
+        id: &str,
+        binding: &JobAttemptBinding,
+    ) -> JournalResult<Option<JournalGeneration>> {
+        self.database.try_with_connection(|tx| {
+            check_host(self, tx, host, false)?;
+            check_session_host(self, tx, host)?;
+            journal(tx, host, id, true)?;
+            let raw: Option<String> = tx.query_row(
+                "SELECT snapshot_json FROM journal_generations WHERE journal_id=?1 AND job_id=?2 AND attempt_id=?3",
+                params![id, binding.job_id, binding.attempt_id], |r| r.get(0),
+            ).optional()?;
+            raw.map(|raw| {
+                let generation: JournalGeneration = serde_json::from_str(&raw)?;
+                if generation.journal_id != id || &generation.job != binding {
+                    return Err(conflict("retained generation identity mismatch"));
+                }
+                Ok(generation)
+            }).transpose()
+        })
+    }
+
     pub fn read_journal_generation(
         &self,
         host: &JournalHostContext,

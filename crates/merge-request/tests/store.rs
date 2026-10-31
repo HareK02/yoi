@@ -377,6 +377,49 @@ fn approve(s: &MergeRequestStore, subject: &str, token: &str) -> ReviewEvent {
     approve_for(s, "MR", "R", subject, token)
 }
 #[test]
+fn review_submission_preserves_long_body_and_findings_on_reload() {
+    for (body, finding_body) in [
+        ("b".repeat(16 * 1024 + 1), "finding".into()),
+        ("review".into(), "指摘".repeat(4096)),
+    ] {
+        let (_dir, store) = fixture();
+        open(&store);
+        request(&store, "source", "token");
+        let findings = vec![ReviewFinding {
+            severity: FindingSeverity::Major,
+            code: None,
+            path: None,
+            line: None,
+            body: finding_body,
+        }];
+        let submitted = store
+            .submit_review(SubmitMergeRequestReview {
+                merge_request_id: "MR".into(),
+                ticket_id: "T".into(),
+                current_subject_ref: "source".into(),
+                capability_token: "token".into(),
+                decision: ReviewDecision::RequestChanges,
+                body: body.clone(),
+                findings: findings.clone(),
+                now: at(4),
+            })
+            .unwrap();
+        assert_eq!(submitted.body, body);
+        assert_eq!(submitted.findings, findings);
+        let reloaded = store.get_by_id("W", "MR").unwrap();
+        let saved = reloaded
+            .thread
+            .iter()
+            .find_map(|event| match event {
+                MergeRequestThreadEvent::Review(review) => Some(review),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(saved, &submitted);
+    }
+}
+
+#[test]
 fn review_submission_authorization_rejects_invalid_grants_before_side_effects() {
     let (_d, store) = fixture();
     open(&store);

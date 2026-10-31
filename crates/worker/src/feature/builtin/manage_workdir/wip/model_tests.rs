@@ -413,7 +413,16 @@ async fn model_repository_create_attach_selected_entries_read_and_detach_preserv
         .invoke(&workdir, "attach", json!({"alias":"checkout"}))
         .await;
     assert_eq!(attached["attached"], true);
+    assert_eq!(attached["already_attached"], false);
     assert_eq!(attached["attachment"]["$case"], "available");
+    let (reused, reused_entries) = f
+        .invoke(&workdir, "attach", json!({"alias":"another-name"}))
+        .await;
+    assert_eq!(reused["already_attached"], true);
+    assert_eq!(reused["alias"], "checkout");
+    assert_eq!(reused["attachment"], attached["attachment"]);
+    assert_eq!(reused_entries, entries);
+    assert_eq!(f.client.catalog.state.lock().unwrap().attachments.len(), 1);
     assert_eq!(
         f.writes("workdir-session/operations"),
         0,
@@ -432,7 +441,7 @@ async fn model_repository_create_attach_selected_entries_read_and_detach_preserv
             .unwrap()
             .contains("isolated content")
     );
-    assert_eq!(f.writes("workdir-attachments"), 1);
+    assert_eq!(f.writes("workdir-attachments"), 2);
     f.invoke(&attachment, "detach", json!({})).await;
     assert!(
         f.execute("Inspect", json!({"path":attachment,"refresh":true}))

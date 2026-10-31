@@ -28,7 +28,19 @@ pub(super) struct Lease {
     id: String,
 }
 
-fn busy() -> WorkingDirectoryDiagnostic {
+fn busy(id: &str, action: &str, blocking: &Entry) -> WorkingDirectoryDiagnostic {
+    let (busy_reason, active_use_count) = match blocking {
+        Entry::Use(count) => ("active_use", *count),
+        Entry::Create => ("creation_in_progress", 0),
+        Entry::Cleanup => ("cleanup_in_progress", 0),
+    };
+    tracing::warn!(target: "yoi::workdir_cleanup",
+        working_directory_id = id,
+        action,
+        busy_source = "materializer_occupancy",
+        busy_reason,
+        active_use_count,
+        "Workdir operation blocked by busy resource");
     WorkingDirectoryDiagnostic::new(
         "working_directory_cleanup_resource_busy",
         "A filesystem resource is busy or changed during removal. Release the resource and retry.",
@@ -42,7 +54,9 @@ impl Occupancy {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         match entries.get_mut(id) {
-            Some(Entry::Cleanup | Entry::Create) => return Err(busy()),
+            Some(blocking @ (Entry::Cleanup | Entry::Create)) => {
+                return Err(busy(id, "acquire_use", blocking));
+            }
             Some(Entry::Use(count)) => *count += 1,
             None => {
                 entries.insert(id.to_string(), Entry::Use(1));
@@ -101,8 +115,8 @@ impl Occupancy {
             .entries
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if entries.contains_key(id) {
-            return Err(busy());
+        if let Some(blocking) = entries.get(id) {
+            return Err(busy(id, "acquire_creation", blocking));
         }
         entries.insert(id.to_string(), Entry::Create);
         Ok(Lease {
@@ -116,8 +130,8 @@ impl Occupancy {
             .entries
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if entries.contains_key(id) {
-            return Err(busy());
+        if let Some(blocking) = entries.get(id) {
+            return Err(busy(id, "acquire_cleanup", blocking));
         }
         entries.insert(id.to_string(), Entry::Cleanup);
         Ok(Lease {
@@ -130,6 +144,71 @@ impl Occupancy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn busy_admission_logs_blocker_and_use_count_without_changing_error() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut output = tempfile::tempfile().unwrap();
+        let writer = output.try_clone().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let occupancy = Occupancy::default();
+            for (id, leases) in [
+                (
+                    "workdir-used",
+                    vec![
+                        occupancy.acquire_use("workdir-used").unwrap(),
+                        occupancy.acquire_use("workdir-used").unwrap(),
+                    ],
+                ),
+                (
+                    "workdir-creating",
+                    vec![occupancy.acquire_creation("workdir-creating").unwrap()],
+                ),
+                (
+                    "workdir-removing",
+                    vec![occupancy.acquire_cleanup("workdir-removing").unwrap()],
+                ),
+            ] {
+                let error = occupancy.acquire_cleanup(id).unwrap_err();
+                assert_eq!(error.code, "working_directory_cleanup_resource_busy");
+                assert_eq!(
+                    error.message,
+                    "A filesystem resource is busy or changed during removal. Release the resource and retry."
+                );
+                drop(leases);
+                drop(occupancy.acquire_cleanup(id).unwrap());
+            }
+        });
+        output.seek(SeekFrom::Start(0)).unwrap();
+        let mut log = String::new();
+        output.read_to_string(&mut log).unwrap();
+        let events: Vec<_> = log.lines().collect();
+        assert_eq!(events.len(), 3, "{log}");
+        for (event, (id, reason, count)) in events.iter().zip([
+            ("workdir-used", "active_use", 2),
+            ("workdir-creating", "creation_in_progress", 0),
+            ("workdir-removing", "cleanup_in_progress", 0),
+        ]) {
+            for field in [
+                "WARN".to_string(),
+                "yoi::workdir_cleanup".to_string(),
+                format!("working_directory_id=\"{id}\""),
+                "action=\"acquire_cleanup\"".to_string(),
+                "busy_source=\"materializer_occupancy\"".to_string(),
+                format!("busy_reason=\"{reason}\""),
+                format!("active_use_count={count}"),
+            ] {
+                assert!(event.contains(&field), "missing {field}: {event}");
+            }
+        }
+    }
 
     #[test]
     fn use_and_cleanup_leases_release_during_unwind() {
