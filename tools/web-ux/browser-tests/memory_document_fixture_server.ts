@@ -43,6 +43,12 @@ const memoryPageCursor = "fixture-memory-page-2";
 const changePageCursor = "fixture-change-page-2";
 const createdSubjectIds = new Set<string>();
 const subjectCreateRequests: unknown[] = [];
+type SubjectCreateInput = { operation_id: string; role: string; behavior_md: string };
+const subjectCreateReceipts = new Map<
+  string,
+  { request: SubjectCreateInput; subject: ReturnType<typeof subject> }
+>();
+const subjectCreateOutcomes: { outcome: string; subject_id?: string }[] = [];
 let createdSubjectCount = 0;
 
 const paragraphs = Array.from(
@@ -390,12 +396,35 @@ async function staticResponse(pathname: string): Promise<Response> {
 Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const url = new URL(request.url);
   if (url.pathname === "/health") return new Response("ok");
+  // 合成HTTPの閲覧主体。実Backendの認証や権限付与の証拠にはしない。
+  if (url.pathname === "/api/auth/whoami") {
+    return json({
+      authentication_reference: "memory-review-fixture-authentication",
+      session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+      actor: {
+        user_id: "fixture-user",
+        account_id: "owner",
+        handle: "fixture",
+        display_name: "Synthetic Memory owner",
+        auth_method: "browser_session",
+      },
+    });
+  }
+  if (url.pathname === "/api/hosting/access") return json({ is_admin: false });
   if (permissionsMode) {
     const response = await permissionsFixture(request);
     if (response) return response;
   }
   if (url.pathname === "/fixture/subject-create-requests") {
     return json({ count: subjectCreateRequests.length, requests: subjectCreateRequests });
+  }
+  if (url.pathname === "/fixture/subject-create-evidence") {
+    return json({
+      authority: "synthetic-http-NOT-real-Backend",
+      requests: subjectCreateRequests,
+      outcomes: subjectCreateOutcomes,
+      created: subjects.filter((item) => createdSubjectIds.has(item.id)),
+    });
   }
   if (url.pathname === "/api/workspaces") {
     return json([{
@@ -488,22 +517,47 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   if (url.pathname === subjectsPath) {
     if (request.method === "POST") {
       const payload = await request.json().catch(() => null) as {
+        operation_id?: unknown;
         role?: unknown;
         behavior_md?: unknown;
       } | null;
       subjectCreateRequests.push(payload);
-      if (!payload || typeof payload.role !== "string" || payload.role.trim().length === 0) {
-        return json({ error: "Bad Request", message: "subject role must not be empty" }, 400);
+      const reject = (message: string, status = 400) => {
+        subjectCreateOutcomes.push({ outcome: `rejected-${status}` });
+        return json({ error: status === 409 ? "Conflict" : "Bad Request", message }, status);
+      };
+      if (
+        !payload || typeof payload.operation_id !== "string" ||
+        payload.operation_id.trim().length === 0
+      ) return reject("subject create operation_id is required");
+      if (typeof payload.role !== "string" || payload.role.trim().length === 0) {
+        return reject("subject role must not be empty");
       }
       if (payload.role === "Permission denied") {
+        subjectCreateOutcomes.push({ outcome: "rejected-403" });
         return json({ error: "Forbidden", message: "workspace permission denied" }, 403);
       }
       if (typeof payload.behavior_md !== "string") {
-        return json({ error: "Bad Request", message: "subject behavior must be a string" }, 400);
+        return reject("subject behavior must be a string");
+      }
+      const input: SubjectCreateInput = {
+        operation_id: payload.operation_id,
+        role: payload.role,
+        behavior_md: payload.behavior_md,
+      };
+      const receipt = subjectCreateReceipts.get(input.operation_id);
+      if (receipt) {
+        if (
+          receipt.request.role !== input.role || receipt.request.behavior_md !== input.behavior_md
+        ) return reject("operation_id already used with different input", 409);
+        subjectCreateOutcomes.push({ outcome: "replay", subject_id: receipt.subject.id });
+        return json(receipt.subject, 201);
       }
       createdSubjectCount += 1;
       const id = `created-subject-${String(createdSubjectCount).padStart(4, "0")}`;
-      const created = subject(id, payload.role, "active", "fingerprint-empty", payload.behavior_md);
+      const created = subject(id, input.role, "active", "fingerprint-empty", input.behavior_md);
+      subjectCreateReceipts.set(input.operation_id, { request: input, subject: created });
+      subjectCreateOutcomes.push({ outcome: "created", subject_id: id });
       createdSubjectIds.add(id);
       subjects.unshift(created);
       return json(created, 201);

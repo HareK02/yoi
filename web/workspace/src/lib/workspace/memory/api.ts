@@ -117,6 +117,18 @@ export class SubjektivSubjectCreateError extends Error {
 export function validateSubjektivSubjectCreateRequest(
   request: SubjektivSubjectCreateRequest,
 ): SubjektivSubjectCreateRequest {
+  if (
+    typeof request.operation_id !== "string" ||
+    request.operation_id.length === 0 ||
+    new TextEncoder().encode(request.operation_id).byteLength > 256 ||
+    request.operation_id.trim() !== request.operation_id ||
+    /[\p{Cc}*]/u.test(request.operation_id)
+  ) {
+    throw new SubjektivSubjectCreateError(
+      "validation",
+      "Subject operation_id must be nonempty, at most 256 bytes, and contain no surrounding whitespace, control characters, or '*'.",
+    );
+  }
   if (request.role.trim().length === 0) {
     throw new SubjektivSubjectCreateError(
       "validation",
@@ -135,7 +147,11 @@ export function validateSubjektivSubjectCreateRequest(
   }
   const behaviorMd = request.behavior_md ?? "";
   validateSubjectBehavior(behaviorMd);
-  return { role: request.role, behavior_md: behaviorMd };
+  return {
+    operation_id: request.operation_id,
+    role: request.role,
+    behavior_md: behaviorMd,
+  };
 }
 
 function validateSubjectBehavior(behaviorMd: string): void {
@@ -224,6 +240,12 @@ export async function deleteSubjektivSubject(
   }
 }
 
+/**
+ * 呼出元は意図した作成ごとにoperation_idを一度だけ採番し、結果不明なら
+ * 同じID・role・behavior_mdの要求全体を保持する。この関数は自動再試行しない。
+ * 厳密な再送は同じSubjectを返し、同じIDで入力を変えると409になる。
+ * 再送は権限の再付与や削除済みSubjectの復活ではない。
+ */
 export async function createSubjektivSubject(
   fetchFn: typeof fetch,
   workspaceId: string,
@@ -241,7 +263,7 @@ export async function createSubjektivSubject(
   } catch {
     throw new SubjektivSubjectCreateError(
       "unknown_outcome",
-      "The request outcome is unknown. A Subject may have been created.",
+      "The request outcome is unknown. A Subject may have been created. Retry only the same operation_id and full request.",
     );
   }
 
@@ -256,7 +278,7 @@ export async function createSubjektivSubject(
     }
     throw new SubjektivSubjectCreateError(
       "unknown_outcome",
-      "The request outcome is unknown. A Subject may have been created.",
+      "The request outcome is unknown. A Subject may have been created. Retry only the same operation_id and full request.",
       response.status,
     );
   }
@@ -275,7 +297,7 @@ export async function createSubjektivSubject(
   } catch {
     throw new SubjektivSubjectCreateError(
       "unknown_outcome",
-      "The Subject may have been created, but the response could not be confirmed.",
+      "The Subject may have been created, but the response could not be confirmed. Retry only the same operation_id and full request.",
     );
   }
 }

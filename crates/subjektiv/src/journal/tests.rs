@@ -429,12 +429,16 @@ mod input_delivery {
                 ))
                 .unwrap();
             let store = SubjektivStore::open(&scope, &registration).unwrap();
-            let subject = store
-                .create_subject_with_behavior(
-                    SubjectRole::new("preserved").unwrap(),
-                    "Existing behavior".into(),
-                )
-                .unwrap();
+            let subject = if baseline.last().unwrap().version() < 12 {
+                pre_permissions_subject_fixture(&store, "preserved", "Existing behavior")
+            } else {
+                store
+                    .create_subject_with_behavior(
+                        SubjectRole::new("preserved").unwrap(),
+                        "Existing behavior".into(),
+                    )
+                    .unwrap()
+            };
             drop(store);
             drop(scope);
             manager.shutdown().unwrap();
@@ -1590,6 +1594,42 @@ use feature_storage::{FeatureStorage, ScopedFeatureStorage};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Barrier};
 use std::thread;
+
+pub(super) fn pre_permissions_subject_fixture(
+    store: &SubjektivStore,
+    role: &str,
+    behavior: &str,
+) -> crate::SubjectRecord {
+    // Freeze the schema 7–11 row/record shape; today's create API also writes policy tables.
+    assert!((7..=11).contains(&store.database.schema_version().unwrap()));
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "id": "legacy-subject",
+        "role": role,
+        "behavior_md": behavior,
+        "state": "active",
+        "created_at": "2026-09-28T10:00:00.000Z",
+        "updated_at": "2026-09-28T10:00:00.000Z"
+    });
+    store
+        .database
+        .try_transaction::<_, crate::SubjektivError>(|tx| {
+            tx.execute(
+                "INSERT INTO subjects(subject_id,role,behavior_md,state,record_json,created_at,updated_at)
+                 VALUES(?1,?2,?3,'active',?4,?5,?5)",
+                rusqlite::params![
+                    "legacy-subject",
+                    role,
+                    behavior,
+                    record.to_string(),
+                    "2026-09-28T10:00:00.000Z",
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    serde_json::from_value(record).unwrap()
+}
 
 #[test]
 fn explicit_erasure_releases_only_after_all_body_sessions_including_unadmitted_history_are_erased()
@@ -3133,16 +3173,17 @@ impl Fixture {
             SubjektivStore::register(&workspace).unwrap()
         };
         let store = SubjektivStore::open(&workspace, &registration).unwrap();
-        let subject = store
-            .create_subject_with_behavior(
-                SubjectRole::new("companion").unwrap(),
-                if upgrade {
-                    "Preserve existing Subject behavior".into()
-                } else {
-                    String::new()
-                },
+        let subject = if upgrade {
+            pre_permissions_subject_fixture(
+                &store,
+                "companion",
+                "Preserve existing Subject behavior",
             )
-            .unwrap();
+        } else {
+            store
+                .create_subject(SubjectRole::new("companion").unwrap())
+                .unwrap()
+        };
         let attribution =
             SubjectSessionAttribution::new(&subject.id, "runtime", "worker", "source-session")
                 .unwrap();
@@ -5508,12 +5549,7 @@ fn journal_migration_failure_rolls_back_ddl_and_retries_without_changing_existin
             ))
             .unwrap();
         let store = SubjektivStore::open(&scope, &registration).unwrap();
-        let subject = store
-            .create_subject_with_behavior(
-                SubjectRole::new("preserved").unwrap(),
-                "Original behavior".into(),
-            )
-            .unwrap();
+        let subject = pre_permissions_subject_fixture(&store, "preserved", "Original behavior");
         store
             .database
             .try_transaction::<_, JournalError>(|tx| {

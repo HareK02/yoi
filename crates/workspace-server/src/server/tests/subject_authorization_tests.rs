@@ -143,7 +143,14 @@ impl Fixture {
                 &subject,
                 &SubjectPermissionsUpdate {
                     operation_id: "fixture-session-setup".into(),
-                    expected_change_id: None,
+                    expected_change_id: Some(
+                        open_subjektiv_store(&api)
+                            .unwrap()
+                            .subject_permissions(&subject)
+                            .unwrap()
+                            .unwrap()
+                            .change_id,
+                    ),
                     execution: vec![subject_permission(&subject, "session.record")],
                     delegation: vec![],
                 },
@@ -3085,7 +3092,7 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
     // not an unset body or a registry/singleton row manufactured by the test.
     let (status, body) = response(&api, human_request(&owner, "POST",
         &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
-        Some(json!({"operation_id":"connected-authorization-policy", "expected_change_id":null,
+        Some(json!({"operation_id":"connected-authorization-policy", "expected_change_id":subject_store.subject_permissions(&subject).unwrap().unwrap().change_id,
             "execution":(["session.record", "memory.resident.read", "memory.resident.supply", "journal.startup.read", "journal.startup.supply"].into_iter().map(|operation| subject_permission(&subject, operation)).collect::<Vec<_>>()),
             "delegation":child_permissions.clone()})))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -3543,7 +3550,7 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
             .human(
                 reqwest::Method::POST,
                 &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
-                json!({"operation_id":format!("parallel-{label}-policy"), "expected_change_id":null,
+                json!({"operation_id":format!("parallel-{label}-policy"), "expected_change_id":subjects.subject_permissions(&subject).unwrap().unwrap().change_id,
                 "execution":execution, "delegation":permissions}),
             )
             .await;

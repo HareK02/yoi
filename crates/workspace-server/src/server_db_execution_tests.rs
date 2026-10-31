@@ -178,7 +178,11 @@ impl Fixture {
         Self::request(
             "POST",
             SUBJECTS,
-            serde_json::json!({ "role": role, "behavior_md": "" }),
+            serde_json::json!({
+                "operation_id": format!("create-{role}"),
+                "role": role,
+                "behavior_md": ""
+            }),
         )
     }
 
@@ -1118,6 +1122,7 @@ async fn subjektiv_runtime_waits_leave_db_and_control_free_and_cancel_retains_th
                 workspace_id: WORKSPACE.into(),
             }),
             Json(server_api::SubjektivSubjectCreateRequest {
+                operation_id: format!("create-network-subject-{kind}"),
                 role: "network subject".into(),
                 behavior_md: String::new(),
             }),
@@ -1136,7 +1141,14 @@ async fn subjektiv_runtime_waits_leave_db_and_control_free_and_cancel_retains_th
                     &subject.id,
                     &server_api::authorization::SubjectPermissionsUpdate {
                         operation_id: format!("session-wait-grant-{kind}"),
-                        expected_change_id: None,
+                        expected_change_id: Some(
+                            open_subjektiv_store(&fixture.api)
+                                .unwrap()
+                                .subject_permissions(&subject.id)
+                                .unwrap()
+                                .unwrap()
+                                .change_id,
+                        ),
                         execution: vec![server_api::authorization::ScopedPermission {
                             operation: operation.into(),
                             resource: server_api::authorization::PermissionResource::Subject {
