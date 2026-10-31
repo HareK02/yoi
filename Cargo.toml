@@ -26,6 +26,7 @@ members = [
     "crates/lint-common",
     "crates/tools",
     "crates/fs-operation",
+    "crates/error-contract",
     "crates/flow",
     "crates/builtin-source",
     "crates/config-source",
@@ -68,6 +69,7 @@ default-members = [
     "crates/lint-common",
     "crates/tools",
     "crates/fs-operation",
+    "crates/error-contract",
     "crates/flow",
     "crates/builtin-source",
     "crates/config-source",
@@ -138,6 +140,7 @@ secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }
 builtin-source = { path = "crates/builtin-source" }
 config-source = { path = "crates/config-source" }
+error-contract = { path = "crates/error-contract" }
 fs-operation = { path = "crates/fs-operation" }
 workdir = { path = "crates/workdir" }
 tui = { path = "crates/tui" }
