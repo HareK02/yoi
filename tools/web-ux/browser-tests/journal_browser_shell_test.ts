@@ -19,8 +19,7 @@ const root = join(dirname(fromFileUrl(import.meta.url)), "../../..");
 const artifacts = join(root, "target/web-ux/t-737-browser-interactions");
 const subjectPath = `/w/${fixture.workspaceId}/subjektiv/${fixture.subjectId}`;
 const journalPath = `${subjectPath}/journal`;
-const memoryPath =
-  `${subjectPath}/memories/${fixture.memoryId}?change_id=change-current`;
+const memoryPath = `${subjectPath}/memories/${fixture.memoryId}?change_id=change-current`;
 const claim = "Keep subject Memory provenance typed and visible";
 const entryTitle = "Release milestone 00 · release [a+b] %_";
 const detailPath = `${journalPath}?journal=journal-release&entry=entry-00`;
@@ -87,9 +86,7 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
           requests.push({
             path,
             method: request.method(),
-            payload: request.method() === "POST"
-              ? request.postDataJSON()
-              : null,
+            payload: request.method() === "POST" ? request.postDataJSON() : null,
           });
         }
       });
@@ -169,18 +166,14 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
             fixture.literalQuery,
           );
           await page.getByRole("button", { name: "検索", exact: true }).click();
-          await page.waitForURL((url) =>
-            url.searchParams.get("q") === fixture.literalQuery
-          );
+          await page.waitForURL((url) => url.searchParams.get("q") === fixture.literalQuery);
           await page.getByRole("link", {
             name: new RegExp(entryTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
           }).waitFor();
           assertEquals(await page.locator(".entry-list > li").count(), 16);
           await page.getByRole("link", { name: "次のページ →", exact: true })
             .click();
-          await page.waitForURL((url) =>
-            url.searchParams.get("after") === "fixture-entries-2"
-          );
+          await page.waitForURL((url) => url.searchParams.get("after") === "fixture-entries-2");
           assertEquals(
             new URL(page.url()).searchParams.get("q"),
             fixture.literalQuery,
@@ -199,9 +192,7 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
             r.payload.query === fixture.literalQuery
           );
           assert(
-            searchRequests.some((r) =>
-              r.payload?.after === "fixture-entries-2"
-            ),
+            searchRequests.some((r) => r.payload?.after === "fixture-entries-2"),
           );
         },
       );
@@ -219,9 +210,7 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
             await page.setViewportSize(viewport);
             await page.emulateMedia({ colorScheme: viewport.theme });
             await page.goto(
-              `${base}${journalPath}?q=${
-                encodeURIComponent(fixture.literalQuery)
-              }`,
+              `${base}${journalPath}?q=${encodeURIComponent(fixture.literalQuery)}`,
             );
             const target = page.locator(".entry-list a").filter({
               hasText: "Release milestone 12",
@@ -288,7 +277,45 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
             await page.locator("[data-journal-view='detail']").waitFor();
             assertEquals(page.url(), detailUrl);
             await restoreTop(page, detailTop);
-            await page.goBack();
+            let listBlocked = false;
+            const releaseList = Promise.withResolvers<void>();
+            const continuedList = Promise.withResolvers<void>();
+            await page.route("**/journal-browser", async (route) => {
+              if (route.request().postDataJSON()?.action === "entries") {
+                listBlocked = true;
+                await releaseList.promise;
+                try {
+                  await route.continue();
+                } finally {
+                  continuedList.resolve();
+                }
+              } else {
+                await route.continue();
+              }
+            });
+            try {
+              const requested = page.waitForRequest((request) =>
+                request.url().endsWith("/journal-browser") &&
+                request.postDataJSON()?.action === "entries"
+              );
+              await page.goBack();
+              await requested;
+              await page.evaluate(() =>
+                new Promise<void>((resolve) => {
+                  const frame = (globalThis as any).requestAnimationFrame;
+                  frame(() => frame(() => resolve()));
+                })
+              );
+              assertEquals(
+                await page.locator("[data-journal-view]").count(),
+                0,
+                "a query-changing history restore must wait for its own Journal data",
+              );
+            } finally {
+              releaseList.resolve();
+              if (listBlocked) await continuedList.promise;
+              await page.unrouteAll({ behavior: "wait" });
+            }
             await page.getByRole("searchbox").waitFor();
             assertEquals(page.url(), listUrl);
             assertEquals(
@@ -391,9 +418,7 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
             .waitFor();
           assertEquals(await popup.locator(".related-list a").count(), 0);
           await popup.close();
-          const candidateRequests = requests.filter((r) =>
-            r.payload?.action === "memory_sources"
-          );
+          const candidateRequests = requests.filter((r) => r.payload?.action === "memory_sources");
           assert(candidateRequests.length > 0);
           for (const r of candidateRequests) {
             assertEquals(r.payload?.selector.candidate_id, fixture.candidateId);
@@ -538,8 +563,7 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
           for (
             const state of [
               {
-                path:
-                  `/w/${fixture.workspaceId}/subjektiv/empty-subject/journal?view=sessions`,
+                path: `/w/${fixture.workspaceId}/subjektiv/empty-subject/journal?view=sessions`,
                 text: "Journalはまだありません。",
                 role: "status" as const,
               },
@@ -620,9 +644,7 @@ Deno.test("Journal fixture UI keeps scoped navigation, bounded links and distinc
         [],
       );
       for (
-        const request of requests.filter((r) =>
-          r.path.endsWith("/journal-browser")
-        )
+        const request of requests.filter((r) => r.path.endsWith("/journal-browser"))
       ) {
         assertEquals(request.method, "POST");
         if (request.payload?.limit != null) {

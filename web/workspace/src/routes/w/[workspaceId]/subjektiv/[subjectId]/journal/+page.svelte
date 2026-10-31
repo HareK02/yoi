@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { page } from '$app/state';
   import DeferredPage from '#lib/workspace/navigation/DeferredPage.svelte';
   import ReadingPosition from '#lib/workspace/memory/ReadingPosition.svelte';
   import PageContent from './PageContent.svelte';
@@ -10,7 +11,7 @@
     restore: (saved: { top: number }) => { position = saved; },
   };
 </script>
-<DeferredPage {data} title="Journal">
+<DeferredPage {data} title="Journal" identity={`${page.url.pathname}${page.url.search}`}>
   {#snippet children(resolved)}
     <PageContent data={resolved} />
     <ReadingPosition {position} restored={() => { position = null; }} />
