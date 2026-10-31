@@ -103,6 +103,8 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "typed_ticket_labels",
     "typed_ticket_orchestration_plans",
     "typed_ticket_raw_frontmatter",
+    "typed_ticket_parent_operations",
+    "typed_ticket_parent_links",
     "typed_ticket_relations",
     "typed_ticket_risk_flags",
     "typed_ticket_targets",

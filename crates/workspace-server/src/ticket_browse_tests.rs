@@ -618,3 +618,93 @@ async fn ticket_browse_plain_page_sql_uses_recent_index_without_history_or_graph
         })
         .unwrap();
 }
+
+#[tokio::test]
+async fn parent_filters_match_browse_and_authoritative_queries_and_bind_cursor_scope() {
+    let f = Fixture::new().await;
+    let parent = f.ticket("Parent", Some("1"));
+    let other = f.ticket("Other", Some("1"));
+    let a = f.ticket("Child A", Some("1"));
+    let b = f.ticket("Child B", Some("1"));
+    for (child, key) in [(&a, "a"), (&b, "b")] {
+        f.backend
+            .set_ticket_parent(
+                child.clone().into(),
+                ticket::TicketParentSetRequest {
+                    expected: Default::default(),
+                    parent: Some(parent.clone()),
+                    operation_key: key.into(),
+                },
+            )
+            .unwrap();
+    }
+    let key = f
+        .backend
+        .show(parent.clone().into())
+        .unwrap()
+        .meta
+        .resource_key
+        .unwrap();
+    let parent_filter = Some(ticket::TicketParentFilter::Parent { ticket: key });
+    let page = f.run(TicketBrowseQueryRequest {
+        parent: parent_filter.clone(),
+        limit: Some(1),
+        ..Default::default()
+    });
+    assert_eq!(page.items.len(), 1);
+    assert!(page.page.has_more);
+    let mismatch = TicketBrowseQueryRequest {
+        parent: Some(ticket::TicketParentFilter::Parent {
+            ticket: other.clone(),
+        }),
+        cursor: page.page.next_cursor.clone(),
+        limit: Some(1),
+        ..Default::default()
+    };
+    assert!(f.authority.query_ticket_browse(mismatch).is_err());
+    let mut expected = vec![a.clone(), b.clone()];
+    expected.sort();
+    let mut browse = ids(&f.run(TicketBrowseQueryRequest {
+        parent: parent_filter.clone(),
+        ..Default::default()
+    }));
+    browse.sort();
+    assert_eq!(browse, expected);
+    let authoritative = f
+        .authority
+        .query_tickets(server_api::TicketQueryRequest {
+            parent: parent_filter,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut actual: Vec<_> = authoritative
+        .items
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    actual.sort();
+    assert_eq!(actual, expected);
+    let observed = f
+        .backend
+        .get_ticket_parent(a.clone().into())
+        .unwrap()
+        .observation;
+    f.backend
+        .set_ticket_parent(
+            a.clone().into(),
+            ticket::TicketParentSetRequest {
+                expected: observed,
+                parent: None,
+                operation_key: "unlink".into(),
+            },
+        )
+        .unwrap();
+    let mut roots = ids(&f.run(TicketBrowseQueryRequest {
+        parent: Some(ticket::TicketParentFilter::None),
+        ..Default::default()
+    }));
+    roots.sort();
+    let mut expected_roots = vec![parent, other, a];
+    expected_roots.sort();
+    assert_eq!(roots, expected_roots);
+}

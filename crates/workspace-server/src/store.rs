@@ -129,7 +129,7 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 112;
+const LATEST_SCHEMA_VERSION: i64 = 113;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -496,6 +496,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 112,
         name: "Ticket Service outbox and fenced consumers",
         apply: migrate_plugin_services_v111_to_v112,
+    },
+    Migration {
+        version: 113,
+        name: "Ticket work-decomposition parent links",
+        apply: migrate_ticket_parents_v112_to_v113,
     },
 ];
 
@@ -15931,10 +15936,31 @@ fn migrate_plugin_services_v111_to_v112(conn: &Connection) -> Result<()> {
     }
     verify_schema_history(conn, 111)?;
     let tx = conn.unchecked_transaction()?;
-    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
-        .map_err(|e| Error::Store(format!("Ticket outbox migration failed: {e}")))?;
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &tx,
+        ticket::HistoricalTicketSchemaTarget::Outbox15,
+    )
+    .map_err(|e| Error::Store(format!("Ticket outbox migration failed: {e}")))?;
     tx.execute_batch(crate::plugin_service::SCHEMA_SQL)?;
     tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES(112,'Ticket Service outbox and fenced consumers')",[])?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_ticket_parents_v112_to_v113(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 112 {
+        return Err(Error::Store(
+            "Ticket parent migration requires schema 112".into(),
+        ));
+    }
+    verify_schema_history(conn, 112)?;
+    let tx = conn.unchecked_transaction()?;
+    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
+        .map_err(|e| Error::Store(format!("Ticket parent migration failed: {e}")))?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(113,?1)",
+        ["Ticket work-decomposition parent links"],
+    )?;
     tx.commit()?;
     Ok(())
 }

@@ -92,6 +92,20 @@ impl BackendWorkspaceProductClient {
             .map_err(|error| crate::backend_workspace::server_client_error(&self.api, error))
     }
 
+    pub fn read_ticket_link_summary(
+        &self,
+        reference: &str,
+    ) -> Result<ticket::TicketLinkSummary, BackendWorkspaceClientError> {
+        let workspace_id = self.workspace_id.clone();
+        let reference = reference.to_owned();
+        self.generated(move |client| async move {
+            client
+                .ticket_link_summary_get(workspace_id, reference)
+                .await
+                .map(|response| response.0)
+        })
+    }
+
     pub fn list_workspace_tags(
         &self,
         request: &ticket::TagListRequest,
@@ -602,6 +616,47 @@ impl BackendWorkspaceProductClient {
 }
 
 impl TicketBackend for BackendWorkspaceProductClient {
+    fn get_ticket_parent(&self, id: TicketIdOrSlug) -> ticket::Result<ticket::TicketParentLink> {
+        let workspace_id = self.workspace_id.clone();
+        let id = ticket_reference(&id);
+        self.generated(move |client| async move {
+            client
+                .ticket_parent_get(workspace_id, id)
+                .await
+                .map(|response| response.0)
+        })
+        .map_err(ticket_client_error)
+    }
+    fn set_ticket_parent(
+        &self,
+        id: TicketIdOrSlug,
+        request: ticket::TicketParentSetRequest,
+    ) -> ticket::Result<ticket::TicketParentLink> {
+        let workspace_id = self.workspace_id.clone();
+        let id = ticket_reference(&id);
+        self.generated(move |client| async move {
+            client
+                .ticket_parent_set(workspace_id, id, server_api::TicketParentRequest(request))
+                .await
+                .map(|response| response.0)
+        })
+        .map_err(ticket_client_error)
+    }
+    fn query_ticket_children(
+        &self,
+        id: TicketIdOrSlug,
+        request: ticket::TicketChildrenRequest,
+    ) -> ticket::Result<ticket::TicketChildrenPage> {
+        let workspace_id = self.workspace_id.clone();
+        let id = ticket_reference(&id);
+        self.generated(move |client| async move {
+            client
+                .ticket_children_query(workspace_id, id, server_api::TicketChildrenQuery(request))
+                .await
+                .map(|response| response.0)
+        })
+        .map_err(ticket_client_error)
+    }
     fn edit_post_with_snapshots(
         &self,
         id: TicketIdOrSlug,

@@ -162,10 +162,18 @@ async fn classification_reads_forward_id_filters_and_preserve_tag_observations()
             assert_eq!(body[field], input[field]);
         }
     }
-    let detail = json!({"resource_key":"T-740", "content_digest":"content-1", "title":"Classify", "body":"Body", "body_truncated":false, "targets":[], "initial_post":{"sequence":0,"event_ref":"initial","is_initial":true,"kind":"comment","body":"Body","body_truncated":false,"body_digest":"a".repeat(64),"editable":true,"author":null,"at":null,"edited_at":null,"edited_by":null}, "state":"open", "closure_operation_key":null, "current_closure":null, "legacy_handoff":null, "closure_history":[], "assignment_tracking":[], "tags":[tag()], "events":[], "linked_objectives":[], "assignments":[], "implementation_reports":[], "merge_requests":[]});
+    let mut detail = super::super::tests::target_detail_fixture(json!([]));
+    detail["resource_key"] = json!("T-740");
+    detail["content_digest"] = json!("content-1");
+    detail["tags"] = json!([tag()]);
+    detail["parent_link"]["ticket_id"] = json!("T-740");
     let client = recording(
         detail,
-        [expected_authorization("ticket.read", Some("T-740"))],
+        [
+            expected_authorization("ticket.read", Some("T-740")),
+            expected_authorization("ticket.relation.read", Some("T-740")),
+            expected_authorization("ticket.relation.read", Some("T-740")),
+        ],
     );
     let (_, tool) =
         workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Show)();

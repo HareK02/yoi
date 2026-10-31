@@ -496,6 +496,11 @@ impl_openapi_schema!(
     WorkspaceTicketTagListRequest,
     WorkspaceTicketTagMutationRequest,
     TicketTagsSetRequest,
+    TicketLinkSummaryResponse,
+    TicketParentRequest,
+    TicketParentResponse,
+    TicketChildrenQuery,
+    TicketChildrenResponse,
     WorkspaceTicketTagList,
     WorkspaceTicketTag,
     RuntimeManagementApiError,
@@ -3516,6 +3521,40 @@ pub trait ServerApi {
         #[body] request: TicketTagsSetRequest,
     ) -> Result<WorkspaceTicketTagList, RepositoryApiError>;
 
+    #[get("/api/w/{workspace_id}/tickets/{id}/link-summary", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_link_summary_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<TicketLinkSummaryResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{id}/parent", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_parent_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<TicketParentResponse, RepositoryApiError>;
+
+    #[put("/api/w/{workspace_id}/tickets/{id}/parent", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_parent_set(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketParentRequest,
+    ) -> Result<TicketParentResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{id}/children", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_children_query(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[query] request: TicketChildrenQuery,
+    ) -> Result<TicketChildrenResponse, RepositoryApiError>;
+
     /// Lightweight browser list; deliberately excludes live MR evidence and external observations.
     #[post("/api/w/{workspace_id}/tickets/browse", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_browse(
@@ -3533,6 +3572,7 @@ pub trait ServerApi {
     #[get("/api/tickets/{id}", status = 200, error_status = 404, additional_error_statuses = [400, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_get_alias(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] id: String,
     ) -> Result<TicketDetail, RepositoryApiError>;
     #[post("/api/w/{workspace_id}/tickets/default-intake-ready-body", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
@@ -3868,6 +3908,7 @@ pub trait ServerApi {
     #[get("/api/w/{workspace_id}/tickets/{id}", status = 200, error_status = 404, additional_error_statuses = [400, 401, 403, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_get(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
     ) -> Result<TicketDetail, RepositoryApiError>;
@@ -3901,6 +3942,7 @@ pub trait ServerApi {
     #[post("/api/w/{workspace_id}/tickets/{id}/show", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_show(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: TicketShowRequest,
@@ -3936,6 +3978,7 @@ pub trait ServerApi {
     #[post("/api/w/{workspace_id}/tickets/{id}/implementation-cancellations", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_implementation_cancel(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: CancelTicketImplementationRequest,
@@ -8315,6 +8358,8 @@ pub struct TicketRoleAssignmentSummary {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketActionEligibility {
+    /// Request-bound browser owner eligibility; never a grant for a later mutation.
+    pub can_set_parent: bool,
     pub can_assign_orchestrator: bool,
     pub can_unassign_orchestrator: bool,
     pub can_queue: bool,
@@ -8430,6 +8475,9 @@ impl TicketAttention {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketQueryRequest {
+    /// Work-decomposition filter; absent means all Tickets, none means no direct parent.
+    #[cfg_attr(feature = "typescript", ts(type = "TicketParentFilter | null"))]
+    pub parent: Option<ticket::TicketParentFilter>,
     /// Exact reason of the current closed-case judgment; reopened/history-only reasons do not match.
     #[cfg_attr(feature = "typescript", ts(type = "TicketClosureReason | null"))]
     pub closure_reason: Option<ticket::TicketClosureReason>,
@@ -8552,6 +8600,8 @@ pub struct TicketShowRequest {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketDetail {
+    #[cfg_attr(feature = "typescript", ts(type = "TicketParentLink"))]
+    pub parent_link: ticket::TicketParentLink,
     pub created_by: Option<String>,
     pub initial_post: TicketEventDetail,
     pub id: String,
@@ -8803,6 +8853,11 @@ transparent_ticket_dto!(
     ticket::WorkspaceTagMutation
 );
 transparent_ticket_dto!(TicketTagsSetRequest, ticket::TicketTagSetRequest);
+transparent_ticket_dto!(TicketLinkSummaryResponse, ticket::TicketLinkSummary);
+transparent_ticket_dto!(TicketParentRequest, ticket::TicketParentSetRequest);
+transparent_ticket_dto!(TicketParentResponse, ticket::TicketParentLink);
+transparent_ticket_dto!(TicketChildrenQuery, ticket::TicketChildrenRequest);
+transparent_ticket_dto!(TicketChildrenResponse, ticket::TicketChildrenPage);
 transparent_ticket_dto!(WorkspaceTicketTagList, Vec<ticket::WorkspaceTag>);
 transparent_ticket_dto!(WorkspaceTicketTag, ticket::WorkspaceTag);
 transparent_ticket_dto!(TicketRecordRef, ticket::TicketRef);
@@ -12352,6 +12407,56 @@ mod tests {
                 "{state}"
             );
         }
+    }
+
+    #[test]
+    fn parent_routes_require_explicit_observation_and_use_typed_bounded_contracts() {
+        for (name, method, path) in [
+            (
+                "ticket_parent_get",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/tickets/{id}/parent",
+            ),
+            (
+                "ticket_parent_set",
+                HttpMethod::Put,
+                "/api/w/{workspace_id}/tickets/{id}/parent",
+            ),
+            (
+                "ticket_children_query",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/tickets/{id}/children",
+            ),
+        ] {
+            let operation = ServerApiMetadata::OPERATIONS
+                .iter()
+                .find(|operation| operation.operation_id == name)
+                .unwrap();
+            assert_eq!(operation.method, method);
+            assert_eq!(operation.path, path);
+        }
+        let wire = serde_json::json!({"expected":{"parent_ticket_id":null,"last_operation_key":null},"parent":null,"operation_key":"unlink"});
+        assert!(serde_json::from_value::<TicketParentRequest>(wire.clone()).is_ok());
+        for field in ["parent_ticket_id", "last_operation_key"] {
+            let mut missing = wire.clone();
+            missing["expected"].as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<TicketParentRequest>(missing).is_err());
+        }
+        let mut missing = wire;
+        missing.as_object_mut().unwrap().remove("parent");
+        assert!(serde_json::from_value::<TicketParentRequest>(missing).is_err());
+        assert!(
+            serde_json::from_value::<TicketQueryRequest>(
+                serde_json::json!({"parent":{"kind":"none"}})
+            )
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<TicketQueryRequest>(
+                serde_json::json!({"parent":{"kind":"none","ticket":"T-1"}})
+            )
+            .is_err()
+        );
     }
 
     #[test]

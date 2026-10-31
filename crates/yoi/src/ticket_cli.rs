@@ -1381,6 +1381,23 @@ mod tests {
     }
 
     impl TicketBackend for FakeBackend {
+        fn get_ticket_parent(&self, _: TicketIdOrSlug) -> ticket::Result<ticket::TicketParentLink> {
+            unreachable!("not used by CLI case fixture")
+        }
+        fn set_ticket_parent(
+            &self,
+            _: TicketIdOrSlug,
+            _: ticket::TicketParentSetRequest,
+        ) -> ticket::Result<ticket::TicketParentLink> {
+            unreachable!("not used by CLI case fixture")
+        }
+        fn query_ticket_children(
+            &self,
+            _: TicketIdOrSlug,
+            _: ticket::TicketChildrenRequest,
+        ) -> ticket::Result<ticket::TicketChildrenPage> {
+            unreachable!("not used by CLI case fixture")
+        }
         fn list(&self, filter: TicketListQuery) -> ticket::Result<Vec<TicketSummary>> {
             self.list_filter.replace(Some(filter));
             Ok(vec![])

@@ -219,6 +219,10 @@ pub(super) fn contract(op: &str) -> Contract {
                         ),
                         rename("related", "related_ticket_id", false, ticket_ref()),
                         p("relation_kind", false, relation()),
+                        p("parent", false, union("kind", vec![
+                            case("none", None),
+                            case("parent", Some(record(vec![p("ticket", true, ticket_ref())]))),
+                        ])),
                         p("tag_ids", false, strings()),
                         p("tag_ids_any", false, strings()),
                         p("tag_ids_none", false, strings()),
@@ -266,9 +270,26 @@ pub(super) fn contract(op: &str) -> Contract {
                 p("targets", false, list(target())),
             ],
         ),
+        "parent_set" => (
+            "parent_set",
+            parent_links::description("TicketParentSet"),
+            vec![
+                p("expected", true, record(vec![
+                    p("parent_ticket_id", true, nullable(Shape::String)),
+                    p("last_operation_key", true, nullable(Shape::String)),
+                ])),
+                p("parent", true, nullable(ticket_ref())),
+                p("operation_key", true, Shape::String),
+            ],
+        ),
+        "children_query" => (
+            "children_query",
+            parent_links::description("TicketChildrenQuery"),
+            vec![page("cursor", "limit")],
+        ),
         "read" => (
             "read",
-            "Read this route-bound Ticket and a bounded thread page. Omit page for Backend defaults.",
+            "Read this route-bound Ticket, its parent_link CAS observation and a bounded thread page. Use children_query for bounded direct children. Parent decomposition grants neither inherited authority nor state/assignment changes. Omit page for Backend defaults.",
             vec![page("event_cursor", "event_limit")],
         ),
         "edit" => (

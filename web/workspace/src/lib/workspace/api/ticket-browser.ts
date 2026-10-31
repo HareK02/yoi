@@ -40,6 +40,9 @@ import type {
   TicketLegacyWorkflowSnapshot,
   TicketListItemSummary,
   TicketListResponse,
+  TicketLinkSummary,
+  TicketParentLink,
+  TicketChildrenPage,
   TicketMergeRequestSummary,
   TicketBrowseQueryItem,
   TicketBrowseQueryResponse,
@@ -223,6 +226,63 @@ function parseClosureReason(
   const item = object(value, label);
   exact(item, ["other"], label);
   return { other: string(item.other, `${label}.other`) };
+}
+
+export function parseTicketLinkSummary(
+  value: unknown,
+  label = "Ticket link summary",
+): TicketLinkSummary {
+  const item = object(value, label);
+  exact(item, ["id", "resource_key", "title", "state", "closure_reason"], label);
+  return {
+    id: string(item.id, `${label}.id`),
+    resource_key: string(item.resource_key, `${label}.resource_key`),
+    title: string(item.title, `${label}.title`),
+    state: parseTicketState(item.state, `${label}.state`),
+    closure_reason: item.closure_reason === null
+      ? null
+      : parseClosureReason(item.closure_reason, `${label}.closure_reason`),
+  };
+}
+
+export function parseTicketParentLink(
+  value: unknown,
+  label = "Ticket parent link",
+): TicketParentLink {
+  const item = object(value, label);
+  exact(item, ["ticket_id", "observation", "parent"], label);
+  const observation = object(item.observation, `${label}.observation`);
+  exact(observation, ["parent_ticket_id", "last_operation_key"], `${label}.observation`);
+  const result: TicketParentLink = {
+    ticket_id: string(item.ticket_id, `${label}.ticket_id`),
+    observation: {
+      parent_ticket_id: nullableString(observation.parent_ticket_id, `${label}.observation.parent_ticket_id`),
+      last_operation_key: nullableString(observation.last_operation_key, `${label}.observation.last_operation_key`),
+    },
+    parent: item.parent === null ? null : parseTicketLinkSummary(item.parent, `${label}.parent`),
+  };
+  if (result.parent !== null && result.parent.id !== result.observation.parent_ticket_id) {
+    throw new TicketBrowserContractError(`${label}.parent does not match observation`);
+  }
+  return result;
+}
+
+export function parseTicketChildrenPage(value: unknown): TicketChildrenPage {
+  const label = "Ticket children page";
+  const item = object(value, label);
+  exact(item, ["parent_ticket_id", "items", "next_cursor", "has_more"], label);
+  const items = array(item.items, `${label}.items`, parseTicketLinkSummary);
+  if (items.length > 100) throw new TicketBrowserContractError(`${label} exceeds its page limit`);
+  const result: TicketChildrenPage = {
+    parent_ticket_id: string(item.parent_ticket_id, `${label}.parent_ticket_id`),
+    items,
+    next_cursor: nullableString(item.next_cursor, `${label}.next_cursor`),
+    has_more: boolean(item.has_more, `${label}.has_more`),
+  };
+  if (result.has_more !== (result.next_cursor !== null && result.next_cursor.length > 0)) {
+    throw new TicketBrowserContractError(`${label} has inconsistent pagination`);
+  }
+  return result;
 }
 
 function parseCaseAction(value: unknown, label: string): TicketCaseAction {
@@ -812,6 +872,7 @@ function parseActionEligibility(
     "blockers",
     "can_assign_orchestrator",
     "can_queue",
+    "can_set_parent",
     "can_start_manual_worker",
     "can_unassign_orchestrator",
     "queue_tickets",
@@ -823,6 +884,7 @@ function parseActionEligibility(
       `${label}.can_assign_orchestrator`,
     ),
     can_queue: boolean(item.can_queue, `${label}.can_queue`),
+    can_set_parent: boolean(item.can_set_parent, `${label}.can_set_parent`),
     can_start_manual_worker: boolean(
       item.can_start_manual_worker,
       `${label}.can_start_manual_worker`,
@@ -1135,6 +1197,7 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "implementation_reports",
     "content_digest",
     "linked_objectives",
+    "parent_link",
     "merge_request",
     "merge_requests",
     "priority",
@@ -1152,6 +1215,10 @@ export function parseTicketDetail(value: unknown): TicketDetail {
     "title",
     "updated_at",
   ], label);
+  const parentLink = parseTicketParentLink(item.parent_link, `${label}.parent_link`);
+  if (parentLink.ticket_id !== item.id) {
+    throw new TicketBrowserContractError(`${label}.parent_link has the wrong Ticket identity`);
+  }
   return {
     ...caseProjection(item, label),
     closure_history: array(
@@ -1203,6 +1270,7 @@ export function parseTicketDetail(value: unknown): TicketDetail {
       parseTicketEvidenceEvent,
     ),
     content_digest: string(item.content_digest, `${label}.content_digest`),
+    parent_link: parentLink,
     linked_objectives: array(
       item.linked_objectives,
       `${label}.linked_objectives`,

@@ -253,6 +253,23 @@ impl From<crate::SqliteTicketBackend> for TicketToolBackend {
 }
 
 impl TicketBackend for TicketToolBackend {
+    fn get_ticket_parent(&self, id: TicketIdOrSlug) -> TicketResult<crate::TicketParentLink> {
+        self.backend.get_ticket_parent(id)
+    }
+    fn set_ticket_parent(
+        &self,
+        id: TicketIdOrSlug,
+        request: crate::TicketParentSetRequest,
+    ) -> TicketResult<crate::TicketParentLink> {
+        self.backend.set_ticket_parent(id, request)
+    }
+    fn query_ticket_children(
+        &self,
+        id: TicketIdOrSlug,
+        request: crate::TicketChildrenRequest,
+    ) -> TicketResult<crate::TicketChildrenPage> {
+        self.backend.query_ticket_children(id, request)
+    }
     fn edit_post_with_snapshots(
         &self,
         id: TicketIdOrSlug,

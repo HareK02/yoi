@@ -44,6 +44,7 @@ mod assignment_public;
 mod assignment_tracking;
 mod native;
 mod notification_diagnostics;
+mod parent_links;
 mod results;
 mod tags;
 
@@ -106,10 +107,10 @@ impl WorkspaceTicketReadKind {
     fn description(self) -> &'static str {
         match self {
             Self::Query => {
-                "Query authoritative Workspace Tickets with bounded typed filters, stable snippets, evidence summaries, and cursor metadata."
+                "Query authoritative Workspace Tickets with bounded typed filters (including direct parent or parentless roots), stable snippets, evidence summaries, and cursor metadata. Parent decomposition does not imply state, assignment, dependency or inherited authority."
             }
             Self::Show => {
-                "Show one authoritative Workspace Ticket with its ordered implementation targets (repository_key, ref_selector, access), content digest, paged thread, links, historical implementation reports, and current Merge Request readiness evidence. Read targets here before choosing a work repository; a null selector remains unspecified, not an inferred default."
+                "Show one authoritative Workspace Ticket with its ordered implementation targets (repository_key, ref_selector, access), content digest, parent_link including its exact nullable CAS observation, paged thread, links, historical implementation reports, and current Merge Request readiness evidence. Read targets here before choosing a work repository; a null selector remains unspecified, not an inferred default. Read direct children with TicketChildrenQuery. Reread parent_link before a new parent mutation; replay receipts are historical, not fresh observations. Parent links grant neither state/assignment changes nor inherited authority."
             }
         }
     }
@@ -207,6 +208,8 @@ struct WorkspaceQueryTicketInput {
     /// Related Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     related_ticket_id: Option<String>,
     relation_kind: Option<WorkspaceTicketRelationFilter>,
+    /// Work decomposition: no filter when omitted; kind none selects roots, parent selects direct children.
+    parent: Option<ticket::TicketParentFilter>,
     /// All stable tag IDs must be attached (AND); at most 100 unique IDs.
     #[serde(default)]
     #[schemars(length(max = 100))]
@@ -292,6 +295,13 @@ impl WorkspaceTicketReadTool {
         })?;
         let (path, body, target) = match command {
             WorkspaceTicketReadCommand::Query(input) => {
+                if let Some(ticket::TicketParentFilter::Parent { ticket }) = &input.parent {
+                    authorize_ticket_item(
+                        self.client.as_ref(),
+                        "ticket.relation.query",
+                        &TicketIdOrSlug::from(ticket.as_str()),
+                    ).map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                }
                 for (name, ids) in [
                     ("tag_ids", &input.tag_ids),
                     ("tag_ids_any", &input.tag_ids_any),
@@ -324,7 +334,11 @@ impl WorkspaceTicketReadTool {
             }
         };
         match target {
-            Some(id) => authorize_ticket_item(self.client.as_ref(), "ticket.read", &id),
+            Some(id) => {
+                authorize_ticket_item(self.client.as_ref(), "ticket.read", &id)
+                    .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+                authorize_ticket_item(self.client.as_ref(), "ticket.relation.read", &id)
+            },
             None => authorize_ticket_operation(self.client.as_ref(), "ticket.query"),
         }
         .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
@@ -352,9 +366,9 @@ impl WorkspaceTicketReadTool {
             WorkspaceTicketReadKind::Query => serde_json::to_value(
                 &project_ticket_query(response_value).map_err(ToolError::ExecutionFailed)?,
             ),
-            WorkspaceTicketReadKind::Show => serde_json::to_value(
-                &project_ticket_detail(response_value).map_err(ToolError::ExecutionFailed)?,
-            ),
+            WorkspaceTicketReadKind::Show => {
+                return parent_links::project_detail(self.client.as_ref(), response_value);
+            }
         }
         .map_err(|error| ToolError::Internal(error.to_string()))
     }
@@ -547,6 +561,7 @@ fn workspace_ticket_tool_description(name: &str) -> String {
             assignment_tracking::description(name).into()
         }
         name if tags::TAG_TOOL_NAMES.contains(&name) => tags::description(name).into(),
+        name if parent_links::TOOL_NAMES.contains(&name) => parent_links::description(name).into(),
         _ => ticket_tool_description(name, None),
     }
 }
@@ -698,6 +713,9 @@ impl TicketFeatureAccess {
                     }),
             )
             .chain(std::iter::once(notification_diagnostics::NAME))
+            .chain(parent_links::TOOL_NAMES.iter().copied().filter(|name| {
+                *name == "TicketChildrenQuery" || self.authoring || self.workflow
+            }))
             .collect()
     }
 
@@ -723,6 +741,7 @@ const READ_ONLY_TOOL_NAMES: &[&str] = &[
     "TicketAssignmentDiagnostics",
     "TicketImplementationResultQuery",
     "NotificationDiagnostics",
+    "TicketChildrenQuery",
 ];
 
 const AUTHORING_TOOL_NAMES: &[&str] = &[
@@ -762,6 +781,8 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketImplementationResult",
     "TicketImplementationResultQuery",
     "NotificationDiagnostics",
+    "TicketParentSet",
+    "TicketChildrenQuery",
 ];
 
 #[cfg(test)]
@@ -791,6 +812,8 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "TicketImplementationResult",
     "TicketImplementationResultQuery",
     "NotificationDiagnostics",
+    "TicketParentSet",
+    "TicketChildrenQuery",
 ];
 
 const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
@@ -1117,6 +1140,44 @@ impl WorkspaceHttpTicketBackend {
     ) -> TicketResult<TicketBackendOperationResult> {
         let base = format!("/api/w/{workspace_id}/tickets");
         match operation {
+            TicketBackendOperation::ParentLink { id } => {
+                authorize_ticket_item(client.as_ref(), "ticket.relation.read", &id)?;
+                let link: ticket::TicketParentLink = Self::request_unprojected(
+                    client.clone(), WorkspaceRequestMethod::Get,
+                    format!("{base}/{}/parent", Self::ticket_path(&id)), None,
+                )?;
+                parent_links::authorize_link(client.as_ref(), &link)?;
+                Ok(TicketBackendOperationResult::ParentLink(link))
+            }
+            TicketBackendOperation::SetParentLink { id, request } => {
+                parent_links::validate_set(&request)?;
+                parent_links::authorize_set(client.clone(), &base, &id, &request)?;
+                let link: ticket::TicketParentLink = Self::request_unprojected(
+                    client, WorkspaceRequestMethod::Put,
+                    format!("{base}/{}/parent", Self::ticket_path(&id)), Some(json!(request)),
+                )?;
+                // Return the exact typed receipt, not a follow-up observation; CAS IDs stay intact.
+                Ok(TicketBackendOperationResult::ParentLink(link))
+            }
+            TicketBackendOperation::ChildrenPage { id, request } => {
+                let endpoint = parent_links::children_endpoint(&base, &id, &request)?;
+                authorize_ticket_item(client.as_ref(), "ticket.relation.read", &id)?;
+                let page: ticket::TicketChildrenPage = Self::request_unprojected(
+                    client.clone(), WorkspaceRequestMethod::Get, endpoint, None,
+                )?;
+                if page.items.len() > request.limit.unwrap_or(50) {
+                    return Err(TicketError::Conflict("Ticket children response exceeds requested bound".into()));
+                }
+                authorize_ticket_item(
+                    client.as_ref(),
+                    "ticket.relation.read",
+                    &TicketIdOrSlug::from(page.parent_ticket_id.as_str()),
+                )?;
+                for child in &page.items {
+                    authorize_ticket_item(client.as_ref(), "ticket.relation.read", &TicketIdOrSlug::from(child.id.as_str()))?;
+                }
+                Ok(TicketBackendOperationResult::ChildrenPage(page))
+            }
             TicketBackendOperation::ListWorkspaceTags { request } => {
                 authorize_ticket_operation(client.as_ref(), "ticket.tag.list")?;
                 let mut endpoint = format!(
@@ -1475,6 +1536,18 @@ macro_rules! expect_ticket_result {
 }
 
 impl TicketBackend for WorkspaceHttpTicketBackend {
+    fn get_ticket_parent(&self, id: TicketIdOrSlug) -> TicketResult<ticket::TicketParentLink> {
+        expect_ticket_result!(self.invoke(TicketBackendOperation::ParentLink { id }), TicketBackendOperationResult::ParentLink)
+    }
+
+    fn set_ticket_parent(&self, id: TicketIdOrSlug, request: ticket::TicketParentSetRequest) -> TicketResult<ticket::TicketParentLink> {
+        expect_ticket_result!(self.invoke(TicketBackendOperation::SetParentLink { id, request }), TicketBackendOperationResult::ParentLink)
+    }
+
+    fn query_ticket_children(&self, id: TicketIdOrSlug, request: ticket::TicketChildrenRequest) -> TicketResult<ticket::TicketChildrenPage> {
+        expect_ticket_result!(self.invoke(TicketBackendOperation::ChildrenPage { id, request }), TicketBackendOperationResult::ChildrenPage)
+    }
+
     fn edit_post_with_snapshots(
         &self,
         id: TicketIdOrSlug,
@@ -1720,6 +1793,18 @@ struct NativeTicketOperation {
 
 fn native_ticket_operation(tool_name: &str) -> Option<NativeTicketOperation> {
     let operation = match tool_name {
+        "TicketParentSet" => NativeTicketOperation {
+            operation: "parent_set",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: true,
+        },
+        "TicketChildrenQuery" => NativeTicketOperation {
+            operation: "children_query",
+            surface: NativeTicketSurface::Item,
+            identity_field: Some("ticket"),
+            mutating: false,
+        },
         "WorkspaceTagList" => NativeTicketOperation {
             operation: "tag_list",
             surface: NativeTicketSurface::Collection,
@@ -1963,6 +2048,11 @@ pub(crate) fn enabled_ticket_definitions(
     }
     if allowed.contains(&notification_diagnostics::NAME) {
         definitions.push(notification_diagnostics::definition(client.clone()));
+    }
+    for kind in [parent_links::ParentToolKind::Set, parent_links::ParentToolKind::Children] {
+        if allowed.contains(&kind.name()) {
+            definitions.push(parent_links::definition(client.clone(), kind));
+        }
     }
     definitions
 }
@@ -2226,8 +2316,15 @@ impl WipOperationHandler for TicketItemWipHandler {
         )?;
         let result_namespaces = context.result_namespaces.clone();
         let response = execute_native_ticket_tool(tool, &self.permissions, input, context).await?;
-        // Classification has its own membership CAS and never changes item content.
-        if operation != "tags_set" {
+        if operation == "parent_set" {
+            // Old-parent CAS IDs may not have a locally observed canonical alias. A receipt
+            // is not a fresh representation; conservatively invalidate rather than leave a
+            // previously read parent/children view attested by a stale route validator.
+            self.observations.lock().unwrap_or_else(|error| error.into_inner())
+                .content_digests.clear();
+        }
+        // Partial pages and classification receipts are not full item observations.
+        if !matches!(operation, "tags_set" | "children_query") {
             record_ticket_observation(
                 &self.observations,
                 Some(&self.ticket_reference),
@@ -2256,6 +2353,9 @@ async fn execute_native_ticket_tool(
     context: WipCallContext,
 ) -> Result<Value, WipOperationError> {
     authorize_native_ticket(permissions, &tool.name, &input)?;
+    if let Some(value) = parent_links::execute_value(tool.client.clone(), &tool.name, input.clone()) {
+        return value.map_err(map_ticket_tool_error);
+    }
     if let Some(value) = assignment_public::execute_native_value(
         tool.client.clone(),
         &tool.name,
@@ -2352,6 +2452,11 @@ async fn execute_ticket_domain(
     command: Value,
     context: ToolExecutionContext,
 ) -> Result<ToolOutput, ToolError> {
+    if let Some(result) = parent_links::execute_value(client.clone(), name, command.clone()) {
+        return result.map(|value| ToolOutput {
+            summary: name.into(), content: Some(value.to_string()), attachments: Vec::new(),
+        });
+    }
     if name == "QueryTicket" || name == "ShowTicket" {
         let kind = if name == "QueryTicket" {
             WorkspaceTicketReadKind::Query
@@ -2998,10 +3103,11 @@ mod tests {
         }
     }
 
-    fn target_detail_fixture(targets: Value) -> Value {
+    pub(super) fn target_detail_fixture(targets: Value) -> Value {
         json!({
             "resource_key": "T-739", "title": "Work location", "body": "Requirements",
             "body_truncated": false, "content_digest": "observed-content", "targets": targets,
+            "parent_link": {"ticket_id":"internal739","observation":{"parent_ticket_id":null,"last_operation_key":null},"parent":null},
             "initial_post": {
                 "sequence": 0, "event_ref": "initial", "is_initial": true,
                 "kind": "comment", "body": "Requirements", "body_truncated": false,

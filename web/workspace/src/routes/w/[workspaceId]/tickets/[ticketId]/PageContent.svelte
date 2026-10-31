@@ -4,6 +4,7 @@
   import TicketTags from "#lib/workspace/tickets/TicketTags.svelte";
   import TicketWorkerObservation from "#lib/workspace/tickets/TicketWorkerObservation.svelte";
   import TicketHandling from "#lib/workspace/tickets/TicketHandling.svelte";
+  import TicketHierarchy from "#lib/workspace/tickets/TicketHierarchy.svelte";
   import { observeOperation, type ObservedOperation } from "#lib/workspace/api/ticket-operations.ts";
   import RichMarkdown from "#lib/workspace/console/RichMarkdown.svelte";
   import BevelLine from "#lib/workspace/ui/BevelLine.svelte";
@@ -588,6 +589,8 @@
         <TicketTags workspaceId={data.workspaceId} {ticket} refresh={refreshOperationTicket} />
       {/key}
 
+      <BevelLine decorative />
+      <TicketHierarchy workspaceId={data.workspaceId} routeTicketId={data.ticketId} {ticket} />
       <BevelLine decorative />
       <section class="ticket-detail-section ticket-relations">
         <div class="ticket-section-heading">
