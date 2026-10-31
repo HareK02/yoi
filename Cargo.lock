@@ -1518,6 +1518,7 @@ dependencies = [
 name = "error-contract"
 version = "0.1.0"
 dependencies = [
+ "iri-string",
  "schemars",
  "serde",
  "serde_json",

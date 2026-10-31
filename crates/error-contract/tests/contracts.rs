@@ -1395,3 +1395,171 @@ fn schemas_derive_typed_details_and_shared_context_bounds_from_the_same_wire_typ
     );
     assert!(workdir["$defs"]["WorkdirInUse"]["properties"]["operation"].is_object());
 }
+
+struct UriBoundary(&'static str);
+impl problem::ApiBoundary<SubjectDenied> for UriBoundary {
+    fn classify(&self, _: &SubjectDenied) -> problem::ProblemClass {
+        problem::ProblemClass {
+            status: problem::HttpFailureStatus::Conflict,
+            type_uri: self.0,
+            title: "Operation conflict",
+        }
+    }
+}
+
+#[test]
+fn rfc9457_uri_references_accept_relative_absolute_and_component_syntax_in_both_directions() {
+    let projected = browser_subject();
+    // RFC 3986 section 5.4 references, plus authorities and escaped delimiters. Syntax only:
+    // no base resolution, normalization, DNS, HTTP scheme restriction or implicit execution.
+    for reference in [
+        "../requests/1",
+        "?occurrence=1",
+        "",
+        "g:h",
+        "g",
+        "./g",
+        "g/",
+        "/g",
+        "//g",
+        "?y",
+        "g?y",
+        "#s",
+        "g#s",
+        "g?y#s",
+        ";x",
+        "g;x",
+        "g;x?y#s",
+        ".",
+        "./",
+        "..",
+        "../",
+        "../g",
+        "../..",
+        "../../",
+        "../../g",
+        "a/b:c",
+        "a//b",
+        "///path",
+        "?",
+        "#",
+        "urn:yoi:occurrence:one",
+        "mailto:user@example.com",
+        "https://user:pass@example.test:443/a?b#c",
+        "//[2001:db8::1]:443/a",
+        "//[::ffff:192.0.2.128]/",
+        "//[v1.a:b]/x",
+        "//host:/",
+        "a%20b/%5B?x=%25&y=?/#%2f",
+        "http://host/path??query#fragment?with/slash",
+    ] {
+        let boundary = UriBoundary(reference);
+        let response = problem::to_problem_details(&projected, &boundary, reference, budget())
+            .unwrap_or_else(|error| panic!("valid reference {reference:?}: {error}"));
+        let wire: Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(wire["type"], reference);
+        assert_eq!(
+            wire["instance"], reference,
+            "syntax validation must not normalize the reference"
+        );
+        assert!(
+            matches!(
+                problem::decode_problem_details::<SubjectDenied>(
+                    response.body(),
+                    response.status,
+                    response.content_type,
+                    &boundary,
+                    budget()
+                ),
+                DecodeFailure::Known(_)
+            ),
+            "{reference:?}"
+        );
+    }
+    let exact = format!("/{}", "a".repeat(MAX_EXPLANATION_BYTES - 1));
+    assert!(problem::to_problem_details(&projected, &WorkerApi, &exact, budget()).is_ok());
+    assert!(problem::to_problem_details(&projected, &WorkerApi, &(exact + "a"), budget()).is_err());
+}
+
+#[test]
+fn rfc9457_uri_references_reject_malformed_components_in_both_directions() {
+    let projected = browser_subject();
+    let response =
+        problem::to_problem_details(&projected, &WorkerApi, "urn:yoi:occurrence:test", budget())
+            .unwrap();
+    let original: Value = serde_json::from_slice(response.body()).unwrap();
+    for reference in [
+        "/requests/%GG",
+        "/requests/[invalid",
+        "foo%",
+        "foo%2",
+        "?%GG",
+        "#%GG",
+        "//user@@host/x",
+        "//host:wrongport/x",
+        "//[::not-ipv6]/",
+        "//[v.a]/",
+        "//[vG.foo]/",
+        "//[v1.]/",
+        "//[::1]tail/",
+        "//[::1",
+        "//host]/",
+        "bad space",
+        "1invalid:rest",
+        ":rest",
+        "a{b",
+        "a#b#c",
+        "a\\b",
+        "日本語",
+        "/a\n",
+        "?x=\0",
+    ] {
+        let invalid_class = UriBoundary(reference);
+        assert!(
+            problem::to_problem_details(
+                &projected,
+                &invalid_class,
+                "urn:yoi:occurrence:test",
+                budget()
+            )
+            .is_err(),
+            "type {reference:?}"
+        );
+        assert!(
+            problem::to_problem_details(&projected, &WorkerApi, reference, budget()).is_err(),
+            "instance {reference:?}"
+        );
+        let mut instance_wire = original.clone();
+        instance_wire["instance"] = json!(reference);
+        assert!(
+            matches!(
+                problem::decode_problem_details::<SubjectDenied>(
+                    &serde_json::to_vec(&instance_wire).unwrap(),
+                    409,
+                    problem::PROBLEM_CONTENT_TYPE,
+                    &WorkerApi,
+                    budget()
+                ),
+                DecodeFailure::Corrupt(_)
+            ),
+            "received instance {reference:?}"
+        );
+        let mut type_wire = original.clone();
+        type_wire["type"] = json!(reference);
+        // Use a matching invalid mapping too, so a classification mismatch cannot mask a
+        // syntax-validation bypass on receive.
+        assert!(
+            matches!(
+                problem::decode_problem_details::<SubjectDenied>(
+                    &serde_json::to_vec(&type_wire).unwrap(),
+                    409,
+                    problem::PROBLEM_CONTENT_TYPE,
+                    &invalid_class,
+                    budget()
+                ),
+                DecodeFailure::Corrupt(_)
+            ),
+            "received type {reference:?}"
+        );
+    }
+}

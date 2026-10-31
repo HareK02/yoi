@@ -86,7 +86,7 @@ pub trait ApiBoundary<D> {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct ProblemDetails<D> {
     #[serde(rename = "type")]
-    #[cfg_attr(feature = "json-schema", schemars(length(min = 1, max = 2048)))]
+    #[cfg_attr(feature = "json-schema", schemars(length(max = 2048)))]
     pub type_uri: String,
     #[cfg_attr(feature = "json-schema", schemars(length(min = 1, max = 2048)))]
     pub title: String,
@@ -94,7 +94,7 @@ pub struct ProblemDetails<D> {
     pub status: u16,
     #[cfg_attr(feature = "json-schema", schemars(length(min = 1, max = 2048)))]
     pub detail: String,
-    #[cfg_attr(feature = "json-schema", schemars(length(min = 1, max = 2048)))]
+    #[cfg_attr(feature = "json-schema", schemars(length(max = 2048)))]
     pub instance: String,
     pub yoi_failure: FailureEnvelope<D>,
 }
@@ -122,19 +122,16 @@ impl ProblemResponse {
 }
 
 fn validate_uri(value: &str) -> Result<(), ContractError> {
-    validate_explanation(value)?;
-    if !value.is_ascii()
-        || value.bytes().any(|byte| {
-            byte <= b' ' || byte == b'"' || byte == b'<' || byte == b'>' || byte == b'\\'
-        })
-    {
+    if value.len() > MAX_EXPLANATION_BYTES {
         return Err(ContractError::Invalid);
     }
-    // Accept absolute URI and RFC URI-reference instances, not arbitrary prose.
-    if !(value.contains(':') || value.starts_with('/') || value.starts_with('#')) {
-        return Err(ContractError::Invalid);
-    }
-    Ok(())
+    // Reuse the RFC 3986 validator already in the transport dependency graph, without its
+    // optional features. Unlike WHATWG URL parsing, borrowed UriReferenceStr validation
+    // neither resolves a base URI nor normalizes malformed input into different text.
+    // Empty references, relative paths, queries and fragments are valid URI-references.
+    iri_string::types::UriReferenceStr::new(value)
+        .map(|_| ())
+        .map_err(|_| ContractError::Invalid)
 }
 
 pub fn to_problem_details<D: WireDetails>(

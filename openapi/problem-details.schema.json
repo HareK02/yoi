@@ -11,8 +11,7 @@
     },
     "instance": {
       "type": "string",
-      "maxLength": 2048,
-      "minLength": 1
+      "maxLength": 2048
     },
     "status": {
       "type": "integer",
@@ -27,8 +26,7 @@
     },
     "type": {
       "type": "string",
-      "maxLength": 2048,
-      "minLength": 1
+      "maxLength": 2048
     },
     "yoi_failure": {
       "$ref": "#/$defs/FailureEnvelope"
