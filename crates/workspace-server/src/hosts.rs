@@ -3156,13 +3156,6 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 diagnostics,
             };
         }
-        if request.requested_worker_name.is_some() {
-            diagnostics.push(diagnostic(
-                "embedded_worker_name_display_only",
-                HostDiagnosticSeverity::Info,
-                "requested_worker_name is used only as display_name; Worker identity is allocated by Workspace authority".to_string(),
-            ));
-        }
         if matches!(request.acceptance, WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments } if expected_segments > 0)
         {
             diagnostics.push(diagnostic(
@@ -8421,9 +8414,12 @@ mod tests {
             Arc::new(FailingSpawnBackend),
         )
         .expect("test backend should connect");
-        let spawned = runtime.spawn_worker(test_create_binding(), embedded_spawn_request());
+        let mut request = embedded_spawn_request();
+        request.requested_worker_name = Some("friendly-name".into());
+        let spawned = runtime.spawn_worker(test_create_binding(), request);
         assert_eq!(spawned.state, InternalWorkerOperationState::Rejected);
         assert!(spawned.acceptance_evidence.is_empty());
+        assert_eq!(spawned.diagnostics.len(), 1);
         assert!(spawned.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "embedded_worker_execution_rejected"
                 && diagnostic
@@ -8594,7 +8590,9 @@ mod tests {
                 .iter()
                 .any(|evidence| evidence.kind == "embedded_runtime_backend_internal_projection")
         );
+        assert!(spawned.diagnostics.is_empty());
         let worker = spawned.worker.expect("created embedded worker");
+        assert_eq!(worker.display_name, "friendly-name-is-not-authority");
         assert_eq!(worker.worker.runtime_id, EMBEDDED_RUNTIME_ID);
         assert_eq!(worker.workspace.visibility, "backend_internal");
         assert_eq!(worker.workspace.identity, "runtime_registry_worker");
