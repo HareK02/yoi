@@ -117,13 +117,15 @@ Deno.test("exclusive sequence pages append without duplicating an earlier public
 Deno.test("revisit uses the same account-scoped create input then reads authoritative pages", async () => {
   const requests: { path: string; body: unknown }[] = [];
   const fetchFn: typeof fetch = (input, init) => {
+    const body = init && "body" in init ? init.body : null;
+    const method = init && "method" in init ? init.method : "GET";
     requests.push({
       path: String(input),
-      body: init?.body ? JSON.parse(String(init.body)) : null,
+      body: body ? JSON.parse(String(body)) : null,
     });
     return Promise.resolve(
       Response.json(
-        init?.method === "POST" ? conversation : page([message(1)]),
+        method === "POST" ? conversation : page([message(2)]),
       ),
     );
   };
@@ -152,7 +154,7 @@ Deno.test("ACK loss retains exact request bytes for explicit replay and accepted
   };
   const bodies: string[] = [];
   const fetchFn: typeof fetch = (_input, init) => {
-    bodies.push(String(init?.body));
+    bodies.push(String(init && "body" in init ? init.body : null));
     return bodies.length === 1
       ? Promise.reject(new TypeError("ACK lost"))
       : Promise.resolve(

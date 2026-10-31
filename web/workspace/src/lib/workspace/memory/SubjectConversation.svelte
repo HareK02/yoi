@@ -35,6 +35,19 @@
       snapshot.kind === 'ready' && snapshot.value.session.kind === 'authenticated' && snapshot.value.actor?.account_id === context.scope.accountId;
   }
 
+  function withdrawAccess(context: NonNullable<typeof active>): void {
+    context.controller.abort();
+    inaccessible = true;
+    conversation = null;
+    messages = [];
+    attempt = null;
+    delivery = null;
+    draft = '';
+    sending = false;
+    reading = false;
+    storageBlocked = false;
+  }
+
   $effect(() => {
     const scope: ConversationScope = { workspaceId, subjectId, accountId };
     return untrack(() => {
@@ -62,10 +75,9 @@
       document.addEventListener('visibilitychange', reconnect);
       const unsubscribe = browserSession.subscribe(() => {
         if (!current(context)) {
-          context.controller.abort();
-          messages = [];
-          conversation = null;
-          inaccessible = true;
+          withdrawAccess(context);
+          sendError = null;
+          historyError = 'The conversation account changed or could not be confirmed. Reopen this page after confirming your session.';
         }
       });
       return () => {
@@ -101,9 +113,7 @@
       if (!current(context)) return;
       historyError = error instanceof ConversationApiError ? error.message : 'Conversation history could not be loaded.';
       if (error instanceof ConversationApiError && [401, 403, 404].includes(error.status ?? 0)) {
-        inaccessible = true;
-        conversation = null;
-        messages = [];
+        withdrawAccess(context);
       }
     } finally { if (current(context)) reading = false; }
   }
@@ -140,9 +150,7 @@
       if (!current(context)) return;
       sendError = error instanceof ConversationApiError ? error.message : 'Send outcome unknown. Keep the saved request.';
       if (error instanceof ConversationApiError && [401, 403, 404].includes(error.status ?? 0)) {
-        inaccessible = true;
-        messages = [];
-        conversation = null;
+        withdrawAccess(context);
       }
     } finally { if (current(context)) sending = false; }
   }
@@ -184,7 +192,7 @@
     {#if !inaccessible}<button type="button" onclick={() => refresh()} disabled={reading}>{reading ? 'Loading history…' : 'Refresh history'}</button>{/if}
   </header>
   {#if historyError}<p class="error" role="alert">{historyError}</p>{/if}
-  {#if !conversation && !historyError}<p role="status">Loading conversation…</p>{/if}
+  {#if !conversation && !historyError && !inaccessible}<p role="status">Loading conversation…</p>{/if}
   <ol aria-label="Saved public messages">
     {#each messages as message (message.id)}
       <li>

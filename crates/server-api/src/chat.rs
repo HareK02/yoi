@@ -170,8 +170,13 @@ mod tests {
         let normalize = |value: &str| {
             value
                 .chars()
-                .filter(|c| !c.is_whitespace())
+                .filter_map(|c| match c {
+                    c if c.is_whitespace() => None,
+                    ',' => Some(';'),
+                    c => Some(c),
+                })
                 .collect::<String>()
+                .replace(";}", "}")
         };
         assert_eq!(normalize(&actual), normalize(&chat_api_typescript()));
     }

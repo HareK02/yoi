@@ -619,6 +619,149 @@ async fn chat_sqlite_append_failure_returns_no_success_or_notify_and_rolls_back_
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_web_create_operation_uses_real_account_membership_and_workspace_storage_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_server_config(dir.path());
+    config.repositories.clear();
+    let control = Arc::new(test_control_store(&config));
+    seed_test_registered_workspace(control.as_ref(), &config)
+        .await
+        .unwrap();
+    let mut first_workspace = control
+        .get_workspace(TEST_WORKSPACE_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut other_workspace = first_workspace.clone();
+    other_workspace.workspace_id = "chat-other-workspace".into();
+    other_workspace.display_name = "Other chat Workspace".into();
+    control.upsert_workspace(&other_workspace).await.unwrap();
+    let second_config = config
+        .for_catalog_workspace(&other_workspace, vec![])
+        .unwrap();
+    let a = WorkspaceApi::new_for_test(config, control.clone())
+        .await
+        .unwrap();
+    let b = WorkspaceApi::new_for_test(second_config, control.clone())
+        .await
+        .unwrap();
+    let owner = seed_test_workspace_owner_token(control.as_ref(), "chat-web-scope-owner").await;
+    let another = seed_test_api_token(control.as_ref(), "chat-web-next-owner");
+    let mut created = Vec::new();
+    for (api, workspace) in [(&a, TEST_WORKSPACE_ID), (&b, "chat-other-workspace")] {
+        let (status, value) = account(api, &owner, "POST", &format!("/api/w/{workspace}/subjektiv/subjects"),
+            Some(json!({"operation_id":"same-subject-create-operation","role":"Web conversation scope","behavior_md":""}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{value}");
+        let subject = value["id"].as_str().unwrap().to_owned();
+        // Deliberately reuse the exact operation across both real Workspace stores,
+        // with different Subject input. A global operation namespace would conflict.
+        let wire =
+            json!({"operation_id":"web-subject-conversation/v1/scope-probe","subject_id":subject});
+        let path = format!("/api/w/{workspace}/chat/conversations");
+        let (status, conversation) = account(api, &owner, "POST", &path, Some(wire.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{conversation}");
+        assert_eq!(
+            account(api, &owner, "POST", &path, Some(wire.clone()))
+                .await
+                .1,
+            conversation
+        );
+        created.push((subject, conversation, wire));
+    }
+    let (subject, first, wire) = &created[0];
+    assert_ne!(first["id"], created[1].1["id"]);
+    assert_ne!(subject, &created[1].0);
+    let first_id = first["id"].as_str().unwrap();
+    for (api, workspace, foreign) in [
+        (&a, TEST_WORKSPACE_ID, created[1].1["id"].as_str().unwrap()),
+        (&b, "chat-other-workspace", first_id),
+    ] {
+        let path = format!("/api/w/{workspace}/chat/conversations/{foreign}/messages");
+        assert_eq!(
+            account(api, &owner, "GET", &path, None).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            account(
+                api,
+                &owner,
+                "POST",
+                &path,
+                Some(json!({"operation_id":"cross-workspace","text":"must not append"}))
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    // The public Account route is owner-only and ownership is immutable. Do not
+    // invent an ownership transfer merely to make a second Account test pass.
+    first_workspace.owner_account_id = "account-chat-web-next-owner".into();
+    assert!(control.upsert_workspace(&first_workspace).await.is_err());
+    assert_eq!(
+        account(
+            &a,
+            &another,
+            "POST",
+            &conversations_path(),
+            Some(wire.clone())
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        account(&a, &another, "GET", &messages_path(first_id), None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        account(
+            &a,
+            &owner,
+            "POST",
+            &conversations_path(),
+            Some(wire.clone())
+        )
+        .await
+        .1,
+        *first
+    );
+    // Separately exercise the real FeatureStorage Account operation namespace.
+    // This trusted-principal store call is NOT a public authorization bypass or
+    // evidence that a non-owner can create a conversation through HTTP.
+    let store = open_subjektiv_store(&a).unwrap();
+    let request: server_api::ChatCreateConversationRequest =
+        serde_json::from_value(wire.clone()).unwrap();
+    let second_account = store
+        .chat_create_conversation("account-chat-web-next-owner", &request)
+        .unwrap();
+    assert_ne!(second_account.id, first_id);
+    assert_eq!(
+        store
+            .chat_create_conversation("account-chat-web-next-owner", &request)
+            .unwrap(),
+        second_account
+    );
+    assert!(
+        store
+            .chat_messages_for_account(
+                &second_account.participant_account_id,
+                first_id,
+                &Default::default()
+            )
+            .is_err()
+    );
+    assert_eq!(
+        account(&a, &owner, "GET", &messages_path(&second_account.id), None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+}
+
 /// Only the model is scripted. ConversationRead/Send execute through the real
 /// installed Feature, signed Runtime request transport, Backend and SQLite.
 #[derive(Clone)]
