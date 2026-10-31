@@ -76,7 +76,7 @@ export type SubjektivSubjectDeleteResponse = { subject_id: string, operation_id:
 
 export type SubjektivSubjectBehaviorUpdateRequest = { expected_behavior_md: string, behavior_md: string, };
 
-export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, state: SubjektivSubjectState, memory_fingerprint: string, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
+export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, state: SubjektivSubjectState, memory_fingerprint: string, created_at: string, updated_at: string, current_body?: import("./subject-body-api").SubjectBodyRef | null, current_worker_diagnostics?: Array<Diagnostic>, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
 
 export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, next_cursor?: string | null, has_more: boolean, };
 

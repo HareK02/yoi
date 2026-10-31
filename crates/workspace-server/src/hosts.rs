@@ -712,6 +712,8 @@ pub struct WorkerStopResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerLifecycleRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_intent: Option<runtime_api::WorkerStopIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket_assignment: Option<WorkerTicketAssignmentRequest>,
@@ -719,6 +721,8 @@ pub struct WorkerLifecycleRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerLifecycleResult {
+    #[serde(default)]
+    pub replayed: bool,
     pub state: InternalWorkerOperationState,
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
@@ -878,6 +882,14 @@ impl RuntimeRegistryError {
             } => {
                 if code == "restore_observation_conflict" {
                     Error::RestoreObservationConflict
+                } else if matches!(
+                    code.as_str(),
+                    "stop_observation_conflict"
+                        | "stop_request_conflict"
+                        | "stop_admission_busy"
+                        | "restore_admission_busy"
+                ) {
+                    Error::RepositoryConflict(message)
                 } else {
                     Error::RuntimeOperationFailed {
                         runtime_id,
@@ -1188,12 +1200,37 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         })
     }
 
+    fn coordinate_worker_stop(
+        &self,
+        _worker_id: &str,
+        _request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeDiagnostic> {
+        Err(diagnostic(
+            "worker_stop_admission_unsupported",
+            HostDiagnosticSeverity::Error,
+            "Runtime does not support fenced stop admission",
+        ))
+    }
+
+    fn worker_stop_outcome(
+        &self,
+        _worker_id: &str,
+        _request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeDiagnostic> {
+        Err(diagnostic(
+            "worker_stop_outcome_unsupported",
+            HostDiagnosticSeverity::Error,
+            "Runtime does not support stop outcome queries",
+        ))
+    }
+
     fn stop_worker(
         &self,
         worker_id: &str,
         _request: WorkerLifecycleRequest,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
+            replayed: false,
             state: InternalWorkerOperationState::Unsupported,
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
@@ -1212,6 +1249,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _request: WorkerLifecycleRequest,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
+            replayed: false,
             state: InternalWorkerOperationState::Unsupported,
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
@@ -2117,6 +2155,40 @@ impl RuntimeRegistry {
             ));
         }
         Ok(runtime.worker_completions(worker_id, request))
+    }
+
+    pub fn coordinate_worker_stop(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        let runtime = self.runtime(&worker.runtime_id)?;
+        runtime
+            .coordinate_worker_stop(&worker.worker_id, request)
+            .map_err(|diagnostic| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
+    }
+
+    pub fn worker_stop_outcome(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        let runtime = self.runtime(&worker.runtime_id)?;
+        runtime
+            .worker_stop_outcome(&worker.worker_id, request)
+            .map_err(|diagnostic| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
     }
 
     pub fn stop_worker(
@@ -3223,6 +3295,56 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
     }
 
+    fn coordinate_worker_stop(
+        &self,
+        worker_id: &str,
+        request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeDiagnostic> {
+        let worker_ref = self.worker_ref(worker_id).ok_or_else(|| {
+            diagnostic(
+                "embedded_worker_id_invalid",
+                HostDiagnosticSeverity::Error,
+                "Worker ID could not be resolved",
+            )
+        })?;
+        let outcome = self
+            .runtime
+            .coordinate_worker_stop(
+                &worker_ref,
+                runtime_api::WorkerLifecycleRequest {
+                    reason: request.reason,
+                    stop_intent: request.stop_intent,
+                },
+            )
+            .map_err(|error| embedded_runtime_diagnostic(&error))?;
+        runtime_contract_convert(outcome)
+    }
+
+    fn worker_stop_outcome(
+        &self,
+        worker_id: &str,
+        request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeDiagnostic> {
+        let worker_ref = self.worker_ref(worker_id).ok_or_else(|| {
+            diagnostic(
+                "embedded_worker_id_invalid",
+                HostDiagnosticSeverity::Error,
+                "Worker ID could not be resolved",
+            )
+        })?;
+        let outcome = self
+            .runtime
+            .worker_stop_outcome(
+                &worker_ref,
+                runtime_api::WorkerLifecycleRequest {
+                    reason: request.reason,
+                    stop_intent: request.stop_intent,
+                },
+            )
+            .map_err(|error| embedded_runtime_diagnostic(&error))?;
+        runtime_contract_convert(outcome)
+    }
+
     fn stop_worker(
         &self,
         worker_id: &str,
@@ -3250,8 +3372,15 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 ),
             );
         };
-        match self.runtime.stop_worker(&worker_ref, request.reason) {
-            Ok(_) => WorkerLifecycleResult {
+        match self.runtime.stop_worker_request(
+            &worker_ref,
+            runtime_api::WorkerLifecycleRequest {
+                reason: request.reason,
+                stop_intent: request.stop_intent,
+            },
+        ) {
+            Ok(response) => WorkerLifecycleResult {
+                replayed: response.replayed,
                 state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 diagnostics: Vec::new(),
@@ -3295,6 +3424,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         };
         match self.runtime.cancel_worker(&worker_ref, request.reason) {
             Ok(_) => WorkerLifecycleResult {
+                replayed: false,
                 state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 diagnostics: Vec::new(),
@@ -4326,6 +4456,8 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
         return "workers:input";
     }
     if path.ends_with("/stop")
+        || path.ends_with("/stop/admit")
+        || path.ends_with("/stop/outcome")
         || path.ends_with("/cancel")
         || (path == "/v1/subject-release" && method == "POST")
     {
@@ -4899,6 +5031,7 @@ impl RemoteWorkerRuntime {
         response: worker_runtime::catalog::WorkerLifecycleAck,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
+            replayed: response.replayed,
             state: InternalWorkerOperationState::Accepted,
             worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
@@ -5574,6 +5707,40 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         }
     }
 
+    fn coordinate_worker_stop(
+        &self,
+        worker_id: &str,
+        request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeDiagnostic> {
+        let worker_id = worker_id.to_string();
+        let request = runtime_api::WorkerLifecycleRequest {
+            reason: request.reason,
+            stop_intent: request.stop_intent,
+        };
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.coordinate_worker_stop(worker_id, request).await },
+        )
+    }
+
+    fn worker_stop_outcome(
+        &self,
+        worker_id: &str,
+        request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeDiagnostic> {
+        let worker_id = worker_id.to_string();
+        let request = runtime_api::WorkerLifecycleRequest {
+            reason: request.reason,
+            stop_intent: request.stop_intent,
+        };
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.worker_stop_outcome(worker_id, request).await },
+        )
+    }
+
     fn stop_worker(
         &self,
         worker_id: &str,
@@ -5581,6 +5748,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     ) -> WorkerLifecycleResult {
         let body = runtime_api::WorkerLifecycleRequest {
             reason: request.reason,
+            stop_intent: request.stop_intent,
         };
         let worker_id_owned = worker_id.to_string();
         match self
@@ -5606,6 +5774,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     ) -> WorkerLifecycleResult {
         let body = runtime_api::WorkerLifecycleRequest {
             reason: request.reason,
+            stop_intent: request.stop_intent,
         };
         let worker_id_owned = worker_id.to_string();
         match self
@@ -6399,6 +6568,7 @@ fn embedded_lifecycle_rejected(
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerLifecycleResult {
     WorkerLifecycleResult {
+        replayed: false,
         state: InternalWorkerOperationState::Rejected,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         diagnostics: vec![diagnostic],
@@ -6411,6 +6581,7 @@ fn remote_lifecycle_rejected(
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerLifecycleResult {
     WorkerLifecycleResult {
+        replayed: false,
         state: InternalWorkerOperationState::Rejected,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         diagnostics: vec![diagnostic],
@@ -6484,6 +6655,26 @@ fn sanitize_embedded_execution_detail(summary: &str, message: &str) -> String {
 
 fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnostic {
     match error {
+        EmbeddedRuntimeError::RestoreAdmissionBusy { .. } => diagnostic(
+            "restore_admission_busy",
+            HostDiagnosticSeverity::Warning,
+            "Worker lifecycle admission is busy; retry the same Restore intent",
+        ),
+        EmbeddedRuntimeError::StopAdmissionBusy { .. } => diagnostic(
+            "stop_admission_busy",
+            HostDiagnosticSeverity::Warning,
+            "Worker lifecycle admission is busy; retry the same stop intent",
+        ),
+        EmbeddedRuntimeError::StopObservationConflict { .. } => diagnostic(
+            "stop_observation_conflict",
+            HostDiagnosticSeverity::Warning,
+            "Stop observation changed; reload before a new intent",
+        ),
+        EmbeddedRuntimeError::StopRequestConflict { .. } => diagnostic(
+            "stop_request_conflict",
+            HostDiagnosticSeverity::Warning,
+            "Stop request ID was already used with different input",
+        ),
         EmbeddedRuntimeError::RestoreObservationConflict { .. } => diagnostic(
             "restore_observation_conflict",
             HostDiagnosticSeverity::Warning,
@@ -7288,6 +7479,7 @@ mod tests {
         assert!(value.get("worker").is_none());
 
         let lifecycle = WorkerLifecycleResult {
+            replayed: false,
             state: InternalWorkerOperationState::Accepted,
             worker: RuntimeWorkerRef::new("arcadia", "30"),
             diagnostics: Vec::new(),
@@ -8620,6 +8812,12 @@ mod tests {
             ),
             "workers:read"
         );
+        for suffix in ["stop", "stop/admit", "stop/outcome"] {
+            assert_eq!(
+                workspace_runtime_operation("POST", &format!("/v1/workers/{worker_id}/{suffix}")),
+                "workers:stop"
+            );
+        }
         assert_eq!(
             workspace_runtime_operation("POST", "/v1/session-public/material/retention/erase"),
             "workers:delete"

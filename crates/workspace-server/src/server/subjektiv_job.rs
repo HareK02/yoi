@@ -113,6 +113,7 @@ pub(super) async fn retire_legacy_worker(api: &WorkspaceApi, subject_id: &str) -
                     .stop_worker(
                         &owner.worker,
                         WorkerLifecycleRequest {
+                            stop_intent: None,
                             reason: Some(
                                 "Retire legacy subjektiv consolidator after foreground completion"
                                     .into(),

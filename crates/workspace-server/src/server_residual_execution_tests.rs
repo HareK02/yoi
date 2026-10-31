@@ -658,6 +658,7 @@ async fn worker_control_source_lookup_waits_off_tokio_and_retains_finite_host_ow
     let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let request = || {
         Json(server_api::RuntimeWorkerLifecycleRequest {
+            stop_intent: None,
             reason: None,
             ticket_assignment: None,
         })

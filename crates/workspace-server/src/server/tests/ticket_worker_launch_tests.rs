@@ -1822,6 +1822,7 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
         .stop_worker(
             &coder,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: None,
                 ticket_assignment: None,
             },

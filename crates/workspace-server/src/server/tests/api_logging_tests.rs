@@ -114,6 +114,7 @@ async fn cleanup_retention_failures_preserve_cause_on_execution_and_recovery() {
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: Some("retention diagnostic fixture".into()),
                 ticket_assignment: None,
             },

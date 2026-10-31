@@ -308,6 +308,7 @@ async fn browser_method_queue_overflow_fails_fast_and_does_not_pin_session_clean
         worker.stop(
             &WorkerOperationContext::Backend,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: Some("cleanup-after-method-overflow".into()),
                 ticket_assignment: None,
             },
@@ -674,6 +675,7 @@ async fn assert_same_worker_reconnect_and_stop(
         worker.stop(
             &WorkerOperationContext::Backend,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: Some("cleanup-after-stalled-protocol".into()),
                 ticket_assignment: None,
             },

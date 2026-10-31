@@ -320,7 +320,7 @@ export function parseRuntimeWorkerLifecycleResult(
   exactKeys(
     item,
     ["state", "runtime_id", "worker_id", "diagnostics"],
-    [],
+    ["replayed"],
     "Runtime Worker lifecycle result",
   );
   const state = boundedString(
@@ -331,6 +331,9 @@ export function parseRuntimeWorkerLifecycleResult(
     fail("Runtime Worker lifecycle result.state", "has an unknown value");
   }
   return {
+    replayed: item.replayed === undefined
+      ? false
+      : boolean(item.replayed, "Runtime Worker lifecycle result.replayed"),
     state: state as WorkerOperationState,
     runtime_id: boundedString(
       item.runtime_id,

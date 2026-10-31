@@ -1,10 +1,29 @@
 <script lang="ts">
   import { subjectHref } from '#lib/workspace/subjektiv/routes.ts';
+  import { untrack } from 'svelte';
+  import { browserSession } from '#lib/workspace/auth/session-state.ts';
+  import SubjectBody from '#lib/workspace/memory/SubjectBody.svelte';
   import SubjectConversation from '#lib/workspace/memory/SubjectConversation.svelte';
   import type { ResolvedPageData } from '#lib/workspace/navigation/deferred.ts';
   import type { PageData as RouteData } from './$types';
   let { data }: { data: ResolvedPageData<RouteData> } = $props();
   const subject = $derived(data.subject.data);
+  let accountConfirmed = $state(false);
+  $effect(() => {
+    const accountId = data.accountId;
+    const workspaceId = data.workspaceId;
+    const subjectId = data.subjectId;
+    return untrack(() => {
+      const generation = browserSession.authenticationGeneration;
+      const stamp = browserSession.authenticationStamp;
+      return browserSession.subscribe((snapshot) => {
+        accountConfirmed = data.workspaceId === workspaceId && data.subjectId === subjectId &&
+          browserSession.authenticationGeneration === generation && browserSession.authenticationStamp === stamp &&
+          snapshot.kind === 'ready' && snapshot.value.session.kind === 'authenticated' &&
+          snapshot.value.actor?.account_id === accountId;
+      });
+    });
+  });
 </script>
 
 <svelte:head><title>{subject?.role ?? 'Subject'} · Conversation · Yoi Workspace</title></svelte:head>
@@ -13,9 +32,14 @@
   <a href={subjectHref(data.workspaceId, data.subjectId)}>← Subject details</a>
   {#if subject}
     <h1 id="conversation-subject-heading">{subject.role}</h1>
-    {#key JSON.stringify([data.accountId, data.workspaceId, subject.id])}
-      <SubjectConversation accountId={data.accountId} workspaceId={data.workspaceId} subjectId={subject.id} subjectName={subject.role} />
-    {/key}
+    {#if accountConfirmed}
+      {#key JSON.stringify([data.accountId, data.workspaceId, subject.id])}
+        <SubjectBody accountId={data.accountId} workspaceId={data.workspaceId} subjectId={subject.id} />
+        <SubjectConversation accountId={data.accountId} workspaceId={data.workspaceId} subjectId={subject.id} subjectName={subject.role} />
+      {/key}
+    {:else}
+      <p role="alert">The conversation account could not be confirmed. Reopen this page after confirming your session.</p>
+    {/if}
   {:else}
     <h1 id="conversation-subject-heading">Subject conversation</h1>
     <p role="alert">{data.subject.error ?? 'The Subject is unavailable. No conversation input was sent.'}</p>

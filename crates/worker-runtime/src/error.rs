@@ -15,6 +15,24 @@ pub enum RuntimeError {
     #[error("worker {worker_id} Restore observation conflicts with the current operation")]
     RestoreObservationConflict { worker_id: WorkerId },
 
+    #[error(
+        "worker {worker_id} lifecycle lock is busy; release caller gates and retry the same Restore intent"
+    )]
+    RestoreAdmissionBusy { worker_id: WorkerId },
+
+    #[error("worker {worker_id} Stop observation conflicts with the current lifecycle")]
+    StopObservationConflict { worker_id: WorkerId },
+
+    #[error(
+        "worker {worker_id} Stop request ID is already bound to different input or another pending stop"
+    )]
+    StopRequestConflict { worker_id: WorkerId },
+
+    #[error(
+        "worker {worker_id} lifecycle lock is busy; release caller gates and retry the same Stop intent"
+    )]
+    StopAdmissionBusy { worker_id: WorkerId },
+
     #[error("worker {worker_id} was not found")]
     WorkerNotFound { worker_id: WorkerId },
 

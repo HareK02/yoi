@@ -822,6 +822,7 @@ async fn old_job_removal_reconciles_exact_input_then_erases_copies_across_http_r
             .stop_worker(
                 &worker,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("Prior independent removal".into()),
                     ticket_assignment: None,
                 },
@@ -1136,6 +1137,7 @@ async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subjec
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: Some("Earlier removal".into()),
                 ticket_assignment: None,
             },

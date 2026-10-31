@@ -1441,7 +1441,22 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
     let worker_ref = RuntimeWorkerRef::new("connected-chat", worker);
     let lifecycle_path =
         format!("/api/w/{TEST_WORKSPACE_ID}/runtimes/connected-chat/workers/{worker}");
-    let stopped = f.post(&format!("{lifecycle_path}/stop"), json!({})).await;
+    let stop_observation = f
+        .api
+        .runtime
+        .worker(&worker_ref)
+        .unwrap()
+        .restore_observation_token
+        .unwrap();
+    let stopped = f
+        .post(
+            &format!("{lifecycle_path}/stop"),
+            json!({"stop_intent": {
+                "request_id": "explicit-chat-stop",
+                "expected_observation_token": stop_observation,
+            }}),
+        )
+        .await;
     assert_eq!(stopped["state"], "accepted");
     let stopped_wire =
         json!({"operation_id":"connected-stopped","text":"CHAT_STOPPED_SAVED_NOT_NOTIFIED"});
@@ -1571,7 +1586,21 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         StatusCode::FORBIDDEN,
         "revocation cannot be repaired by profile or create replay: {body}"
     );
-    f.post(&format!("{lifecycle_path}/stop"), json!({})).await;
+    let stop_observation = f
+        .api
+        .runtime
+        .worker(&worker_ref)
+        .unwrap()
+        .restore_observation_token
+        .unwrap();
+    f.post(
+        &format!("{lifecycle_path}/stop"),
+        json!({"stop_intent": {
+            "request_id": "explicit-chat-stop-after-revocation",
+            "expected_observation_token": stop_observation,
+        }}),
+    )
+    .await;
     let token = f
         .api
         .runtime

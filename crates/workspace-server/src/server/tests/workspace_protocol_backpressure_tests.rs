@@ -124,6 +124,7 @@ async fn actual_workspace_multiplexer_stalled_writer_timeout_or_disconnect_recla
             .stop(
                 &WorkerOperationContext::Backend,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("cleanup-after-multiplexer-exit".into()),
                     ticket_assignment: None,
                 },

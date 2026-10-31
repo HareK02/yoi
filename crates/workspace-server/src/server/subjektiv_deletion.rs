@@ -240,6 +240,7 @@ async fn remove_worker(
                     .stop_worker(
                         worker,
                         WorkerLifecycleRequest {
+                            stop_intent: None,
                             reason: Some(format!("Explicit Subject deletion {operation}")),
                             ticket_assignment: None,
                         },

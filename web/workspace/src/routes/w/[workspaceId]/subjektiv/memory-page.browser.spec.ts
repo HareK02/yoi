@@ -110,7 +110,7 @@ test("renders the subject index as the Memory product entry", () => {
   expect(screen.getByRole("link", { name: /Release coordinator/ })).not
     .toBeNull();
   expect(screen.getByText("subject-1")).not.toBeNull();
-  expect(screen.getByText("Not connected")).not.toBeNull();
+  expect(screen.getByText("No current body")).not.toBeNull();
   expect(screen.queryByText("Memory fingerprint", { exact: true })).toBeNull();
   expect(screen.getByText("1 shown · more available")).not.toBeNull();
   expect(screen.getByRole("link", { name: "First page" }).getAttribute("href"))
@@ -346,8 +346,14 @@ test("renders a ready resident surface and committed Memory lifecycle states", a
     .toContain("Prefer explicit evidence.");
   expect(screen.getByRole("article", { name: "Resident context" })).not
     .toBeNull();
-  expect(screen.getByText("Connected", { exact: true })).not.toBeNull();
-  expect(screen.getByText("Release Worker", { exact: true })).not.toBeNull();
+  // Legacy connection fields cannot authorize or infer the current singleton body.
+  expect(screen.queryByText("Connected", { exact: true })).toBeNull();
+  expect(screen.queryByText("Release Worker", { exact: true })).toBeNull();
+  expect(
+    screen.getByText(
+      "Confirming account identity before loading body controls…",
+    ),
+  ).toBeTruthy();
   expect(screen.getByText("3 on this page", { exact: true })).not.toBeNull();
   expect(screen.getByText("Memory fingerprint", { exact: true })).not
     .toBeNull();
@@ -791,7 +797,12 @@ test("candidate-only Subjects show no committed Memories, not an inferred candid
 
   expect(screen.getByText("None", { exact: true })).not.toBeNull();
   expect(screen.getByText("No committed Memories yet.")).not.toBeNull();
-  expect(screen.getByText("Not connected", { exact: true })).not.toBeNull();
+  expect(
+    screen.getByText(
+      "Confirming account identity before loading body controls…",
+      { exact: true },
+    ),
+  ).not.toBeNull();
   expect(screen.getAllByText("Not generated", { exact: true })).toHaveLength(2);
   expect(screen.queryByRole("article", { name: "Resident context" }))
     .toBeNull();
@@ -834,7 +845,12 @@ test.each(["ready", "ungenerated", "stale", "failed"] as const)(
     expect(screen.getByText("Generated Memory context", { exact: true })).not
       .toBeNull();
     expect(screen.getByText("No committed Memories yet.")).not.toBeNull();
-    expect(screen.getByText("Not connected", { exact: true })).not.toBeNull();
+    expect(
+      screen.getByText(
+        "Confirming account identity before loading body controls…",
+        { exact: true },
+      ),
+    ).not.toBeNull();
     const technical = view.container.querySelector(
       "details.subject-technical-details",
     ) as HTMLDetailsElement;

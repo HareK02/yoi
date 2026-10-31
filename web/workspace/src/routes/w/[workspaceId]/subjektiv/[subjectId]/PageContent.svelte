@@ -5,9 +5,11 @@
   // behaviorは利用者が管理する本文、surfaceはMemoryからの生成物として分ける。
   // ready-empty／ungenerated／stale／failedとrequest failureを区別し、surfaceの現在性を
   // 実行中Workerの履歴へ反映済みであることの証明には使わない。診断値は詳細へ分離する。
-  import { untrack } from 'svelte';
+  import { onMount, untrack } from 'svelte';
+  import { browserSession } from '#lib/workspace/auth/session-state.ts';
   import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
   import SubjectDelete from '#lib/workspace/memory/SubjectDelete.svelte';
+  import SubjectBody from '#lib/workspace/memory/SubjectBody.svelte';
   import { formatDate } from '#lib/workspace/api/http.ts';
   import {
     SubjektivSubjectCreateError,
@@ -20,6 +22,11 @@
   type PageProps = { data: ResolvedPageData<RouteData> };
 
   let { data }: PageProps = $props();
+  let accountId = $state<string | null>(null);
+  onMount(() => browserSession.subscribe((snapshot) => {
+    accountId = snapshot.kind === 'ready' && snapshot.value.session.kind === 'authenticated'
+      ? snapshot.value.actor?.account_id ?? null : null;
+  }));
 
   let subject = $state(untrack(() => data.subject.data));
   let editingBehavior = $state(false);
@@ -189,9 +196,13 @@
         <p>{subject.state === 'active' ? 'Available for new Worker connections.' : 'No longer available for new Worker connections.'}</p>
       </div>
       <div>
-        <span>Worker connection</span>
-        <strong>{subject.current_worker ? 'Connected' : 'Not connected'}</strong>
-        <p>{subject.current_worker?.display_name ?? 'No Worker currently owns this Subject connection.'}</p>
+        {#if accountId}
+          {#key JSON.stringify([accountId, data.workspaceId, data.subjectId])}
+            <SubjectBody {accountId} workspaceId={data.workspaceId} subjectId={data.subjectId} />
+          {/key}
+        {:else}
+          <p role="status">Confirming account identity before loading body controls…</p>
+        {/if}
       </div>
       <div>
         <span>Committed Memories</span>

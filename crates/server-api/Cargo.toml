@@ -48,6 +48,10 @@ name = "generate_chat_api_types"
 required-features = ["typescript"]
 
 [[example]]
+name = "generate_subject_body_api_types"
+required-features = ["typescript"]
+
+[[example]]
 name = "generate_memory_api_types"
 required-features = ["typescript"]
 
