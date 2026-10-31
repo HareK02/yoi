@@ -1,10 +1,11 @@
 <script lang="ts">
+  import { subjectHref as subjectDetailHref, subjectMemoryHref } from '#lib/workspace/subjektiv/routes.ts';
   // current／historicalはchange_idとcurrent_change_idの一致で区別する。
   // 本文・evidenceの続きも同じimmutable changeへ固定し、現在版の内容を混ぜない。
   import OriginalSource from '#lib/workspace/memory/OriginalSource.svelte';
   import { journalHref } from '#lib/workspace/memory/journal-api.ts';
   import DocumentMarkdown from '#lib/workspace/markdown/DocumentMarkdown.svelte';
-  import { formatDate, workspaceRoute } from '#lib/workspace/api/http.ts';
+  import { formatDate } from '#lib/workspace/api/http.ts';
   import type {
     MemoryEvidenceOrigin,
     SubjektivMemoryChangeRef,
@@ -21,14 +22,11 @@
   const changes = $derived(data.changes.data?.items ?? []);
 
   function subjectHref(): string {
-    return workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}`);
+    return subjectDetailHref(data.workspaceId, data.subjectId);
   }
 
   function memoryPath(memoryId = data.memoryId): string {
-    return workspaceRoute(
-      data.workspaceId,
-      `/memory/${encodeURIComponent(data.subjectId)}/${encodeURIComponent(memoryId)}`,
-    );
+    return subjectMemoryHref(data.workspaceId, data.subjectId, memoryId);
   }
 
   function changeHref(changeId: string): string {

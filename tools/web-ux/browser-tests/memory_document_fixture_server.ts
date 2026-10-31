@@ -16,7 +16,8 @@ if (
 }
 
 // 既存Memory scenarioとpaginationを変えないよう、明示選択時だけ有効にする。
-const permissionsMode = Deno.args[3] === "permissions";
+const navigationMode = Deno.args[3] === "navigation";
+const permissionsMode = Deno.args[3] === "permissions" || navigationMode;
 if (permissionsMode) {
   // 権限の証拠は親から渡された実製品buildを使って採取する。
   // build欠落時に/healthを成功させたり、fixture HTMLで代替したりしない。
@@ -103,6 +104,12 @@ const subjects = [
 if (permissionsMode) {
   subjects.push(
     ...permissionFixtureSubjects.map(([id, role]) => subject(id, role, "active", "fingerprint-0")),
+  );
+}
+if (navigationMode) {
+  subjects.push(
+    subject("staging", "Subject named staging", "active", "fingerprint-0"),
+    subject("encoded/Subject ?#日本%", "Encoded identity Subject", "active", "fingerprint-0"),
   );
 }
 const pagedSubject = subject(pagedSubjectId, "Subject on the next page", "active", "fingerprint-1");
@@ -513,6 +520,9 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     });
   }
 
+  if (navigationMode && url.pathname === `/api/w/${workspaceId}/memory/staging`) {
+    return json({ limit: 200, returned_count: 0, total_valid_count: 0, invalid_count: 0, truncated: false, order: "fixture", record_authority: "synthetic-http", items: [], diagnostics: [] });
+  }
   const subjectsPath = `/api/w/${workspaceId}/subjektiv/subjects`;
   if (url.pathname === subjectsPath) {
     if (request.method === "POST") {

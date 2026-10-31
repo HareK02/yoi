@@ -20,7 +20,7 @@
     {
       "id": "subjects",
       "label": "Subject index",
-      "path": "/w/memory-review/memory",
+      "path": "/w/memory-review/subjektiv",
       "goal": "Choose an explicit Memory subject or create one with a Backend-validated role.",
       "dataState": "Active and retired subjects across a paginated list, plus create-form and permission-rejection states.",
       "ready": {
@@ -67,7 +67,7 @@
     {
       "id": "subjects-empty",
       "label": "Empty Subject index",
-      "path": "/w/memory-review/memory?cursor=fixture-empty-subject-page",
+      "path": "/w/memory-review/subjektiv?cursor=fixture-empty-subject-page",
       "goal": "Create the first visible Subject when the current bounded page is empty.",
       "dataState": "Successful empty Subject page with a return-to-first-page recovery link.",
       "ready": {
@@ -92,7 +92,7 @@
     {
       "id": "subjects-error",
       "label": "Subject list error",
-      "path": "/w/memory-review/memory?cursor=fixture-error-subject-page",
+      "path": "/w/memory-review/subjektiv?cursor=fixture-error-subject-page",
       "goal": "Keep explicit Subject creation available while the existing list cannot load.",
       "dataState": "Intentional Subject-list HTTP 503 with the independent create disclosure still available.",
       "ready": {
@@ -117,7 +117,7 @@
     {
       "id": "representative",
       "label": "Ready subject surface",
-      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review",
+      "path": "/w/memory-review/subjektiv/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review",
       "goal": "Read the ready resident surface and scan active, resolved, and retracted committed Memories without nested vertical scrolling.",
       "dataState": "Ready generated Markdown surface with long content, unsafe Markdown, wide table/code, provenance refs, and three lifecycle states.",
       "ready": {
@@ -153,7 +153,7 @@
     {
       "id": "detail",
       "label": "Committed Memory detail",
-      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/memory-decision-with-a-deliberately-long-stable-identity-for-overflow-review-0000000001",
+      "path": "/w/memory-review/subjektiv/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/memories/memory-decision-with-a-deliberately-long-stable-identity-for-overflow-review-0000000001",
       "goal": "Audit immutable Memory body, candidate evidence, source refs, derivations, and change history.",
       "dataState": "Current active change with bounded typed provenance and active/resolved/retracted immutable history.",
       "ready": {
@@ -165,7 +165,7 @@
     {
       "id": "empty",
       "label": "Ready-empty subject",
-      "path": "/w/memory-review/memory/empty-subject",
+      "path": "/w/memory-review/subjektiv/empty-subject",
       "goal": "Distinguish a valid ready-empty snapshot and an empty committed Memory list from failure.",
       "dataState": "Ready snapshot with empty Markdown and no refs; successful current list with no records.",
       "ready": {
@@ -177,7 +177,7 @@
     {
       "id": "ungenerated",
       "label": "Ungenerated subject context",
-      "path": "/w/memory-review/memory/ungenerated-subject",
+      "path": "/w/memory-review/subjektiv/ungenerated-subject",
       "goal": "Distinguish a Subject with no generated resident context from lost committed Memory.",
       "dataState": "Ungenerated resident context and a successful empty committed Memory list.",
       "ready": {
@@ -189,7 +189,7 @@
     {
       "id": "stale",
       "label": "Stale subject surface",
-      "path": "/w/memory-review/memory/stale-subject",
+      "path": "/w/memory-review/subjektiv/stale-subject",
       "goal": "Recognize that no snapshot is displayable while committed Memories remain readable.",
       "dataState": "Stale availability without snapshot and one resolved committed Memory.",
       "ready": {
@@ -201,7 +201,7 @@
     {
       "id": "failed",
       "label": "Failed subject surface",
-      "path": "/w/memory-review/memory/failed-subject",
+      "path": "/w/memory-review/subjektiv/failed-subject",
       "goal": "See generation failure without displaying a failed or partial snapshot.",
       "dataState": "Failed availability without snapshot and one retracted committed Memory.",
       "ready": {
@@ -213,7 +213,7 @@
     {
       "id": "error",
       "label": "Subject endpoint error",
-      "path": "/w/memory-review/memory/error-subject",
+      "path": "/w/memory-review/subjektiv/error-subject",
       "goal": "Keep each read-only region explicit when subject, surface, and current Memory requests fail.",
       "dataState": "Intentional HTTP 503 from all subject-scoped endpoints.",
       "ready": {

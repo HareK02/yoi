@@ -74,7 +74,7 @@ Deno.test({
               await route.continue();
             },
           );
-          await page.goto(`${origin}/w/memory-review/memory/pending-subject`);
+          await page.goto(`${origin}/w/memory-review/subjektiv/pending-subject`);
           await page.locator(".subject-delete-open").waitFor();
           await page.screenshot({
             path: join(artifact, `${theme}-${width}-initial.png`),
@@ -143,7 +143,7 @@ Deno.test({
             requests.push(request.postDataJSON());
           }
         });
-        await page.goto(`${origin}/w/memory-review/memory/${subject}`);
+        await page.goto(`${origin}/w/memory-review/subjektiv/${subject}`);
         await page.locator(".subject-delete-open").waitFor();
         if (subject === "legacy-subject") {
           assert(
@@ -186,7 +186,7 @@ Deno.test({
               });}
           },
         );
-        await page.goto(`${origin}/w/memory-review/memory/pending-subject`);
+        await page.goto(`${origin}/w/memory-review/subjektiv/pending-subject`);
         await confirm(page);
         await page.locator('[data-delete-state="failed"]').waitFor();
         await page.screenshot({ path: join(artifact, "rejected.png") });
@@ -217,7 +217,7 @@ Deno.test({
             });
           },
         );
-        await page.goto(`${origin}/w/memory-review/memory/pending-subject`);
+        await page.goto(`${origin}/w/memory-review/subjektiv/pending-subject`);
         await confirm(page);
         await page.locator('[data-delete-state="running"]').waitFor();
         await page.getByRole("link", { name: "← All subjects", exact: true })
@@ -241,7 +241,7 @@ Deno.test({
       {
         const page = await browser.newPage();
         await page.goto(
-          `${origin}/w/memory-review/memory/legacy-subject?persona=reader`,
+          `${origin}/w/memory-review/subjektiv/legacy-subject?persona=reader`,
         );
         await page.locator(".subject-overview").waitFor();
         assertEquals(await page.locator(".subject-deletion").count(), 0);

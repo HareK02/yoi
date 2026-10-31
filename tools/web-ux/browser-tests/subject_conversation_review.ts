@@ -24,7 +24,7 @@ await Deno.mkdir(output);
 const port = await freePort();
 const base = `http://127.0.0.1:${port}`;
 const subject = "empty-subject";
-const subjectRoute = `/w/memory-review/memory/${subject}`;
+const subjectRoute = `/w/memory-review/${mode === "before" ? "memory" : "subjektiv"}/${subject}`;
 const captures: unknown[] = [];
 const failures: string[] = [];
 const faults: { kind: string; message: string; expected: boolean }[] = [];
@@ -233,7 +233,7 @@ try {
         faultMode = "normal";
         const secondTab = await context.newPage();
         try {
-          await secondTab.goto(`${base}${subjectRoute}/conversation`);
+          await secondTab.goto(`${base}${subjectRoute}/chat`);
           await secondTab.getByRole("textbox").fill("Independent input from another tab");
           await secondTab.getByRole("button", { name: "Send message", exact: true }).click();
           await secondTab.getByText(

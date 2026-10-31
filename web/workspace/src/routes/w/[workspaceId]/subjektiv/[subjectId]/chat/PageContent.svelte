@@ -1,6 +1,6 @@
 <script lang="ts">
+  import { subjectHref } from '#lib/workspace/subjektiv/routes.ts';
   import SubjectConversation from '#lib/workspace/memory/SubjectConversation.svelte';
-  import { workspaceRoute } from '#lib/workspace/api/http.ts';
   import type { ResolvedPageData } from '#lib/workspace/navigation/deferred.ts';
   import type { PageData as RouteData } from './$types';
   let { data }: { data: ResolvedPageData<RouteData> } = $props();
@@ -10,7 +10,7 @@
 <svelte:head><title>{subject?.role ?? 'Subject'} · Conversation · Yoi Workspace</title></svelte:head>
 
 <section class="conversation-page" aria-labelledby="conversation-subject-heading">
-  <a href={workspaceRoute(data.workspaceId, `/memory/${encodeURIComponent(data.subjectId)}`)}>← Subject details</a>
+  <a href={subjectHref(data.workspaceId, data.subjectId)}>← Subject details</a>
   {#if subject}
     <h1 id="conversation-subject-heading">{subject.role}</h1>
     {#key JSON.stringify([data.accountId, data.workspaceId, subject.id])}

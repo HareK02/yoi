@@ -35,7 +35,7 @@
     {
       "id": "permissions-empty",
       "label": "Unset permissions",
-      "path": "/w/memory-review/memory/permissions-empty/permissions",
+      "path": "/w/memory-review/subjektiv/permissions-empty/permissions",
       "goal": "Distinguish unset permission policy from unavailable or read-only; locate separate direct and delegation scopes.",
       "dataState": "Synthetic HTTP only; no real Backend persistence, authorization, lifecycle or Worker evidence. Unset permissions.",
       "ready": {
@@ -52,7 +52,7 @@
     {
       "id": "permissions-edit",
       "label": "Configured permissions",
-      "path": "/w/memory-review/memory/permissions-edit/permissions",
+      "path": "/w/memory-review/subjektiv/permissions-edit/permissions",
       "goal": "Read exact operation and target before editing.",
       "dataState": "Synthetic HTTP only; no real Backend persistence, authorization, lifecycle or Worker evidence. Configured permissions.",
       "ready": {
@@ -69,7 +69,7 @@
     {
       "id": "permissions-legacy",
       "label": "Preserved unsupported permission",
-      "path": "/w/memory-review/memory/permissions-legacy/permissions",
+      "path": "/w/memory-review/subjektiv/permissions-legacy/permissions",
       "goal": "Recognize preserved legacy Worker target without treating T-803 messaging as available.",
       "dataState": "Synthetic HTTP only; no real Backend persistence, authorization, lifecycle or Worker evidence. Preserved unsupported permission.",
       "ready": {
@@ -86,7 +86,7 @@
     {
       "id": "permissions-reader",
       "label": "Read-only permissions",
-      "path": "/w/memory-review/memory/permissions-reader/permissions",
+      "path": "/w/memory-review/subjektiv/permissions-reader/permissions",
       "goal": "Read policy without unauthorized editing controls.",
       "dataState": "Synthetic HTTP only; no real Backend persistence, authorization, lifecycle or Worker evidence. Read-only permissions.",
       "ready": {
@@ -103,7 +103,7 @@
     {
       "id": "permissions-unavailable",
       "label": "Unavailable permission service",
-      "path": "/w/memory-review/memory/permissions-unavailable/permissions",
+      "path": "/w/memory-review/subjektiv/permissions-unavailable/permissions",
       "goal": "Recover without success claims.",
       "dataState": "Synthetic HTTP only; no real Backend persistence, authorization, lifecycle or Worker evidence. Unavailable permission service.",
       "ready": {

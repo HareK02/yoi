@@ -257,7 +257,7 @@ try {
       };
       manifest.scenarios.push(scenario);
       try {
-        await page.goto(`${base}/w/memory-review/memory`);
+        await page.goto(`${base}/w/memory-review/subjektiv`);
         await page.getByRole("heading", { name: "Subjects", level: 1, exact: true }).waitFor();
         await page.getByRole("button", { name: "New Subject", exact: true }).click();
         const role = page.getByRole("textbox", { name: "Role", exact: true });
@@ -354,7 +354,7 @@ try {
           await page.getByRole("alert").scrollIntoViewIfNeeded();
           await capture(page, observation, `${prefix}-later-403-reopened-pending`);
           await page.getByRole("button", { name: "Create Subject", exact: true }).click();
-          await page.waitForURL("**/memory/created-subject-0001");
+          await page.waitForURL("**/subjektiv/created-subject-0001");
           await page.getByRole("heading", { name: roleText.trim(), level: 1, exact: true })
             .waitFor();
           assertEquals(

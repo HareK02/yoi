@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { subjectsHref, subjectHref } from '#lib/workspace/subjektiv/routes.ts';
   import { onDestroy, onMount } from "svelte";
   import BevelLine from "#lib/workspace/ui/BevelLine.svelte";
   import type { TicketDetail, TicketAssignmentTrackingProjection, TicketAssignmentTrackingHistoryPage, TicketAssignmentsPage, TicketAssignmentPrincipalSnapshot } from "#lib/generated/ticket-api.ts";
@@ -156,7 +157,7 @@
       {#if subjectsBusy}<p role="status">Loading Subjects…</p>{/if}
       {#if subjectsError}<p class="workspace-callout is-error" role="alert">Subjects: {subjectsError}</p><button class="workspace-secondary-button" disabled={subjectsBusy} onclick={() => void readSubjects()}>Retry Subjects</button>{/if}
       {#if subjectsCursor}<button class="workspace-secondary-button" disabled={subjectsBusy} onclick={() => void readSubjects(true)}>More Subjects</button>{/if}
-      {#if !subjectsBusy && !subjectsError && !subjects.length}<p>No Subjects available. Create or configure a Subject in <a href={`/w/${encodeURIComponent(workspaceId)}/memory`}>Memory</a>.</p>{/if}
+      {#if !subjectsBusy && !subjectsError && !subjects.length}<p>No Subjects available. Create or configure a Subject in <a href={subjectsHref(workspaceId)}>Subjects</a>.</p>{/if}
       <p>Backend validates the Subject and current permissions. Assignment does not grant permissions or select or start a concrete Worker.</p>
     </details>
   {/if}
@@ -196,7 +197,7 @@
   <details class="ticket-detail-section ticket-subject-worker">
     <summary>Subject and current Worker</summary>
     <p>Assignment follows the Subject across Worker replacement. Worker availability does not change handling status.</p>
-    <a href={`/w/${encodeURIComponent(workspaceId)}/memory/${encodeURIComponent(current.principal.subject_id)}`}>Open responsible Subject and current Worker</a>
+    <a href={subjectHref(workspaceId, current.principal.subject_id)}>Open responsible Subject and current Worker</a>
   </details>
 {:else if current}
   <p class="workspace-callout">Legacy assignment retained for audit only. Select a Subject to create a new assignment; old receipts do not authorize new work.</p>

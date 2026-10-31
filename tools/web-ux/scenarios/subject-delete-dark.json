@@ -35,7 +35,7 @@
     {
       "id": "subject",
       "label": "Subject detail",
-      "path": "/w/memory-review/memory/pending-subject",
+      "path": "/w/memory-review/subjektiv/pending-subject",
       "goal": "Review the Subject before irreversible deletion.",
       "dataState": "Active Subject, no current Worker; owner permissions from Backend projection.",
       "ready": {
@@ -98,7 +98,7 @@
     {
       "id": "legacy",
       "label": "Legacy ended Subject",
-      "path": "/w/memory-review/memory/legacy-subject",
+      "path": "/w/memory-review/subjektiv/legacy-subject",
       "goal": "Delete a legacy ended Subject without reactivating it.",
       "dataState": "Saved retired wire state, owner.",
       "ready": {
@@ -129,7 +129,7 @@
     {
       "id": "non-owner",
       "label": "Nonowner Subject view",
-      "path": "/w/memory-review/memory/legacy-subject?persona=reader",
+      "path": "/w/memory-review/subjektiv/legacy-subject?persona=reader",
       "goal": "Read Subject without presenting unauthorized deletion.",
       "dataState": "Backend delete_subjects=false; no deletion controls.",
       "ready": {
