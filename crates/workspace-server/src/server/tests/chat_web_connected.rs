@@ -111,7 +111,7 @@ async fn chat_web_connected_busy_unknown_replay_and_authorization_use_real_runti
         .kill_on_drop(true)
         .spawn()
         .expect("explicit browser test requires Deno");
-    let wire = serde_json::to_vec(&json!({"origin":f.url,"workspace_id":TEST_WORKSPACE_ID,"subject_path":format!("/w/{TEST_WORKSPACE_ID}/memory/{subject}"),"subject_name":"Web connected companion","conversation_id":c,"owner_token":f.owner,"foreign_token":foreign})).unwrap();
+    let wire = serde_json::to_vec(&json!({"origin":f.url,"workspace_id":TEST_WORKSPACE_ID,"subject_id":subject,"subject_name":"Web connected companion","conversation_id":c,"owner_token":f.owner,"foreign_token":foreign})).unwrap();
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(&wire).await.unwrap();
     drop(stdin);

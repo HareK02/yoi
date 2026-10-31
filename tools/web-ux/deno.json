@@ -1,6 +1,7 @@
 {
   "lock": true,
   "imports": {
+    "#lib/": "../../web/workspace/src/lib/",
     "@std/assert": "jsr:@std/assert@1.0.19",
     "@std/path": "jsr:@std/path@1.1.4",
     "pixelmatch": "npm:pixelmatch@7.1.0",
