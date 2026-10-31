@@ -1,7 +1,7 @@
 //! Explicit browser/component connection, not a separate product-process launcher.
 //! Reuses ConnectedChat's real server/auth/storage/Runtime/installed chat Feature.
-//! The browser uses the actual static Web build and Account API-token auth; only
-//! the external model and response-loss/Busy timing are controlled. Shared Body
+//! The browser uses the actual static Web build and real persisted session-cookie auth;
+//! only the external model and response-loss/Busy timing are controlled. Shared Body
 //! start/stop/restore and canonical/legacy Subject navigation stay real. Restore
 //! requires the runner-owned isolation checked before either server starts.
 //! Build `web/workspace` first, then explicitly select:
@@ -133,6 +133,7 @@ async fn chat_web_connected_busy_unknown_replay_and_authorization_use_real_runti
     )
     .await;
     let subject = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"), json!({"operation_id":"browser-connected-subject","role":"Web connected companion","behavior_md":""})).await["id"].as_str().unwrap().to_owned();
+    let other_subject = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"), json!({"operation_id":"browser-other-subject","role":"Other connected companion","behavior_md":""})).await["id"].as_str().unwrap().to_owned();
     let conversation = f.post(&conversations_path(), json!({"operation_id":format!("web-subject-conversation/v1/{subject}"),"subject_id":subject})).await;
     let c = conversation["id"].as_str().unwrap();
     *conversation_id.lock().unwrap() = c.into();
@@ -148,6 +149,31 @@ async fn chat_web_connected_busy_unknown_replay_and_authorization_use_real_runti
     f.lose_next_input_ack
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let foreign = seed_test_api_token(f.api.store.as_ref(), "chat-connected-foreign");
+    let mut sessions = Vec::new();
+    for token in [&f.owner, &foreign] {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let actor = resolve_actor(&ServerAuthApi::from(&f.api), &headers)
+            .await
+            .unwrap()
+            .unwrap();
+        let session = uuid::Uuid::now_v7().to_string();
+        f.api
+            .store
+            .create_browser_session(&BrowserSessionRecord {
+                token_hash: crate::auth::token_hash(&session),
+                session_id: uuid::Uuid::now_v7().to_string(),
+                user_id: actor.user_id,
+                created_at: now_registry_timestamp(),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+                revoked_at: None,
+            })
+            .unwrap();
+        sessions.push(session);
+    }
     let mut child = tokio::process::Command::new("deno")
         .current_dir(&root)
         .args([
@@ -165,7 +191,7 @@ async fn chat_web_connected_busy_unknown_replay_and_authorization_use_real_runti
         .spawn()
         .expect("explicit browser test requires Deno");
     let artifacts = root.join("target/t808-validation/body-connected");
-    let wire = serde_json::to_vec(&json!({"origin":f.url,"workspace_id":TEST_WORKSPACE_ID,"subject_id":subject,"subject_name":"Web connected companion","conversation_id":c,"owner_token":f.owner,"foreign_token":foreign,"artifact_dir":artifacts})).unwrap();
+    let wire = serde_json::to_vec(&json!({"origin":f.url,"workspace_id":TEST_WORKSPACE_ID,"subject_id":subject,"other_subject_id":other_subject,"subject_name":"Web connected companion","conversation_id":c,"owner_token":f.owner,"foreign_token":foreign,"owner_session":sessions[0],"foreign_session":sessions[1],"artifact_dir":artifacts})).unwrap();
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(&wire).await.unwrap();
     drop(stdin);
@@ -180,6 +206,8 @@ async fn chat_web_connected_busy_unknown_replay_and_authorization_use_real_runti
         String::from_utf8_lossy(bytes)
             .replace(&f.owner, "[redacted]")
             .replace(&foreign, "[redacted]")
+            .replace(&sessions[0], "[redacted]")
+            .replace(&sessions[1], "[redacted]")
     };
     assert!(
         output.status.success(),

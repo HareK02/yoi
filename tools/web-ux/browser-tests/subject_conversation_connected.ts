@@ -31,6 +31,7 @@ const git = async (args: string[]) => {
 };
 const pageErrors: string[] = [];
 const captures: unknown[] = [];
+const consoleErrors: { message: string; expected: boolean }[] = [];
 const manifest = {
   evidence: "actual-Web-Backend-SQLite-signed-Runtime; external model scripted",
   source: {
@@ -42,6 +43,8 @@ const manifest = {
   visualVerdict: "UNREVIEWED: implementation author must view images",
   status: "running",
   pageErrors,
+  consoleErrors,
+  workspaceSubscriptions: 0,
   captures,
 };
 const save = () =>
@@ -71,14 +74,50 @@ try {
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1000 },
     colorScheme: "light",
-    extraHTTPHeaders: { Authorization: `Bearer ${input.owner_token}` },
+    extraHTTPHeaders: { Origin: origin.origin },
   });
+  const sessionCookie = (value: string) => ({
+    name: "yoi_workspace_session",
+    value,
+    url: origin.origin,
+    httpOnly: true,
+    sameSite: "Lax" as const,
+  });
+  await context.addCookies([sessionCookie(input.owner_session)]);
   const page = await context.newPage();
   activePage = page;
   page.setDefaultTimeout(30000);
   const posts: Record<string, unknown>[] = [];
   const bodyPosts: { path: string; input: Record<string, unknown> }[] = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("console", (message) => {
+    if (message.type() !== "error") return;
+    const text = message.text().replaceAll(input.owner_token, "[redacted]").replaceAll(
+      input.foreign_token,
+      "[redacted]",
+    ).replaceAll(input.owner_session, "[redacted]").replaceAll(input.foreign_session, "[redacted]");
+    consoleErrors.push({
+      message: text,
+      expected: /net::ERR_FAILED|status of (409|403)/.test(text),
+    });
+  });
+  const subscribed = new Promise<void>((resolve, reject) => {
+    const deadline = setTimeout(
+      () => reject(new Error("real Workspace subscription deadline")),
+      30000,
+    );
+    page.on("websocket", (socket) => {
+      if (!new URL(socket.url()).pathname.endsWith("/protocol/ws")) return;
+      socket.on("framereceived", ({ payload }) => {
+        const frame = JSON.parse(typeof payload === "string" ? payload : payload.toString());
+        if (frame.frame === "response" && frame.message?.result === "subscribed") {
+          manifest.workspaceSubscriptions++;
+          clearTimeout(deadline);
+          resolve();
+        }
+      });
+    });
+  });
   page.on("request", (request) => {
     const path = new URL(request.url()).pathname;
     if (request.method() !== "POST") return;
@@ -88,7 +127,7 @@ try {
     if (path.startsWith(`${bodyPath}/`)) bodyPosts.push({ path, input: request.postDataJSON() });
   });
   // 有限の状態観測で同期する。refreshやACKからRuntimeのidleを推論しない。
-  async function idle() {
+  async function idle(refreshControls = true) {
     await page.waitForFunction(async (path) => {
       const response = await fetch(path, { cache: "no-store" });
       if (!response.ok) return false;
@@ -96,13 +135,17 @@ try {
       return body.observation.kind === "available" &&
         body.observation.worker.worker_state?.state.kind === "idle";
     }, bodyPath);
-    await page.getByRole("button", { name: "Refresh body state", exact: true }).click();
-    await page.getByText("idle", { exact: true }).first().waitFor();
+    if (refreshControls) {
+      await page.getByRole("button", { name: "Refresh body state", exact: true }).click();
+      await page.getByText("idle", { exact: true }).first().waitFor();
+    }
   }
   const response = await page.goto(`${origin.origin}${legacy}${suffix}`);
   assertEquals(response?.status(), 200);
   await page.waitForURL(`${origin.origin}${detail}${suffix}`);
   await page.getByText("No current conversation body.", { exact: true }).waitFor();
+  await subscribed;
+  assertEquals(await page.getByText("Worker updates unavailable", { exact: true }).count(), 0);
   await capture(page, "light-1440-absent-detail");
   await page.getByRole("button", { name: "Start conversation body", exact: true }).click();
   await idle();
@@ -115,6 +158,7 @@ try {
   await open.click();
   await page.waitForURL(`${origin.origin}${chat}`);
   await page.getByText("No public messages yet.").waitFor();
+  await page.getByRole("textbox", { name: `Message to ${input.subject_name}` }).focus();
   await capture(page, "light-1440-empty-chat");
   for (const alias of ["conversation", "chat"]) {
     const response = await page.goto(`${origin.origin}${legacy}/${alias}${suffix}`);
@@ -243,7 +287,9 @@ try {
   const observed = await context.request.get(`${origin.origin}/__fixture/model-resumed`);
   assertEquals(observed.status(), 200);
   assertEquals(await observed.json(), { observed: true });
-  await idle();
+  // UIの停止tokenは再開後の新turnより前の実観測のまま残す。
+  // Runtimeが新turnを終えても、その古い観測からの停止を認めない。
+  await idle(false);
   await page.getByRole("button", { name: "Refresh history", exact: true }).click();
   await history.getByText("WEB_CONNECTED_AFTER_RESTART", { exact: true }).waitFor();
   assertEquals(
@@ -258,30 +304,66 @@ try {
       await capture(page, `${theme}-${width}-restored-chat`, theme);
     }
   }
+  const staleResponse = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === `${bodyPath}/stop` &&
+    response.request().method() === "POST"
+  );
+  const independentObservation = page.waitForResponse((response) =>
+    new URL(response.url()).pathname === bodyPath && response.request().method() === "GET"
+  );
   await page.getByRole("button", { name: "Stop conversation body", exact: true }).click();
-  const stopDisposition = await Promise.race([
-    page.getByText("Body stopped.", { exact: true }).waitFor().then(() => "stopped"),
-    page.getByText("Request rejected.", { exact: true }).waitFor().then(() => "rejected"),
-  ]);
-  if (stopDisposition === "rejected") {
-    // 実Backendの既知の未実行拒否だけが新観測・新依頼へ進める。
-    // unknownをここで清算したり、同IDの入力を差し替えたりしない。
-    await page.getByRole("button", { name: "Refresh body state", exact: true }).click();
-    await page.getByRole("button", { name: "Stop conversation body", exact: true }).click();
-    await page.getByText("Body stopped.", { exact: true }).waitFor();
-    const stops = bodyPosts.filter((post) => post.path === `${bodyPath}/stop`);
-    assert(stops.at(-1)!.input.request_id !== stops.at(-2)!.input.request_id);
-  }
+  const stale = await staleResponse;
+  assertEquals(stale.status(), 409);
+  const failed = await stale.json();
+  assertEquals(Object.keys(failed).sort(), ["diagnostics", "error", "message", "request"]);
+  assertEquals(failed.request, {
+    workspace_id: input.workspace_id,
+    subject_id: input.subject_id,
+    request_id: bodyPosts.at(-1)!.input.request_id,
+    resolution: "not_accepted",
+  });
+  await page.getByRole("alert").filter({ hasText: /Request not accepted\./ }).waitFor();
+  assertEquals((await independentObservation).status(), 200);
+  await capture(page, "dark-390-stale-stop-not-accepted", "dark");
+  // 既知terminal拒否と独立GETの後に限り、新たな利用者操作を行う。
+  await page.getByRole("button", { name: "Stop conversation body", exact: true }).click();
+  await page.getByText("Body stopped.", { exact: true }).waitFor();
+  const stops = bodyPosts.filter((post) => post.path === `${bodyPath}/stop`);
+  assertEquals(stops.length, 3);
+  assert(stops.at(-1)!.input.request_id !== stops.at(-2)!.input.request_id);
   assertEquals(await history.getByRole("listitem").count(), 5);
   assertEquals(bodyPosts.filter((post) => post.path === `${bodyPath}/start`).length, 2);
-  assertEquals(
-    bodyPosts.filter((post) => post.path === `${bodyPath}/stop`).length,
-    stopDisposition === "rejected" ? 3 : 2,
+  // 通常のSPA導線で別Subjectへ移動し、元の履歴・Body・入力を持ち越さない。
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.getByLabel("Workspace sections").getByRole("link", { name: "Subjects", exact: true })
+    .click();
+  await page.locator(`a[href="${subjectHref(input.workspace_id, input.other_subject_id)}"]`)
+    .click();
+  await page.getByRole("link", { name: "Open conversation", exact: true }).click();
+  await page.waitForURL(
+    `${origin.origin}${subjectChatHref(input.workspace_id, input.other_subject_id)}`,
   );
+  await page.getByText("No public messages yet.").waitFor();
+  await page.getByText("No current conversation body.", { exact: true }).waitFor();
+  assertEquals(await history.getByRole("listitem").count(), 0);
+  assertEquals(await composer.count(), 0);
+  await capture(page, "dark-1440-other-subject", "dark");
+  await page.getByLabel("Workspace sections").getByRole("link", { name: "Subjects", exact: true })
+    .click();
+  await page.locator(`a[href="${detail}"]`).click();
+  await page.getByRole("link", { name: "Open conversation", exact: true }).click();
+  await page.getByText("WEB_CONNECTED_AFTER_RESTART", { exact: true }).waitFor();
+  assertEquals(await history.getByRole("listitem").count(), 5);
+  assertEquals(posts.length, 5, "navigation must not resubmit either conversation's input");
   const deniedPath = `${origin.origin}${base}/${
     encodeURIComponent(input.conversation_id)
   }/messages`;
-  await context.setExtraHTTPHeaders({ Authorization: `Bearer ${input.foreign_token}` });
+  const ownerIdentity = await (await context.request.get(`${origin.origin}/api/auth/whoami`))
+    .json();
+  await context.addCookies([sessionCookie(input.foreign_session)]);
+  const foreignIdentity = await (await context.request.get(`${origin.origin}/api/auth/whoami`))
+    .json();
+  assert(ownerIdentity.actor.account_id !== foreignIdentity.actor.account_id);
   const denied = await context.request.post(deniedPath, {
     data: { operation_id: "foreign-cannot-post", text: "must not append" },
   });
@@ -292,8 +374,29 @@ try {
   await page.getByRole("alert").filter({ hasText: /Body state could not be confirmed/ }).waitFor();
   assertEquals(await page.getByRole("textbox").count(), 0);
   assertEquals(await history.getByRole("listitem").count(), 0);
+  await page.setViewportSize({ width: 390, height: 1000 });
   await capture(page, "dark-390-permission-denied", "dark");
+  const accountTab = await context.newPage();
+  try {
+    await accountTab.goto(origin.origin);
+    await accountTab.evaluate(
+      'localStorage.setItem("yoi.browser-auth-generation", JSON.stringify({id:crypto.randomUUID(),reason:"authentication"}))',
+    );
+    await page.getByRole("alert").filter({
+      hasText: /The conversation account could not be confirmed/,
+    }).waitFor();
+    assertEquals(
+      await page.getByRole("heading", { name: "Conversation body", exact: true }).count(),
+      0,
+    );
+    assertEquals(await composer.count(), 0);
+    await capture(page, "dark-390-account-generation-fenced", "dark");
+  } finally {
+    await accountTab.close();
+  }
   assertEquals(pageErrors, []);
+  assertEquals(consoleErrors.filter((error) => !error.expected), []);
+  assert(manifest.workspaceSubscriptions > 0);
   manifest.status = "passed";
   console.log(
     "real Web -> Backend -> Runtime -> explicit public replies passed; scripted model; shared Body start/stop/restore and canonical/legacy routes included",

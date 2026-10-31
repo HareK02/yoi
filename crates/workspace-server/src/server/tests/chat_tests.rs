@@ -968,6 +968,14 @@ impl ConnectedChat {
         let mut config = test_server_config(dir.path());
         config.backend_base_url = Some(url.clone());
         config.static_assets_dir = assets.clone();
+        if assets.is_some() {
+            config.auth = AuthConfig::Passkey {
+                rp_id: "127.0.0.1".into(),
+                origin: url.clone(),
+                public_base_url: url.clone(),
+                cookie_name: "yoi_workspace_session".into(),
+            };
+        }
         let control = Arc::new(test_control_store(&config));
         seed_test_registered_workspace(control.as_ref(), &config)
             .await

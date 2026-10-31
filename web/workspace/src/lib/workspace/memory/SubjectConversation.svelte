@@ -189,7 +189,7 @@
 <section class="subject-conversation" aria-label="Conversation with {subjectName}">
   <header>
     <h2>Conversation</h2>
-    {#if !inaccessible}<button type="button" onclick={() => refresh()} disabled={reading}>{reading ? 'Loading history…' : 'Refresh history'}</button>{/if}
+    {#if !inaccessible}<button class="workspace-secondary-button" type="button" onclick={() => refresh()} disabled={reading}>{reading ? 'Loading history…' : 'Refresh history'}</button>{/if}
   </header>
   {#if historyError}<p class="error" role="alert">{historyError}</p>{/if}
   {#if !conversation && !historyError && !inaccessible}<p role="status">Loading conversation…</p>{/if}
@@ -202,7 +202,7 @@
     {/each}
   </ol>
   {#if conversation && messages.length === 0}<p>No public messages yet.</p>{/if}
-  {#if hasMore && !inaccessible}<button type="button" onclick={() => refresh()} disabled={reading}>Load newer messages</button>{/if}
+  {#if hasMore && !inaccessible}<button class="workspace-secondary-button" type="button" onclick={() => refresh()} disabled={reading}>Load newer messages</button>{/if}
 
   <div class="send-status" aria-live="polite">
     {#if sending}<p>Sending saved input…</p>
@@ -210,11 +210,11 @@
     {:else if attempt}<p>Previous send outcome is unknown. Its original input is retained.</p>{/if}
   </div>
   {#if sendError}<p class="error" role="alert">{sendError}</p>{/if}
-  {#if storageBlocked}<button type="button" onclick={recheckStorage} disabled={sending}>Recheck retry storage</button>{/if}
+  {#if storageBlocked}<button class="workspace-secondary-button" type="button" onclick={recheckStorage} disabled={sending}>Recheck retry storage</button>{/if}
   {#if attempt}
     <details><summary>Retained send input</summary><p class="message-text">{attempt.text}</p></details>
     <p>Retry uses the same ID and full input. Runtime duplicate suppression has bounded receipt retention; it is not an indefinite delivery guarantee.</p>
-    {#if !inaccessible && !storageBlocked}<button type="button" onclick={() => send(true)} disabled={sending || !conversation}>Retry same input</button>{/if}
+    {#if !inaccessible && !storageBlocked}<button class="workspace-secondary-button" type="button" onclick={() => send(true)} disabled={sending || !conversation}>Retry same input</button>{/if}
   {/if}
   {#if !inaccessible}
     <form onsubmit={(event) => { event.preventDefault(); void send(); }}>
@@ -223,7 +223,7 @@
       <p id="conversation-constraint">Text only, up to {CHAT_LIMITS.maxTextBytes} UTF-8 bytes. Attachments are not supported.</p>
       {#if draftBytes > CHAT_LIMITS.maxTextBytes}<p class="error">The message exceeds the text limit.</p>{/if}
       {#if attempt}<p>Resolve the retained send before sending another message. Your next draft remains editable.</p>{/if}
-      <button type="submit" disabled={sending || !!attempt || storageBlocked || !conversation || !draft.trim() || draftBytes > CHAT_LIMITS.maxTextBytes}>Send message</button>
+      <button class="workspace-secondary-button" type="submit" disabled={sending || !!attempt || storageBlocked || !conversation || !draft.trim() || draftBytes > CHAT_LIMITS.maxTextBytes}>Send message</button>
     </form>
   {/if}
 </section>
@@ -238,6 +238,9 @@
   .message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
   form { display: grid; gap: var(--space-2); }
   textarea { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line-strong); padding: var(--space-2); }
-  button { justify-self: start; }
+  button { justify-self: start; font-size: var(--font-size-body); line-height: var(--line-height-body); border-radius: var(--radius-soft); }
+  button:hover:not(:disabled) { background: var(--interactive-hover); }
+  button:active:not(:disabled) { background: var(--interactive-selected); }
+  button:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .error { color: var(--danger); }
 </style>
