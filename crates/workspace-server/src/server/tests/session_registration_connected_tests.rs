@@ -199,10 +199,99 @@ fn contains_saved_value(saved: &Value, expected: &Value) -> bool {
 }
 
 fn read_metadata(root: &std::path::Path, worker: &str) -> Value {
-    // WorkerAggregateStore owns metadata.json; worker.json is the Runtime
-    // catalog. Open a new file handle on each read.
-    let path = root.join("workers").join(worker).join("metadata.json");
-    serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap()
+    // Reopen the canonical metadata store, not the separate Runtime catalog.
+    let name = format!("worker-runtime-{worker}");
+    let store = session_store::WorkerAggregateStore::open_read_only(
+        &root.join("workers").join(worker),
+        &name,
+    )
+    .unwrap();
+    let metadata = store.read_by_name(&name).unwrap().unwrap();
+    assert!(matches!(
+        metadata.decode_startup_failure::<SessionRegistrationCause>(),
+        session_store::worker_metadata::StartupFailureRead::Present(_)
+    ));
+    serde_json::to_value(metadata).unwrap()
+}
+
+#[tokio::test]
+async fn session_registration_real_judgments_separate_operator_subject_and_attribution() {
+    // This normal boundary fixture uses the real router, Runtime signature,
+    // authority store and attribution store; its Runtime does not run a model.
+    let f = Fixture::new().await;
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/sessions");
+    let missing_session = session_store::new_session_id().to_string();
+    let request = json!({"session_id": missing_session, "create_if_missing": false});
+    let (status, body) = response(
+        &f.api,
+        human_request(&f.owner, "POST", &path, Some(request.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_registration_cause(
+        body,
+        SessionRegistrationCause::denied(SessionPrincipal::Operator),
+    );
+
+    let signed = |request: &Value| {
+        runtime_source_request(
+            &f.identity,
+            Some(&f.source.worker_id),
+            "POST",
+            &path,
+            serde_json::to_vec(request).unwrap(),
+        )
+    };
+    let (status, body) = response(&f.api, signed(&request)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_registration_cause(body, SessionRegistrationCause::attribution_missing());
+
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let foreign_session = session_store::new_session_id().to_string();
+    store
+        .record_session_attribution(
+            crate::subjektiv::SubjectSessionAttribution::new(
+                &f.subject,
+                &f.source.runtime_id,
+                "foreign-worker",
+                &foreign_session,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let (status, body) = response(
+        &f.api,
+        signed(&json!({"session_id":foreign_session, "create_if_missing":false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_registration_cause(body, SessionRegistrationCause::binding_mismatch());
+
+    // The fixture removes its bootstrap policy only after the real setup POST.
+    let (status, body) = response(
+        &f.api,
+        signed(&json!({"session_id":missing_session, "create_if_missing":true})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_registration_cause(
+        body,
+        SessionRegistrationCause::denied(SessionPrincipal::Subject),
+    );
+    assert!(
+        store
+            .session_attribution(&missing_session)
+            .unwrap()
+            .is_none()
+    );
+}
+
+fn assert_registration_cause(body: Value, cause: SessionRegistrationCause) {
+    let error: server_api::RepositoryApiError = serde_json::from_value(body).unwrap();
+    assert_eq!(
+        error.failure,
+        Some(session_registration_attachment(cause).unwrap())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

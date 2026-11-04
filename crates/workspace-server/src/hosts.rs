@@ -6772,6 +6772,9 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
         ),
     };
     if let EmbeddedRuntimeError::WorkerExecutionRejected { result, .. } = error {
+        if result.startup_failure.is_some() {
+            projection.message = "Embedded Runtime Worker startup failed".into();
+        }
         projection.startup = result.startup_failure.as_ref().and_then(|primary| {
             internal_startup_transfer(runtime_api::WorkerStartupFailure {
                 primary: primary.clone(),
@@ -7177,6 +7180,79 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn session_registration_embedded_and_remote_host_projection_is_internal_only() {
+        use protocol::session_failure::{
+            SessionPrincipal, SessionRegistrationCause, session_registration_attachment,
+        };
+        use worker_runtime::execution::{
+            WorkerExecutionOperation, WorkerExecutionOutcome, WorkerExecutionResult,
+        };
+        let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn);
+        result.outcome = WorkerExecutionOutcome::Errored;
+        result.startup_failure = Some(
+            session_registration_attachment(SessionRegistrationCause::denied(
+                SessionPrincipal::Subject,
+            ))
+            .unwrap(),
+        );
+        result.startup_failure_persistence =
+            Some(protocol::startup_failure::StartupPersistenceOutcome::OutcomeUnknown);
+        result.secondary_failures.push(
+            protocol::startup_failure::StartupSecondaryFailure::Persistence {
+                phase: protocol::startup_failure::StartupFailurePhase::MetadataSave,
+                outcome: protocol::startup_failure::StartupPersistenceOutcome::OutcomeUnknown,
+            },
+        );
+        let error = EmbeddedRuntimeError::WorkerExecutionRejected {
+            worker_id: EmbeddedWorkerId::now_v7(),
+            operation: result.operation,
+            outcome: result.outcome,
+            message: "TEST_ONLY_CREDENTIAL /private/path raw_http_body".into(),
+            result,
+        };
+        let embedded = embedded_runtime_diagnostic(&error);
+        let mut wire = runtime_api::RuntimeApiError::new(
+            500,
+            "worker_execution_rejected",
+            "unused remote prose",
+        );
+        wire.error.startup = embedded.startup.clone();
+        let received = serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
+        let remote = runtime_api_diagnostic(
+            "remote",
+            runtime_api::client_support::ClientError::Public {
+                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                error: received,
+            },
+        );
+        assert!(embedded.startup.is_some());
+        assert_eq!(embedded.startup, remote.startup);
+        let public = serde_json::to_value(&remote).unwrap();
+        assert!(
+            public.get("startup").is_none(),
+            "no blind public/storage attachment forwarding"
+        );
+        for secret in ["TEST_ONLY_CREDENTIAL", "/private/path", "raw_http_body"] {
+            assert!(!serde_json::to_string(&embedded).unwrap().contains(secret));
+        }
+
+        let legacy = runtime_api_diagnostic(
+            "remote",
+            runtime_api::client_support::ClientError::Public {
+                status: reqwest::StatusCode::FORBIDDEN,
+                error: runtime_api::RuntimeApiError::new(403, "forbidden", "session.record denied"),
+            },
+        );
+        assert!(
+            legacy.startup.is_none(),
+            "HTTP status and prose cannot attest a Session cause"
+        );
+        let mut corrupt = embedded.startup.unwrap();
+        corrupt.primary = serde_json::from_value(json!("not an error-contract envelope")).unwrap();
+        assert!(internal_startup_transfer(corrupt).is_none());
+    }
 
     #[tokio::test]
     async fn async_workdir_authorization_uses_store_capacity_without_bearer_fallback() {
