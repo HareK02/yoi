@@ -66,6 +66,7 @@ webauthn-rs = { workspace = true, features = ["conditional-ui"] }
 webauthn-rs-proto = "0.5.5"
 
 [dev-dependencies]
+error-contract.workspace = true
 content-history.workspace = true
 content-history-store.workspace = true
 content-history-adapters.workspace = true

@@ -7580,6 +7580,7 @@ dependencies = [
  "content-history",
  "content-history-adapters",
  "content-history-store",
+ "error-contract",
  "feature-storage",
  "flate2",
  "flow",
