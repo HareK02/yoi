@@ -31,6 +31,9 @@ members = [
     "crates/builtin-source",
     "crates/config-source",
     "crates/config-source-wasm",
+    "crates/content-history",
+    "crates/content-history-store",
+    "crates/content-history-adapters",
     "crates/workdir",
     "crates/tui",
     "crates/memory",
@@ -74,6 +77,9 @@ default-members = [
     "crates/builtin-source",
     "crates/config-source",
     "crates/config-source-wasm",
+    "crates/content-history",
+    "crates/content-history-store",
+    "crates/content-history-adapters",
     "crates/workdir",
     "crates/tui",
     "crates/memory",
@@ -140,6 +146,9 @@ secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }
 builtin-source = { path = "crates/builtin-source" }
 config-source = { path = "crates/config-source" }
+content-history = { path = "crates/content-history" }
+content-history-store = { path = "crates/content-history-store" }
+content-history-adapters = { path = "crates/content-history-adapters" }
 error-contract = { path = "crates/error-contract" }
 fs-operation = { path = "crates/fs-operation" }
 workdir = { path = "crates/workdir" }
