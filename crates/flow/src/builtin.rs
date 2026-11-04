@@ -73,6 +73,41 @@ mod tests {
     }
 
     #[test]
+    fn compiled_handoff_uses_host_owned_retry_identity() {
+        let flow = builtin_flow_source(CODER_REVIEW_FLOW_SLUG)
+            .unwrap()
+            .compile()
+            .unwrap();
+        let complete = flow
+            .state(&crate::StateId::new("complete").unwrap())
+            .unwrap();
+        assert!(
+            complete
+                .instructions
+                .contains("The Host owns transport retry identity")
+        );
+        assert!(
+            complete
+                .instructions
+                .contains("do not supply operation_key")
+        );
+        assert!(!complete.instructions.contains("same key and full input"));
+        let fix = flow.state(&crate::StateId::new("fix").unwrap()).unwrap();
+        assert!(
+            fix.instructions
+                .contains("rerun validation affected by the fixes")
+        );
+        assert!(
+            fix.instructions
+                .contains("Cite reusable evidence for unaffected scope")
+        );
+        assert!(
+            fix.instructions
+                .contains("Source movement invalidates the prior verdict")
+        );
+    }
+
+    #[test]
     fn every_builtin_flow_compiles_and_matches_catalog_identity() {
         assert!(!builtin_flow_sources().is_empty());
         for source in builtin_flow_sources() {

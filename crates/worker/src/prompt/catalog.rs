@@ -824,6 +824,20 @@ mod tests {
     }
 
     #[test]
+    fn flow_verifier_reuses_inspected_evidence_without_claiming_live_read_authority() {
+        let prompt = PromptCatalog::builtins_only()
+            .unwrap()
+            .flow_verifier_system()
+            .unwrap();
+        assert!(prompt.contains("stable entry references"));
+        assert!(prompt.contains("unchanged tree under equivalent conditions"));
+        assert!(prompt.contains("never transfers an old approval or authority"));
+        assert!(prompt.contains("cannot perform live MR or other-session reads"));
+        assert!(prompt.contains("return `indeterminate`"));
+        assert!(prompt.contains("FinishFlowVerification"));
+    }
+
+    #[test]
     fn merge_request_prompts_keep_recording_and_reviewer_contracts() {
         let catalog = PromptCatalog::builtins_only().unwrap();
         let common = &catalog.projection.templates["common.merge_request"];

@@ -16148,6 +16148,10 @@ mod build_summary_prompt_tests {
         assert!(worker.history().is_empty());
     }
 
+    mod prompt_wiring_tests {
+        include!("worker/prompt_wiring_tests.rs");
+    }
+
     #[tokio::test]
     async fn worker_without_initial_system_prompt_does_not_load_feature_contribution() {
         let dir = tempfile::tempdir().unwrap();
