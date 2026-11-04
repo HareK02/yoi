@@ -1,0 +1,22 @@
+{
+  "grants": [
+    { "kind": "set", "value": "ticket" },
+    {
+      "kind": "namespace",
+      "value": {
+        "namespace": "ticket",
+        "keys": ["ticket.hoge", "ticket.hoge.fuga.finish"]
+      }
+    }
+  ],
+  "exclusions": [
+    {
+      "kind": "namespace",
+      "value": {
+        "namespace": "ticket",
+        "keys": ["ticket.hoge.unlinked"]
+      }
+    }
+  ],
+  "revoked": false
+}

@@ -50,6 +50,12 @@ impl NamespaceHandle {
     pub fn namespace(&self) -> &NamespaceId {
         &self.namespace
     }
+
+    /// Compare the actual registrations, never caller-supplied owner names.
+    pub fn is_owned_by(&self, feature: &FeatureHandle) -> bool {
+        Arc::ptr_eq(&self.feature.host, &feature.host)
+            && Arc::ptr_eq(&self.feature.registration, &feature.registration)
+    }
 }
 #[derive(Clone, Debug)]
 struct FeatureRecord {

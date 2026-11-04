@@ -1,0 +1,45 @@
+{
+  "workspace": "workspace-a",
+  "namespaces": [
+    {
+      "namespace": "ticket",
+      "feature": "builtin:ticket",
+      "enabled": true,
+      "declaration": {
+        "permissions": [
+          {
+            "key": "ticket.hoge",
+            "description": "Root operation with explicit children",
+            "children": ["ticket.hoge.fuga"]
+          },
+          {
+            "key": "ticket.hoge.fuga",
+            "description": "Intermediate operation with an explicit child",
+            "children": ["ticket.hoge.fuga.finish"]
+          },
+          {
+            "key": "ticket.hoge.fuga.finish",
+            "description": "Leaf operation",
+            "children": []
+          },
+          {
+            "key": "ticket.hoge.unlinked",
+            "description": "Same prefix without an inclusion edge",
+            "children": []
+          }
+        ],
+        "sets": [
+          {
+            "set": "ticket",
+            "children": [
+              {
+                "kind": "namespace",
+                "value": { "namespace": "ticket", "keys": ["ticket.hoge"] }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -41,6 +41,8 @@ use background::{
     FeatureBackgroundTaskRegistryBuilder,
 };
 
+pub mod permissions;
+
 /// Stable source-qualified identifier for a feature module.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FeatureId(String);
@@ -718,6 +720,16 @@ impl FeatureDescriptor {
 /// Feature module contribution boundary.
 pub trait FeatureModule: Send + Sync {
     fn descriptor(&self) -> FeatureDescriptor;
+
+    /// Declare operation keys through the Host-bound owner registrar. This does
+    /// not activate the Feature or grant permissions to any execution subject.
+    fn declare_permissions(
+        &self,
+        _registrar: &mut permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        Ok(())
+    }
+
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError>;
 }
 
@@ -2112,6 +2124,15 @@ impl FeatureRegistryBuilder {
             .iter()
             .map(|module| module.descriptor())
             .collect()
+    }
+
+    /// Build a declaration catalog for the authenticated Workspace, independently
+    /// of Worker policy and activation. Only trusted selected modules run here.
+    pub fn permission_registry(
+        &self,
+        workspace: feature_permissions::WorkspaceId,
+    ) -> Result<permissions::FeaturePermissionRegistry, FeatureInstallError> {
+        permissions::FeaturePermissionRegistry::from_builder(self, workspace)
     }
 
     pub fn plan(&self) -> Result<FeatureInstallPlan, FeaturePlanError> {

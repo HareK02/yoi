@@ -8,6 +8,7 @@ pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, WebSocketOperation};
 pub mod authorization;
 mod chat;
+pub mod feature_permissions;
 pub use chat::*;
 mod subject_body;
 pub use subject_body::*;
