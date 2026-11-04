@@ -340,6 +340,9 @@ impl SqliteWorkspaceStore {
     ) -> Result<WorkspaceConfigState> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if crate::config_adoption::canonical(&tx, workspace_id)? {
+                return Err(config_conflict("configuration authority is adopted; use owner adoption with the observed editing head and operation ID"));
+            }
             let workspace_exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
                 [workspace_id],
@@ -490,7 +493,7 @@ fn format_candidate_sources(
 }
 
 // Read persisted provenance, not load_state's upgraded in-memory contract.
-fn load_evaluation_identity(
+pub(crate) fn load_evaluation_identity(
     conn: &rusqlite::Connection,
     workspace_id: &str,
 ) -> Result<(String, String)> {
@@ -509,7 +512,7 @@ fn has_plugin_provider(bundle: &WorkspaceConfigSchemaBundle) -> bool {
         .any(|provider| provider.provider_id == "builtin:plugins")
 }
 
-fn evaluate_candidate_in_transaction(
+pub(crate) fn evaluate_candidate_in_transaction(
     tx: &rusqlite::Transaction<'_>,
     workspace_id: &str,
     current: WorkspaceConfigState,
@@ -564,6 +567,21 @@ fn evaluate_candidate(
         contract,
         evaluation,
     })
+}
+
+pub(crate) fn sync_adopted_config_references(
+    tx: &rusqlite::Transaction<'_>, workspace: &str, state: &WorkspaceConfigState,
+) -> Result<()> {
+    if has_plugin_provider(&state.contract.schema_bundle) {
+        let (contract, evaluation, resolved) = crate::plugin_settings::evaluate_catalog_config(
+            tx, workspace, &state.snapshot, state.contract.schema_bundle.clone(),
+        )?;
+        if contract != state.contract || evaluation.projection_digest != state.projection_digest {
+            return Err(config_conflict("Plugin catalog/schema changed during adoption"));
+        }
+        crate::plugin_settings::sync_config_references(tx, workspace, &resolved)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn load_state(
@@ -792,7 +810,7 @@ fn config_not_materialized() -> Error {
     Error::RegistryInconsistency("workspace config tree is not materialized".to_string())
 }
 
-fn validate_entrypoint_request(entrypoints: &[VirtualPath]) -> Result<()> {
+pub(crate) fn validate_entrypoint_request(entrypoints: &[VirtualPath]) -> Result<()> {
     if entrypoints == [main_config_path()] {
         Ok(())
     } else {

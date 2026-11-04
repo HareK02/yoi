@@ -7579,6 +7579,7 @@ dependencies = [
  "content-history",
  "content-history-adapters",
  "content-history-store",
+ "feature-permissions",
  "feature-storage",
  "flate2",
  "flow",

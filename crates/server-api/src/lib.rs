@@ -9,6 +9,7 @@ pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, Web
 pub mod authorization;
 mod chat;
 pub mod feature_permissions;
+pub mod configuration_adoption;
 pub use chat::*;
 mod subject_body;
 pub use subject_body::*;

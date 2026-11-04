@@ -5,6 +5,9 @@ pub mod authority;
 pub mod backend_job;
 pub mod companion;
 pub mod config;
+pub mod config_adoption;
+mod configuration_migration;
+pub mod policy_config;
 pub mod config_source;
 #[cfg(test)]
 mod content_history_tests;

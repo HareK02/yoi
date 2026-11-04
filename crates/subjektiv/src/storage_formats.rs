@@ -81,7 +81,14 @@ pub(super) fn validate(
     applied: &[(u32, String)],
 ) -> feature_storage::Result<()> {
     let format = recognize(applied)?;
-    let expected = reference_shape(format)?;
+    let transfer = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='permission_source_transfer_receipt')",
+        [], |row| row.get::<_, bool>(0),
+    )?;
+    if transfer && matches!(format, Format::Common(count) if count < COMMON_COUNT) {
+        return Err(incompatible("permission transfer requires complete common 1..17"));
+    }
+    let expected = reference_shape_with_transfer(format, transfer)?;
     let actual = domain_shape(tx)?;
     if actual != expected {
         let difference = actual
@@ -115,9 +122,14 @@ fn domain_shape(connection: &Connection) -> feature_storage::Result<Vec<SchemaOb
     Ok(shape)
 }
 
+#[cfg(test)]
 fn reference_shape(format: Format) -> feature_storage::Result<Vec<SchemaObject>> {
+    reference_shape_with_transfer(format, false)
+}
+
+fn reference_shape_with_transfer(format: Format, transfer: bool) -> feature_storage::Result<Vec<SchemaObject>> {
     // Cache reference shapes only; every target is reread under its caller's transaction.
-    static SHAPES: [OnceLock<Vec<SchemaObject>>; 25] = [const { OnceLock::new() }; 25];
+    static SHAPES: [OnceLock<Vec<SchemaObject>>; 50] = [const { OnceLock::new() }; 50];
     let index = match format {
         Format::Common(count) => count,
         Format::Permission18 => 18,
@@ -127,7 +139,7 @@ fn reference_shape(format: Format) -> feature_storage::Result<Vec<SchemaObject>>
         Format::Consolidation20 => 22,
         Format::Fixed20 => 23,
         Format::Cancellation20 => 24,
-    };
+    } + if transfer { 25 } else { 0 };
     if let Some(shape) = SHAPES[index].get() {
         return Ok(shape.clone());
     }
@@ -184,9 +196,56 @@ fn reference_shape(format: Format) -> feature_storage::Result<Vec<SchemaObject>>
             tx.execute_batch(CONSOLIDATION_SQL)?;
         }
     }
+    if transfer {
+        install_transfer_shape(&tx, format == Format::Permission18)?;
+    }
     let shape = domain_shape(&tx)?;
     let _ = SHAPES[index].set(shape.clone());
     Ok(shape)
+}
+
+/// Installs a separate permission-domain v1 shape without changing common/published receipts.
+/// Existing published seals and their serialized exports are never rewritten or relabelled.
+/// The FeatureDatabase guard and caller's transaction cover validation and installation.
+pub(super) fn install_permission_transfer(tx: &Transaction<'_>) -> feature_storage::Result<()> {
+    let mut statement = tx.prepare(&format!("SELECT version,name FROM {HISTORY_TABLE} ORDER BY version"))?;
+    let applied = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<(u32, String)>, _>>()?;
+    let format = recognize(&applied)?;
+    if matches!(format, Format::Common(count) if count < COMMON_COUNT) {
+        return Ok(());
+    }
+    validate(tx, &applied)?;
+    let installed: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='permission_source_transfer_receipt')",
+        [], |row| row.get(0),
+    )?;
+    if !installed {
+        install_transfer_shape(tx, format == Format::Permission18)?;
+    }
+    validate(tx, &applied)
+}
+
+fn install_transfer_shape(tx: &Transaction<'_>, published_permission: bool) -> feature_storage::Result<()> {
+    if !published_permission {
+        tx.execute_batch(PERMISSION_SEAL_SQL)?;
+    }
+    tx.execute_batch(include_str!("permissions/transfer.sql"))?;
+    // Seal every legacy writer. New execution binding evidence has no legacy-source FK and
+    // lives in the extension table, leaving published grants and their triggers intact.
+    for table in PERMISSION_FENCE_TABLES {
+        for action in ["INSERT", "UPDATE", "DELETE"] {
+            let deletion_exception = if action == "DELETE" {
+                " AND NOT EXISTS(SELECT 1 FROM subject_deletions WHERE subject_id=OLD.subject_id)"
+            } else { "" };
+            tx.execute_batch(&format!(
+                "CREATE TRIGGER permission_transfer_fence_{table}_{action} BEFORE {action} ON {table}
+                 WHEN EXISTS(SELECT 1 FROM permission_authority_seal){deletion_exception}
+                 BEGIN SELECT RAISE(ABORT, 'legacy permission authority is sealed'); END;"
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 const PERMISSION_FENCE_TABLES: [&str; 4] = [
@@ -196,7 +255,9 @@ const PERMISSION_FENCE_TABLES: [&str; 4] = [
     "worker_execution_grants",
 ];
 
-// Frozen physical shape evidence, not target migrations. Permission SQL is from
+// Published DDL is retained byte-for-byte as physical shape evidence. Only the permission
+// fragment is also reused by the explicit separate-domain initializer above, never as migration 18.
+// Permission SQL is from
 // 9edebfa5936f2411adb6affffc793d3e93cc21bd:crates/subjektiv/src/permissions/authority.rs.
 // Journal/consolidation SQL is from 7b39a44ca698c474287e5511f674f2e8baae4c03:
 // crates/subjektiv/src/{consolidation_write_bindings.sql,journal/final_scope.sql,

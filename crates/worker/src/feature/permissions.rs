@@ -146,3 +146,7 @@ impl FeaturePermissionRegistry {
 
 #[cfg(test)]
 mod tests;
+
+#[path = "builtin/permission_catalog.rs"]
+mod builtin_catalog;
+pub use builtin_catalog::builtin_permission_host;

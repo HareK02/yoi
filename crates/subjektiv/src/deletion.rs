@@ -319,6 +319,11 @@ impl SubjektivStore {
                 UNION SELECT subject_id,runtime_id,worker_id FROM journal_writer_bindings WHERE subject_id=?1
                 UNION SELECT subject_id,runtime_id,worker_id FROM worker_execution_grants WHERE subject_id=?1
                 UNION SELECT subject_id,json_extract(record_json,'$.origin_runtime_id'),json_extract(record_json,'$.origin_worker_id') FROM worker_execution_grants WHERE subject_id=?1",[subject])?;
+            if permissions::transfer::has_table(tx, "canonical_worker_execution_grants")? {
+                tx.execute("INSERT OR IGNORE INTO subject_deleted_workers(subject_id,runtime_id,worker_id)
+                    SELECT subject_id,runtime_id,worker_id FROM canonical_worker_execution_grants WHERE subject_id=?1
+                    UNION SELECT subject_id,json_extract(record_json,'$.origin_runtime_id'),json_extract(record_json,'$.origin_worker_id') FROM canonical_worker_execution_grants WHERE subject_id=?1", [subject])?;
+            }
             tx.execute("INSERT INTO subject_deleted_sessions(subject_id,session_id)
                 SELECT subject_id,session_id FROM subject_session_attributions WHERE subject_id=?1
                 UNION SELECT subject_id,source_session_id FROM journals WHERE subject_id=?1
@@ -400,6 +405,9 @@ impl SubjektivStore {
                     ),
                     [subject],
                 )?;
+            }
+            if permissions::transfer::has_table(tx, "canonical_worker_execution_grants")? {
+                tx.execute("DELETE FROM canonical_worker_execution_grants WHERE subject_id=?1", [subject])?;
             }
             for table in DIRECT {
                 tx.execute(
