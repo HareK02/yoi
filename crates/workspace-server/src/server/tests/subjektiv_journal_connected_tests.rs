@@ -55,6 +55,7 @@ fn connected_subject_permissions(
 struct ConnectedJournalModel {
     dialogs: Arc<Mutex<Vec<Request>>>,
     journal_inputs: Arc<Mutex<Vec<String>>>,
+    journal_observations: Arc<Mutex<Vec<Value>>>,
 }
 
 impl ConnectedJournalModel {
@@ -257,6 +258,19 @@ impl LlmClient for ConnectedJournalModel {
                 inputs.push(envelope);
             }
             drop(inputs);
+            let mut observations = self.journal_observations.lock().unwrap();
+            if observations.len() == 16 {
+                observations.remove(0);
+            }
+            observations.push(json!({
+                "observed_at": Utc::now().to_rfc3339(),
+                "tool_results": request.items.iter().rev().filter_map(|item| match item {
+                    Item::ToolResult { call_id, is_error, summary, .. } =>
+                        Some(json!({"call_id":call_id,"is_error":is_error,"summary":summary.chars().take(256).collect::<String>()})),
+                    _ => None,
+                }).take(16).collect::<Vec<_>>(),
+            }));
+            drop(observations);
             Self::journal_response(&request)
         } else if request.tools.iter().any(|tool| {
             matches!(
@@ -333,6 +347,8 @@ async fn connected_wait_for_recording(
     api: &WorkspaceApi,
     store: &crate::subjektiv::SubjektivStore,
     attr: &crate::subjektiv::SubjectSessionAttribution,
+    model: &ConnectedJournalModel,
+    phase: &str,
 ) {
     let host = JournalHostContext::validated_session(store, attr.clone()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -372,11 +388,21 @@ async fn connected_wait_for_recording(
     })
     .await
     .unwrap_or_else(|_| {
+        let jobs = api.store
+            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &attr.session_id, None, 100)
+            .unwrap();
+        let attempts = jobs.iter().map(|job| {
+            let history = api.store.list_backend_job_attempts(TEST_WORKSPACE_ID, &job.request.job_id).unwrap();
+            let workers = history.iter().filter_map(|attempt| attempt.worker.as_ref())
+                .map(|worker| (worker.clone(), api.runtime.worker(worker)))
+                .collect::<Vec<_>>();
+            (job.request.job_id.clone(), history, workers)
+        }).collect::<Vec<_>>();
         panic!(
-            "real Controller recording did not complete: {:?}",
-            api.store
-                .list_backend_journal_jobs(TEST_WORKSPACE_ID, &attr.session_id, None, 100)
-                .unwrap()
+            "real Controller recording did not complete: phase={phase}; jobs={jobs:?}; attempts={attempts:?}; recovery_owners={:?}; cleanup_owners={:?}; model_observations={:?}",
+            api.backend_job_recovery.recovery_owner_ids(),
+            api.backend_job_recovery.cleanup_owner_ids(),
+            model.journal_observations.lock().unwrap(),
         )
     });
 }
@@ -460,7 +486,7 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         .into_iter()
         .find(|attr| attr.worker_id == old.worker_id)
         .unwrap();
-    connected_wait_for_recording(&api, &store, &old_attr).await;
+    connected_wait_for_recording(&api, &store, &old_attr, &model, "first-body").await;
     let old_host = JournalHostContext::validated_session(&store, old_attr.clone()).unwrap();
     let old_binding = JournalWriterBinding {
         subject_id: subject.id.clone(),
@@ -618,7 +644,7 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         .find(|attr| attr.worker_id == next.worker_id)
         .unwrap();
     assert_ne!(next_attr.session_id, old_attr.session_id);
-    connected_wait_for_recording(&api, &store, &next_attr).await;
+    connected_wait_for_recording(&api, &store, &next_attr, &model, "next-body").await;
 
     // Read actual Session files produced by the real Controller; no fixture Session append,
     // startup-item injection, fake disconnect or store-only simulation is used in this test.
