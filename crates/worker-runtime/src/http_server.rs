@@ -2347,8 +2347,8 @@ impl RuntimeHttpRestError {
             RuntimeError::WorkerExecutionRejected { result, .. } => startup_transfer(result),
             _ => None,
         };
-        let message = if startup.is_some() {
-            "Worker startup failed".to_owned()
+        let message = if let Some(startup) = &startup {
+            worker::startup_failure::internal_startup_failure_summary(&startup.primary).to_owned()
         } else {
             error.to_string()
         };

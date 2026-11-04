@@ -6772,8 +6772,11 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
         ),
     };
     if let EmbeddedRuntimeError::WorkerExecutionRejected { result, .. } = error {
-        if result.startup_failure.is_some() {
-            projection.message = "Embedded Runtime Worker startup failed".into();
+        if let Some(primary) = &result.startup_failure {
+            projection.message = format!(
+                "Embedded Runtime: {}",
+                worker::startup_failure::internal_startup_failure_summary(primary)
+            );
         }
         projection.startup = result.startup_failure.as_ref().and_then(|primary| {
             internal_startup_transfer(runtime_api::WorkerStartupFailure {
