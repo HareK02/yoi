@@ -64,16 +64,23 @@ impl<'a, 'conn> ScopedStore<'a, 'conn> {
     }
 
     fn authorize(&self, access: Access) -> Result<()> {
-        if self.key.workspace.is_empty() || self.key.target.is_empty()
+        if self.key.workspace.is_empty()
+            || self.key.target.is_empty()
             || !self.authority.allows(&self.key, access)
         {
             return Err(Error::Denied);
         }
-        let erased: Option<bool> = self.tx.query_row(
-            "SELECT erased FROM content_scopes WHERE workspace=?1 AND target=?2",
-            params![self.key.workspace, self.key.target], |r| r.get(0),
-        ).optional()?;
-        if erased == Some(true) { return Err(Error::Erased); }
+        let erased: Option<bool> = self
+            .tx
+            .query_row(
+                "SELECT erased FROM content_scopes WHERE workspace=?1 AND target=?2",
+                params![self.key.workspace, self.key.target],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if erased == Some(true) {
+            return Err(Error::Erased);
+        }
         Ok(())
     }
 
@@ -91,12 +98,21 @@ impl<'a, 'conn> ScopedStore<'a, 'conn> {
     }
 
     fn head_inner(&self) -> Result<Option<HistoryId>> {
-        let raw: Option<Vec<u8>> = self.tx.query_row(
-            "SELECT head FROM content_scopes WHERE workspace=?1 AND target=?2",
-            params![self.key.workspace, self.key.target], |r| r.get(0),
-        ).optional()?.flatten();
-        raw.map(|v| Ok(HistoryId::from_bytes(v.try_into().map_err(|_| Error::InvalidReference)?)))
-            .transpose()
+        let raw: Option<Vec<u8>> = self
+            .tx
+            .query_row(
+                "SELECT head FROM content_scopes WHERE workspace=?1 AND target=?2",
+                params![self.key.workspace, self.key.target],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        raw.map(|v| {
+            Ok(HistoryId::from_bytes(
+                v.try_into().map_err(|_| Error::InvalidReference)?,
+            ))
+        })
+        .transpose()
     }
 
     /// Preparation requires the full canonical bytes, not possession of another scope's hash.
@@ -110,11 +126,18 @@ impl<'a, 'conn> ScopedStore<'a, 'conn> {
     fn put_inner(&self, id: ObjectId, bytes: &[u8]) -> Result<()> {
         self.ensure_scope()?;
         let (kind, hash) = parts(id);
-        self.tx.execute("INSERT OR IGNORE INTO content_objects(kind,hash,bytes) VALUES(?1,?2,?3)",
-            params![kind, hash, bytes])?;
+        self.tx.execute(
+            "INSERT OR IGNORE INTO content_objects(kind,hash,bytes) VALUES(?1,?2,?3)",
+            params![kind, hash, bytes],
+        )?;
         let stored: Vec<u8> = self.tx.query_row(
-            "SELECT bytes FROM content_objects WHERE kind=?1 AND hash=?2", params![kind, hash], |r| r.get(0))?;
-        if stored != bytes { return Err(Error::ImmutableMismatch); }
+            "SELECT bytes FROM content_objects WHERE kind=?1 AND hash=?2",
+            params![kind, hash],
+            |r| r.get(0),
+        )?;
+        if stored != bytes {
+            return Err(Error::ImmutableMismatch);
+        }
         self.tx.execute("INSERT OR IGNORE INTO content_scope_objects(workspace,target,kind,hash) VALUES(?1,?2,?3,?4)",
             params![self.key.workspace, self.key.target, kind, hash])?;
         Ok(())
@@ -128,7 +151,9 @@ impl<'a, 'conn> ScopedStore<'a, 'conn> {
         let allowed: bool = self.tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM content_reachable WHERE workspace=?1 AND target=?2 AND kind=?3 AND hash=?4)",
             params![self.key.workspace, self.key.target, kind, hash], |r| r.get(0))?;
-        if !allowed { return Err(Error::Unavailable); }
+        if !allowed {
+            return Err(Error::Unavailable);
+        }
         self.load_prepared(id)
     }
 
@@ -149,18 +174,32 @@ impl<'a, 'conn> ScopedStore<'a, 'conn> {
         self.walk([ObjectId::Tree(record.root)], true)
     }
 
-    fn walk(&self, roots: impl IntoIterator<Item=ObjectId>, public: bool) -> Result<BTreeMap<ObjectId, Object>> {
+    fn walk(
+        &self,
+        roots: impl IntoIterator<Item = ObjectId>,
+        public: bool,
+    ) -> Result<BTreeMap<ObjectId, Object>> {
         let mut pending: Vec<_> = roots.into_iter().collect();
         let mut objects = BTreeMap::new();
         while let Some(id) = pending.pop() {
-            if objects.contains_key(&id) { continue; }
-            let object = if public { self.read(id)? } else { self.load_prepared(id)? };
+            if objects.contains_key(&id) {
+                continue;
+            }
+            let object = if public {
+                self.read(id)?
+            } else {
+                self.load_prepared(id)?
+            };
             match &object {
-                Object::Blob(_) => {},
-                Object::Tree(tree) => pending.extend(tree.entries().iter().map(|e| ObjectId::from(e.target))),
+                Object::Blob(_) => {}
+                Object::Tree(tree) => {
+                    pending.extend(tree.entries().iter().map(|e| ObjectId::from(e.target)))
+                }
                 Object::History(history) => {
                     pending.push(ObjectId::Tree(history.root));
-                    if let Some(parent) = history.parent { pending.push(ObjectId::History(parent)); }
+                    if let Some(parent) = history.parent {
+                        pending.push(ObjectId::History(parent));
+                    }
                 }
             }
             objects.insert(id, object);
@@ -171,7 +210,13 @@ impl<'a, 'conn> ScopedStore<'a, 'conn> {
     /// Authenticated actor and clock facts belong to the caller, not restored post authors.
     /// Restoring an old root appends a history with the current parent; no rewind operation exists.
     /// The private savepoint prevents even a caught error from publishing a partial adoption.
-    pub fn adopt(&self, root: TreeId, expected: Option<HistoryId>, actor: String, timestamp_micros: i64) -> Result<HistoryId> {
+    pub fn adopt(
+        &self,
+        root: TreeId,
+        expected: Option<HistoryId>,
+        actor: String,
+        timestamp_micros: i64,
+    ) -> Result<HistoryId> {
         self.authorize(Access::Write)?;
         self.atomic(|| {
             if self.head_inner()? != expected { return Err(Error::Conflict); }
@@ -215,9 +260,18 @@ impl<'a, 'conn> ScopedStore<'a, 'conn> {
         self.authorize(Access::Erase)?;
         self.atomic(|| {
             self.ensure_scope()?;
-            self.tx.execute("DELETE FROM content_reachable WHERE workspace=?1 AND target=?2", params![self.key.workspace,self.key.target])?;
-            self.tx.execute("DELETE FROM content_scope_objects WHERE workspace=?1 AND target=?2", params![self.key.workspace,self.key.target])?;
-            self.tx.execute("UPDATE content_scopes SET head=NULL,erased=1 WHERE workspace=?1 AND target=?2", params![self.key.workspace,self.key.target])?;
+            self.tx.execute(
+                "DELETE FROM content_reachable WHERE workspace=?1 AND target=?2",
+                params![self.key.workspace, self.key.target],
+            )?;
+            self.tx.execute(
+                "DELETE FROM content_scope_objects WHERE workspace=?1 AND target=?2",
+                params![self.key.workspace, self.key.target],
+            )?;
+            self.tx.execute(
+                "UPDATE content_scopes SET head=NULL,erased=1 WHERE workspace=?1 AND target=?2",
+                params![self.key.workspace, self.key.target],
+            )?;
             self.collect_physical()
         })
     }
@@ -227,12 +281,18 @@ impl<'a, 'conn> ScopedStore<'a, 'conn> {
         Ok(())
     }
 
-    fn atomic<T>(&self, f: impl FnOnce()->Result<T>) -> Result<T> {
-        self.tx.execute_batch("SAVEPOINT content_history_operation")?;
+    fn atomic<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.tx
+            .execute_batch("SAVEPOINT content_history_operation")?;
         match f() {
-            Ok(value) => { self.tx.execute_batch("RELEASE content_history_operation")?; Ok(value) },
+            Ok(value) => {
+                self.tx.execute_batch("RELEASE content_history_operation")?;
+                Ok(value)
+            }
             Err(error) => {
-                self.tx.execute_batch("ROLLBACK TO content_history_operation; RELEASE content_history_operation")?;
+                self.tx.execute_batch(
+                    "ROLLBACK TO content_history_operation; RELEASE content_history_operation",
+                )?;
                 Err(error)
             }
         }
@@ -241,8 +301,8 @@ impl<'a, 'conn> ScopedStore<'a, 'conn> {
 
 fn parts(id: ObjectId) -> (u8, Vec<u8>) {
     match id {
-        ObjectId::Blob(h) => (1,h.as_bytes().to_vec()),
-        ObjectId::Tree(h) => (2,h.as_bytes().to_vec()),
-        ObjectId::History(h) => (3,h.as_bytes().to_vec()),
+        ObjectId::Blob(h) => (1, h.as_bytes().to_vec()),
+        ObjectId::Tree(h) => (2, h.as_bytes().to_vec()),
+        ObjectId::History(h) => (3, h.as_bytes().to_vec()),
     }
 }
