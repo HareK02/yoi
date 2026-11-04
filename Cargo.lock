@@ -5040,6 +5040,7 @@ dependencies = [
  "agen",
  "async-trait",
  "client",
+ "error-contract",
  "feature-storage",
  "fs4",
  "futures",

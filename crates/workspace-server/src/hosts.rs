@@ -6867,7 +6867,10 @@ fn runtime_api_diagnostic(
 ) -> RuntimeDiagnostic {
     match error {
         runtime_api::client_support::ClientError::Public { status, error } => {
-            let startup = error.error.startup.and_then(internal_startup_transfer);
+            if let Some(startup) = error.error.startup {
+                return remote_startup_diagnostic(runtime_id, status, startup);
+            }
+            let startup = None;
             let remote_code = error.error.code;
             let message = sanitize_remote_runtime_message(&remote_code, &error.error.message);
             let (code, severity) = match status {
@@ -6946,6 +6949,9 @@ fn remote_http_status_diagnostic(
         .ok()
         .filter(|_| body.len() <= MAX_RUNTIME_PING_RESPONSE_BYTES)
         .and_then(|_| serde_json::from_slice::<RuntimeHttpErrorResponse>(&body).ok());
+    if let Some(startup) = error.as_ref().and_then(|error| error.error.startup.clone()) {
+        return remote_startup_diagnostic(runtime_id, status, startup);
+    }
     let remote_code = error
         .as_ref()
         .map(|error| error.error.code.as_str())
@@ -6977,6 +6983,29 @@ fn remote_http_status_diagnostic(
     projection.startup = error
         .and_then(|error| error.error.startup)
         .and_then(internal_startup_transfer);
+    projection
+}
+
+fn remote_startup_diagnostic(
+    runtime_id: &str,
+    status: StatusCode,
+    startup: runtime_api::WorkerStartupFailure,
+) -> RuntimeDiagnostic {
+    let startup = internal_startup_transfer(startup);
+    let message = startup.as_ref().map_or("Worker startup failed", |startup| {
+        worker::startup_failure::internal_startup_failure_summary(&startup.primary)
+    });
+    let code = if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        "remote_runtime_auth_failed"
+    } else {
+        "remote_runtime_startup_failed"
+    };
+    let mut projection = diagnostic(
+        code,
+        HostDiagnosticSeverity::Error,
+        format!("Remote Runtime '{runtime_id}' rejected request (HTTP {status}): {message}"),
+    );
+    projection.startup = startup;
     projection
 }
 
@@ -7219,7 +7248,7 @@ mod tests {
         let mut wire = runtime_api::RuntimeApiError::new(
             500,
             "worker_execution_rejected",
-            "unused remote prose",
+            "TEST_ONLY_CREDENTIAL private-subject-id raw_http_body",
         );
         wire.error.startup = embedded.startup.clone();
         let received = serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
@@ -7237,8 +7266,14 @@ mod tests {
             public.get("startup").is_none(),
             "no blind public/storage attachment forwarding"
         );
-        for secret in ["TEST_ONLY_CREDENTIAL", "/private/path", "raw_http_body"] {
+        for secret in [
+            "TEST_ONLY_CREDENTIAL",
+            "private-subject-id",
+            "/private/path",
+            "raw_http_body",
+        ] {
             assert!(!serde_json::to_string(&embedded).unwrap().contains(secret));
+            assert!(!serde_json::to_string(&remote).unwrap().contains(secret));
         }
 
         let legacy = runtime_api_diagnostic(
@@ -7255,6 +7290,84 @@ mod tests {
         let mut corrupt = embedded.startup.unwrap();
         corrupt.primary = serde_json::from_value(json!("not an error-contract envelope")).unwrap();
         assert!(internal_startup_transfer(corrupt).is_none());
+    }
+
+    #[test]
+    fn remote_startup_receivers_discard_untrusted_prose_and_code_even_without_paths() {
+        use protocol::session_failure::{
+            SessionRegistrationCause, session_registration_attachment,
+        };
+        let valid = runtime_api::WorkerStartupFailure {
+            primary: session_registration_attachment(SessionRegistrationCause::binding_mismatch())
+                .unwrap(),
+            secondary: vec![],
+            persistence: None,
+            resources: None,
+            io_kind: None,
+        };
+        for corrupt in [false, true] {
+            for status in [StatusCode::FORBIDDEN, StatusCode::INTERNAL_SERVER_ERROR] {
+                let mut startup = valid.clone();
+                if corrupt {
+                    startup.primary = serde_json::from_value(json!("corrupt attachment")).unwrap();
+                }
+                let mut wire = runtime_api::RuntimeApiError::new(
+                    status.as_u16(),
+                    "PRIVATE_CODE_SENTINEL",
+                    "TEST_ONLY_CREDENTIAL private-subject-id raw_http_body",
+                );
+                wire.error.startup = Some(startup);
+                let body = serde_json::to_string(&wire).unwrap();
+                let typed = runtime_api_diagnostic(
+                    "remote",
+                    runtime_api::client_support::ClientError::Public {
+                        status,
+                        error: serde_json::from_str(&body).unwrap(),
+                    },
+                );
+                let (url, server) = serve_mock_http(vec![mock_response(
+                    "GET",
+                    "/",
+                    false,
+                    status.as_u16(),
+                    body,
+                )]);
+                let response = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap()
+                    .get(url)
+                    .send()
+                    .unwrap();
+                let http = remote_http_status_diagnostic("remote", status, response);
+                server.join().unwrap();
+                for diagnostic in [typed, http] {
+                    assert_eq!(diagnostic.startup.is_some(), !corrupt);
+                    assert_eq!(diagnostic.message.contains("session.record"), !corrupt);
+                    assert_eq!(
+                        diagnostic.code,
+                        if status == StatusCode::FORBIDDEN {
+                            "remote_runtime_auth_failed"
+                        } else {
+                            "remote_runtime_startup_failed"
+                        }
+                    );
+                    let public = serde_json::to_string(&diagnostic).unwrap();
+                    for secret in [
+                        "PRIVATE_CODE_SENTINEL",
+                        "TEST_ONLY_CREDENTIAL",
+                        "private-subject-id",
+                        "raw_http_body",
+                        "corrupt attachment",
+                    ] {
+                        assert!(
+                            !public.contains(secret),
+                            "received prose/code must never bypass startup projection: {public}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

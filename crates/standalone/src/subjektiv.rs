@@ -275,6 +275,8 @@ impl StandaloneSubjects {
             writer,
             self_weak: weak.clone(),
             journal_dispatch: Mutex::new(false),
+            #[cfg(test)]
+            registration_before_attribution: Mutex::new(None),
             language: self.memory_language.clone(),
             catalog: self,
             binding: binding.clone(),
@@ -373,6 +375,8 @@ pub(crate) struct LocalSubjectHost {
     writer: subjektiv::journal::JournalWriterBinding,
     self_weak: std::sync::Weak<Self>,
     journal_dispatch: Mutex<bool>,
+    #[cfg(test)]
+    registration_before_attribution: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     catalog: StandaloneSubjects,
     binding: StandaloneSubjectBinding,
     worker_id: protocol::WorkerId,
@@ -467,7 +471,11 @@ impl LocalSubjectHost {
         context: &SubjektivHostContext,
         create: bool,
     ) -> Result<SubjectSessionAttribution, SubjektivHostError> {
-        self.body(context)?;
+        self.registration_authority(context)?;
+        #[cfg(test)]
+        if let Some(checkpoint) = self.registration_before_attribution.lock().unwrap().take() {
+            checkpoint();
+        }
         let store = &self.catalog.store;
         if let Some(record) = store
             .session_attribution(&context.session_id)
@@ -484,7 +492,7 @@ impl LocalSubjectHost {
             }
             store
                 .bind_journal_session(&self.writer, record.clone())
-                .map_err(journal::journal_error)?;
+                .map_err(registration_journal_error)?;
             return Ok(record);
         }
         if !create {
@@ -507,9 +515,23 @@ impl LocalSubjectHost {
             .map_err(registration_domain_error)?;
         store
             .bind_journal_session(&self.writer, record.clone())
-            .map_err(journal::journal_error)?;
+            .map_err(registration_journal_error)?;
         Ok(record)
     }
+}
+
+fn registration_journal_error(error: subjektiv::journal::JournalError) -> SubjektivHostError {
+    let cause = match &error {
+        subjektiv::journal::JournalError::PermissionDenied(_) => {
+            SessionRegistrationCause::binding_mismatch()
+        }
+        subjektiv::journal::JournalError::Subject(
+            subjektiv::SubjektivError::SessionSubjectConflict { .. }
+            | subjektiv::SubjektivError::SessionAttributionConflict { .. },
+        ) => SessionRegistrationCause::binding_mismatch(),
+        _ => SessionRegistrationCause::outcome_unknown(),
+    };
+    SubjektivHostError::session_registration(cause, error)
 }
 
 fn registration_domain_error(error: subjektiv::SubjektivError) -> SubjektivHostError {
@@ -868,7 +890,11 @@ impl SubjektivHost for LocalSubjectHost {
         // An explicit operator connection issues this local body capability.
         // Revalidate its live writer on every access/supply, not Feature enablement.
         // Job decisions and Backend conversations are not local body capabilities.
-        self.body(context)?;
+        if operation == "session.record" {
+            self.registration_authority(context)?;
+        } else {
+            self.body(context)?;
+        }
         match operation {
             "session.record"
             | "memory.resident.read"
@@ -1095,7 +1121,7 @@ impl SubjektivHost for LocalSubjectHost {
     ) -> Result<SubjektivRecordSessionResponse, SubjektivHostError> {
         self.registration_authority(context)?;
         let attribution = self.attribution(context, create_if_missing)?;
-        self.reserve_journal_session(context)?;
+        self.reserve_journal_session(context, &attribution)?;
         Ok(SubjektivRecordSessionResponse {
             subject_id: attribution.subject_id,
             session_id: attribution.session_id,
