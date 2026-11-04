@@ -15,7 +15,7 @@ impl RuntimeWorkerFactory for SubjectDeleteDeferredCreate {
     async fn spawn_controller(
         &self,
         _: WorkerExecutionSpawnRequest,
-    ) -> Result<RuntimeWorkerController, String> {
+    ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
         self.entered.send(()).unwrap();
         self.release.notified().await;
         Err("create failed before any Controller".into())

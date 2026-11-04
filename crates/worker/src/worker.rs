@@ -11457,6 +11457,16 @@ fn compact_failure_category(error: &WorkerError) -> CompactFailureCategory {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
+    /// The domain-projected primary error survives wrappers and metadata-save failures.
+    /// This attachment is not execution cleanup or lifecycle evidence.
+    #[error("{source}")]
+    StartupFailure {
+        #[source]
+        source: Box<WorkerError>,
+        failure: protocol::startup_failure::StartupFailureAttachment,
+        secondary: Vec<protocol::startup_failure::StartupSecondaryFailure>,
+        metadata_save: Option<protocol::startup_failure::StartupPersistenceOutcome>,
+    },
     /// A construction or activation step failed after acquiring resources. Retain
     /// these handles until explicit cleanup succeeds. Consuming constructors drop
     /// the Worker before returning; in-place activation leaves its owner responsible

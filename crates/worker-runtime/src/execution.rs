@@ -103,6 +103,8 @@ pub struct WorkerExecutionResult {
     pub startup_resources: Option<protocol::startup_failure::StartupResourceFacts>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_failure_persistence: Option<protocol::startup_failure::StartupPersistenceOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_io_kind: Option<protocol::startup_failure::StartupIoKind>,
 }
 
 /// Backend result class for a Worker execution operation.
@@ -129,6 +131,7 @@ impl WorkerExecutionResult {
             secondary_failures: Vec::new(),
             startup_resources: None,
             startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -158,6 +161,7 @@ impl WorkerExecutionResult {
             secondary_failures: Vec::new(),
             startup_resources: None,
             startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -178,6 +182,7 @@ impl WorkerExecutionResult {
             secondary_failures: Vec::new(),
             startup_resources: None,
             startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -193,6 +198,7 @@ impl WorkerExecutionResult {
             secondary_failures: Vec::new(),
             startup_resources: None,
             startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -208,6 +214,7 @@ impl WorkerExecutionResult {
             secondary_failures: Vec::new(),
             startup_resources: None,
             startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -223,6 +230,7 @@ impl WorkerExecutionResult {
             secondary_failures: Vec::new(),
             startup_resources: None,
             startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -238,6 +246,7 @@ impl WorkerExecutionResult {
             secondary_failures: Vec::new(),
             startup_resources: None,
             startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 

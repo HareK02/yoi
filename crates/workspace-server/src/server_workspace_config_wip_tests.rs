@@ -494,7 +494,9 @@ async fn workspace_config_apply_model_union_cases_and_composite_persist_evaluate
     // Subsequent calls use the Client's returned root validator, without reinspection or
     // model-supplied preconditions. All four variants share the same public contract.
     fixture
-        .apply_observed(json!([{"$case":"update","value":{"path":"notes/edit.txt","content":"updated"}}]))
+        .apply_observed(
+            json!([{"$case":"update","value":{"path":"notes/edit.txt","content":"updated"}}]),
+        )
         .await;
     fixture
         .apply_observed(
@@ -541,7 +543,8 @@ async fn workspace_config_apply_model_union_cases_and_composite_persist_evaluate
     );
     assert_eq!(
         fragment.content,
-        "{\n    common = {\n        language = \"TYPED_BATCH\";\n    };\n}\n"    );
+        "{\n    common = {\n        language = \"TYPED_BATCH\";\n    };\n}\n"
+    );
     assert_eq!(
         state
             .snapshot
@@ -804,10 +807,7 @@ async fn workspace_config_apply_cached_contract_cannot_bypass_readonly_or_revoca
         let error = config_call(&fixture.wip, "/workspace-config", "apply_changes", json!({"changes":[
             {"$case":"create","value":{"path":"notes/denied.txt","content":"denied","content_type":"text"}}
         ]})).await.unwrap_err();
-        assert!(
-            !error.to_string().contains("outcome unknown"),
-            "{error}"
-        );
+        assert!(!error.to_string().contains("outcome unknown"), "{error}");
         assert_eq!(fixture.state(), before);
         assert_eq!(fixture.commits(), commits);
         if !revoke {
@@ -845,10 +845,7 @@ async fn workspace_config_apply_known_rejection_differs_from_lost_response_witho
     let error = config_call(&fixture.wip, "/workspace-config", "apply_changes", json!({"changes":[
         {"$case":"create","value":{"path":"notes/unknown.txt","content":"committed once","content_type":"text"}}
     ]})).await.unwrap_err();
-    assert!(
-        error.to_string().contains("outcome unknown"),
-        "{error}"
-    );
+    assert!(error.to_string().contains("outcome unknown"), "{error}");
     let state = fixture.state();
     assert_eq!(
         state
@@ -1165,7 +1162,10 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for ConfigCaptureFacto
     async fn spawn_controller(
         &self,
         mut request: worker_runtime::execution::WorkerExecutionSpawnRequest,
-    ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
+    ) -> std::result::Result<
+        worker_runtime::worker_backend::RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
         // No LLM request is issued; explicit unauthenticated test model avoids
         // depending on developer credentials during production bootstrap.
         let archive = worker_runtime::profile_archive::ProfileSourceArchive::build(worker_runtime::profile_archive::ProfileSourceArchiveInput {
@@ -1188,7 +1188,7 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for ConfigCaptureFacto
     async fn preflight_restore(
         &self,
         request: &worker_runtime::execution::WorkerExecutionRestoreRequest,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), worker_runtime::worker_backend::RuntimeRestoreFailure> {
         self.inner.preflight_restore(request).await
     }
 

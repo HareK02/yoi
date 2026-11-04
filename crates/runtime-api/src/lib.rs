@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 use workdir::workspace::{MaterializerKind, RuntimeWorkerRef, RuntimeWorkingDirectorySummary};
 
 pub use protocol::startup_failure::{
-    RuntimeStartupCause, StartupCleanupFailure, StartupFailureAttachment, StartupFailurePhase,
-    StartupPersistenceOutcome, StartupSecondaryFailure, StartupStage,
+    RuntimeStartupCause, RuntimeStartupReason, StartupCleanup, StartupCleanupFailure,
+    StartupFailureAttachment, StartupFailurePhase, StartupIoKind, StartupPersistenceOutcome,
+    StartupResourceFacts, StartupResources, StartupSecondaryFailure, StartupStage,
+    StoredStartupFailureAttachment,
 };
 
 pub const RUNTIME_API_VERSION: &str = "v1";

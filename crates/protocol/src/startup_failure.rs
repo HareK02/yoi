@@ -40,11 +40,52 @@ impl StartupFailureAttachment {
         decode_failure(self.0.as_bytes(), Self::budget())
     }
 
+    /// Redisclosure requires a fresh domain/audience projection and current authorization.
+    /// Unsupported or corrupt stored bytes are never forwarded as public details.
+    pub fn project_for<A: Audience, D: WireDetails + error_contract::ProjectFor<A>>(
+        &self,
+        authorization: &D::Authorization,
+    ) -> Result<ProjectedFailure<A, D::Details>, ContractError> {
+        match self.decode::<D>() {
+            DecodeFailure::Known(received) => {
+                error_contract::project_failure(received.facts(), authorization)
+            }
+            DecodeFailure::Unsupported(_) | DecodeFailure::Corrupt(_) => {
+                Err(ContractError::ProjectionUnavailable)
+            }
+        }
+    }
+
     fn budget() -> Budget {
         Budget::new(
             error_contract::MAX_FAILURE_BYTES,
             error_contract::MAX_FAILURE_BYTES,
         )
+    }
+}
+
+/// Storage encoding cannot be constructed by relabeling an internal-transfer attachment.
+/// A loaded value remains untrusted evidence; publication still requires `project_for`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct StoredStartupFailureAttachment(StartupFailureAttachment);
+
+impl StoredStartupFailureAttachment {
+    pub fn from_projected<D: WireDetails>(
+        failure: &ProjectedFailure<error_contract::Storage, D>,
+    ) -> Result<Self, ContractError> {
+        StartupFailureAttachment::from_projected(failure).map(Self)
+    }
+    pub fn decode<D: WireDetails>(&self) -> DecodeFailure<D> {
+        self.0.decode()
+    }
+    pub fn project_for<A: Audience, D: WireDetails + error_contract::ProjectFor<A>>(
+        &self,
+        authorization: &D::Authorization,
+    ) -> Result<ProjectedFailure<A, D::Details>, ContractError> {
+        self.0.project_for::<A, D>(authorization)
     }
 }
 
@@ -177,6 +218,9 @@ pub enum StartupCleanupFailure {
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum StartupSecondaryFailure {
+    ProjectionUnavailable {
+        phase: StartupFailurePhase,
+    },
     Cleanup {
         failure: StartupCleanupFailure,
     },
@@ -228,4 +272,122 @@ pub struct StartupResourceFacts {
     pub resources: StartupResources,
     pub cleanup: StartupCleanup,
     pub durable_effects_possible: bool,
+}
+
+/// Path-free IO classification. Nonportable OS details remain at the resource owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub enum StartupIoKind {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    InvalidInput,
+    InvalidData,
+    Interrupted,
+    TimedOut,
+    WouldBlock,
+    UnexpectedEof,
+    Other,
+}
+impl From<std::io::ErrorKind> for StartupIoKind {
+    fn from(kind: std::io::ErrorKind) -> Self {
+        use std::io::ErrorKind;
+        match kind {
+            ErrorKind::NotFound => Self::NotFound,
+            ErrorKind::PermissionDenied => Self::PermissionDenied,
+            ErrorKind::AlreadyExists => Self::AlreadyExists,
+            ErrorKind::InvalidInput => Self::InvalidInput,
+            ErrorKind::InvalidData => Self::InvalidData,
+            ErrorKind::Interrupted => Self::Interrupted,
+            ErrorKind::TimedOut => Self::TimedOut,
+            ErrorKind::WouldBlock => Self::WouldBlock,
+            ErrorKind::UnexpectedEof => Self::UnexpectedEof,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use error_contract::{
+        Browser, FailureFacts, InternalTransfer, OperationContext, Storage, project_failure,
+    };
+
+    #[test]
+    fn startup_projection_preserves_allowlisted_facts_without_secret_context() {
+        let mut facts = FailureFacts::new(RuntimeStartupCause {
+            stage: StartupStage::Binding,
+            reason: RuntimeStartupReason::AttributionFailed,
+        })
+        .unwrap();
+        let mut context = OperationContext::new("worker_startup", "runtime").unwrap();
+        context.operation_ref = Some("TEST_ONLY_CREDENTIAL".into());
+        facts.with_context(context).unwrap();
+        facts
+            .with_context(OperationContext::new("/private/internal/path", "raw_http_body").unwrap())
+            .unwrap();
+        let transfer = project_failure::<InternalTransfer, _>(&facts, &()).unwrap();
+        let attachment = StartupFailureAttachment::from_projected(&transfer).unwrap();
+        let storage_projection = attachment
+            .project_for::<Storage, RuntimeStartupCause>(&())
+            .unwrap();
+        let stored = StoredStartupFailureAttachment::from_projected(&storage_projection).unwrap();
+        let browser = stored
+            .project_for::<Browser, RuntimeStartupCause>(&())
+            .unwrap();
+        assert_eq!(browser.details(), facts.cause());
+        assert_eq!(browser.context().operations.len(), 1);
+        assert_eq!(browser.context().operations[0].operation_ref, None);
+        let public =
+            encode_projected_failure(&browser, StartupFailureAttachment::budget()).unwrap();
+        let wire = std::str::from_utf8(public.as_bytes()).unwrap();
+        for secret in [
+            "TEST_ONLY_CREDENTIAL",
+            "/private/internal/path",
+            "raw_http_body",
+        ] {
+            assert!(!wire.contains(secret));
+            assert!(!serde_json::to_string(&stored).unwrap().contains(secret));
+        }
+        assert!(matches!(
+            stored.decode::<RuntimeStartupCause>(),
+            DecodeFailure::Known(_)
+        ));
+    }
+
+    #[test]
+    fn unsupported_and_corrupt_startup_attachments_cannot_be_redisclosed() {
+        let facts = FailureFacts::new(RuntimeStartupCause {
+            stage: StartupStage::Controller,
+            reason: RuntimeStartupReason::StartupFailed,
+        })
+        .unwrap();
+        let projected = project_failure::<InternalTransfer, _>(&facts, &()).unwrap();
+        let attachment = StartupFailureAttachment::from_projected(&projected).unwrap();
+        let future =
+            StartupFailureAttachment(attachment.0.replace("\"version\":1", "\"version\":999"));
+        assert!(matches!(
+            future.decode::<RuntimeStartupCause>(),
+            DecodeFailure::Unsupported(_)
+        ));
+        assert!(
+            future
+                .project_for::<Browser, RuntimeStartupCause>(&())
+                .is_err()
+        );
+        let corrupt = StartupFailureAttachment("{invalid TEST_ONLY_SECRET".into());
+        assert!(matches!(
+            corrupt.decode::<RuntimeStartupCause>(),
+            DecodeFailure::Corrupt(_)
+        ));
+        assert!(
+            corrupt
+                .project_for::<Browser, RuntimeStartupCause>(&())
+                .is_err()
+        );
+        assert!(!format!("{corrupt:?}").contains("TEST_ONLY_SECRET"));
+    }
 }

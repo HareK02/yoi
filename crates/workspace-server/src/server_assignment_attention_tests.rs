@@ -730,9 +730,13 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for AttentionWorkerFac
     async fn spawn_controller(
         &self,
         request: worker_runtime::execution::WorkerExecutionSpawnRequest,
-    ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
+    ) -> std::result::Result<
+        worker_runtime::worker_backend::RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
         self.controller(request.worker_ref.worker_id.to_string(), false)
             .await
+            .map_err(Into::into)
     }
     async fn prepare_restore(
         &self,

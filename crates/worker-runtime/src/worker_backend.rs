@@ -71,7 +71,7 @@ fn rollback_materialized_spawn_workdirs(
     materializer: &dyn WorkingDirectoryMaterializer,
     bindings: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
     workdir_ids: &[String],
-    failure_context: &str,
+    failure_context: &WorkerExecutionResult,
 ) -> Result<(), WorkerExecutionSpawnResult> {
     let mut cleanup_failures = Vec::new();
     let mut uncertain_attachments = Vec::new();
@@ -93,13 +93,15 @@ fn rollback_materialized_spawn_workdirs(
         return Ok(());
     }
     Err(WorkerExecutionSpawnResult::ReconciliationRequired {
-        result: WorkerExecutionResult::errored(
-            WorkerExecutionOperation::Spawn,
-            format!(
-                "{failure_context}; Workdir cleanup could not be proven: {}",
-                cleanup_failures.join("; ")
-            ),
-        ),
+        result: {
+            let mut result = failure_context.clone();
+            result.push_secondary_failure(
+                protocol::startup_failure::StartupSecondaryFailure::Cleanup {
+                    failure: protocol::startup_failure::StartupCleanupFailure::Workdir,
+                },
+            );
+            result
+        },
         worker_state: None,
         workdir_attachments: uncertain_attachments,
     })
@@ -164,6 +166,8 @@ fn subscribe_worker_protocol_session(handle: &WorkerHandle) -> WorkerProtocolSes
     let _publish_guard = handle.protocol_snapshot_publish_guard();
     worker::ipc::protocol_session::subscribe_worker_protocol_session(handle)
 }
+
+mod startup_failure;
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
 const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -262,9 +266,81 @@ pub struct RuntimeRestoreFailure {
     io_kind: Option<std::io::ErrorKind>,
     cleanup_failure: Option<RuntimeRestoreCleanupFailure>,
     durable_effects_possible: bool,
+    primary: protocol::startup_failure::StartupFailureAttachment,
+    secondary: Vec<protocol::startup_failure::StartupSecondaryFailure>,
+    legacy_diagnostic: Option<String>,
+    metadata_save: Option<protocol::startup_failure::StartupPersistenceOutcome>,
 }
 
 impl RuntimeRestoreFailure {
+    fn fallback_primary(
+        stage: RuntimeRestoreStage,
+    ) -> protocol::startup_failure::StartupFailureAttachment {
+        worker::startup_failure::runtime_startup_attachment(
+            protocol::startup_failure::RuntimeStartupCause {
+                stage: stage.into(),
+                reason: protocol::startup_failure::RuntimeStartupReason::StartupFailed,
+            },
+        )
+        .expect("fixed Runtime startup projection fits the error-contract budget")
+    }
+
+    pub fn with_startup_failure(
+        mut self,
+        primary: protocol::startup_failure::StartupFailureAttachment,
+    ) -> Self {
+        self.primary = primary;
+        self
+    }
+
+    pub fn startup_failure(&self) -> &protocol::startup_failure::StartupFailureAttachment {
+        &self.primary
+    }
+
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        self.io_kind
+    }
+
+    fn from_worker(stage: RuntimeRestoreStage, error: &WorkerError) -> Self {
+        let mut failure = Self::started(stage, restore_worker_cause(error));
+        failure.primary = error
+            .startup_failure_at(stage.into())
+            .expect("fixed Worker startup projection fits the error-contract budget");
+        failure.secondary = error.startup_secondary_failures().to_vec();
+        failure.metadata_save = error.startup_metadata_save();
+        failure
+    }
+
+    pub fn execution_result(&self, operation: WorkerExecutionOperation) -> WorkerExecutionResult {
+        use protocol::startup_failure::*;
+        let mut result = WorkerExecutionResult::errored(operation, self.to_string())
+            .with_startup_failure(self.primary.clone());
+        result.secondary_failures = self.secondary.clone();
+        result.startup_failure_persistence = self.metadata_save;
+        result.startup_io_kind = self.io_kind.map(Into::into);
+        // Retain the first cleanup failure even if a later retry completed cleanup.
+        if let Some(failure) = self.cleanup_failure {
+            result.push_secondary_failure(StartupSecondaryFailure::Cleanup {
+                failure: failure.into(),
+            });
+        }
+        result.startup_resources = Some(StartupResourceFacts {
+            resources: match self.resources {
+                RuntimeRestoreResources::None => StartupResources::None,
+                RuntimeRestoreResources::WorkerStartup => StartupResources::WorkerStartup,
+                RuntimeRestoreResources::Unproven => StartupResources::Unproven,
+            },
+            cleanup: match self.cleanup {
+                RuntimeRestoreCleanup::NotNeeded => StartupCleanup::NotNeeded,
+                RuntimeRestoreCleanup::Required => StartupCleanup::Required,
+                RuntimeRestoreCleanup::Confirmed => StartupCleanup::Confirmed,
+                RuntimeRestoreCleanup::Failed(failure) => StartupCleanup::Failed(failure.into()),
+            },
+            durable_effects_possible: self.durable_effects_possible,
+        });
+        result
+    }
+
     pub fn refused(stage: RuntimeRestoreStage, cause: &'static str) -> Self {
         Self {
             stage,
@@ -274,6 +350,10 @@ impl RuntimeRestoreFailure {
             io_kind: None,
             cleanup_failure: None,
             durable_effects_possible: false,
+            primary: Self::fallback_primary(stage),
+            secondary: Vec::new(),
+            legacy_diagnostic: None,
+            metadata_save: None,
         }
     }
 
@@ -286,6 +366,10 @@ impl RuntimeRestoreFailure {
             io_kind: None,
             cleanup_failure: None,
             durable_effects_possible: false,
+            primary: Self::fallback_primary(stage),
+            secondary: Vec::new(),
+            legacy_diagnostic: None,
+            metadata_save: None,
         }
     }
 
@@ -298,6 +382,10 @@ impl RuntimeRestoreFailure {
             io_kind: None,
             cleanup_failure: None,
             durable_effects_possible: false,
+            primary: Self::fallback_primary(stage),
+            secondary: Vec::new(),
+            legacy_diagnostic: None,
+            metadata_save: None,
         }
     }
 
@@ -311,7 +399,13 @@ impl RuntimeRestoreFailure {
 
 impl std::fmt::Display for RuntimeRestoreFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let cause: String = self.cause.chars().take(160).collect();
+        let cause: String = self
+            .legacy_diagnostic
+            .as_deref()
+            .unwrap_or(self.cause)
+            .chars()
+            .take(160)
+            .collect();
         write!(
             f,
             "restore {:?}: {}; io={:?}; resources={:?}; cleanup={:?}; prior_cleanup={:?}",
@@ -323,6 +417,7 @@ impl std::fmt::Display for RuntimeRestoreFailure {
 fn restore_worker_cause(error: &WorkerError) -> &'static str {
     match error {
         WorkerError::ConstructionCleanup { source, .. }
+        | WorkerError::StartupFailure { source, .. }
         | WorkerError::RestoreActivationEffects { source } => restore_worker_cause(source),
         WorkerError::SegmentEmpty { .. } => "saved segment empty",
         WorkerError::SegmentSystemPromptMissing { .. } => "saved segment system prompt missing",
@@ -368,14 +463,13 @@ async fn prepare_restore_operation<F: RuntimeWorkerFactory + ?Sized>(
     request: WorkerExecutionRestoreRequest,
 ) -> Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure> {
     let prior_effects = request.source_repair_possible;
-    factory.preflight_restore(&request).await.map_err(|_| {
-        let mut failure = RuntimeRestoreFailure::refused(
-            RuntimeRestoreStage::Preflight,
-            "restore preflight refused",
-        );
-        failure.durable_effects_possible = prior_effects;
-        failure
-    })?;
+    factory
+        .preflight_restore(&request)
+        .await
+        .map_err(|mut failure| {
+            failure.durable_effects_possible = prior_effects;
+            failure
+        })?;
     let repaired = factory
         .recover_restore_source(&request)
         .await
@@ -479,12 +573,12 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
     async fn spawn_controller(
         &self,
         request: WorkerExecutionSpawnRequest,
-    ) -> Result<RuntimeWorkerController, String>;
+    ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure>;
 
     async fn preflight_restore(
         &self,
         _request: &WorkerExecutionRestoreRequest,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeRestoreFailure> {
         Ok(())
     }
 
@@ -907,7 +1001,9 @@ impl ProfileRuntimeWorkerFactory {
         request: &WorkerExecutionRestoreRequest,
         error: &WorkerError,
     ) {
-        if let WorkerError::RestoreActivationEffects { source } = error {
+        if let WorkerError::RestoreActivationEffects { source }
+        | WorkerError::StartupFailure { source, .. } = error
+        {
             self.retain_construction_failure(request, source);
             return;
         }
@@ -2008,7 +2104,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
     async fn spawn_controller(
         &self,
         request: WorkerExecutionSpawnRequest,
-    ) -> Result<RuntimeWorkerController, String> {
+    ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
         let worker_name = Self::runtime_worker_name(&request);
         let profile = Self::runtime_profile(&request);
         let has_local_filesystem = request.workdir_attachments.len() == 1;
@@ -2128,13 +2224,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             Some(factory) => bootstrap.with_model_client(factory()),
             None => bootstrap,
         };
-        let mut prepared = bootstrap.prepare().await.map_err(|error| match error {
-            WorkerBootstrapError::Worker(source) => {
-                format!("failed to create Worker from profile: {source}")
-            }
-            WorkerBootstrapError::Controller { source, .. } => {
-                format!("failed to prepare Worker controller: {source}")
-            }
+        let mut prepared = bootstrap.prepare().await.map_err(|error| {
+            RuntimeRestoreFailure::from_bootstrap(RuntimeRestoreStage::Reconstruction, &error)
         })?;
         let worker = prepared.worker_mut();
         if let Some(snapshot) = &request.request.plugin_execution {
@@ -2160,12 +2251,34 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 .map_err(str::to_string)?;
         }
         validate_worker_memory_settings(worker.manifest(), &request.request)?;
+        let expected = worker
+            .store()
+            .read_by_name(&worker_name)?
+            .and_then(|metadata| {
+                session_store::worker_metadata::StartupFailureExpectation::from_metadata(&metadata)
+            });
         worker
             .finalize_subjektiv_session_attribution(
                 request.request.subjektiv_attached,
                 SubjektivSessionAttributionLifecycle::NewSession,
             )
-            .map_err(|error| format!("finalize Worker Session attribution: {error}"))?;
+            .map_err(|error| {
+                let error = if let Some(expected) = &expected {
+                    worker::startup_failure::persist_startup_failure::<
+                        _,
+                        protocol::startup_failure::RuntimeStartupCause,
+                    >(
+                        worker.store(),
+                        expected,
+                        error,
+                        protocol::startup_failure::StartupStage::Binding,
+                        &(),
+                    )
+                } else {
+                    error
+                };
+                RuntimeRestoreFailure::from_worker(RuntimeRestoreStage::Binding, &error)
+            })?;
         let workdir_capabilities = request
             .workdir_attachments
             .keys()
@@ -2206,19 +2319,14 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 return Err(format!(
                     "install Flow transition feature failed: {:?}",
                     report.reports
-                ));
+                )
+                .into());
             }
         }
 
         let workspace_client = worker.workspace_client_handle();
-        let started = prepared.start().await.map_err(|error| match error {
-            WorkerBootstrapError::Worker(source) => {
-                format!("failed to prepare Worker before controller start: {source}")
-            }
-            WorkerBootstrapError::Controller { source, .. } => format!(
-                "failed to spawn Worker controller in {}: {source}",
-                run_dir.display()
-            ),
+        let started = prepared.start().await.map_err(|error| {
+            RuntimeRestoreFailure::from_bootstrap(RuntimeRestoreStage::Controller, &error)
         })?;
         let (handle, shutdown_rx, controller_task) =
             (started.handle, started.shutdown, started.controller_task);
@@ -2244,79 +2352,90 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
     async fn preflight_restore(
         &self,
         request: &WorkerExecutionRestoreRequest,
-    ) -> Result<(), String> {
-        #[cfg(not(feature = "http-server"))]
-        RuntimeWorkspaceBackendRef::from_worker_request(
-            &request.request,
-            self.runtime_id.as_deref(),
-        )?;
-        let worker_name = Self::runtime_worker_name_for_ref(&request.worker_ref);
-        let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
-        if !worker_aggregate_dir.is_dir() {
-            return Err("Persisted Worker aggregate metadata is unavailable".to_string());
-        }
-        if !worker_aggregate_dir.join("session").is_dir() {
-            return Err("Persisted Worker Session metadata is unavailable".to_string());
-        }
-        let metadata_store = WorkerAggregateStore::new(&worker_aggregate_dir, &worker_name)
-            .map_err(|error| format!("failed to read Worker aggregate metadata: {error}"))?;
-        let metadata = metadata_store
-            .read_by_name(&worker_name)
-            .map_err(|error| format!("failed to read Worker metadata: {error}"))?
-            .ok_or_else(|| "Persisted Worker metadata is unavailable".to_string())?;
-        let (manifest, loader) = Self::manifest_for_restore(&metadata, &request.request)?;
-        if let Some(active) = metadata.active.as_ref()
-            && let Some(segment_id) = active.segment_id
-        {
-            // Preflight must not create lock files or migrate retained sources.
-            // Actual restore reacquires the live guard before any publication.
-            self.session_retention()?
-                .ensure_live(active.session_id)
-                .map_err(|error| format!("Worker Session source is unavailable: {error}"))?;
-            let session_store =
-                WorkerSessionStore::open_read_only(worker_aggregate_dir.join("session"))
-                    .map_err(|error| format!("failed to read Worker Session store: {error}"))?;
-            if !session_store
-                .exists(active.session_id, segment_id)
-                .map_err(|error| format!("failed to inspect Worker Session segment: {error}"))?
+    ) -> Result<(), RuntimeRestoreFailure> {
+        let result: Result<(), String> = async {
+            #[cfg(not(feature = "http-server"))]
+            RuntimeWorkspaceBackendRef::from_worker_request(
+                &request.request,
+                self.runtime_id.as_deref(),
+            )?;
+            let worker_name = Self::runtime_worker_name_for_ref(&request.worker_ref);
+            let worker_aggregate_dir = self.worker_aggregate_dir(&request.worker_ref)?;
+            if !worker_aggregate_dir.is_dir() {
+                return Err("Persisted Worker aggregate metadata is unavailable".to_string());
+            }
+            if !worker_aggregate_dir.join("session").is_dir() {
+                return Err("Persisted Worker Session metadata is unavailable".to_string());
+            }
+            let metadata_store = WorkerAggregateStore::new(&worker_aggregate_dir, &worker_name)
+                .map_err(|error| format!("failed to read Worker aggregate metadata: {error}"))?;
+            let metadata = metadata_store
+                .read_by_name(&worker_name)
+                .map_err(|error| format!("failed to read Worker metadata: {error}"))?
+                .ok_or_else(|| "Persisted Worker metadata is unavailable".to_string())?;
+            let (manifest, loader) = Self::manifest_for_restore(&metadata, &request.request)?;
+            if let Some(active) = metadata.active.as_ref()
+                && let Some(segment_id) = active.segment_id
             {
-                return Err("Persisted Worker Session segment is unavailable".to_string());
+                // Preflight must not create lock files or migrate retained sources.
+                // Actual restore reacquires the live guard before any publication.
+                self.session_retention()?
+                    .ensure_live(active.session_id)
+                    .map_err(|error| format!("Worker Session source is unavailable: {error}"))?;
+                let session_store =
+                    WorkerSessionStore::open_read_only(worker_aggregate_dir.join("session"))
+                        .map_err(|error| format!("failed to read Worker Session store: {error}"))?;
+                if !session_store
+                    .exists(active.session_id, segment_id)
+                    .map_err(|error| format!("failed to inspect Worker Session segment: {error}"))?
+                {
+                    return Err("Persisted Worker Session segment is unavailable".to_string());
+                }
+                session_store
+                    .read_all(active.session_id, segment_id)
+                    .map_err(|error| format!("failed to read Worker Session segment: {error}"))?;
             }
-            session_store
-                .read_all(active.session_id, segment_id)
-                .map_err(|error| format!("failed to read Worker Session segment: {error}"))?;
-        }
-        if let Some(api) = request.request.workspace_api.as_ref()
-            && metadata
-                .active
-                .as_ref()
-                .is_some_and(|active| active.segment_id.is_none())
-        {
-            let bundle = request.config_bundle.as_ref().ok_or_else(|| {
-                "Pending Workspace Worker restore requires operation-owned launch material"
-                    .to_string()
-            })?;
-            crate::config_bundle::validate_config_bundle(bundle)
-                .map_err(|error| format!("invalid pending Worker launch material: {error}"))?;
-            if bundle.metadata.workspace_id != api.workspace_id {
-                return Err(format!(
-                    "Workspace Prompt projection scope mismatch: expected {}, got {}",
-                    api.workspace_id, bundle.metadata.workspace_id
-                ));
+            if let Some(api) = request.request.workspace_api.as_ref()
+                && metadata
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.segment_id.is_none())
+            {
+                let bundle = request.config_bundle.as_ref().ok_or_else(|| {
+                    "Pending Workspace Worker restore requires operation-owned launch material"
+                        .to_string()
+                })?;
+                crate::config_bundle::validate_config_bundle(bundle)
+                    .map_err(|error| format!("invalid pending Worker launch material: {error}"))?;
+                if bundle.metadata.workspace_id != api.workspace_id {
+                    return Err(format!(
+                        "Workspace Prompt projection scope mismatch: expected {}, got {}",
+                        api.workspace_id, bundle.metadata.workspace_id
+                    ));
+                }
+                let prompt_catalog = bundle.prompt_catalog.as_ref().ok_or_else(|| {
+                    "pending Workspace Worker restore requires a saved Workspace Prompt projection"
+                        .to_string()
+                })?;
+                // Validate the exact launch catalog without publishing it into the
+                // current projection cache or allocating live Worker resources.
+                worker::SystemPromptTemplate::parse(
+                    &manifest.engine.instruction,
+                    loader.with_effective_catalog(prompt_catalog.clone()),
+                )
+                .map_err(|error| format!("invalid pending Worker launch Prompt: {error}"))?;
             }
-            let prompt_catalog = bundle.prompt_catalog.as_ref().ok_or_else(|| {
-                "pending Workspace Worker restore requires a saved Workspace Prompt projection"
-                    .to_string()
-            })?;
-            // Validate the exact launch catalog without publishing it into the
-            // current projection cache or allocating live Worker resources.
-            worker::SystemPromptTemplate::parse(
-                &manifest.engine.instruction,
-                loader.with_effective_catalog(prompt_catalog.clone()),
-            )
-            .map_err(|error| format!("invalid pending Worker launch Prompt: {error}"))?;
+            Ok(())
         }
-        Ok(())
+        .await;
+        result.map_err(|diagnostic| {
+            let mut failure = RuntimeRestoreFailure::refused(
+                RuntimeRestoreStage::Preflight,
+                "restore preflight refused",
+            );
+            failure.legacy_diagnostic = Some(diagnostic);
+            failure
+        })
     }
 
     async fn recover_restore_source(
@@ -2347,12 +2466,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             self.runtime_id.as_deref(),
         )
         .map_err(|cause| RuntimeRestoreFailure::refused(RuntimeRestoreStage::Preflight, cause))?;
-        self.preflight_restore(&request).await.map_err(|_| {
-            RuntimeRestoreFailure::refused(
-                RuntimeRestoreStage::Preflight,
-                "restore preflight refused",
-            )
-        })?;
+        self.preflight_restore(&request).await?;
         #[cfg(test)]
         self.restore_faults
             .executions
@@ -2455,7 +2569,10 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 .await
                 .map_err(|error| {
                     self.retain_construction_failure(&request, &error);
-                    restore_worker_cause(&error)
+                    let failure = RuntimeRestoreFailure::from_worker(stage, &error);
+                    let cause = failure.cause;
+                    preparation_failure = Some(failure);
+                    cause
                 })?;
             self.failed_restore_resources
                 .lock()
@@ -2728,7 +2845,8 @@ impl RuntimeRestoreCandidate for ProfileRestoreCandidate {
                     Some(source.kind()),
                 ),
             };
-            let mut failure = RuntimeRestoreFailure::started(stage, cause);
+            let mut failure = RuntimeRestoreFailure::from_bootstrap(stage, &error);
+            failure.cause = cause;
             failure.durable_effects_possible = true;
             failure.io_kind = io_kind;
             failure
@@ -2870,6 +2988,7 @@ impl ProfileRuntimeWorkerFactory {
     ) -> Result<ProfileRestoreCandidate, RuntimeRestoreFailure> {
         let mut stage = RuntimeRestoreStage::Binding;
         let mut io_kind = None;
+        let mut primary_failure = None;
         let result: Result<ProfileRestoreCandidate, &str> = async {
             let feature_tasks = candidate
                 .retain_startup_feature_cleanup()
@@ -2998,6 +3117,7 @@ impl ProfileRuntimeWorkerFactory {
                     WorkerBootstrapError::Worker(error) => {
                         stage = RuntimeRestoreStage::Reconstruction;
                         self.retain_construction_failure(request, &error);
+                        primary_failure = Some(RuntimeRestoreFailure::from_worker(stage, &error));
                         restore_worker_cause(&error)
                     }
                     WorkerBootstrapError::Controller { source, .. } => {
@@ -3028,7 +3148,8 @@ impl ProfileRuntimeWorkerFactory {
         }
         .await;
         result.map_err(|cause| {
-            let mut failure = RuntimeRestoreFailure::started(stage, cause);
+            let mut failure =
+                primary_failure.unwrap_or_else(|| RuntimeRestoreFailure::started(stage, cause));
             failure.io_kind = io_kind;
             failure
         })
@@ -3744,10 +3865,16 @@ where
 
         let factory = Arc::clone(&self.factory);
         let request = request.clone();
-        self.run_on_adapter_runtime(async move { factory.preflight_restore(&request).await })
+        let outcome = self
+            .run_on_adapter_runtime(async move { Ok(factory.preflight_restore(&request).await) })
             .map_err(|message| {
                 WorkerExecutionResult::rejected(WorkerExecutionOperation::Restore, message)
             })?;
+        outcome.map_err(|failure| {
+            let mut result = failure.execution_result(WorkerExecutionOperation::Restore);
+            result.outcome = crate::execution::WorkerExecutionOutcome::Rejected;
+            result
+        })?;
         Ok(())
     }
 
@@ -5418,10 +5545,15 @@ where
                 let worker_ref = request.worker_ref.clone();
                 let spawn_result = self
                     .run_cancellable_on_adapter_runtime(self.spawn_restore_timeout, async move {
-                        factory.spawn_controller(request).await
+                        Ok(factory.spawn_controller(request).await)
                     });
                 let controller = match spawn_result {
-                    Ok(controller) => controller,
+                    Ok(Ok(controller)) => controller,
+                    Ok(Err(failure)) => {
+                        return WorkerExecutionSpawnResult::Errored(
+                            failure.execution_result(WorkerExecutionOperation::Spawn),
+                        );
+                    }
                     Err(message) => {
                         return WorkerExecutionSpawnResult::Errored(
                             WorkerExecutionResult::errored(
@@ -5457,7 +5589,10 @@ where
                     materializer.as_ref(),
                     &request.workdir_attachments,
                     &rollback_workdirs,
-                    &message,
+                    &WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Spawn,
+                        message.clone(),
+                    ),
                 ) {
                     return result;
                 }
@@ -5479,7 +5614,10 @@ where
                         materializer.as_ref(),
                         &request.workdir_attachments,
                         &rollback_workdirs,
-                        &message,
+                        &WorkerExecutionResult::rejected(
+                            WorkerExecutionOperation::Spawn,
+                            message.clone(),
+                        ),
                     ) {
                         return result;
                     }
@@ -5497,7 +5635,10 @@ where
                     materializer.as_ref(),
                     &request.workdir_attachments,
                     &rollback_workdirs,
-                    &message,
+                    &WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Spawn,
+                        message.clone(),
+                    ),
                 ) {
                     return result;
                 }
@@ -5521,7 +5662,10 @@ where
                         materializer.as_ref(),
                         &request.workdir_attachments,
                         &rollback_workdirs,
-                        &message,
+                        &WorkerExecutionResult::rejected(
+                            WorkerExecutionOperation::Spawn,
+                            message.clone(),
+                        ),
                     ) {
                         return result;
                     }
@@ -5539,17 +5683,32 @@ where
         let worker_ref = request.worker_ref.clone();
         let spawn_result = self
             .run_cancellable_on_adapter_runtime(self.spawn_restore_timeout, async move {
-                factory.spawn_controller(request).await
+                Ok(factory.spawn_controller(request).await)
             });
 
         let controller = match spawn_result {
-            Ok(controller) => controller,
+            Ok(Ok(controller)) => controller,
+            Ok(Err(failure)) => {
+                let result = failure.execution_result(WorkerExecutionOperation::Spawn);
+                if let Err(cleanup) = rollback_materialized_spawn_workdirs(
+                    materializer.as_ref(),
+                    &workdir_attachments,
+                    &rollback_workdirs,
+                    &result,
+                ) {
+                    return cleanup;
+                }
+                return WorkerExecutionSpawnResult::Errored(result);
+            }
             Err(message) => {
                 if let Err(result) = rollback_materialized_spawn_workdirs(
                     materializer.as_ref(),
                     &workdir_attachments,
                     &rollback_workdirs,
-                    &message,
+                    &WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Spawn,
+                        message.clone(),
+                    ),
                 ) {
                     return result;
                 }
@@ -5663,8 +5822,7 @@ where
         if *completed_id != operation_id {
             return None;
         }
-        let result =
-            WorkerExecutionResult::errored(WorkerExecutionOperation::Restore, failure.to_string());
+        let result = failure.execution_result(WorkerExecutionOperation::Restore);
         Some(if failure.cleanup == RuntimeRestoreCleanup::NotNeeded {
             WorkerExecutionSpawnResult::Rejected(result)
         } else {
@@ -5935,7 +6093,7 @@ where
         };
         if let Err(message) = self.wait_pending_restore(&pending, self.spawn_restore_timeout) {
             return WorkerExecutionSpawnResult::ReconciliationRequired {
-                result: WorkerExecutionResult::errored(WorkerExecutionOperation::Restore, message),
+                result: pending.failure_result(message),
                 worker_state: None,
                 workdir_attachments: Vec::new(),
             };
@@ -5946,10 +6104,7 @@ where
                 .and_then(|()| self.wait_pending_restore(&pending, self.spawn_restore_timeout))
             {
                 return WorkerExecutionSpawnResult::ReconciliationRequired {
-                    result: WorkerExecutionResult::errored(
-                        WorkerExecutionOperation::Restore,
-                        message,
-                    ),
+                    result: pending.failure_result(message),
                     worker_state: None,
                     workdir_attachments: Vec::new(),
                 };
@@ -5962,10 +6117,15 @@ where
             .as_ref()
         {
             return WorkerExecutionSpawnResult::ReconciliationRequired {
-                result: WorkerExecutionResult::errored(
-                    WorkerExecutionOperation::Restore,
-                    failure.to_string(),
-                ),
+                result: {
+                    let mut result = pending.failure_result(failure.to_string());
+                    result.push_secondary_failure(
+                        protocol::startup_failure::StartupSecondaryFailure::Cleanup {
+                            failure: (*failure).into(),
+                        },
+                    );
+                    result
+                },
                 worker_state: None,
                 workdir_attachments: pending.request.previous_workdir_attachments.clone(),
             };
@@ -5982,13 +6142,15 @@ where
                     workdir_attachments: pending.request.previous_workdir_attachments.clone(),
                 };
             }
-            let message = match activated.as_ref() {
-                Some(Err(failure)) => failure.to_string(),
-                _ => "restore activation is owned by the same operation; reconcile activation"
-                    .to_string(),
+            let result = match activated.as_ref() {
+                Some(Err(failure)) => failure.execution_result(WorkerExecutionOperation::Restore),
+                _ => WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Restore,
+                    "restore activation is owned by the same operation; reconcile activation",
+                ),
             };
             return WorkerExecutionSpawnResult::ReconciliationRequired {
-                result: WorkerExecutionResult::errored(WorkerExecutionOperation::Restore, message),
+                result,
                 worker_state: None,
                 workdir_attachments: pending.request.previous_workdir_attachments.clone(),
             };
@@ -6010,10 +6172,7 @@ where
             match retained.as_ref() {
                 Some(Ok(candidate)) => candidate.initial_state(),
                 Some(Err(failure)) => {
-                    let result = WorkerExecutionResult::errored(
-                        WorkerExecutionOperation::Restore,
-                        failure.to_string(),
-                    );
+                    let result = failure.execution_result(WorkerExecutionOperation::Restore);
                     let cleanup = failure.cleanup;
                     if failure.durable_effects_possible {
                         return WorkerExecutionSpawnResult::ReconciliationRequired {
@@ -6224,10 +6383,7 @@ where
                 .insert(worker_ref.clone(), (operation_id, failure.clone()));
             self.remove_pending_restore(worker_ref)?;
             Ok(WorkerExecutionSpawnResult::RolledBack(
-                WorkerExecutionResult::errored(
-                    WorkerExecutionOperation::Restore,
-                    failure.to_string(),
-                ),
+                failure.execution_result(WorkerExecutionOperation::Restore),
             ))
         })();
         reclaimed.unwrap_or_else(
@@ -6360,10 +6516,7 @@ where
                 .insert(worker_ref.clone(), (operation_id, failure.clone()));
             self.remove_pending_restore(worker_ref)?;
             Ok(WorkerExecutionSpawnResult::RolledBack(
-                WorkerExecutionResult::errored(
-                    WorkerExecutionOperation::Restore,
-                    failure.to_string(),
-                ),
+                failure.execution_result(WorkerExecutionOperation::Restore),
             ))
         })();
         discarded.unwrap_or_else(
@@ -8876,7 +9029,11 @@ mod tests {
         let before = persisted_files(&runtime_store);
         let error = factory.preflight_restore(&request).await.unwrap_err();
         assert!(
-            error.contains("Pending Workspace Worker restore requires"),
+            error
+                .legacy_diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Pending Workspace Worker restore requires"),
             "{error}"
         );
         assert_eq!(persisted_files(&runtime_store), before);
@@ -8936,7 +9093,14 @@ mod tests {
             (missing_instruction, "invalid pending Worker launch Prompt"),
         ] {
             let error = factory.preflight_restore(&invalid).await.unwrap_err();
-            assert!(error.contains(expected), "{error}");
+            assert!(
+                error
+                    .legacy_diagnostic
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(expected),
+                "{error}"
+            );
             let error = match factory.restore_controller(invalid).await {
                 Ok(controller) => {
                     shutdown_profile_controller(controller).await;
@@ -9075,7 +9239,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.contains("subjektiv settings snapshot mismatch"),
+            error
+                .legacy_diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("subjektiv settings snapshot mismatch"),
             "{error}"
         );
         let error = match factory.restore_controller(wrong_settings).await {
@@ -10053,7 +10221,7 @@ mod tests {
         async fn spawn_controller(
             &self,
             _request: WorkerExecutionSpawnRequest,
-        ) -> Result<RuntimeWorkerController, String> {
+        ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
             let _drop = FactoryFutureDrop(self.dropped.clone());
             self.started.send(()).unwrap();
             std::future::pending().await
@@ -10233,7 +10401,7 @@ mod tests {
         async fn spawn_controller(
             &self,
             request: WorkerExecutionSpawnRequest,
-        ) -> Result<RuntimeWorkerController, String> {
+        ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
             let manifest = WorkerManifest::from_toml(
                 r#"
                 [worker]
@@ -10664,8 +10832,8 @@ mod tests {
         async fn spawn_controller(
             &self,
             _request: WorkerExecutionSpawnRequest,
-        ) -> Result<RuntimeWorkerController, String> {
-            Err("spawn failed".to_string())
+        ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
+            Err("spawn failed".into())
         }
 
         async fn restore_controller(
@@ -10701,7 +10869,7 @@ mod tests {
         async fn spawn_controller(
             &self,
             request: WorkerExecutionSpawnRequest,
-        ) -> Result<RuntimeWorkerController, String> {
+        ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
             self.inner.spawn_controller(request).await
         }
 
@@ -11021,7 +11189,7 @@ mod tests {
         async fn spawn_controller(
             &self,
             _request: WorkerExecutionSpawnRequest,
-        ) -> Result<RuntimeWorkerController, String> {
+        ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
             panic!("stop must not spawn a Controller")
         }
         async fn restore_controller(
@@ -11077,11 +11245,14 @@ mod tests {
         async fn spawn_controller(
             &self,
             _: WorkerExecutionSpawnRequest,
-        ) -> Result<RuntimeWorkerController, String> {
+        ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
             panic!("reclaim must not spawn")
         }
 
-        async fn preflight_restore(&self, _: &WorkerExecutionRestoreRequest) -> Result<(), String> {
+        async fn preflight_restore(
+            &self,
+            _: &WorkerExecutionRestoreRequest,
+        ) -> Result<(), RuntimeRestoreFailure> {
             panic!("reclaim must not preflight preparation")
         }
 
@@ -11461,7 +11632,7 @@ mod tests {
         async fn spawn_controller(
             &self,
             request: WorkerExecutionSpawnRequest,
-        ) -> Result<RuntimeWorkerController, String> {
+        ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
             self.inner.spawn_controller(request).await
         }
         async fn restore_controller(
