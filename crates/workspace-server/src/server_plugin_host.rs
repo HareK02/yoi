@@ -141,9 +141,12 @@ pub(super) fn with_authority_database<T>(
     api: &WorkspaceApi,
     check: impl FnOnce() -> crate::Result<T>,
 ) -> crate::Result<T> {
-    let _database = api
+    let database = api
         .feature_storage
         .open(&api.subjektiv_registration)
+        .map_err(|error| Error::Store(error.to_string()))?;
+    let _guard = database
+        .guard(database.identity())
         .map_err(|error| Error::Store(error.to_string()))?;
     check()
 }

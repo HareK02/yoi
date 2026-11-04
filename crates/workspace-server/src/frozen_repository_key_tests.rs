@@ -470,7 +470,7 @@ fn migrated_workdir_request_replays_and_retries_without_accepting_changed_displa
     rename_saved_secret_receipt_counters(&conn).unwrap();
     let store = SqliteWorkspaceStore {
         db_executor: crate::db_executor::DbExecutor::shared(),
-        conn: Arc::new(Mutex::new(conn)),
+        conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
     };
     let migrated = store
         .load_workdir_create_operation("space", "create-workdir")
@@ -654,7 +654,7 @@ fn deleted_successful_workdir_archives_verbatim_history_without_authorizing_retr
     rename_saved_secret_receipt_counters(&conn).unwrap();
     let store = Arc::new(SqliteWorkspaceStore {
         db_executor: crate::db_executor::DbExecutor::shared(),
-        conn: Arc::new(Mutex::new(conn)),
+        conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
     });
     let archived = store
         .load_workdir_create_legacy_ssh_archive("space", "create-workdir")
@@ -1030,7 +1030,7 @@ fn migrated_ssh_mutations_replay_complete_old_input_without_reexecution_or_recei
     rename_saved_secret_receipt_counters(&conn).unwrap();
     let store = Arc::new(SqliteWorkspaceStore {
         db_executor: crate::db_executor::DbExecutor::shared(),
-        conn: Arc::new(Mutex::new(conn)),
+        conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
     });
     let service =
         crate::repository_access::RepositorySecretService::open(store.clone(), &database).unwrap();
@@ -1183,7 +1183,7 @@ fn deleted_legacy_receipt_does_not_bind_to_later_reused_key_ordinal() {
     rename_saved_secret_receipt_counters(&conn).unwrap();
     let store = Arc::new(SqliteWorkspaceStore {
         db_executor: crate::db_executor::DbExecutor::shared(),
-        conn: Arc::new(Mutex::new(conn)),
+        conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
     });
     let service =
         crate::repository_access::RepositorySecretService::open(store.clone(), &database).unwrap();

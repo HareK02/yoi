@@ -69,6 +69,7 @@ webauthn-rs-proto = "0.5.5"
 content-history.workspace = true
 content-history-store.workspace = true
 content-history-adapters.workspace = true
+rusqlite = { workspace = true, features = ["hooks"] }
 feature-storage = { workspace = true, features = ["test-support"] }
 native-tls = "0.2"
 tokio-native-tls = "0.3"
