@@ -2035,10 +2035,21 @@ async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publicati
     );
     // Only this fixture's retained operation is cleaned up, after its durable
     // evidence has been checked. Cleanup is not the restore outcome above.
-    let cleanup = execution.stop_worker(&worker_ref);
+    let stop = worker_runtime::execution::WorkerExecutionStopRequest {
+        worker_ref: worker_ref.clone(),
+        operation_id: worker_runtime::execution::WorkerLifecycleOperationId::new(),
+    };
+    let cleanup = execution.stop_worker_operation(stop.clone());
     assert!(
         cleanup.is_accepted(),
         "fixture restore cleanup: {cleanup:?}"
+    );
+    assert!(
+        cleanup
+            .termination
+            .as_ref()
+            .is_some_and(|receipt| receipt.confirms_scope_shutdown(&worker_ref, stop.operation_id)),
+        "fixture cleanup must join its original prepared owner: {cleanup:?}"
     );
     shutdown_workspace_feature_storage(&api).await.unwrap();
 }
@@ -2534,9 +2545,17 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
     let worker_ref = worker_runtime::identity::WorkerRef::try_from(worker).unwrap();
     if revoked {
         assert!(fixture.execution.worker_snapshot(&worker_ref).is_none());
+        let stop = worker_runtime::execution::WorkerExecutionStopRequest {
+            worker_ref: worker_ref.clone(),
+            operation_id: worker_runtime::execution::WorkerLifecycleOperationId::new(),
+        };
+        let cleanup = fixture.execution.stop_worker_operation(stop.clone());
+        assert!(cleanup.is_accepted(), "fixture repair cleanup: {cleanup:?}");
         assert!(
-            fixture.execution.stop_worker(&worker_ref).is_accepted(),
-            "fixture-owned repair resource cleanup"
+            cleanup.termination.as_ref().is_some_and(
+                |receipt| receipt.confirms_scope_shutdown(&worker_ref, stop.operation_id)
+            ),
+            "fixture cleanup must join its original repair owner: {cleanup:?}"
         );
     } else {
         assert!(fixture.execution.worker_snapshot(&worker_ref).is_some());
