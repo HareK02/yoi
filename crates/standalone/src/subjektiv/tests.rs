@@ -297,6 +297,13 @@ fn session_registration_uses_real_capability_and_attribution_decisions() {
             .session_registration_cause(),
         SessionRegistrationCause::binding_mismatch(),
     );
+    // Normal factory startup creates the Worker Session store before registration.
+    // Keep that real filesystem prerequisite without pre-creating attribution.
+    let _sessions = session_store::FsStore::new_with_retention(
+        root.join(id.to_string()).join("sessions"),
+        crate::store::session_retention(&root),
+    )
+    .unwrap();
     let success = port.record_session(&context, true).unwrap();
     assert_eq!(success.subject_id, subject.id);
     assert_eq!(success.session_id, context.session_id);
