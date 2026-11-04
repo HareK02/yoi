@@ -6586,19 +6586,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         workspace_id: &str,
         repository_key: &str,
     ) -> Result<Option<RepositoryRecord>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
-                          source_kind, source_uri, default_ref,
-                          source_fingerprint, observed_status, observed_at, created_at, updated_at
-                   FROM repositories
-                   WHERE workspace_id = ?1 AND repository_key = ?2"#,
-                params![workspace_id, repository_key],
-                read_repository_record,
-            )
-            .optional()
-            .map_err(Error::from)
-        })
+        self.with_conn(|conn| read_repository_by_key(conn, workspace_id, repository_key))
     }
 
     fn list_repositories(&self, workspace_id: &str) -> Result<Vec<RepositoryRecord>> {
@@ -12223,6 +12211,24 @@ fn validate_repository_record_identity(record: &RepositoryRecord) -> Result<()> 
     server_api::validate_repository_key(&record.repository_key)
         .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
     Ok(())
+}
+
+pub(crate) fn read_repository_by_key(
+    conn: &Connection,
+    workspace_id: &str,
+    repository_key: &str,
+) -> Result<Option<RepositoryRecord>> {
+    conn.query_row(
+        r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
+                  source_kind, source_uri, default_ref,
+                  source_fingerprint, observed_status, observed_at, created_at, updated_at
+           FROM repositories
+           WHERE workspace_id = ?1 AND repository_key = ?2"#,
+        params![workspace_id, repository_key],
+        read_repository_record,
+    )
+    .optional()
+    .map_err(Error::from)
 }
 
 fn read_repository_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRecord> {
