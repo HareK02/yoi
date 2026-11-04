@@ -10,6 +10,8 @@ autobins = false
 default = []
 
 [dependencies]
+error-contract.workspace = true
+feature-permissions.workspace = true
 async-trait = { workspace = true }
 agen = { workspace = true, features = ["codex"] }
 session-store = { workspace = true }

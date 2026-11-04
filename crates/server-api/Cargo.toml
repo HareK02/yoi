@@ -10,6 +10,7 @@ default = []
 typescript = ["dep:ts-rs", "protocol/typescript"]
 
 [dependencies]
+feature-permissions.workspace = true
 api-macros = { workspace = true, features = ["reqwest", "axum", "openapi"] }
 memory.workspace = true
 plugin-plan.workspace = true
