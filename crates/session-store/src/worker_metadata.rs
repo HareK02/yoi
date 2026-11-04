@@ -323,7 +323,8 @@ impl StartupFailureExpectation {
         })
     }
 
-    fn matches(&self, metadata: &WorkerMetadata) -> bool {
+    /// Compare the complete observation without adopting newer ownership or causes.
+    pub fn matches(&self, metadata: &WorkerMetadata) -> bool {
         metadata.worker_name == self.worker_name
             && metadata.workspace_id == self.workspace_id
             && metadata.active.as_ref().map(|active| active.session_id) == Some(self.session_id)

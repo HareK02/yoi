@@ -196,6 +196,10 @@ pub enum StartupFailurePhase {
     RuntimeRecordDelete,
     RuntimeSnapshotSave,
     RuntimeRemovalPublish,
+    /// Retaining create reconciliation observations in the canonical Worker record.
+    RuntimeReconciliationRecordSave,
+    /// Publishing a retained record to Runtime subscribers; not a durable write.
+    RuntimeReconciliationPublish,
     MetadataSave,
 }
 

@@ -1569,7 +1569,7 @@ impl Runtime {
                 });
             }
             WorkerExecutionSpawnResult::ReconciliationRequired {
-                result,
+                mut result,
                 worker_state,
                 workdir_attachments,
             } => {
@@ -1582,12 +1582,33 @@ impl Runtime {
                 } else {
                     self.retain_create_reconciliation_pending(&worker_ref, workdir_attachments)
                 };
-                if let Err(error) = retain_result {
+                if let Err((phase, error)) = retain_result {
+                    let outcome = if matches!(error, RuntimeError::StoreCommitOutcomeUnknown { .. })
+                    {
+                        StartupPersistenceOutcome::OutcomeUnknown
+                    } else {
+                        StartupPersistenceOutcome::NotSaved
+                    };
+                    if phase == StartupFailurePhase::RuntimeReconciliationPublish {
+                        result.push_secondary_failure(StartupSecondaryFailure::Persistence {
+                            phase: StartupFailurePhase::RuntimeReconciliationRecordSave,
+                            outcome: StartupPersistenceOutcome::Persisted,
+                        });
+                    }
+                    result.push_secondary_failure(StartupSecondaryFailure::Persistence {
+                        phase,
+                        outcome,
+                    });
                     tracing::error!(
                         worker_id = %worker_ref.worker_id,
                         %error,
                         "failed to persist Worker create reconciliation evidence"
                     );
+                } else {
+                    result.push_secondary_failure(StartupSecondaryFailure::Persistence {
+                        phase: StartupFailurePhase::RuntimeReconciliationRecordSave,
+                        outcome: StartupPersistenceOutcome::Persisted,
+                    });
                 }
                 return Err(RuntimeError::WorkerExecutionRejected {
                     worker_id: worker_ref.worker_id.clone(),
@@ -5193,9 +5214,10 @@ impl Runtime {
 
         worker_state: protocol::WorkerStateSnapshot,
         workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
-    ) -> Result<(), RuntimeError> {
-        let mut state = self.lock()?;
-        let mut candidate = state.worker(worker_ref)?.clone();
+    ) -> Result<(), (StartupFailurePhase, RuntimeError)> {
+        let record_error = |error| (StartupFailurePhase::RuntimeReconciliationRecordSave, error);
+        let mut state = self.lock().map_err(record_error)?;
+        let mut candidate = state.worker(worker_ref).map_err(record_error)?.clone();
 
         candidate.restore_guard.rotate();
         candidate.execution_metadata_available = true;
@@ -5204,9 +5226,13 @@ impl Runtime {
         candidate.apply_worker_state(&worker_state);
         candidate.restore_intent = WorkerRestoreIntent::Automatic;
         candidate.workdir_attachments = workdir_attachments;
-        state.persist_worker_record(&candidate)?;
+        state
+            .persist_worker_record(&candidate)
+            .map_err(record_error)?;
         state.workers.insert(worker_ref.worker_id, candidate);
-        state.publish_worker_upsert(worker_ref.worker_id)?;
+        state
+            .publish_worker_upsert(worker_ref.worker_id)
+            .map_err(|error| (StartupFailurePhase::RuntimeReconciliationPublish, error))?;
         Ok(())
     }
 
@@ -5228,9 +5254,10 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
         workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
-    ) -> Result<(), RuntimeError> {
-        let mut state = self.lock()?;
-        let mut candidate = state.worker(worker_ref)?.clone();
+    ) -> Result<(), (StartupFailurePhase, RuntimeError)> {
+        let record_error = |error| (StartupFailurePhase::RuntimeReconciliationRecordSave, error);
+        let mut state = self.lock().map_err(record_error)?;
+        let mut candidate = state.worker(worker_ref).map_err(record_error)?.clone();
 
         candidate.restore_guard.rotate();
         candidate.execution_metadata_available = false;
@@ -5246,8 +5273,12 @@ impl Runtime {
             logical_workdir_attachments_from_statuses(&workdir_attachments, claims);
         candidate.workdir_attachments = workdir_attachments;
         state.workers.insert(worker_ref.worker_id, candidate);
-        state.persist_worker(&worker_ref.worker_id)?;
-        state.publish_worker_upsert(worker_ref.worker_id)?;
+        state
+            .persist_worker(&worker_ref.worker_id)
+            .map_err(record_error)?;
+        state
+            .publish_worker_upsert(worker_ref.worker_id)
+            .map_err(|error| (StartupFailurePhase::RuntimeReconciliationPublish, error))?;
         Ok(())
     }
 
@@ -8378,6 +8409,8 @@ mod tests {
             });
             result
         }
+
+        include!("runtime/create_reconciliation_tests.rs");
 
         fn check_rollback(fault: Fault) {
             let primary = primary_failure();

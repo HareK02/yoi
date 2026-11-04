@@ -2251,34 +2251,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 .map_err(str::to_string)?;
         }
         validate_worker_memory_settings(worker.manifest(), &request.request)?;
-        let expected = worker
-            .store()
-            .read_by_name(&worker_name)?
-            .and_then(|metadata| {
-                session_store::worker_metadata::StartupFailureExpectation::from_metadata(&metadata)
-            });
-        worker
-            .finalize_subjektiv_session_attribution(
-                request.request.subjektiv_attached,
-                SubjektivSessionAttributionLifecycle::NewSession,
-            )
-            .map_err(|error| {
-                let error = if let Some(expected) = &expected {
-                    worker::startup_failure::persist_startup_failure::<
-                        _,
-                        protocol::startup_failure::RuntimeStartupCause,
-                    >(
-                        worker.store(),
-                        expected,
-                        error,
-                        protocol::startup_failure::StartupStage::Binding,
-                        &(),
-                    )
-                } else {
-                    error
-                };
-                RuntimeRestoreFailure::from_worker(RuntimeRestoreStage::Binding, &error)
-            })?;
+        startup_failure::finalize_startup_binding(worker, request.request.subjektiv_attached)?;
         let workdir_capabilities = request
             .workdir_attachments
             .keys()
@@ -7187,6 +7160,7 @@ mod tests {
     use worker::PreparedWorker;
 
     include!("subject_delete_backend_tests.rs");
+    include!("worker_backend/startup_binding_tests.rs");
     #[cfg(feature = "fs-store")]
     include!("subject_delete_create_tests.rs");
 

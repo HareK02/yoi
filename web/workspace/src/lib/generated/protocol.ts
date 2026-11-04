@@ -12,7 +12,7 @@ export type RuntimeStartupReason = "startup_failed" | "segment_empty" | "system_
 
 export type RuntimeStartupCause = { stage: StartupStage, reason: RuntimeStartupReason, };
 
-export type StartupFailurePhase = "cleanup" | "runtime_record_delete" | "runtime_snapshot_save" | "runtime_removal_publish" | "metadata_save";
+export type StartupFailurePhase = "cleanup" | "runtime_record_delete" | "runtime_snapshot_save" | "runtime_removal_publish" | "runtime_reconciliation_record_save" | "runtime_reconciliation_publish" | "metadata_save";
 
 export type StartupCleanupFailure = "ownership" | "workdir" | "artifacts" | "allocation" | "feature" | "unsupported";
 

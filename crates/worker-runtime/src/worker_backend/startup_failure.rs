@@ -102,6 +102,21 @@ impl PendingRuntimeRestore {
     }
 }
 
+pub(super) fn finalize_startup_binding<St>(
+    worker: &Worker<Box<dyn agen::llm_client::LlmClient>, St>,
+    attached: bool,
+) -> Result<(), RuntimeRestoreFailure>
+where
+    St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
+{
+    worker
+        .finalize_subjektiv_session_attribution_retaining_startup_failure(
+            attached,
+            SubjektivSessionAttributionLifecycle::NewSession,
+        )
+        .map_err(|error| RuntimeRestoreFailure::from_worker(RuntimeRestoreStage::Binding, &error))
+}
+
 #[cfg(test)]
 mod tests {
     //! Connect the typed factory seam to the real Tokio adapter and protocol codec.
