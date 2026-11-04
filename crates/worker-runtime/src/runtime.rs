@@ -4375,16 +4375,31 @@ impl Runtime {
             StopAdmission::Stopped(ack) => return Ok(ack),
             StopAdmission::Pending(operation_id) => operation_id,
         };
-        let backend = self.lock()?.execution_backend.clone().ok_or_else(|| {
-            RuntimeError::WorkerExecutionUnavailable {
-                worker_id: worker_ref.worker_id,
-                message: "runtime has no execution backend".into(),
-            }
-        })?;
-        let result = backend.stop_worker_operation(WorkerExecutionStopRequest {
-            operation_id,
-            worker_ref: worker_ref.clone(),
-        });
+        let (backend, saved) = {
+            let mut state = self.lock()?;
+            state.refresh_uncertain_worker_write(worker_ref)?;
+            let backend = state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::WorkerExecutionUnavailable {
+                    worker_id: worker_ref.worker_id,
+                    message: "runtime has no execution backend".into(),
+                }
+            })?;
+            (
+                backend,
+                state
+                    .worker(worker_ref)?
+                    .restore_guard
+                    .execution_termination
+                    .clone(),
+            )
+        };
+        let result = backend.reconcile_stop_worker_operation(
+            WorkerExecutionStopRequest {
+                operation_id,
+                worker_ref: worker_ref.clone(),
+            },
+            saved.as_ref(),
+        );
         self.commit_stopped_worker(worker_ref, operation_id, result)
     }
 
@@ -5116,8 +5131,9 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
     ) -> Result<(), RuntimeError> {
-        let (backend, operation_id) = {
-            let state = self.lock()?;
+        let (backend, operation_id, saved) = {
+            let mut state = self.lock()?;
+            state.refresh_uncertain_worker_write(worker_ref)?;
             let worker = state.worker(worker_ref)?;
             let pending = worker.pending_stop.ok_or_else(|| {
                 RuntimeError::InvalidRequest(format!(
@@ -5131,12 +5147,19 @@ impl Runtime {
                     message: "runtime has no execution backend".to_string(),
                 }
             })?;
-            (backend, pending.operation_id)
+            (
+                backend,
+                pending.operation_id,
+                worker.restore_guard.execution_termination.clone(),
+            )
         };
-        let result = backend.stop_worker_operation(WorkerExecutionStopRequest {
-            operation_id,
-            worker_ref: worker_ref.clone(),
-        });
+        let result = backend.reconcile_stop_worker_operation(
+            WorkerExecutionStopRequest {
+                operation_id,
+                worker_ref: worker_ref.clone(),
+            },
+            saved.as_ref(),
+        );
         self.commit_stopped_worker(worker_ref, operation_id, result)?;
         Ok(())
     }
@@ -9979,6 +10002,36 @@ mod tests {
             } else {
                 Err("shutdown is unconfirmed".into())
             }
+        }
+        fn fence_subject_delete_worker(
+            &self,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> Result<(), String> {
+            self.subject_delete_worker(request)
+        }
+        fn subject_delete_worker_stop(
+            &self,
+            _request: &runtime_api::SubjectDeleteWorkerRequest,
+            stop: WorkerExecutionStopRequest,
+            canonical: Option<&crate::execution::WorkerExecutionTermination>,
+        ) -> Result<WorkerExecutionResult, String> {
+            // Component substitution only. Real owner/report/join coverage lives
+            // in subject_delete_backend_tests, never in this response fixture.
+            if let Some(saved) = canonical {
+                let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop);
+                result.execution_id = Some(saved.execution_id);
+                result.termination = Some(saved.clone());
+                Ok(result)
+            } else {
+                Ok(self.stop_worker_operation(stop))
+            }
+        }
+        fn confirm_subject_delete_worker_absent(
+            &self,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> Result<(), String> {
+            // Replaces only the adapter boundary in these persistence tests.
+            self.subject_delete_worker(request)
         }
         fn recover_subject_create(
             &self,

@@ -5266,6 +5266,147 @@ where
         Ok(())
     }
 
+    // Caller holds the adapter Worker lock through validation, Stop and cleanup.
+    fn subject_delete_worker_under_lock(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+        stop: Option<WorkerExecutionStopRequest>,
+        canonical: Option<&crate::execution::WorkerExecutionTermination>,
+    ) -> Result<WorkerExecutionResult, String> {
+        let worker = WorkerRef::new(request.worker_id);
+        self.validate_subject_delete_identity(request)?;
+        if stop.as_ref().is_some_and(|stop| stop.worker_ref != worker) {
+            return Err("Subject Stop Worker identity mismatch".into());
+        }
+        let canonical_result = if let Some(saved) = canonical {
+            let stop = stop
+                .as_ref()
+                .ok_or("canonical Stop requires original child")?;
+            Some(self.saved_stop_result_under_lock(stop, saved)?)
+        } else {
+            None
+        };
+        let operation_id = {
+            let mut admissions = self
+                .admissions
+                .lock()
+                .map_err(|_| "worker admission lock poisoned")?;
+            let admission = admissions
+                .entry(worker.clone())
+                .or_insert_with(|| WorkerAdmission {
+                    workspace_id: Some(request.workspace_id.clone()),
+                    create_fingerprint: request.create_fingerprint.clone(),
+                    deletion: None,
+                    deletion_stop_operation_id: None,
+                });
+            admission.deletion = Some(request.clone());
+            match admission.deletion_stop_operation_id {
+                Some(operation_id) => {
+                    if stop
+                        .as_ref()
+                        .is_some_and(|stop| stop.operation_id != operation_id)
+                    {
+                        return Err("Subject Stop child identity changed".into());
+                    }
+                    operation_id
+                }
+                None => {
+                    // Reuse a completed original Stop, never retag its receipt
+                    // as a newly generated deletion child. The Stop consumer
+                    // below rejects replay if any replacement owner is present.
+                    let retained = self
+                        .completed_stops
+                        .lock()
+                        .map_err(|_| "stop completion receipts lock poisoned")?
+                        .get(&worker)
+                        .map(|receipt| receipt.stop_operation_id);
+                    let operation_id = stop
+                        .as_ref()
+                        .map(|stop| stop.operation_id)
+                        .or(retained)
+                        .unwrap_or_default();
+                    if retained.is_some_and(|original| original != operation_id) {
+                        return Err("Subject Stop differs from retained original operation".into());
+                    }
+                    admission.deletion_stop_operation_id = Some(operation_id);
+                    operation_id
+                }
+            }
+        };
+        let result = if let Some(result) = canonical_result {
+            result
+        } else {
+            self.stop_worker_operation_under_lock(WorkerExecutionStopRequest {
+                worker_ref: worker.clone(),
+                operation_id,
+            })
+        };
+        let result = self.reconcile_stop_cleanup_under_lock(&worker, result);
+        if !result.is_accepted() {
+            return Ok(result);
+        }
+        self.subject_reservations
+            .lock()
+            .map_err(|_| "Subject reservations poisoned")?
+            .retain(|(saved, _), _| saved != &worker);
+        self.completed_restore_failures
+            .lock()
+            .map_err(|_| "completed restores poisoned")?
+            .remove(&worker);
+        Ok(result)
+    }
+
+    // Caller holds the adapter Worker lock across receipt and cleanup checks.
+    fn saved_stop_result_under_lock(
+        &self,
+        stop: &WorkerExecutionStopRequest,
+        saved: &crate::execution::WorkerExecutionTermination,
+    ) -> Result<WorkerExecutionResult, String> {
+        if !saved.confirms_scope_shutdown(&stop.worker_ref, stop.operation_id) {
+            return Err("invalid canonical Stop receipt".into());
+        }
+        // Even a same-execution live entry is not authority to reuse history.
+        let has_execution = self
+            .workers
+            .lock()
+            .map_err(|_| "worker registry poisoned")?
+            .contains_key(&stop.worker_ref);
+        if has_execution
+            || self
+                .read_termination_receipt_under_lock(&stop.worker_ref, Some(saved))?
+                .as_ref()
+                != Some(saved)
+        {
+            return Err("canonical Stop has a current execution or candidate".into());
+        }
+        let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop);
+        result.execution_id = Some(saved.execution_id);
+        result.termination = Some(saved.clone());
+        Ok(result)
+    }
+
+    fn reconcile_stop_cleanup_under_lock(
+        &self,
+        worker: &WorkerRef,
+        mut result: WorkerExecutionResult,
+    ) -> WorkerExecutionResult {
+        if !result.is_accepted() {
+            return result;
+        }
+        // Scope join and factory-owned cache/artifact cleanup are independent.
+        let factory = self.factory.clone();
+        let stopped = worker.clone();
+        if let Err(error) = self
+            .run_cancellable_on_adapter_runtime(RUNTIME_TASK_TIMEOUT, async move {
+                factory.reconcile_stopped_worker(&stopped).await
+            })
+        {
+            result.outcome = crate::execution::WorkerExecutionOutcome::Errored;
+            result.message = Some(error);
+        }
+        result
+    }
+
     fn read_termination_receipt(
         &self,
         worker_ref: &WorkerRef,
@@ -5275,6 +5416,14 @@ where
         let _guard = operation
             .lock()
             .map_err(|_| "Worker operation lock poisoned".to_string())?;
+        self.read_termination_receipt_under_lock(worker_ref, saved)
+    }
+
+    fn read_termination_receipt_under_lock(
+        &self,
+        worker_ref: &WorkerRef,
+        saved: Option<&crate::execution::WorkerExecutionTermination>,
+    ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
         if self
             .pending_spawns
             .lock()
@@ -5289,8 +5438,12 @@ where
                 .subject_reservations
                 .lock()
                 .map_err(|_| "Subject reservation registry poisoned".to_string())?
-                .keys()
-                .any(|(worker, _)| worker == worker_ref)
+                .iter()
+                .any(|((worker, _), reservation)| {
+                    worker == worker_ref
+                        && (reservation.guard.is_some()
+                            || reservation.state != runtime_api::SubjectReleaseState::Cancelled)
+                })
         {
             return Ok(None);
         }
@@ -5828,63 +5981,104 @@ where
         let worker = WorkerRef::new(request.worker_id);
         let lock = self.worker_lock(&worker)?;
         let _operation = lock.lock().map_err(|_| "worker operation lock poisoned")?;
-        self.validate_subject_delete_identity(request)?;
-        let operation_id = {
-            let mut admissions = self
-                .admissions
-                .lock()
-                .map_err(|_| "worker admission lock poisoned")?;
-            let admission = admissions
-                .entry(worker.clone())
-                .or_insert_with(|| WorkerAdmission {
-                    workspace_id: Some(request.workspace_id.clone()),
-                    create_fingerprint: request.create_fingerprint.clone(),
-                    deletion: None,
-                    deletion_stop_operation_id: None,
-                });
-            admission.deletion = Some(request.clone());
-            match admission.deletion_stop_operation_id {
-                Some(operation_id) => operation_id,
-                None => {
-                    // Reuse a completed original Stop, never retag its receipt
-                    // as a newly generated deletion child. The Stop consumer
-                    // below rejects replay if any replacement owner is present.
-                    let operation_id = self
-                        .completed_stops
-                        .lock()
-                        .map_err(|_| "stop completion receipts lock poisoned")?
-                        .get(&worker)
-                        .map(|receipt| receipt.stop_operation_id)
-                        .unwrap_or_default();
-                    admission.deletion_stop_operation_id = Some(operation_id);
-                    operation_id
-                }
-            }
-        };
-        let result = self.stop_worker_operation_under_lock(WorkerExecutionStopRequest {
-            worker_ref: worker.clone(),
-            operation_id,
-        });
-        if !result.is_accepted() {
-            return Err(result.message_or_default());
+        let result = self.subject_delete_worker_under_lock(request, None, None)?;
+        if result.is_accepted() {
+            Ok(())
+        } else {
+            Err(result.message_or_default())
         }
-        // A live Controller and failed unpublished candidates can coexist. The
-        // ordinary stop's live branch joins the Controller; also reconcile any
-        // factory-owned cache/artifacts before issuing deletion proof.
-        let factory = self.factory.clone();
-        let stopped = worker.clone();
-        self.run_cancellable_on_adapter_runtime(RUNTIME_TASK_TIMEOUT, async move {
-            factory.reconcile_stopped_worker(&stopped).await
-        })?;
-        self.subject_reservations
+    }
+
+    fn fence_subject_delete_worker(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        let worker = WorkerRef::new(request.worker_id);
+        let lock = self.worker_lock(&worker)?;
+        let _operation = lock.lock().map_err(|_| "worker operation lock poisoned")?;
+        self.validate_subject_delete_identity(request)?;
+        self.admissions
             .lock()
-            .map_err(|_| "Subject reservations poisoned")?
-            .retain(|(saved, _), _| saved != &worker);
-        self.completed_restore_failures
-            .lock()
-            .map_err(|_| "completed restores poisoned")?
-            .remove(&worker);
+            .map_err(|_| "worker admission lock poisoned")?
+            .entry(worker)
+            .or_insert_with(|| WorkerAdmission {
+                workspace_id: Some(request.workspace_id.clone()),
+                create_fingerprint: request.create_fingerprint.clone(),
+                deletion: None,
+                deletion_stop_operation_id: None,
+            })
+            .deletion = Some(request.clone());
         Ok(())
+    }
+
+    fn confirm_subject_delete_worker_absent(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        let worker = WorkerRef::new(request.worker_id);
+        let lock = self.worker_lock(&worker)?;
+        let _operation = lock.lock().map_err(|_| "worker operation lock poisoned")?;
+        self.validate_subject_delete_identity(request)?;
+        if self
+            .runtime
+            .lock()
+            .map_err(|_| "adapter runtime poisoned")?
+            .is_none()
+        {
+            return Err("execution backend is unavailable".into());
+        }
+        if self
+            .admissions
+            .lock()
+            .map_err(|_| "worker admission lock poisoned")?
+            .get(&worker)
+            .and_then(|admission| admission.deletion.as_ref())
+            != Some(request)
+        {
+            return Err("exact Subject admission fence required".into());
+        }
+        if self.pending_spawn_exists(&worker)?
+            || self
+                .pending_restores
+                .lock()
+                .map_err(|_| "restore registry poisoned")?
+                .contains_key(&worker)
+            || self
+                .workers
+                .lock()
+                .map_err(|_| "worker registry poisoned")?
+                .contains_key(&worker)
+            || self
+                .subject_reservations
+                .lock()
+                .map_err(|_| "Subject reservations poisoned")?
+                .iter()
+                .any(|((saved, _), reservation)| {
+                    *saved == worker
+                        && (reservation.guard.is_some()
+                            || reservation.state != runtime_api::SubjectReleaseState::Cancelled)
+                })
+        {
+            return Err("Subject Worker still has an execution resource owner".into());
+        }
+        // The caller's confirmed fence proves prior shutdown. Factory artifacts
+        // are checked separately; neither an empty map nor cleanup mints proof.
+        let factory = self.factory.clone();
+        self.run_cancellable_on_adapter_runtime(RUNTIME_TASK_TIMEOUT, async move {
+            factory.reconcile_stopped_worker(&worker).await
+        })
+    }
+
+    fn subject_delete_worker_stop(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+        stop: WorkerExecutionStopRequest,
+        canonical: Option<&crate::execution::WorkerExecutionTermination>,
+    ) -> Result<WorkerExecutionResult, String> {
+        let worker = WorkerRef::new(request.worker_id);
+        let lock = self.worker_lock(&worker)?;
+        let _operation = lock.lock().map_err(|_| "worker operation lock poisoned")?;
+        self.subject_delete_worker_under_lock(request, Some(stop), canonical)
     }
 
     fn recover_subject_create(
@@ -7922,6 +8116,52 @@ where
         self.send_method(WorkerExecutionOperation::ProtocolMethod, worker, method)
     }
 
+    fn reconcile_stop_worker_operation(
+        &self,
+        request: WorkerExecutionStopRequest,
+        saved: Option<&crate::execution::WorkerExecutionTermination>,
+    ) -> WorkerExecutionResult {
+        let Some(saved) = saved else {
+            return self.stop_worker_operation(request);
+        };
+        let reconcile = || -> Result<WorkerExecutionResult, String> {
+            let lock = self.worker_lock(&request.worker_ref)?;
+            let _guard = lock
+                .lock()
+                .map_err(|_| "worker operation lock is poisoned")?;
+            let execution = self
+                .workers
+                .lock()
+                .map_err(|_| "worker registry poisoned")?
+                .get(&request.worker_ref)
+                .cloned();
+            let result = if let Some(execution) = execution {
+                // A warm original may still own resource cleanup after its join.
+                // Never send Stop to a replacement using the saved predecessor.
+                if !saved.confirms_scope_shutdown(&request.worker_ref, request.operation_id)
+                    || execution
+                        .tasks
+                        .termination(&request.worker_ref, request.operation_id)
+                        .as_ref()
+                        != Some(saved)
+                    || self
+                        .read_termination_receipt_under_lock(&request.worker_ref, Some(saved))?
+                        .as_ref()
+                        != Some(saved)
+                {
+                    return Err("saved Stop differs from current execution or candidate".into());
+                }
+                self.stop_worker_operation_under_lock(request.clone())
+            } else {
+                self.saved_stop_result_under_lock(&request, saved)?
+            };
+            Ok(self.reconcile_stop_cleanup_under_lock(&request.worker_ref, result))
+        };
+        reconcile().unwrap_or_else(|message| {
+            WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message)
+        })
+    }
+
     fn stop_worker_operation(&self, request: WorkerExecutionStopRequest) -> WorkerExecutionResult {
         let lock = match self.worker_lock(&request.worker_ref) {
             Ok(lock) => lock,
@@ -8225,21 +8465,14 @@ mod tests {
     #[cfg(feature = "fs-store")]
     include!("subject_delete_create_tests.rs");
 
-    // Both candidate and failure suites need the same guarded, checkout-owned
-    // temporary root, independently of Runtime's optional filesystem catalog.
+    // Candidate and failure suites keep the Yoi ownership preflight, while
+    // disposable source trees follow the runner's isolated temporary directory.
     fn restore_failure_tempdir() -> tempfile::TempDir {
         require_restore_test_environment();
-        let target = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("target");
-        fs::create_dir_all(&target).unwrap();
         tempfile::Builder::new()
             .prefix("r")
             .rand_bytes(3)
-            .tempdir_in(target)
+            .tempdir()
             .unwrap()
     }
 

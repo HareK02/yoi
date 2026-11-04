@@ -1225,7 +1225,8 @@ async fn subject_create_recovery_signed_http_requires_delete_and_matching_worksp
 }
 
 #[tokio::test]
-async fn subject_delete_worker_signed_http_requires_delete_and_matching_workspace() {
+async fn subject_delete_worker_signed_http_requires_delete_scope_without_inventing_missing_originals()
+ {
     let f = Fixture::new();
     let identity = RuntimeIdentityMaterial::generate("recovery-key").unwrap();
     let trust = workspace_trust(&identity);
@@ -1259,16 +1260,23 @@ async fn subject_delete_worker_signed_http_requires_delete_and_matching_workspac
         let claims = signed_claims(&trust, "POST", path, &body);
         assert_eq!(claims.operation, "workers:delete");
         let response = signed_request(app.clone(), &identity, &claims, body, "workspace-a").await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 16384)
-            .await
-            .unwrap();
-        let receipt: runtime_api::SubjectDeleteWorkerResponse =
-            serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(receipt.worker_id, request.worker_id);
-        assert_eq!(receipt.workspace_id, request.workspace_id);
-        assert_eq!(receipt.create_fingerprint, request.create_fingerprint);
-        assert_eq!(receipt.operation_id, request.operation_id);
+        // Valid authorization reaches domain validation, but the arbitrary ID
+        // has neither an original Stop nor a confirmed historical fence.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: RuntimeHttpErrorResponse = read_json(response).await;
+        assert_eq!(error.error.code, "invalid_request");
+        assert!(
+            error
+                .error
+                .message
+                .contains("Missing original confirmed Subject shutdown")
+        );
+        assert!(f.runtime.worker_detail(&f.worker).is_ok());
+        assert!(
+            f.runtime
+                .worker_detail(&WorkerRef::new(request.worker_id))
+                .is_err()
+        );
     }
 }
 

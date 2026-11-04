@@ -913,6 +913,38 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Err("execution backend cannot confirm Subject Worker shutdown".into())
     }
 
+    /// Retain the durable Runtime exclusion in the adapter even when no Stop
+    /// can yet be admitted (for example an unresolved failed create).
+    fn fence_subject_delete_worker(
+        &self,
+        _request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        Err("execution backend cannot fence Subject Worker admission".into())
+    }
+
+    /// Check current resources after a previously confirmed Subject deletion.
+    /// Runtime separately verifies its durable fence and physical originals;
+    /// this does not issue a Stop or establish historical termination.
+    fn confirm_subject_delete_worker_absent(
+        &self,
+        _request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        Err("execution backend cannot confirm Subject Worker resource absence".into())
+    }
+
+    /// Internal Runtime consumer: the durable fence and original Stop child are
+    /// owned by Runtime. A saved canonical receipt (settled or pending cleanup)
+    /// is read-only execution evidence, not permission to stop a replacement or
+    /// mint another operation. Runtime alone settles a still-pending Stop.
+    fn subject_delete_worker_stop(
+        &self,
+        _request: &runtime_api::SubjectDeleteWorkerRequest,
+        _stop: WorkerExecutionStopRequest,
+        _canonical: Option<&WorkerExecutionTermination>,
+    ) -> Result<WorkerExecutionResult, String> {
+        Err("execution backend cannot reconcile Subject Worker Stop evidence".into())
+    }
+
     /// Must reserve the actual Controller, not infer Idle from a catalog snapshot.
     fn subject_release(
         &self,
@@ -1217,6 +1249,22 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Internal pending-Stop recovery. Saved scope termination does not prove
+    /// factory cleanup; backends must reconcile both under their Worker lock.
+    fn reconcile_stop_worker_operation(
+        &self,
+        request: WorkerExecutionStopRequest,
+        saved: Option<&WorkerExecutionTermination>,
+    ) -> WorkerExecutionResult {
+        if saved.is_some() {
+            return WorkerExecutionResult::errored(
+                WorkerExecutionOperation::Stop,
+                "execution backend cannot reconcile saved Stop termination and cleanup",
+            );
+        }
+        self.stop_worker_operation(request)
+    }
+
     fn stop_worker_operation(&self, request: WorkerExecutionStopRequest) -> WorkerExecutionResult {
         self.stop_worker(&request.worker_ref)
     }
@@ -1297,11 +1345,28 @@ impl WorkerExecutionBackendRef {
         self.backend.preflight_subject_delete_worker(request)
     }
 
-    pub(crate) fn subject_delete_worker(
+    pub(crate) fn fence_subject_delete_worker(
         &self,
         request: &runtime_api::SubjectDeleteWorkerRequest,
     ) -> Result<(), String> {
-        self.backend.subject_delete_worker(request)
+        self.backend.fence_subject_delete_worker(request)
+    }
+
+    pub(crate) fn confirm_subject_delete_worker_absent(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        self.backend.confirm_subject_delete_worker_absent(request)
+    }
+
+    pub(crate) fn subject_delete_worker_stop(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+        stop: WorkerExecutionStopRequest,
+        canonical: Option<&WorkerExecutionTermination>,
+    ) -> Result<WorkerExecutionResult, String> {
+        self.backend
+            .subject_delete_worker_stop(request, stop, canonical)
     }
 
     pub(crate) fn subject_release(
@@ -1537,6 +1602,14 @@ impl WorkerExecutionBackendRef {
     ) -> Vec<protocol::CompletionEntry> {
         self.backend
             .worker_completions(worker_ref, kind, prefix, context)
+    }
+
+    pub(crate) fn reconcile_stop_worker_operation(
+        &self,
+        request: WorkerExecutionStopRequest,
+        saved: Option<&WorkerExecutionTermination>,
+    ) -> WorkerExecutionResult {
+        self.backend.reconcile_stop_worker_operation(request, saved)
     }
 
     pub(crate) fn stop_worker_operation(

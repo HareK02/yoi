@@ -63,8 +63,7 @@ fn subject_job_removal_purge_partial_physical_failure_keeps_fence_and_retry_eras
 }
 
 #[test]
-fn subject_job_removal_purge_unconfirmed_durable_deletion_fence_preserves_copies_until_reconciled()
-{
+fn subject_job_removal_purge_unconfirmed_fence_never_invents_removed_execution_proof() {
     let f = Fixture::new();
     let request = f.removal_purge_request(SessionDisposition::Archive);
     f.complete_removal(&request);
@@ -80,8 +79,10 @@ fn subject_job_removal_purge_unconfirmed_durable_deletion_fence_preserves_copies
     } = f;
     drop(store);
     drop(runtime);
-    // Frozen durable crash-window fixture: permanent admission exclusion was
-    // saved, but no confirmed execution-shutdown response was committed.
+    // Retained incomplete-proof fixture: deliberately remove the confirmation
+    // after removal. Correct current ordering requires that confirmation before
+    // removal; this is not evidence that such a crash window can occur now.
+    // The old removal result cannot manufacture the missing Subject proof.
     let snapshot_path = temp.path().join("runtime.json");
     let mut snapshot: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
@@ -101,17 +102,16 @@ fn subject_job_removal_purge_unconfirmed_durable_deletion_fence_preserves_copies
     );
     assert_eq!(tree(&temp.path().join("archives")), copies);
     assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt);
-    runtime
-        .subject_delete_worker_scoped(&scope, request.deletion.clone())
-        .unwrap();
-    runtime
-        .purge_subject_job_removal_scoped(&scope, request)
-        .unwrap();
     assert!(
-        !temp
-            .path()
-            .join("archives/workers/canonical-archive/session")
-            .exists()
+        runtime
+            .subject_delete_worker_scoped(&scope, request.deletion.clone())
+            .is_err()
     );
+    assert!(
+        runtime
+            .purge_subject_job_removal_scoped(&scope, request)
+            .is_err()
+    );
+    assert_eq!(tree(&temp.path().join("archives")), copies);
     assert_eq!(std::fs::read(receipt_path).unwrap(), receipt);
 }

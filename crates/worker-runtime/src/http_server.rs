@@ -10,6 +10,8 @@
 //! Removal reserves only its target under the Runtime state mutex, releasing it before
 //! filesystem/Git inspection and unlink; conflicting target use is rejected promptly.
 
+#[cfg(test)]
+mod controller_fixture;
 mod runtime_management_api;
 #[cfg(test)]
 mod workdir_close_tests;
@@ -3485,6 +3487,30 @@ mod tests {
 
     struct AcceptingBackend;
 
+    impl AcceptingBackend {
+        fn fixture_stop_result(
+            request: crate::execution::WorkerExecutionStopRequest,
+        ) -> WorkerExecutionResult {
+            // Only execution is substituted in these HTTP/retention fixtures.
+            // Model its bound stop report explicitly; do not relax Runtime's
+            // production requirement or claim real Controller/Host coverage.
+            let execution_id =
+                uuid::Uuid::parse_str(&request.worker_ref.worker_id.to_string()).unwrap();
+            let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop);
+            result.execution_id = Some(execution_id);
+            result.termination = Some(crate::execution::WorkerExecutionTermination {
+                scope: crate::execution::WorkerExecutionTerminationScope::Controller,
+                worker_ref: request.worker_ref,
+                stop_operation_id: request.operation_id,
+                execution_id,
+                shutdown_command_id: None,
+                submissions: Vec::new(),
+                feature_failures: Vec::new(),
+            });
+            result
+        }
+    }
+
     impl WorkerExecutionBackend for AcceptingBackend {
         fn preflight_subject_delete_worker(
             &self,
@@ -3497,6 +3523,35 @@ mod tests {
             _request: &runtime_api::SubjectDeleteWorkerRequest,
         ) -> Result<(), String> {
             Ok(())
+        }
+        fn fence_subject_delete_worker(
+            &self,
+            _request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> Result<(), String> {
+            // This replaces admission exclusion only, not scope termination.
+            Ok(())
+        }
+        fn confirm_subject_delete_worker_absent(
+            &self,
+            _request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> Result<(), String> {
+            // This stateless execution substitute owns no Controller or resources.
+            // Runtime separately checks its confirmed durable fence and originals;
+            // this boundary check supplies no historical termination evidence.
+            Ok(())
+        }
+        fn subject_delete_worker_stop(
+            &self,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
+            stop: crate::execution::WorkerExecutionStopRequest,
+            canonical: Option<&crate::execution::WorkerExecutionTermination>,
+        ) -> Result<WorkerExecutionResult, String> {
+            if stop.worker_ref.worker_id != request.worker_id {
+                return Err("fixture Subject Stop Worker mismatch".into());
+            }
+            // Runtime supplies the original Stop child; canonical evidence must
+            // match that child unchanged, not be retagged for another operation.
+            Ok(self.reconcile_stop_worker_operation(stop, canonical))
         }
         fn recover_subject_create(
             &self,
@@ -3557,42 +3612,88 @@ mod tests {
             WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
         }
 
+        fn termination_receipt(
+            &self,
+            _worker_ref: &WorkerRef,
+        ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
+            // No receipt is retained by this unit fixture. Without a supplied
+            // original, deterministic construction alone is not Stop evidence.
+            Ok(None)
+        }
+
+        fn reconcile_termination_receipt(
+            &self,
+            worker_ref: &WorkerRef,
+            saved: &crate::execution::WorkerExecutionTermination,
+        ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
+            let expected =
+                Self::fixture_stop_result(crate::execution::WorkerExecutionStopRequest {
+                    worker_ref: worker_ref.clone(),
+                    operation_id: saved.stop_operation_id,
+                });
+            // Compare the whole bound fixture receipt, including scope, execution,
+            // shutdown command, submissions and Feature failures, not just IDs.
+            Ok(expected
+                .termination
+                .filter(|receipt| receipt == saved)
+                .map(|_| saved.clone()))
+        }
+
+        fn reconcile_stop_worker_operation(
+            &self,
+            request: crate::execution::WorkerExecutionStopRequest,
+            saved: Option<&crate::execution::WorkerExecutionTermination>,
+        ) -> WorkerExecutionResult {
+            let Some(saved) = saved else {
+                return self.stop_worker_operation(request);
+            };
+            let mut result = Self::fixture_stop_result(request);
+            if result.termination.as_ref() != Some(saved) {
+                return WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Stop,
+                    "canonical Stop does not match the whole bound fixture receipt",
+                );
+            }
+            result.termination = Some(saved.clone());
+            result
+        }
+
         fn stop_worker_operation(
             &self,
             request: crate::execution::WorkerExecutionStopRequest,
         ) -> WorkerExecutionResult {
-            // Only execution is substituted in these HTTP/retention fixtures.
-            // Model its bound stop report explicitly; do not relax Runtime's
-            // production requirement or claim real Controller/Host coverage.
-            let execution_id =
-                uuid::Uuid::parse_str(&request.worker_ref.worker_id.to_string()).unwrap();
-            let mut result = self.stop_worker(&request.worker_ref);
-            result.execution_id = Some(execution_id);
-            result.termination = Some(crate::execution::WorkerExecutionTermination {
-                scope: crate::execution::WorkerExecutionTerminationScope::Controller,
-                worker_ref: request.worker_ref,
-                stop_operation_id: request.operation_id,
-                execution_id,
-                shutdown_command_id: None,
-                submissions: Vec::new(),
-                feature_failures: Vec::new(),
-            });
-            result
+            Self::fixture_stop_result(request)
         }
     }
 
     #[cfg(feature = "fs-store")]
-    #[derive(Default)]
     struct RejectingRestoreBackend {
+        inner: Arc<super::controller_fixture::Backend>,
         restores: Mutex<Vec<WorkerRef>>,
         inputs: Mutex<Vec<WorkerRef>>,
-        stops: Mutex<Vec<WorkerRef>>,
+        stops: Mutex<Vec<crate::execution::WorkerExecutionStopRequest>>,
+        stop_results: Mutex<Vec<WorkerExecutionResult>>,
+        canonical_queries: Mutex<Vec<crate::execution::WorkerExecutionTermination>>,
+    }
+
+    #[cfg(feature = "fs-store")]
+    impl RejectingRestoreBackend {
+        fn new(inner: Arc<super::controller_fixture::Backend>) -> Self {
+            Self {
+                inner,
+                restores: Mutex::new(Vec::new()),
+                inputs: Mutex::new(Vec::new()),
+                stops: Mutex::new(Vec::new()),
+                stop_results: Mutex::new(Vec::new()),
+                canonical_queries: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     #[cfg(feature = "fs-store")]
     impl WorkerExecutionBackend for RejectingRestoreBackend {
         fn backend_id(&self) -> &str {
-            "http-test"
+            self.inner.backend_id()
         }
 
         fn spawn_worker(
@@ -3625,9 +3726,34 @@ mod tests {
             )
         }
 
-        fn stop_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
-            self.stops.lock().unwrap().push(worker_ref.clone());
-            WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
+        fn stop_worker_operation(
+            &self,
+            request: crate::execution::WorkerExecutionStopRequest,
+        ) -> WorkerExecutionResult {
+            self.stops.lock().unwrap().push(request.clone());
+            let result = self.inner.stop_worker_operation(request);
+            self.stop_results.lock().unwrap().push(result.clone());
+            result
+        }
+
+        fn stop_worker(&self, _worker_ref: &WorkerRef) -> WorkerExecutionResult {
+            panic!("HTTP lifecycle must retain its typed Stop operation");
+        }
+
+        fn termination_receipt(
+            &self,
+            worker_ref: &WorkerRef,
+        ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
+            self.inner.termination_receipt(worker_ref)
+        }
+
+        fn reconcile_termination_receipt(
+            &self,
+            worker_ref: &WorkerRef,
+            saved: &crate::execution::WorkerExecutionTermination,
+        ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
+            self.canonical_queries.lock().unwrap().push(saved.clone());
+            self.inner.reconcile_termination_receipt(worker_ref, saved)
         }
     }
 
@@ -4240,34 +4366,52 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[tokio::test]
-    async fn rest_saved_active_worker_restore_rejection_is_observable_and_can_be_stopped_removed() {
-        let temp = tempfile::tempdir().unwrap();
-        let options = crate::fs_store::FsRuntimeStoreOptions::new(temp.path().join("runtime"));
-        let runtime = Runtime::with_fs_store_and_execution_backend(
-            options.clone(),
-            Arc::new(AcceptingBackend),
-        )
-        .unwrap();
-        runtime
-            .store_config_bundle(test_bundle(ProfileSelector::Builtin(
-                "builtin:coder".to_string(),
-            )))
+    async fn rest_saved_active_worker_restore_rejection_retains_unproven_stop_and_source() {
+        let mut fixture = super::controller_fixture::ControllerFixture::persisted();
+        let created = fixture.worker.clone();
+        let options =
+            crate::fs_store::FsRuntimeStoreOptions::new(fixture.root_path().join("runtime"))
+                .with_runtime_id("http-controller-fixture");
+        let mut input = WorkerInput::user("materialize the original saved Session");
+        input.submission_request_id = Some("http-cold-original".into());
+        fixture
+            .runtime()
+            .send_input(&created.worker_ref, input)
             .unwrap();
-        let mut request = task_request("saved active Worker");
-        request.workspace_api = Some(WorkspaceApiRef {
-            workspace_id: "local".to_string(),
-            base_url: "http://127.0.0.1:8787".to_string(),
-        });
-        let created = runtime
-            .create_worker_scoped(&RuntimeWorkspaceScope::new("local", "local-token"), request)
-            .unwrap();
-        assert_eq!(created.status, crate::catalog::WorkerStatus::Idle);
-        assert!(created.worker_state.is_some());
-        drop(runtime);
+        // Reclaim the actual seed Controller without saving a Runtime canonical
+        // Stop. The cold adapter must not infer this historical join from absence.
+        let raw_stop =
+            fixture
+                .backend()
+                .stop_worker_operation(crate::execution::WorkerExecutionStopRequest {
+                    worker_ref: created.worker_ref.clone(),
+                    operation_id: crate::execution::WorkerLifecycleOperationId::new(),
+                });
+        assert!(raw_stop.is_accepted(), "{raw_stop:?}");
+        super::controller_fixture::assert_real_termination(
+            &created.worker_ref,
+            raw_stop.termination.as_ref().unwrap(),
+        );
+        let saved_session = fixture.saved_session();
+        assert!(
+            fixture
+                .runtime()
+                .execution_termination(&created.worker_ref)
+                .unwrap()
+                .is_none()
+        );
+        fixture.assert_persisted_request(fixture.runtime());
+        fixture.close_catalog();
 
-        let backend = Arc::new(RejectingRestoreBackend::default());
+        let backend = Arc::new(RejectingRestoreBackend::new(fixture.empty_backend()));
+        assert!(
+            backend
+                .termination_receipt(&created.worker_ref)
+                .unwrap()
+                .is_none()
+        );
         let runtime =
-            Runtime::with_fs_store_and_execution_backend(options, backend.clone()).unwrap();
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
         // Startup attempted automatic restore without turning rejection into a
         // fabricated live Worker or silently changing its saved lifecycle status.
         assert_eq!(
@@ -4302,7 +4446,7 @@ mod tests {
             Method::POST,
             &format!("{worker_uri}/restore"),
             token,
-            &runtime.test_restore_request(&created.worker_ref),
+            &fixture.restore_request(&runtime),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -4388,39 +4532,172 @@ mod tests {
             token,
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let stopped: RuntimeHttpWorkerLifecycleResponse = read_json(response).await;
-        assert_eq!(stopped.ack.worker_ref, created.worker_ref);
-        assert_eq!(stopped.ack.status, crate::catalog::WorkerStatus::Stopped);
-        assert_eq!(
-            *backend.stops.lock().unwrap(),
-            vec![created.worker_ref.clone()]
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error: RuntimeHttpErrorResponse = read_json(response).await;
+        assert_eq!(error.error.code, "worker_execution_rejected");
+        let stops = backend.stops.lock().unwrap();
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].worker_ref, created.worker_ref);
+        let original_stop_id = stops[0].operation_id;
+        drop(stops);
+        assert!(
+            backend
+                .stop_results
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|result| result.termination.is_none())
+        );
+        assert!(
+            runtime
+                .execution_termination(&created.worker_ref)
+                .unwrap()
+                .is_none()
         );
 
         let response = authed_empty_request(app.clone(), Method::GET, &worker_uri, token).await;
         assert_eq!(response.status(), StatusCode::OK);
         let detail: RuntimeHttpWorkerResponse = read_json(response).await;
-        assert_eq!(detail.worker.status, crate::catalog::WorkerStatus::Stopped);
+        assert_ne!(detail.worker.status, crate::catalog::WorkerStatus::Stopped);
 
+        let response = authed_empty_request(app.clone(), Method::DELETE, &worker_uri, token).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "pending unproven Stop must forbid removal"
+        );
+        let error: RuntimeHttpErrorResponse = read_json(response).await;
+        assert_eq!(error.error.code, "invalid_request");
+        assert_eq!(
+            backend.stops.lock().unwrap().len(),
+            1,
+            "DELETE must not mint a replacement Stop"
+        );
+        let record = runtime
+            .test_runtime_store()
+            .read_worker_record(&created.worker_ref)
+            .unwrap();
+        let crate::fs_store::PersistedWorkerExecutionState::ReconciliationRequired(
+            crate::fs_store::PersistedWorkerLifecycleOperation::Stop(pending),
+        ) = record.execution_state
+        else {
+            panic!("unproven Stop must retain its durable owner");
+        };
+        assert_eq!(pending.operation_id, original_stop_id);
+        assert_eq!(pending.request.as_ref().unwrap(), fixture.create_request());
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                options
+                    .root
+                    .join("workers")
+                    .join(created.worker_id.to_string())
+                    .join("worker.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(document["restore_guard"]["execution_termination"].is_null());
+        assert_eq!(
+            fixture.saved_session(),
+            saved_session,
+            "cold refusal must preserve the original Session"
+        );
+        let response = authed_empty_request(app, Method::GET, &worker_uri, token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[tokio::test]
+    async fn rest_cold_stopped_worker_deletion_reuses_real_canonical_stop_without_launch() {
+        let mut fixture = super::controller_fixture::ControllerFixture::persisted();
+        let created = fixture.worker.clone();
+        let mut input = WorkerInput::user("persist a real Session before the canonical Stop");
+        input.submission_request_id = Some("http-canonical-original".into());
+        fixture
+            .runtime()
+            .send_input(&created.worker_ref, input)
+            .unwrap();
+        let token = "local-token";
+        let worker_uri = format!("/v1/workers/{}", created.worker_id);
+        let app = runtime_http_router(fixture.runtime().clone(), token.into());
+        let response = authed_empty_request(
+            app.clone(),
+            Method::POST,
+            &format!("{worker_uri}/stop"),
+            token,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let stopped: RuntimeHttpWorkerLifecycleResponse = read_json(response).await;
+        assert_eq!(stopped.ack.status, crate::catalog::WorkerStatus::Stopped);
+        let original = fixture
+            .runtime()
+            .execution_termination(&created.worker_ref)
+            .unwrap()
+            .unwrap();
+        super::controller_fixture::assert_real_termination(&created.worker_ref, &original);
+        assert_eq!(
+            fixture
+                .backend()
+                .termination_receipt(&created.worker_ref)
+                .unwrap(),
+            Some(original.clone())
+        );
+        let saved_session = fixture.saved_session();
+        let options =
+            crate::fs_store::FsRuntimeStoreOptions::new(fixture.root_path().join("runtime"))
+                .with_runtime_id("http-controller-fixture");
+        drop(app);
+        fixture.assert_persisted_request(fixture.runtime());
+        fixture.close_catalog();
+        let backend = Arc::new(RejectingRestoreBackend::new(fixture.empty_backend()));
+        assert!(
+            backend
+                .termination_receipt(&created.worker_ref)
+                .unwrap()
+                .is_none()
+        );
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        let app = runtime_http_router(runtime.clone(), token.into());
+        assert_eq!(
+            runtime.worker_detail(&created.worker_ref).unwrap().status,
+            crate::catalog::WorkerStatus::Stopped
+        );
+        assert_eq!(
+            runtime.execution_termination(&created.worker_ref).unwrap(),
+            Some(original.clone())
+        );
+        fixture.assert_persisted_request(&runtime);
+        assert_eq!(fixture.saved_session(), saved_session);
         let response = authed_empty_request(app.clone(), Method::DELETE, &worker_uri, token).await;
         assert_eq!(response.status(), StatusCode::OK);
         let removed: RuntimeHttpWorkerDeleteResponse = read_json(response).await;
         assert_eq!(removed.worker.worker_id, created.worker_id);
         assert!(removed.worker.deleted);
-        // Removal asks the backend to reconfirm shutdown even for a saved
-        // Stopped Worker; it must use the same WorkerRef as the original stop.
-        assert_eq!(
-            *backend.stops.lock().unwrap(),
-            vec![created.worker_ref.clone(), created.worker_ref.clone()]
+        assert!(
+            backend.restores.lock().unwrap().is_empty(),
+            "Stopped catalog must not launch a restore"
         );
         assert!(
-            !temp
-                .path()
-                .join("runtime/workers")
+            backend.stops.lock().unwrap().is_empty(),
+            "deletion must read the original Stop, not issue another"
+        );
+        assert!(
+            backend
+                .canonical_queries
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|saved| saved == &original)
+        );
+        assert!(
+            !options
+                .root
+                .join("workers")
                 .join(created.worker_id.to_string())
                 .exists()
         );
-
         let response = authed_empty_request(app, Method::GET, &worker_uri, token).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -5640,42 +5917,7 @@ mod ws_tests {
         ));
     }
 
-    #[tokio::test]
-    async fn protocol_ws_stop_closes_old_stream_and_restore_requires_new_connection() {
-        let (runtime, backend, worker_ref, url) = spawn_runtime_server().await;
-        let (mut old_stream, _) = connect_async(authed_ws_request(&url)).await.unwrap();
-        let _ = next_frame(&mut old_stream).await;
-        runtime.stop_worker(&worker_ref, None).unwrap();
-        runtime
-            .restore_worker(&worker_ref, runtime.test_restore_request(&worker_ref))
-            .unwrap();
-        backend.publish(
-            &worker_ref,
-            protocol::Event::TextDelta {
-                text: "new execution".into(),
-            },
-        );
-        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), old_stream.next())
-            .await
-            .expect("the old protocol connection must close on stop");
-        assert!(matches!(closed, Some(Ok(Message::Close(_))) | None));
-
-        let (mut new_stream, _) = connect_async(authed_ws_request(&url)).await.unwrap();
-        assert!(matches!(
-            next_frame(&mut new_stream).await,
-            protocol::Event::Snapshot { .. }
-        ));
-        backend.publish(
-            &worker_ref,
-            protocol::Event::TextDone {
-                text: "restored execution".into(),
-            },
-        );
-        assert!(matches!(
-            next_frame(&mut new_stream).await,
-            protocol::Event::TextDone { text } if text == "restored execution"
-        ));
-    }
+    include!("http_server/controller_ws_tests.rs");
 
     #[tokio::test]
     async fn protocol_ws_cursor_resume_is_duplicate_safe_and_filters_workers() {
@@ -5711,43 +5953,6 @@ mod ws_tests {
             next_frame(&mut stream).await,
             protocol::Event::TextDone { .. }
         ));
-    }
-
-    #[tokio::test]
-    async fn protocol_ws_old_cursor_never_replays_stopped_execution_after_new_snapshot() {
-        let (runtime, backend, worker_ref, url) = spawn_runtime_server().await;
-        let old = backend.publish(
-            &worker_ref,
-            protocol::Event::TextDelta {
-                text: "old cursor".into(),
-            },
-        );
-        backend.publish(
-            &worker_ref,
-            protocol::Event::TextDone {
-                text: "old output".into(),
-            },
-        );
-        backend.publish(&worker_ref, protocol::Event::Shutdown);
-        runtime.stop_worker(&worker_ref, None).unwrap();
-        runtime
-            .restore_worker(&worker_ref, runtime.test_restore_request(&worker_ref))
-            .unwrap();
-        let resume_url = format!("{url}?cursor={}", old.cursor);
-        let (mut stream, _) = connect_async(authed_ws_request(&resume_url)).await.unwrap();
-        assert!(matches!(
-            next_frame(&mut stream).await,
-            protocol::Event::Snapshot { .. }
-        ));
-        backend.publish(
-            &worker_ref,
-            protocol::Event::TextDone {
-                text: "new output".into(),
-            },
-        );
-        assert!(
-            matches!(next_frame(&mut stream).await, protocol::Event::TextDone { text } if text == "new output")
-        );
     }
 
     #[tokio::test]

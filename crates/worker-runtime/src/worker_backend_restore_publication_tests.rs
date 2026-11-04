@@ -878,8 +878,22 @@ mod publication {
                 let second = EmbeddedRuntime::with_fs_store_and_execution_backend(options, fixture.backend.clone()).unwrap();
                 assert_eq!(second.restore_worker_operation_scoped(scope, &worker_ref, request).unwrap(), receipt);
                 assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), 0);
-            } else {
+            } else if commit == F::Committed {
                 restarted.stop_worker_scoped(scope, &worker_ref, None).unwrap();
+                assert!(restarted.execution_termination(&worker_ref).unwrap().is_some());
+            } else {
+                // A cold cleanup-only owner can release resources but has no
+                // original Controller report/join. Preserve the pending history.
+                let error = restarted.stop_worker_scoped(scope, &worker_ref, None).unwrap_err();
+                assert!(matches!(error, crate::error::RuntimeError::WorkerExecutionRejected { result, .. } if result.termination.is_none()));
+                assert!(restarted.execution_termination(&worker_ref).unwrap().is_none());
+                assert!(restarted.worker_detail(&worker_ref).is_ok());
+                let record = restarted.test_runtime_store().read_worker_record(&worker_ref).unwrap();
+                assert!(matches!(record.execution_state, PersistedWorkerExecutionState::ReconciliationRequired(_)));
+                assert_eq!(fixture.canonical_files(), before);
+                let retry = restarted.restore_worker_operation(&worker_ref, request.clone()).unwrap();
+                assert_eq!(retry.worker, receipt.worker);
+                assert_eq!(retry.state, server_api::WorkerRestoreState::ReconciliationRequired);
             }
             fixture.assert_released();
             fixture.assert_quiet();
