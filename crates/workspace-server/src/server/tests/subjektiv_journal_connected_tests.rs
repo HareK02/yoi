@@ -451,9 +451,10 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         worker_id: old.worker_id.clone(),
         binding_id: old_host.writer_binding_id().unwrap().into(),
     };
-    // Inject a durable result-acceptance gap after real Journal completion. This must
-    // reject before writer revocation and confirm cancellation of the actual Controller
-    // guard; merely returning Err would strand the body and its execution-admission fence.
+    // Corrupt only the saved Job projection after real completion, deliberately
+    // leaving its attempt/checkpoint completed. This is a fail-closed consumer
+    // contrast, not a simulated transaction interruption or a recovery mechanism.
+    // The pre-revoke refusal must cancel the actual Controller guard before retry.
     let recorded = api
         .store
         .list_backend_journal_jobs(TEST_WORKSPACE_ID, &old_attr.session_id, None, 100)
@@ -488,7 +489,7 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         rusqlite::params![TEST_WORKSPACE_ID, uncertain_job], |r| Ok((r.get(0)?, r.get(1)?)),
     ).unwrap();
     conn.execute(
-        "UPDATE backend_jobs SET state='unknown',result_json=NULL,result_digest=NULL WHERE workspace_id=?1 AND job_id=?2",
+        "UPDATE backend_jobs SET state='pending',result_json=NULL,result_digest=NULL WHERE workspace_id=?1 AND job_id=?2",
         rusqlite::params![TEST_WORKSPACE_ID, uncertain_job],
     )
     .unwrap();
@@ -500,7 +501,7 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         serde_json::from_value(incomplete.clone()).unwrap(),
     )
     .unwrap_err();
-    assert!(error.to_string().contains("Unknown"), "{error}");
+    assert!(error.to_string().contains("still pending"), "{error}");
     assert!(store.journal_writer_active(&old_binding).unwrap());
     assert!(
         !api.config_store

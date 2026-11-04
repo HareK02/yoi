@@ -3,7 +3,9 @@
 //! Only initial dispatch opens Host admission; a reconstructed empty map proves nothing.
 use super::*;
 use crate::backend_job::BackendJobRecord;
-use crate::backend_job_host_effects::{JobHostEffects, JobHostOwner, JobHostRequestLease};
+use crate::backend_job_host_effects::{
+    JobHostDrain, JobHostEffects, JobHostOwner, JobHostRequestLease,
+};
 use feature_storage::FeatureStorageError;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -28,6 +30,12 @@ pub(super) struct RecoveryOwners {
     pub(super) nonjournal_lookup_pending: tokio::sync::Notify,
     #[cfg(test)]
     pub(super) cleanup_before_claim: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    #[cfg(test)]
+    pub(super) cleanup_before_writer_fence: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(super) cleanup_after_claim: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    #[cfg(test)]
+    pub(super) cleanup_claimed_writer: tokio::sync::Notify,
 }
 
 impl RecoveryOwners {
@@ -60,7 +68,11 @@ impl RecoveryOwners {
             .clone()
     }
 
-    pub(super) fn initially_admit(&self, owner: JobHostOwner) -> Result<()> {
+    pub(super) fn initially_admit(
+        &self,
+        owner: JobHostOwner,
+        database: &std::path::Path,
+    ) -> Result<()> {
         let mut hosts = self
             .hosts
             .lock()
@@ -71,7 +83,10 @@ impl RecoveryOwners {
             None => {
                 hosts.insert(
                     owner.attempt_id.clone(),
-                    (owner.clone(), JobHostEffects::initially_admit(owner)),
+                    (
+                        owner.clone(),
+                        JobHostEffects::initially_admit(owner, database)?,
+                    ),
                 );
                 Ok(())
             }
@@ -96,6 +111,19 @@ impl RecoveryOwners {
             .lock()
             .map_err(|_| Error::Store("Job submission ownership poisoned".into()))?
             .insert(owner.attempt_id.clone()))
+    }
+
+    fn close_host_admission(&self, expected: &JobHostOwner) -> Result<()> {
+        let hosts = self
+            .hosts
+            .lock()
+            .map_err(|_| Error::Store("Job Host owners poisoned".into()))?;
+        if let Some((_, effects)) = hosts.get(&expected.attempt_id) {
+            effects.close_admission(expected)?;
+        }
+        // A missing live owner is not evidence. The original retained resource
+        // below must independently fence every accepted Host and cleanup writer.
+        Ok(())
     }
 
     pub(super) fn effects(&self, expected: &JobHostOwner) -> Result<Arc<JobHostEffects>> {
@@ -455,7 +483,6 @@ impl WorkspaceApi {
         &self,
         expected: BackendJobAttemptRecord,
     ) -> Result<()> {
-        let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Pin the observed canonical operation across this owner's storage retries.
         let removal_owner = Arc::new(Mutex::new(None::<(String, String)>));
         let mut failures = 0;
@@ -465,13 +492,23 @@ impl WorkspaceApi {
             }
             let api = self.clone();
             let owner = expected.clone();
-            let mine = claimed.clone();
             let removal_owner = removal_owner.clone();
             let runtime = tokio::runtime::Handle::current();
             let result = self
                 .host_executors
                 .cleanup()?
                 .run(move || {
+                    // Every cleanup caller, including its blocking descendants, holds
+                    // the original admission resource exclusively through actual return.
+                    // Recovery therefore fences the predecessor's writers rather than
+                    // treating Executing, an empty map, or process exit as ownership.
+                    api.backend_job_recovery
+                        .close_host_admission(&JobHostOwner::try_from(&owner)?)?;
+                    #[cfg(test)]
+                    api.backend_job_recovery
+                        .cleanup_before_writer_fence
+                        .notify_one();
+                    let drain = JobHostEffects::fence_retained(&api.config.database_path, &owner)?;
                     let current = api
                         .store
                         .get_backend_job_attempt(
@@ -480,7 +517,8 @@ impl WorkspaceApi {
                             &owner.attempt_id,
                         )?
                         .ok_or_else(|| Error::Store("Cleanup owner disappeared".into()))?;
-                    if current.worker != owner.worker
+                    if !current.state.terminal()
+                        || current.worker != owner.worker
                         || current.runtime_run_id != owner.runtime_run_id
                         || current.input_digest != owner.input_digest
                     {
@@ -498,40 +536,9 @@ impl WorkspaceApi {
                     let attempt = if current.worker_cleanup_state
                         == Some(BackendJobWorkerCleanupState::Executing)
                     {
-                        if !mine.load(Ordering::Acquire) {
-                            // Executing is not a lease we can steal after restart.
-                            // First require the exact durable execution/Host fence,
-                            // then recover (never plan) its canonical removal owner.
-                            api.require_backend_job_attempt_effects_ended(&current)?;
-                            let worker = current.worker.as_ref().ok_or_else(||
-                                Error::RepositoryConflict("Executing cleanup Worker missing".into()))?;
-                            let saved = api.config_store.recover_worker_removal_execution(
-                                api.workspace_id(), worker,
-                            ).map_err(|error| Error::Store(error.to_string()))?
-                                .ok_or_else(|| Error::RepositoryConflict(
-                                    "Executing cleanup has no retained canonical removal operation; ownership cannot be reconstructed".into()))?;
-                            if saved.plan.workspace_id != api.workspace_id()
-                                || saved.plan.worker != *worker
-                                || saved.plan.operation_id.is_empty()
-                                || saved.plan.input_fingerprint.is_empty()
-                                || saved.runtime_request.workspace_id != api.workspace_id()
-                                || saved.runtime_request.source_runtime_id != worker.runtime_id
-                                || saved.runtime_request.worker_id.to_string() != worker.worker_id
-                                || saved.runtime_request.operation_id != saved.plan.operation_id
-                                || saved.runtime_request.input_fingerprint != saved.plan.input_fingerprint
-                            {
-                                return Err(Error::RepositoryConflict(
-                                    "Executing cleanup canonical removal owner mismatch".into()));
-                            }
-                            let expected = (saved.plan.operation_id, saved.plan.input_fingerprint);
-                            let mut pinned = removal_owner.lock().map_err(|_| Error::Store(
-                                "Cleanup removal owner poisoned".into()))?;
-                            if pinned.as_ref().is_some_and(|prior| prior != &expected) {
-                                return Err(Error::RepositoryConflict(
-                                    "Executing cleanup canonical removal owner changed".into()));
-                            }
-                            *pinned = Some(expected);
-                        }
+                        // Exclusive original-writer fencing authorizes recovery,
+                        // not the Executing marker. Canonical child continuity is
+                        // checked under the removal service's own operation lock.
                         current
                     } else {
                         let history = api
@@ -549,19 +556,29 @@ impl WorkspaceApi {
                                 "Cleanup belongs to another admitted owner".into(),
                             ));
                         }
-                        mine.store(true, Ordering::Release);
                         attempt
                     };
-                    let retained_removal = removal_owner.lock().map_err(|_| Error::Store(
-                        "Cleanup removal owner poisoned".into()))?.clone();
+                    #[cfg(test)]
+                    let after_claim = api
+                        .backend_job_recovery
+                        .cleanup_after_claim
+                        .lock()
+                        .unwrap()
+                        .clone();
                     runtime.block_on(async {
+                        #[cfg(test)]
+                        if let Some(gate) = after_claim {
+                            api.backend_job_recovery.cleanup_claimed_writer.notify_one();
+                            gate.acquire().await.unwrap().forget();
+                        }
                         if attempt.state == BackendJobAttemptState::Completed
                             || attempt.failure_category.as_deref() == Some("invalid_result")
                         {
                             api.wait_for_backend_job_worker_run_teardown(&attempt)
                                 .await?;
                         }
-                        api.cleanup_backend_job_attempt_worker(attempt, retained_removal).await
+                        api.cleanup_backend_job_attempt_worker(attempt, &removal_owner, &drain)
+                            .await
                     })
                 })
                 .await;
@@ -1231,7 +1248,13 @@ impl WorkspaceApi {
     pub(super) async fn fence_backend_job_effects(
         &self,
         attempt: &BackendJobAttemptRecord,
+        drain: &JobHostDrain,
     ) -> Result<()> {
+        if drain.owner() != &JobHostOwner::try_from(attempt)? {
+            return Err(Error::RepositoryConflict(
+                "Job cleanup admission owner changed".into(),
+            ));
+        }
         if self
             .store
             .has_backend_job_execution_fence(self.workspace_id(), attempt)?
@@ -1252,15 +1275,15 @@ impl WorkspaceApi {
             || termination.scope
                 != worker_runtime::execution::WorkerExecutionTerminationScope::Controller
             || termination.worker_ref.worker_id.to_string() != worker.worker_id
+            || !termination.submissions.iter().any(|submission| {
+                Some(&submission.submission_request_id) == attempt.runtime_run_id.as_ref()
+            })
         {
             return Err(Error::RepositoryConflict(
                 "Runtime receipt does not prove exact Controller/Feature/background termination"
                     .into(),
             ));
         }
-        let owner = JobHostOwner::try_from(attempt)?;
-        let effects = self.backend_job_recovery.effects(&owner)?;
-        let drain = effects.close_and_drain(&owner).await?;
         self.store.record_backend_job_execution_fence(
             self.workspace_id(),
             attempt,
@@ -1321,9 +1344,31 @@ pub(super) async fn admit_host_request(
                 .get_backend_job_attempt(lookup.workspace_id(), &job.request.job_id, &id)?
                 .ok_or_else(|| Error::Store("Job Host attempt missing".into()))?;
             let owner = JobHostOwner::try_from(&attempt)?;
-            Ok(Some(
-                lookup.backend_job_recovery.effects(&owner)?.admit(&owner)?,
-            ))
+            let lease = lookup.backend_job_recovery.effects(&owner)?.admit(&owner)?;
+            // Close the stale-read window: cleanup's exclusive admission fence and
+            // terminal row must preclude every later callback, including another Host.
+            let current_job = lookup
+                .store
+                .get_active_backend_job_for_worker(lookup.workspace_id(), &worker)?
+                .ok_or_else(|| {
+                    Error::WorkspacePermissionDenied(
+                        "Job admission closed before callback acquisition".into(),
+                    )
+                })?;
+            let current = lookup
+                .store
+                .get_backend_job_attempt(lookup.workspace_id(), &job.request.job_id, &id)?
+                .ok_or_else(|| Error::Store("Job Host attempt disappeared".into()))?;
+            if current_job.request.job_id != owner.job_id
+                || current_job.current_attempt != current.attempt
+                || current.state != BackendJobAttemptState::Dispatched
+                || JobHostOwner::try_from(&current)? != owner
+            {
+                return Err(Error::WorkspacePermissionDenied(
+                    "Job callback owner changed during admission".into(),
+                ));
+            }
+            Ok(Some(lease))
         })
         .await;
     match admission {

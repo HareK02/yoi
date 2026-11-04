@@ -311,6 +311,26 @@ impl SqliteWorkspaceStore {
         req: &WorkerRemovalPlanRequest,
         inv: &WorkerRetentionInventory,
     ) -> Result<WorkerRemovalPlan, WorkerRetentionError> {
+        self.plan_worker_removal_inner(req, inv, false)
+    }
+
+    /// An automatic Job cleanup may create its first canonical child, but cannot
+    /// replace one hidden by authority/staleness filters after an uncertain effect.
+    /// The predecessor check and first-plan save share the canonical writer Tx.
+    pub(crate) fn plan_job_cleanup_worker_removal(
+        &self,
+        req: &WorkerRemovalPlanRequest,
+        inv: &WorkerRetentionInventory,
+    ) -> Result<WorkerRemovalPlan, WorkerRetentionError> {
+        self.plan_worker_removal_inner(req, inv, true)
+    }
+
+    fn plan_worker_removal_inner(
+        &self,
+        req: &WorkerRemovalPlanRequest,
+        inv: &WorkerRetentionInventory,
+        first_job_cleanup_child: bool,
+    ) -> Result<WorkerRemovalPlan, WorkerRetentionError> {
         validate_plan(req, inv)?;
         if req
             .journal_erasure
@@ -325,6 +345,15 @@ impl SqliteWorkspaceStore {
         let now = Utc::now().to_rfc3339();
         self.with_conn_mut(|conn| {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if first_job_cleanup_child {
+                let prior: Option<String> = tx.query_row(
+                    "SELECT plan_id FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 ORDER BY created_at,operation_id LIMIT 1",
+                    params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id], |row| row.get(0),
+                ).optional()?;
+                if let Some(plan_id) = prior {
+                    return Err(StoreError::InvalidInput(format!("stale:{plan_id}:Job cleanup must reconcile its existing canonical removal; a filtered child is not absence")));
+                }
+            }
             let policy=load_removal_policy(&tx,&req.workspace_id,&req.worker,erased_journal,true)?.ok_or_else(|| StoreError::InvalidInput(format!("policy-missing:{}",req.workspace_id)))?;
             let worker=match load_worker(&tx,&req.workspace_id,&req.worker)? {
                 Some(v)=>v,
@@ -2783,6 +2812,93 @@ mod tests {
         let replacement = store.plan_worker_removal(&request, &inv()).unwrap();
         assert_eq!(replacement.worker_updated_at, "2026-08-24T00:00:01Z");
         assert_ne!(replacement.plan_id, plan.plan_id);
+    }
+
+    #[test]
+    fn automatic_job_cleanup_cannot_replace_a_hidden_or_stale_canonical_child() {
+        for changed in ["policy", "worker"] {
+            let store = setup();
+            let request = req();
+            let original = store
+                .plan_job_cleanup_worker_removal(&request, &inv())
+                .unwrap();
+            store
+                .prepare_worker_removal_execution(
+                    "w",
+                    &original.plan_id,
+                    &original.input_fingerprint,
+                )
+                .unwrap();
+            store
+                .fail_worker_removal(
+                    "w",
+                    &original.operation_id,
+                    &original.input_fingerprint,
+                    "runtime_outcome_unconfirmed",
+                )
+                .unwrap();
+            if changed == "policy" {
+                let policy = store.worker_retention_policy("w").unwrap().unwrap();
+                store
+                    .update_worker_retention_policy(
+                        "w",
+                        &policy.policy_digest,
+                        &WorkerRetentionPolicyUpdate {
+                            policy_id: "changed-after-uncertain-removal".into(),
+                            session_disposition: policy.session_disposition,
+                            metadata_disposition: policy.metadata_disposition,
+                            archive_retention: policy.archive_retention,
+                            diagnostics_disposition: policy.diagnostics_disposition,
+                            diagnostics_retention_seconds: policy.diagnostics_retention_seconds,
+                        },
+                    )
+                    .unwrap();
+                assert!(
+                    store
+                        .prepare_worker_removal_execution(
+                            "w",
+                            &original.plan_id,
+                            &original.input_fingerprint
+                        )
+                        .is_err()
+                );
+            } else {
+                store.with_conn(|connection| {
+                    connection.execute("UPDATE worker_registry SET updated_at='2026-08-24T00:00:01Z' WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1", [worker_id().to_string()])?;
+                    Ok(())
+                }).unwrap();
+            }
+            assert!(
+                store
+                    .recover_worker_removal_execution("w", &request.worker)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .plan_job_cleanup_worker_removal(&request, &inv())
+                    .is_err(),
+                "{changed}"
+            );
+            store
+                .with_conn(|connection| {
+                    let count: i64 = connection.query_row(
+                        "SELECT COUNT(*) FROM worker_removal_operations WHERE workspace_id='w'",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(
+                        count, 1,
+                        "filtered canonical ownership must not become a new operation"
+                    );
+                    let saved = load_plan(connection, &original.plan_id)?.unwrap();
+                    assert_eq!(saved.operation_id, original.operation_id);
+                    assert_eq!(saved.input_fingerprint, original.input_fingerprint);
+                    assert_ne!(saved.state, WorkerRemovalPlanState::Succeeded);
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
 
     #[test]

@@ -194,18 +194,232 @@ async fn backend_job_lost_allocation_response_binds_original_receipt_without_hos
 }
 
 #[tokio::test]
-async fn backend_job_executing_cleanup_restart_requires_fence_and_original_removal() {
+async fn backend_job_executing_cleanup_restart_fences_original_writers_at_each_cut() {
+    for cut in [
+        "claimed",
+        "fenced",
+        "removed",
+        "missing-resource",
+        "wrong-resource",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let request = recovery_request(&format!("executing-cleanup-{cut}"));
+        let dispatched = api.dispatch_backend_job(&request).unwrap();
+        let worker = dispatched.attempt.worker.clone().unwrap();
+        assert_eq!(execution.take_inputs().len(), 1);
+        seed_worker_session_for_cleanup(temp.path(), &worker);
+        // Quiesce only fixture recovery tasks. The substituted execution boundary
+        // and real Host admission resource remain; this is not a process-exit test.
+        api.stop_backend_job_recovery().await;
+        let current = api
+            .store
+            .finish_backend_job_attempt(
+                api.workspace_id(),
+                &request.job_id,
+                &dispatched.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "fixture_failure",
+                "retained original failure",
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        let history = api
+            .store
+            .list_backend_job_attempts(api.workspace_id(), &request.job_id)
+            .unwrap();
+        let (claimed, acquired) = api
+            .store
+            .claim_backend_job_worker_cleanup_owned(
+                api.workspace_id(),
+                &history,
+                &current,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert!(acquired);
+        assert!(
+            api.require_backend_job_attempt_effects_ended(&claimed)
+                .is_err()
+        );
+        assert!(
+            api.config_store
+                .recover_worker_removal_execution(api.workspace_id(), &worker)
+                .unwrap()
+                .is_none()
+        );
+        // A claimed marker cannot fabricate a missing canonical child.
+        assert!(
+            WorkerRemovalService::new(&api)
+                .execute_target_removal_on_host_checked(
+                    api.runtime.as_ref(),
+                    &worker,
+                    "must not replace missing child",
+                    None,
+                    Some(&Mutex::new(Some((
+                        "missing-operation".into(),
+                        "missing-fingerprint".into()
+                    )))),
+                )
+                .await
+                .is_err()
+        );
+        if matches!(cut, "missing-resource" | "wrong-resource") {
+            let mut path = api.config.database_path.as_os_str().to_owned();
+            path.push(".job-host-admission");
+            let path = std::path::PathBuf::from(path);
+            if cut == "missing-resource" {
+                std::fs::remove_dir_all(&path).unwrap();
+            } else {
+                let file = std::fs::read_dir(&path)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let mut owner = serde_json::to_value(
+                    crate::backend_job_host_effects::JobHostOwner::try_from(&claimed).unwrap(),
+                )
+                .unwrap();
+                owner["runtime_run_id"] = "successor-run".into();
+                std::fs::write(file, serde_json::to_vec(&owner).unwrap()).unwrap();
+            }
+            let mut restarted = api.clone();
+            restarted.backend_job_recovery = Arc::default();
+            let error = restarted
+                .run_backend_job_cleanup(claimed.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Original Job Host admission"),
+                "{cut}: {error}"
+            );
+            assert!(
+                api.require_backend_job_attempt_effects_ended(&claimed)
+                    .is_err()
+            );
+            assert!(
+                api.config_store
+                    .recover_worker_removal_execution(api.workspace_id(), &worker)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(execution.take_inputs().is_empty());
+            if cut == "missing-resource" {
+                assert!(!path.exists());
+            }
+            continue;
+        }
+        let original = if cut != "claimed" {
+            let drain = crate::backend_job_host_effects::JobHostEffects::fence_retained(
+                &api.config.database_path,
+                &claimed,
+            )
+            .unwrap();
+            api.runtime
+                .stop_worker(
+                    &worker,
+                    WorkerLifecycleRequest {
+                        stop_intent: None,
+                        reason: Some("fixture exact execution termination".into()),
+                        ticket_assignment: None,
+                    },
+                )
+                .unwrap();
+            api.fence_backend_job_effects(&claimed, &drain)
+                .await
+                .unwrap();
+            assert!(
+                api.require_backend_job_attempt_effects_ended(&claimed)
+                    .is_ok()
+            );
+            if cut == "removed" {
+                let response = WorkerRemovalService::new(&api)
+                    .execute_target_removal_on_host(
+                        api.runtime.as_ref(),
+                        &worker,
+                        &format!("Terminal Backend Job attempt {}", claimed.attempt_id),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status, StatusCode::OK.as_u16());
+            }
+            api.config_store
+                .recover_worker_removal_execution(api.workspace_id(), &worker)
+                .unwrap()
+        } else {
+            None
+        };
+        let mut restarted = api.clone();
+        restarted.backend_job_recovery = Arc::default();
+        let owner = crate::backend_job_host_effects::JobHostOwner::try_from(&claimed).unwrap();
+        assert!(restarted.backend_job_recovery.effects(&owner).is_err());
+        restarted.recover_backend_job_worker_cleanups().unwrap();
+        let cleaned = wait_for_backend_job_worker_cleanup(
+            &restarted,
+            &request.job_id,
+            &claimed.attempt_id,
+            BackendJobWorkerCleanupState::Completed,
+        )
+        .await;
+        assert_eq!(
+            cleaned.failure_category.as_deref(),
+            Some("fixture_failure"),
+            "{cut}"
+        );
+        assert_eq!(
+            cleaned.failure_detail.as_deref(),
+            Some("retained original failure")
+        );
+        assert_eq!(cleaned.worker, claimed.worker);
+        assert_eq!(cleaned.runtime_run_id, claimed.runtime_run_id);
+        assert_eq!(cleaned.input_digest, claimed.input_digest);
+        restarted
+            .require_backend_job_attempt_effects_ended(&cleaned)
+            .unwrap();
+        let retained = api
+            .config_store
+            .recover_worker_removal_execution(api.workspace_id(), &worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained.plan.state,
+            crate::retention::WorkerRemovalPlanState::Succeeded
+        );
+        if let Some(original) = original {
+            assert_eq!(retained.plan.operation_id, original.plan.operation_id);
+            assert_eq!(
+                retained.plan.input_fingerprint,
+                original.plan.input_fingerprint
+            );
+        }
+        assert_eq!(
+            api.store
+                .list_backend_job_attempts(api.workspace_id(), &request.job_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(execution.take_inputs().is_empty());
+        assert!(api.runtime.worker(&worker).is_err());
+        restarted.stop_backend_job_recovery().await;
+    }
+}
+
+#[tokio::test]
+async fn job_cleanup_policy_staleness_retains_the_first_child_across_retry_and_new_owner() {
+    use crate::retention::{WorkerRemovalPlanRequest, WorkerRetentionPolicyUpdate};
     let temp = tempfile::tempdir().unwrap();
     let (api, execution) = test_api_with_recording_backend(temp.path()).await;
-    let request = recovery_request("executing-cleanup-restart");
+    let request = recovery_request("stale-cleanup-child");
     let dispatched = api.dispatch_backend_job(&request).unwrap();
     let worker = dispatched.attempt.worker.clone().unwrap();
     execution.take_inputs();
     seed_worker_session_for_cleanup(temp.path(), &worker);
-    // Stop only the recovery tasks, not execution. Inject a crash boundary after
-    // cleanup claim without a live cleanup task. This is not a process-exit test.
     api.stop_backend_job_recovery().await;
-    api.store
+    let failed = api
+        .store
         .finish_backend_job_attempt(
             api.workspace_id(),
             &request.job_id,
@@ -216,95 +430,220 @@ async fn backend_job_executing_cleanup_restart_requires_fence_and_original_remov
             &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
         )
         .unwrap();
-    let current = api
-        .store
-        .get_backend_job_attempt(
-            api.workspace_id(),
-            &request.job_id,
-            &dispatched.attempt.attempt_id,
-        )
-        .unwrap()
-        .unwrap();
-    let history = api
-        .store
-        .list_backend_job_attempts(api.workspace_id(), &request.job_id)
-        .unwrap();
-    let (claimed, acquired) = api
-        .store
-        .claim_backend_job_worker_cleanup_owned(
-            api.workspace_id(),
-            &history,
-            &current,
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-        )
-        .unwrap();
-    assert!(acquired);
-    let mut restarted = api.clone();
-    restarted.backend_job_recovery = Arc::default();
-    let error = restarted
-        .run_backend_job_cleanup(claimed.clone())
-        .await
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("Host writer/drain evidence missing")
-    );
-    assert!(
-        api.config_store
-            .recover_worker_removal_execution(api.workspace_id(), &worker)
-            .unwrap()
-            .is_none()
-    );
-
+    let drain = crate::backend_job_host_effects::JobHostEffects::fence_retained(
+        &api.config.database_path,
+        &failed,
+    )
+    .unwrap();
     api.runtime
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
                 stop_intent: None,
-                reason: Some("fixture exact execution termination".into()),
+                reason: Some("fixture original scope join".into()),
                 ticket_assignment: None,
             },
         )
         .unwrap();
-    api.fence_backend_job_effects(&claimed).await.unwrap();
-    let error = restarted
-        .run_backend_job_cleanup(claimed.clone())
+    api.fence_backend_job_effects(&failed, &drain)
         .await
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("no retained canonical removal operation")
-    );
-    assert!(
-        api.config_store
-            .recover_worker_removal_execution(api.workspace_id(), &worker)
-            .unwrap()
-            .is_none(),
-        "a restarted Executing marker cannot authorize a new removal"
-    );
+        .unwrap();
+    let reason = format!("Terminal Backend Job attempt {}", failed.attempt_id);
+    let plan = api
+        .config_store
+        .plan_job_cleanup_worker_removal(
+            &WorkerRemovalPlanRequest {
+                workspace_id: api.workspace_id().into(),
+                worker: worker.clone(),
+                reason: reason.clone(),
+                journal_erasure: None,
+            },
+            &api.runtime.worker_retention_inventory(&worker).unwrap(),
+        )
+        .unwrap();
+    api.config_store
+        .prepare_worker_removal_execution(
+            api.workspace_id(),
+            &plan.plan_id,
+            &plan.input_fingerprint,
+        )
+        .unwrap();
+    // Seed an uncertain canonical child, not a successful provider response.
+    api.config_store
+        .fail_worker_removal(
+            api.workspace_id(),
+            &plan.operation_id,
+            &plan.input_fingerprint,
+            "fixture_runtime_outcome_unconfirmed",
+        )
+        .unwrap();
+    let policy = api
+        .config_store
+        .worker_retention_policy(api.workspace_id())
+        .unwrap()
+        .unwrap();
+    api.config_store
+        .update_worker_retention_policy(
+            api.workspace_id(),
+            &policy.policy_digest,
+            &WorkerRetentionPolicyUpdate {
+                policy_id: "changed-after-uncertain-job-child".into(),
+                session_disposition: policy.session_disposition,
+                metadata_disposition: policy.metadata_disposition,
+                archive_retention: policy.archive_retention,
+                diagnostics_disposition: policy.diagnostics_disposition,
+                diagnostics_retention_seconds: policy.diagnostics_retention_seconds,
+            },
+        )
+        .unwrap();
+    let child = Mutex::new(None);
+    let service = WorkerRemovalService::new(&api);
+    let response = service
+        .execute_target_removal_on_host_checked(
+            api.runtime.as_ref(),
+            &worker,
+            &reason,
+            None,
+            Some(&child),
+        )
+        .await
+        .unwrap();
+    assert_ne!(response.status, StatusCode::OK.as_u16());
     assert_eq!(
-        api.store
-            .get_backend_job_attempt(api.workspace_id(), &request.job_id, &claimed.attempt_id)
-            .unwrap()
-            .unwrap()
-            .worker_cleanup_state,
-        Some(BackendJobWorkerCleanupState::Executing)
+        *child.lock().unwrap(),
+        Some((plan.operation_id.clone(), plan.input_fingerprint.clone()))
     );
-
-    // Checked restart entry cannot fall through to planning without the pinned
-    // original operation, even though execution/Host fences now exist.
     assert!(
-        WorkerRemovalService::new(&api)
+        service
             .execute_target_removal_on_host_checked(
                 api.runtime.as_ref(),
                 &worker,
-                "must not create a replacement",
+                &reason,
                 None,
-                Some(("missing-operation", "missing-fingerprint"))
+                Some(&child)
             )
             .await
+            .is_err()
+    );
+    // A fresh recovery owner's empty memory still cannot treat filtered Stale as
+    // proof that no canonical child was ever created.
+    let cold = Mutex::new(None);
+    let response = service
+        .execute_target_removal_on_host_checked(
+            api.runtime.as_ref(),
+            &worker,
+            &reason,
+            None,
+            Some(&cold),
+        )
+        .await
+        .unwrap();
+    assert_ne!(response.status, StatusCode::OK.as_u16());
+    assert!(cold.lock().unwrap().is_none());
+    api.config_store.with_conn(|connection| {
+        let count: i64 = connection.query_row("SELECT COUNT(*) FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3", rusqlite::params![api.workspace_id(), worker.runtime_id, worker.worker_id], |row| row.get(0))?;
+        assert_eq!(count, 1);
+        Ok(())
+    }).unwrap();
+    assert!(api.runtime.worker(&worker).is_ok());
+    assert!(execution.take_inputs().is_empty());
+    assert_eq!(
+        api.store
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap()
+            .failure_category
+            .as_deref(),
+        Some("fixture_failure")
+    );
+}
+
+#[tokio::test]
+async fn cancelled_cleanup_waiter_keeps_its_actual_writer_exclusive_across_recovery_owners() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+    let request = recovery_request("cancelled-cleanup-writer");
+    let dispatched = api.dispatch_backend_job(&request).unwrap();
+    let worker = dispatched.attempt.worker.clone().unwrap();
+    assert_eq!(execution.take_inputs().len(), 1);
+    seed_worker_session_for_cleanup(temp.path(), &worker);
+    api.stop_backend_job_recovery().await;
+    let failed = api
+        .store
+        .finish_backend_job_attempt(
+            api.workspace_id(),
+            &request.job_id,
+            &dispatched.attempt.attempt_id,
+            BackendJobAttemptState::Failed,
+            "fixture_failure",
+            "retain original failure",
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        )
+        .unwrap();
+    let mut original = api.clone();
+    original.backend_job_recovery = Arc::default();
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    *original
+        .backend_job_recovery
+        .cleanup_after_claim
+        .lock()
+        .unwrap() = Some(hold.clone());
+    let original_api = original.clone();
+    let expected = failed.clone();
+    let waiter = tokio::spawn(async move { original_api.run_backend_job_cleanup(expected).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        original
+            .backend_job_recovery
+            .cleanup_claimed_writer
+            .notified(),
+    )
+    .await
+    .unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    // The real cleanup-lane closure is still gated after claim. Its exclusive
+    // resource must survive the cancelled async response waiter independently.
+    let mut directory = api.config.database_path.as_os_str().to_owned();
+    directory.push(".job-host-admission");
+    let path = std::fs::read_dir(std::path::PathBuf::from(directory))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let competing_writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    assert!(
+        competing_writer.try_lock().is_err(),
+        "actual predecessor cleanup lost its writer lease"
+    );
+    let mut recovered = api.clone();
+    recovered.backend_job_recovery = Arc::default();
+    recovered.recover_backend_job_worker_cleanups().unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recovered
+            .backend_job_recovery
+            .cleanup_before_writer_fence
+            .notified(),
+    )
+    .await
+    .unwrap();
+    let pending = api
+        .store
+        .get_backend_job_attempt(api.workspace_id(), &request.job_id, &failed.attempt_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pending.worker_cleanup_state,
+        Some(BackendJobWorkerCleanupState::Executing)
+    );
+    assert!(
+        api.require_backend_job_attempt_effects_ended(&pending)
             .is_err()
     );
     assert!(
@@ -313,49 +652,28 @@ async fn backend_job_executing_cleanup_restart_requires_fence_and_original_remov
             .unwrap()
             .is_none()
     );
-
-    // The original owner performs canonical removal, then loses its cleanup save.
-    let response = WorkerRemovalService::new(&api)
-        .execute_target_removal_on_host(
-            api.runtime.as_ref(),
-            &worker,
-            &format!("Terminal Backend Job attempt {}", claimed.attempt_id),
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status, StatusCode::OK.as_u16());
-    let original = api
-        .config_store
-        .recover_worker_removal_execution(api.workspace_id(), &worker)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        original.plan.state,
-        crate::retention::WorkerRemovalPlanState::Succeeded
-    );
-    restarted.recover_backend_job_worker_cleanups().unwrap();
+    hold.add_permits(1);
     let cleaned = wait_for_backend_job_worker_cleanup(
-        &restarted,
+        &recovered,
         &request.job_id,
-        &claimed.attempt_id,
+        &failed.attempt_id,
         BackendJobWorkerCleanupState::Completed,
     )
     .await;
-    assert_eq!(cleaned.failure_category.as_deref(), Some("fixture_failure"));
-    let retained = api
-        .config_store
-        .recover_worker_removal_execution(api.workspace_id(), &worker)
-        .unwrap()
+    assert_eq!(cleaned.worker, failed.worker);
+    assert_eq!(cleaned.runtime_run_id, failed.runtime_run_id);
+    assert_eq!(cleaned.failure_category, failed.failure_category);
+    recovered
+        .require_backend_job_attempt_effects_ended(&cleaned)
         .unwrap();
-    assert_eq!(retained.plan.operation_id, original.plan.operation_id);
-    assert_eq!(
-        retained.plan.input_fingerprint,
-        original.plan.input_fingerprint
-    );
+    api.config_store.with_conn(|connection| {
+        let count: i64 = connection.query_row("SELECT COUNT(*) FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3", rusqlite::params![api.workspace_id(), worker.runtime_id, worker.worker_id], |row| row.get(0))?;
+        assert_eq!(count, 1, "both admitted cleanup callers must converge on one canonical child");
+        Ok(())
+    }).unwrap();
     assert!(execution.take_inputs().is_empty());
     assert!(api.runtime.worker(&worker).is_err());
-    restarted.stop_backend_job_recovery().await;
+    recovered.stop_backend_job_recovery().await;
 }
 
 #[tokio::test]
@@ -417,7 +735,7 @@ async fn backend_job_definitive_input_rejection_is_not_receipt_ambiguity() {
 #[tokio::test]
 async fn backend_job_cancelled_callback_keeps_actual_host_db_effect_owned_until_drain() {
     let temp = tempfile::tempdir().unwrap();
-    let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+    let (api, _execution) = test_api_with_recording_backend(temp.path()).await;
     let request = recovery_request("host-drain");
     let reservation = api.dispatch_backend_job(&request).unwrap();
     let owner =
@@ -489,8 +807,7 @@ async fn backend_job_cancelled_callback_keeps_actual_host_db_effect_owned_until_
     // closure is real and still blocked despite its cancelled async waiter.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if !execution.terminations.lock().unwrap().is_empty() && effects.admit(&owner).is_err()
-            {
+            if effects.admit(&owner).is_err() {
                 break;
             }
             tokio::task::yield_now().await;

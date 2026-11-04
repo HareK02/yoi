@@ -1790,8 +1790,26 @@ async fn migration_stopped_checkpoint_is_excluded_from_recovery_result_acceptanc
 async fn saved_checkpoint_never_promotes_erased_released_retired_or_missing_source_to_success() {
     for unavailable in ["erased", "body_released", "retired", "deleted_worker"] {
         let f = RuntimeFixture::new().await;
+        // Join only this fixture's background recovery before constructing the cut.
+        // This orders checkpoint/unavailability; it is not execution-ended evidence.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            f.api.stop_backend_job_recovery(),
+        )
+        .await
+        .expect("fixture recovery must quiesce before the unavailable-source cut");
         let dispatched = f.dispatch_input();
+        let gate = f
+            .api
+            .backend_job_recovery
+            .dispatch_gate(&dispatched.attempt.attempt_id);
+        let dispatch_finished = gate.lock().unwrap();
         let worker = dispatched.attempt.worker.as_ref().unwrap();
+        let generation = f
+            .store
+            .active_journal_generation(&f.host, &f.id)
+            .unwrap()
+            .unwrap();
         f.checkpoint(worker);
         let completion = subjektiv_journal::finish(&f.api, worker).unwrap();
         let checkpoint = f
@@ -1830,9 +1848,53 @@ async fn saved_checkpoint_never_promotes_erased_released_retired_or_missing_sour
         }
         let job = current_journal_job(&f);
         let attempt = current_journal_attempt(&f, &dispatched.attempt.attempt_id);
+        let registry = f
+            .api
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, &f.source)
+            .unwrap();
+        // Read-only evidence remains observable after writer release; the public
+        // active-generation API correctly refuses that released writer's authority.
+        let generation_evidence = || {
+            f.api
+                .feature_storage
+                .open(&f.api.subjektiv_registration)
+                .unwrap()
+                .with_connection(|connection| {
+                    use rusqlite::OptionalExtension as _;
+                    Ok(connection.query_row(
+                        "SELECT json_object('snapshot',json(snapshot_json),'active',active,'completion',json(completion_json)) FROM journal_generations WHERE id=?1",
+                        [&generation.id], |row| row.get::<_, String>(0),
+                    ).optional()?)
+                })
+                .unwrap()
+        };
+        let retained = generation_evidence();
+        if unavailable == "erased" {
+            assert!(
+                retained.is_none(),
+                "explicit erasure removes generation evidence"
+            );
+        } else {
+            let evidence: Value = serde_json::from_str(retained.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                evidence["snapshot"],
+                serde_json::to_value(&generation).unwrap()
+            );
+            assert_eq!(
+                evidence["active"], 0,
+                "saved domain completion closes only the generation"
+            );
+            assert_eq!(
+                evidence["completion"],
+                serde_json::to_value(&completion).unwrap()
+            );
+        }
         f.execution.take_inputs();
         subjektiv_journal::reconcile_attempt(&f.api, &job, &attempt).unwrap();
+        drop(dispatch_finished);
         let failed = current_journal_job(&f);
+        let failed_attempt = current_journal_attempt(&f, &attempt.attempt_id);
         assert_eq!(failed.state, BackendJobState::Failed, "{unavailable}");
         assert_eq!(
             failed.failure_category.as_deref(),
@@ -1847,6 +1909,11 @@ async fn saved_checkpoint_never_promotes_erased_released_retired_or_missing_sour
         assert!(failed.result.is_none());
         assert_eq!(failed.current_attempt, attempt.attempt);
         assert_eq!(failed.input_digest, attempt.input_digest);
+        assert_eq!(failed.input_digest, f.request.input_digest().unwrap());
+        assert_eq!(failed.intent_fingerprint, f.request.fingerprint().unwrap());
+        if unavailable != "retired" {
+            assert_eq!(failed.load_executable_request().unwrap(), &f.request);
+        }
         assert!(
             f.api
                 .accept_backend_job_result(
@@ -1860,10 +1927,56 @@ async fn saved_checkpoint_never_promotes_erased_released_retired_or_missing_sour
                 )
                 .is_err()
         );
-        assert!(
+        // The stale caller cannot execute. Available terminal input returns only
+        // its saved Failed observation; explicitly retired input remains rejected.
+        let replay = f.api.dispatch_backend_job_reservation(dispatched.clone());
+        if unavailable == "retired" {
+            assert!(matches!(replay, Err(Error::WorkspacePermissionDenied(_))));
+        } else {
+            let replay = replay.unwrap();
+            assert!(replay.replayed, "{unavailable}");
+            assert_eq!(replay.job, failed, "{unavailable}");
+            assert_eq!(replay.attempt, failed_attempt, "{unavailable}");
+        }
+        assert_eq!(
+            current_journal_job(&f),
+            failed,
+            "failure, input and retirement must survive replay: {unavailable}"
+        );
+        assert_eq!(
+            current_journal_attempt(&f, &attempt.attempt_id),
+            failed_attempt
+        );
+        assert_eq!(failed.request, job.request);
+        assert_eq!(failed.intent_fingerprint, job.intent_fingerprint);
+        assert_eq!(failed.input_disposition, job.input_disposition);
+        assert_eq!(failed_attempt.state, BackendJobAttemptState::Failed);
+        assert_eq!(failed_attempt.worker, attempt.worker);
+        assert_eq!(failed_attempt.runtime_run_id, attempt.runtime_run_id);
+        assert_eq!(failed_attempt.failure_category, failed.failure_category);
+        assert!(failed_attempt.result.is_none());
+        assert_eq!(generation_evidence(), retained);
+        assert_eq!(
+            f.store
+                .journal_worker_was_released(
+                    &f.request
+                        .grants
+                        .subjektiv_journal
+                        .as_ref()
+                        .unwrap()
+                        .subject_id,
+                    &f.source.runtime_id,
+                    &f.source.worker_id,
+                )
+                .unwrap(),
+            unavailable == "body_released"
+        );
+        assert_eq!(
             f.api
-                .dispatch_backend_job_reservation(dispatched.clone())
-                .is_err()
+                .store
+                .get_worker_registry(TEST_WORKSPACE_ID, &f.source)
+                .unwrap(),
+            registry
         );
         assert!(
             f.execution.take_inputs().is_empty(),
@@ -1881,6 +1994,7 @@ async fn saved_checkpoint_never_promotes_erased_released_retired_or_missing_sour
         }
         if unavailable == "retired" {
             assert!(failed.load_executable_request().is_err());
+            assert!(failed.request.input.is_null());
             assert_eq!(
                 failed.input_disposition,
                 crate::backend_job::JobInputDisposition::Invalidated
@@ -2451,6 +2565,7 @@ async fn explicit_erasure_interrupts_completed_journal_cleanup_waiting_for_run_t
 struct SubjectRemovalFixture {
     dir: tempfile::TempDir,
     api: WorkspaceApi,
+    execution: Arc<DeterministicExecutionBackend>,
     dispatcher: Arc<crate::worker_source::EmbeddedServerWorkerMutationDispatcher>,
     controller: RuntimeWorkerRef,
     target: RuntimeWorkerRef,
@@ -2475,10 +2590,11 @@ impl SubjectRemovalFixture {
                 control.clone(),
             ),
         );
+        let execution = Arc::new(DeterministicExecutionBackend::default());
         let api = WorkspaceApi::new_with_execution_backend_and_broker(
             config,
             control,
-            Arc::new(DeterministicExecutionBackend::default()),
+            execution.clone(),
             BackendResourceBroker::default(),
             HostExecutors::default(),
             Some(dispatcher.clone()),
@@ -2595,6 +2711,7 @@ impl SubjectRemovalFixture {
         Self {
             dir,
             api,
+            execution,
             dispatcher,
             controller,
             target,
@@ -3636,7 +3753,7 @@ async fn disabled_subject_removal_does_not_admit_new_public_history_or_reserve_a
 }
 
 #[tokio::test]
-async fn disabled_subject_removal_retains_only_the_already_admitted_prefix() {
+async fn disabled_subject_removal_defers_unreflected_prefix_without_admitting_new_history() {
     let f = SubjectRemovalFixture::new().await;
     let runtime_api::SessionMaterialCatalogAvailability::Page { page } = f
         .api
@@ -3684,20 +3801,41 @@ async fn disabled_subject_removal_retains_only_the_already_admitted_prefix() {
         .store
         .accept_journal_sources(&f.host, "accepted before disablement", &ranges[..1])
         .unwrap();
+    let admitted = f
+        .store
+        .list_journal_sources(&f.host, &id, None, 32)
+        .unwrap();
+    assert_eq!(admitted.items.len(), 1);
+    let before = f.store.read_journal(&f.host, &id).unwrap();
+    let source_before = subjektiv_journal::capture_input(&f.api, &f.attr, 0, 0, 48 * 1024).unwrap();
     f.disable();
+    let registry = f
+        .api
+        .store
+        .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+        .unwrap()
+        .unwrap();
     let response = f.remove();
     assert_eq!(
         response.status,
-        StatusCode::OK.as_u16(),
+        StatusCode::CONFLICT.as_u16(),
         "{}",
         response.body
     );
+    let body: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(body["code"], "journal_handoff_incomplete");
     assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("unreflected input")
+    );
+    assert_eq!(
         f.api
             .store
             .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
-            .unwrap()
-            .is_none()
+            .unwrap(),
+        Some(registry)
     );
     assert!(
         f.api
@@ -3710,9 +3848,66 @@ async fn disabled_subject_removal_retains_only_the_already_admitted_prefix() {
         f.store.journal_for_session(&f.host).unwrap().as_deref(),
         Some(id.as_str())
     );
+    assert_eq!(f.store.read_journal(&f.host, &id).unwrap(), before);
+    assert_eq!(
+        f.store
+            .list_journal_sources(&f.host, &id, None, 32)
+            .unwrap(),
+        admitted
+    );
+    assert!(
+        f.store
+            .read_journal_source(&f.host, &id, ranges[1].source.order)
+            .is_err()
+    );
     assert!(f.store.journal_retention_required(&f.host).unwrap());
-    assert!(!session_root(f.dir.path(), &f.target).exists());
-    f.assert_removed_with_history();
+    assert!(!f.store.journal_session_erased(&f.host).unwrap());
+    assert!(session_root(f.dir.path(), &f.target).exists());
+    let runtime_api::SessionRecordingCaptureAvailability::Captured { slice } = f
+        .api
+        .runtime
+        .session_recording_capture(
+            &f.target.runtime_id,
+            runtime_api::SessionRecordingCaptureRequest {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                source: runtime_api::SessionPublicSource::Retained {
+                    worker_id: worker_runtime::identity::WorkerId::parse(&f.target.worker_id)
+                        .unwrap(),
+                },
+                expected_session_id: f.attr.session_id.clone(),
+                start: session_store::capture::RecordingPosition {
+                    canonical_order: 0,
+                    byte_offset: 0,
+                },
+                max_entries: MAX_JOURNAL_RANGES,
+                max_serialized_bytes: 48 * 1024,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("ordinary removal must retain the readable original history")
+    };
+    assert_eq!(
+        slice.capture, source_before,
+        "ordinary removal must retain both the admitted and unadmitted original history"
+    );
+    assert!(
+        f.api
+            .config_store
+            .worker_session_archive(TEST_WORKSPACE_ID, &f.target, &f.attr.session_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !f.store
+            .journal_worker_was_released(
+                &f.attr.subject_id,
+                &f.target.runtime_id,
+                &f.target.worker_id,
+            )
+            .unwrap()
+    );
+    f.assert_occupied();
 }
 
 #[tokio::test]
@@ -4006,6 +4201,7 @@ impl SubjectRemovalFixture {
         let Self {
             dir,
             api,
+            execution,
             dispatcher,
             controller,
             target,
@@ -4015,6 +4211,7 @@ impl SubjectRemovalFixture {
         } = self;
         let config = api.config.clone();
         drop(api);
+        drop(execution);
         drop(dispatcher);
         drop(store);
         let control = Arc::new(test_control_store(&config));
@@ -4024,10 +4221,11 @@ impl SubjectRemovalFixture {
                 control.clone(),
             ),
         );
+        let execution = Arc::new(DeterministicExecutionBackend::default());
         let api = WorkspaceApi::new_with_execution_backend_and_broker(
             config,
             control,
-            Arc::new(DeterministicExecutionBackend::default()),
+            execution.clone(),
             BackendResourceBroker::default(),
             HostExecutors::default(),
             Some(dispatcher.clone()),
@@ -4038,6 +4236,7 @@ impl SubjectRemovalFixture {
         Self {
             dir,
             api,
+            execution,
             dispatcher,
             controller,
             target,
@@ -4527,7 +4726,7 @@ journal_recovery_cases! {
 }
 
 #[tokio::test]
-async fn legacy_journal_grant_preserves_old_json_and_only_recovers_original_current_body() {
+async fn legacy_journal_grant_preserves_wire_digest_but_authorizes_neither_writer() {
     let f = SubjectRemovalFixture::new().await;
     let old = json!({"subject_id":f.attr.subject_id,"session_id":f.attr.session_id,"journal_id":"legacy-journal","selected_ranges":[]});
     let wire = serde_json::to_string(&old).unwrap();
@@ -4538,11 +4737,22 @@ async fn legacy_journal_grant_preserves_old_json_and_only_recovers_original_curr
         old,
         "old canonical request/digest must not acquire a new empty binding_id field"
     );
+    let roundtrip = serde_json::to_string(&serde_json::to_value(&grant).unwrap()).unwrap();
+    assert_eq!(roundtrip, wire);
     assert_eq!(
-        serde_json::to_string(&serde_json::to_value(&grant).unwrap()).unwrap(),
-        wire
+        job::sha256(roundtrip.as_bytes()),
+        job::sha256(wire.as_bytes())
     );
-    assert!(subjektiv_journal::host(&f.api, &f.store, &grant).is_ok());
+    let mut bound = grant.clone();
+    bound.binding_id = f.host.writer_binding_id().unwrap().into();
+    assert!(subjektiv_journal::host(&f.api, &f.store, &bound).is_ok());
+    assert!(
+        matches!(
+            subjektiv_journal::host(&f.api, &f.store, &grant),
+            Err(Error::WorkspacePermissionDenied(_))
+        ),
+        "wire compatibility is not authority even for the original writer"
+    );
     let writer = JournalWriterBinding {
         subject_id: f.attr.subject_id.clone(),
         runtime_id: f.attr.runtime_id.clone(),
@@ -4550,13 +4760,21 @@ async fn legacy_journal_grant_preserves_old_json_and_only_recovers_original_curr
         binding_id: f.host.writer_binding_id().unwrap().into(),
     };
     f.store.release_journal_writer(&writer).unwrap();
-    f.store
+    let successor = f
+        .store
         .claim_journal_writer(&f.attr.subject_id, &f.attr.runtime_id, "different-body")
         .unwrap();
+    assert!(f.store.journal_writer_active(&successor).unwrap());
+    assert!(!f.store.journal_writer_active(&writer).unwrap());
+    assert_ne!(successor.binding_id, writer.binding_id);
     assert!(
-        subjektiv_journal::host(&f.api, &f.store, &grant).is_err(),
+        matches!(
+            subjektiv_journal::host(&f.api, &f.store, &grant),
+            Err(Error::WorkspacePermissionDenied(_))
+        ),
         "legacy grant must never map to a later writer"
     );
+    assert_eq!(serde_json::to_value(&grant).unwrap(), old);
 }
 
 /// Real embedded Runtime capture + SQLite + production dispatch; synthetic ordinary
@@ -4662,6 +4880,85 @@ mod immutable {
         .unwrap();
     }
 
+    fn frozen_lifetime_evidence(
+        f: &RuntimeFixture,
+        generation: &subjektiv::journal::JournalGeneration,
+        phase: &str,
+    ) -> Value {
+        let job = current_journal_job(f);
+        let attempt = current_journal_attempt(f, &generation.job.attempt_id);
+        let fence = f.job_store.with_conn(|connection| {
+            use rusqlite::OptionalExtension as _;
+            Ok(connection.query_row(
+                "SELECT json_object('owner', json(owner_json), 'history', json(history_json),
+                    'controller', json(controller_json), 'host', json(host_json), 'recorded_at', recorded_at)
+                 FROM backend_job_execution_fences WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",
+                rusqlite::params![TEST_WORKSPACE_ID, generation.job.job_id, generation.job.attempt_id],
+                |row| row.get::<_, String>(0),
+            ).optional()?)
+        }).unwrap();
+        let removal = attempt.worker.as_ref().and_then(|worker| {
+            f.api
+                .config_store
+                .recover_worker_removal_execution(TEST_WORKSPACE_ID, worker)
+                .unwrap()
+                .map(|saved| {
+                    json!({
+                        "operation_id": saved.plan.operation_id,
+                        "input_fingerprint": saved.plan.input_fingerprint,
+                        "state": saved.plan.state,
+                        "worker": saved.plan.worker,
+                        "session_disposition": saved.runtime_request.session_disposition,
+                    })
+                })
+        });
+        let domain = f
+            .api
+            .feature_storage
+            .open(&f.api.subjektiv_registration)
+            .unwrap()
+            .with_connection(|connection| {
+                let domain: String = connection.query_row(
+                    "SELECT json_object('generation_id', g.id, 'job_id', g.job_id, 'attempt_id', g.attempt_id, 'active', g.active,
+                        'completion', json(g.completion_json),
+                        'process_order', j.process_order, 'process_byte', j.process_byte,
+                        'checkpoints', (SELECT COUNT(*) FROM journal_operations o
+                            WHERE o.generation_id=g.id
+                            AND json_extract(o.request_json,'$.action.action')='checkpoint'))
+                    FROM journal_generations g JOIN journals j ON j.id=g.journal_id
+                    WHERE g.id=?1 AND g.job_id=?2 AND g.attempt_id=?3",
+                    rusqlite::params![
+                        generation.id,
+                        generation.job.job_id,
+                        generation.job.attempt_id
+                    ],
+                    |row| row.get(0),
+                )?;
+                Ok(domain)
+            })
+            .unwrap();
+        let evidence = json!({
+            "phase": phase,
+            "job": {
+                "job_id": job.request.job_id, "state": job.state,
+                "current_attempt": job.current_attempt, "input_digest": job.input_digest,
+                "input_disposition": job.input_disposition, "result": job.result,
+                "failure_category": job.failure_category, "failure_detail": job.failure_detail,
+            },
+            "attempt": attempt,
+            "retained": f.store.retained_journal_generation(&f.host, &f.id, &generation.job).unwrap(),
+            "domain": serde_json::from_str::<Value>(&domain).unwrap(),
+            "execution_fence": f.api.store.has_backend_job_execution_fence(TEST_WORKSPACE_ID, &attempt).unwrap(),
+            "fence_receipt": fence.map(|raw| serde_json::from_str::<Value>(&raw).unwrap()),
+            "canonical_removal": removal,
+            "source_writer_binding_id": f.host.writer_binding_id(),
+            "source_erased": f.store.journal_session_erased(&f.host).unwrap(),
+            "source_registered": f.api.store.get_worker_registry(TEST_WORKSPACE_ID, &f.source).unwrap().is_some(),
+        });
+        eprintln!("frozen-generation-lifetime: {evidence}");
+        evidence
+    }
+
     #[tokio::test]
     async fn backend_immutable_input_survives_missing_source_and_predispatch_host_reopen() {
         let RuntimeFixture {
@@ -4719,24 +5016,27 @@ mod immutable {
             range,
             id,
         };
-        let saved = f
+        // The production constructor itself restores the accepted owner and may
+        // dispatch. Join that test owner's work, then use its real dispatch gate
+        // to order the two receipt-reconciliation cuts below. No live Worker is stopped.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            f.api.stop_backend_job_recovery(),
+        )
+        .await
+        .expect("startup recovery did not quiesce for the frozen-generation cut");
+        let gate = f
             .api
-            .store
-            .get_backend_job(TEST_WORKSPACE_ID, &f.request.job_id)
-            .unwrap()
-            .unwrap();
+            .backend_job_recovery
+            .dispatch_gate(&generation.job.attempt_id);
+        let saved = current_journal_job(&f);
+        let reopened = frozen_lifetime_evidence(&f, &generation, "reopen_before_checkpoint");
         assert_eq!(
             serde_json::to_vec(&saved.load_executable_request().unwrap().input).unwrap(),
             frozen
         );
         assert_eq!(saved.input_digest, digest);
-        assert_eq!(
-            saved.state,
-            BackendJobState::Pending,
-            "pre-dispatch reopen failure: {:?}: {:?}",
-            saved.failure_category,
-            saved.failure_detail
-        );
+        assert_eq!(saved.state, BackendJobState::Pending, "{reopened}");
         let dispatched = f
             .api
             .dispatch_backend_job_reservation(f.reserved.clone())
@@ -4744,50 +5044,150 @@ mod immutable {
         assert_eq!(
             dispatched.attempt.state,
             BackendJobAttemptState::Dispatched,
-            "dispatch failure: {:?}: {:?}",
-            dispatched.attempt.failure_category,
-            dispatched.attempt.failure_detail
-        );
-        assert_eq!(
-            f.store
-                .active_journal_generation(&f.host, &f.id)
-                .unwrap()
-                .unwrap_or_else(|| {
-                    let current = current_journal_job(&f);
-                    let attempt = current_journal_attempt(&f, &dispatched.attempt.attempt_id);
-                    panic!("generation disappeared after dispatch: job={:?} {:?}: {:?}; attempt={:?} {:?}: {:?}",
-                        current.state, current.failure_category, current.failure_detail,
-                        attempt.state, attempt.failure_category, attempt.failure_detail);
-                }),
-            generation
+            "{reopened}"
         );
         let worker = dispatched.attempt.worker.as_ref().unwrap();
-        assert!(!root.exists());
+        // Background recovery was joined; initial dispatch has returned. Hold the
+        // existing producer gate through the unreflected recovery and checkpoint.
+        let dispatch_finished = gate.lock().unwrap();
+        let before = frozen_lifetime_evidence(&f, &generation, "dispatch_finished");
+        assert_eq!(before["domain"]["active"], 1, "{before}");
+        assert!(before["domain"]["completion"].is_null(), "{before}");
+        assert_eq!(before["domain"]["checkpoints"], 0, "{before}");
+        assert_eq!(before["execution_fence"], false, "{before}");
         assert_eq!(
-            f.execution.take_inputs().last().unwrap().1,
+            f.store
+                .retained_journal_generation(&f.host, &f.id, &generation.job)
+                .unwrap(),
+            Some(generation.clone()),
+            "{before}"
+        );
+        assert!(!root.exists());
+        let inputs = f.execution.take_inputs();
+        assert_eq!(
+            inputs.len(),
+            1,
+            "one exact submission, including startup dispatch"
+        );
+        assert_eq!(
+            inputs[0].1,
             f.request
                 .worker_input(&dispatched.attempt.attempt_id)
                 .unwrap()
         );
+
+        // Same callee as recover_backend_job_step, at an exact current owner cut.
+        // There is neither a checkpoint nor an execution/Host fence. Incomplete
+        // finish MUST NOT close; missing fences MUST NOT authorize continuation.
+        let error = subjektiv_journal::reconcile_attempt(
+            &f.api,
+            &current_journal_job(&f),
+            &current_journal_attempt(&f, &generation.job.attempt_id),
+        )
+        .expect_err("unreflected generation without execution fences cannot complete or retry");
+        let unreflected = frozen_lifetime_evidence(&f, &generation, "owner_before_checkpoint");
+        eprintln!("frozen-generation-lifetime: incomplete_owner_error={error}");
+        assert!(
+            matches!(error, Error::RepositoryConflict(_)),
+            "{error}; {unreflected}"
+        );
+        assert_eq!(unreflected["domain"], before["domain"], "{unreflected}");
+        assert_eq!(current_journal_job(&f).state, BackendJobState::Pending);
+        assert_eq!(
+            current_journal_attempt(&f, &generation.job.attempt_id).state,
+            BackendJobAttemptState::Dispatched
+        );
+
+        // Keep canonical cleanup before claim: a terminal Job cannot hide the
+        // generation's close cause behind purge, retirement or a later owner.
+        let cleanup_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *f.api
+            .backend_job_recovery
+            .cleanup_before_claim
+            .lock()
+            .unwrap() = Some(cleanup_gate.clone());
         f.checkpoint(worker);
-        let completion = subjektiv_journal::finish(&f.api, worker).unwrap();
+        let checkpoint = f
+            .store
+            .query_journal_operation(&f.host, &f.id, "checkpoint")
+            .unwrap()
+            .unwrap();
+        let checkpointed = frozen_lifetime_evidence(&f, &generation, "checkpoint_before_owner");
+        assert_eq!(checkpointed["domain"]["active"], 1, "{checkpointed}");
+        assert!(
+            checkpointed["domain"]["completion"].is_null(),
+            "{checkpointed}"
+        );
+        assert_eq!(checkpointed["domain"]["checkpoints"], 1, "{checkpointed}");
+        assert_eq!(checkpointed["domain"]["process_order"], 1, "{checkpointed}");
+        f.api.backend_job_recovery.resume_after_test_pause();
+        f.api.own_backend_job_recovery(&dispatched.attempt);
+        drop(dispatch_finished);
+
+        // Release only the producer gate. No explicit finish/result/second input:
+        // the actual root owner must recover the saved checkpoint on the same Job.
+        let completed = observe_journal_completion(&f).await;
+        let settled = frozen_lifetime_evidence(&f, &generation, "owner_completed_cleanup_blocked");
+        assert_eq!(completed.state, BackendJobState::Completed, "{settled}");
+        assert_eq!(completed.current_attempt, dispatched.attempt.attempt);
+        assert_eq!(completed.input_digest, digest);
+        let completion: JournalJobCompletion =
+            serde_json::from_value(completed.result.clone().unwrap()).unwrap();
+        assert_eq!(completion.generation_id, generation.id, "{settled}");
         assert_eq!(completion.process_order, 1);
+        assert_eq!(completion.process_byte, 0);
+        assert_eq!(settled["domain"]["active"], 0, "{settled}");
+        assert_eq!(
+            settled["domain"]["completion"],
+            json!(completion),
+            "{settled}"
+        );
+        // The retained completion is written atomically with the normal close.
+        // Cleanup is still gated, so neither a cleanup close nor an execution
+        // fence can be the cause of this active -> completed transition.
+        assert_eq!(settled["domain"]["job_id"], json!(generation.job.job_id));
+        assert_eq!(
+            settled["domain"]["attempt_id"],
+            json!(generation.job.attempt_id)
+        );
+        assert_eq!(settled["domain"]["generation_id"], json!(generation.id));
+        assert_eq!(settled["domain"]["checkpoints"], 1, "{settled}");
+        assert_eq!(settled["execution_fence"], false, "{settled}");
+        let terminal = current_journal_attempt(&f, &generation.job.attempt_id);
+        assert_eq!(terminal.worker, dispatched.attempt.worker);
+        assert_eq!(terminal.runtime_run_id, dispatched.attempt.runtime_run_id);
+        assert_eq!(
+            terminal.worker_cleanup_state,
+            Some(BackendJobWorkerCleanupState::Pending)
+        );
+        assert_eq!(
+            f.store
+                .retained_journal_generation(&f.host, &f.id, &generation.job)
+                .unwrap(),
+            Some(generation.clone()),
+            "{settled}"
+        );
+        assert_eq!(
+            f.store
+                .query_journal_operation(&f.host, &f.id, "checkpoint")
+                .unwrap(),
+            Some(checkpoint)
+        );
+        assert_eq!(
+            completed.load_executable_request().unwrap().input,
+            f.request.input
+        );
+        assert!(
+            f.execution.take_inputs().is_empty(),
+            "owner must not resubmit input"
+        );
         assert!(
             !root.exists(),
-            "checkpoint completed with original capture/catalog/read unavailable"
+            "completion must not reacquire the original source"
         );
+
         std::fs::rename(&unavailable, &root).unwrap();
-        f.api
-            .accept_backend_job_result(
-                worker,
-                &BackendJobResultSubmission {
-                    job_id: f.request.job_id.clone(),
-                    attempt_id: dispatched.attempt.attempt_id.clone(),
-                    input_digest: digest,
-                    result: serde_json::to_value(completion).unwrap(),
-                },
-            )
-            .unwrap();
+        cleanup_gate.add_permits(1);
         wait_for_backend_job_worker_cleanup(
             &f.api,
             &f.request.job_id,
@@ -4795,6 +5195,27 @@ mod immutable {
             BackendJobWorkerCleanupState::Completed,
         )
         .await;
+        let cleaned = frozen_lifetime_evidence(&f, &generation, "cleanup_completed");
+        assert_eq!(cleaned["execution_fence"], true, "{cleaned}");
+        assert_eq!(
+            cleaned["domain"], settled["domain"],
+            "cleanup cannot reclose a different owner"
+        );
+        assert_eq!(
+            f.api
+                .store
+                .list_backend_job_attempts(TEST_WORKSPACE_ID, &f.request.job_id)
+                .unwrap()
+                .len(),
+            1,
+            "checkpoint recovery must not create a continuation attempt"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            f.api.stop_backend_job_recovery(),
+        )
+        .await
+        .expect("frozen-generation recovery did not finish");
     }
 
     #[tokio::test]
@@ -5640,8 +6061,8 @@ mod journal_migration {
     use subjektiv::journal::recording::JournalInput;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn reserved_legacy_descriptor_invalidates_exact_identity_and_migrates_only_after_saved_checkpoint()
-     {
+    async fn reserved_legacy_descriptor_fails_without_reselection_and_preserves_partial_checkpoint()
+    {
         let f = SubjectRemovalFixture::new().await;
         let capture = subjektiv_journal::capture_input(&f.api, &f.attr, 0, 0, 48 * 1024).unwrap();
         let ranges = subjektiv::journal::recording::capture_ranges(&capture).unwrap();
@@ -5693,7 +6114,7 @@ mod journal_migration {
                 &ctx,
                 JournalOperation {
                     request_id: "legacy-saved-record".into(),
-                    expected_state: generation.initial_journal.state_token,
+                    expected_state: generation.initial_journal.state_token.clone(),
                     action: JournalAction::Create {
                         title: "Saved before migration".into(),
                         body: "First original reflected; second still pending".into(),
@@ -5726,7 +6147,7 @@ mod journal_migration {
                 &ctx,
                 JournalOperation {
                     request_id: "legacy-saved-checkpoint".into(),
-                    expected_state: position.state_token,
+                    expected_state: position.state_token.clone(),
                     action: JournalAction::Checkpoint {
                         record_operation_ids: vec!["legacy-saved-record".into()],
                     },
@@ -5737,19 +6158,56 @@ mod journal_migration {
         f.store
             .close_journal_generation(&f.host, &generation.id, &binding)
             .unwrap();
-        assert_eq!(f.store.read_journal(&f.host, &id).unwrap().process_order, 1);
+        let before = f.store.read_journal(&f.host, &id).unwrap();
+        assert_eq!(before.process_order, 1);
+        assert_eq!(before.process_byte, 0);
+        let sources = f
+            .store
+            .list_journal_sources(&f.host, &id, None, 32)
+            .unwrap();
+        let entries = f
+            .store
+            .list_journal_entries(&f.host, &id, None, 16)
+            .unwrap();
+        assert_eq!(entries.items.len(), 1);
+        assert!(f.store.journal_retention_required(&f.host).unwrap());
+        let registry = f
+            .api
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+            .unwrap();
+        // This is the descriptor-only admission rejection boundary, NOT schema
+        // migration. Make the live source unavailable so dispatch/recovery cannot
+        // silently materialize a new body-bearing Job from the original Session.
+        let root = session_root(f.dir.path(), &f.target);
+        let unavailable = f.dir.path().join("legacy-source-unavailable");
+        std::fs::rename(&root, &unavailable).unwrap();
+        assert!(subjektiv_journal::capture_input(&f.api, &f.attr, 0, 0, 48 * 1024).is_err());
+        f.execution.take_inputs();
+        let original = reserved.clone();
         let api = f.api.clone();
-        let migrated = joined(spawn(move || {
+        let rejected = joined(spawn(move || {
             api.dispatch_backend_job_reservation(reserved)
         }))
         .unwrap();
-        assert_eq!(migrated.job.request.job_id, legacy.job_id);
         let old = f
             .api
             .store
             .get_backend_job(TEST_WORKSPACE_ID, &legacy.job_id)
             .unwrap()
             .unwrap();
+        let old_attempt = f
+            .api
+            .store
+            .get_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &legacy.job_id,
+                &original.attempt.attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.job, old);
+        assert_eq!(rejected.attempt, old_attempt);
         assert_eq!(old.state, BackendJobState::Failed);
         assert_eq!(
             old.failure_category.as_deref(),
@@ -5757,122 +6215,146 @@ mod journal_migration {
         );
         assert_eq!(
             old.input_disposition,
-            crate::backend_job::JobInputDisposition::Invalidated
+            crate::backend_job::JobInputDisposition::Available
         );
+        assert_eq!(old.request, legacy);
+        assert_eq!(old.load_executable_request().unwrap(), &legacy);
         assert_eq!(old.input_digest, digest);
         assert_eq!(old.intent_fingerprint, fingerprint);
-        assert_eq!(old.request.job_id, legacy.job_id);
-        assert!(old.request.input.is_null());
-        assert!(old.load_executable_request().is_err());
         assert_eq!(old.current_attempt, 1);
-        let old_attempt = f
-            .api
-            .store
-            .get_backend_job_attempt(
-                TEST_WORKSPACE_ID,
-                &legacy.job_id,
-                &crate::backend_job::attempt_id(&legacy.job_id, 1),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(old_attempt.input_digest, digest);
+        assert!(old.result.is_none());
         assert!(
-            old_attempt.worker.is_none(),
-            "descriptor-only input must never reach a Worker"
+            !f.api
+                .store
+                .backend_job_was_migrated(TEST_WORKSPACE_ID, &legacy.job_id)
+                .unwrap(),
+            "descriptor rejection must not impersonate schema migration"
         );
+        assert_eq!(old_attempt.state, BackendJobAttemptState::Failed);
+        assert_eq!(old_attempt.attempt_id, original.attempt.attempt_id);
+        assert_eq!(old_attempt.attempt, 1);
+        assert_eq!(old_attempt.input_digest, digest);
+        assert_eq!(old_attempt.failure_category, old.failure_category);
+        assert_eq!(old_attempt.failure_detail, old.failure_detail);
+        assert!(old_attempt.worker.is_none());
+        assert!(old_attempt.runtime_run_id.is_none());
+        assert!(old_attempt.result.is_none());
 
-        let (new, attempt) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            loop {
-                for job in f
-                    .api
-                    .store
-                    .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
-                    .unwrap()
-                {
-                    if job.request.job_id == legacy.job_id {
-                        continue;
-                    }
-                    let attempt = f
-                        .api
-                        .store
-                        .get_backend_job_attempt(
-                            TEST_WORKSPACE_ID,
-                            &job.request.job_id,
-                            &crate::backend_job::attempt_id(
-                                &job.request.job_id,
-                                job.current_attempt,
-                            ),
-                        )
-                        .unwrap()
-                        .unwrap();
-                    if attempt.state == BackendJobAttemptState::Dispatched {
-                        return (job, attempt);
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("migration dispatch progresses without a lifecycle gate inversion");
-        assert_ne!(new.request.job_id, legacy.job_id);
-        let frozen = JournalInput::decode(&new.request.input).unwrap();
-        assert_eq!(frozen.selected_ranges, vec![ranges[1].clone()]);
-        assert_eq!(frozen.initial_state_token, checkpoint.state_token);
+        subjektiv_journal::reconcile_attempt(&f.api, &old, &old_attempt).unwrap();
+        subjektiv_journal::recover_attempts(&f.api).unwrap();
+        f.api.recover_backend_jobs().unwrap();
+        let api = f.api.clone();
+        let replay = joined(spawn(move || {
+            api.dispatch_backend_job_reservation(original)
+        }))
+        .unwrap();
+        assert!(
+            replay.replayed,
+            "terminal rejection is observation, not execution"
+        );
+        assert_eq!(replay.job, old);
+        assert_eq!(replay.attempt, old_attempt);
         assert_eq!(
-            f.store
-                .query_journal_operation(&f.host, &id, "legacy-saved-record")
+            f.api
+                .store
+                .get_backend_job(TEST_WORKSPACE_ID, &legacy.job_id)
                 .unwrap(),
-            Some(record)
+            Some(old.clone())
         );
         assert_eq!(
-            f.store
-                .query_journal_operation(&f.host, &id, "legacy-saved-checkpoint")
+            f.api
+                .store
+                .get_backend_job_attempt(TEST_WORKSPACE_ID, &legacy.job_id, &old_attempt.attempt_id)
                 .unwrap(),
-            Some(checkpoint)
+            Some(old_attempt)
+        );
+        assert_eq!(
+            f.api
+                .store
+                .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
+                .unwrap(),
+            vec![old],
+            "descriptor failure must not automatically select a new Job"
+        );
+        assert!(
+            f.api
+                .store
+                .get_backend_job_attempt(
+                    TEST_WORKSPACE_ID,
+                    &legacy.job_id,
+                    &crate::backend_job::attempt_id(&legacy.job_id, 2),
+                )
+                .unwrap()
+                .is_none(),
+            "no automatic continuation attempt"
+        );
+        assert!(
+            f.execution.take_inputs().is_empty(),
+            "neither the old nor a new Job may submit"
+        );
+        assert!(
+            !root.exists(),
+            "dispatch must not recreate the unavailable source"
+        );
+        assert_eq!(f.store.read_journal(&f.host, &id).unwrap(), before);
+        assert_eq!(
+            f.store
+                .list_journal_sources(&f.host, &id, None, 32)
+                .unwrap(),
+            sources
         );
         assert_eq!(
             f.store
                 .list_journal_entries(&f.host, &id, None, 16)
+                .unwrap(),
+            entries
+        );
+        for (request_id, receipt) in [
+            ("legacy-saved-record", record),
+            ("legacy-saved-position", position),
+            ("legacy-saved-checkpoint", checkpoint),
+        ] {
+            assert_eq!(
+                f.store
+                    .query_journal_operation(&f.host, &id, request_id)
+                    .unwrap(),
+                Some(receipt)
+            );
+        }
+        assert_eq!(
+            f.store
+                .retained_journal_generation(&f.host, &id, &binding)
+                .unwrap(),
+            Some(generation)
+        );
+        assert!(
+            f.store
+                .active_journal_generation(&f.host, &id)
                 .unwrap()
-                .items
-                .len(),
-            1
+                .is_none()
         );
-        let api = f.api.clone();
-        let worker = attempt.worker.clone().unwrap();
         assert!(
-            joined(spawn(move || subjektiv_journal::execute(
-                &api,
-                &worker,
-                JournalJobRequest::ReadState
-            )))
-            .is_ok()
+            f.store.journal_retention_required(&f.host).unwrap(),
+            "Failed is not reflection of the second original"
         );
-        let api = f.api.clone();
-        let stale = migrated.clone();
+        assert_eq!(
+            f.api
+                .store
+                .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+                .unwrap(),
+            registry
+        );
+        assert!(!f.store.journal_session_erased(&f.host).unwrap());
         assert!(
-            joined(spawn(move || api.dispatch_backend_job_reservation(stale))).is_err(),
-            "invalidated internal reservations cannot dispatch or silently replay"
+            !f.store
+                .journal_worker_was_released(
+                    &f.attr.subject_id,
+                    &f.target.runtime_id,
+                    &f.target.worker_id,
+                )
+                .unwrap()
         );
-        // Stop this intentionally unfinished new body Job without pretending its
-        // remaining original was reflected; normal cleanup still needs its receipt.
-        f.api
-            .finish_backend_job_attempt(
-                &new.request.job_id,
-                &attempt.attempt_id,
-                BackendJobAttemptState::Failed,
-                "test_finished",
-                "remaining original deliberately unprocessed",
-            )
-            .unwrap();
-        wait_for_backend_job_worker_cleanup(
-            &f.api,
-            &new.request.job_id,
-            &attempt.attempt_id,
-            BackendJobWorkerCleanupState::Completed,
-        )
-        .await;
-        assert_eq!(f.store.read_journal(&f.host, &id).unwrap().process_order, 1);
+        std::fs::rename(&unavailable, &root).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

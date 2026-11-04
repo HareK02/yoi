@@ -301,6 +301,10 @@ fn validate_fence(
         || ended.execution_id.is_nil()
         || ended.shutdown_command_id.is_none()
         || ended.worker_ref.worker_id.to_string() != owner.worker.worker_id
+        || !ended
+            .submissions
+            .iter()
+            .any(|submission| submission.submission_request_id == owner.runtime_run_id)
     {
         return Err(Error::InvalidInput("Controller/Feature/background and Host drain must confirm the exact owner independently".into()));
     }
@@ -1070,7 +1074,11 @@ mod tests {
             "scope":"controller", "worker_ref":{"worker_id":owner.worker.as_ref().unwrap().worker_id},
             "stop_operation_id":"019a4ea8-0000-7000-8000-000000000001",
             "execution_id":"019a4ea8-0000-7000-8000-000000000002",
-            "shutdown_command_id":1,"submissions":[],"feature_failures":[]
+            "shutdown_command_id":1,"submissions":[{
+                "submission_request_id":owner.runtime_run_id,
+                "submission_id":"accepted-submission",
+                "disposition":"started"
+            }],"feature_failures":[]
         });
         (
             controller.to_string(),
@@ -1101,6 +1109,31 @@ mod tests {
         assert!(
             store
                 .record_backend_job_execution_fence("workspace", &owner, &controller, &wrong, NOW)
+                .is_err()
+        );
+        let mut wrong_run: serde_json::Value = serde_json::from_str(&controller).unwrap();
+        wrong_run["submissions"][0]["submission_request_id"] = "successor-run".into();
+        assert!(
+            store
+                .record_backend_job_execution_fence(
+                    "workspace",
+                    &owner,
+                    &wrong_run.to_string(),
+                    &host,
+                    NOW
+                )
+                .is_err()
+        );
+        wrong_run["submissions"] = serde_json::json!([]);
+        assert!(
+            store
+                .record_backend_job_execution_fence(
+                    "workspace",
+                    &owner,
+                    &wrong_run.to_string(),
+                    &host,
+                    NOW
+                )
                 .is_err()
         );
         let bad = controller.replace("controller", "unpublished_startup_candidate");

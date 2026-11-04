@@ -476,6 +476,14 @@ async fn subjektiv_job_surface_only_requires_attempt_owned_generation_and_real_o
     );
     let job = resource(&api, &subject.id);
     let attempt = current_attempt(&api, &job);
+    // This test exercises live-grant operations before result reconciliation.
+    // The owner may otherwise complete the ready domain surface during an await.
+    let recovery_gate = api.backend_job_recovery.dispatch_gate(&attempt.attempt_id);
+    let recovery_guard = recovery_gate.lock().unwrap();
+    assert_eq!(
+        current_attempt(&api, &job).state,
+        BackendJobAttemptState::Dispatched
+    );
     let worker = attempt.worker.as_ref().unwrap();
     assert!(
         store
@@ -541,6 +549,7 @@ async fn subjektiv_job_surface_only_requires_attempt_owned_generation_and_real_o
         result: serde_json::json!({"subject_id":subject.id,"candidate_ids":[],"surface":{"availability":"ready","generation_id":generation.id,"memory_fingerprint":generation.memory_fingerprint,"snapshot_id":snapshot.id}}),
     };
     api.accept_backend_job_result(worker, &submission).unwrap();
+    drop(recovery_guard);
     wait_for_backend_job_worker_cleanup(
         &api,
         &job.request.job_id,

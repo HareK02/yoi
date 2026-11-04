@@ -1616,6 +1616,14 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         now_seconds: u64,
         consumed_at: &str,
     ) -> Result<bool>;
+    fn plan_job_cleanup_worker_removal(
+        &self,
+        request: &crate::retention::WorkerRemovalPlanRequest,
+        inventory: &worker_runtime::retention::WorkerRetentionInventory,
+    ) -> std::result::Result<
+        crate::retention::WorkerRemovalPlan,
+        crate::retention::WorkerRetentionError,
+    >;
     fn plan_worker_removal(
         &self,
         request: &crate::retention::WorkerRemovalPlanRequest,
@@ -6413,6 +6421,17 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 })
             })
             .await
+    }
+
+    fn plan_job_cleanup_worker_removal(
+        &self,
+        request: &crate::retention::WorkerRemovalPlanRequest,
+        inventory: &worker_runtime::retention::WorkerRetentionInventory,
+    ) -> std::result::Result<
+        crate::retention::WorkerRemovalPlan,
+        crate::retention::WorkerRetentionError,
+    > {
+        SqliteWorkspaceStore::plan_job_cleanup_worker_removal(self, request, inventory)
     }
 
     fn plan_worker_removal(

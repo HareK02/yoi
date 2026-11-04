@@ -2664,7 +2664,7 @@ impl WorkerRemovalService {
         target: &RuntimeWorkerRef,
         reason: &str,
         parent_workspace_deletion_operation_id: Option<&str>,
-        expected_removal: Option<(&str, &str)>,
+        job_cleanup_owner: Option<&Mutex<Option<(String, String)>>>,
     ) -> std::result::Result<worker::WorkspaceResponse, String> {
         let remove_lock = {
             let mut locks = self
@@ -2693,6 +2693,15 @@ impl WorkerRemovalService {
             .store
             .recover_worker_removal_execution(&self.workspace_id, &target)
             .map_err(|_| "Worker removal recovery authority is unavailable".to_string())?;
+        let expected_removal = job_cleanup_owner
+            .map(|owner| {
+                owner
+                    .lock()
+                    .map(|saved| saved.clone())
+                    .map_err(|_| "Job cleanup child owner poisoned".to_string())
+            })
+            .transpose()?
+            .flatten();
         if let Some((operation_id, fingerprint)) = expected_removal {
             if !prepared.as_ref().is_some_and(|saved| {
                 saved.plan.workspace_id == self.workspace_id
@@ -2708,6 +2717,28 @@ impl WorkerRemovalService {
             }
         }
         if let Some(prepared) = prepared {
+            if let Some(owner) = job_cleanup_owner {
+                if prepared.plan.workspace_id != self.workspace_id
+                    || prepared.plan.worker != *target
+                    || prepared.plan.operation_id.is_empty()
+                    || prepared.plan.input_fingerprint.is_empty()
+                    || prepared.runtime_request.workspace_id != self.workspace_id
+                    || prepared.runtime_request.source_runtime_id != target.runtime_id
+                    || prepared.runtime_request.worker_id.to_string() != target.worker_id
+                    || prepared.runtime_request.operation_id != prepared.plan.operation_id
+                    || prepared.runtime_request.input_fingerprint != prepared.plan.input_fingerprint
+                {
+                    return Err("Job cleanup canonical removal binding mismatch".into());
+                }
+                // Retain the first observed canonical child before any external
+                // effect or retry, including children created by this live owner.
+                *owner
+                    .lock()
+                    .map_err(|_| "Job cleanup child owner poisoned".to_string())? = Some((
+                    prepared.plan.operation_id.clone(),
+                    prepared.plan.input_fingerprint.clone(),
+                ));
+            }
             if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Succeeded {
                 self.worker_projection
                     .publish_ordered(|| {
@@ -2835,10 +2866,21 @@ impl WorkerRemovalService {
             reason: reason.to_string(),
             journal_erasure,
         };
-        let plan = match self.store.plan_worker_removal(&request, &inventory) {
+        let plan = match if job_cleanup_owner.is_some() {
+            self.store
+                .plan_job_cleanup_worker_removal(&request, &inventory)
+        } else {
+            self.store.plan_worker_removal(&request, &inventory)
+        } {
             Ok(plan) => plan,
             Err(error) => return Ok(worker_retention_error_response(error)),
         };
+        if let Some(owner) = job_cleanup_owner {
+            *owner
+                .lock()
+                .map_err(|_| "Job cleanup child owner poisoned".to_string())? =
+                Some((plan.operation_id.clone(), plan.input_fingerprint.clone()));
+        }
         let prepared = match self.store.prepare_worker_removal_execution(
             &self.workspace_id,
             &plan.plan_id,
@@ -5129,6 +5171,7 @@ impl WorkspaceApi {
                 worker: worker.worker.clone(),
                 runtime_run_id: runtime_run_id.clone(),
             },
+            &self.config.database_path,
         )?;
         let newly_bound = self.worker_projection.publish_ordered(|| {
             self.store
@@ -5414,7 +5457,8 @@ impl WorkspaceApi {
     async fn cleanup_backend_job_attempt_worker(
         &self,
         attempt: BackendJobAttemptRecord,
-        retained_removal: Option<(String, String)>,
+        removal_owner: &Mutex<Option<(String, String)>>,
+        drain: &crate::backend_job_host_effects::JobHostDrain,
     ) -> Result<()> {
         let history = self
             .store
@@ -5507,7 +5551,7 @@ impl WorkspaceApi {
                 }
                 Err(error) => return fail("backend_job_cleanup_stop_unconfirmed", error.message()),
             }
-            if let Err(error) = self.fence_backend_job_effects(&attempt).await {
+            if let Err(error) = self.fence_backend_job_effects(&attempt, drain).await {
                 return fail("backend_job_cleanup_effects_unconfirmed", error.to_string());
             }
         }
@@ -5518,9 +5562,7 @@ impl WorkspaceApi {
                 &worker,
                 &format!("Terminal Backend Job attempt {attempt_id}"),
                 None,
-                retained_removal
-                    .as_ref()
-                    .map(|(id, fingerprint)| (id.as_str(), fingerprint.as_str())),
+                Some(removal_owner),
             )
             .await
             .map_err(|message| Error::RuntimeOperationFailed {
