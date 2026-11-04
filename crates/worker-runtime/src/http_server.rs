@@ -542,6 +542,8 @@ pub struct RuntimeHttpErrorResponse {
 pub struct RuntimeHttpErrorDetail {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<runtime_api::WorkerStartupFailure>,
 }
 
 #[cfg(feature = "ws-server")]
@@ -2325,6 +2327,7 @@ struct RuntimeHttpRestError {
     status: StatusCode,
     code: String,
     message: String,
+    startup: Option<runtime_api::WorkerStartupFailure>,
 }
 
 impl RuntimeHttpRestError {
@@ -2333,13 +2336,28 @@ impl RuntimeHttpRestError {
             status,
             code: code.into(),
             message: message.into(),
+            startup: None,
         }
     }
 
     fn runtime(error: RuntimeError) -> Self {
         let status = status_for_runtime_error(&error);
         let code = code_for_runtime_error(&error);
-        Self::new(status, code, error.to_string())
+        let startup = match &error {
+            RuntimeError::WorkerExecutionRejected { result, .. } => startup_transfer(result),
+            _ => None,
+        };
+        let message = if startup.is_some() {
+            "Worker startup failed".to_owned()
+        } else {
+            error.to_string()
+        };
+        Self {
+            status,
+            code,
+            message,
+            startup,
+        }
     }
 
     fn working_directory_join(_error: tokio::task::JoinError) -> Self {
@@ -2375,10 +2393,29 @@ impl IntoResponse for RuntimeHttpRestError {
             error: RuntimeHttpErrorDetail {
                 code: self.code,
                 message: self.message,
+                startup: self.startup,
             },
         };
         (self.status, Json(body)).into_response()
     }
+}
+
+/// Explicit transfer mapping, not another execution/lifecycle result. HTTP request
+/// authentication has already established this internal Runtime caller's scope.
+fn startup_transfer(
+    result: &crate::execution::WorkerExecutionResult,
+) -> Option<runtime_api::WorkerStartupFailure> {
+    let primary = worker::startup_failure::reproject_internal_startup_failure(
+        result.startup_failure.as_ref()?,
+    )
+    .ok()?;
+    Some(runtime_api::WorkerStartupFailure {
+        primary,
+        secondary: result.secondary_failures.clone(),
+        resources: result.startup_resources,
+        persistence: result.startup_failure_persistence,
+        io_kind: result.startup_io_kind,
+    })
 }
 
 fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {

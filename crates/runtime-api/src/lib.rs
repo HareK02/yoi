@@ -105,10 +105,25 @@ pub struct RuntimeApiError {
     status: u16,
 }
 
+/// Transient, allowlisted startup observations copied from the execution owner.
+/// This is not an operation result, lifecycle record, or permission to retry.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerStartupFailure {
+    pub primary: StartupFailureAttachment,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secondary: Vec<StartupSecondaryFailure>,
+    pub resources: Option<StartupResourceFacts>,
+    pub persistence: Option<StartupPersistenceOutcome>,
+    pub io_kind: Option<StartupIoKind>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeApiErrorDetail {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<WorkerStartupFailure>,
 }
 
 impl RuntimeApiError {
@@ -117,6 +132,7 @@ impl RuntimeApiError {
             error: RuntimeApiErrorDetail {
                 code: code.into(),
                 message: message.into(),
+                startup: None,
             },
             status,
         }

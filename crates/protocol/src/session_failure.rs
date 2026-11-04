@@ -3,6 +3,48 @@
 //! Causes contain only fixed enum values. Stored or transferred attachments are
 //! observations, never permission to disclose: Browser/Tool projections require
 //! the caller's current visibility decision and fail closed without it.
+//!
+//! # Projection boundary
+//!
+//! The same closed cause is mapped explicitly into the shared error-contract codec.
+//! The transport boundary does not convert an internal Session denial into an HTTP
+//! verdict about a Browser operator. Public consumers must resolve current viewer
+//! authority before projecting; a saved attachment cannot carry that authority.
+//!
+//! | Contract fact | Internal transfer / storage | Authorized Browser / Tool |
+//! | --- | --- | --- |
+//! | Domain, reason, principal, required operation | Typed cause | Same cause, never inferred from prose |
+//! | Explanation | Fixed local template | Fixed local template, not received text |
+//! | Operation context | Allowlisted operation/stage pairs | Same allowlist, no operation references |
+//! | Subject, Session, Worker IDs; credentials; paths; raw HTTP body | Not representable in this cause | Not representable in this cause |
+//! | Resource ownership, persistence, secondary cleanup | Separate startup result facts | Not disclosure/retry authority |
+//!
+//! A denied current visibility decision fails projection instead of substituting
+//! an invented cause. Unknown codec versions and corrupt attachments stay distinct
+//! from known causes. Missing legacy attachments do not certify legacy diagnostics.
+//!
+//! # Failure investigation
+//!
+//! A known denial identifies the operation and principal class, not an instruction
+//! to grant rights. Check the current Subject execution policy and the authenticated
+//! Runtime/Worker binding at the Session-record authorization boundary. Compare
+//! existing Session attribution and saved Worker metadata before deciding whether
+//! any state repair is needed. Operator authority and Subject execution policy are
+//! different decisions; neither can be derived from an internal HTTP status alone.
+//!
+//! Transport and unknown outcomes do not establish non-execution. Reconcile the
+//! existing Session attribution, Worker aggregate and Runtime operation result;
+//! a lost response may coexist with a committed write. A conflict invalidates the
+//! old metadata expectation. Do not retry the startup, create another Worker, or
+//! enlarge permissions solely because a failure was displayed. Inspect primary,
+//! secondary, persistence and resource facts independently: rollback failure must
+//! not replace the refusal, and persistence uncertainty must not be called saved.
+//!
+//! The real authorization/factory fixture is owned by workspace-server's normal
+//! `session_registration_connected` tests. Its signed Session callback revokes the
+//! real policy at a synchronization point; a real retention pin forces independent
+//! cleanup failure. Leaf transport/projection tests do not substitute for that
+//! product connection, and the fixture claims neither a process crash nor restore.
 
 use error_contract::{
     Browser, Category, ContractError, Disclosure, FailureCause, FailureFacts, FailureIdentity,

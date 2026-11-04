@@ -106,6 +106,20 @@ pub fn runtime_startup_attachment(
     StartupFailureAttachment::from_projected(&projected)
 }
 
+/// The internal HTTP/Host transfer admits only implemented startup domains.
+/// Unknown/corrupt envelopes cannot be blindly forwarded or classified from text.
+pub fn reproject_internal_startup_failure(
+    failure: &StartupFailureAttachment,
+) -> Result<StartupFailureAttachment, error_contract::ContractError> {
+    if let Ok(projected) = failure
+        .project_for::<InternalTransfer, protocol::session_failure::SessionRegistrationCause>(&())
+    {
+        return StartupFailureAttachment::from_projected(&projected);
+    }
+    let projected = failure.project_for::<InternalTransfer, RuntimeStartupCause>(&())?;
+    StartupFailureAttachment::from_projected(&projected)
+}
+
 /// Dispatch by the domain attested in process, not by parsing attachment fields.
 pub(crate) fn persist_binding_startup_failure<S: session_store::WorkerMetadataStore>(
     store: &S,

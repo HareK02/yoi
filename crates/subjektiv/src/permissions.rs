@@ -12,6 +12,12 @@ use server_api::authorization::{
 };
 use sha2::{Digest, Sha256};
 
+pub(crate) mod transfer;
+pub use transfer::{
+    CanonicalPermissionSource, DatabaseIdentity, PermissionAuthorityGuard, PermissionSourceExport,
+    PermissionTransferReceipt, PermissionTransferSnapshot,
+};
+
 pub const MAX_SUBJECT_WORKER_EXECUTION_GRANTS: usize = 1_000;
 
 pub(super) fn migrate(tx: &Transaction<'_>) -> feature_storage::Result<()> {
@@ -23,9 +29,9 @@ impl SubjektivStore {
     /// Unset sources are `None` (deny), including migrated Subjects. This is an admin read,
     /// not an effective-authorization decision; retired Subjects retain their source evidence.
     pub fn subject_permissions(&self, subject_id: &str) -> Result<Option<SubjectPermissions>> {
-        self.database.try_with_connection(|connection| {
+        self.database.try_transaction(|connection| {
             require_subject_in_connection(connection, subject_id)?;
-            source_in_connection(connection, subject_id)
+            self.current_permission_source(connection, subject_id)
         })
     }
 
@@ -43,7 +49,8 @@ impl SubjektivStore {
     /// Management replacement rejects new unsupported operation/resource pairs while
     /// retaining exact legacy entries in their original execution/delegation lane.
     /// Validation shares the existing CAS/receipt transaction so a stale editor cannot
-    /// retain a removed legacy grant. Exact replay remains historical evidence.
+    /// retain a removed legacy grant. Before sealing, exact replay remains historical evidence;
+    /// once sealed, replacements reject even an otherwise exact historical receipt replay.
     pub fn set_managed_subject_permissions(
         &self,
         subject_id: &str,
@@ -71,6 +78,7 @@ impl SubjektivStore {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         self.database.try_transaction(|tx| {
+            transfer::require_unsealed(tx)?;
             require_subject(tx, subject_id)?;
             let receipt: Option<(String, String)> = tx.query_row(
                 "SELECT request_fingerprint, change_id FROM subject_permission_receipts WHERE operation_id=?1",
@@ -129,7 +137,7 @@ impl SubjektivStore {
                 };
             }
             require_active_subject(tx, &grant.subject_id)?;
-            let source = source_in_connection(tx, &grant.subject_id)?
+            let source = self.current_permission_source(tx, &grant.subject_id)?
                 .ok_or_else(|| denied("Subject permissions are unset"))?;
             if source.change_id != grant.source_change_id {
                 return Err(denied("Subject permission source is no longer current"));
@@ -148,7 +156,12 @@ impl SubjektivStore {
                 require_covered(&origin.redelegation, &grant.permissions)?;
                 require_covered(&origin.redelegation, &grant.redelegation)?;
             }
-            tx.execute("INSERT INTO worker_execution_grants(runtime_id,worker_id,subject_id,source_change_id,record_json) VALUES(?1,?2,?3,?4,?5)",
+            let table = if transfer::is_sealed(tx)? {
+                // Canonical IDs must not be mirrored into legacy source history to satisfy its FK.
+                crate::storage_formats::install_permission_transfer(tx)?;
+                "canonical_worker_execution_grants"
+            } else { "worker_execution_grants" };
+            tx.execute(&format!("INSERT INTO {table}(runtime_id,worker_id,subject_id,source_change_id,record_json) VALUES(?1,?2,?3,?4,?5)"),
                 params![grant.runtime_id, grant.worker_id, grant.subject_id, grant.source_change_id, serde_json::to_string(grant)?])?;
             Ok(())
         })
@@ -164,9 +177,12 @@ impl SubjektivStore {
         validate_authorization_identifier(subject_id).map_err(SubjektivError::InvalidRecord)?;
         self.database.try_with_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
-            let mut statement = connection.prepare(
-                "SELECT record_json FROM worker_execution_grants WHERE subject_id=?1 ORDER BY runtime_id,worker_id LIMIT ?2",
-            )?;
+            let sql = if transfer::has_table(connection, "canonical_worker_execution_grants")? {
+                "SELECT record_json FROM (SELECT runtime_id,worker_id,subject_id,record_json FROM worker_execution_grants UNION ALL SELECT runtime_id,worker_id,subject_id,record_json FROM canonical_worker_execution_grants) WHERE subject_id=?1 ORDER BY runtime_id,worker_id LIMIT ?2"
+            } else {
+                "SELECT record_json FROM worker_execution_grants WHERE subject_id=?1 ORDER BY runtime_id,worker_id LIMIT ?2"
+            };
+            let mut statement = connection.prepare(sql)?;
             let mut rows = statement.query(params![subject_id, MAX_SUBJECT_WORKER_EXECUTION_GRANTS + 1])?;
             let mut grants = Vec::new();
             while let Some(row) = rows.next()? {
@@ -216,12 +232,13 @@ fn grant_in_connection(
     // Absence must never become non-Subject fallback authority after purge.
     deletion::require_live_worker(connection, runtime, worker)?;
 
+    let sql = if transfer::has_table(connection, "canonical_worker_execution_grants")? {
+        "SELECT record_json FROM (SELECT runtime_id,worker_id,subject_id,record_json FROM worker_execution_grants UNION ALL SELECT runtime_id,worker_id,subject_id,record_json FROM canonical_worker_execution_grants) g WHERE runtime_id=?1 AND worker_id=?2 AND NOT EXISTS(SELECT 1 FROM subject_deletions d WHERE d.subject_id=g.subject_id)"
+    } else {
+        "SELECT record_json FROM worker_execution_grants WHERE runtime_id=?1 AND worker_id=?2 AND NOT EXISTS(SELECT 1 FROM subject_deletions d WHERE d.subject_id=worker_execution_grants.subject_id)"
+    };
     let raw: Option<String> = connection
-        .query_row(
-            "SELECT record_json FROM worker_execution_grants WHERE runtime_id=?1 AND worker_id=?2 AND NOT EXISTS(SELECT 1 FROM subject_deletions d WHERE d.subject_id=worker_execution_grants.subject_id)",
-            params![runtime, worker],
-            |row| row.get(0),
-        )
+        .query_row(sql, params![runtime, worker], |row| row.get(0))
         .optional()?;
     raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
         .transpose()

@@ -898,6 +898,10 @@ pub(crate) fn test_subject_authorization_response(
 }
 
 #[cfg(test)]
+#[path = "subjektiv_session_registration_tests.rs"]
+mod session_registration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{

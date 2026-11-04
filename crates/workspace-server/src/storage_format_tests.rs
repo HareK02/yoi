@@ -110,8 +110,13 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
     verify_history(conn, current).unwrap();
     if current >= 114 {
         let plan = published_plan(conn, current).unwrap().unwrap();
-        assert!(plan.migrations.is_empty());
-        assert_eq!(plan.target_schema_version, current);
+        assert_eq!(plan.migrations.len(), 1);
+        assert_eq!(plan.migrations[0].version, 122);
+        assert_eq!(
+            plan.migrations[0].name,
+            crate::config_adoption::MIGRATION_NAME
+        );
+        assert_eq!(plan.target_schema_version, 122);
     }
     assert_eq!(rows, saved_rows(conn));
     assert_eq!(shape, snapshot(conn).unwrap());
@@ -195,11 +200,30 @@ fn published_database_runs_normal_store_preparation_and_reopens_without_downgrad
             let conn = Connection::open(&path).unwrap();
             // Production store owner, not a separate test migration implementation.
             super::super::prepare_connection(&conn).unwrap();
+            assert_eq!(super::super::current_schema_version(&conn).unwrap(), 122);
+            for (table, rows) in &expected {
+                if table != "__yoi_schema_migrations" {
+                    assert_eq!(
+                        saved_rows(&conn)
+                            .into_iter()
+                            .find(|(name, _)| name == table)
+                            .unwrap()
+                            .1,
+                        *rows,
+                        "{table}, from {current}"
+                    );
+                }
+            }
+            let mut history = super::super::workspace_schema_migration_history(&conn).unwrap();
             assert_eq!(
-                super::super::current_schema_version(&conn).unwrap(),
-                current
+                history.pop(),
+                Some((122, crate::config_adoption::MIGRATION_NAME.into()))
             );
-            assert_eq!(saved_rows(&conn), expected);
+            assert_eq!(
+                history,
+                super::super::workspace_schema_migration_history(&source).unwrap()
+            );
+            verify_history(&conn, 122).unwrap();
         }
     }
 }
@@ -290,7 +314,7 @@ fn oldest_data_bearing_schema_and_both_real_103_histories_migrate_without_relabe
         let (_temp, conn) = retained_to(103, alternate);
         let original = super::super::workspace_schema_migration_history(&conn).unwrap();
         super::super::prepare_connection(&conn).unwrap();
-        verify_history(&conn, 113).unwrap();
+        verify_history(&conn, super::super::LATEST_SCHEMA_VERSION).unwrap();
         let updated = super::super::workspace_schema_migration_history(&conn).unwrap();
         assert_eq!(&updated[..original.len()], &original);
         let name: String = conn

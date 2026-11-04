@@ -6,5 +6,6 @@ HTTP contract shared by Workspace Server and Rust clients. Owns public DTOs, API
 
 - [`ServerApi`] — HTTP operations and transport metadata
 - [`ServerRequestContext`] — Request context passed to Server authentication adapters
+- [`configuration_adoption`] — Owner-only source preview, adoption and exact-request reconciliation
 - [`RequestActor`] — Human identity and authentication method
 - [`WorkerRestoreRequest`] / [`WorkerRestoreResult`] — Observation-based Restore intent and result

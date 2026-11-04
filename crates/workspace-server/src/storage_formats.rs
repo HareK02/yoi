@@ -71,6 +71,31 @@ fn invalid(message: impl std::fmt::Display) -> Error {
 /// Every other row, gap, mixed family, unknown suffix and missing object fails.
 pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
     let rows = super::workspace_schema_migration_history(conn)?;
+    verify_history_records(conn, current, &rows)
+}
+
+fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Result<()> {
+    if current == 122 {
+        verify_configuration_shape(conn)?;
+        if rows == [(122, super::SCHEMA_BASELINE_NAME.to_owned())] {
+            require_shape(conn, Stage::Base)?;
+            return verify_103_features(conn, current, rows);
+        }
+        if rows.last().map(|(version, name)| (*version, name.as_str()))
+            != Some((122, crate::config_adoption::MIGRATION_NAME))
+        {
+            return Err(invalid("unrecognized configuration adoption receipt"));
+        }
+        let prefix = &rows[..rows.len() - 1];
+        let prior = prefix
+            .last()
+            .map(|row| row.0)
+            .ok_or_else(|| invalid("missing configuration predecessor"))?;
+        if !(113..=121).contains(&prior) {
+            return Err(invalid("invalid configuration predecessor"));
+        }
+        return verify_history_records(conn, prior, prefix);
+    }
     let Some((baseline, name)) = rows.first() else {
         return Err(invalid("missing migration receipts"));
     };
@@ -191,9 +216,32 @@ pub(super) fn published_plan(
     verify_history(conn, current)?;
     Ok(Some(super::WorkspaceSchemaMigrationPlan {
         current_schema_version: current,
-        target_schema_version: current,
-        migrations: vec![],
+        target_schema_version: 122,
+        migrations: if current < 122 {
+            vec![super::WorkspaceSchemaMigrationStep {
+                version: 122,
+                name: crate::config_adoption::MIGRATION_NAME.to_owned(),
+            }]
+        } else {
+            vec![]
+        },
     }))
+}
+
+fn verify_configuration_shape(conn: &Connection) -> Result<()> {
+    let expected_db = Connection::open_in_memory()?;
+    expected_db.execute_batch(content_history_store::SCHEMA)?;
+    expected_db.execute_batch(crate::config_adoption::SCHEMA)?;
+    let expected = snapshot(&expected_db)?;
+    let tables: BTreeSet<_> = expected.values().map(|object| object.1.clone()).collect();
+    let actual: Shape = snapshot(conn)?
+        .into_iter()
+        .filter(|(_, object)| tables.contains(&object.1))
+        .collect();
+    if actual != expected {
+        return Err(invalid("configuration adoption receipt/shape mismatch"));
+    }
+    Ok(())
 }
 
 // sqlite_schema programs, not table/column presence alone. SQL literal bytes,
@@ -233,7 +281,7 @@ fn reference_base() -> Result<Connection> {
     merge_request::migrate(&conn).map_err(invalid)?;
     conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")?;
     let tx = conn.unchecked_transaction()?;
-    super::create_latest_workspace_schema(&tx)?;
+    super::create_workspace_schema_through_v113(&tx)?;
     tx.commit()?;
     Ok(conn)
 }
