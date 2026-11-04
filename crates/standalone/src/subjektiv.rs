@@ -30,6 +30,7 @@ use std::sync::{
 
 use feature_storage::FeatureStorage;
 use fs4::fs_std::FileExt;
+use protocol::session_failure::{SessionPrincipal, SessionRegistrationCause};
 use serde::{Deserialize, Serialize};
 use server_api::*;
 use subjektiv::{SubjectRecord, SubjectRole, SubjectSessionAttribution, SubjektivStore};
@@ -418,6 +419,49 @@ impl LocalSubjectHost {
         }
         Ok(())
     }
+    fn registration_authority(
+        &self,
+        context: &SubjektivHostContext,
+    ) -> Result<(), SubjektivHostError> {
+        if !self.live.load(Ordering::Acquire) {
+            return Err(SubjektivHostError::SessionRegistration {
+                cause: SessionRegistrationCause::denied(SessionPrincipal::Subject),
+                source: None,
+            });
+        }
+        if !self
+            .catalog
+            .store
+            .journal_writer_active(&self.writer)
+            .map_err(|error| {
+                SubjektivHostError::session_registration(
+                    SessionRegistrationCause::outcome_unknown(),
+                    error,
+                )
+            })?
+        {
+            return Err(SubjektivHostError::SessionRegistration {
+                cause: SessionRegistrationCause::binding_mismatch(),
+                source: None,
+            });
+        }
+        if context.worker_id != self.worker_key && context.worker_id != self.worker_id.to_string() {
+            return Err(SubjektivHostError::SessionRegistration {
+                cause: SessionRegistrationCause::binding_mismatch(),
+                source: None,
+            });
+        }
+        context
+            .session_id
+            .parse::<session_store::SessionId>()
+            .map_err(|error| {
+                SubjektivHostError::session_registration(
+                    SessionRegistrationCause::invalid_response(),
+                    error,
+                )
+            })?;
+        Ok(())
+    }
     fn attribution(
         &self,
         context: &SubjektivHostContext,
@@ -427,15 +471,16 @@ impl LocalSubjectHost {
         let store = &self.catalog.store;
         if let Some(record) = store
             .session_attribution(&context.session_id)
-            .map_err(domain_error)?
+            .map_err(registration_domain_error)?
         {
             if record.subject_id != self.binding.subject_id
                 || record.runtime_id != self.binding.scope_id
                 || record.worker_id != self.worker_id.to_string()
             {
-                return Err(SubjektivHostError::InvalidArgument(
-                    "Session does not belong to this local Subject/Worker scope".into(),
-                ));
+                return Err(SubjektivHostError::SessionRegistration {
+                    cause: SessionRegistrationCause::binding_mismatch(),
+                    source: None,
+                });
             }
             store
                 .bind_journal_session(&self.writer, record.clone())
@@ -443,9 +488,10 @@ impl LocalSubjectHost {
             return Ok(record);
         }
         if !create {
-            return Err(SubjektivHostError::InvalidArgument(
-                "Session attribution is unavailable".into(),
-            ));
+            return Err(SubjektivHostError::SessionRegistration {
+                cause: SessionRegistrationCause::attribution_missing(),
+                source: None,
+            });
         }
         // The capability is bound before controller startup. The Worker supplies
         // the Session it owns; models cannot call this Host API or select one.
@@ -455,15 +501,26 @@ impl LocalSubjectHost {
             self.worker_id.to_string(),
             &context.session_id,
         )
-        .map_err(domain_error)?;
+        .map_err(registration_domain_error)?;
         let record = store
             .record_session_attribution(record)
-            .map_err(domain_error)?;
+            .map_err(registration_domain_error)?;
         store
             .bind_journal_session(&self.writer, record.clone())
             .map_err(journal::journal_error)?;
         Ok(record)
     }
+}
+
+fn registration_domain_error(error: subjektiv::SubjektivError) -> SubjektivHostError {
+    let cause = match &error {
+        subjektiv::SubjektivError::SessionSubjectConflict { .. }
+        | subjektiv::SubjektivError::SessionAttributionConflict { .. } => {
+            SessionRegistrationCause::binding_mismatch()
+        }
+        _ => SessionRegistrationCause::outcome_unknown(),
+    };
+    SubjektivHostError::session_registration(cause, error)
 }
 
 fn domain_error(error: subjektiv::SubjektivError) -> SubjektivHostError {
@@ -1036,6 +1093,7 @@ impl SubjektivHost for LocalSubjectHost {
         context: &SubjektivHostContext,
         create_if_missing: bool,
     ) -> Result<SubjektivRecordSessionResponse, SubjektivHostError> {
+        self.registration_authority(context)?;
         let attribution = self.attribution(context, create_if_missing)?;
         self.reserve_journal_session(context)?;
         Ok(SubjektivRecordSessionResponse {

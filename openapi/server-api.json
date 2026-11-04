@@ -11817,6 +11817,17 @@
           "error": {
             "type": "string"
           },
+          "failure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupFailureAttachment"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "An origin-projected error-contract attachment, not raw HTTP error text.\nReceiving it does not authorize redisclosure to a different audience."
+          },
           "message": {
             "type": "string"
           }
@@ -14798,6 +14809,10 @@
           "kind"
         ],
         "type": "object"
+      },
+      "StartupFailureAttachment": {
+        "description": "A bounded, projected envelope at the Worker/Runtime or metadata boundary.\nNo constructor accepts Display text, arbitrary JSON fields, or an unprojected error.",
+        "type": "string"
       },
       "SubjectBodyApiError": {
         "additionalProperties": false,
@@ -23348,7 +23363,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:28ee9c6c6e2a4eb71829386849b508fcee758fbd7ecdbc0cdcc72cd3b86be321"
+    "x-yoi-source-digest": "sha256:894ccff36a463bec91b635956924114aa0db87d8b3f815230d6e8395511d2f6e"
   },
   "openapi": "3.1.0",
   "paths": {

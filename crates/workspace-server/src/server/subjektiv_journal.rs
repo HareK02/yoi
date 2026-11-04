@@ -449,6 +449,13 @@ pub(super) fn bind_host_session(
     api: &WorkspaceApi,
     attr: crate::subjektiv::SubjectSessionAttribution,
 ) -> Result<()> {
+    bind_host_session_for_registration(api, attr).map_err(|failure| failure.error)
+}
+
+pub(super) fn bind_host_session_for_registration(
+    api: &WorkspaceApi,
+    attr: crate::subjektiv::SubjectSessionAttribution,
+) -> ApiResult<()> {
     let gate = lifecycle_lock(api, &attr.subject_id)?;
     let _guard = gate
         .lock()
@@ -465,16 +472,18 @@ pub(super) fn bind_host_session(
     {
         return Err(Error::RepositoryConflict(
             "Subject release intent fences Controller publication".into(),
-        ));
+        )
+        .into());
     }
     let store = store(api)?;
     if store
         .journal_worker_was_released(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
-        .map_err(domain)?
+        .map_err(session_registration::journal_error)?
     {
         return Err(Error::WorkspacePermissionDenied(
             "released body cannot reacquire Journal authority".into(),
-        ));
+        )
+        .into());
     }
     // A released Backend body is never rebound by a delayed create/restore callback. New
     // Backend bodies have new Worker IDs; their first callback has no historical generation.
@@ -484,7 +493,8 @@ pub(super) fn bind_host_session(
         .into_iter()
         .filter(|a| a.runtime_id == attr.runtime_id && a.worker_id == attr.worker_id)
     {
-        let host = JournalHostContext::validated_session(&store, prior).map_err(domain)?;
+        let host = JournalHostContext::validated_session(&store, prior)
+            .map_err(session_registration::journal_error)?;
         if let Some(id) = host.writer_binding_id() {
             let binding = JournalWriterBinding {
                 subject_id: attr.subject_id.clone(),
@@ -492,10 +502,14 @@ pub(super) fn bind_host_session(
                 worker_id: attr.worker_id.clone(),
                 binding_id: id.into(),
             };
-            if !store.journal_writer_active(&binding).map_err(domain)? {
+            if !store
+                .journal_writer_active(&binding)
+                .map_err(session_registration::journal_error)?
+            {
                 return Err(Error::WorkspacePermissionDenied(
                     "released body Session cannot reacquire Journal authority".into(),
-                ));
+                )
+                .into());
             }
         }
     }
@@ -503,11 +517,13 @@ pub(super) fn bind_host_session(
     // authenticated before a recovery intent must not leave a late attribution.
     let attr = store
         .record_session_attribution(attr)
-        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        .map_err(session_registration::domain_error)?;
     let writer = store
         .claim_journal_writer(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
-        .map_err(domain)?;
-    store.bind_journal_session(&writer, attr).map_err(domain)?;
+        .map_err(session_registration::journal_error)?;
+    store
+        .bind_journal_session(&writer, attr)
+        .map_err(session_registration::journal_error)?;
     Ok(())
 }
 

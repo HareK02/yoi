@@ -9,6 +9,8 @@ use super::*;
 mod chat_delegation_connected;
 #[path = "chat_tests.rs"]
 mod chat_tests;
+#[path = "session_registration_connected_tests.rs"]
+mod session_registration_connected;
 #[path = "subject_body_cleanup_connected_tests.rs"]
 mod subject_body_cleanup_connected;
 #[path = "subject_body_connected_tests.rs"]
@@ -2737,6 +2739,7 @@ pub(super) struct ConnectedWorkerHarness {
     materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
     authorizations: Arc<Mutex<Vec<(Value, StatusCode)>>>,
     runtime_errors: Arc<Mutex<Vec<String>>>,
+    runtime_startup_failures: Arc<Mutex<Vec<runtime_api::WorkerStartupFailure>>>,
     _backend_server: AuthorizationCallbackServer,
     _runtime_server: ConnectedRuntimeServer,
     _dir: tempfile::TempDir,
@@ -2942,6 +2945,8 @@ impl ConnectedWorkerHarness {
         .unwrap();
         let runtime_errors = Arc::new(Mutex::new(Vec::<String>::new()));
         let captured_errors = runtime_errors.clone();
+        let runtime_startup_failures = Arc::new(Mutex::new(Vec::new()));
+        let captured_startup_failures = runtime_startup_failures.clone();
         let runtime_server = ConnectedRuntimeServer::start(
             runtime_listener,
             worker_runtime::http_server::runtime_http_router_with_workspace_auth(
@@ -2955,6 +2960,7 @@ impl ConnectedWorkerHarness {
             .layer(axum::middleware::from_fn(
                 move |request: axum::extract::Request, next: axum::middleware::Next| {
                     let errors = captured_errors.clone();
+                    let startup_failures = captured_startup_failures.clone();
                     async move {
                         let response = next.run(request).await;
                         if !response.status().is_client_error()
@@ -2965,6 +2971,13 @@ impl ConnectedWorkerHarness {
                         let (parts, body) = response.into_parts();
                         let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
                         let body: Value = serde_json::from_slice(&bytes).unwrap();
+                        if let Some(startup) = body["error"].get("startup").filter(|v| !v.is_null())
+                        {
+                            startup_failures.lock().unwrap().push(
+                                serde_json::from_value(startup.clone())
+                                    .expect("RuntimeHTTP structured startup failure"),
+                            );
+                        }
                         errors.lock().unwrap().push(
                             body["error"]["message"]
                                 .as_str()
@@ -3045,6 +3058,7 @@ impl ConnectedWorkerHarness {
             materializer,
             authorizations,
             runtime_errors,
+            runtime_startup_failures,
             _backend_server: backend_server,
             _runtime_server: runtime_server,
             _dir: dir,

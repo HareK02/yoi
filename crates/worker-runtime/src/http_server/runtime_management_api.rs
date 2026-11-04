@@ -224,7 +224,10 @@ where
 }
 
 fn api_error(error: RuntimeHttpRestError) -> runtime_api::RuntimeApiError {
-    runtime_api::RuntimeApiError::new(error.status.as_u16(), error.code, error.message)
+    let mut response =
+        runtime_api::RuntimeApiError::new(error.status.as_u16(), error.code, error.message);
+    response.error.startup = error.startup;
+    response
 }
 
 impl runtime_api::RuntimeApi for RuntimeManagementApi {

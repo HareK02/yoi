@@ -83,7 +83,9 @@ impl JournalCompactionFailure {
             SubjektivHostError::PermissionDenied(_) => Self::SnapshotPermissionDenied,
             SubjektivHostError::Conflict { .. } => Self::SnapshotConflict,
             SubjektivHostError::InvalidArgument(_) => Self::SnapshotInvalidArgument,
-            SubjektivHostError::Unavailable(_) => Self::SnapshotUnavailable,
+            SubjektivHostError::Unavailable(_) | SubjektivHostError::SessionRegistration { .. } => {
+                Self::SnapshotUnavailable
+            }
         }
     }
 
