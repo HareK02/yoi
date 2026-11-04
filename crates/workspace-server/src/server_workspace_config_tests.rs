@@ -390,8 +390,10 @@ mod workspace_config_integration {
             "the granted WIP path remains available"
         );
 
-        // Real API-token authentication still permits the normal UI editor.
-        let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+        // Real owner API-token authentication still permits the normal editor,
+        // but only through the head/request-bound adoption boundary.
+        let token =
+            seed_test_workspace_owner_token(api.store.as_ref(), "logical-editor-owner").await;
         for (method, path) in &routes {
             if *method == "GET" {
                 request_json_authenticated(
@@ -409,11 +411,52 @@ mod workspace_config_integration {
             build_router(api.clone()),
             "POST",
             &format!("{tree}/commit"),
-            Some(serde_json::to_value(change).unwrap()),
+            Some(serde_json::to_value(&change).unwrap()),
             &token,
-            StatusCode::CREATED,
+            StatusCode::CONFLICT,
         )
         .await;
+        let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+        catalog
+            .apis
+            .lock()
+            .await
+            .insert(TEST_WORKSPACE_ID.into(), api.clone());
+        catalog
+            .routers
+            .lock()
+            .await
+            .insert(TEST_WORKSPACE_ID.into(), build_inner_router(api.clone()));
+        let editor = workspace_server_router(catalog);
+        let adoption_path = format!("/api/w/{TEST_WORKSPACE_ID}/config/adoption");
+        let current = get_json_authenticated(editor.clone(), &adoption_path, &token).await;
+        let adoption = json!({
+            "operation_id": "logical-editor-owner-adoption",
+            "expected_head": current["history_head"],
+            "expected_catalog_digest": current["catalog_digest"],
+            "expected_legacy_export": current["expected_legacy_export"],
+            "source": {"base_digest": current["state"]["snapshot"]["digest"],
+                "entrypoints": current["state"]["contract"]["entrypoints"], "changes": change.changes}
+        });
+        let preview = request_json_authenticated(
+            editor.clone(),
+            "POST",
+            &format!("{adoption_path}/preview"),
+            Some(adoption.clone()),
+            &token,
+            StatusCode::OK,
+        )
+        .await;
+        let receipt = request_json_authenticated(
+            editor,
+            "POST",
+            &format!("{adoption_path}/commit"),
+            Some(adoption),
+            &token,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(receipt["state"], preview["state"]);
         let saved = api
             .config_store
             .load_workspace_config(TEST_WORKSPACE_ID)

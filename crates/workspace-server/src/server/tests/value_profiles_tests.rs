@@ -47,33 +47,63 @@ fn source(value: &str) -> String {
 async fn value_profiles_builtin_http_config_tree_is_read_only_and_never_falls_back() {
     let dir = tempfile::tempdir().unwrap();
     let api = test_api(dir.path()).await;
-    let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
-    let app = build_router(api.clone());
+    let token = seed_test_workspace_owner_token(api.store.as_ref(), "builtin-profile-owner").await;
+    let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+    catalog
+        .apis
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), api.clone());
+    catalog
+        .routers
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), build_inner_router(api.clone()));
+    let app = workspace_server_router(catalog);
     let tree = format!("/api/w/{TEST_WORKSPACE_ID}/config/source-tree");
-    let commit = format!("{tree}/commit");
-    let initial = get_json_authenticated(app.clone(), &tree, &token).await;
-    let saved = request_json_authenticated(
+    let adoption_path = format!("/api/w/{TEST_WORKSPACE_ID}/config/adoption");
+    let commit = format!("{adoption_path}/commit");
+    let current = get_json_authenticated(app.clone(), &adoption_path, &token).await;
+    let initial = current["state"].clone();
+    let adoption = |current: &Value, id: &str, source: Value| {
+        json!({
+            "operation_id": id, "expected_head": current["history_head"],
+            "expected_catalog_digest": current["catalog_digest"], "expected_legacy_export": current["expected_legacy_export"],
+            "source": source,
+        })
+    };
+    let source_request = json!({
+        "base_digest": current["state"]["snapshot"]["digest"],
+        "entrypoints": current["state"]["contract"]["entrypoints"],
+        "changes": [
+            { "kind": "update", "path": "main.dcdl",
+              "expected_digest": current["state"]["snapshot"]["entries"]["main.dcdl"]["content_digest"],
+              "content": source(r#"import "$builtin/profiles/companion.dcdl""#) },
+            // A Workspace file at the matching suffix must not rescue an unknown builtin.
+            { "kind": "create", "path": "profiles/private.dcdl", "content_type": "decodal", "content": PROFILE }
+        ],
+    });
+    let save = adoption(&current, "builtin-profile-adopt", source_request);
+    let preview = request_json_authenticated(
+        app.clone(),
+        "POST",
+        &format!("{adoption_path}/preview"),
+        Some(save.clone()),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    let receipt = request_json_authenticated(
         app.clone(),
         "POST",
         &commit,
-        Some(
-            serde_json::to_value(request(
-                &api,
-                &source(r#"import "$builtin/profiles/companion.dcdl""#),
-                vec![config_source::ConfigTreeChange::Create {
-                    // An ordinary Workspace file at the matching suffix must not rescue
-                    // an unknown builtin import.
-                    path: config_source::VirtualPath::parse("profiles/private.dcdl").unwrap(),
-                    content_type: config_source::ConfigContentType::Decodal,
-                    content: PROFILE.into(),
-                }],
-            ))
-            .unwrap(),
-        ),
+        Some(save),
         &token,
-        StatusCode::CREATED,
+        StatusCode::OK,
     )
     .await;
+    assert_eq!(receipt["state"], preview["state"]);
+    let saved = receipt["state"].clone();
     assert_ne!(saved["snapshot"]["digest"], initial["snapshot"]["digest"]);
     let listed = get_json_authenticated(app.clone(), &tree, &token).await;
     assert_eq!(listed, saved);
@@ -107,22 +137,23 @@ async fn value_profiles_builtin_http_config_tree_is_read_only_and_never_falls_ba
         "base_digest": listed["snapshot"]["digest"],
         "entrypoints": listed["contract"]["entrypoints"],
     });
+    let current = get_json_authenticated(app.clone(), &adoption_path, &token).await;
     let reserved = "$builtin/profiles/companion.dcdl";
-    for change in [
+    for (index, change) in [
         json!({ "kind": "create", "path": reserved, "content_type": "decodal", "content": PROFILE }),
         json!({ "kind": "create", "path": "$builtin", "content_type": "text", "content": "shadow" }),
         json!({ "kind": "update", "path": reserved, "expected_digest": "not-a-workspace-entry", "content": PROFILE }),
         json!({ "kind": "delete", "path": reserved, "expected_digest": "not-a-workspace-entry" }),
         json!({ "kind": "rename", "from": "profiles/private.dcdl", "to": reserved, "expected_digest": shadow["content_digest"] }),
         json!({ "kind": "rename", "from": reserved, "to": "profiles/copy.dcdl", "expected_digest": "not-a-workspace-entry" }),
-    ] {
+    ].into_iter().enumerate() {
         let mut body = base.clone();
         body["changes"] = json!([change]);
         let error = request_json_authenticated(
             app.clone(),
             "POST",
             &commit,
-            Some(body),
+            Some(adoption(&current, &format!("reserved-builtin-{index}"), body)),
             &token,
             StatusCode::BAD_REQUEST,
         )
@@ -148,7 +179,7 @@ async fn value_profiles_builtin_http_config_tree_is_read_only_and_never_falls_ba
         app.clone(),
         "POST",
         &commit,
-        Some(body),
+        Some(adoption(&current, "unknown-builtin-import", body)),
         &token,
         StatusCode::BAD_REQUEST,
     )
