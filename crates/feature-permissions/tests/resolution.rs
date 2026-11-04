@@ -910,3 +910,125 @@ fn current_parent_execution_delegation_and_explicit_revocation_each_limit_childr
         PermissionError::RevokedGrant
     );
 }
+
+fn assert_exclusion_survives_feature_disable(exclusion: PermissionReference) {
+    let mut host = host("workspace-a");
+    let (_, ticket) = register(&mut host, "builtin:ticket", "ticket");
+    host.declare(
+        &ticket,
+        declaration(
+            &[("ticket.read", &[]), ("ticket.keep", &[])],
+            &[(
+                "companion",
+                vec![keys("ticket", &["ticket.read", "ticket.keep"])],
+            )],
+        ),
+    )
+    .unwrap();
+    let (plugin, bundle) = register(&mut host, "plugin:bundle", "bundle");
+    host.declare(
+        &bundle,
+        declaration(
+            &[
+                ("bundle.block", &["ticket.read"]),
+                ("bundle.block.nested", &["bundle.block"]),
+                ("bundle.query", &[]),
+            ],
+            &[
+                ("companion", vec![keys("bundle", &["bundle.query"])]),
+                ("blocked", vec![keys("bundle", &["bundle.block.nested"])]),
+                ("blocked-alias", vec![set("blocked")]),
+            ],
+        ),
+    )
+    .unwrap();
+    let unrestricted_policy = assignment(vec![set("companion")]);
+    let restricted_policy = PermissionAssignment {
+        exclusions: vec![exclusion],
+        ..unrestricted_policy.clone()
+    };
+    // Issue before the deny is added, so a frozen child/Job cannot evade it.
+    let initial = host.resolve(Some(&unrestricted_policy));
+    let requested = [key("ticket.read"), key("ticket.keep")];
+    let child = host.issue_delegation(&initial, &requested).unwrap();
+    let job = host
+        .issue_job_grant("job-a".into(), &initial, &requested)
+        .unwrap();
+
+    for enabled in [true, false, true] {
+        host.set_enabled(&plugin, enabled).unwrap();
+        let unrestricted = host.resolve(Some(&unrestricted_policy));
+        let restricted = host.resolve(Some(&restricted_policy));
+        assert!(
+            !host
+                .allows(&ticket, &restricted, &key("ticket.read"))
+                .unwrap()
+        );
+        assert!(
+            host.allows(&ticket, &restricted, &key("ticket.keep"))
+                .unwrap()
+        );
+        assert_eq!(
+            host.allows(&bundle, &restricted, &key("bundle.query"))
+                .unwrap(),
+            enabled,
+            "disable must still withdraw the Plugin's positive contribution"
+        );
+        assert!(
+            restricted
+                .projection()
+                .diagnostics
+                .contains(&PermissionDiagnostic::Excluded(key("ticket.read")))
+        );
+        assert_eq!(
+            restricted
+                .projection()
+                .diagnostics
+                .contains(&PermissionDiagnostic::DisabledFeature(
+                    FeatureIdentity::parse("plugin:bundle").unwrap()
+                )),
+            !enabled
+        );
+        assert_eq!(
+            host.issue_delegation(&restricted, &[key("ticket.read")])
+                .unwrap_err(),
+            PermissionError::DelegationExceeded(key("ticket.read"))
+        );
+        assert_eq!(
+            host.issue_job_grant("job-b".into(), &restricted, &[key("ticket.read")])
+                .unwrap_err(),
+            PermissionError::DelegationExceeded(key("ticket.read"))
+        );
+        for (execution, delegation) in [
+            (&restricted, &unrestricted),
+            (&unrestricted, &restricted),
+            (&restricted, &restricted),
+        ] {
+            assert_keys(
+                &host.resolve_limited(execution, delegation, &child).unwrap(),
+                &["ticket.keep"],
+            );
+            assert_keys(
+                &host
+                    .resolve_job("job-a", execution, delegation, &child, &job)
+                    .unwrap(),
+                &["ticket.keep"],
+            );
+        }
+    }
+}
+
+#[test]
+fn disabled_feature_cannot_erase_direct_cross_feature_exclusion() {
+    assert_exclusion_survives_feature_disable(keys("bundle", &["bundle.block"]));
+}
+
+#[test]
+fn disabled_feature_cannot_erase_multilevel_cross_feature_exclusion() {
+    assert_exclusion_survives_feature_disable(keys("bundle", &["bundle.block.nested"]));
+}
+
+#[test]
+fn disabled_feature_cannot_erase_set_cross_feature_exclusion() {
+    assert_exclusion_survives_feature_disable(set("blocked-alias"));
+}

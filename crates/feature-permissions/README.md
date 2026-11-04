@@ -19,9 +19,11 @@ the same references. Installing a declaration validates its candidate graph
 atomically. Duplicate definitions, unknown references and cycles reject the update
 without changing the prior catalog. Duplicate assignment paths are deduplicated,
 with distinct provenance paths retained in deterministic order. Invalid assignment
-references deny the whole assignment with diagnostics. Disabled contributions are
-omitted independently; removing a Feature retires its handles and withdraws only
-its declarations. Dangling references deny rather than recovering an old result.
+references deny the whole assignment with diagnostics. Disabled positive
+contributions are omitted independently. Explicit exclusions still traverse disabled
+Features' declared keys and set edges, so disabling a Plugin cannot revive another
+Feature's excluded operation. Removing a Feature retires its handles and withdraws
+only its declarations. Dangling references deny rather than recovering an old result.
 
 Every change invalidates prior [`ResolvedPermissions`]. The Host re-resolves the
 current assignment before use. A resolution retains its actual catalog snapshot;

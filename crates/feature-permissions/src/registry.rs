@@ -317,11 +317,11 @@ impl PermissionHost {
             None => projection.diagnostics.push(PermissionDiagnostic::Unset),
             Some(a) if a.revoked => projection.diagnostics.push(PermissionDiagnostic::Revoked),
             Some(a) => {
-                let mut expansion = Expansion::new(self);
+                let mut expansion = Expansion::new(self, ExpansionPurpose::Grant);
                 for reference in &a.grants {
                     expansion.reference(reference, vec![]);
                 }
-                let mut exclusions = Expansion::new(self);
+                let mut exclusions = Expansion::new(self, ExpansionPurpose::Exclusion);
                 for reference in &a.exclusions {
                     exclusions.reference(reference, vec![]);
                 }
@@ -391,7 +391,7 @@ impl PermissionHost {
         requested: &[PermissionKey],
     ) -> Result<LimitedGrant, PermissionError> {
         self.check_resolution(ceiling)?;
-        let mut expansion = Expansion::new(self);
+        let mut expansion = Expansion::new(self, ExpansionPurpose::Grant);
         for key in requested {
             expansion.key(key, vec![]);
         }
@@ -572,15 +572,25 @@ fn validate_graph(
     Ok(())
 }
 
+#[derive(PartialEq, Eq)]
+enum ExpansionPurpose {
+    Grant,
+    // Disabling an owner withdraws positive contributions, not the meaning of
+    // an explicit deny. Its retained declaration still defines exclusion edges.
+    Exclusion,
+}
+
 struct Expansion<'a> {
     host: &'a PermissionHost,
+    purpose: ExpansionPurpose,
     allowed: BTreeMap<PermissionKey, BTreeSet<Vec<OriginStep>>>,
     diagnostics: BTreeSet<PermissionDiagnostic>,
 }
 impl<'a> Expansion<'a> {
-    fn new(host: &'a PermissionHost) -> Self {
+    fn new(host: &'a PermissionHost, purpose: ExpansionPurpose) -> Self {
         Self {
             host,
+            purpose,
             allowed: BTreeMap::new(),
             diagnostics: BTreeSet::new(),
         }
@@ -620,7 +630,9 @@ impl<'a> Expansion<'a> {
                                 .insert(PermissionDiagnostic::DisabledFeature(
                                     record.owner.clone(),
                                 ));
-                            continue;
+                            if self.purpose == ExpansionPurpose::Grant {
+                                continue;
+                            }
                         }
                         let mut next = path.clone();
                         next.push(OriginStep::Set(set.clone()));
@@ -656,7 +668,9 @@ impl<'a> Expansion<'a> {
         if !self.host.catalog.features[&record.owner].enabled {
             self.diagnostics
                 .insert(PermissionDiagnostic::DisabledFeature(record.owner.clone()));
-            return;
+            if self.purpose == ExpansionPurpose::Grant {
+                return;
+            }
         }
         if path.contains(&OriginStep::Key(key.clone())) {
             return;
