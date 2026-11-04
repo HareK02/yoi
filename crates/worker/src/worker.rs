@@ -13152,8 +13152,24 @@ mod build_summary_prompt_tests {
                     .unwrap(),
                 }),
                 AttributionOutcome::Rejected => Ok(WorkspaceResponse {
-                    status: 503,
-                    body: "temporarily unavailable".to_string(),
+                    status: 403,
+                    body: serde_json::to_string(
+                        &server_api::RepositoryApiError::new(
+                            403,
+                            "PermissionDenied",
+                            "Session registration permission denied.",
+                            Vec::new(),
+                        )
+                        .with_failure(
+                            protocol::session_failure::session_registration_attachment(
+                                protocol::session_failure::SessionRegistrationCause::denied(
+                                    protocol::session_failure::SessionPrincipal::Subject,
+                                ),
+                            )
+                            .unwrap(),
+                        ),
+                    )
+                    .unwrap(),
                 }),
                 AttributionOutcome::Success => {
                     let input: server_api::SubjektivRecordSessionRequest =
@@ -13484,10 +13500,23 @@ mod build_summary_prompt_tests {
 
     #[tokio::test]
     async fn unknown_and_failed_attribution_remain_incomplete_until_lifecycle_retry() {
-        for (first, expected_state) in [
-            (AttributionOutcome::TransportUnknown, "outcome_unknown"),
-            (AttributionOutcome::Rejected, "failed"),
-            (AttributionOutcome::Unauthorized, "failed"),
+        use protocol::session_failure::{SessionPrincipal, SessionRegistrationCause};
+        for (first, expected_state, expected_cause) in [
+            (
+                AttributionOutcome::TransportUnknown,
+                "outcome_unknown",
+                SessionRegistrationCause::outcome_unknown(),
+            ),
+            (
+                AttributionOutcome::Rejected,
+                "failed",
+                SessionRegistrationCause::denied(SessionPrincipal::Subject),
+            ),
+            (
+                AttributionOutcome::Unauthorized,
+                "outcome_unknown",
+                SessionRegistrationCause::outcome_unknown(),
+            ),
         ] {
             let client = Arc::new(AttributionLifecycleClient::new([
                 first,
@@ -13500,10 +13529,10 @@ mod build_summary_prompt_tests {
                     SubjektivSessionAttributionLifecycle::NewSession,
                 )
                 .unwrap_err();
-            assert!(error.to_string().contains(expected_state));
+            assert_eq!(error.session_registration_cause(), Some(expected_cause));
             if matches!(first, AttributionOutcome::Unauthorized) {
-                assert!(error.to_string().contains("rejected with HTTP 401"));
-                assert!(!error.to_string().contains("outcome_unknown"));
+                // A legacy HTTP status is not a domain authorization attestation.
+                // Attribution remains incomplete and no implicit retry is issued.
                 assert_eq!(
                     client.requests.lock().unwrap().len(),
                     1,
@@ -13672,7 +13701,12 @@ mod build_summary_prompt_tests {
             )
             .unwrap_err();
 
-        assert!(error.to_string().contains("legacy_unknown"));
+        assert_eq!(
+            error.session_registration_cause(),
+            Some(protocol::session_failure::SessionRegistrationCause::denied(
+                protocol::session_failure::SessionPrincipal::Subject,
+            )),
+        );
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         let request: server_api::SubjektivRecordSessionRequest =
