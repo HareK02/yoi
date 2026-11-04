@@ -23919,7 +23919,7 @@ where
 
 fn open_legacy_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
     crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
-        .map_err(|error| ApiError::from(Error::Store(error.to_string())))
+        .map_err(|error| ApiError::from(subjektiv_store_error(error)))
 }
 
 fn open_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
@@ -26253,7 +26253,7 @@ fn subjektiv_store_error(error: crate::subjektiv::SubjektivError) -> Error {
         crate::subjektiv::SubjektivError::MemoryNotFound(memory_id) => Error::InvalidInput(
             format!("memory_not_found: Memory `{memory_id}` was not found"),
         ),
-        crate::subjektiv::SubjektivError::Storage(_) => Error::Store(error.to_string()),
+        crate::subjektiv::SubjektivError::Storage(error) => Error::SubjektivStorage(error),
         _ => Error::InvalidInput(error.to_string()),
     }
 }
@@ -71200,6 +71200,7 @@ impl From<subjektiv::api::OperationError> for Error {
             Common::PermissionDenied(message) => Error::WorkspacePermissionDenied(message),
             Common::SubjectNotFound(id) => Error::SubjektivSubjectNotFound(id),
             Common::Store(message) => Error::Store(message),
+            Common::Storage(error) => Error::SubjektivStorage(error),
         };
         error
     }

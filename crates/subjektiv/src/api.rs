@@ -1293,6 +1293,8 @@ pub enum OperationError {
     SubjectNotFound(String),
     #[error("{0}")]
     Store(String),
+    #[error(transparent)]
+    Storage(#[from] feature_storage::FeatureStorageError),
 }
 
 pub type OperationResult<T> = std::result::Result<T, OperationError>;
@@ -1323,7 +1325,7 @@ pub fn subjektiv_store_error(error: crate::SubjektivError) -> OperationError {
         crate::SubjektivError::MemoryNotFound(id) => {
             OperationError::InvalidInput(format!("memory_not_found: Memory `{id}` was not found"))
         }
-        crate::SubjektivError::Storage(_) => OperationError::Store(error.to_string()),
+        crate::SubjektivError::Storage(error) => OperationError::Storage(error),
         _ => OperationError::InvalidInput(error.to_string()),
     }
 }

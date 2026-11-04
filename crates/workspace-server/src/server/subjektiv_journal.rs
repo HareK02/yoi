@@ -12,13 +12,15 @@ pub(super) fn domain(error: JournalError) -> Error {
     match error {
         JournalError::PermissionDenied(s) => Error::WorkspacePermissionDenied(s),
         JournalError::Conflict(s) => Error::RepositoryConflict(s),
+        JournalError::Storage(error) => Error::SubjektivStorage(error),
+        JournalError::Subject(error) => subjektiv_store_error(error),
         other => Error::Store(other.to_string()),
     }
 }
 
 fn store(api: &WorkspaceApi) -> Result<crate::subjektiv::SubjektivStore> {
     crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
-        .map_err(|e| Error::Store(e.to_string()))
+        .map_err(subjektiv_store_error)
 }
 
 pub(super) fn host(
@@ -28,7 +30,7 @@ pub(super) fn host(
 ) -> Result<JournalHostContext> {
     let attribution = store
         .session_attribution(&grant.session_id)
-        .map_err(|e| Error::Store(e.to_string()))?
+        .map_err(subjektiv_store_error)?
         .filter(|a| a.subject_id == grant.subject_id)
         .ok_or_else(|| {
             Error::WorkspacePermissionDenied("Journal Session attribution mismatch".into())
@@ -53,7 +55,7 @@ pub(super) fn prepare(api: &WorkspaceApi, reservation: &BackendJobReservation) -
     let store = store(api)?;
     let attribution = store
         .session_attribution(&grant.session_id)
-        .map_err(|e| Error::Store(e.to_string()))?
+        .map_err(subjektiv_store_error)?
         .filter(|attr| attr.subject_id == grant.subject_id)
         .ok_or_else(|| {
             Error::WorkspacePermissionDenied("Journal source attribution missing".into())
@@ -63,7 +65,7 @@ pub(super) fn prepare(api: &WorkspaceApi, reservation: &BackendJobReservation) -
     let host = host(api, &store, grant)?;
     let attr = store
         .session_attribution(&grant.session_id)
-        .map_err(|e| Error::Store(e.to_string()))?
+        .map_err(subjektiv_store_error)?
         .ok_or_else(|| {
             Error::WorkspacePermissionDenied("Journal Session attribution missing".into())
         })?;

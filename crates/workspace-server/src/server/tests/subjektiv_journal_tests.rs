@@ -4,6 +4,7 @@
 //! Tool-result persistence is a fixture boundary; no signed remote HTTP or model evaluation.
 use super::*;
 use crate::backend_job::{BackendJobGrants, SubjektivJournalGrant, journal_serialization_key};
+use feature_storage::FeatureStorageError;
 use sha2::{Digest, Sha256};
 use subjektiv::journal::transport::*;
 use subjektiv::journal::*;
@@ -1152,6 +1153,201 @@ impl Drop for JournalCompletionSaveFault {
     fn drop(&mut self) {
         self.0.execute_batch("ROLLBACK").unwrap();
     }
+}
+
+fn lock_journal_domain(f: &RuntimeFixture) -> JournalCompletionSaveFault {
+    let database = f
+        .api
+        .feature_storage
+        .open(&f.api.subjektiv_registration)
+        .unwrap();
+    let path: String = database
+        .with_connection(|connection| {
+            connection.busy_timeout(std::time::Duration::ZERO)?;
+            Ok(connection.query_row("PRAGMA database_list", [], |row| row.get(2))?)
+        })
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    JournalCompletionSaveFault(connection)
+}
+
+#[tokio::test]
+async fn domain_storage_lock_beyond_initial_settlement_recovers_original_journal_attempt() {
+    for already_prepared in [false, true] {
+        let f = RuntimeFixture::new().await;
+        if already_prepared {
+            subjektiv_journal::prepare(&f.api, &f.reserved).unwrap();
+        }
+        let binding = subjektiv::api::JobAttemptBinding {
+            job_id: f.request.job_id.clone(),
+            attempt_id: f.reserved.attempt.attempt_id.clone(),
+        };
+        let saved_generation = f
+            .store
+            .retained_journal_generation(&f.host, &f.id, &binding)
+            .unwrap();
+        assert_eq!(saved_generation.is_some(), already_prepared);
+        let fault = lock_journal_domain(&f);
+        // Real domain storage stays locked. The healthy Workspace DB must not be
+        // used as proof that Journal preparation can proceed.
+        let error = subjektiv_journal::prepare(&f.api, &f.reserved).unwrap_err();
+        assert!(
+            matches!(error, Error::SubjektivStorage(
+            FeatureStorageError::Sqlite(rusqlite::Error::SqliteFailure(code, _)))
+            if code.code == rusqlite::ErrorCode::DatabaseBusy),
+            "{error}"
+        );
+        f.api.own_backend_job_recovery(&f.reserved.attempt);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            f.api
+                .backend_job_recovery
+                .domain_storage_settlement
+                .notified(),
+        )
+        .await
+        .expect("domain operation did not retain ownership beyond six failed settlements");
+        let pending = current_journal_attempt(&f, &binding.attempt_id);
+        assert_eq!(pending.state, BackendJobAttemptState::Reserved);
+        assert_eq!(
+            pending.failure_category.as_deref(),
+            Some("domain_storage_unavailable")
+        );
+        assert_eq!(pending.deadline_at, f.reserved.attempt.deadline_at);
+        assert!(pending.worker.is_none());
+        assert!(f.execution.inputs.lock().unwrap().is_empty());
+        f.api
+            .store
+            .probe_backend_job_recovery(TEST_WORKSPACE_ID, &pending)
+            .unwrap();
+        assert_eq!(
+            current_journal_attempt(&f, &binding.attempt_id).state,
+            BackendJobAttemptState::Reserved
+        );
+        drop(fault);
+        // Only release the independent DB lock. No second dispatch or recovery call.
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let attempt = current_journal_attempt(&f, &binding.attempt_id);
+                if attempt.state != BackendJobAttemptState::Reserved
+                    && attempt.state != BackendJobAttemptState::Dispatching
+                {
+                    break attempt;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("same Journal attempt did not autonomously dispatch");
+        // Observe the existing producer boundary before issuing fixture model operations.
+        // The saved Dispatched row alone can precede its first input acceptance.
+        {
+            let gate = f
+                .api
+                .backend_job_recovery
+                .dispatch_gate(&binding.attempt_id);
+            let _dispatch_finished = gate.lock().unwrap();
+        }
+        assert_eq!(
+            dispatched.state,
+            BackendJobAttemptState::Dispatched,
+            "{dispatched:?}"
+        );
+        assert_eq!(dispatched.attempt_id, binding.attempt_id);
+        assert_eq!(dispatched.input_digest, f.reserved.attempt.input_digest);
+        assert_eq!(dispatched.deadline_at, f.reserved.attempt.deadline_at);
+        let worker = dispatched.worker.as_ref().unwrap();
+        f.api
+            .store
+            .update_worker_retention(
+                TEST_WORKSPACE_ID,
+                worker,
+                "pinned",
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        f.checkpoint(worker);
+        let completion = subjektiv_journal::finish(&f.api, worker).unwrap();
+        let completed = observe_journal_completion(&f).await;
+        assert_eq!(completed.state, BackendJobState::Completed);
+        assert_eq!(completed.current_attempt, f.reserved.attempt.attempt);
+        assert_eq!(completed.input_digest, f.reserved.attempt.input_digest);
+        assert_eq!(
+            completed.result,
+            Some(serde_json::to_value(completion).unwrap())
+        );
+        let terminal = current_journal_attempt(&f, &binding.attempt_id);
+        assert_eq!(terminal.worker, dispatched.worker);
+        assert_eq!(terminal.runtime_run_id, dispatched.runtime_run_id);
+        let generation = f
+            .store
+            .retained_journal_generation(&f.host, &f.id, &binding)
+            .unwrap()
+            .unwrap();
+        if let Some(saved) = saved_generation {
+            assert_eq!(generation.id, saved.id);
+        }
+        assert_eq!(f.execution.inputs.lock().unwrap().len(), 1);
+        assert_eq!(
+            completed.load_executable_request().unwrap().input,
+            f.request.input
+        );
+        assert!(
+            f.api
+                .store
+                .get_backend_job_attempt(
+                    TEST_WORKSPACE_ID,
+                    &binding.job_id,
+                    &crate::backend_job::attempt_id(&binding.job_id, 2)
+                )
+                .unwrap()
+                .is_none()
+        );
+        f.api.stop_backend_job_recovery().await;
+    }
+}
+
+#[tokio::test]
+async fn domain_storage_lock_stops_at_original_attempt_deadline_without_dispatch() {
+    let mut f = RuntimeFixture::new().await;
+    let deadline = (Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+    f.job_store.with_conn(|connection| {
+        connection.execute("UPDATE backend_job_attempts SET deadline_at=?1 WHERE workspace_id=?2 AND attempt_id=?3",
+            rusqlite::params![deadline, TEST_WORKSPACE_ID, f.reserved.attempt.attempt_id])?;
+        Ok(())
+    }).unwrap();
+    f.reserved.attempt = current_journal_attempt(&f, &f.reserved.attempt.attempt_id);
+    let fault = lock_journal_domain(&f);
+    f.api.own_backend_job_recovery(&f.reserved.attempt);
+    let failed = observe_journal_completion(&f).await;
+    assert_eq!(failed.state, BackendJobState::Failed);
+    assert_eq!(
+        failed.failure_category.as_deref(),
+        Some("recovery_cannot_continue")
+    );
+    let detail = failed.failure_detail.as_deref().unwrap();
+    assert!(
+        detail.contains("Original attempt deadline exceeded"),
+        "{detail}"
+    );
+    assert!(detail.contains("Subjektiv storage"), "{detail}");
+    let attempt = current_journal_attempt(&f, &f.reserved.attempt.attempt_id);
+    assert_eq!(attempt.deadline_at, deadline);
+    assert!(attempt.worker.is_none());
+    assert!(f.execution.inputs.lock().unwrap().is_empty());
+    drop(fault);
+    assert!(
+        f.store
+            .active_journal_generation(&f.host, &f.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        failed.load_executable_request().unwrap().input,
+        f.request.input
+    );
+    f.api.stop_backend_job_recovery().await;
 }
 
 fn current_journal_job(f: &RuntimeFixture) -> crate::backend_job::BackendJobRecord {

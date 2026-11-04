@@ -293,7 +293,7 @@ pub(super) fn validate_result(
     };
     let store =
         crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
-            .map_err(|e| Error::Store(e.to_string()))?;
+            .map_err(subjektiv_store_error)?;
     subjektiv::job::validate_result(
         &store,
         &grant.subject_id,
@@ -320,7 +320,7 @@ pub(super) fn with_dispositions(
         .ok_or_else(|| Error::InvalidInput("missing consolidation grant".into()))?;
     let store =
         crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
-            .map_err(|e| Error::Store(e.to_string()))?;
+            .map_err(subjektiv_store_error)?;
     subjektiv::job::with_dispositions(&store, &grant.subject_id, &grant.candidate_ids, value)
         .map_err(Error::from)
 }

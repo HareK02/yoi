@@ -94,7 +94,7 @@ pub fn validate_result(
     for candidate_id in batch {
         if store
             .staging_resolution(subject_id, candidate_id)
-            .map_err(|e| OperationError::Store(e.to_string()))?
+            .map_err(crate::api::subjektiv_store_error)?
             .is_none()
         {
             return Err(OperationError::InvalidInput(format!(
@@ -113,8 +113,11 @@ pub fn validate_result(
             job_id,
             attempt_id,
         )
-        .map_err(|e| {
-            OperationError::InvalidInput(format!("consolidation surface result mismatch: {e}"))
+        .map_err(|error| match error {
+            crate::SubjektivError::Storage(error) => OperationError::Storage(error),
+            other => OperationError::InvalidInput(format!(
+                "consolidation surface result mismatch: {other}"
+            )),
         })
 }
 
@@ -204,7 +207,7 @@ pub fn lookup_result(
         if let Some(id) = snapshot_id { surface["snapshot_id"] = id.into(); }
         if let Some(reason) = reason_code { surface["reason_code"] = reason.into(); }
         Ok(Some(serde_json::json!({"subject_id":subject_id, "candidate_ids":batch,"surface":surface})))
-    }).map_err(|error: SubjektivError| OperationError::Store(error.to_string()))?;
+    }).map_err(crate::api::subjektiv_store_error)?;
     let Some(result) = result else {
         return Ok(None);
     };
@@ -225,7 +228,7 @@ pub fn with_dispositions(
     for id in batch {
         let resolution = store
             .staging_resolution(subject_id, id)
-            .map_err(|e| OperationError::Store(e.to_string()))?
+            .map_err(crate::api::subjektiv_store_error)?
             .ok_or_else(|| {
                 OperationError::InvalidInput(format!("candidate `{id}` has no durable disposition"))
             })?;

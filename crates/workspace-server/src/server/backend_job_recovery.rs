@@ -4,6 +4,7 @@
 use super::*;
 use crate::backend_job::BackendJobRecord;
 use crate::backend_job_host_effects::{JobHostEffects, JobHostOwner, JobHostRequestLease};
+use feature_storage::FeatureStorageError;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -21,6 +22,8 @@ pub(super) struct RecoveryOwners {
     changed: tokio::sync::Notify,
     #[cfg(test)]
     pub(super) storage_probe_started: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(super) domain_storage_settlement: tokio::sync::Notify,
     #[cfg(test)]
     pub(super) nonjournal_lookup_pending: tokio::sync::Notify,
     #[cfg(test)]
@@ -145,7 +148,31 @@ fn receipt_matches(
         && result.runtime_run_id == attempt.runtime_run_id
 }
 
+fn transient_subjektiv_storage(error: &Error) -> bool {
+    match error {
+        Error::SubjektivStorage(FeatureStorageError::Sqlite(rusqlite::Error::SqliteFailure(
+            error,
+            _,
+        ))) => matches!(
+            error.code,
+            rusqlite::ErrorCode::DatabaseBusy
+                | rusqlite::ErrorCode::DatabaseLocked
+                | rusqlite::ErrorCode::SystemIoFailure
+                | rusqlite::ErrorCode::DiskFull
+                | rusqlite::ErrorCode::CannotOpen
+        ),
+        // Feature I/O is bounded by the same operation's deadline, not a health flag.
+        Error::SubjektivStorage(FeatureStorageError::Io(_)) => true,
+        Error::SubjektivStorage(FeatureStorageError::OutcomeUnknown { .. }) => true,
+        _ => false,
+    }
+}
+
 fn transient_storage(error: &Error) -> bool {
+    transient_subjektiv_storage(error) || workspace_storage_failure(error)
+}
+
+fn workspace_storage_failure(error: &Error) -> bool {
     matches!(error, Error::Sqlite(rusqlite::Error::SqliteFailure(error, _))
         if matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
             | rusqlite::ErrorCode::SystemIoFailure | rusqlite::ErrorCode::DiskFull
@@ -550,7 +577,7 @@ impl WorkspaceApi {
                         .await;
                     failures += 1;
                 }
-                Err(error) if transient_storage(&error) => {
+                Err(error) if workspace_storage_failure(&error) => {
                     tracing::warn!(attempt_id=%expected.attempt_id, %error, "Cleanup settlement budget exhausted; exact-owner storage probe only");
                     let mut delay = Duration::from_secs(1);
                     loop {
@@ -601,13 +628,24 @@ impl WorkspaceApi {
     }
 
     async fn run_backend_job_recovery(&self, expected: BackendJobAttemptRecord) -> Result<()> {
-        // Only transient storage failure enters probe mode. Timers, unrelated writes and
-        // receipt failures never refill this settlement budget or authorize execution.
+        // Workspace write probes never refill a Feature operation's settlement budget.
+        // Feature failures reconcile the original operation until its original deadline.
         let mut storage_failures = 0;
+        let mut domain_failures = 0usize;
+        let deadline = chrono::DateTime::parse_from_rfc3339(&expected.deadline_at)
+            .map_err(|error| Error::Store(error.to_string()))?;
         let mut definitive_failure: Option<String> = None;
+        let mut domain_failure: Option<String> = None;
         loop {
             if self.backend_job_recovery.stopping.load(Ordering::Acquire) {
                 return Ok(());
+            }
+            if Utc::now() >= deadline
+                && let Some(error) = domain_failure.take()
+            {
+                definitive_failure = Some(format!(
+                    "Original attempt deadline exceeded during exact Feature operation reconciliation: {error}; execution and Host termination remain unconfirmed"
+                ));
             }
             let api = self.clone();
             let owner = expected.clone();
@@ -619,18 +657,56 @@ impl WorkspaceApi {
                     if let Some(detail) = failure {
                         api.fail_backend_job_recovery(&owner, &detail)
                     } else {
-                        api.recover_backend_job_step(&owner)
+                        let result = api.recover_backend_job_step(&owner);
+                        if let Err(error) = &result
+                            && transient_subjektiv_storage(error)
+                        {
+                            let current = api.store.get_backend_job_attempt(api.workspace_id(),
+                                &owner.job_id, &owner.attempt_id)?
+                                .ok_or_else(|| Error::Store("Domain reconciliation owner disappeared".into()))?;
+                            api.retain_backend_job_recovery(&current, "domain_storage_unavailable",
+                                &error.to_string(),
+                                "Reconcile the same Feature operation and receipt until the original attempt deadline; do not resubmit or probe another database")?;
+                        }
+                        result
                     }
                 })
                 .await;
             match step {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
+                    domain_failure = None;
                     self.backend_job_recovery
                         .pause(Duration::from_millis(250))
                         .await;
                 }
-                Err(error) if transient_storage(&error) => {
+                Err(error) if transient_subjektiv_storage(&error) => {
+                    domain_failure = Some(error.to_string());
+                    if Utc::now() >= deadline {
+                        continue;
+                    }
+                    if domain_failures >= SETTLEMENT_BACKOFF_MS.len() {
+                        #[cfg(test)]
+                        self.backend_job_recovery
+                            .domain_storage_settlement
+                            .notify_one();
+                    }
+                    let delay = SETTLEMENT_BACKOFF_MS
+                        .get(domain_failures)
+                        .copied()
+                        .map(Duration::from_millis)
+                        .unwrap_or_else(|| {
+                            Duration::from_secs(
+                                (1u64 << domain_failures.saturating_sub(5).min(5)).min(30),
+                            )
+                        });
+                    domain_failures = domain_failures.saturating_add(1);
+                    let remaining = (deadline.with_timezone(&Utc) - Utc::now())
+                        .to_std()
+                        .unwrap_or_default();
+                    self.backend_job_recovery.pause(delay.min(remaining)).await;
+                }
+                Err(error) if workspace_storage_failure(&error) => {
                     if let Some(delay) = SETTLEMENT_BACKOFF_MS.get(storage_failures) {
                         storage_failures += 1;
                         self.backend_job_recovery
@@ -790,6 +866,14 @@ impl WorkspaceApi {
             return Ok(true);
         }
         if attempt.state == BackendJobAttemptState::Reserved {
+            let deadline = chrono::DateTime::parse_from_rfc3339(&attempt.deadline_at)
+                .map_err(|error| Error::Store(error.to_string()))?;
+            if Utc::now() >= deadline {
+                self.finish_backend_job_attempt(&attempt.job_id, &attempt.attempt_id,
+                    BackendJobAttemptState::Failed, "timeout",
+                    "Original attempt deadline exceeded before dispatch; no execution termination is inferred")?;
+                return Ok(false);
+            }
             self.dispatch_backend_job_reservation(BackendJobReservation {
                 job,
                 attempt,

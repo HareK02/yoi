@@ -51,7 +51,7 @@ impl From<&WorkspaceApi> for WorkerAuthorityView {
 impl WorkerAuthorityView {
     fn subject_store(&self) -> ApiResult<crate::subjektiv::SubjektivStore> {
         crate::subjektiv::SubjektivStore::open(&self.feature_storage, &self.subjektiv_registration)
-            .map_err(|error| Error::Store(error.to_string()).into())
+            .map_err(|error| subjektiv_store_error(error).into())
     }
 
     fn require_not_deleted(&self, worker: &RuntimeWorkerRef) -> ApiResult<()> {

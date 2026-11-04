@@ -8368,7 +8368,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 tx.commit()?;
                 return Ok((BackendJobReservation { job, attempt, replayed: true, resource_reused: false }, false));
             }
-            let deadline = backend_job_deadline(now, job.request.limits.timeout_seconds)?;
+            // Admission already fixed this attempt's deadline. Recovering prepare or
+            // waiting for a slot must not extend the same accepted operation's budget.
+            let deadline = &attempt.deadline_at;
             let changed = tx.execute(
                 "UPDATE backend_job_attempts SET state = 'dispatching', deadline_at = ?4, updated_at = ?5 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state = 'reserved' AND worker_id IS NULL",
                 params![workspace_id, job_id, attempt_id, deadline, now],

@@ -98,6 +98,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("Subjektiv storage error: {0}")]
+    SubjektivStorage(#[source] FeatureStorageError),
     #[error("ticket error: {0}")]
     Ticket(#[from] ticket::TicketError),
     #[error("merge request error: {0}")]
