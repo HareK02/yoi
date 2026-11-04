@@ -106,8 +106,22 @@ function reviewCancelled(
   };
 }
 
-function detail(thread: MergeRequestThreadEvent[]): MergeRequestDetail {
+function detail(
+  thread: MergeRequestThreadEvent[],
+  reviewStatus = "none",
+  latestSubject = "source-2",
+): MergeRequestDetail {
   return {
+    view: "detail",
+    summary: {
+      review_status: reviewStatus,
+      review: null,
+      latest_review_subject_ref: latestSubject,
+      latest_event: null,
+      thread_event_count: thread.length,
+      readiness: { ready: false, blockers: [] },
+    },
+    event_page: { omitted: false, has_more: false, next_after: null, limit: 100 as MergeRequestDetail["event_page"]["limit"] },
     merge_request_id: "MR-1",
     workspace_id: "W",
     repository_key: "main",
@@ -148,7 +162,7 @@ Deno.test("revoked review requires a fresh review instead of appearing pending",
 Deno.test("unresolved review request for the current source is pending", () => {
   const mergeRequest = detail([
     reviewRequested("request-2", "source-2"),
-  ]);
+  ], "pending");
 
   assertEquals(
     sourceReviewFreshness(mergeRequest),
@@ -160,7 +174,7 @@ Deno.test("completed or cancelled request is not projected as pending", () => {
   const approved = detail([
     reviewRequested("request-3", "source-2"),
     review("review-3", "request-3", "source-2"),
-  ]);
+  ], "approved");
   assertEquals(
     sourceReviewFreshness(approved),
     "Current source approved at exact ref source-2.",
@@ -176,10 +190,22 @@ Deno.test("completed or cancelled request is not projected as pending", () => {
   );
 });
 
+Deno.test("status uses complete backend evidence rather than a selected history page", () => {
+  // The visible approval has been revoked outside this page.
+  const revoked = detail([review("old-approval", "old-request", "source-2")], "none");
+  assertEquals(sourceReviewFreshness(revoked),
+    "Fresh source review required: no effective verdict exists for source-2.");
+  // The current verdict need not appear in the returned page at all.
+  assertEquals(sourceReviewFreshness(detail([], "approved")),
+    "Current source approved at exact ref source-2.");
+  assertEquals(sourceReviewFreshness(detail([], "request_changes")),
+    "Current source requests changes at exact ref source-2.");
+});
+
 Deno.test("source movement explains the exact stale and current refs", () => {
   const mergeRequest = detail([
     review("review-old", "request-old", "source-1"),
-  ]);
+  ], "none", "source-1");
 
   assertEquals(
     sourceReviewFreshness(mergeRequest),

@@ -1727,6 +1727,82 @@ function parseLinkedTicket(
   };
 }
 
+function parseMergeRequestEventReference(
+  value: unknown,
+  label: string,
+): NonNullable<MergeRequestDetailResponse["summary"]["latest_event"]> | null {
+  if (value === null) return null;
+  const item = object(value, label);
+  exact(item, ["event_id", "sequence"], label);
+  return {
+    event_id: string(item.event_id, `${label}.event_id`),
+    sequence: integer(item.sequence, `${label}.sequence`, 1),
+  };
+}
+
+function parseMergeRequestStatusSummary(
+  value: unknown,
+  label: string,
+): MergeRequestDetailResponse["summary"] {
+  const item = object(value, label);
+  exact(item, ["review_status", "review", "latest_review_subject_ref", "latest_event", "thread_event_count", "readiness"], label);
+  const status = string(item.review_status, `${label}.review_status`);
+  if (!["unknown", "none", "pending", "approved", "request_changes"].includes(status)) {
+    throw new TicketBrowserContractError(`${label}.review_status is invalid`);
+  }
+  let review: MergeRequestDetailResponse["summary"]["review"] = null;
+  if (item.review !== null) {
+    const r = object(item.review, `${label}.review`);
+    exact(r, ["event", "request_event_id", "subject_ref", "ticket_content_digest", "decision", "findings_count"], `${label}.review`);
+    const event = parseMergeRequestEventReference(r.event, `${label}.review.event`);
+    if (event === null) throw new TicketBrowserContractError(`${label}.review.event is required`);
+    const decision = string(r.decision, `${label}.review.decision`);
+    if (decision !== "approve" && decision !== "request_changes") {
+      throw new TicketBrowserContractError(`${label}.review.decision is invalid`);
+    }
+    review = {
+      event,
+      request_event_id: string(r.request_event_id, `${label}.review.request_event_id`),
+      subject_ref: string(r.subject_ref, `${label}.review.subject_ref`),
+      ticket_content_digest: string(r.ticket_content_digest, `${label}.review.ticket_content_digest`),
+      decision,
+      findings_count: integer(r.findings_count, `${label}.review.findings_count`),
+    };
+  }
+  const readiness = object(item.readiness, `${label}.readiness`);
+  exact(readiness, ["ready", "blockers", "subject_ref", "review"], `${label}.readiness`);
+  // The compact summary never embeds a full review; its stable reference is above.
+  if (readiness.review !== undefined && readiness.review !== null) {
+    throw new TicketBrowserContractError(`${label}.readiness.review must be omitted`);
+  }
+  return {
+    review_status: status,
+    review,
+    latest_review_subject_ref: nullableString(item.latest_review_subject_ref, `${label}.latest_review_subject_ref`),
+    latest_event: parseMergeRequestEventReference(item.latest_event, `${label}.latest_event`),
+    thread_event_count: integer(item.thread_event_count, `${label}.thread_event_count`),
+    readiness: {
+      ready: boolean(readiness.ready, `${label}.readiness.ready`),
+      blockers: strings(readiness.blockers, `${label}.readiness.blockers`),
+      subject_ref: optionalNullableString(readiness.subject_ref, `${label}.readiness.subject_ref`),
+    },
+  };
+}
+
+function parseMergeRequestEventPage(
+  value: unknown,
+  label: string,
+): MergeRequestDetailResponse["event_page"] {
+  const item = object(value, label);
+  exact(item, ["omitted", "has_more", "next_after", "limit"], label);
+  return {
+    omitted: boolean(item.omitted, `${label}.omitted`),
+    has_more: boolean(item.has_more, `${label}.has_more`),
+    next_after: item.next_after === null ? null : integer(item.next_after, `${label}.next_after`, 1),
+    limit: integer(item.limit, `${label}.limit`, 1, 200) as MergeRequestDetailResponse["event_page"]["limit"],
+  };
+}
+
 export function parseMergeRequestDetailResponse(
   value: unknown,
 ): MergeRequestDetailResponse {
@@ -1743,6 +1819,9 @@ export function parseMergeRequestDetailResponse(
     "state",
     "target",
     "thread",
+    "summary",
+    "view",
+    "event_page",
     "ticket_ids",
     "updated_at",
     "workspace_id",
@@ -1751,7 +1830,14 @@ export function parseMergeRequestDetailResponse(
   if (!["open", "merged", "closed"].includes(state)) {
     throw new TicketBrowserContractError(`${label}.state is invalid`);
   }
+  const view = string(item.view, `${label}.view`);
+  if (view !== "summary" && view !== "detail") {
+    throw new TicketBrowserContractError(`${label}.view is invalid`);
+  }
   return {
+    view,
+    summary: parseMergeRequestStatusSummary(item.summary, `${label}.summary`),
+    event_page: parseMergeRequestEventPage(item.event_page, `${label}.event_page`),
     created_at: string(item.created_at, `${label}.created_at`),
     linked_tickets: array(
       item.linked_tickets,

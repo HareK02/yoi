@@ -91,12 +91,21 @@ struct MergeRequestInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ShowMergeRequestInput {
     merge_request_id: String,
+    /// summary (default) omits review bodies/history; detail returns exact paged events.
+    /// For compatibility, supplying after/limit without view selects detail.
+    view: Option<MergeRequestReadView>,
     /// Return thread events strictly after this sequence.
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     after: Option<u64>,
-    /// Bounded thread page size. The Backend also enforces its authoritative cap.
+    /// Exact detail/history page size (default 20, maximum 200). Continue with event_page.next_after.
     #[schemars(range(min = 1, max = 200))]
     limit: Option<usize>,
+}
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum MergeRequestReadView {
+    Summary,
+    Detail,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 struct OpenMergeRequestInput {
@@ -203,7 +212,27 @@ impl Tool for MergeRequestTool {
                     "limit must be between 1 and 200".into(),
                 ));
             }
-            return self.show_merge_request(ws, &value.merge_request_id, value.after, value.limit);
+            let view = value.view.unwrap_or_else(|| {
+                if value.after.is_some() || value.limit.is_some() {
+                    MergeRequestReadView::Detail
+                } else {
+                    MergeRequestReadView::Summary
+                }
+            });
+            if matches!(view, MergeRequestReadView::Summary)
+                && (value.after.is_some() || value.limit.is_some())
+            {
+                return Err(ToolError::InvalidArgument(
+                    "after/limit require view=detail".into(),
+                ));
+            }
+            return self.show_merge_request(
+                ws,
+                &value.merge_request_id,
+                view,
+                value.after,
+                value.limit,
+            );
         }
         let (method, path, body) = match self.kind {
             Kind::Readiness => {
@@ -290,12 +319,19 @@ impl MergeRequestTool {
         &self,
         workspace_id: &str,
         merge_request_id: &str,
+        view: MergeRequestReadView,
         after: Option<u64>,
         limit: Option<usize>,
     ) -> Result<ToolOutput, ToolError> {
         let merge_request_id = encode_path_segment(merge_request_id);
         let mut path = format!("/api/w/{workspace_id}/merge-requests/{merge_request_id}");
-        let mut query = Vec::new();
+        let mut query = vec![format!(
+            "view={}",
+            match view {
+                MergeRequestReadView::Summary => "summary",
+                MergeRequestReadView::Detail => "detail",
+            }
+        )];
         if let Some(after) = after {
             query.push(format!("after={after}"));
         }
@@ -1099,7 +1135,7 @@ fn merge_request_operation_not_found() -> WipOperationError {
 pub fn description(n: &str) -> Option<&'static str> {
     match n {
         "ShowMergeRequest" => Some(
-            "Read the selector-based Merge Request, append-only thread, source-review freshness, and target-integration evidence before review, fix, or handoff decisions.",
+            "Read an authoritative compact MR summary by default: source/target observations, full-evidence review status/readiness and stable event references, without review bodies/history. Use view=detail with bounded after/limit for exact reviews/findings and history; continue with event_page.next_after. Status is never inferred from a history page. Summary is not approval or integration authority.",
         ),
         "CheckMergeRequestReadiness" => Some(
             "Resolve current provider refs and derive readiness from exact-source review evidence; source movement requires fresh review while target-only movement preserves unchanged-source approval.",
@@ -1222,7 +1258,10 @@ mod tests {
         let requests = client.requests.lock().expect("request lock");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].method, WorkspaceRequestMethod::Get);
-        assert_eq!(requests[0].path, "/api/w/ws/merge-requests/MR%2F1");
+        assert_eq!(
+            requests[0].path,
+            "/api/w/ws/merge-requests/MR%2F1?view=summary"
+        );
     }
 
     #[tokio::test]
@@ -1243,7 +1282,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             client.requests.lock().expect("request lock")[0].path,
-            "/api/w/ws/merge-requests/MR-1?after=42&limit=200"
+            "/api/w/ws/merge-requests/MR-1?view=detail&after=42&limit=200"
         );
 
         let rejected = tool
@@ -1255,6 +1294,64 @@ mod tests {
             .expect_err("unbounded page size must fail before dispatch");
         assert!(rejected.to_string().contains("between 1 and 200"));
         assert_eq!(client.requests.lock().expect("request lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn native_read_forwards_explicit_projection_and_rejects_ambiguous_summary_paging() {
+        let client = Arc::new(RecordingWorkspaceClient::new(vec![response(json!({
+            "merge_request_id": "MR-1", "view": "detail", "thread": [],
+            "summary": {"review_status": "approved"},
+            "event_page": {"omitted": false, "has_more": true, "next_after": 9, "limit": 1}
+        }))]));
+        let tool = native_merge_request_tools(
+            client.clone(),
+            MergeRequestFeatureConfig {
+                show: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .remove(0);
+        let input = native_merge_request_input(
+            &BTreeMap::from([
+                ("view".into(), WipValue::String("detail".into())),
+                ("after".into(), json_to_wip(&json!(8)).unwrap()),
+                ("limit".into(), json_to_wip(&json!(1)).unwrap()),
+            ]),
+            Some("MR-1"),
+            Some("merge_request_id"),
+        )
+        .unwrap_or_else(|_| panic!("native read arguments should bind"));
+        let output = execute_native_merge_request_tool(
+            &tool,
+            &None,
+            input,
+            Some("MR-1"),
+            WipCallContext {
+                execution: ToolExecutionContext::direct(),
+                security_context: "reader".into(),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("native detail read should succeed"));
+        let output = merge_request_tool_output_json(output)
+            .unwrap_or_else(|_| panic!("valid JSON response"));
+        assert_eq!(output["summary"]["review_status"], "approved");
+        assert_eq!(output["event_page"]["next_after"], 9);
+        assert_eq!(
+            client.requests.lock().unwrap()[0].path,
+            "/api/w/ws/merge-requests/MR-1?view=detail&after=8&limit=1"
+        );
+        let rejected = tool
+            .tool
+            .execute(
+                r#"{"merge_request_id":"MR-1","view":"summary","limit":1}"#,
+                ToolExecutionContext::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(rejected.to_string().contains("require view=detail"));
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

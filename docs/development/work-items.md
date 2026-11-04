@@ -22,6 +22,8 @@ Assignは担当への委譲であり、readyやQueueの操作を前提にしな�
 
 実装・routing・レビュー・終了の判断前には、現行Ticketと必要な関連記録を読む。通知、要約、過去の実装報告を現行の要求や承認の証拠にしない。Worker内の操作は、提供されたtyped toolsとsystem instructionsに従う。CLIや保存先の直接編集で欠けた権限を代替しない。typed Ticket toolsのないクライアントでは、Ticketの作成・更新をYoi Workerへ委ねる。
 
+通常の進捗確認は`ShowTicket(view="summary")`を使い、要求初読・`content_digest`の変化・内容を要する判断では`detail`へ進む。モデル向け要求本文は`initial_post.body`に一度だけ置き、MRは`merge_requests`を正規の一覧とする。`history`は本文を反復しないページ、`post`は観測済み`event_ref`による全文取得であり、切詰め本文を編集CASに使わない。全文post読取りは1 MiBまでで、それを超える投稿は切詰めずエラーにする（分割全文読取りは未対応）。`ShowMergeRequest`のTool/WIPはsummaryを既定とし、履歴・review本文・findingは明示的な`detail`とcursorで読む。MR状態要約は完全な証拠から計算し、表示中の履歴ページから承認・失効を推測しない。これらはモデルへの出力を分ける契約であり、保存正本やDB読込み量の削減を意味しない。
+
 成果には、実際の変更、検証結果、未確認事項、判断に必要な証拠を残す。すべての作業にコメントやartifactを義務付けず、利用者が必要とする返却方法を選ぶ。長い調査結果、生ログ、秘密情報はTicket本文へ転載しない。
 
 対応終了と案件終了はそれぞれ明示的に判断する。結果を返して案件を開いたままにすることもできる。要求充足の判断は担当Worker・利用者の責任であり、Backendの認可・競合検査の成功や、成果物・承認済みMRの存在が代わりに判定するものではない。

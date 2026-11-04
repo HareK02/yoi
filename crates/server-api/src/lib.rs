@@ -8978,6 +8978,9 @@ pub struct MergeRequestListQuery {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MergeRequestThreadQuery {
+    /// Show only: summary omits history; detail returns an exact bounded thread page.
+    /// Omission retains the existing HTTP detail response.
+    pub view: Option<MergeRequestReadView>,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub after: Option<u64>,
     #[schemars(range(min = 0, max = 1000))]
@@ -9005,6 +9008,73 @@ pub struct MergeRequestLinkedTicketResponse {
     pub key: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum MergeRequestReadView {
+    Summary,
+    #[default]
+    Detail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestEventReference {
+    pub event_id: String,
+    /// Exact event: read detail with after = sequence - 1 and limit = 1.
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestReviewSummary {
+    pub event: MergeRequestEventReference,
+    pub request_event_id: String,
+    pub subject_ref: String,
+    pub ticket_content_digest: String,
+    pub decision: ReviewDecision,
+    /// Findings retain their order in the exact review event; no finding body is truncated here.
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub findings_count: usize,
+}
+
+/// Computed from complete persisted evidence, never from the returned history page.
+/// This observation is not integration authority or current-requirements approval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestStatusSummary {
+    /// unknown, none, pending, approved, or request_changes for the observed source.
+    pub review_status: String,
+    pub review: Option<MergeRequestReviewSummary>,
+    pub latest_review_subject_ref: Option<String>,
+    pub latest_event: Option<MergeRequestEventReference>,
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_usize))]
+    pub thread_event_count: usize,
+    /// Existing readiness semantics; review bodies are omitted in this compact projection.
+    pub readiness: MergeRequestReadinessResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequestEventPage {
+    /// Summary deliberately omits events. Read detail from the beginning to obtain history.
+    pub omitted: bool,
+    pub has_more: bool,
+    #[cfg_attr(feature = "typescript", ts(type = "number | null"))]
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub next_after: Option<u64>,
+    #[schemars(range(min = 1, max = 200))]
+    pub limit: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
@@ -9014,6 +9084,9 @@ pub struct MergeRequestDetailResponse {
     pub source: MergeRequestRefResponse,
     pub target: MergeRequestRefResponse,
     pub linked_tickets: Vec<MergeRequestLinkedTicketResponse>,
+    pub view: MergeRequestReadView,
+    pub summary: MergeRequestStatusSummary,
+    pub event_page: MergeRequestEventPage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]

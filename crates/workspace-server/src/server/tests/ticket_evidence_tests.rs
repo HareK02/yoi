@@ -393,6 +393,33 @@ impl EvidenceApiFixture {
 }
 
 #[tokio::test]
+async fn mr_summary_route_omits_history_but_keeps_page_external_approval() {
+    let fixture = EvidenceApiFixture::new().await;
+    let approval = fixture.approve("summary-route");
+    fixture.integrate(&approval);
+    let value = get_json(
+        fixture.app.clone(),
+        &format!("/api/w/{TEST_WORKSPACE_ID}/merge-requests/{EVIDENCE_MR}?view=summary"),
+    )
+    .await;
+    let summary: MergeRequestDetailResponse = serde_json::from_value(value).unwrap();
+    assert!(summary.merge_request.thread.is_empty());
+    assert!(summary.event_page.omitted);
+    assert!(summary.event_page.has_more);
+    assert_eq!(summary.summary.review_status, "approved");
+    assert_eq!(
+        summary.summary.review.as_ref().unwrap().event.event_id,
+        approval.event_id
+    );
+    assert!(summary.summary.readiness.review.is_none());
+    let page = fixture.detail(0, 1).await;
+    assert_eq!(page.merge_request.thread.len(), 1);
+    assert!(page.event_page.has_more);
+    assert!(page.event_page.next_after.is_some());
+    assert_eq!(page.summary, summary.summary);
+}
+
+#[tokio::test]
 async fn closed_merged_remote_ticket_uses_immutable_result_in_show_query_list_and_paged_detail() {
     let fixture = EvidenceApiFixture::new().await;
     let approval = fixture.approve("integration");

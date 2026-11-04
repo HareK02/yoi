@@ -4933,6 +4933,9 @@
           "created_at": {
             "type": "string"
           },
+          "event_page": {
+            "$ref": "#/components/schemas/MergeRequestEventPage"
+          },
           "linked_tickets": {
             "items": {
               "$ref": "#/components/schemas/MergeRequestLinkedTicketResponse"
@@ -4960,6 +4963,9 @@
           "state": {
             "$ref": "#/components/schemas/MergeRequestState"
           },
+          "summary": {
+            "$ref": "#/components/schemas/MergeRequestStatusSummary"
+          },
           "target": {
             "$ref": "#/components/schemas/MergeRequestRefResponse"
           },
@@ -4978,6 +4984,9 @@
           "updated_at": {
             "type": "string"
           },
+          "view": {
+            "$ref": "#/components/schemas/MergeRequestReadView"
+          },
           "workspace_id": {
             "type": "string"
           }
@@ -4994,7 +5003,63 @@
           "thread",
           "source",
           "target",
-          "linked_tickets"
+          "linked_tickets",
+          "view",
+          "summary",
+          "event_page"
+        ],
+        "type": "object"
+      },
+      "MergeRequestEventPage": {
+        "additionalProperties": false,
+        "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "limit": {
+            "format": "uint",
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "next_after": {
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "omitted": {
+            "description": "Summary deliberately omits events. Read detail from the beginning to obtain history.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "omitted",
+          "has_more",
+          "limit"
+        ],
+        "type": "object"
+      },
+      "MergeRequestEventReference": {
+        "additionalProperties": false,
+        "properties": {
+          "event_id": {
+            "type": "string"
+          },
+          "sequence": {
+            "description": "Exact event: read detail with after = sequence - 1 and limit = 1.",
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "event_id",
+          "sequence"
         ],
         "type": "object"
       },
@@ -5120,6 +5185,13 @@
         ],
         "type": "object"
       },
+      "MergeRequestReadView": {
+        "enum": [
+          "summary",
+          "detail"
+        ],
+        "type": "string"
+      },
       "MergeRequestReadinessResponse": {
         "additionalProperties": false,
         "properties": {
@@ -5219,6 +5291,42 @@
         ],
         "type": "object"
       },
+      "MergeRequestReviewSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/ReviewDecision"
+          },
+          "event": {
+            "$ref": "#/components/schemas/MergeRequestEventReference"
+          },
+          "findings_count": {
+            "description": "Findings retain their order in the exact review event; no finding body is truncated here.",
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "request_event_id": {
+            "type": "string"
+          },
+          "subject_ref": {
+            "type": "string"
+          },
+          "ticket_content_digest": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "event",
+          "request_event_id",
+          "subject_ref",
+          "ticket_content_digest",
+          "decision",
+          "findings_count"
+        ],
+        "type": "object"
+      },
       "MergeRequestState": {
         "enum": [
           "open",
@@ -5226,6 +5334,58 @@
           "closed"
         ],
         "type": "string"
+      },
+      "MergeRequestStatusSummary": {
+        "additionalProperties": false,
+        "description": "Computed from complete persisted evidence, never from the returned history page.\nThis observation is not integration authority or current-requirements approval.",
+        "properties": {
+          "latest_event": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MergeRequestEventReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "latest_review_subject_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "readiness": {
+            "$ref": "#/components/schemas/MergeRequestReadinessResponse",
+            "description": "Existing readiness semantics; review bodies are omitted in this compact projection."
+          },
+          "review": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MergeRequestReviewSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "review_status": {
+            "description": "unknown, none, pending, approved, or request_changes for the observed source.",
+            "type": "string"
+          },
+          "thread_event_count": {
+            "format": "uint",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "review_status",
+          "thread_event_count",
+          "readiness"
+        ],
+        "type": "object"
       },
       "MergeRequestThreadEvent": {
         "oneOf": [
@@ -5548,6 +5708,17 @@
               "integer",
               "null"
             ]
+          },
+          "view": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MergeRequestReadView"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Show only: summary omits history; detail returns an exact bounded thread page.\nOmission retains the existing HTTP detail response."
           }
         },
         "type": "object"
@@ -18307,7 +18478,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:3436eada52ceea48f4c50f40195cba02bec37fbbff4ea8f5a332133e6fcde962"
+    "x-yoi-source-digest": "sha256:d5817a2c8527f1859b68e9824b3b277987980f228b0692a2569708a57035fd10"
   },
   "openapi": "3.1.0",
   "paths": {

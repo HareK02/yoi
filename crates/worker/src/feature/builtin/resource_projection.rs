@@ -15,7 +15,7 @@ struct ModelTicketQueryItem {
     title: String,
     state: ticket::TicketState,
     closure_operation_key: Option<String>,
-    current_closure: Option<ticket::TicketClosureJudgment>,
+    current_closure: Option<Value>,
     legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
     assignment_tracking: Vec<ModelAssignmentTracking>,
     tags: Vec<ticket::WorkspaceTag>,
@@ -34,7 +34,6 @@ struct ModelTicketQueryItem {
     unresolved_review_count: usize,
     evidence: Option<ModelTicketEvidence>,
     merge_requests: Vec<ModelMergeRequest>,
-    merge_request: Option<ModelMergeRequest>,
 }
 
 #[derive(Debug, serde::Deserialize, Serialize)]
@@ -50,14 +49,12 @@ pub(super) struct ModelTicketDetail {
     ticket: String,
     content_digest: String,
     title: String,
-    body: String,
-    body_truncated: bool,
     initial_post: ModelTicketEvent,
     targets: Vec<ModelTicketTarget>,
     created_by: Option<String>,
     state: ticket::TicketState,
     closure_operation_key: Option<String>,
-    current_closure: Option<ticket::TicketClosureJudgment>,
+    current_closure: Option<Value>,
     legacy_handoff: Option<ticket::TicketLegacyWorkflowSnapshot>,
     assignment_tracking: Vec<ModelAssignmentTracking>,
     tags: Vec<ticket::WorkspaceTag>,
@@ -65,7 +62,7 @@ pub(super) struct ModelTicketDetail {
     priority: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
-    closure_history: Vec<ticket::TicketCaseHistoryEntry>,
+    closure_history: Vec<Value>,
     thread: Vec<ModelTicketEvent>,
     relations: ModelTicketRelations,
     linked_objectives: Vec<ModelObjectiveSummary>,
@@ -73,7 +70,6 @@ pub(super) struct ModelTicketDetail {
     current_worker: Option<ModelWorkerSummary>,
     implementation_reports: Vec<ModelEvidenceEvent>,
     merge_requests: Vec<ModelMergeRequest>,
-    merge_request: Option<ModelMergeRequest>,
     evidence: Option<ModelTicketEvidence>,
     actions: Option<ModelTicketActions>,
     event_page: Option<ModelEventPage>,
@@ -280,6 +276,21 @@ fn typed_field<T: serde::de::DeserializeOwned>(
     serde_json::from_value(value.clone()).map_err(|error| format!("Invalid Ticket {key}: {error}"))
 }
 
+fn closure_metadata<T: Serialize>(value: T) -> Result<Value, String> {
+    let mut value = serde_json::to_value(value).map_err(|error| error.to_string())?;
+    if let Some(object) = value.as_object_mut() {
+        // The full explanation is available in thread history/post, not repeated
+        // in current judgment and closure-index metadata as well.
+        object.remove("explanation");
+    }
+    Ok(value)
+}
+
+fn project_current_closure(root: &Map<String, Value>) -> Result<Option<Value>, String> {
+    let closure: Option<ticket::TicketClosureJudgment> = typed_field(root, "current_closure")?;
+    closure.map(closure_metadata).transpose()
+}
+
 pub(super) fn project_ticket_query(value: Value) -> Result<ModelTicketQueryResponse, String> {
     let root = object(&value, "Ticket query response")?;
     let page = object_field(root, "page")?;
@@ -301,7 +312,7 @@ fn project_ticket_query_item(value: &Value) -> Result<ModelTicketQueryItem, Stri
         title: string_field(item, "title")?,
         state: typed_field(item, "state")?,
         closure_operation_key: typed_field(item, "closure_operation_key")?,
-        current_closure: typed_field(item, "current_closure")?,
+        current_closure: project_current_closure(item)?,
         legacy_handoff: typed_field(item, "legacy_handoff")?,
         assignment_tracking: project_assignment_tracking(item)?,
         tags: project_tags(item)?,
@@ -330,12 +341,82 @@ fn project_ticket_query_item(value: &Value) -> Result<ModelTicketQueryItem, Stri
             .iter()
             .map(project_merge_request)
             .collect::<Result<Vec<_>, _>>()?,
-        merge_request: item
-            .get("merge_request")
-            .filter(|value| !value.is_null())
-            .map(project_merge_request)
-            .transpose()?,
     })
+}
+
+/// Status is deliberately projected from authority fields, not from serialized detail:
+/// prose/history size and history parsing have no effect on this response.
+pub(super) fn project_ticket_status(value: Value) -> Result<Value, String> {
+    use serde_json::json;
+    let root = object(&value, "Ticket summary response")?;
+    let state: ticket::TicketState = typed_field(root, "state")?;
+    let closure_key: Option<String> = typed_field(root, "closure_operation_key")?;
+    let closure: Option<ticket::TicketClosureJudgment> = typed_field(root, "current_closure")?;
+    let targets: Vec<ModelTicketTarget> = typed_field(root, "targets")?;
+    let tracking = project_assignment_tracking(root)?.into_iter().map(|row| json!({
+        "assignment_id": row.assignment_id, "role": row.role, "principal": row.principal,
+        "assigned_by": row.assigned_by, "assigned_at": row.assigned_at, "current": row.current,
+        "status": row.tracking.map(|tracking| tracking.status),
+        "last_event_id": row.last_event_id, "updated_at": row.updated_at,
+    })).collect::<Vec<_>>();
+    let merges = array_field(root, "merge_requests")?
+        .iter()
+        .map(|value| {
+            let mut merge = serde_json::to_value(project_merge_request(value)?)
+                .map_err(|error| error.to_string())?;
+            merge
+                .as_object_mut()
+                .expect("typed merge object")
+                .remove("review_excerpt");
+            Ok(merge)
+        })
+        .collect::<Result<Vec<Value>, String>>()?;
+    let latest_event_ref = array_field(root, "events")?
+        .last()
+        .map(|event| string_field(object(event, "Ticket event")?, "event_ref"))
+        .transpose()?;
+    Ok(json!({
+        "ticket": resource_ref(root, "resource_key", "T-")?,
+        "title": string_field(root, "title")?,
+        "content_digest": string_field(root, "content_digest")?,
+        "state": state, "closure_operation_key": closure_key,
+        "current_closure": closure.map(|j| json!({"operation_key": j.operation_key, "reason": j.reason, "author": j.author, "at": j.at})),
+        "targets": targets, "tags": project_tags(root)?,
+        "readiness": optional_string(root, "readiness")?,
+        "priority": optional_string(root, "priority")?,
+        "updated_at": optional_string(root, "updated_at")?,
+        "assignment_tracking": tracking,
+        "current_worker": root.get("current_worker").filter(|value| !value.is_null()).map(project_worker).transpose()?,
+        "merge_requests": merges,
+        "evidence": root.get("evidence").map(project_evidence).transpose()?,
+        "actions": root.get("action_eligibility").filter(|value| !value.is_null()).map(project_actions).transpose()?,
+        "latest_event_ref": latest_event_ref,
+    }))
+}
+
+pub(super) fn project_ticket_history(value: Value) -> Result<Value, String> {
+    let root = object(&value, "Ticket history response")?;
+    let thread = array_field(root, "events")?
+        .iter()
+        .filter(|event| event.get("is_initial") != Some(&Value::Bool(true)))
+        .map(project_ticket_event)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(serde_json::json!({
+        "ticket": resource_ref(root, "resource_key", "T-")?,
+        "thread": thread,
+        "event_page": project_event_page(root.get("event_page").ok_or("missing event_page")?)?,
+    }))
+}
+
+pub(super) fn project_ticket_post(value: Value) -> Result<Value, String> {
+    let post = project_ticket_event(&value)?;
+    if post.body_truncated || post.body.is_none() {
+        return Err(
+            "Full-post read returned an absent or truncated body; do not use it for edit CAS"
+                .into(),
+        );
+    }
+    serde_json::to_value(post).map_err(|error| error.to_string())
 }
 
 pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, String> {
@@ -354,8 +435,6 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
         ticket: resource_ref(root, "resource_key", "T-")?,
         content_digest: string_field(root, "content_digest")?,
         title: string_field(root, "title")?,
-        body: string_field(root, "body")?,
-        body_truncated: bool_field(root, "body_truncated")?,
         initial_post: project_ticket_event(
             root.get("initial_post")
                 .ok_or("Ticket detail response is missing initial_post")?,
@@ -364,9 +443,15 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
         created_by: optional_string(root, "created_by")?,
         state: typed_field(root, "state")?,
         closure_operation_key: typed_field(root, "closure_operation_key")?,
-        current_closure: typed_field(root, "current_closure")?,
+        current_closure: project_current_closure(root)?,
         legacy_handoff: typed_field(root, "legacy_handoff")?,
-        closure_history: typed_field(root, "closure_history")?,
+        closure_history: typed_field::<Vec<ticket::TicketCaseHistoryEntry>>(
+            root,
+            "closure_history",
+        )?
+        .into_iter()
+        .map(closure_metadata)
+        .collect::<Result<Vec<_>, _>>()?,
         assignment_tracking: project_assignment_tracking(root)?,
         tags: project_tags(root)?,
         readiness: optional_string(root, "readiness")?,
@@ -375,6 +460,7 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
         updated_at: optional_string(root, "updated_at")?,
         thread: array_field(root, "events")?
             .iter()
+            .filter(|event| event.get("is_initial") != Some(&Value::Bool(true)))
             .map(project_ticket_event)
             .collect::<Result<Vec<_>, _>>()?,
         relations: project_relations(root.get("relations"))?,
@@ -392,11 +478,6 @@ pub(super) fn project_ticket_detail(value: Value) -> Result<ModelTicketDetail, S
             .iter()
             .map(project_merge_request)
             .collect::<Result<Vec<_>, _>>()?,
-        merge_request: root
-            .get("merge_request")
-            .filter(|value| !value.is_null())
-            .map(project_merge_request)
-            .transpose()?,
         evidence: root.get("evidence").map(project_evidence).transpose()?,
         actions: root
             .get("action_eligibility")
@@ -919,7 +1000,18 @@ mod tests {
         assert_eq!(projected["state"], "open");
         assert_eq!(projected["closure_operation_key"], "close-1");
         assert_eq!(projected["current_closure"], Value::Null);
-        assert_eq!(projected["closure_history"], history);
+        assert_eq!(
+            projected["closure_history"],
+            json!(
+                history
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(closure_metadata)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            )
+        );
         assert_eq!(projected["legacy_handoff"], legacy);
         assert_eq!(projected["tags"], response["tags"]);
         assert_eq!(projected["content_digest"], "content-digest");
@@ -1191,7 +1283,8 @@ mod tests {
             .expect("source evidence must project");
             let projected = serde_json::to_value(projected).expect("serialize Ticket detail");
 
-            for merge in [&projected["merge_requests"][0], &projected["merge_request"]] {
+            assert!(projected.get("merge_request").is_none());
+            for merge in [&projected["merge_requests"][0]] {
                 assert_eq!(merge["subject_ref"], json!(subject_ref));
                 assert_eq!(merge["source_ref_observation"], observation);
                 assert_eq!(
@@ -1378,9 +1471,14 @@ mod tests {
             "current_closure",
             "legacy_handoff",
         ] {
-            assert_eq!(projected_detail[field], detail[field], "detail {field}");
+            let expected = if field == "current_closure" {
+                closure_metadata(&detail[field]).unwrap()
+            } else {
+                detail[field].clone()
+            };
+            assert_eq!(projected_detail[field], expected, "detail {field}");
             assert_eq!(
-                projected_query["tickets"][0][field], detail[field],
+                projected_query["tickets"][0][field], expected,
                 "query {field}"
             );
         }
@@ -1392,10 +1490,22 @@ mod tests {
             assert!(actual.get("workspace_id").is_none());
             assert!(actual.get("ticket_id").is_none());
         }
-        assert_eq!(projected_detail["closure_history"], history);
+        assert_eq!(
+            projected_detail["closure_history"],
+            json!(
+                history
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(closure_metadata)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            )
+        );
         assert_eq!(projected_detail["content_digest"], "content-1");
         assert_eq!(projected_detail["created_by"], "workspace-user:creator");
-        assert_eq!(projected_detail["body_truncated"], false);
+        assert_eq!(projected_detail["initial_post"]["body_truncated"], false);
+        assert!(projected_detail.get("body").is_none());
         for initial in [true, false] {
             let input = post_fixture(initial, "The same post contract");
             let output = serde_json::to_value(project_ticket_event(&input).unwrap()).unwrap();
@@ -1486,6 +1596,93 @@ mod tests {
                 "{state}"
             );
         }
+    }
+
+    #[test]
+    fn ticket_views_keep_prose_once_and_summary_independent_of_prose_and_history() {
+        let body = "unique-long-requirement-".repeat(600);
+        let post = post_fixture(true, &body);
+        let closure = json!({"operation_key":"close", "reason":"completed", "explanation":"closure prose", "references":[], "author":"user", "at":"today"});
+        let tracking = json!({"workspace_id":"ws", "ticket_id":"internal", "assignment_id":"assignment", "role":"orchestrator", "principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"}, "assigned_by":"user", "assigned_at":"today", "release":null, "current":true, "last_event_id":"handling-event", "updated_at":"today", "migration_diagnostic":null, "tracking":{"status":"waiting", "waiting_reason":"prose", "progress":null, "next_action":"prose", "result":null}});
+        let merge = json!({"merge_request_id":"MR-1", "repository_key":"main", "state":"open", "selector_from":"topic", "selector_to":"main", "review_status":"request_changes", "current_subject_ref":"sha1", "source_ref_observation":{"status":"observed"}, "integration_evidence_error":null, "review_excerpt":"review prose"});
+        let mut input = json!({
+            "resource_key":"T-848", "title":"Views", "body":body, "body_truncated":false, "initial_post":post,
+            "content_digest":"content", "state":"closed", "closure_operation_key":"close", "current_closure":closure,
+            "closure_history":[], "legacy_handoff":null, "targets":[], "tags":[], "assignment_tracking":[tracking],
+            "events":[post, post_fixture(false, "discussion")], "assignments":[], "linked_objectives":[],
+            "implementation_reports":[], "merge_requests":[merge.clone()], "merge_request":merge,
+            "event_page":{"next_cursor":"stable-cursor", "has_more":true}
+        });
+        let detail = serde_json::to_value(project_ticket_detail(input.clone()).unwrap()).unwrap();
+        assert_eq!(detail.to_string().matches(&body).count(), 1);
+        assert!(detail.get("body").is_none());
+        assert!(detail.get("merge_request").is_none());
+        assert_eq!(detail["thread"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["initial_post"]["event_ref"], "post-initial");
+        assert_eq!(detail["initial_post"]["body_digest"], "a".repeat(64));
+        assert!(detail["current_closure"].get("explanation").is_none());
+        let history = project_ticket_history(input.clone()).unwrap();
+        assert_eq!(history.as_object().unwrap().len(), 3);
+        assert_eq!(history["event_page"]["next_cursor"], "stable-cursor");
+        let summary = project_ticket_status(input.clone()).unwrap();
+        // Reconstruct the removed model-facing aliases on this same fixture.
+        let mut duplicated = detail.clone();
+        duplicated["body"] = detail["initial_post"]["body"].clone();
+        duplicated["body_truncated"] = detail["initial_post"]["body_truncated"].clone();
+        duplicated["merge_request"] = detail["merge_requests"][0].clone();
+        duplicated["thread"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, detail["initial_post"].clone());
+        assert_eq!(duplicated.to_string().matches(&body).count(), 3);
+        assert!(duplicated.to_string().len() > detail.to_string().len());
+        let mut changed = input.clone();
+        changed["content_digest"] = json!("new-requirements-digest");
+        changed["merge_requests"][0]["current_subject_ref"] = json!("sha2");
+        changed["merge_requests"][0]["review_status"] = json!("pending");
+        let changed = project_ticket_status(changed).unwrap();
+        assert_ne!(summary["content_digest"], changed["content_digest"]);
+        assert_ne!(
+            summary["merge_requests"][0]["subject_ref"],
+            changed["merge_requests"][0]["subject_ref"]
+        );
+        assert_ne!(
+            summary["merge_requests"][0]["review_status"],
+            changed["merge_requests"][0]["review_status"]
+        );
+        assert_eq!(summary["content_digest"], "content");
+        assert_eq!(summary["closure_operation_key"], "close");
+        assert_eq!(summary["assignment_tracking"][0]["status"], "waiting");
+        assert_eq!(
+            summary["assignment_tracking"][0]["last_event_id"],
+            "handling-event"
+        );
+        assert_eq!(summary["merge_requests"][0]["subject_ref"], "sha1");
+        assert_eq!(
+            summary["merge_requests"][0]["review_status"],
+            "request_changes"
+        );
+        let huge = "全文🦀".repeat(100_000);
+        input["body"] = json!(huge);
+        input["initial_post"]["body"] = json!(huge);
+        input["current_closure"]["explanation"] = json!(huge);
+        input["assignment_tracking"][0]["tracking"]["waiting_reason"] = json!(huge);
+        input["merge_requests"][0]["review_excerpt"] = json!(huge);
+        input["closure_history"] = json!(vec![json!({"explanation":huge}); 20]);
+        input["implementation_reports"] = json!(vec![json!({"excerpt":huge}); 20]);
+        input["events"] = json!(vec![post_fixture(false, "history prose"); 1000]);
+        let larger = project_ticket_status(input).unwrap();
+        assert_eq!(summary, larger);
+        eprintln!(
+            "Ticket workspace bytes: duplicated fixture={}, detail={}, summary={} (identical with large prose and 1000 events)",
+            duplicated.to_string().len(),
+            detail.to_string().len(),
+            summary.to_string().len()
+        );
+        let mut full = post_fixture(false, &huge);
+        assert_eq!(project_ticket_post(full.clone()).unwrap()["body"], huge);
+        full["body_truncated"] = json!(true);
+        assert!(project_ticket_post(full).is_err());
     }
 
     #[test]

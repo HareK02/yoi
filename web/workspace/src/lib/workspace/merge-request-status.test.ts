@@ -138,7 +138,7 @@ Deno.test("closed Ticket can retain immutable approval while current requirement
 Deno.test("Ticket route separates current requirement evidence from immutable integration approval without changing case closure", async () => {
   const source = await Deno.readTextFile(
     new URL(
-      "../../routes/w/[workspaceId]/tickets/[ticketId]/+page.svelte",
+      "../../routes/w/[workspaceId]/tickets/[ticketId]/PageContent.svelte",
       import.meta.url,
     ),
   );
@@ -164,7 +164,7 @@ Deno.test("Ticket route separates current requirement evidence from immutable in
 Deno.test("Merge Request routes distinguish recorded approval from live source observation and expose errors", async () => {
   const list = await Deno.readTextFile(
     new URL(
-      "../../routes/w/[workspaceId]/merge-requests/+page.svelte",
+      "../../routes/w/[workspaceId]/merge-requests/PageContent.svelte",
       import.meta.url,
     ),
   );
@@ -172,7 +172,7 @@ Deno.test("Merge Request routes distinguish recorded approval from live source o
   assertEquals(list.includes("Integration evidence error:"), true);
   const detail = await Deno.readTextFile(
     new URL(
-      "../../routes/w/[workspaceId]/merge-requests/[mergeRequestId]/+page.svelte",
+      "../../routes/w/[workspaceId]/merge-requests/[mergeRequestId]/PageContent.svelte",
       import.meta.url,
     ),
   );
@@ -183,6 +183,23 @@ Deno.test("Merge Request routes distinguish recorded approval from live source o
 
 Deno.test("merged detail uses backend validated immutable evidence even with a partial thread", () => {
   const detail: MergeRequestDetail = {
+    view: "detail",
+    summary: {
+      review_status: "approved",
+      review: {
+        event: { event_id: "approval-1", sequence: 2 },
+        request_event_id: "request-1",
+        subject_ref: "source-1",
+        ticket_content_digest: "a".repeat(64),
+        decision: "approve",
+        findings_count: 0,
+      },
+      latest_review_subject_ref: "source-1",
+      latest_event: { event_id: "merge-1", sequence: 3 },
+      thread_event_count: 3,
+      readiness: { ready: false, blockers: ["already_merged"] },
+    },
+    event_page: { omitted: false, has_more: false, next_after: null, limit: 100 as MergeRequestDetail["event_page"]["limit"] },
     merge_request_id: "mr-1",
     workspace_id: "workspace-a",
     repository_key: "main",
@@ -224,7 +241,7 @@ Deno.test("merged detail uses backend validated immutable evidence even with a p
   );
   assertEquals(
     sourceReviewFreshness({ ...detail, thread: [] }),
-    "Recorded integration approval for immutable merged source source-1.",
+    "Recorded integration approval approval-1 for immutable merged source source-1.",
   );
   assertEquals(
     sourceReviewFreshness({

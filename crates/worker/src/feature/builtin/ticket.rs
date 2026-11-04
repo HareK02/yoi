@@ -80,7 +80,11 @@ use crate::wip::{
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 use agen::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 
-use super::resource_projection::{project_ticket_detail, project_ticket_query};
+use super::resource_projection::{
+    project_ticket_detail, project_ticket_history, project_ticket_post, project_ticket_query,
+    project_ticket_status,
+};
+use ticket::tool::ShowTicketView;
 
 #[derive(Clone, Copy)]
 enum WorkspaceTicketReadKind {
@@ -102,7 +106,7 @@ impl WorkspaceTicketReadKind {
                 "Query authoritative Workspace Tickets with bounded typed filters, stable snippets, evidence summaries, and cursor metadata."
             }
             Self::Show => {
-                "Show one authoritative Workspace Ticket with its ordered implementation targets (repository_key, ref_selector, access), content digest, paged thread, links, historical implementation reports, and current Merge Request readiness evidence. Read targets here before choosing a work repository; a null selector remains unspecified, not an inferred default."
+                "Read one authoritative Workspace Ticket. Use view=summary for current state/CAS, targets, delegation identities/status and MR evidence without prose/history; detail (default) for canonical initial_post and bounded discussion; history with event_cursor for only thread/page metadata; post with an observed event_ref for the exact full post. Never use truncated text for edit CAS or guess event IDs. Read targets before choosing a repository; a null selector remains unspecified. Summary alone is not approval or completion authority."
             }
         }
     }
@@ -227,9 +231,14 @@ struct WorkspaceQueryTicketInput {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 struct WorkspaceShowTicketInput {
+    /// summary omits prose/history; detail is default; history returns only a thread page; post returns the exact full post up to 1 MiB (larger posts fail, never truncate).
+    #[serde(default)]
+    view: ShowTicketView,
+    /// Exact observed event_ref, required only for view=post. Never a display ordinal.
+    event_ref: Option<String>,
     /// Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility.
     id: String,
-    /// Most-recent thread entries to return, bounded by the Backend to 1..=50.
+    /// Most-recent thread entries to return, bounded by the Backend to 1..=100.
     event_limit: Option<usize>,
     /// Opaque event cursor returned by a prior ShowTicket page.
     event_cursor: Option<String>,
@@ -251,6 +260,8 @@ impl Tool for WorkspaceTicketReadTool {
         let workspace_id = self.client.workspace_id().ok_or_else(|| {
             ToolError::InvalidArgument("Workspace Ticket reads require workspace identity".into())
         })?;
+        let mut view = ShowTicketView::Detail;
+        let mut method = WorkspaceRequestMethod::Post;
         let (path, body) = match self.kind {
             WorkspaceTicketReadKind::Query => {
                 let input: WorkspaceQueryTicketInput = serde_json::from_str(&input)
@@ -276,22 +287,41 @@ impl Tool for WorkspaceTicketReadTool {
                         "ShowTicket.id must not be empty".into(),
                     ));
                 }
-                let path = format!("/api/w/{workspace_id}/tickets/{}/show", input.id.trim());
-                let body = json!({
-                    "event_limit": input.event_limit,
-                    "event_cursor": input.event_cursor,
-                });
-                (path, body)
+                view = input.view;
+                view.validate(input.event_cursor.as_deref(), input.event_ref.as_deref())
+                    .map_err(ToolError::InvalidArgument)?;
+                let id =
+                    WorkspaceHttpTicketBackend::ticket_path(&TicketIdOrSlug::from(input.id.trim()));
+                if let Some(event_ref) = input.event_ref {
+                    method = WorkspaceRequestMethod::Get;
+                    let event_ref =
+                        WorkspaceHttpTicketBackend::ticket_path(&TicketIdOrSlug::from(event_ref));
+                    (
+                        format!("/api/w/{workspace_id}/tickets/{id}/posts/{event_ref}"),
+                        Value::Null,
+                    )
+                } else {
+                    let path = format!("/api/w/{workspace_id}/tickets/{id}/show");
+                    let body = json!({
+                        "event_limit": if view == ShowTicketView::Summary { Some(1) } else { input.event_limit },
+                        "event_cursor": input.event_cursor,
+                    });
+                    (path, body)
+                }
             }
         };
         let response = self
             .client
-            .execute(WorkspaceRequest::json(
-                WorkspaceRequestMethod::Post,
-                path,
-                serde_json::to_string(&body)
-                    .map_err(|error| ToolError::Internal(error.to_string()))?,
-            ))
+            .execute(if method == WorkspaceRequestMethod::Get {
+                WorkspaceRequest::get(path)
+            } else {
+                WorkspaceRequest::json(
+                    method,
+                    path,
+                    serde_json::to_string(&body)
+                        .map_err(|error| ToolError::Internal(error.to_string()))?,
+                )
+            })
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         if !response.is_success() {
             return Err(ToolError::ExecutionFailed(ticket_api_error_message(
@@ -308,9 +338,20 @@ impl Tool for WorkspaceTicketReadTool {
             WorkspaceTicketReadKind::Query => serde_json::to_string(
                 &project_ticket_query(response_value).map_err(ToolError::ExecutionFailed)?,
             ),
-            WorkspaceTicketReadKind::Show => serde_json::to_string(
-                &project_ticket_detail(response_value).map_err(ToolError::ExecutionFailed)?,
-            ),
+            WorkspaceTicketReadKind::Show => match view {
+                ShowTicketView::Detail => serde_json::to_string(
+                    &project_ticket_detail(response_value).map_err(ToolError::ExecutionFailed)?,
+                ),
+                ShowTicketView::Summary => serde_json::to_string(
+                    &project_ticket_status(response_value).map_err(ToolError::ExecutionFailed)?,
+                ),
+                ShowTicketView::History => serde_json::to_string(
+                    &project_ticket_history(response_value).map_err(ToolError::ExecutionFailed)?,
+                ),
+                ShowTicketView::Post => serde_json::to_string(
+                    &json!({"post": project_ticket_post(response_value).map_err(ToolError::ExecutionFailed)?}),
+                ),
+            },
         }
         .map_err(|error| ToolError::Internal(error.to_string()))?;
         Ok(ToolOutput {
@@ -2891,6 +2932,127 @@ mod tests {
                     .iter()
                     .all(|request| request.path == "/api/w/workspace/tickets/T-739/show")
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn show_views_share_tool_and_route_bound_wip_wiring() {
+        for view in ["summary", "detail", "history", "post"] {
+            let mut detail = target_detail_fixture(
+                json!([{"repository_key":"main", "ref_selector":null, "access":"read_write"}]),
+            );
+            let unicode = "全文🦀é\n".repeat(20_000);
+            detail["event_page"] = json!({"next_cursor":"opaque-before", "has_more":true});
+            let mut post = detail["initial_post"].clone();
+            post["event_ref"] = json!("persisted:id/with unicode界");
+            post["body"] = json!(unicode);
+            let response = if view == "post" { post.clone() } else { detail };
+            let client = Arc::new(DecisionClient {
+                requests: Mutex::new(Vec::new()),
+                response: crate::worker::WorkspaceResponse {
+                    status: 200,
+                    body: response.to_string(),
+                },
+            });
+            let (meta, tool) =
+                workspace_ticket_read_definition(client.clone(), WorkspaceTicketReadKind::Show)();
+            assert!(meta.input_schema["properties"]["view"].is_object());
+            assert!(meta.input_schema["properties"]["event_ref"].is_object());
+            let mut input = json!({"id":"T-739", "view":view});
+            if view == "post" {
+                input["event_ref"] = post["event_ref"].clone();
+            }
+            if view == "history" {
+                input["event_cursor"] = json!("opaque-before");
+            }
+            let direct = ticket_tool_output_json(
+                tool.execute(&input.to_string(), ToolExecutionContext::direct())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap_or_else(|_| panic!("Ticket {view} returned invalid JSON"));
+            let tools =
+                native_ticket_tools(client.clone(), TicketFeatureAccess::read_only()).unwrap();
+            let descriptor = ticket_descriptor(&tools, "Ticket", "bound").unwrap();
+            let read = descriptor
+                .operations
+                .iter()
+                .find(|op| op.name == "read")
+                .unwrap();
+            assert!(read.parameters.iter().any(|param| param.name == "view"));
+            assert!(
+                read.parameters
+                    .iter()
+                    .any(|param| param.name == "event_ref")
+            );
+            assert!(!read.parameters.iter().any(|param| param.name == "id"));
+            let resolver = TicketItemResolver {
+                tools: operation_map(tools),
+                permissions: None,
+                collection_route: "/tickets".into(),
+                observations: Arc::new(Mutex::new(TicketObservationState::default())),
+            };
+            input.as_object_mut().unwrap().remove("id");
+            let arguments = input
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), json_to_wip(value).unwrap()))
+                .collect();
+            let bound = resolver.resolve("T-739").unwrap();
+            let output = bound
+                .handler
+                .call(
+                    "read",
+                    &arguments,
+                    WipCallContext {
+                        execution: ToolExecutionContext::direct(),
+                        security_context: "reader".into(),
+                    },
+                )
+                .await
+                .unwrap_or_else(|_| panic!("WIP {view} failed"));
+            assert_eq!(wip_to_json(&output.value).unwrap(), direct);
+            match view {
+                "post" => {
+                    assert_eq!(direct["post"]["body"], unicode);
+                    assert_eq!(direct["post"]["body_truncated"], false);
+                }
+                "history" => {
+                    assert_eq!(direct.as_object().unwrap().len(), 3);
+                }
+                "summary" => {
+                    assert!(direct.get("initial_post").is_none());
+                    assert_eq!(direct["content_digest"], "observed-content");
+                }
+                _ => {
+                    assert_eq!(direct["initial_post"]["body"], "Requirements");
+                }
+            }
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].method, requests[1].method);
+            assert_eq!(requests[0].path, requests[1].path);
+            assert_eq!(requests[0].body, requests[1].body);
+            if view == "post" {
+                assert_eq!(requests[0].method, WorkspaceRequestMethod::Get);
+                assert_eq!(
+                    requests[0].path,
+                    "/api/w/workspace/tickets/T-739/posts/persisted%3Aid%2Fwith%20unicode%E7%95%8C"
+                );
+                assert!(requests[0].body.is_none());
+            } else {
+                let body: Value =
+                    serde_json::from_str(requests[0].body.as_deref().unwrap()).unwrap();
+                assert!(body.get("view").is_none());
+                assert!(body.get("event_ref").is_none());
+                if view == "summary" {
+                    assert_eq!(body["event_limit"], 1);
+                }
+                if view == "history" {
+                    assert_eq!(body["event_cursor"], "opaque-before");
+                }
+            }
         }
     }
 

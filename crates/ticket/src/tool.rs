@@ -132,9 +132,7 @@ System events and case judgments cannot be edited. The Workspace backend supplie
 const LIST_DESCRIPTION: &str = "Query Tickets from the configured typed Ticket backend as a bounded \
 overview. Workspace-backed Workers replace this definition with the richer authoritative \
 text/event/evidence/relation/Objective/time/attention query.";
-const SHOW_DESCRIPTION: &str = "Show one Ticket by id or exact query through the configured typed \
-Ticket backend. Output includes the initial comment and recent events with stable event_ref, author/time and edit metadata, bounded Markdown body, resolution, and artifact \
-metadata; Workspace-backed Workers replace this definition with the richer authoritative evidence projection.";
+const SHOW_DESCRIPTION: &str = "Read one Ticket by id or exact query. Use view=summary for status/CAS without prose or history; detail (default) for canonical initial_post and bounded recent discussion; history with event_cursor for older thread pages; post with an observed event_ref for the exact full post. Never use truncated bodies for edit CAS or guess event identities. Workspace-backed Workers retain the same views with authoritative delegation and MR evidence.";
 const COMMENT_DESCRIPTION: &str = "Append a typed Ticket comment event. `body` is Markdown.";
 const PLAN_DESCRIPTION: &str = "Append a typed Ticket plan event. `body` is Markdown.";
 const DECISION_DESCRIPTION: &str = "Append a typed Ticket decision event. `body` is Markdown.";
@@ -549,8 +547,50 @@ impl QueryTicketParams {
     }
 }
 
+/// Model-facing read modes shared by generic Ticket and Workspace Tool/WIP reads.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ShowTicketView {
+    Summary,
+    #[default]
+    Detail,
+    History,
+    Post,
+}
+
+impl ShowTicketView {
+    pub fn validate(
+        self,
+        event_cursor: Option<&str>,
+        event_ref: Option<&str>,
+    ) -> Result<(), String> {
+        if (self == Self::Post) != event_ref.is_some()
+            || event_ref.is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(
+                "event_ref is required only for view=post; use an observed identity".into(),
+            );
+        }
+        if event_cursor.is_some() && !matches!(self, Self::Detail | Self::History) {
+            return Err("event_cursor is only valid for detail/history".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ShowTicketParams {
+    /// summary omits prose/history; detail is the default; history returns only a thread page; post returns an exact full post up to 1 MiB (larger posts fail, never truncate).
+    #[serde(default)]
+    view: ShowTicketView,
+    /// Opaque continuation from event_page. Valid for detail/history only.
+    #[serde(default)]
+    event_cursor: Option<String>,
+    /// Exact observed post identity. Required only for view=post.
+    #[serde(default)]
+    event_ref: Option<String>,
     /// Ticket reference. Prefer `T-*`; canonical internal ids remain accepted for compatibility. Exactly one of `id` or `query` must be provided.
     #[serde(default)]
     id: Option<String>,
@@ -1096,6 +1136,10 @@ impl Tool for ShowTicketTool {
         _ctx: agen::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: ShowTicketParams = parse_input("ShowTicket", input_json)?;
+        params
+            .view
+            .validate(params.event_cursor.as_deref(), params.event_ref.as_deref())
+            .map_err(ToolError::InvalidArgument)?;
         let query = id_or_query(params.id, params.query)?;
         let event_limit = bounded(params.event_limit, DEFAULT_EVENT_LIMIT, MAX_EVENT_LIMIT);
         let artifact_limit = bounded(
@@ -1117,10 +1161,45 @@ impl Tool for ShowTicketTool {
             ticket.meta.id,
             ticket.meta.workflow_state.as_str()
         );
-        Ok(json_output(
-            summary,
-            ticket_json(&ticket, event_limit, artifact_limit, body_max_bytes),
-        ))
+        let value = match params.view {
+            ShowTicketView::Summary => ticket_status_json(&ticket),
+            ShowTicketView::Post => {
+                let event = ticket
+                    .events
+                    .iter()
+                    .find(|event| Some(event.event_ref.as_str()) == params.event_ref.as_deref())
+                    .ok_or_else(|| {
+                        ToolError::InvalidArgument(
+                            "Observed post identity not found in this Ticket".into(),
+                        )
+                    })?;
+                // Match the Workspace full-post route: never silently truncate CAS input.
+                if event.body.as_str().len() > 1024 * 1024 {
+                    return Err(ToolError::ExecutionFailed(
+                        "Exact post exceeds the 1 MiB full-read limit; do not edit from a truncated preview".into(),
+                    ));
+                }
+                json!({"ticket": ticket.meta.id, "post": ticket_event_json(event, usize::MAX)})
+            }
+            ShowTicketView::Detail | ShowTicketView::History => {
+                let (events, page) = ticket_event_page(
+                    &ticket,
+                    params.event_cursor.as_deref(),
+                    event_limit,
+                    body_max_bytes,
+                )?;
+                if params.view == ShowTicketView::History {
+                    json!({"ticket": ticket.meta.id, "thread": events, "event_page": page})
+                } else {
+                    let mut detail =
+                        ticket_json(&ticket, event_limit, artifact_limit, body_max_bytes);
+                    detail["events"] = events;
+                    detail["event_page"] = page;
+                    detail
+                }
+            }
+        };
+        Ok(json_output(summary, value))
     }
 }
 
@@ -1694,8 +1773,70 @@ fn ticket_relations_json(ticket: &Ticket) -> Value {
     })
 }
 
-fn ticket_event_json(event: &crate::TicketEvent, body_max_bytes: usize) -> Value {
+fn ticket_status_json(ticket: &Ticket) -> Value {
     json!({
+        "ticket": ticket.meta.resource_key.as_deref().unwrap_or(&ticket.meta.id),
+        "title": ticket.meta.title,
+        "state": ticket.meta.workflow_state,
+        "content_digest": crate::ticket_content_digest(ticket),
+        "closure_operation_key": ticket.closure_operation_key,
+        "current_closure": ticket.current_closure.as_ref().map(|j| json!({
+            "operation_key": j.operation_key, "reason": j.reason, "author": j.author, "at": j.at
+        })),
+        "targets": ticket.meta.targets,
+        "tags": ticket.tags,
+        "assignee": ticket.meta.assignee,
+        "readiness": ticket.meta.readiness,
+        "updated_at": ticket.meta.updated_at,
+        "latest_event_ref": ticket.events.last().map(|event| &event.event_ref),
+    })
+}
+
+// Cursor is the persisted identity of the oldest returned event, never an offset.
+// Appending newer events between pages therefore cannot shift the continuation.
+fn ticket_event_page(
+    ticket: &Ticket,
+    cursor: Option<&str>,
+    limit: usize,
+    body_max_bytes: usize,
+) -> Result<(Value, Value), ToolError> {
+    let events: Vec<_> = ticket
+        .events
+        .iter()
+        .filter(|event| !event.is_initial)
+        .collect();
+    let end = match cursor {
+        None => events.len(),
+        Some(cursor) => events
+            .iter()
+            .position(|event| event.event_ref == cursor)
+            .ok_or_else(|| {
+                ToolError::InvalidArgument(
+                    "Unknown Ticket event_cursor; reuse a returned cursor".into(),
+                )
+            })?,
+    };
+    let start = end.saturating_sub(limit.max(1));
+    let items: Vec<_> = events[start..end]
+        .iter()
+        .map(|event| ticket_event_json(event, body_max_bytes))
+        .collect();
+    let next_cursor = if start > 0 {
+        Some(&events[start].event_ref)
+    } else {
+        None
+    };
+    Ok((
+        json!({"count": events.len(), "returned": items.len(), "truncated": start > 0, "items": items}),
+        json!({"next_cursor": next_cursor, "has_more": start > 0}),
+    ))
+}
+
+fn ticket_event_json(event: &crate::TicketEvent, body_max_bytes: usize) -> Value {
+    use sha2::{Digest, Sha256};
+    json!({
+        "body_digest": Sha256::digest(event.body.as_str().as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "editable": event.kind == TicketEventKind::Comment,
         "event_ref": event.event_ref,
         "is_initial": event.is_initial,
         "kind": event.kind.as_str(),
@@ -1722,13 +1863,8 @@ fn ticket_json(
     artifact_limit: usize,
     body_max_bytes: usize,
 ) -> Value {
-    let event_count = ticket.events.len();
-    let events: Vec<_> = ticket
-        .events
-        .iter()
-        .skip(event_count.saturating_sub(event_limit))
-        .map(|event| ticket_event_json(event, body_max_bytes))
-        .collect();
+    let (events, event_page) = ticket_event_page(ticket, None, event_limit, body_max_bytes)
+        .expect("first thread page has no cursor to reject");
     let artifact_count = ticket.artifacts.len();
     let artifacts: Vec<_> = ticket
         .artifacts
@@ -1753,17 +1889,12 @@ fn ticket_json(
         },
         "content_digest": crate::ticket_content_digest(ticket),
         "closure_operation_key": ticket.closure_operation_key,
-        "current_closure": ticket.current_closure.as_ref().map(|j| json!({"operation_key": j.operation_key, "reason": j.reason, "explanation": truncate_text(&j.explanation, body_max_bytes), "author": j.author, "references": j.references, "at": j.at})),
-        "case_history": { "count": ticket.case_history.len(), "items": ticket.case_history.iter().rev().take(event_limit).map(|j| json!({"operation_key": j.operation_key, "previous_closure_operation_key": j.previous_closure_operation_key, "action": j.action, "explanation": truncate_text(&j.explanation, body_max_bytes), "author": j.author, "references": j.references, "at": j.at})).collect::<Vec<_>>() },
+        "current_closure": ticket.current_closure.as_ref().map(|j| json!({"operation_key": j.operation_key, "reason": j.reason, "author": j.author, "references": j.references, "at": j.at})),
+        "case_history": { "count": ticket.case_history.len(), "items": ticket.case_history.iter().rev().take(event_limit).map(|j| json!({"operation_key": j.operation_key, "previous_closure_operation_key": j.previous_closure_operation_key, "action": j.action, "author": j.author, "references": j.references, "at": j.at})).collect::<Vec<_>>() },
         "legacy_workflow_snapshot": ticket.legacy_workflow_snapshot,
         "initial_post": ticket.events.iter().find(|event| event.is_initial).map(|event| ticket_event_json(event, body_max_bytes)),
-        "body": truncate_text(ticket.document.body.as_str(), body_max_bytes),
-        "events": {
-            "count": event_count,
-            "returned": events.len(),
-            "truncated": event_count > events.len(),
-            "items": events,
-        },
+        "events": events,
+        "event_page": event_page,
         "artifacts": {
             "count": artifact_count,
             "returned": artifacts.len(),
@@ -2063,13 +2194,17 @@ mod tests {
                 .await
                 .unwrap();
             let value: Value = serde_json::from_str(&output.content.unwrap()).unwrap();
-            assert_eq!(value["events"]["count"], 2);
-            let projected = value["events"]["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|e| e["event_ref"] == post.event_ref)
-                .unwrap();
+            assert_eq!(value["events"]["count"], 1);
+            let projected = if post.is_initial {
+                &value["initial_post"]
+            } else {
+                value["events"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["event_ref"] == post.event_ref)
+                    .unwrap()
+            };
             assert_eq!(projected["author"], json!(post.author));
             assert_eq!(projected["at"], json!(post.at));
             assert_eq!(projected["is_initial"], post.is_initial);
@@ -2104,7 +2239,8 @@ mod tests {
             value["initial_post"]["event_ref"],
             before.events[0].event_ref
         );
-        assert_eq!(value["initial_post"]["body"], value["body"]);
+        assert_eq!(value["initial_post"]["body"], "Edited Initial body");
+        assert!(value.get("body").is_none());
         assert_eq!(value["meta"]["created_by"], "creator");
         assert_eq!(value["initial_post"]["author"], "creator");
         let initial_keys = value["initial_post"]
@@ -2518,7 +2654,10 @@ mod tests {
             .unwrap();
         let value: Value = serde_json::from_str(&output.content.unwrap()).unwrap();
         assert_eq!(
-            value["body"].as_str().unwrap().trim_start_matches('\n'),
+            value["initial_post"]["body"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches('\n'),
             "ONE\ntwo\nONE\n"
         );
 
@@ -2980,13 +3119,13 @@ mod tests {
         assert_eq!(value["closure_operation_key"], "tool-correct");
         assert_eq!(value["case_history"]["count"], 2);
         assert_eq!(value["case_history"]["items"].as_array().unwrap().len(), 1);
+        assert!(value["current_closure"].get("explanation").is_none());
         assert!(
-            value["current_closure"]["explanation"]
-                .as_str()
-                .unwrap()
-                .len()
-                < 256
+            value["case_history"]["items"][0]
+                .get("explanation")
+                .is_none()
         );
+        assert_eq!(value["events"]["items"][0]["body_truncated"], true);
         assert!(value["content_digest"].as_str().unwrap().len() == 64);
         let mut reopen = correction;
         reopen["expected_closure_operation_key"] = json!("tool-correct");
@@ -3013,6 +3152,148 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn show_views_deduplicate_bound_history_and_read_exact_unicode_posts() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let body = "long-requirement-".repeat(700);
+        let mut input = NewTicket::new("Read projections");
+        input.body = MarkdownText::new(body.clone());
+        let reference = backend.create(input).unwrap();
+        for index in 0..5 {
+            backend
+                .add_event(
+                    reference.id.clone().into(),
+                    NewTicketEvent::new(TicketEventKind::Comment, format!("comment-{index}")),
+                )
+                .unwrap();
+        }
+        let before = backend.show(reference.id.clone().into()).unwrap();
+        let detail = ticket_json(&before, 20, 20, DEFAULT_BODY_MAX_BYTES);
+        assert_eq!(detail.to_string().matches(&body).count(), 1);
+        assert!(detail.get("body").is_none());
+        assert!(
+            detail["events"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|event| event["is_initial"] == false)
+        );
+        let mut larger = before.clone();
+        larger.document.body = MarkdownText::new("prose".repeat(100_000));
+        larger.events[0].body = larger.document.body.clone();
+        larger
+            .events
+            .extend(vec![before.events.last().unwrap().clone(); 1000]);
+        let small_summary = ticket_status_json(&before).to_string();
+        let large_summary = ticket_status_json(&larger).to_string();
+        assert_eq!(small_summary.len(), large_summary.len());
+        eprintln!(
+            "Ticket generic bytes: detail={}, summary={} (unchanged with 500KB body / 1000 extra events)",
+            detail.to_string().len(),
+            small_summary.len()
+        );
+
+        let show = tool_by_name(backend.clone(), "ShowTicket");
+        let mut cursor = Value::Null;
+        let mut seen = Vec::new();
+        loop {
+            let output = show.execute(&json!({"id": reference.id, "view": "history", "event_limit": 2, "event_cursor": cursor}).to_string(), Default::default()).await.unwrap();
+            let page: Value = serde_json::from_str(&output.content.unwrap()).unwrap();
+            assert_eq!(page.as_object().unwrap().len(), 3);
+            for event in page["thread"]["items"].as_array().unwrap() {
+                seen.push(event["event_ref"].as_str().unwrap().to_owned());
+            }
+            if cursor.is_null() {
+                backend
+                    .add_event(
+                        reference.id.clone().into(),
+                        NewTicketEvent::new(TicketEventKind::Comment, "newer append"),
+                    )
+                    .unwrap();
+            }
+            cursor = page["event_page"]["next_cursor"].clone();
+            if cursor.is_null() {
+                break;
+            }
+        }
+        seen.sort();
+        let mut expected: Vec<_> = before
+            .events
+            .iter()
+            .filter(|event| !event.is_initial)
+            .map(|event| event.event_ref.clone())
+            .collect();
+        expected.sort();
+        assert_eq!(seen, expected);
+        assert!(
+            show.execute(
+                &json!({"id": reference.id, "view":"history", "event_cursor":"guessed"})
+                    .to_string(),
+                Default::default()
+            )
+            .await
+            .is_err()
+        );
+
+        let unicode = "全文🦀é\n".repeat(20_000);
+        let post = &before.events[0];
+        let edit = tool_by_name(backend.clone(), "TicketEditPost");
+        let edit_args = json!({"ticket":reference.id, "event_ref":post.event_ref, "expected_body":post.body.as_str(), "body":unicode});
+        edit.execute(&edit_args.to_string(), Default::default())
+            .await
+            .unwrap();
+        let full = show.execute(&json!({"id":reference.id, "view":"post", "event_ref":post.event_ref, "body_max_bytes":1}).to_string(), Default::default()).await.unwrap();
+        let full: Value = serde_json::from_str(&full.content.unwrap()).unwrap();
+        assert_eq!(full["post"]["body"], unicode);
+        assert_eq!(full["post"]["body_truncated"], false);
+        assert_eq!(full["post"]["editable"], true);
+        assert!(
+            edit.execute(&edit_args.to_string(), Default::default())
+                .await
+                .is_err()
+        );
+        for args in [
+            json!({"view":"post"}),
+            json!({"view":"summary", "event_ref":post.event_ref}),
+            json!({"view":"summary", "event_cursor":"x"}),
+        ] {
+            let mut args = args;
+            args["id"] = json!(reference.id);
+            assert!(
+                show.execute(&args.to_string(), Default::default())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_post_read_rejects_oversize_instead_of_truncating_edit_input() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let mut input = NewTicket::new("Full-post limit");
+        input.body = MarkdownText::new("x".repeat(1024 * 1024 + 1));
+        let reference = backend.create(input).unwrap();
+        let observed = backend.show(reference.id.clone().into()).unwrap();
+        let event_ref = &observed
+            .events
+            .iter()
+            .find(|event| event.is_initial)
+            .unwrap()
+            .event_ref;
+        let show = tool_by_name(backend.clone(), "ShowTicket");
+        let error = show
+            .execute(
+                &json!({"id":reference.id, "view":"post", "event_ref":event_ref}).to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("1 MiB"));
+        assert_eq!(backend.show(reference.id.into()).unwrap(), observed);
     }
 
     #[tokio::test]

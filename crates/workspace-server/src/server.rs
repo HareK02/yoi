@@ -18752,6 +18752,130 @@ fn integrated_merge_refs(
     Some((source, target))
 }
 
+fn merge_request_event_reference(
+    event: &merge_request::MergeRequestThreadEvent,
+) -> server_api::MergeRequestEventReference {
+    use merge_request::MergeRequestThreadEvent as Event;
+    let event_id = match event {
+        Event::ReviewRequested(event) => &event.event_id,
+        Event::Review(event) => &event.event_id,
+        Event::ReviewRevoked(event) => &event.event_id,
+        Event::ReviewCancelled(event) => &event.event_id,
+        Event::Comment(event) => &event.event_id,
+        Event::Merge(event) => &event.event_id,
+    };
+    server_api::MergeRequestEventReference {
+        event_id: event_id.clone(),
+        sequence: event.sequence(),
+    }
+}
+
+fn merge_request_status_summary(
+    mr: &merge_request::MergeRequest,
+    source: &server_api::MergeRequestRefResponse,
+    mut readiness: server_api::MergeRequestReadinessResponse,
+) -> server_api::MergeRequestStatusSummary {
+    use merge_request::MergeRequestThreadEvent as Event;
+    // Never trust a ref retained alongside an unknown/invalid observation.
+    let subject = (source.status == "known")
+        .then_some(source.resolved_ref.as_deref())
+        .flatten();
+    let review = subject.and_then(|subject| {
+        if mr.state == merge_request::MergeRequestState::Merged {
+            mr.integration_approval().ok()
+        } else {
+            mr.effective_review(subject)
+        }
+    });
+    let pending = subject.is_some_and(|subject| {
+        mr.thread.iter().any(|event| {
+            let Event::ReviewRequested(request) = event else {
+                return false;
+            };
+            request.subject_ref == subject
+                && !mr.thread.iter().any(|event| match event {
+                    Event::Review(review) => review.request_event_id == request.event_id,
+                    Event::ReviewCancelled(cancelled) => {
+                        cancelled.request_event_id == request.event_id
+                    }
+                    _ => false,
+                })
+        })
+    });
+    let review_status = match (subject, review) {
+        (None, _) => "unknown",
+        (_, Some(review)) => match review.decision {
+            merge_request::ReviewDecision::Approve => "approved",
+            merge_request::ReviewDecision::RequestChanges => "request_changes",
+        },
+        (_, None) if pending => "pending",
+        _ => "none",
+    };
+    // Readiness performs a second store read. A concurrent review/revocation must
+    // not turn this older summary snapshot into ready evidence for another review.
+    let snapshot_review = review.cloned().map(public_review_event);
+    if readiness.subject_ref.as_deref() != subject || readiness.review != snapshot_review {
+        readiness.ready = false;
+        readiness.blockers.push("readiness_evidence_changed".into());
+    }
+    // Retain readiness's established checks, but not a duplicate review body.
+    readiness.review = None;
+    server_api::MergeRequestStatusSummary {
+        review_status: review_status.into(),
+        review: review.map(|review| server_api::MergeRequestReviewSummary {
+            event: server_api::MergeRequestEventReference {
+                event_id: review.event_id.clone(),
+                sequence: review.sequence,
+            },
+            request_event_id: review.request_event_id.clone(),
+            subject_ref: review.subject_ref.clone(),
+            ticket_content_digest: review.ticket_content_digest.clone(),
+            decision: public_review_decision(review.decision),
+            findings_count: review.findings.len(),
+        }),
+        latest_review_subject_ref: mr.thread.iter().rev().find_map(|event| match event {
+            Event::ReviewRequested(event) => Some(event.subject_ref.clone()),
+            Event::Review(event) => Some(event.subject_ref.clone()),
+            _ => None,
+        }),
+        latest_event: mr.thread.last().map(merge_request_event_reference),
+        thread_event_count: mr.thread.len(),
+        readiness,
+    }
+}
+
+// Page the same complete snapshot used for the canonical summary. A second store
+// read could include a revocation newer than the summary (or miss one it includes).
+fn project_merge_request_thread(
+    mr: &mut merge_request::MergeRequest,
+    query: &server_api::MergeRequestThreadQuery,
+) -> server_api::MergeRequestEventPage {
+    // Preserve legacy HTTP callers; explicit compact/detail reads use the smaller default.
+    let default_limit = if query.view.is_none() { 100 } else { 20 };
+    let limit = query.limit.unwrap_or(default_limit).clamp(1, 200);
+    if query.view == Some(server_api::MergeRequestReadView::Summary) {
+        let has_more = !mr.thread.is_empty();
+        mr.thread.clear();
+        return server_api::MergeRequestEventPage {
+            omitted: true,
+            has_more,
+            next_after: None,
+            limit,
+        };
+    }
+    let mut events = std::mem::take(&mut mr.thread)
+        .into_iter()
+        .filter(|event| query.after.is_none_or(|after| event.sequence() > after));
+    mr.thread = events.by_ref().take(limit).collect();
+    let has_more = events.next().is_some();
+    server_api::MergeRequestEventPage {
+        omitted: false,
+        has_more,
+        next_after: has_more.then(|| mr.thread.last().unwrap().sequence()),
+        limit,
+    }
+}
+
 async fn scoped_show_merge_request(
     State(api): State<WorkspaceApi>,
     AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
@@ -18765,12 +18889,16 @@ async fn scoped_show_merge_request(
             let store = merge_request_store(&api, &workspace_id)?;
             let mut mr = store.get_by_id(&workspace_id, &merge_request_id)?;
             let integrated_refs = integrated_merge_refs(&mr);
-            mr.thread = store.thread_page_by_id(
-                &workspace_id,
-                &merge_request_id,
-                query.after,
-                query.limit.unwrap_or(100),
-            )?;
+            if query.view == Some(server_api::MergeRequestReadView::Summary)
+                && (query.after.is_some() || query.limit.is_some())
+            {
+                return Err(
+                    Error::MergeRequest(merge_request::MergeRequestError::Validation(
+                        "after/limit require view=detail".into(),
+                    ))
+                    .into(),
+                );
+            }
             let ticket_id = mr.ticket_ids.first().ok_or_else(|| {
                 Error::MergeRequest(merge_request::MergeRequestError::Conflict(
                     "Merge Request has no linked Ticket".into(),
@@ -18824,6 +18952,38 @@ async fn scoped_show_merge_request(
                 };
                 (source, target)
             };
+            let mut report = store.readiness(merge_request::ReadinessCheck {
+                merge_request_id: mr.merge_request_id.clone(),
+                ticket_id: ticket_id.clone(),
+                current_subject_ref: (source.status == "known")
+                    .then(|| source.resolved_ref.clone())
+                    .flatten(),
+                auth: merge_request::MergeRequestAuth {
+                    workspace_id: workspace_id.clone(),
+                    repository_id: mr.repository_id.clone(),
+                    runtime_id: String::new(),
+                    worker_id: String::new(),
+                    assignment_id: String::new(),
+                },
+            })?;
+            if let Some(diagnostic) = &source.diagnostic {
+                let blocker = source_ref_readiness_blocker(&diagnostic.code).to_string();
+                if !report.blockers.contains(&blocker) {
+                    report.blockers.push(blocker);
+                }
+                report.ready = false;
+            }
+            let summary = merge_request_status_summary(
+                &mr,
+                &source,
+                server_api::MergeRequestReadinessResponse {
+                    ready: report.ready,
+                    blockers: report.blockers,
+                    subject_ref: report.subject_ref,
+                    review: report.review.map(public_review_event),
+                },
+            );
+            let event_page = project_merge_request_thread(&mut mr, &query);
             let linked_tickets = mr
                 .ticket_ids
                 .iter()
@@ -18844,6 +19004,9 @@ async fn scoped_show_merge_request(
                 source,
                 target,
                 linked_tickets,
+                view: query.view.unwrap_or_default(),
+                summary,
+                event_page,
             }))
         })
         .await
@@ -65938,6 +66101,321 @@ mod tests {
         assert_eq!(response["actual_protocol_version"], serde_json::Value::Null);
         let projected = serde_json::to_string(&response).unwrap();
         assert!(!projected.contains("different-runtime"));
+    }
+
+    fn mr_read_fixture() -> merge_request::MergeRequest {
+        serde_json::from_value(json!({
+            "workspace_id": TEST_WORKSPACE_ID, "merge_request_id": "mr-read",
+            "repository_id": "repo", "state": "open", "selector_from": "work/read",
+            "selector_to": "develop", "ticket_ids": ["ticket"],
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            "thread": [
+                {"kind": "review_requested", "event_id": "request-1", "sequence": 1,
+                 "subject_ref": "source-1", "ticket_content_digest": "digest",
+                 "ticket_merge_request_subjects": [],
+                 "requested_by": {"runtime_id": "runtime", "worker_id": "coder"},
+                 "reviewer": {"runtime_id": "runtime", "worker_id": "reviewer"},
+                 "created_at": "2026-01-01T00:00:00Z"},
+                {"kind": "review", "event_id": "approval-1", "sequence": 2,
+                 "request_event_id": "request-1", "subject_ref": "source-1",
+                 "ticket_content_digest": "digest", "ticket_merge_request_subjects": [],
+                 "decision": "approve", "body": "Exact review body", "findings": [],
+                 "reviewer": {"runtime_id": "runtime", "worker_id": "reviewer"},
+                 "created_at": "2026-01-01T00:00:00Z"},
+                {"kind": "comment", "event_id": "comment-1", "sequence": 3,
+                 "body": "Later history", "author": {"runtime_id": "runtime", "worker_id": "coder"},
+                 "created_at": "2026-01-01T00:00:00Z"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn mr_read_source() -> server_api::MergeRequestRefResponse {
+        server_api::MergeRequestRefResponse {
+            status: "known".into(),
+            resolved_ref: Some("source-1".into()),
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            diagnostic: None,
+        }
+    }
+
+    fn mr_read_summary(mr: &merge_request::MergeRequest) -> server_api::MergeRequestStatusSummary {
+        merge_request_status_summary(
+            mr,
+            &mr_read_source(),
+            server_api::MergeRequestReadinessResponse {
+                ready: false,
+                blockers: vec!["fixture readiness".into()],
+                subject_ref: Some("source-1".into()),
+                review: mr
+                    .effective_review("source-1")
+                    .cloned()
+                    .map(public_review_event),
+            },
+        )
+    }
+
+    #[test]
+    fn mr_read_http_default_page_preserves_legacy_limit() {
+        let mut complete = mr_read_fixture();
+        let merge_request::MergeRequestThreadEvent::Comment(comment) =
+            complete.thread.pop().unwrap()
+        else {
+            panic!()
+        };
+        complete.thread = (1..=205)
+            .map(|sequence| {
+                let mut comment = comment.clone();
+                comment.sequence = sequence;
+                comment.event_id = format!("comment-{sequence}");
+                merge_request::MergeRequestThreadEvent::Comment(comment)
+            })
+            .collect();
+        for (view, limit, expected) in [
+            (None, None, 100),
+            (Some(server_api::MergeRequestReadView::Detail), None, 20),
+            (None, Some(7), 7),
+            (
+                Some(server_api::MergeRequestReadView::Detail),
+                Some(500),
+                200,
+            ),
+        ] {
+            let mut mr = complete.clone();
+            let page = project_merge_request_thread(
+                &mut mr,
+                &server_api::MergeRequestThreadQuery {
+                    view,
+                    limit,
+                    after: None,
+                },
+            );
+            assert_eq!(mr.thread.len(), expected);
+            assert_eq!(page.limit, expected);
+            assert!(page.has_more && !page.omitted);
+            assert_eq!(page.next_after, Some(expected as u64));
+        }
+        let page = project_merge_request_thread(
+            &mut complete,
+            &server_api::MergeRequestThreadQuery {
+                after: Some(200),
+                ..Default::default()
+            },
+        );
+        assert_eq!(complete.thread.len(), 5);
+        assert!(!page.has_more);
+        assert_eq!(page.next_after, None);
+    }
+
+    #[test]
+    fn mr_read_readiness_requires_same_review_snapshot() {
+        let mut mr = mr_read_fixture();
+        let report = server_api::MergeRequestReadinessResponse {
+            ready: true,
+            blockers: vec![],
+            subject_ref: Some("source-1".into()),
+            review: mr
+                .effective_review("source-1")
+                .cloned()
+                .map(public_review_event),
+        };
+        let summary = merge_request_status_summary(&mr, &mr_read_source(), report.clone());
+        assert!(summary.readiness.ready);
+        assert!(summary.readiness.blockers.is_empty());
+        assert!(
+            summary.readiness.review.is_none(),
+            "exact evidence is checked before body omission"
+        );
+        assert_eq!(summary.review.unwrap().event.event_id, "approval-1");
+
+        let mut changed = report.clone();
+        changed.review.as_mut().unwrap().event_id = "new-approval".into();
+        let summary = merge_request_status_summary(&mr, &mr_read_source(), changed);
+        assert!(
+            !summary.readiness.ready,
+            "different approval cannot validate the older snapshot"
+        );
+        assert_eq!(summary.readiness.blockers, ["readiness_evidence_changed"]);
+        assert_eq!(summary.review.unwrap().event.event_id, "approval-1");
+
+        let mut revoked = report.clone();
+        revoked.ready = false;
+        revoked.review = None;
+        revoked.blockers.push("review revoked".into());
+        let summary = merge_request_status_summary(&mr, &mr_read_source(), revoked);
+        assert!(!summary.readiness.ready);
+        assert_eq!(
+            summary.readiness.blockers,
+            ["review revoked", "readiness_evidence_changed"]
+        );
+
+        let mut moved = report.clone();
+        moved.subject_ref = Some("source-2".into());
+        let summary = merge_request_status_summary(&mr, &mr_read_source(), moved);
+        assert!(!summary.readiness.ready);
+        assert_eq!(summary.readiness.subject_ref.as_deref(), Some("source-2"));
+        assert_eq!(summary.review.unwrap().subject_ref, "source-1");
+
+        let merge_request::MergeRequestThreadEvent::Review(review) = &mut mr.thread[1] else {
+            panic!()
+        };
+        review.decision = merge_request::ReviewDecision::RequestChanges;
+        let summary = merge_request_status_summary(&mr, &mr_read_source(), report.clone());
+        assert_eq!(summary.review_status, "request_changes");
+        assert!(
+            !summary.readiness.ready,
+            "new approval cannot contradict snapshot request_changes"
+        );
+        mr.thread.truncate(1);
+        let summary = merge_request_status_summary(&mr, &mr_read_source(), report);
+        assert_eq!(summary.review_status, "pending");
+        assert!(
+            !summary.readiness.ready,
+            "new approval cannot contradict snapshot pending review"
+        );
+    }
+
+    #[test]
+    fn mr_read_status_includes_page_external_approval_and_revocation() {
+        let complete = mr_read_fixture();
+        let summary = mr_read_summary(&complete);
+        let mut page = complete.clone();
+        let query = server_api::MergeRequestThreadQuery {
+            view: Some(server_api::MergeRequestReadView::Detail),
+            after: Some(2),
+            limit: Some(1),
+        };
+        let pagination = project_merge_request_thread(&mut page, &query);
+        assert_eq!(summary.review_status, "approved");
+        assert_eq!(
+            summary.review.as_ref().unwrap().event.event_id,
+            "approval-1"
+        );
+        assert!(
+            page.effective_review("source-1").is_none(),
+            "approval is outside the page"
+        );
+        assert!(!pagination.has_more);
+        assert_eq!(pagination.next_after, None);
+
+        let mut revoked = complete;
+        revoked.thread.push(serde_json::from_value(json!({
+            "kind": "review_revoked", "event_id": "revoke-1", "sequence": 4,
+            "review_event_id": "approval-1", "subject_ref": "source-1", "reason": "Found a defect",
+            "revoked_by": {"runtime_id": "runtime", "worker_id": "reviewer"},
+            "created_at": "2026-01-01T00:00:00Z"
+        })).unwrap());
+        let summary = mr_read_summary(&revoked);
+        let pagination = project_merge_request_thread(
+            &mut revoked,
+            &server_api::MergeRequestThreadQuery {
+                after: Some(1),
+                ..query
+            },
+        );
+        assert_eq!(summary.review_status, "none");
+        assert!(summary.review.is_none());
+        assert_eq!(summary.latest_event.unwrap().event_id, "revoke-1");
+        assert!(
+            revoked.effective_review("source-1").is_some(),
+            "page alone would falsely approve"
+        );
+        assert!(pagination.has_more);
+        assert_eq!(pagination.next_after, Some(2));
+    }
+
+    #[test]
+    fn mr_read_summary_is_body_independent_and_detail_preserves_exact_findings() {
+        let mut complete = mr_read_fixture();
+        let merge_request::MergeRequestThreadEvent::Review(review) = &mut complete.thread[1] else {
+            panic!()
+        };
+        review.decision = merge_request::ReviewDecision::RequestChanges;
+        review.findings = vec![
+            serde_json::from_value(json!({
+                "severity": "major", "code": "regression", "path": "src/lib.rs", "line": 42,
+                "body": "Exact finding"
+            }))
+            .unwrap(),
+        ];
+        let small = serde_json::to_vec(&mr_read_summary(&complete)).unwrap();
+        let merge_request::MergeRequestThreadEvent::Review(review) = &mut complete.thread[1] else {
+            panic!()
+        };
+        review.body = "review evidence ".repeat(10_000);
+        review.findings[0].body = "finding evidence ".repeat(10_000);
+        let summary = mr_read_summary(&complete);
+        let compact = serde_json::to_vec(&summary).unwrap();
+        assert_eq!(
+            small, compact,
+            "summary contains no review/finding excerpts or bodies"
+        );
+        assert_eq!(summary.review_status, "request_changes");
+        assert_eq!(summary.review.as_ref().unwrap().findings_count, 1);
+        let original_review = complete.thread[1].clone();
+        let legacy = serde_json::to_vec(&complete).unwrap();
+        eprintln!(
+            "MR fixture bytes: full={}, summary={}",
+            legacy.len(),
+            compact.len()
+        );
+        assert!(compact.len() * 100 < legacy.len());
+
+        let mut summary_mr = complete.clone();
+        let omitted = project_merge_request_thread(
+            &mut summary_mr,
+            &server_api::MergeRequestThreadQuery {
+                view: Some(server_api::MergeRequestReadView::Summary),
+                ..Default::default()
+            },
+        );
+        assert!(summary_mr.thread.is_empty());
+        assert!(omitted.omitted && omitted.has_more);
+        assert_eq!(
+            omitted.next_after, None,
+            "start detail at the beginning, not the latest event"
+        );
+
+        let event = &summary.review.unwrap().event;
+        let page = project_merge_request_thread(
+            &mut complete,
+            &server_api::MergeRequestThreadQuery {
+                view: Some(server_api::MergeRequestReadView::Detail),
+                after: Some(event.sequence - 1),
+                limit: Some(1),
+            },
+        );
+        assert_eq!(complete.thread, vec![original_review]);
+        assert_eq!(page.next_after, Some(event.sequence));
+    }
+
+    #[test]
+    fn mr_read_summary_preserves_unknown_movement_pending_and_merged_evidence() {
+        let mut mr = mr_read_fixture();
+        let readiness = mr_read_summary(&mr).readiness;
+        let mut source = mr_read_source();
+        source.status = "unknown".into();
+        let summary = merge_request_status_summary(&mr, &source, readiness.clone());
+        assert_eq!(summary.review_status, "unknown");
+        assert!(
+            summary.review.is_none(),
+            "retained ref does not establish observation"
+        );
+        source.status = "known".into();
+        source.resolved_ref = Some("source-2".into());
+        let summary = merge_request_status_summary(&mr, &source, readiness.clone());
+        assert_eq!(summary.review_status, "none");
+        assert_eq!(
+            summary.latest_review_subject_ref.as_deref(),
+            Some("source-1")
+        );
+        mr.thread.truncate(1);
+        assert_eq!(mr_read_summary(&mr).review_status, "pending");
+        mr.state = merge_request::MergeRequestState::Merged;
+        assert!(
+            mr_read_summary(&mr).review.is_none(),
+            "merged state alone is not approval"
+        );
     }
 
     #[tokio::test]

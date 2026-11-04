@@ -608,6 +608,16 @@ Deno.test("Ticket Browser parser accepts the generated Objective list shape", ()
 
 Deno.test("Ticket Browser parser validates the canonical Merge Request thread", () => {
   const parsed = parseMergeRequestDetailResponse({
+    view: "detail",
+    summary: {
+      review_status: "pending",
+      review: null,
+      latest_review_subject_ref: "abc123",
+      latest_event: { event_id: "event-1", sequence: 1 },
+      thread_event_count: 1,
+      readiness: { ready: false, blockers: ["review_missing"], subject_ref: "abc123" },
+    },
+    event_page: { omitted: false, has_more: false, next_after: null, limit: 100 },
     workspace_id: "workspace-a",
     merge_request_id: "mr-1",
     repository_key: "main",
@@ -643,6 +653,16 @@ Deno.test("Ticket Browser parser validates the canonical Merge Request thread", 
     linked_tickets: [{ ticket_id: "ticket-id", key: "T-1" }],
   });
   assertEquals(parsed.thread[0]?.kind, "review_requested");
+  assertEquals(parsed.summary.review_status, "pending");
+  assertEquals(parsed.summary.latest_event?.event_id, "event-1");
+  assertThrows(
+    () => parseMergeRequestDetailResponse({ ...parsed, summary: { ...parsed.summary, review_status: "invented" } }),
+    "review_status is invalid",
+  );
+  assertThrows(
+    () => parseMergeRequestDetailResponse({ ...parsed, event_page: { ...parsed.event_page, next_after: -1 } }),
+    "next_after",
+  );
   assertThrows(
     () =>
       parseMergeRequestDetailResponse({
