@@ -9406,14 +9406,6 @@ fn incomplete_subjektiv_attribution_state(
     }
 }
 
-fn incomplete_subjektiv_attribution_label(create_if_missing: bool) -> &'static str {
-    if create_if_missing {
-        "outcome_unknown"
-    } else {
-        "legacy_unknown"
-    }
-}
-
 fn bounded_attribution_diagnostic(mut diagnostic: String) -> String {
     const MAX_CHARS: usize = 1024;
     if diagnostic.chars().count() > MAX_CHARS {
@@ -9721,15 +9713,10 @@ where
             &mut expected,
         )
         .map_err(|error| match expected {
-            Some(expected) => crate::startup_failure::persist_startup_failure::<
-                _,
-                protocol::startup_failure::RuntimeStartupCause,
-            >(
+            Some(expected) => crate::startup_failure::persist_binding_startup_failure(
                 &self.store,
                 &expected,
                 error,
-                protocol::startup_failure::StartupStage::Binding,
-                &(),
             ),
             None => error,
         })
@@ -9855,145 +9842,55 @@ where
             pending_attribution.clone(),
         )?;
         let output = if self.subjektiv_host.is_some() {
-            let connection = self
-                .subjektiv_host_connection()
-                .map_err(|error| WorkerError::SubjektivSessionAttribution {
-                    state: "failed",
-                    message: error.to_string(),
-                })?
-                .ok_or_else(|| WorkerError::SubjektivSessionAttribution {
-                    state: "failed",
-                    message: "Session attribution requires enabled explicit Host capability".into(),
-                })?;
-            match connection
-                .host
-                .record_session(&connection.context, create_if_missing)
-            {
-                Ok(output) => output,
-                Err(error) => {
-                    let message = bounded_attribution_diagnostic(error.to_string());
-                    let rejected =
-                        !matches!(error, crate::subjektiv::SubjektivHostError::Unavailable(_));
-                    let state = if create_if_missing && rejected {
-                        SubjektivSessionAttributionState::Failed {
-                            session_id,
-                            diagnostic: message.clone(),
-                        }
-                    } else {
-                        incomplete_subjektiv_attribution_state(
-                            session_id,
-                            create_if_missing,
-                            message.clone(),
-                        )
-                    };
-                    persist_attribution(Some(&pending_attribution), state)?;
-                    return Err(WorkerError::SubjektivSessionAttribution {
-                        state: if create_if_missing && rejected {
-                            "failed"
-                        } else {
-                            incomplete_subjektiv_attribution_label(create_if_missing)
-                        },
-                        message,
-                    });
-                }
-            }
+            self.subjektiv_host_connection()
+                .map_err(|error| crate::subjektiv::SubjektivHostError::session_registration(
+                    protocol::session_failure::SessionRegistrationCause::outcome_unknown(), error,
+                ))
+                .and_then(|connection| connection.ok_or_else(|| {
+                    crate::subjektiv::SubjektivHostError::SessionRegistration {
+                        cause: protocol::session_failure::SessionRegistrationCause::binding_mismatch(),
+                        source: None,
+                    }
+                }))
+                .and_then(|connection| connection.host.record_session(&connection.context, create_if_missing))
         } else {
-            let response = match self.workspace_client().execute_server_operation(
-                WorkspaceServerOperation::SubjektivRecordSession(
-                    server_api::SubjektivRecordSessionRequest {
-                        session_id: session_id.to_string(),
-                        create_if_missing,
-                    },
-                ),
-            ) {
-                Ok(response) => response,
-                Err(error) => {
-                    let message = bounded_attribution_diagnostic(format!(
-                        "Session attribution transport outcome is unknown: {error}"
-                    ));
-                    persist_attribution(
-                        Some(&pending_attribution),
-                        incomplete_subjektiv_attribution_state(
-                            session_id,
-                            create_if_missing,
-                            message.clone(),
-                        ),
-                    )?;
-                    return Err(WorkerError::SubjektivSessionAttribution {
-                        state: incomplete_subjektiv_attribution_label(create_if_missing),
-                        message,
-                    });
-                }
-            };
-            if !response.is_success() {
-                let message = bounded_attribution_diagnostic(format!(
-                    "Session attribution was rejected with HTTP {}: {}",
-                    response.status, response.body
-                ));
-                let state = if create_if_missing {
+            crate::subjektiv::record_backend_session(
+                self.workspace_client(), &session_id.to_string(), create_if_missing,
+            )
+        }.and_then(|output| crate::subjektiv::validate_session_registration(output, &session_id.to_string()));
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                use protocol::session_failure::SessionRegistrationReason;
+                let cause = error.session_registration_cause();
+                let rejected = matches!(
+                    cause.reason,
+                    SessionRegistrationReason::PermissionDenied
+                        | SessionRegistrationReason::AttributionMissing
+                        | SessionRegistrationReason::BindingMismatch
+                );
+                // The legacy lifecycle diagnostic is a fixed domain label, never a
+                // transport body, credential, path or upstream Display string.
+                let diagnostic = cause.to_string();
+                let next = if create_if_missing && rejected {
                     SubjektivSessionAttributionState::Failed {
                         session_id,
-                        diagnostic: message.clone(),
+                        diagnostic,
                     }
                 } else {
-                    SubjektivSessionAttributionState::LegacyUnknown {
+                    incomplete_subjektiv_attribution_state(
                         session_id,
-                        diagnostic: message.clone(),
-                    }
+                        create_if_missing,
+                        diagnostic,
+                    )
                 };
-                persist_attribution(Some(&pending_attribution), state)?;
-                return Err(WorkerError::SubjektivSessionAttribution {
-                    state: if create_if_missing {
-                        "failed"
-                    } else {
-                        "legacy_unknown"
-                    },
-                    message,
-                });
+                let source = WorkerError::SessionRegistration { source: error };
+                let saved = persist_attribution(Some(&pending_attribution), next);
+                return Err(crate::startup_failure::retain_attribution_save_failure(
+                    source, saved,
+                ));
             }
-            let output: server_api::SubjektivRecordSessionResponse =
-                match serde_json::from_str(&response.body) {
-                    Ok(output) => output,
-                    Err(error) => {
-                        let message = bounded_attribution_diagnostic(format!(
-                            "Session attribution response outcome is unknown: {error}"
-                        ));
-                        persist_attribution(
-                            Some(&pending_attribution),
-                            incomplete_subjektiv_attribution_state(
-                                session_id,
-                                create_if_missing,
-                                message.clone(),
-                            ),
-                        )?;
-                        return Err(WorkerError::SubjektivSessionAttribution {
-                            state: incomplete_subjektiv_attribution_label(create_if_missing),
-                            message,
-                        });
-                    }
-                };
-            output
         };
-        if output.session_id != session_id.to_string()
-            || output.subject_id.trim().is_empty()
-            || output.subject_id.chars().any(char::is_control)
-        {
-            let message =
-                "Session attribution response did not confirm the requested immutable identity"
-                    .to_string();
-            persist_attribution(
-                Some(&pending_attribution),
-                incomplete_subjektiv_attribution_state(
-                    session_id,
-                    create_if_missing,
-                    message.clone(),
-                ),
-            )?;
-            return Err(WorkerError::SubjektivSessionAttribution {
-                state: incomplete_subjektiv_attribution_label(create_if_missing),
-                message,
-            });
-        }
         persist_attribution(
             Some(&pending_attribution),
             SubjektivSessionAttributionState::Confirmed {
@@ -11554,6 +11451,12 @@ pub enum WorkerError {
 
     #[error("feature lifecycle rejected operation: {0}")]
     FeatureLifecycle(String),
+
+    #[error("Session registration failed: {source}")]
+    SessionRegistration {
+        #[source]
+        source: crate::subjektiv::SubjektivHostError,
+    },
 
     #[error("Subjektiv Session attribution lifecycle is {state}: {message}")]
     SubjektivSessionAttribution {

@@ -9,6 +9,18 @@ use protocol::startup_failure::{
 };
 
 impl WorkerError {
+    pub fn session_registration_cause(
+        &self,
+    ) -> Option<protocol::session_failure::SessionRegistrationCause> {
+        match self {
+            Self::SessionRegistration { source } => Some(source.session_registration_cause()),
+            Self::StartupFailure { source, .. }
+            | Self::ConstructionCleanup { source, .. }
+            | Self::RestoreActivationEffects { source } => source.session_registration_cause(),
+            _ => None,
+        }
+    }
+
     pub fn with_startup_failure(self, failure: StartupFailureAttachment) -> Self {
         Self::StartupFailure {
             source: Box::new(self),
@@ -55,6 +67,9 @@ impl WorkerError {
         if let Some(failure) = self.startup_failure() {
             return Ok(failure.clone());
         }
+        if let Some(cause) = self.session_registration_cause() {
+            return protocol::session_failure::session_registration_attachment(cause);
+        }
         let reason = match self {
             Self::ConstructionCleanup { source, .. }
             | Self::RestoreActivationEffects { source } => return source.startup_failure_at(stage),
@@ -89,6 +104,63 @@ pub fn runtime_startup_attachment(
     facts.with_context(OperationContext::new("worker_startup", "runtime")?)?;
     let projected = project_failure::<InternalTransfer, _>(&facts, &())?;
     StartupFailureAttachment::from_projected(&projected)
+}
+
+/// Dispatch by the domain attested in process, not by parsing attachment fields.
+pub(crate) fn persist_binding_startup_failure<S: session_store::WorkerMetadataStore>(
+    store: &S,
+    expected: &session_store::worker_metadata::StartupFailureExpectation,
+    source: WorkerError,
+) -> WorkerError {
+    if source.session_registration_cause().is_some() {
+        persist_startup_failure::<_, protocol::session_failure::SessionRegistrationCause>(
+            store,
+            expected,
+            source,
+            StartupStage::Binding,
+            &(),
+        )
+    } else {
+        persist_startup_failure::<_, RuntimeStartupCause>(
+            store,
+            expected,
+            source,
+            StartupStage::Binding,
+            &(),
+        )
+    }
+}
+
+/// An attribution-state write failure supplements the registration decision. It
+/// neither establishes the write's absence nor replaces the primary Error source.
+pub(crate) fn retain_attribution_save_failure(
+    source: WorkerError,
+    saved: Result<(), WorkerError>,
+) -> WorkerError {
+    use protocol::startup_failure::{StartupFailurePhase, StartupPersistenceOutcome};
+    let Err(error) = saved else {
+        return source;
+    };
+    let outcome = match error {
+        WorkerError::SubjektivSessionAttribution {
+            state: "attribution_conflict",
+            ..
+        } => StartupPersistenceOutcome::Conflict,
+        WorkerError::WorkerStore(_) => StartupPersistenceOutcome::OutcomeUnknown,
+        _ => StartupPersistenceOutcome::NotSaved,
+    };
+    let failure = source
+        .startup_failure_at(StartupStage::Binding)
+        .expect("fixed Session cause fits the shared codec budget");
+    WorkerError::StartupFailure {
+        source: Box::new(source),
+        failure,
+        secondary: vec![StartupSecondaryFailure::Persistence {
+            phase: StartupFailurePhase::MetadataSave,
+            outcome,
+        }],
+        metadata_save: None,
+    }
 }
 
 /// Bind a caller-owned cause to the exact pre-observed Session/attribution. Saving
