@@ -343,7 +343,9 @@ fn subject_delete_without_original_owner_retains_child_identity_but_never_issues
 
 #[test]
 #[cfg(feature = "fs-store")]
-fn subject_delete_cancelled_release_history_consumes_prior_canonical_stop() {
+fn subject_delete_terminal_release_history_consumes_prior_canonical_stop() {
+    use runtime_api::{SubjectReleaseAction as Action, SubjectReleaseState as State};
+    for (action, terminal) in [(Action::Cancel, State::Cancelled), (Action::Disconnect, State::Disconnected)] {
     let temp = tempfile::tempdir_in(".").unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let backend = Arc::new(
@@ -397,19 +399,22 @@ fn subject_delete_cancelled_release_history_consumes_prior_canonical_stop() {
             .stop_worker_scoped(&scope, &worker.worker_ref, None)
             .is_err()
     );
-    release.action = runtime_api::SubjectReleaseAction::Cancel;
+    release.action = action;
     assert_eq!(
         runtime
             .subject_release_scoped(&scope, release.clone())
             .unwrap()
             .state,
-        runtime_api::SubjectReleaseState::Cancelled
+        terminal
     );
     {
         let reservations = backend.subject_reservations.lock().unwrap();
         let saved = &reservations[&(worker.worker_ref.clone(), release.operation_id.clone())];
-        assert_eq!(saved.state, runtime_api::SubjectReleaseState::Cancelled);
+        assert_eq!(saved.state, terminal);
         assert!(saved.guard.is_none());
+    }
+    if terminal == State::Disconnected {
+        assert!(runtime.send_input(&worker.worker_ref, WorkerInput::user("must not resume a disconnected body")).is_err());
     }
     runtime
         .stop_worker_scoped(&scope, &worker.worker_ref, None)
@@ -424,7 +429,7 @@ fn subject_delete_cancelled_release_history_consumes_prior_canonical_stop() {
         create_fingerprint: create.create_fingerprint,
         operation_id: "delete-prior-stop".into(),
     };
-    // Retained non-Cancelled state still blocks canonical consumption even if
+    // Retained non-terminal state still blocks canonical consumption even if
     // its local guard is unavailable; only the terminal no-guard row is harmless.
     let key = (worker.worker_ref.clone(), release.operation_id);
     backend
@@ -458,7 +463,7 @@ fn subject_delete_cancelled_release_history_consumes_prior_canonical_stop() {
         .unwrap()
         .get_mut(&key)
         .unwrap()
-        .state = runtime_api::SubjectReleaseState::Cancelled;
+        .state = terminal;
     runtime
         .subject_delete_worker_scoped(&scope, deletion.clone())
         .unwrap();
@@ -478,6 +483,7 @@ fn subject_delete_cancelled_release_history_consumes_prior_canonical_stop() {
     assert!(backend.workers.lock().unwrap().is_empty());
     assert!(backend.pending_spawns.lock().unwrap().is_empty());
     assert!(backend.pending_restores.lock().unwrap().is_empty());
+    }
 }
 
 // Only the extra factory-owned cleanup is faulted. Controller Stop, scope join,
@@ -1215,5 +1221,297 @@ fn subject_delete_confirmed_removal_retries_warm_and_cold_without_new_stop() {
     assert!(cold.workers.lock().unwrap().is_empty());
     assert!(cold.pending_spawns.lock().unwrap().is_empty());
     assert!(cold.pending_restores.lock().unwrap().is_empty());
+    assert!(reopened.create_worker_scoped(&scope, create).is_err());
+}
+
+#[test]
+#[cfg(feature = "fs-store")]
+#[serial_test::serial(worker_allocation)]
+fn subject_delete_removal_first_retains_original_stop_and_rechecks_cold_history() {
+    let temp = tempfile::tempdir_in(".").unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let cleanup_allowed = Arc::new(AtomicBool::new(true));
+    let cleanup_calls = Arc::new(AtomicUsize::new(0));
+    let new_backend = || {
+        Arc::new(
+            WorkerRuntimeExecutionBackend::new(SubjectCleanupFaultFactory {
+                inner: MockFactory {
+                    client: MockClient::new(vec![]),
+                    runtime_base: PathBuf::from(temp.path().file_name().unwrap()).join("c"),
+                    cwd: root.clone(),
+                    store_dir: root.join("sessions"),
+                    worker_metadata_dir: root.join("metadata"),
+                    observed_cwds: Arc::default(),
+                    observed_workspace_clients: Arc::default(),
+                },
+                spawns: spawns.clone(),
+                cleanup_allowed: cleanup_allowed.clone(),
+                cleanup_calls: cleanup_calls.clone(),
+            })
+            .unwrap(),
+        )
+    };
+    let backend = new_backend();
+    let options = crate::fs_store::FsRuntimeStoreOptions::new(root.join("catalog"))
+        .with_runtime_id("removal-first");
+    let runtime =
+        EmbeddedRuntime::with_fs_store_and_execution_backend(options.clone(), backend.clone())
+            .unwrap();
+    runtime.bind_runtime_identity("removal-first").unwrap();
+    runtime.store_config_bundle(test_bundle()).unwrap();
+    let scope = crate::runtime::RuntimeWorkspaceScope::new("ws-test", "server-test");
+    let mut create = create_request("ordinary removal before first Subject confirmation");
+    create.workspace_api = Some(WorkspaceApiRef {
+        workspace_id: scope.workspace_id.clone(),
+        base_url: "https://workspace.invalid".into(),
+    });
+    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+        workspace_id: scope.workspace_id.clone(),
+        language: "English".into(),
+    });
+    let worker = runtime
+        .create_worker_scoped(&scope, create.clone())
+        .unwrap();
+    let execution = backend.workers.lock().unwrap()[&worker.worker_ref].clone();
+    runtime
+        .stop_worker_scoped(&scope, &worker.worker_ref, None)
+        .unwrap();
+    let original = runtime
+        .execution_termination(&worker.worker_ref)
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.execution_id, execution.tasks.execution_id);
+    assert!(execution.handle.protocol_is_closed());
+    assert!(execution.tasks.tasks.lock().unwrap().is_empty());
+    let removal = crate::retention::WorkerRetentionExecutionRequest {
+        operation_id: "ordinary-removal".into(),
+        input_fingerprint: "ordinary-input".into(),
+        archive_id: None,
+        workspace_id: scope.workspace_id.clone(),
+        source_runtime_id: "removal-first".into(),
+        worker_id: create.worker_id,
+        source_created_at: "2026-11-04T00:00:00Z".into(),
+        removed_at: "2026-11-04T01:00:00Z".into(),
+        effective_profile: None,
+        retention_class: None,
+        policy_id: "ordinary-policy".into(),
+        session_disposition: crate::retention::SessionDisposition::Purge,
+        diagnostics_disposition: crate::retention::DiagnosticsDisposition::Purge,
+    };
+    assert!(
+        runtime
+            .execute_worker_retention(&removal)
+            .unwrap()
+            .source_removed
+    );
+    assert!(runtime.worker_detail(&worker.worker_ref).is_err());
+    let receipt_path = options
+        .root
+        .join("retention/operations/ordinary-removal.json");
+    let receipt_bytes = fs::read(&receipt_path).unwrap();
+    let receipt: serde_json::Value = serde_json::from_slice(&receipt_bytes).unwrap();
+    assert_eq!(
+        receipt["shutdown"]["termination"],
+        serde_json::to_value(&original).unwrap()
+    );
+    let deletion = runtime_api::SubjectDeleteWorkerRequest {
+        workspace_id: scope.workspace_id.clone(),
+        worker_id: create.worker_id,
+        create_fingerprint: create.create_fingerprint.clone(),
+        operation_id: "first-Subject".into(),
+    };
+    // Every failure happens after a real ordinary removal, before any successful
+    // Subject response; an empty adapter/catalog cannot provide the missing fact.
+    let mut bad = receipt.clone();
+    bad.as_object_mut().unwrap().remove("shutdown");
+    fs::write(&receipt_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(
+        runtime
+            .execute_worker_retention(&removal)
+            .unwrap()
+            .source_removed
+    );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&receipt_path).unwrap())
+            .unwrap()
+            .get("shutdown")
+            .is_none(),
+        "legacy replay must not synthesize shutdown"
+    );
+    assert!(
+        runtime
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    let mut bad = receipt.clone();
+    bad["shutdown"]["stop_operation_id"] =
+        serde_json::to_value(crate::execution::WorkerLifecycleOperationId::new()).unwrap();
+    fs::write(&receipt_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(
+        runtime
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    let mut bad = receipt.clone();
+    bad["shutdown"]["termination"]["worker_ref"] =
+        serde_json::to_value(WorkerRef::new(WorkerId::now_v7())).unwrap();
+    fs::write(&receipt_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(
+        runtime
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    let mut bad = receipt.clone();
+    bad["request"]["source_runtime_id"] = "other-runtime".into();
+    fs::write(&receipt_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(
+        runtime
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    let mut bad = receipt.clone();
+    bad["request"]["operation_id"] = "other-removal".into();
+    bad["result"]["operation_id"] = "other-removal".into();
+    fs::write(&receipt_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(
+        runtime
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    let mut bad = receipt.clone();
+    bad["request"]["workspace_id"] = "other-workspace".into();
+    fs::write(&receipt_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(
+        runtime
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    let mut bad = receipt.clone();
+    bad["shutdown"]["create_fingerprint"] = "other-create".into();
+    fs::write(&receipt_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(
+        runtime
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    let mut bad = receipt.clone();
+    bad["result"]["source_removed"] = false.into();
+    fs::write(&receipt_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(
+        runtime
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    fs::write(&receipt_path, &receipt_bytes).unwrap();
+    cleanup_allowed.store(false, Ordering::SeqCst);
+    assert!(
+        runtime
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    cleanup_allowed.store(true, Ordering::SeqCst);
+    let confirmed = runtime
+        .subject_delete_worker_scoped(&scope, deletion.clone())
+        .unwrap();
+    assert!(confirmed.originals_absent);
+    assert_eq!(
+        backend.completed_stops.lock().unwrap()[&worker.worker_ref],
+        original
+    );
+    assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+    drop(execution);
+    drop(runtime);
+    drop(backend);
+
+    let cold = new_backend();
+    let reopened =
+        EmbeddedRuntime::with_fs_store_and_execution_backend(options.clone(), cold.clone())
+            .unwrap();
+    reopened.bind_runtime_identity("removal-first").unwrap();
+    // A saved Subject response cannot hide a lost or changed original child.
+    fs::remove_file(&receipt_path).unwrap();
+    assert!(
+        reopened
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    let mut bad = receipt.clone();
+    bad["request"]["input_fingerprint"] = "changed-input".into();
+    bad["result"]["input_fingerprint"] = "changed-input".into();
+    fs::write(&receipt_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(
+        reopened
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    fs::write(&receipt_path, &receipt_bytes).unwrap();
+    let mut bad = receipt.clone();
+    bad["shutdown"]["termination"]["execution_id"] =
+        serde_json::to_value(uuid::Uuid::now_v7()).unwrap();
+    fs::write(&receipt_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(
+        reopened
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err(),
+        "cold retry must reread the original whole child receipt, not just request fields"
+    );
+    fs::write(&receipt_path, &receipt_bytes).unwrap();
+    // A later completed Controller is successor evidence even with empty maps.
+    let mut successor = original.clone();
+    successor.execution_id = uuid::Uuid::now_v7();
+    cold.completed_stops
+        .lock()
+        .unwrap()
+        .insert(worker.worker_ref.clone(), successor);
+    assert!(
+        reopened
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    cold.completed_stops.lock().unwrap().clear();
+    let mut duplicate = receipt.clone();
+    duplicate["request"]["operation_id"] = "later-removal".into();
+    duplicate["result"]["operation_id"] = "later-removal".into();
+    let duplicate_path = options.root.join("retention/operations/later-removal.json");
+    fs::write(&duplicate_path, serde_json::to_vec(&duplicate).unwrap()).unwrap();
+    assert!(
+        reopened
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    fs::remove_file(duplicate_path).unwrap();
+    cleanup_allowed.store(false, Ordering::SeqCst);
+    assert!(
+        reopened
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    cleanup_allowed.store(true, Ordering::SeqCst);
+    let material = options
+        .root
+        .join("workers")
+        .join(create.worker_id.to_string());
+    fs::create_dir_all(&material).unwrap();
+    fs::write(material.join("residual"), "still owned original").unwrap();
+    assert!(
+        reopened
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .is_err()
+    );
+    fs::remove_dir_all(material).unwrap();
+    assert_eq!(
+        reopened
+            .subject_delete_worker_scoped(&scope, deletion)
+            .unwrap(),
+        confirmed
+    );
+    assert_eq!(spawns.load(Ordering::SeqCst), 1);
+    assert!(cleanup_calls.load(Ordering::SeqCst) > 0);
+    assert!(cold.completed_stops.lock().unwrap().is_empty());
+    assert!(cold.workers.lock().unwrap().is_empty());
+    assert!(cold.pending_spawns.lock().unwrap().is_empty());
+    assert!(cold.pending_restores.lock().unwrap().is_empty());
+    assert_eq!(fs::read(receipt_path).unwrap(), receipt_bytes);
     assert!(reopened.create_worker_scoped(&scope, create).is_err());
 }

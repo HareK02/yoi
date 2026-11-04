@@ -22,6 +22,10 @@ pub(super) struct RecoveryOwners {
     submitted: Mutex<HashSet<String>>,
     stopping: std::sync::atomic::AtomicBool,
     changed: tokio::sync::Notify,
+    // Already accepted owners take fair turns before entering the finite Host
+    // lane. Immediate rejection plus independent retry timers otherwise lets
+    // earlier reservations monopolize every slot after a large reopen.
+    step_admission: tokio::sync::Mutex<()>,
     #[cfg(test)]
     pub(super) storage_probe_started: tokio::sync::Notify,
     #[cfg(test)]
@@ -42,6 +46,11 @@ impl RecoveryOwners {
     #[cfg(test)]
     pub(super) fn resume_after_test_pause(&self) {
         self.stopping.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn recovery_owner_ids(&self) -> HashSet<String> {
+        self.running.lock().unwrap().clone()
     }
 
     #[cfg(test)]
@@ -498,17 +507,54 @@ impl WorkspaceApi {
                 .host_executors
                 .cleanup()?
                 .run(move || {
+                    // Observe before preflight: a failure may diagnose only this
+                    // exact row/history, never a successor or intervening progress.
+                    let history = api
+                        .store
+                        .list_backend_job_attempts(api.workspace_id(), &owner.job_id)?;
+                    let observed = history
+                        .iter()
+                        .find(|attempt| attempt.attempt_id == owner.attempt_id)
+                        .ok_or_else(|| Error::Store("Cleanup owner disappeared".into()))?;
+                    if !owner.state.terminal()
+                        || !observed.state.terminal()
+                        || observed.attempt != owner.attempt
+                        || JobHostOwner::try_from(observed)? != JobHostOwner::try_from(&owner)?
+                    {
+                        return Err(Error::RepositoryConflict(
+                            "Cleanup execution owner changed before preflight".into(),
+                        ));
+                    }
                     // Every cleanup caller, including its blocking descendants, holds
                     // the original admission resource exclusively through actual return.
                     // Recovery therefore fences the predecessor's writers rather than
                     // treating Executing, an empty map, or process exit as ownership.
-                    api.backend_job_recovery
-                        .close_host_admission(&JobHostOwner::try_from(&owner)?)?;
-                    #[cfg(test)]
-                    api.backend_job_recovery
-                        .cleanup_before_writer_fence
-                        .notify_one();
-                    let drain = JobHostEffects::fence_retained(&api.config.database_path, &owner)?;
+                    let preflight = (|| {
+                        api.backend_job_recovery
+                            .close_host_admission(&JobHostOwner::try_from(observed)?)?;
+                        #[cfg(test)]
+                        api.backend_job_recovery
+                            .cleanup_before_writer_fence
+                            .notify_one();
+                        JobHostEffects::fence_retained(&api.config.database_path, observed)
+                    })();
+                    let drain = match preflight {
+                        Ok(drain) => drain,
+                        Err(error) => {
+                            api.store.record_backend_job_cleanup_preflight_failure(
+                                api.workspace_id(),
+                                &history,
+                                observed,
+                                &format!(
+                                    "Host admission close/fence failed: {error}; execution and Host termination remain unconfirmed. Retain result/input and reconcile the original admission resource; never create replacement evidence."
+                                ),
+                                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                            )?;
+                            // Neither a saved diagnosis nor failure to save it is
+                            // success. Storage errors still reach retry/probe ownership.
+                            return Err(error);
+                        }
+                    };
                     let current = api
                         .store
                         .get_backend_job_attempt(
@@ -667,6 +713,10 @@ impl WorkspaceApi {
             let api = self.clone();
             let owner = expected.clone();
             let failure = definitive_failure.clone();
+            let admission = self.backend_job_recovery.step_admission.lock().await;
+            if self.backend_job_recovery.stopping.load(Ordering::Acquire) {
+                return Ok(());
+            }
             let step = self
                 .host_executors
                 .host()?
@@ -689,6 +739,7 @@ impl WorkspaceApi {
                     }
                 })
                 .await;
+            drop(admission);
             match step {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
@@ -741,12 +792,17 @@ impl WorkspaceApi {
                         self.backend_job_recovery.pause(delay).await;
                         let api = self.clone();
                         let owner = expected.clone();
-                        match self
+                        let admission = self.backend_job_recovery.step_admission.lock().await;
+                        if self.backend_job_recovery.stopping.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        let probe = self
                             .host_executors
                             .host()?
                             .run(move || api.probe_backend_job_storage(&owner))
-                            .await
-                        {
+                            .await;
+                        drop(admission);
+                        match probe {
                             Ok(()) => {
                                 storage_failures = 0;
                                 break;

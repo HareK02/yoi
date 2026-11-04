@@ -218,6 +218,7 @@ fn completed_v4_archive(
             schema_version: OPERATION_SCHEMA_VERSION,
             request: request.clone(),
             result: completed.clone(),
+            shutdown: None,
         },
     );
     fs::remove_dir_all(provider.worker_dir(worker)).unwrap();

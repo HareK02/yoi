@@ -764,6 +764,112 @@ impl FsWorkerRetentionProvider {
         ))
     }
 
+    /// Read, never create or finish, the original canonical removal. The Worker
+    /// operation and Runtime owner locks are held by the caller; the retention
+    /// lock also excludes receipt publication while inspecting history.
+    pub(crate) fn subject_shutdown_removal(
+        &self,
+        deletion: &runtime_api::SubjectDeleteWorkerRequest,
+        runtime_id: &str,
+        expected: Option<(&WorkerRetentionExecutionRequest, &str)>,
+    ) -> Result<
+        (
+            WorkerRetentionExecutionRequest,
+            crate::execution::WorkerExecutionTermination,
+            String,
+        ),
+        RuntimeError,
+    > {
+        let invalid = || {
+            RuntimeError::InvalidRequest(
+                "Missing or mismatched original canonical removal shutdown".into(),
+            )
+        };
+        let lock_path = self.runtime_root.join(RETENTION_LOCK);
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| RuntimeError::StoreIo {
+                operation: "lock Subject removal history",
+                path: lock_path.clone(),
+                source,
+            })?;
+        lock.lock().map_err(|source| RuntimeError::StoreIo {
+            operation: "lock Subject removal history",
+            path: lock_path,
+            source,
+        })?;
+        let operations = self.runtime_root.join("retention").join("operations");
+        let entries = fs::read_dir(&operations).map_err(|_| invalid())?;
+        let mut found = None;
+        for entry in entries {
+            let path = entry.map_err(|_| invalid())?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let receipt = read_operation_receipt(&path)?.ok_or_else(&invalid)?;
+            if receipt.request.worker_id != deletion.worker_id {
+                continue;
+            }
+            // More than one removal of this ID is successor history, not proof
+            // that the original scope covers whichever generation is now gone.
+            if found.is_some() {
+                return Err(invalid());
+            }
+            let request = &receipt.request;
+            // Identity of the immutable child receipt, not another copy of its
+            // shutdown facts in the parent. Detect changed proof on cold retry.
+            let receipt_sha256 =
+                Sha256::digest(serde_json::to_vec(&receipt).map_err(|_| invalid())?)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+            validate_request(request)?;
+            validate_receipt_request(&receipt, request)?;
+            let shutdown = receipt.shutdown.as_ref().ok_or_else(&invalid)?;
+            let result = &receipt.result;
+            let worker = crate::identity::WorkerRef::new(deletion.worker_id);
+            if path != self.operation_path(&request.operation_id)?
+                || request.workspace_id != deletion.workspace_id
+                || request.source_runtime_id != runtime_id
+                || expected.is_some_and(|(saved, digest)| {
+                    saved != request || digest != receipt_sha256.as_str()
+                })
+                || shutdown.create_fingerprint != deletion.create_fingerprint
+                || !shutdown
+                    .termination
+                    .confirms_scope_shutdown(&worker, shutdown.stop_operation_id)
+                || result.worker_id != request.worker_id
+                || result.session_disposition != request.session_disposition
+                || result.diagnostics_disposition != request.diagnostics_disposition
+                || result.diagnostics_retained
+                    != (request.diagnostics_disposition == DiagnosticsDisposition::Retain)
+                || !result.source_removed
+            {
+                return Err(invalid());
+            }
+            match (&result.archive, request.session_disposition) {
+                (None, SessionDisposition::Purge) => {}
+                (Some(archive), SessionDisposition::Archive)
+                    if archive.workspace_id == request.workspace_id
+                        && archive.source_runtime_id == request.source_runtime_id
+                        && archive.source_worker_id == request.worker_id
+                        && archive.operation_id == request.operation_id
+                        && archive.input_fingerprint == request.input_fingerprint
+                        && Some(&archive.archive_id) == request.archive_id.as_ref() => {}
+                _ => return Err(invalid()),
+            }
+            found = Some((
+                receipt.request.clone(),
+                shutdown.termination.clone(),
+                receipt_sha256,
+            ));
+        }
+        found.ok_or_else(invalid)
+    }
+
     pub(crate) fn recover_after_source_removal(
         &self,
         request: &WorkerRetentionExecutionRequest,
@@ -909,6 +1015,18 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
         &self,
         request: &WorkerRetentionExecutionRequest,
     ) -> Result<WorkerRetentionExecutionResult, RuntimeError> {
+        self.execute_with_shutdown(request, None)
+    }
+}
+
+impl FsWorkerRetentionProvider {
+    // Only Runtime's canonical removal caller supplies this evidence, before
+    // deleting its source aggregate. Replays never upgrade a legacy receipt.
+    pub(crate) fn execute_with_shutdown(
+        &self,
+        request: &WorkerRetentionExecutionRequest,
+        shutdown: Option<RetainedWorkerShutdown>,
+    ) -> Result<WorkerRetentionExecutionResult, RuntimeError> {
         validate_request(request)?;
         fs::create_dir_all(&self.runtime_root).map_err(|source| RuntimeError::StoreIo {
             operation: "prepare Worker retention",
@@ -937,6 +1055,14 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
             validate_receipt_request(receipt, request)?;
             if receipt.result.source_removed {
                 return Ok(receipt.result.clone());
+            }
+            if receipt.shutdown.is_some()
+                && self.worker_dir(request.worker_id).is_dir()
+                && receipt.shutdown != shutdown
+            {
+                return Err(RuntimeError::InvalidRequest(
+                    "Canonical removal original shutdown changed".into(),
+                ));
             }
         }
 
@@ -1026,6 +1152,12 @@ impl WorkerRetentionProvider for FsWorkerRetentionProvider {
             schema_version: OPERATION_SCHEMA_VERSION,
             request: request.clone(),
             result: result.clone(),
+            // The original operation owns this fact. Do not retag a pending
+            // removal with a later Stop, or enrich an older proofless receipt.
+            shutdown: match pending {
+                Some(receipt) => receipt.shutdown,
+                None => shutdown,
+            },
         };
         // Pending receipt makes the delete/final-receipt crash window
         // recoverable without treating an uncommitted archive as completion.
@@ -1079,11 +1211,25 @@ struct CanonicalSessionManifest {
     session_id: String,
 }
 
+/// Evidence destroyed with the canonical aggregate, retained only by its
+/// existing removal operation. This is not a new Stop or an execution ledger.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedWorkerShutdown {
+    pub(crate) create_fingerprint: String,
+    pub(crate) stop_operation_id: crate::execution::WorkerLifecycleOperationId,
+    pub(crate) termination: crate::execution::WorkerExecutionTermination,
+}
+
 #[derive(Serialize, Deserialize)]
 struct RetentionOperationReceipt {
     schema_version: u32,
     request: WorkerRetentionExecutionRequest,
     result: WorkerRetentionExecutionResult,
+    // Additive read compatibility: an old receipt remains valid retention
+    // history, but cannot establish previously unrecorded Subject shutdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shutdown: Option<RetainedWorkerShutdown>,
 }
 
 fn read_operation_receipt(path: &Path) -> Result<Option<RetentionOperationReceipt>, RuntimeError> {
@@ -2320,6 +2466,7 @@ mod tests {
                 schema_version: OPERATION_SCHEMA_VERSION,
                 request: request.clone(),
                 result: completed.clone(),
+                shutdown: None,
             },
         );
         fs::remove_dir_all(provider.worker_dir(worker)).unwrap();

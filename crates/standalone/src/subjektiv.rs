@@ -276,6 +276,7 @@ impl StandaloneSubjects {
             writer,
             self_weak: weak.clone(),
             journal_dispatch: Mutex::new(false),
+            consolidation_recovery: Mutex::new(std::collections::HashMap::new()),
             #[cfg(test)]
             registration_before_attribution: Mutex::new(None),
             language: self.memory_language.clone(),
@@ -372,10 +373,46 @@ impl Drop for SubjectConnection {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ConsolidationRecoveryError {
+    #[error(transparent)]
+    Host(#[from] SubjektivHostError),
+    #[error(transparent)]
+    Service(#[from] crate::jobs::JobServiceError),
+    #[error(transparent)]
+    Domain(#[from] subjektiv::api::OperationError),
+}
+
+impl ConsolidationRecoveryError {
+    fn retryable_read_or_storage(&self) -> bool {
+        use crate::jobs::{JobServiceError, JobStoreError};
+        matches!(
+            self,
+            Self::Service(JobServiceError::Store(
+                JobStoreError::Sqlite(_) | JobStoreError::Storage(_) | JobStoreError::Io(_)
+            )) | Self::Domain(subjektiv::api::OperationError::Storage(_))
+            // The Host's writer/Subject liveness reads wrap storage errors in
+            // Unavailable. Recheck them within this same finite read-only budget;
+            // their failure NEVER authorizes a receipt, release, or execution.
+            | Self::Host(SubjektivHostError::Unavailable(_))
+        )
+    }
+}
+
+struct ConsolidationRecoveryOwner {
+    running: bool,
+    passes: usize,
+    error: ConsolidationRecoveryError,
+}
+
 pub(crate) struct LocalSubjectHost {
     writer: subjektiv::journal::JournalWriterBinding,
     self_weak: std::sync::Weak<Self>,
     journal_dispatch: Mutex<bool>,
+    // Exact-attempt, process-local bounded recovery owners/diagnostics. The Job
+    // grant and its unchanged input remain the durable obligation, not this map.
+    consolidation_recovery:
+        Mutex<std::collections::HashMap<(String, String, String), ConsolidationRecoveryOwner>>,
     #[cfg(test)]
     registration_before_attribution: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     catalog: StandaloneSubjects,
@@ -767,10 +804,7 @@ impl LocalSubjectHost {
                             schedule_job(jobs.clone(), job.request.job_id, self.self_weak.clone());
                         }
                         Ok(false) => {} // Missing receipts never authorize replay of effects.
-                        Err(error) => eprintln!(
-                            "standalone consolidation Job {} reconciliation blocked: {error}",
-                            job.request.job_id
-                        ),
+                        Err(error) => self.own_consolidation_recovery(jobs.clone(), job, error),
                     }
                 }
             }
@@ -779,24 +813,24 @@ impl LocalSubjectHost {
         self.recover_journals();
     }
 
-    /// Reconstructs a result from domain receipts, never by reentering the finalizer.
-    /// Acceptance does not assert prior owner shutdown or discharge cleanup ownership.
+    /// Prefer a complete saved result. Otherwise close only this failed attempt's
+    /// domain reservation, retaining unresolved work and the original failure.
+    /// Neither path reruns the finalizer or proves prior execution shutdown.
     fn recover_consolidation_job(
         &self,
         jobs: &crate::jobs::StandaloneJobs,
         observed: &crate::jobs::JobSnapshot,
-    ) -> Result<bool, SubjektivHostError> {
-        let service_error = |error: crate::jobs::JobServiceError| {
-            SubjektivHostError::Unavailable(error.to_string())
-        };
+    ) -> Result<bool, ConsolidationRecoveryError> {
         self.ensure_live()?;
-        let current = jobs.get(&observed.request.job_id).map_err(service_error)?;
+        let current = jobs.get(&observed.request.job_id)?;
         if current.attempt.attempt_id != observed.attempt.attempt_id
             || current.input_digest != observed.input_digest
+            || current.domain_grant != observed.domain_grant
         {
             return Err(SubjektivHostError::InvalidArgument(
-                "consolidation recovery attempt/input changed".into(),
-            ));
+                "consolidation recovery attempt/input/grant changed".into(),
+            )
+            .into());
         }
         if current.version_stopped
             || current.input_disposition != crate::jobs::JobInputDisposition::Available
@@ -804,35 +838,154 @@ impl LocalSubjectHost {
         {
             return Err(SubjektivHostError::InvalidArgument(
                 "stopped or retired consolidation cannot be recovered".into(),
-            ));
+            )
+            .into());
         }
         current
             .load_executable_request()
-            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+            .map_err(crate::jobs::JobServiceError::from)?;
         let grant = self.consolidation_grant(&current)?;
-        let Some(result) = subjektiv::job::lookup_result(
+        if let Some(result) = subjektiv::job::lookup_result(
             &self.catalog.store,
             &grant.binding.subject_id,
             &grant.candidate_ids,
             &current.request.job_id,
             &current.attempt.attempt_id,
-        )
-        .map_err(operation_error)?
-        else {
-            return Ok(false);
-        };
-        self.ensure_live()?;
-        let settled = jobs
-            .accept_reconciled(&job::JobResultSubmission {
+        )? {
+            self.ensure_live()?;
+            let settled = jobs.accept_reconciled(&job::JobResultSubmission {
                 job_id: current.request.job_id,
                 attempt_id: current.attempt.attempt_id,
                 input_digest: current.input_digest,
                 result,
-            })
-            .map_err(service_error)?;
-        jobs.acknowledge(&settled.request.job_id)
-            .map_err(service_error)?;
+            })?;
+            jobs.acknowledge(&settled.request.job_id)?;
+            return Ok(true);
+        }
+        if current.state != crate::jobs::JobState::Failed
+            || current.attempt.state != crate::jobs::JobAttemptState::Failed
+            || !current.executions_released()
+        {
+            return Ok(false);
+        }
+        // This inspection reads original candidate/disposition and preparation
+        // records transactionally. Missing preparation is valid; stale preparation,
+        // missing candidates, retired Subjects and malformed receipts are not.
+        // Do NOT turn unresolved IDs into dispositions or fail a newer/ready surface.
+        let _retained = subjektiv::job::inspect_abandoned_attempt(
+            &self.catalog.store,
+            &grant.binding.subject_id,
+            &grant.candidate_ids,
+            &current.request.job_id,
+            &current.attempt.attempt_id,
+        )?;
+        // Stable reference to the original immutable grant/input and failed
+        // attempt, not a hash of mutable pending-work projections. Later explicit
+        // work can resolve retained candidates without invalidating exact replay.
+        // The existing Job receipt is the closure; no parallel domain ledger.
+        let reference = job::fingerprint(&(
+            "consolidation-abandoned-v1",
+            &grant.binding,
+            &current.request.job_id,
+            &current.attempt.attempt_id,
+            &current.input_digest,
+        ))
+        .map_err(|error| SubjektivHostError::InvalidArgument(error.to_string()))?;
+        self.ensure_live()?;
+        // Recheck the exact Host/grant before persistence. The service/store also
+        // fence the current attempt and independently require ALL executions released.
+        let checked = jobs.get(&current.request.job_id)?;
+        if checked != current {
+            return Err(SubjektivHostError::InvalidArgument(
+                "consolidation changed during abandoned-attempt inspection".into(),
+            )
+            .into());
+        }
+        self.consolidation_grant(&checked)?;
+        jobs.reconcile_granted_attempt(
+            &current.request.job_id,
+            &current.attempt.attempt_id,
+            &format!("consolidation-abandoned-v1:{reference}"),
+        )?;
         Ok(true)
+    }
+
+    /// Keep a finite recovery owner for read/storage failure of this exact
+    /// snapshot. No startup-only repair, disconnect polling, new attempt or model
+    /// call. Exhaustion retains the typed cause and original durable obligation;
+    /// a fresh Host can reconcile it, never infer success from budget exhaustion.
+    fn own_consolidation_recovery(
+        &self,
+        jobs: crate::jobs::StandaloneJobs,
+        observed: crate::jobs::JobSnapshot,
+        error: ConsolidationRecoveryError,
+    ) {
+        eprintln!(
+            "standalone consolidation Job {} reconciliation blocked: {error}",
+            observed.request.job_id
+        );
+        if !error.retryable_read_or_storage() {
+            return;
+        }
+        let key = (
+            observed.request.job_id.clone(),
+            observed.attempt.attempt_id.clone(),
+            observed.input_digest.clone(),
+        );
+        let mut owners = self
+            .consolidation_recovery
+            .lock()
+            .expect("consolidation recovery poisoned");
+        if let Some(owner) = owners.get(&key) {
+            if !owner.running {
+                eprintln!(
+                    "standalone consolidation Job {} retains exhausted reconciliation after {} passes: {}; next action: resolve cause and restore the same Host binding",
+                    key.0, owner.passes, owner.error
+                );
+            }
+            return; // Repeated disconnect cannot refill a running or exhausted budget.
+        }
+        let Some(host) = self.self_weak.upgrade() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        owners.insert(
+            key.clone(),
+            ConsolidationRecoveryOwner {
+                running: true,
+                passes: 1,
+                error,
+            },
+        );
+        runtime.spawn(async move {
+            const PASSES: usize = 8;
+            for pass in 2..=PASSES {
+                tokio::time::sleep(std::time::Duration::from_millis(100 << (pass - 2).min(5))).await;
+                let result = host.recover_consolidation_job(&jobs, &observed);
+                let mut owners = host.consolidation_recovery.lock().expect("consolidation recovery poisoned");
+                match result {
+                    Ok(_) => {
+                        owners.remove(&key);
+                        drop(owners);
+                        host.wake_journals();
+                        return;
+                    }
+                    Err(error) => {
+                        let retry = error.retryable_read_or_storage() && pass < PASSES;
+                        let owner = owners.get_mut(&key).expect("retained consolidation owner");
+                        owner.passes = pass;
+                        owner.running = retry;
+                        owner.error = error;
+                        if !retry {
+                            eprintln!("standalone consolidation Job {} reconciliation stopped after {} passes: {}; original Failed/input/receipts retained; next action: resolve storage/authority failure and restore the same Host binding", key.0, owner.passes, owner.error);
+                            return;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     fn consolidation_grant(
@@ -1595,6 +1748,13 @@ fn schedule_job(
         match jobs.wait(&id).await {
             Ok(result) if result.state == crate::jobs::JobState::Completed => {
                 let _ = jobs.acknowledge(&id);
+            }
+            Ok(result) if result.state == crate::jobs::JobState::Failed => {
+                if let Some(host) = host.upgrade() {
+                    if let Err(error) = host.recover_consolidation_job(&jobs, &result) {
+                        host.own_consolidation_recovery(jobs.clone(), result, error);
+                    }
+                }
             }
             Ok(_) => {}
             Err(error) => eprintln!(

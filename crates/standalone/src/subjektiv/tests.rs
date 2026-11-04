@@ -22,39 +22,45 @@ impl Drop for ConsolidationRecoveryFixture {
 
 impl ConsolidationRecoveryFixture {
     fn new() -> Self {
+        Self::with_candidates(&["candidate"])
+    }
+
+    fn with_candidates(candidate_ids: &[&str]) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let catalog = StandaloneSubjects::open(temp.path().join("state")).unwrap();
         let subject = catalog.create("recovery-owner", None).unwrap();
         let body = catalog
             .connect(&subject.id, protocol::WorkerId::now_v7())
             .unwrap();
-        body.host
-            .catalog
-            .store
-            .stage_candidate(subjektiv::SubjectStagingRecord::attach(
-                &subject.id,
-                memory::extract::StagingRecord::from_candidate(
-                    "candidate",
-                    "dedup",
-                    memory::schema::SourceRef {
-                        segment_id: "segment".into(),
-                        range: [1, 1],
-                    },
-                    memory::extract::ExtractedCandidate {
-                        kind: memory::extract::CandidateKind::Lesson,
-                        claim: "claim".into(),
-                        why_useful: "reason".into(),
-                        staleness: None,
-                        evidence_ids: vec![],
-                    },
-                    vec![],
-                    vec![],
-                ),
-            ))
-            .unwrap();
+        for candidate_id in candidate_ids {
+            body.host
+                .catalog
+                .store
+                .stage_candidate(subjektiv::SubjectStagingRecord::attach(
+                    &subject.id,
+                    memory::extract::StagingRecord::from_candidate(
+                        *candidate_id,
+                        *candidate_id,
+                        memory::schema::SourceRef {
+                            segment_id: "segment".into(),
+                            range: [1, 1],
+                        },
+                        memory::extract::ExtractedCandidate {
+                            kind: memory::extract::CandidateKind::Lesson,
+                            claim: "claim".into(),
+                            why_useful: "reason".into(),
+                            staleness: None,
+                            evidence_ids: vec![],
+                        },
+                        vec![],
+                        vec![],
+                    ),
+                ))
+                .unwrap();
+        }
         let grant = LocalConsolidationGrant {
             binding: body.binding.clone(),
-            candidate_ids: vec!["candidate".into()],
+            candidate_ids: candidate_ids.iter().map(|id| (*id).to_owned()).collect(),
         };
         let request = job::JobRequest {
             job_id: "consolidation-recovery".into(),
@@ -91,6 +97,19 @@ impl ConsolidationRecoveryFixture {
             saved,
             execution_owner: store,
         }
+    }
+
+    fn domain_closure(&self) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        rusqlite::Connection::open(&self.body.jobs_path)
+            .unwrap()
+            .query_row(
+                "SELECT domain_receipt FROM job_domain_reconciliations WHERE job_id=?1 AND attempt_id=?2",
+                rusqlite::params![self.saved.request.job_id, self.saved.attempt.attempt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
     }
 
     fn confirm_execution_joined(&mut self) {
@@ -146,6 +165,244 @@ impl ConsolidationRecoveryFixture {
             .publish_surface_generation(&self.body.binding.subject_id, &generation.id, vec![])
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn failed_consolidation_closes_only_attempt_and_preserves_unresolved_input_and_applied_memory()
+ {
+    for partial_apply in [false, true] {
+        let mut fixture =
+            ConsolidationRecoveryFixture::with_candidates(&["candidate", "unresolved"]);
+        let subject_id = fixture.body.binding.subject_id.clone();
+        let subject = &subject_id;
+        let store = &fixture.body.host.catalog.store;
+        let applied = partial_apply.then(|| {
+            store
+                .decide_candidate(
+                    subject,
+                    subjektiv::CandidateDecisionRequest {
+                        request_id: "applied-before-failure".into(),
+                        candidate_id: "candidate".into(),
+                        reason: "retained applied lesson".into(),
+                        decision: subjektiv::CandidateDecision::Apply {
+                            target: subjektiv::MemoryChangeTarget::Create,
+                            draft: subjektiv::MemoryDraft::active(
+                                memory::extract::CandidateKind::Lesson,
+                                "claim",
+                                "body",
+                                "reason",
+                                "change",
+                            ),
+                        },
+                    },
+                )
+                .unwrap()
+        });
+        // This fixture substitutes only positive execution termination, not the
+        // domain lookup. No model is configured; any accidental execution fails.
+        fixture.confirm_execution_joined();
+        let before = fixture.jobs.get(&fixture.saved.request.job_id).unwrap();
+        let memory = serde_json::to_value(
+            fixture
+                .body
+                .host
+                .catalog
+                .store
+                .list_memories(subject)
+                .unwrap(),
+        )
+        .unwrap();
+        fixture.body.host.recover_jobs();
+        let receipt = fixture
+            .domain_closure()
+            .expect("failed attempt closure persisted");
+        assert!(receipt.starts_with("consolidation-abandoned-v1:"));
+        assert_eq!(fixture.jobs.get(&before.request.job_id).unwrap(), before);
+        assert_eq!(before.state, crate::jobs::JobState::Failed);
+        assert!(before.result.is_none());
+        assert!(fixture.jobs.unreleased_granted().unwrap().is_empty());
+        let retained = subjektiv::job::inspect_abandoned_attempt(
+            &fixture.body.host.catalog.store,
+            subject,
+            &["candidate".into(), "unresolved".into()],
+            &before.request.job_id,
+            &before.attempt.attempt_id,
+        )
+        .unwrap();
+        assert!(
+            retained.prepared_generation_id.is_none(),
+            "no new generation"
+        );
+        assert_eq!(
+            retained.unresolved_candidate_ids,
+            if partial_apply {
+                vec!["unresolved"]
+            } else {
+                vec!["candidate", "unresolved"]
+            }
+        );
+        if let Some(applied) = applied {
+            assert_eq!(retained.disposition_ids, vec![applied.resolution.id]);
+            let saved = fixture
+                .body
+                .host
+                .catalog
+                .store
+                .staging_resolution(subject, "candidate")
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.affected_memory, applied.resolution.affected_memory);
+        } else {
+            assert!(retained.disposition_ids.is_empty());
+        }
+        assert_eq!(
+            serde_json::to_value(
+                fixture
+                    .body
+                    .host
+                    .catalog
+                    .store
+                    .list_memories(subject)
+                    .unwrap()
+            )
+            .unwrap(),
+            memory
+        );
+        // Stable exact replay; a reference does not mean all candidate work is done.
+        assert!(
+            fixture
+                .body
+                .host
+                .recover_consolidation_job(&fixture.jobs, &before)
+                .unwrap()
+        );
+        assert_eq!(fixture.domain_closure(), Some(receipt));
+        let reopened = crate::job_store::JobStore::open(&fixture.body.jobs_path).unwrap();
+        assert_eq!(reopened.get(&before.request.job_id).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn failed_consolidation_retains_unreleased_stale_inactive_migrated_and_erased_controls() {
+    for case in [
+        "unreleased",
+        "stale",
+        "inactive",
+        "migrated",
+        "erased",
+        "changed_grant",
+    ] {
+        let mut fixture = ConsolidationRecoveryFixture::new();
+        if case != "unreleased" {
+            fixture.confirm_execution_joined();
+        }
+        if case == "stale" {
+            fixture.generation(&fixture.saved.attempt.attempt_id);
+            fixture
+                .body
+                .host
+                .catalog
+                .store
+                .create_memory(
+                    &fixture.body.binding.subject_id,
+                    subjektiv::MemoryDraft::active(
+                        memory::extract::CandidateKind::Lesson,
+                        "new",
+                        "body",
+                        "reason",
+                        "change",
+                    ),
+                )
+                .unwrap();
+        }
+        if case == "inactive" {
+            fixture.body.host.live.store(false, Ordering::Release);
+        }
+        if case == "migrated" {
+            rusqlite::Connection::open(&fixture.body.jobs_path)
+                .unwrap()
+                .execute(
+                    "INSERT INTO job_version_stops(job_id) VALUES (?1)",
+                    [&fixture.saved.request.job_id],
+                )
+                .unwrap();
+        }
+        if case == "erased" {
+            fixture
+                .jobs
+                .reclaim_input(
+                    &fixture.saved.request.job_id,
+                    &fixture.saved.input_digest,
+                    crate::jobs::JobInputRetirementReason::ExplicitErasure,
+                )
+                .unwrap();
+        }
+        let mut observed = fixture.saved.clone();
+        if case == "changed_grant" {
+            observed.domain_grant = None;
+        }
+        let before = fixture.jobs.get(&fixture.saved.request.job_id).unwrap();
+        let outcome = fixture
+            .body
+            .host
+            .recover_consolidation_job(&fixture.jobs, &observed);
+        assert!(!matches!(outcome, Ok(true)), "{case}");
+        assert!(fixture.domain_closure().is_none(), "{case}");
+        assert_eq!(
+            fixture.jobs.get(&fixture.saved.request.job_id).unwrap(),
+            before,
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_consolidation_receipt_storage_error_has_autonomous_exact_attempt_recovery() {
+    let mut fixture = ConsolidationRecoveryFixture::new();
+    fixture.confirm_execution_joined();
+    let before = fixture.saved.clone();
+    let connection = rusqlite::Connection::open(&fixture.body.jobs_path).unwrap();
+    // Fail only the closure write; the read-only domain check and all independent
+    // cleanup proofs are real. A storage error is never a successful closure.
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_domain_closure BEFORE INSERT ON job_domain_reconciliations
+        BEGIN SELECT RAISE(FAIL, 'fixture domain receipt storage failure'); END;",
+        )
+        .unwrap();
+    let error = fixture
+        .body
+        .host
+        .recover_consolidation_job(&fixture.jobs, &before)
+        .unwrap_err();
+    assert!(error.retryable_read_or_storage());
+    assert!(fixture.domain_closure().is_none());
+    fixture
+        .body
+        .host
+        .own_consolidation_recovery(fixture.jobs.clone(), before.clone(), error);
+    connection
+        .execute_batch("DROP TRIGGER fail_domain_closure;")
+        .unwrap();
+    // No disconnect, recover_jobs call, restart, new Job, model or finalizer.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fixture.domain_closure().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(fixture.jobs.unreleased_granted().unwrap().is_empty());
+    assert_eq!(fixture.jobs.get(&before.request.job_id).unwrap(), before);
+    assert!(
+        fixture
+            .body
+            .host
+            .consolidation_recovery
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

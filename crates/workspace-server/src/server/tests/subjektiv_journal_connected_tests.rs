@@ -2759,7 +2759,40 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
         // independent Journal job, not a second execution of the restored body.
         let before_stop = fixture.execution.worker_snapshot(&worker_ref);
         let original_stop_count = probe.stops.lock().unwrap().len();
-        let stopped = connected_stop_worker(api, worker).await;
+        let mut stopped = connected_stop_worker(api, worker).await;
+        let uncertain = {
+            let stops = probe.stops.lock().unwrap();
+            stops[original_stop_count..]
+                .last()
+                .and_then(|(request, result)| {
+                    result
+                        .message
+                        .as_deref()
+                        .filter(|message| {
+                            message.contains("admission is unknown and waiter is retained")
+                        })
+                        .and_then(|message| message.strip_prefix("Shutdown command "))
+                        .and_then(|message| message.split_whitespace().next()?.parse::<u64>().ok())
+                        .map(|command| (request.clone(), command))
+                })
+        };
+        if let Some((request, _)) = &uncertain {
+            // A bounded admission wait is not definitive rejection. Reconcile
+            // the retained operation/command once, without a readiness method,
+            // replacement Controller, new Stop identity, or a new input.
+            let pending = record();
+            assert_eq!(
+                pending["execution_state"]["state"],
+                "reconciliation_required"
+            );
+            assert_eq!(pending["execution_state"]["execution"]["operation"], "stop");
+            assert_eq!(
+                pending["execution_state"]["execution"]["intent"]["operation_id"],
+                serde_json::to_value(request.operation_id).unwrap()
+            );
+            assert!(pending["restore_guard"]["execution_termination"].is_null());
+            stopped = connected_stop_worker(api, worker).await;
+        }
         let task_finished = probe
             .controller_tasks
             .lock()
@@ -2788,6 +2821,20 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
             .expect("teardown must obtain a typed Stop from the real adapter");
         assert_eq!(stop.worker_ref, worker_ref);
         assert!(result.is_accepted(), "real adapter teardown: {result:?}");
+        assert!(
+            task_finished.iter().all(|finished| *finished),
+            "real Controller tasks must finish: {task_finished:?}"
+        );
+        if let Some((original, command)) = uncertain {
+            assert!(stops[original_stop_count..].iter().all(|(request, _)| {
+                request.operation_id == original.operation_id
+                    && request.worker_ref == original.worker_ref
+            }));
+            assert_eq!(
+                result.termination.as_ref().unwrap().shutdown_command_id,
+                Some(command)
+            );
+        }
         assert!(
             result.termination.as_ref().is_some_and(
                 |receipt| receipt.confirms_scope_shutdown(&worker_ref, stop.operation_id)

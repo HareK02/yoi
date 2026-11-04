@@ -85,6 +85,10 @@ pub(crate) trait JobDomainProvider: Send + Sync {
     ) -> Result<worker::job::JobFeatureGrant, String>;
 }
 
+type OwnedExecutionReport = Arc<
+    Mutex<Option<Result<worker::job::OwnedInternalJobExecution, worker::job::JobExecutionError>>>,
+>;
+
 struct Execution {
     cancel: watch::Sender<bool>,
     complete: watch::Receiver<Option<Result<(), String>>>,
@@ -95,11 +99,7 @@ struct Execution {
     recovery_issue: Arc<Mutex<Option<JobServiceError>>>,
     task: tokio::task::JoinHandle<Result<(), JobServiceError>>,
     // Retain typed Worker failures and their cleanup resources until the owner can resolve them.
-    _owned: Arc<
-        Mutex<
-            Option<Result<worker::job::OwnedInternalJobExecution, worker::job::JobExecutionError>>,
-        >,
-    >,
+    _owned: OwnedExecutionReport,
 }
 struct Executions {
     closed: bool,
@@ -133,9 +133,30 @@ pub struct StandaloneJobs {
     // Exact restore admissions and typed causes remain Host-owned, even if a
     // dispatcher fails. These are identities, never copies of immutable bodies.
     result_recovery: Arc<Mutex<HashMap<String, Arc<Mutex<Option<JobServiceError>>>>>>,
+    // Process-local typed reports survive successful wait/capacity release.
+    // They are diagnostics, never durable shutdown or replay authority.
+    diagnostics: Arc<Mutex<HashMap<(String, String), OwnedExecutionReport>>>,
 }
 
 impl StandaloneJobs {
+    /// Inspect a retained ordinary Worker failure for one exact attempt in this Host.
+    /// The report survives `wait` and shutdown, but is not restart or cleanup evidence.
+    pub fn with_execution_diagnostic<T>(
+        &self,
+        job_id: &str,
+        attempt_id: &str,
+        inspect: impl FnOnce(&worker::job::OwnedInternalJobExecution) -> T,
+    ) -> Option<T> {
+        let report = self
+            .diagnostics
+            .lock()
+            .expect("Job diagnostics poisoned")
+            .get(&(job_id.to_owned(), attempt_id.to_owned()))
+            .cloned()?;
+        let owned = report.lock().expect("Job owned execution poisoned");
+        owned.as_ref()?.as_ref().ok().map(inspect)
+    }
+
     /// Excludes request/start/result acknowledgement while a Subject Host checks its final
     /// saved obligations and releases ownership. Accepted results alone are insufficient:
     /// every spawned execution must have actually finished successful cleanup.
@@ -178,6 +199,7 @@ impl StandaloneJobs {
             storage_recovered: Arc::default(),
             capacity_changed: Arc::default(),
             result_recovery: Arc::default(),
+            diagnostics: Arc::default(),
         })
     }
 
@@ -635,6 +657,7 @@ impl StandaloneJobs {
         let task_issue = recovery_issue.clone();
         let storage_recovered = self.storage_recovered.clone();
         let capacity_changed = self.capacity_changed.clone();
+        let diagnostics = self.diagnostics.clone();
         let task = tokio::spawn(async move {
             let (sender_tx, mut sender_rx) = tokio::sync::oneshot::channel();
             let run = prepared.run_owned(attempt_id.clone(), sink, move |sender| {
@@ -708,6 +731,19 @@ impl StandaloneJobs {
                 },
             )
             .await;
+            if outcome.is_ok()
+                && retained
+                    .lock()
+                    .expect("Job owned execution poisoned")
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .is_some_and(|execution| execution.worker_failure().is_some())
+            {
+                diagnostics
+                    .lock()
+                    .expect("Job diagnostics poisoned")
+                    .insert((id.clone(), attempt_id.clone()), retained.clone());
+            }
             complete_tx.send_replace(Some(
                 outcome.as_ref().map(|_| ()).map_err(ToString::to_string),
             ));
@@ -1018,7 +1054,7 @@ fn settle_owned_execution(
         .map_err(|error| JobServiceError::Cleanup(error.to_string()))?;
     if !domain_fenced
         || !execution.feature_shutdown_complete()
-        || execution.worker_failure().is_some()
+        || execution.requires_worker_cleanup_reconciliation()
     {
         return Err(JobServiceError::Cleanup(format!(
             "owned Worker shutdown unconfirmed ({} Feature shutdown failures); typed execution retained",

@@ -80,6 +80,10 @@ impl Fixture {
         let mut request = task_request("independent Worker");
         request.config_bundle = None;
         request.memory_settings.as_mut().unwrap().workspace_id = self.scope.workspace_id.clone();
+        request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
+            workspace_id: self.scope.workspace_id.clone(),
+            base_url: "https://backend.test".into(),
+        });
         self.runtime
             .create_worker_scoped(&self.scope, request)
             .unwrap()
@@ -145,6 +149,11 @@ fn subject_job_removal_purge_erases_copies_preserves_receipt_and_prior_success_a
         let prior = tree(&f.temp.path().join("archives/workers/prior-archive"));
         assert!(!prior.is_empty());
         let unrelated = f.independent_worker();
+        // Compare settled retained material, not an active Worker whose cold
+        // automatic restore legitimately changes worker.json independently of purge.
+        f.runtime
+            .stop_worker_scoped(&f.scope, &unrelated, None)
+            .unwrap();
         let unrelated_root = f
             .temp
             .path()

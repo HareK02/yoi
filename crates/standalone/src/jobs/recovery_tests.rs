@@ -190,6 +190,13 @@ async fn restored_results_continue_after_wait_error_without_forging_cleanup() {
     let jobs = StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
     let failed = jobs.request(request("wait-error")).unwrap();
     let later = jobs.request(request("later-result")).unwrap();
+    let db = rusqlite::Connection::open(temp.path().join("jobs.sqlite3")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER reject_cleanup_receipt BEFORE UPDATE OF cleanup_receipt ON job_execution_ownership
+         WHEN NEW.job_id='wait-error' AND NEW.cleanup_receipt IS NOT NULL
+         BEGIN SELECT RAISE(FAIL, 'scripted cleanup receipt rejection'); END;",
+    )
+    .unwrap();
     let ids = jobs.reserved_result_attempts().unwrap();
     let release = Arc::new(Notify::new());
     let _release_on_failure = ReleaseShutdownOnDrop(release.clone());
@@ -206,7 +213,8 @@ async fn restored_results_continue_after_wait_error_without_forging_cleanup() {
     let owner_jobs = jobs.clone();
     let owner = tokio::spawn(async move { owner_jobs.resume_reserved_result_jobs(ids).await });
     // Wait for the later model to enter, then observe its real cleanup. The first
-    // owner still cannot finish; it is held before a known provider failure.
+    // owner is held before provider return and its exact cleanup receipt write
+    // will be rejected independently of that ordinary model failure.
     await_model(&model).await;
     assert_eq!(
         await_job(&jobs, "later-result").await.state,
@@ -233,7 +241,7 @@ async fn restored_results_continue_after_wait_error_without_forging_cleanup() {
     assert!(
         jobs.result_recovery_diagnostic("wait-error")
             .unwrap()
-            .contains("cleanup")
+            .contains("scripted cleanup receipt rejection")
     );
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     assert_eq!(bad_model.requests.lock().unwrap().len(), 2);

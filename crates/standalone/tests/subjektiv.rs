@@ -1383,7 +1383,61 @@ async fn transport_loss_after_candidate_apply_preserves_memory_and_later_job_onl
         failed.result.is_none(),
         "partial apply is not an accepted Job result"
     );
+    assert!(
+        failed.executions_released(),
+        "real cleanup is independent of failure"
+    );
+    let requests_for_failed_job = || {
+        losing
+            .requests()
+            .iter()
+            .filter(|request| {
+                request.items.iter().filter_map(Item::as_text).any(|text| {
+                    text.lines()
+                        .any(|line| line == format!("job_id: {first_id}"))
+                })
+            })
+            .count()
+    };
+    let failed_job_requests = requests_for_failed_job();
+    let job_db = rusqlite::Connection::open(
+        state
+            .join("subjektiv/jobs")
+            .join(&subject.id)
+            .join("jobs.sqlite3"),
+    )
+    .unwrap();
+    // Wait for the production post-terminal consumer, NOT disconnect retries or
+    // a manual startup/recovery call. This row is explicitly non-success and the
+    // original Failed snapshot/cause/input remain unchanged.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            use rusqlite::OptionalExtension;
+            let receipt: Option<String> = job_db.query_row(
+                "SELECT domain_receipt FROM job_domain_reconciliations WHERE job_id=?1 AND attempt_id=?2",
+                rusqlite::params![first_id, failed.attempt.attempt_id], |row| row.get(0),
+            ).optional().unwrap();
+            if let Some(receipt) = receipt {
+                assert!(receipt.starts_with("consolidation-abandoned-v1:"));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("failed domain reconciliation is owned without disconnect/startup");
+    assert_eq!(host.jobs().get(&first_id).unwrap(), failed);
+    assert_eq!(
+        requests_for_failed_job(),
+        failed_job_requests,
+        "no extra model request"
+    );
     disconnect_recorded(&mut host).await;
+    // Disconnect closes this service; compare the durable Failed snapshot after
+    // the next Host reopens the same Subject ledger below.
+    assert_eq!(
+        requests_for_failed_job(),
+        failed_job_requests,
+        "no replay during handoff"
+    );
     host.shutdown().await.unwrap();
     let original = inspect_store(&state, |store| {
         assert!(

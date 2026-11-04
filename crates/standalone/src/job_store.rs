@@ -366,6 +366,13 @@ impl JobStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let snapshot = require_snapshot(&tx, job_id)?;
         check_attempt(&snapshot, attempt_id)?;
+        if snapshot.version_stopped || snapshot.input_disposition != JobInputDisposition::Available
+        {
+            return Err(JobStoreError::InvalidTransition(
+                "stopped or retired input forbids domain reconciliation",
+            ));
+        }
+        snapshot.load_executable_request()?;
         if snapshot.domain_grant.is_none()
             || snapshot.attempt.state != JobAttemptState::Failed
             || !matches!(snapshot.state, JobState::Failed | JobState::Cancelled)
@@ -1261,6 +1268,54 @@ mod tests {
                 .is_err()
         );
         assert!(reopened.retry("first").is_err());
+    }
+
+    #[test]
+    fn granted_reconciliation_rechecks_retired_input_in_its_own_transaction() {
+        let (dir, mut store) = fixture();
+        for (id, erase) in [("live-input", false), ("erased-input", true)] {
+            let reserved = store
+                .reserve_granted(request(id), Some(json!({"domain":"consolidation"})))
+                .unwrap();
+            store.dispatch(id, &reserved.attempt.attempt_id, 8).unwrap();
+            store
+                .finish(
+                    id,
+                    &reserved.attempt.attempt_id,
+                    JobAttemptState::Failed,
+                    Some("provider failure"),
+                )
+                .unwrap();
+            record_runner_cleanup(&mut store, id);
+            let observed = store.get(id).unwrap();
+            assert!(observed.executions_released());
+            if erase {
+                let mut other = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+                other
+                    .reclaim_input(
+                        id,
+                        &observed.input_digest,
+                        JobInputRetirementReason::ExplicitErasure,
+                    )
+                    .unwrap();
+            }
+            let result = store.reconcile_granted_attempt(
+                id,
+                &observed.attempt.attempt_id,
+                "inspected-original-effects",
+            );
+            assert_eq!(result.is_ok(), !erase);
+            let receipts: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM job_domain_reconciliations WHERE job_id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(receipts, i64::from(!erase));
+            assert_eq!(store.get(id).unwrap().state, JobState::Failed);
+        }
     }
 
     #[test]
@@ -2612,6 +2667,7 @@ mod tests {
                 Some("known failure"),
             )
             .unwrap();
+        assert!(!failed.executions_released());
         record_runner_cleanup(&mut store, "atomic");
         let failed = store.get("atomic").unwrap();
         store

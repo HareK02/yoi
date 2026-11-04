@@ -6224,7 +6224,59 @@ impl Runtime {
                 "Worker retention cannot remove pending {operation} reconciliation"
             )));
         }
-        let result = provider.execute(request)?;
+        // Preserve only the original canonical Stop, not stopped status, map
+        // absence or a backend receipt for a different execution. The aggregate
+        // is about to disappear; the existing retention operation owns the
+        // historical copy. Missing legacy evidence does not block removal.
+        let shutdown = worker.request.as_ref().and_then(|create| {
+            worker
+                .restore_guard
+                .execution_termination
+                .as_ref()
+                .and_then(|termination| {
+                    termination
+                        .confirms_scope_shutdown(&worker.worker_ref, termination.stop_operation_id)
+                        .then(|| crate::retention::RetainedWorkerShutdown {
+                            create_fingerprint: create.create_fingerprint.clone(),
+                            stop_operation_id: termination.stop_operation_id,
+                            termination: termination.clone(),
+                        })
+                })
+        });
+        let expected = worker.persisted_record();
+        let backend = state.execution_backend.clone();
+        drop(state);
+        if let Some(saved) = shutdown.as_ref() {
+            let current = backend
+                .ok_or_else(|| {
+                    RuntimeError::InvalidRequest(
+                        "Canonical removal shutdown has no execution owner".into(),
+                    )
+                })?
+                .reconcile_termination_receipt(&expected.worker_ref, &saved.termination)
+                .map_err(RuntimeError::InvalidRequest)?;
+            if current.as_ref() != Some(&saved.termination) {
+                return Err(RuntimeError::InvalidRequest(
+                    "Canonical removal shutdown no longer matches execution owner".into(),
+                ));
+            }
+        }
+        let mut state = self.lock()?;
+        state.ensure_running()?;
+        if shutdown.is_some() {
+            let store = state.fs_store().ok_or_else(|| {
+                RuntimeError::InvalidRequest(
+                    "Canonical removal shutdown requires filesystem storage".into(),
+                )
+            })?;
+            let (_, matches) = store.reconcile_worker_record(&expected)?;
+            if !matches {
+                return Err(RuntimeError::InvalidRequest(
+                    "Canonical removal shutdown source changed".into(),
+                ));
+            }
+        }
+        let result = provider.execute_with_shutdown(request, shutdown)?;
         state.workers.remove(&request.worker_id);
         state.persist_runtime_snapshot()?;
         Ok(result)

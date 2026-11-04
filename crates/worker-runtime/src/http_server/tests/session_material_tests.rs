@@ -58,6 +58,10 @@ impl Fixture {
         let mut request = task_request("canonical Session fixture");
         request.config_bundle = None;
         request.memory_settings.as_mut().unwrap().workspace_id = scope.workspace_id.clone();
+        request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
+            workspace_id: scope.workspace_id.clone(),
+            base_url: "https://backend.test".into(),
+        });
         let worker = runtime
             .create_worker_scoped(&scope, request)
             .unwrap()
@@ -1265,11 +1269,11 @@ async fn subject_delete_worker_signed_http_requires_delete_scope_without_inventi
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let error: RuntimeHttpErrorResponse = read_json(response).await;
         assert_eq!(error.error.code, "invalid_request");
+        let diagnostic = error.error.message.to_ascii_lowercase();
         assert!(
-            error
-                .error
-                .message
-                .contains("Missing original confirmed Subject shutdown")
+            diagnostic.contains("original") && diagnostic.contains("shutdown"),
+            "expected rejection for absent original shutdown proof, got: {}",
+            error.error.message
         );
         assert!(f.runtime.worker_detail(&f.worker).is_ok());
         assert!(

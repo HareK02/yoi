@@ -1396,6 +1396,13 @@ pub struct HostingAdminInitialBearer {
     pub expires_at: String,
 }
 
+/// Immutable boundary for the all-state startup recovery scan, not an execution claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackendJobRecoveryCursor {
+    pub job_id: String,
+    pub attempt_id: String,
+}
+
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     fn plugin_upload(
@@ -2054,6 +2061,15 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         expected: &BackendJobAttemptRecord,
         now: &str,
     ) -> Result<(BackendJobAttemptRecord, bool)>;
+    /// Diagnose failed Host preflight without claiming cleanup or proving termination.
+    fn record_backend_job_cleanup_preflight_failure(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        failure_detail: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
     fn finish_backend_job_worker_cleanup_owned(
         &self,
         workspace_id: &str,
@@ -2064,9 +2080,20 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         failure_detail: Option<&str>,
         now: &str,
     ) -> Result<BackendJobAttemptRecord>;
+    /// Read the first bounded page; use the paged variant to enumerate all owners.
     fn list_recoverable_backend_job_attempts(
         &self,
         workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BackendJobAttemptRecord>> {
+        self.list_recoverable_backend_job_attempts_page(workspace_id, None, limit)
+    }
+    /// Read one bounded page without claiming or changing any attempt.
+    /// Startup must traverse every page, independently of admitted owner progress.
+    fn list_recoverable_backend_job_attempts_page(
+        &self,
+        workspace_id: &str,
+        after: Option<&BackendJobRecoveryCursor>,
         limit: usize,
     ) -> Result<Vec<BackendJobAttemptRecord>>;
     fn claim_backend_job_attempt_dispatch(
@@ -8315,6 +8342,23 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             now,
         )
     }
+    fn record_backend_job_cleanup_preflight_failure(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        failure_detail: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        backend_job_recovery_store::record_cleanup_preflight_failure(
+            self,
+            workspace_id,
+            expected_history,
+            expected,
+            failure_detail,
+            now,
+        )
+    }
     fn finish_backend_job_worker_cleanup_owned(
         &self,
         workspace_id: &str,
@@ -8336,26 +8380,42 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             now,
         )
     }
-    fn list_recoverable_backend_job_attempts(
+    fn list_recoverable_backend_job_attempts_page(
         &self,
         workspace_id: &str,
+        after: Option<&BackendJobRecoveryCursor>,
         limit: usize,
     ) -> Result<Vec<BackendJobAttemptRecord>> {
-        self.with_conn_mut(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // Preserve the last confirmed dispatch fact. An unbound claim may
-            // already own an external allocation; the Server reconciles its ID.
+        self.with_conn(|conn| {
+            // A deferred read snapshot keeps identities and records consistent
+            // without reserving the writer or changing the last dispatch fact.
+            let tx = conn.unchecked_transaction()?;
             let mut statement = tx.prepare(
-                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND a.state IN ('reserved', 'dispatching', 'dispatched') AND a.attempt=j.current_attempt AND j.state='pending' AND j.input_disposition='available' AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.created_at LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.state IN ('reserved', 'dispatching', 'dispatched') AND a.attempt=j.current_attempt AND j.state='pending' AND j.input_disposition='available' AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.job_id, a.attempt_id LIMIT ?2",
             )?;
-            let identities = statement.query_map(params![workspace_id, limit as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            // Identities remain stable when earlier owners update state or
+            // timestamps. Reading a page never grants allocation/Submit authority.
+            let limit = limit.min(usize::from(crate::backend_job::ABSOLUTE_MAX_CONCURRENT_JOBS));
+            let identities = statement
+                .query_map(
+                    params![
+                        workspace_id,
+                        limit as i64,
+                        after.map(|cursor| cursor.job_id.as_str()),
+                        after.map(|cursor| cursor.attempt_id.as_str()),
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
-            let attempts = identities.into_iter().map(|(job_id, attempt_id)| {
-                read_backend_job_attempt(&tx, workspace_id, &job_id, &attempt_id)?
-                    .ok_or_else(|| Error::Store("recoverable Backend Job attempt disappeared".to_string()))
-            }).collect::<Result<Vec<_>>>()?;
+            let attempts = identities
+                .into_iter()
+                .map(|(job_id, attempt_id)| {
+                    read_backend_job_attempt(&tx, workspace_id, &job_id, &attempt_id)?.ok_or_else(|| {
+                        Error::Store("recoverable Backend Job attempt disappeared".to_string())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             tx.commit()?;
             Ok(attempts)
         })

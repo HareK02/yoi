@@ -5442,7 +5442,11 @@ where
                 .any(|((worker, _), reservation)| {
                     worker == worker_ref
                         && (reservation.guard.is_some()
-                            || reservation.state != runtime_api::SubjectReleaseState::Cancelled)
+                            || !matches!(
+                                reservation.state,
+                                runtime_api::SubjectReleaseState::Cancelled
+                                    | runtime_api::SubjectReleaseState::Disconnected
+                            ))
                 })
         {
             return Ok(None);
@@ -6056,7 +6060,11 @@ where
                 .any(|((saved, _), reservation)| {
                     *saved == worker
                         && (reservation.guard.is_some()
-                            || reservation.state != runtime_api::SubjectReleaseState::Cancelled)
+                            || !matches!(
+                                reservation.state,
+                                runtime_api::SubjectReleaseState::Cancelled
+                                    | runtime_api::SubjectReleaseState::Disconnected
+                            ))
                 })
         {
             return Err("Subject Worker still has an execution resource owner".into());
@@ -6213,6 +6221,9 @@ where
                     .as_mut()
                     .ok_or("Controller reservation missing")?
                     .commit_disconnect()?;
+                // The Controller's permanent mutation fence is now committed;
+                // the temporary quiescence lease no longer owns a live handoff.
+                saved.guard.take();
                 saved.state = State::Disconnected;
             }
             (Action::Disconnect, State::Disconnected) | (Action::Cancel, State::Cancelled) => {}

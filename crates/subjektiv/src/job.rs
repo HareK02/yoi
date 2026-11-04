@@ -215,6 +215,93 @@ pub fn lookup_result(
     with_dispositions(store, subject_id, batch, &result).map(Some)
 }
 
+/// A read-only view of work retained by an abandoned attempt, NOT a successful
+/// consolidation result. Receipt IDs point to immutable dispositions; unresolved
+/// IDs remain in the original input/staging store for later explicit work.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AbandonedAttempt {
+    pub disposition_ids: Vec<String>,
+    pub unresolved_candidate_ids: Vec<String>,
+    pub prepared_generation_id: Option<String>,
+}
+
+/// Inspect the original batch and preparation without deciding candidates,
+/// preparing/failing a surface, or calling a model/finalizer. The Host must first
+/// prove the exact failed attempt's execution release and current grant/input.
+/// No preparation is a valid pre-effects cut; an existing but stale preparation
+/// is not. A ready surface (possibly shared by another preparation) is untouched.
+pub fn inspect_abandoned_attempt(
+    store: &SubjektivStore,
+    subject_id: &str,
+    batch: &[String],
+    job_id: &str,
+    attempt_id: &str,
+) -> OperationResult<AbandonedAttempt> {
+    use crate::SubjektivError;
+    use rusqlite::{OptionalExtension, params};
+
+    if batch.len() > CANDIDATE_BATCH_LIMIT
+        || batch
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != batch.len()
+    {
+        return Err(OperationError::InvalidInput(
+            "invalid consolidation batch".into(),
+        ));
+    }
+    store.database.try_transaction(|tx| {
+        crate::require_active_subject(tx, subject_id)?;
+        crate::validate_label("Job id", job_id)?;
+        crate::validate_label("attempt id", attempt_id)?;
+        let mut retained = AbandonedAttempt {
+            disposition_ids: Vec::new(),
+            unresolved_candidate_ids: Vec::new(),
+            prepared_generation_id: None,
+        };
+        for id in batch {
+            let raw: Option<String> = tx.query_row(
+                "SELECT record_json FROM staging_records WHERE subject_id=?1 AND candidate_id=?2",
+                params![subject_id, id], |row| row.get(0)
+            ).optional()?;
+            let raw_candidate = raw.ok_or_else(|| SubjektivError::CandidateNotFound(id.clone()))?;
+            let candidate = crate::parse_staging(store.workspace_id(), &raw_candidate)?;
+            if candidate.subject_id != subject_id || candidate.id != *id {
+                return Err(SubjektivError::InvalidRecord("consolidation candidate identity mismatch".into()));
+            }
+            let resolution: Option<String> = tx.query_row(
+                "SELECT resolution_json FROM staging_resolutions WHERE subject_id=?1 AND candidate_id=?2",
+                params![subject_id, id], |row| row.get(0)
+            ).optional()?;
+            if let Some(raw) = resolution {
+                let saved = crate::parse_resolution(&raw)?;
+                if saved.subject_id != subject_id || saved.candidate_id != *id
+                    || !crate::equivalent_staging_payload(&serde_json::to_string(&saved.candidate)?, &raw_candidate)?
+                {
+                    return Err(SubjektivError::InvalidRecord("consolidation disposition identity mismatch".into()));
+                }
+                retained.disposition_ids.push(saved.id);
+            } else {
+                retained.unresolved_candidate_ids.push(id.clone());
+            }
+        }
+        let fingerprint = crate::memory_fingerprint_in_connection(tx, subject_id)?;
+        retained.prepared_generation_id = tx.query_row(
+            "SELECT generation_id FROM surface_generation_runs
+             WHERE subject_id=?1 AND job_id=?2 AND attempt_id=?3 AND memory_fingerprint=?4
+             ORDER BY generation_id LIMIT 1",
+            params![subject_id, job_id, attempt_id, fingerprint], |row| row.get(0)
+        ).optional()?;
+        if retained.prepared_generation_id.is_none() && tx.prepare(
+            "SELECT 1 FROM surface_generation_runs WHERE subject_id=?1 AND job_id=?2 AND attempt_id=?3"
+        )?.exists(params![subject_id, job_id, attempt_id])? {
+            return Err(SubjektivError::InvalidRecord("abandoned consolidation generation input is stale".into()));
+        }
+        Ok(retained)
+    }).map_err(crate::api::subjektiv_store_error)
+}
+
 /// Adds a compact projection of stored dispositions to a validated result.
 /// Reasons, change references, and provenance stay in the receipt store, not duplicated in bounded Job results.
 /// Neither reapplies candidates nor creates a new ledger.

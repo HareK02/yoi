@@ -580,7 +580,7 @@ async fn process_loss_fails_same_attempt_without_claiming_execution_cleanup() {
 }
 
 #[tokio::test]
-async fn model_failure_retains_unconfirmed_execution_and_forbids_retry() {
+async fn ordinary_model_failure_preserves_cause_and_confirms_independent_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let (host, _) = host(&temp).await;
     let jobs = host.jobs();
@@ -589,14 +589,14 @@ async fn model_failure_retains_unconfirmed_execution_and_forbids_retry() {
         fail: true,
         ..ScriptedClient::new(Vec::new())
     };
-    jobs.start_with_model_client("model-failure", client)
+    jobs.start_with_model_client("model-failure", client.clone())
         .await
         .unwrap();
-    assert!(matches!(
-        jobs.wait("model-failure").await,
-        Err(JobServiceError::Cleanup(_))
-    ));
-    let failure = jobs.get("model-failure").unwrap();
+    let failure = tokio::time::timeout(Duration::from_secs(10), jobs.wait("model-failure"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(jobs.get("model-failure").unwrap(), failure);
     assert_eq!(failure.state, JobState::Failed);
     assert!(failure.result.is_none());
     assert!(
@@ -607,11 +607,40 @@ async fn model_failure_retains_unconfirmed_execution_and_forbids_retry() {
             .unwrap()
             .contains("scripted model failure")
     );
-    assert!(!failure.executions_released());
-    assert!(jobs.retry("model-failure").is_err());
-    assert_eq!(jobs.get("model-failure").unwrap(), failure);
+    assert!(failure.executions_released());
+    assert_eq!(failure.executions.len(), 1);
+    let execution = &failure.executions[0];
+    assert!(execution.writes_revoked);
     assert_eq!(
-        host.shutdown().await,
-        Err(standalone::StandaloneShutdownError::JobCleanup)
+        execution.cleanup_receipt.as_deref(),
+        Some(format!("owned-run:{}", execution.run_id).as_str())
     );
+    assert_eq!(client.requests().len(), 1, "no automatic model retry");
+    assert_eq!(
+        jobs.with_execution_diagnostic("model-failure", &failure.attempt.attempt_id, |report| {
+            assert_eq!(report.run_id.to_string(), execution.run_id);
+            assert!(report.feature_shutdown_complete());
+            assert!(report.worker_failure().is_some());
+            assert!(report.result.is_err());
+            !report.requires_worker_cleanup_reconciliation()
+        }),
+        Some(true)
+    );
+    assert_eq!(jobs.request(request("model-failure")).unwrap(), failure);
+    let retried = jobs.retry("model-failure").unwrap();
+    assert_eq!(retried.attempt.number, 2);
+    assert_ne!(retried.attempt.attempt_id, failure.attempt.attempt_id);
+    assert_eq!(retried.executions, failure.executions);
+    let recovery = success();
+    jobs.start_with_model_client("model-failure", recovery.clone())
+        .await
+        .unwrap();
+    let completed = jobs.wait("model-failure").await.unwrap();
+    assert_eq!(completed.state, JobState::Completed);
+    assert_eq!(completed.executions.len(), 2);
+    assert_eq!(completed.executions[0], failure.executions[0]);
+    assert!(completed.executions_released());
+    assert_eq!(recovery.requests().len(), 2);
+    assert_eq!(client.requests().len(), 1);
+    host.shutdown().await.unwrap();
 }

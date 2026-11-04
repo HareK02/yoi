@@ -1,47 +1,96 @@
 use super::*;
 
+struct SubjectOriginalAbsence {
+    // None only for the existing confirmation-before-removal path.
+    removal_shutdown: Option<crate::execution::WorkerExecutionTermination>,
+}
+
 impl RuntimeState {
-    // Absence is usable only after this exact Subject operation confirmed the
-    // original scope and cleanup. A new missing catalog ID is never proof.
+    // Absence needs original scope shutdown evidence, independently of current
+    // resource cleanup. A new missing catalog ID is never proof.
     fn confirmed_subject_delete_originals_absent(
-        &self,
+        &mut self,
         request: &runtime_api::SubjectDeleteWorkerRequest,
-    ) -> Result<bool, RuntimeError> {
+    ) -> Result<Option<SubjectOriginalAbsence>, RuntimeError> {
         if self.workers.contains_key(&request.worker_id) {
-            return Ok(false);
+            return Ok(None);
         }
         if self.unreconciled_worker_writes.contains(&request.worker_id) {
             return Err(RuntimeError::InvalidRequest(
                 "Subject Worker write remains uncertain".into(),
             ));
         }
-        self.subject_delete_worker_fences
-            .get(&request.worker_id)
-            .filter(|fence| fence.request == *request)
-            .and_then(|fence| fence.response.as_ref())
-            .filter(|saved| {
-                saved.workspace_id == request.workspace_id
-                    && saved.worker_id == request.worker_id
-                    && saved.create_fingerprint == request.create_fingerprint
-                    && saved.operation_id == request.operation_id
-            })
-            .ok_or_else(|| {
-                RuntimeError::InvalidRequest("Missing original confirmed Subject shutdown".into())
-            })?;
         #[cfg(feature = "fs-store")]
-        if self
-            .fs_store()
-            .ok_or_else(|| {
-                RuntimeError::InvalidRequest("Subject original absence requires fs storage".into())
-            })?
-            .worker_originals_absent(request.worker_id)?
         {
-            return Ok(true);
+            let fence = self
+                .subject_delete_worker_fences
+                .get(&request.worker_id)
+                .filter(|fence| fence.request == *request)
+                .ok_or_else(|| {
+                    RuntimeError::InvalidRequest("Missing exact Subject fence".into())
+                })?;
+            let store = self.fs_store().ok_or_else(|| {
+                RuntimeError::InvalidRequest("Subject original absence requires fs storage".into())
+            })?;
+            if !store.worker_originals_absent(request.worker_id)? {
+                return Err(RuntimeError::InvalidRequest(
+                    "Subject Worker original material remains".into(),
+                ));
+            }
+            // Preserve confirmation-before-removal replay. A fence confirmed
+            // through retention history must instead reread its original child
+            // every time; its response is not a substitute for that receipt.
+            if fence.canonical_removal.is_none()
+                && fence.response.as_ref().is_some_and(|saved| {
+                    saved.workspace_id == request.workspace_id
+                        && saved.worker_id == request.worker_id
+                        && saved.create_fingerprint == request.create_fingerprint
+                        && saved.operation_id == request.operation_id
+                })
+            {
+                return Ok(Some(SubjectOriginalAbsence {
+                    removal_shutdown: None,
+                }));
+            }
+            let runtime_id = self.runtime_identity.as_deref().ok_or_else(|| {
+                RuntimeError::InvalidRequest("Subject removal Runtime identity missing".into())
+            })?;
+            let (removal, termination, receipt_sha256) =
+                FsWorkerRetentionProvider::new(store.runtime_dir()).subject_shutdown_removal(
+                    request,
+                    runtime_id,
+                    fence
+                        .canonical_removal
+                        .as_ref()
+                        .map(|child| (&child.request, child.receipt_sha256.as_str())),
+                )?;
+            self.subject_delete_worker_fences
+                .get_mut(&request.worker_id)
+                .expect("exact Subject fence held under Worker lock")
+                .canonical_removal = Some(SubjectCanonicalRemoval {
+                request: removal,
+                receipt_sha256,
+            });
+            // Bind the original child before external resource cleanup. Retry
+            // also synchronizes a prior uncertain snapshot acknowledgement.
+            self.persist_runtime_snapshot()?;
+            return Ok(Some(SubjectOriginalAbsence {
+                removal_shutdown: Some(termination),
+            }));
         }
+        #[cfg(not(feature = "fs-store"))]
         Err(RuntimeError::InvalidRequest(
             "Subject Worker original material remains or cannot be inspected".into(),
         ))
     }
+}
+
+#[cfg(feature = "fs-store")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SubjectCanonicalRemoval {
+    request: WorkerRetentionExecutionRequest,
+    receipt_sha256: String,
 }
 
 /// Permanent exclusion survives WorkerRemoval. A receipt never substitutes for a
@@ -51,6 +100,10 @@ impl RuntimeState {
 pub(crate) struct SubjectDeleteWorkerFence {
     pub(crate) request: runtime_api::SubjectDeleteWorkerRequest,
     pub(crate) response: Option<runtime_api::SubjectDeleteWorkerResponse>,
+    // Child identity only; shutdown remains authoritative in the removal receipt.
+    #[cfg(feature = "fs-store")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) canonical_removal: Option<SubjectCanonicalRemoval>,
 }
 
 impl Runtime {
@@ -218,6 +271,8 @@ impl Runtime {
                     SubjectDeleteWorkerFence {
                         request: request.clone(),
                         response: None,
+                        #[cfg(feature = "fs-store")]
+                        canonical_removal: None,
                     },
                 );
             }
@@ -233,17 +288,31 @@ impl Runtime {
         backend
             .fence_subject_delete_worker(&request)
             .map_err(RuntimeError::InvalidRequest)?;
-        if self
-            .lock()?
-            .confirmed_subject_delete_originals_absent(&request)?
-        {
-            // The durable confirmed fence owns the historical shutdown proof;
-            // this separately checks current adapter resources after removal.
+        let absent = {
+            let mut state = self.lock()?;
+            state.confirmed_subject_delete_originals_absent(&request)?
+        };
+        if let Some(absent) = absent {
+            if let Some(saved) = absent.removal_shutdown.as_ref() {
+                let current = backend
+                    .reconcile_termination_receipt(&worker_ref, saved)
+                    .map_err(RuntimeError::InvalidRequest)?;
+                if current.as_ref() != Some(saved) {
+                    return Err(RuntimeError::InvalidRequest(
+                        "Original removal Stop no longer matches execution owner".into(),
+                    ));
+                }
+            }
+            // The durable confirmed fence or original removal owns historical
+            // shutdown proof; separately check current adapter/factory resources.
             backend
                 .confirm_subject_delete_worker_absent(&request)
                 .map_err(RuntimeError::InvalidRequest)?;
             let mut state = self.lock()?;
-            if !state.confirmed_subject_delete_originals_absent(&request)? {
+            if state
+                .confirmed_subject_delete_originals_absent(&request)?
+                .is_none()
+            {
                 return Err(RuntimeError::InvalidRequest(
                     "Subject originals changed during absence reconciliation".into(),
                 ));

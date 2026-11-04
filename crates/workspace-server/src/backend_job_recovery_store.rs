@@ -189,6 +189,66 @@ pub(super) fn claim_cleanup_owned(
     })
 }
 
+/// A failed Host preflight is diagnostic evidence, never cleanup ownership or
+/// termination proof. In particular, a competing unfenced Executing writer must
+/// remain Executing; only its original admission resource can authorize recovery.
+pub(super) fn record_cleanup_preflight_failure(
+    store: &SqliteWorkspaceStore,
+    workspace: &str,
+    expected_history: &[BackendJobAttemptRecord],
+    expected: &BackendJobAttemptRecord,
+    detail: &str,
+    now: &str,
+) -> Result<BackendJobAttemptRecord> {
+    if detail.trim().is_empty() {
+        return Err(Error::InvalidInput(
+            "cleanup preflight requires a cause detail".into(),
+        ));
+    }
+    store.with_conn_mut(|conn| {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_current_contract(&tx, workspace, &expected.job_id)?;
+        require_history(&tx, workspace, expected_history, expected)?;
+        let job = require_retained_owner(&tx, workspace, expected)?;
+        if job.current_attempt != expected.attempt
+            || job.state == BackendJobState::Pending
+            || !expected.state.terminal()
+            || expected.worker.is_none()
+            || expected
+                .runtime_run_id
+                .as_ref()
+                .is_none_or(|run| run.is_empty())
+            || expected.worker_cleanup_completed_at.is_some()
+            || !matches!(
+                expected.worker_cleanup_state,
+                Some(
+                    BackendJobWorkerCleanupState::Pending
+                        | BackendJobWorkerCleanupState::Failed
+                        | BackendJobWorkerCleanupState::Executing
+                )
+            )
+        {
+            return Err(Error::RepositoryConflict(
+                "Cleanup preflight diagnostic owner is no longer eligible".into(),
+            ));
+        }
+        let fenced: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM backend_job_execution_fences WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3)",
+            params![workspace, expected.job_id, expected.attempt_id], |row| row.get(0),
+        )?;
+        if fenced {
+            return Err(Error::RepositoryConflict(
+                "Cleanup execution fence already recorded; preflight cannot overwrite progress".into(),
+            ));
+        }
+        tx.execute("UPDATE backend_job_attempts SET worker_cleanup_state=CASE WHEN worker_cleanup_state='executing' THEN 'executing' ELSE 'failed' END,worker_cleanup_failure_category='backend_job_cleanup_host_admission_unconfirmed',worker_cleanup_failure_detail=?4,worker_cleanup_updated_at=?5 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3", params![workspace, expected.job_id, expected.attempt_id, bounded_failure_detail(detail), now])?;
+        let result = read_backend_job_attempt(&tx, workspace, &expected.job_id, &expected.attempt_id)?
+            .ok_or_else(|| Error::Store("Cleanup diagnostic owner disappeared".into()))?;
+        tx.commit()?;
+        Ok(result)
+    })
+}
+
 pub(super) fn finish_cleanup_owned(
     store: &SqliteWorkspaceStore,
     workspace: &str,
@@ -1284,6 +1344,349 @@ mod tests {
             .get_backend_job_attempt("workspace", "accepted", &reservation.attempt.attempt_id)
             .unwrap()
             .unwrap()
+    }
+
+    #[test]
+    fn cleanup_preflight_failure_full_cas_preserves_result_input_and_rolls_back_storage_error() {
+        let (dir, store, reserved) = fixture();
+        let owner = bind_fixture_owner(&store, &reserved);
+        let completed = store
+            .reconcile_backend_job_domain_result(
+                "workspace",
+                &owner,
+                &BackendJobResultSubmission {
+                    job_id: owner.job_id.clone(),
+                    attempt_id: owner.attempt_id.clone(),
+                    input_digest: owner.input_digest.clone(),
+                    result: serde_json::json!({"saved": true}),
+                },
+                NOW,
+            )
+            .unwrap();
+        let history = store
+            .list_backend_job_attempts("workspace", "accepted")
+            .unwrap();
+        let job = store
+            .get_backend_job("workspace", "accepted")
+            .unwrap()
+            .unwrap();
+        let detail =
+            "Original Host admission unavailable; termination unconfirmed; retain result/input";
+        let later = "2026-11-04T00:00:01Z";
+        assert!(
+            store
+                .record_backend_job_cleanup_preflight_failure(
+                    "workspace",
+                    &[],
+                    &completed,
+                    detail,
+                    later,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .record_backend_job_cleanup_preflight_failure(
+                    "other-workspace",
+                    &history,
+                    &completed,
+                    detail,
+                    later,
+                )
+                .is_err()
+        );
+        let mut foreign = completed.clone();
+        foreign.runtime_run_id = Some("successor-run".into());
+        assert!(
+            store
+                .record_backend_job_cleanup_preflight_failure(
+                    "workspace",
+                    &[foreign.clone()],
+                    &foreign,
+                    detail,
+                    later,
+                )
+                .is_err()
+        );
+        // Real SQLite failure at the diagnostic write must propagate, leaving
+        // the exact observation available for its existing retry/probe owner.
+        store.with_conn(|conn| {
+            conn.execute_batch("CREATE TEMP TRIGGER preflight_fault BEFORE UPDATE OF worker_cleanup_failure_category ON main.backend_job_attempts BEGIN SELECT RAISE(ABORT,'diagnostic storage fault'); END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            store
+                .record_backend_job_cleanup_preflight_failure(
+                    "workspace",
+                    &history,
+                    &completed,
+                    detail,
+                    later,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .list_backend_job_attempts("workspace", "accepted")
+                .unwrap(),
+            history
+        );
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER preflight_fault")?;
+                Ok(())
+            })
+            .unwrap();
+        let failed = store
+            .record_backend_job_cleanup_preflight_failure(
+                "workspace",
+                &history,
+                &completed,
+                detail,
+                later,
+            )
+            .unwrap();
+        let mut expected = completed.clone();
+        expected.worker_cleanup_state = Some(BackendJobWorkerCleanupState::Failed);
+        expected.worker_cleanup_failure_category =
+            Some("backend_job_cleanup_host_admission_unconfirmed".into());
+        expected.worker_cleanup_failure_detail = Some(detail.into());
+        expected.worker_cleanup_updated_at = Some(later.into());
+        assert_eq!(
+            failed, expected,
+            "only cleanup diagnostic columns may change"
+        );
+        assert_eq!(
+            store
+                .get_backend_job("workspace", "accepted")
+                .unwrap()
+                .unwrap(),
+            job
+        );
+        assert!(
+            !store
+                .has_backend_job_execution_fence("workspace", &failed)
+                .unwrap()
+        );
+        assert!(
+            store
+                .record_backend_job_cleanup_preflight_failure(
+                    "workspace",
+                    &history,
+                    &completed,
+                    "late stale failure",
+                    later,
+                )
+                .is_err()
+        );
+        let fresh_history = store
+            .list_backend_job_attempts("workspace", "accepted")
+            .unwrap();
+        assert!(
+            store
+                .finish_backend_job_worker_cleanup_owned(
+                    "workspace",
+                    &fresh_history,
+                    &failed,
+                    BackendJobWorkerCleanupState::Completed,
+                    None,
+                    None,
+                    later,
+                )
+                .is_err(),
+            "diagnosis must not claim Executing ownership"
+        );
+        assert!(
+            store
+                .reserve_backend_job_retry("workspace", "accepted", later)
+                .is_err()
+        );
+        drop(store);
+        let store =
+            SqliteWorkspaceStore::open_for_test(&dir.path().join("recovery.sqlite")).unwrap();
+        assert_eq!(
+            store
+                .list_backend_job_attempts("workspace", "accepted")
+                .unwrap(),
+            vec![failed]
+        );
+        assert_eq!(
+            store
+                .get_backend_job("workspace", "accepted")
+                .unwrap()
+                .unwrap(),
+            job
+        );
+    }
+
+    #[test]
+    fn cleanup_preflight_diagnosis_keeps_executing_and_rejects_fenced_completed_or_successor_owner()
+    {
+        let (_dir, store, reserved) = fixture();
+        let bound = bind_fixture_owner(&store, &reserved);
+        // As in the fence component tests, only the external termination receipt
+        // is fixture evidence; this test does not claim real execution ended.
+        store.with_conn(|conn| {
+            conn.execute("UPDATE backend_job_attempts SET worker_id='019a4ea8-0000-7000-8000-000000000003' WHERE attempt_id=?1", params![bound.attempt_id])?;
+            Ok(())
+        }).unwrap();
+        let failed = store
+            .finish_backend_job_attempt(
+                "workspace",
+                "accepted",
+                &bound.attempt_id,
+                BackendJobAttemptState::Failed,
+                "execution_failed",
+                "saved original failure",
+                NOW,
+            )
+            .unwrap();
+        let history = store
+            .list_backend_job_attempts("workspace", "accepted")
+            .unwrap();
+        let (executing, acquired) = store
+            .claim_backend_job_worker_cleanup_owned("workspace", &history, &failed, NOW)
+            .unwrap();
+        assert!(acquired);
+        let history = store
+            .list_backend_job_attempts("workspace", "accepted")
+            .unwrap();
+        let diagnosed = store
+            .record_backend_job_cleanup_preflight_failure(
+                "workspace",
+                &history,
+                &executing,
+                "Host close/fence unavailable; no termination proof",
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(
+            diagnosed.worker_cleanup_state,
+            Some(BackendJobWorkerCleanupState::Executing)
+        );
+        assert_eq!(
+            diagnosed.failure_detail.as_deref(),
+            Some("saved original failure")
+        );
+        assert_eq!(
+            diagnosed.worker_cleanup_failure_category.as_deref(),
+            Some("backend_job_cleanup_host_admission_unconfirmed")
+        );
+        assert!(diagnosed.worker_cleanup_completed_at.is_none());
+        assert!(
+            !store
+                .has_backend_job_execution_fence("workspace", &diagnosed)
+                .unwrap()
+        );
+        assert!(
+            store
+                .finish_backend_job_worker_cleanup_owned(
+                    "workspace",
+                    &history,
+                    &executing,
+                    BackendJobWorkerCleanupState::Completed,
+                    None,
+                    None,
+                    NOW,
+                )
+                .is_err(),
+            "intervening diagnosis must invalidate stale completion CAS"
+        );
+        let history = store
+            .list_backend_job_attempts("workspace", "accepted")
+            .unwrap();
+        let (controller, host) = evidence(&diagnosed);
+        store
+            .record_backend_job_execution_fence("workspace", &diagnosed, &controller, &host, NOW)
+            .unwrap();
+        assert!(
+            store
+                .record_backend_job_cleanup_preflight_failure(
+                    "workspace",
+                    &history,
+                    &diagnosed,
+                    "late unfenced observation",
+                    NOW,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .list_backend_job_attempts("workspace", "accepted")
+                .unwrap(),
+            history
+        );
+        let completed = store
+            .finish_backend_job_worker_cleanup_owned(
+                "workspace",
+                &history,
+                &diagnosed,
+                BackendJobWorkerCleanupState::Completed,
+                None,
+                None,
+                NOW,
+            )
+            .unwrap();
+        let history = store
+            .list_backend_job_attempts("workspace", "accepted")
+            .unwrap();
+        assert!(
+            store
+                .record_backend_job_cleanup_preflight_failure(
+                    "workspace",
+                    &history,
+                    &completed,
+                    "late failure after completion",
+                    NOW,
+                )
+                .is_err()
+        );
+        let next = store
+            .reserve_backend_job_retry("workspace", "accepted", NOW)
+            .unwrap();
+        let successor = bind_fixture_owner(&store, &next);
+        let next_job = store
+            .get_backend_job("workspace", "accepted")
+            .unwrap()
+            .unwrap();
+        let history = store
+            .list_backend_job_attempts("workspace", "accepted")
+            .unwrap();
+        assert!(
+            store
+                .record_backend_job_cleanup_preflight_failure(
+                    "workspace",
+                    &history,
+                    &completed,
+                    "late historical failure",
+                    NOW,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .record_backend_job_cleanup_preflight_failure(
+                    "workspace",
+                    &history,
+                    &successor,
+                    "nonterminal owner cannot diagnose cleanup",
+                    NOW,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .list_backend_job_attempts("workspace", "accepted")
+                .unwrap(),
+            history
+        );
+        assert_eq!(
+            store
+                .get_backend_job("workspace", "accepted")
+                .unwrap()
+                .unwrap(),
+            next_job
+        );
     }
 
     #[test]

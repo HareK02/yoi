@@ -5582,11 +5582,30 @@ impl WorkspaceApi {
 
     /// Restore owners for current-contract attempts without replaying uncertain effects.
     pub fn recover_backend_jobs(&self) -> Result<()> {
-        for attempt in self.store.list_recoverable_backend_job_attempts(
-            self.workspace_id(),
-            usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS),
-        )? {
-            self.own_backend_job_recovery(&attempt);
+        let page_limit = usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS);
+        let mut after = None;
+        loop {
+            let attempts = self.store.list_recoverable_backend_job_attempts_page(
+                self.workspace_id(),
+                after.as_ref(),
+                page_limit,
+            )?;
+            let Some(last) = attempts.last() else {
+                break;
+            };
+            let next = crate::store::BackendJobRecoveryCursor {
+                job_id: last.job_id.clone(),
+                attempt_id: last.attempt_id.clone(),
+            };
+            for attempt in &attempts {
+                self.own_backend_job_recovery(attempt);
+            }
+            if attempts.len() < page_limit {
+                break;
+            }
+            // Reservations are not bounded by active concurrency. Traverse past
+            // admitted owners even if they remain pending or change timestamps.
+            after = Some(next);
         }
         subjektiv_journal::recover_attempts(self)?;
         self.recover_backend_job_worker_cleanups()?;

@@ -366,7 +366,7 @@ async fn accepted_result_with_feature_shutdown_failure_retains_typed_owner_and_b
 }
 
 #[tokio::test]
-async fn accepted_result_with_worker_failure_does_not_confirm_execution_cleanup() {
+async fn accepted_result_with_ordinary_worker_failure_confirms_independent_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let jobs = StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
     jobs.request(request("post-result-error")).unwrap();
@@ -380,31 +380,52 @@ async fn accepted_result_with_worker_failure_does_not_confirm_execution_cleanup(
     jobs.start_with_model_client("post-result-error", model)
         .await
         .unwrap();
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(5), jobs.wait("post-result-error"))
-            .await
-            .unwrap(),
-        Err(JobServiceError::Cleanup(_))
-    ));
-    let accepted = jobs.get("post-result-error").unwrap();
-    assert_eq!(accepted.state, JobState::Completed);
-    assert_eq!(accepted.result, Some(json!({"valid":true})));
-    assert!(!accepted.executions_released());
+    let mut completion = jobs.executions.lock().unwrap().jobs["post-result-error"]
+        .complete
+        .clone();
+    completion.wait_for(Option::is_some).await.unwrap();
     {
         let executions = jobs.executions.lock().unwrap();
         let owned = executions.jobs["post-result-error"]._owned.lock().unwrap();
         let owned = owned.as_ref().unwrap().as_ref().unwrap();
         assert!(owned.feature_shutdown_complete());
         assert!(owned.worker_failure().is_some());
+        assert!(!owned.requires_worker_cleanup_reconciliation());
         assert!(owned.result.is_ok());
     }
+    let accepted = tokio::time::timeout(Duration::from_secs(5), jobs.wait("post-result-error"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.state, JobState::Completed);
+    assert_eq!(accepted.result, Some(json!({"valid":true})));
+    assert!(accepted.executions_released());
+    assert_eq!(
+        jobs.with_execution_diagnostic(
+            "post-result-error",
+            &accepted.attempt.attempt_id,
+            |report| {
+                assert_eq!(report.run_id.to_string(), accepted.executions[0].run_id);
+                assert!(report.feature_shutdown_complete());
+                assert!(!report.requires_worker_cleanup_reconciliation());
+                assert!(report.result.is_ok());
+                matches!(
+                    report.worker_failure(),
+                    Some(worker::WorkerError::Engine(_))
+                )
+            }
+        ),
+        Some(true),
+        "typed ordinary failure survives execution-slot release"
+    );
+    assert!(
+        jobs.with_execution_diagnostic("post-result-error", "foreign-attempt", |_| ())
+            .is_none()
+    );
     assert!(jobs.retry("post-result-error").is_err());
-    assert!(jobs.reserve_quiescent_closure().is_err());
-    assert!(matches!(
-        jobs.shutdown().await,
-        Err(JobServiceError::Cleanup(_))
-    ));
-    assert!(jobs.store.lock().unwrap().is_some());
+    assert!(jobs.reserve_quiescent_closure().is_ok());
+    jobs.shutdown().await.unwrap();
+    assert!(jobs.store.lock().unwrap().is_none());
 }
 
 #[tokio::test]
