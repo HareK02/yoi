@@ -1,8 +1,12 @@
 mod startup_binding_tests {
     //! Exercise the factory's production binding step with a constructed Worker,
     //! real aggregate/Session stores and reopen. Only the Workspace response is
-    //! synthetic; this suite does not test domain authorization or network transport.
+    //! synthetic in the binding cases; the direct internal Profile factory case uses
+    //! a refused real loopback transport. Domain authorization is tested by Server.
     use super::*;
+    use protocol::session_failure::{
+        SessionPrincipal, SessionRegistrationCause, session_registration_attachment,
+    };
     use protocol::startup_failure::{RuntimeStartupCause, StartupPersistenceOutcome};
     use session_store::worker_metadata::StartupFailureRead;
     use worker::{WorkspaceClientError, WorkspaceRequest, WorkspaceResponse};
@@ -67,13 +71,27 @@ mod startup_binding_tests {
                 _ => self.store.read_by_name(&self.name).unwrap().unwrap(),
             };
             if matches!(self.response, Response::Lost) {
-                return Err(WorkspaceClientError::Unavailable(
+                return Err(WorkspaceClientError::Request(
                     "response deliberately lost".into(),
                 ));
             }
             Ok(WorkspaceResponse {
                 status: 403,
-                body: "synthetic rejection with private token /internal/path".into(),
+                body: serde_json::to_string(
+                    &server_api::RepositoryApiError::new(
+                        403,
+                        "PermissionDenied",
+                        "synthetic rejection with private token /internal/path",
+                        vec![],
+                    )
+                    .with_failure(
+                        session_registration_attachment(SessionRegistrationCause::denied(
+                            SessionPrincipal::Subject,
+                        ))
+                        .unwrap(),
+                    ),
+                )
+                .unwrap(),
             })
         }
     }
@@ -137,9 +155,41 @@ mod startup_binding_tests {
         let failure = startup_failure::finalize_startup_binding(&worker, true)
             .err()
             .expect("failure must remain a failure");
+        if matches!(response, Response::Lost | Response::Rejected) {
+            let mut source = std::error::Error::source(&failure);
+            let mut worker = false;
+            let mut host = false;
+            let mut client = false;
+            while let Some(current) = source {
+                worker |= current.is::<WorkerError>();
+                host |= current.is::<worker::subjektiv::SubjektivHostError>();
+                client |= current.is::<WorkspaceClientError>();
+                source = current.source();
+            }
+            assert!(worker && host, "common factory binding step retains in-process domain sources");
+            assert_eq!(client, matches!(response, Response::Lost));
+            assert!(!format!("{failure:?} {failure}").contains("response deliberately lost"));
+        }
         let result = failure.execution_result(WorkerExecutionOperation::Spawn);
-        let primary = result.startup_failure::<RuntimeStartupCause>().unwrap();
-        assert!(matches!(primary, error_contract::DecodeFailure::Known(_)));
+        if matches!(response, Response::BeforeSession | Response::BeforeOwner) {
+            let primary = result.startup_failure::<RuntimeStartupCause>().unwrap();
+            assert!(matches!(primary, error_contract::DecodeFailure::Known(_)));
+        } else {
+            let error_contract::DecodeFailure::Known(primary) = result
+                .startup_failure::<SessionRegistrationCause>()
+                .unwrap()
+            else {
+                panic!("a Session decision must not be relabeled as a generic Runtime failure");
+            };
+            assert_eq!(
+                *primary.facts().cause(),
+                if matches!(response, Response::Lost) {
+                    SessionRegistrationCause::outcome_unknown()
+                } else {
+                    SessionRegistrationCause::denied(SessionPrincipal::Subject)
+                }
+            );
+        }
         drop(worker);
         drop(store);
         let reopened = WorkerAggregateStore::new(root.path(), name).unwrap();
@@ -151,13 +201,17 @@ mod startup_binding_tests {
                     Some(StartupPersistenceOutcome::Persisted)
                 );
                 let StartupFailureRead::Present(error_contract::DecodeFailure::Known(cause)) =
-                    metadata.decode_startup_failure::<RuntimeStartupCause>()
+                    metadata.decode_startup_failure::<SessionRegistrationCause>()
                 else {
                     panic!("same-Session failure must actually save a typed cause")
                 };
                 assert_eq!(
-                    cause.facts().cause().reason,
-                    protocol::startup_failure::RuntimeStartupReason::AttributionFailed
+                    *cause.facts().cause(),
+                    if matches!(response, Response::Lost) {
+                        SessionRegistrationCause::outcome_unknown()
+                    } else {
+                        SessionRegistrationCause::denied(SessionPrincipal::Subject)
+                    }
                 );
                 assert_eq!(metadata.active.unwrap().session_id, origin);
                 let saved = serde_json::to_string(&metadata.startup_failure).unwrap();
@@ -222,6 +276,74 @@ mod startup_binding_tests {
             }
         }
     }
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    #[serial_test::serial(worker_allocation)]
+    async fn internal_profile_factory_transport_failure_retains_source_chain_and_reopened_cause() {
+        require_restore_test_environment();
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let mut request = create_request("internal factory source");
+        request.worker_id = worker_ref.worker_id;
+        request.workspace_api = Some(WorkspaceApiRef { workspace_id: "adapter-test".into(), base_url: endpoint.clone() });
+        request.subjektiv_attached = true;
+        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot { workspace_id: "adapter-test".into(), language: "English".into() });
+        let archive = crate::profile_archive::ProfileSourceArchive::build_evaluated_profile(
+            "profile-source-archive:internal-source".into(), "builtin:companion".into(),
+            serde_json::json!({"slug":"internal-source", "description":"internal source test", "scope":"workspace_read",
+                "model":{"scheme":"anthropic", "model_id":"unused", "auth":{"kind":"none"}},
+                "engine":{"max_tokens":100}, "feature":{"subjektiv":{"enabled":true,"extraction":{"enabled":false}}}})
+        ).unwrap();
+        let mut bundle = test_bundle();
+        bundle.profile_source_archive = Some(archive.clone());
+        let bundle = bundle.with_computed_digest();
+        request.profile_source = crate::catalog::ProfileSourceArchiveSource::Embedded { archive };
+        request.config_bundle = Some(ConfigBundleRef { id: bundle.metadata.id.clone(), digest: bundle.metadata.digest.clone() });
+        let request = WorkerExecutionSpawnRequest {
+            worker_ref: worker_ref.clone(), request,
+            workspace_scope: None,
+            context: test_execution_context(worker_ref.clone()),
+            workdir_attachments: BTreeMap::new(), config_bundle: Some(bundle),
+        };
+        // Direct internal caller, not a Browser handler or Runtime result decoder.
+        // The real transport is refused at an unused loopback socket; only the model is replaced.
+        let factory = ProfileRuntimeWorkerFactory::new(root.path())
+            .with_runtime_id("internal-source-runtime")
+            .with_runtime_store_dir(root.path().join("runtime"))
+            .with_spawn_model_client_factory(|| Box::new(MockClient::new(vec![])));
+        let failure = match factory.spawn_controller(request).await {
+            Err(failure) => failure,
+            Ok(_) => panic!("disconnected Backend must not create a Controller"),
+        };
+        assert_eq!(failure.stage, RuntimeRestoreStage::Binding);
+        let mut source = std::error::Error::source(&failure);
+        let mut worker = false; let mut host = false; let mut transport = false;
+        while let Some(current) = source {
+            worker |= current.is::<WorkerError>();
+            host |= current.is::<worker::subjektiv::SubjektivHostError>();
+            if let Some(error) = current.downcast_ref::<WorkspaceClientError>() {
+                assert!(matches!(error, WorkspaceClientError::Request(_)));
+                transport = true;
+            }
+            source = current.source();
+        }
+        assert!(worker && host && transport, "factory must retain original typed in-process source");
+        let result = failure.execution_result(WorkerExecutionOperation::Spawn);
+        let Some(error_contract::DecodeFailure::Known(cause)) = result.startup_failure::<SessionRegistrationCause>() else { panic!("Session cause must remain typed") };
+        assert_eq!(*cause.facts().cause(), SessionRegistrationCause::outcome_unknown());
+        assert_eq!(result.startup_failure_persistence, Some(StartupPersistenceOutcome::Persisted));
+        let aggregate = root.path().join("runtime/workers").join(worker_ref.worker_id.to_string());
+        let name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
+        let metadata = WorkerAggregateStore::new(aggregate, &name).unwrap().read_by_name(&name).unwrap().unwrap();
+        let StartupFailureRead::Present(error_contract::DecodeFailure::Known(cause)) = metadata.decode_startup_failure::<SessionRegistrationCause>() else { panic!("saved factory cause must reopen") };
+        assert_eq!(*cause.facts().cause(), SessionRegistrationCause::outcome_unknown());
+        assert!(!format!("{failure:?} {failure}").contains(&endpoint));
+        assert!(!serde_json::to_string(&result).unwrap().contains(&endpoint));
+    }
+
     #[tokio::test]
     async fn factory_rejection_saves_same_session_cause_after_own_attribution_transition() {
         check_binding(Response::Rejected).await;

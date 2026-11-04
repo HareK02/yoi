@@ -3,6 +3,7 @@
 //! Worker metadata. Only the unused external model is replaced. No restore,
 //! operation replay, singleton-release, or Browser rendering contract is asserted.
 use super::*;
+use api_macros::HttpError as _;
 use protocol::session_failure::{
     SessionPrincipal, SessionRegistrationCause, session_registration_attachment,
 };
@@ -29,15 +30,29 @@ impl agen::llm_client::LlmClient for UnusedModel {
     }
 }
 
+type ReleaseFence = (
+    crate::store::WorkerSingletonLease,
+    subjektiv::journal::JournalWriterBinding,
+);
+
 struct RegistrationFixture {
     connected: ConnectedWorkerHarness,
     subject: String,
     callbacks: Arc<Mutex<Vec<(StatusCode, Value)>>>,
     model: UnusedModel,
+    release_fence: Arc<Mutex<Option<ReleaseFence>>>,
+}
+
+#[derive(Clone, Copy)]
+enum RegistrationFault {
+    Allow,
+    Deny,
+    DenyWithMetadataReadFailure,
+    ReleasePending,
 }
 
 impl RegistrationFixture {
-    async fn new(revoke_on_registration: bool) -> Self {
+    async fn new(fault: RegistrationFault) -> Self {
         // Armed only after real Subject creation with its normal default policy.
         // The callback is a deterministic synchronization point, not a fake Host
         // rejection: the original signed request and real handler remain intact.
@@ -46,11 +61,14 @@ impl RegistrationFixture {
         let callbacks = Arc::new(Mutex::new(Vec::new()));
         let observed = callbacks.clone();
         let model = UnusedModel::default();
+        let release_fence = Arc::new(Mutex::new(None));
+        let reserved = release_fence.clone();
         let connected = ConnectedWorkerHarness::start_with_layer(model.clone(), move |router| {
             router.layer(axum::middleware::from_fn(
                 move |request: axum::extract::Request, next: axum::middleware::Next| {
                     let hook = hook.clone();
                     let observed = observed.clone();
+                    let reserved = reserved.clone();
                     async move {
                         if request.method() != axum::http::Method::POST
                             || request.uri().path()
@@ -63,6 +81,9 @@ impl RegistrationFixture {
                         ));
                         let armed = hook.lock().unwrap().take();
                         let pin_root = armed.as_ref().map(|(_, _, root)| root.clone());
+                        let metadata_fault_root = pin_root.clone().filter(|_| {
+                            matches!(fault, RegistrationFault::DenyWithMetadataReadFailure)
+                        });
                         if let Some((api, subject, _)) = armed {
                             let store = open_subjektiv_store(&api).unwrap();
                             let policy = store.subject_permissions(&subject).unwrap().unwrap();
@@ -72,22 +93,39 @@ impl RegistrationFixture {
                                     .iter()
                                     .any(|p| p.operation == "session.record")
                             );
-                            store
-                                .set_subject_permissions(
-                                    &subject,
-                                    &SubjectPermissionsUpdate {
-                                        operation_id: "session-registration-revoke-at-callback"
-                                            .into(),
-                                        expected_change_id: Some(policy.change_id),
-                                        execution: policy
-                                            .execution
-                                            .into_iter()
-                                            .filter(|p| p.operation != "session.record")
-                                            .collect(),
-                                        delegation: policy.delegation,
-                                    },
-                                )
-                                .unwrap();
+                            if matches!(fault, RegistrationFault::ReleasePending) {
+                                let key = crate::subjektiv::subject_worker_singleton_key(&subject).unwrap();
+                                let lease = api.store
+                                    .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
+                                    .unwrap().unwrap();
+                                let writer = store.claim_journal_writer(
+                                    &subject, &lease.worker.runtime_id, &lease.worker.worker_id,
+                                ).unwrap();
+                                api.config_store.reserve_subject_release(
+                                    TEST_WORKSPACE_ID, &lease, &writer.binding_id,
+                                    "registration-release-fence",
+                                ).unwrap();
+                                assert!(store.journal_writer_active(&writer).unwrap());
+                                assert_eq!(api.store.current_worker_singleton_owner(TEST_WORKSPACE_ID, &key).unwrap(), Some(lease.clone()));
+                                *reserved.lock().unwrap() = Some((lease, writer));
+                            } else {
+                                store
+                                    .set_subject_permissions(
+                                        &subject,
+                                        &SubjectPermissionsUpdate {
+                                            operation_id: "session-registration-revoke-at-callback"
+                                                .into(),
+                                            expected_change_id: Some(policy.change_id),
+                                            execution: policy
+                                                .execution
+                                                .into_iter()
+                                                .filter(|p| p.operation != "session.record")
+                                                .collect(),
+                                            delegation: policy.delegation,
+                                        },
+                                    )
+                                    .unwrap();
+                            }
                         }
                         let (parts, body) = request.into_parts();
                         let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
@@ -111,6 +149,19 @@ impl RegistrationFixture {
                         let response = next
                             .run(Request::from_parts(parts, Body::from(bytes)))
                             .await;
+                        if let Some(root) = metadata_fault_root {
+                            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                            // The real denial has already been decided. Replace only this
+                            // fixture's metadata file with a directory before Worker save:
+                            // a real read error, not a fake authorization/store response.
+                            let workers = std::fs::read_dir(root.join("workers"))
+                                .unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+                            assert_eq!(workers.len(), 1);
+                            let metadata = workers[0].join("metadata.json");
+                            assert!(metadata.is_file());
+                            std::fs::remove_file(&metadata).unwrap();
+                            std::fs::create_dir(&metadata).unwrap();
+                        }
                         observed.lock().unwrap().push((response.status(), input));
                         response
                     }
@@ -136,7 +187,7 @@ impl RegistrationFixture {
                 .iter()
                 .any(|p| p.operation == "session.record")
         );
-        if revoke_on_registration {
+        if !matches!(fault, RegistrationFault::Allow) {
             *revoke.lock().unwrap() = Some((
                 connected.api.clone(),
                 subject.clone(),
@@ -148,6 +199,7 @@ impl RegistrationFixture {
             subject,
             callbacks,
             model,
+            release_fence,
         }
     }
 
@@ -296,7 +348,7 @@ fn assert_registration_cause(body: Value, cause: SessionRegistrationCause) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn real_session_record_denial_survives_runtime_host_and_metadata_reopen() {
-    let fixture = RegistrationFixture::new(true).await;
+    let fixture = RegistrationFixture::new(RegistrationFault::Deny).await;
     // The real create preflight sees normal defaults. Revocation happens only
     // after the actual factory has issued its signed Session-registration POST.
     let error = scoped_create_workspace_worker(
@@ -392,8 +444,221 @@ async fn real_session_record_denial_survives_runtime_host_and_metadata_reopen() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn real_session_record_denial_and_metadata_save_failure_remain_separate() {
+    use protocol::startup_failure::{
+        StartupFailurePhase, StartupPersistenceOutcome, StartupSecondaryFailure,
+    };
+    let fixture = RegistrationFixture::new(RegistrationFault::DenyWithMetadataReadFailure).await;
+    let error = scoped_create_workspace_worker(
+        State(fixture.connected.api.clone()),
+        AxumPath(ScopedWorkspacePath {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+        }),
+        HeaderMap::new(),
+        Json(fixture.request()),
+    )
+    .await
+    .unwrap_err();
+    fixture.assert_callback(StatusCode::FORBIDDEN);
+    let failures = fixture.connected.runtime_startup_failures.lock().unwrap();
+    assert_eq!(
+        failures.len(),
+        1,
+        "one real startup attempt, not an operation replay"
+    );
+    let wire = &failures[0];
+    assert_eq!(
+        wire.primary,
+        session_registration_attachment(SessionRegistrationCause::denied(
+            SessionPrincipal::Subject
+        ),)
+        .unwrap()
+    );
+    assert_eq!(wire.persistence, Some(StartupPersistenceOutcome::NotSaved));
+    assert!(wire.secondary.iter().any(|failure| matches!(
+        failure,
+        StartupSecondaryFailure::Persistence {
+            phase: StartupFailurePhase::MetadataSave,
+            outcome: StartupPersistenceOutcome::NotSaved
+        }
+    )));
+    let host = error
+        .diagnostics
+        .iter()
+        .filter_map(|d| d.startup.as_ref())
+        .find(|startup| startup.primary == wire.primary)
+        .unwrap();
+    assert_eq!(
+        host, wire,
+        "Remote Host preserves the refusal and independent save failure"
+    );
+    assert!(
+        open_subjektiv_store(&fixture.connected.api)
+            .unwrap()
+            .subject_session_attributions(&fixture.subject)
+            .unwrap()
+            .is_empty()
+    );
+    let workers = std::fs::read_dir(fixture.connected.runtime_root.join("workers"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(workers.len(), 1);
+    let name = format!(
+        "worker-runtime-{}",
+        workers[0].file_name().unwrap().to_str().unwrap()
+    );
+    let reopened = session_store::WorkerAggregateStore::open_read_only(&workers[0], &name).unwrap();
+    assert!(
+        reopened.read_by_name(&name).is_err(),
+        "the real read failure remains, not a false saved cause"
+    );
+}
+
+#[tokio::test]
+async fn pending_release_binding_refusal_retains_original_conflict_source() {
+    let f = Fixture::new().await;
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let lease = f
+        .api
+        .store
+        .require_current_worker_singleton_owner(TEST_WORKSPACE_ID, &f.source)
+        .unwrap()
+        .unwrap();
+    let writer = store
+        .claim_journal_writer(&f.subject, &f.source.runtime_id, &f.source.worker_id)
+        .unwrap();
+    f.api
+        .config_store
+        .reserve_subject_release(
+            TEST_WORKSPACE_ID,
+            &lease,
+            &writer.binding_id,
+            "registration-source-release",
+        )
+        .unwrap();
+    let session = session_store::new_session_id().to_string();
+    let attr = crate::subjektiv::SubjectSessionAttribution::new(
+        &f.subject,
+        &f.source.runtime_id,
+        &f.source.worker_id,
+        &session,
+    )
+    .unwrap();
+    let error = session_registration::bind_host_session(&f.api, attr).unwrap_err();
+    assert_eq!(
+        error.session_registration_cause,
+        Some(SessionRegistrationCause::binding_mismatch())
+    );
+    assert!(matches!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<Error>(),
+        Some(Error::RepositoryConflict(_))
+    ));
+    assert_eq!(
+        error.into_repository_api_error().status_code(),
+        StatusCode::CONFLICT.as_u16()
+    );
+    assert!(store.session_attribution(&session).unwrap().is_none());
+    // A conflict without this explicit decision must not acquire a denial.
+    let unrelated = session_registration::Judgment::SessionRecord
+        .binding_rejection(Error::RepositoryConflict("an unrelated conflict".into()).into());
+    assert!(unrelated.session_registration_cause.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn release_fence_refusal_survives_signed_registration_and_metadata_reopen() {
+    let fixture = RegistrationFixture::new(RegistrationFault::ReleasePending).await;
+    let api = &fixture.connected.api;
+    let store = open_subjektiv_store(api).unwrap();
+    let policy = store
+        .subject_permissions(&fixture.subject)
+        .unwrap()
+        .unwrap();
+    let error = scoped_create_workspace_worker(
+        State(api.clone()),
+        AxumPath(ScopedWorkspacePath {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+        }),
+        HeaderMap::new(),
+        Json(fixture.request()),
+    )
+    .await
+    .unwrap_err();
+    let session = fixture.assert_callback(StatusCode::CONFLICT);
+    let (lease, writer) = fixture.release_fence.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        store.subject_permissions(&fixture.subject).unwrap(),
+        Some(policy)
+    );
+    assert!(store.session_attribution(&session).unwrap().is_none());
+    assert!(store.journal_writer_active(&writer).unwrap());
+    api.config_store
+        .require_subject_release_intent(
+            TEST_WORKSPACE_ID,
+            &lease,
+            &writer.binding_id,
+            "registration-release-fence",
+        )
+        .unwrap();
+    assert!(
+        api.config_store
+            .subject_release_pending(TEST_WORKSPACE_ID, &lease.worker)
+            .unwrap()
+    );
+    assert!(
+        !api.config_store
+            .subject_release_proven(
+                TEST_WORKSPACE_ID,
+                &lease,
+                &writer.binding_id,
+                "registration-release-fence"
+            )
+            .unwrap()
+    );
+
+    let failures = fixture.connected.runtime_startup_failures.lock().unwrap();
+    assert_eq!(failures.len(), 1, "one real factory startup, not replay");
+    let wire = &failures[0];
+    let expected =
+        session_registration_attachment(SessionRegistrationCause::binding_mismatch()).unwrap();
+    assert_eq!(wire.primary, expected);
+    assert_eq!(
+        wire.persistence,
+        Some(protocol::startup_failure::StartupPersistenceOutcome::Persisted)
+    );
+    let host = error
+        .diagnostics
+        .iter()
+        .filter_map(|d| d.startup.as_ref())
+        .find(|failure| failure.primary == expected)
+        .expect("Remote Host retains known refusal");
+    assert_eq!(host.primary, wire.primary);
+    assert!(
+        host.secondary.iter().any(|failure| matches!(
+            failure,
+            protocol::startup_failure::StartupSecondaryFailure::Persistence {
+                phase: protocol::startup_failure::StartupFailurePhase::RuntimeRecordDelete,
+                ..
+            }
+        )),
+        "retention cleanup failure is separate from refusal"
+    );
+    let saved = read_metadata(&fixture.connected.runtime_root, &lease.worker.worker_id);
+    assert!(contains_saved_value(
+        &saved,
+        &serde_json::to_value(&expected).unwrap()
+    ));
+    assert_eq!(
+        read_metadata(&fixture.connected.runtime_root, &lease.worker.worker_id),
+        saved
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn permitted_session_registration_reaches_real_factory_and_saved_confirmation() {
-    let fixture = RegistrationFixture::new(false).await;
+    let fixture = RegistrationFixture::new(RegistrationFault::Allow).await;
     let initial = open_subjektiv_store(&fixture.connected.api)
         .unwrap()
         .subject_permissions(&fixture.subject)

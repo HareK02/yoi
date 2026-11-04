@@ -120,6 +120,20 @@ pub fn reproject_internal_startup_failure(
     StartupFailureAttachment::from_projected(&projected)
 }
 
+/// Fixed, identifier-free summary for an already authenticated internal caller.
+/// Keep the required operation actionable without exposing the source's Display.
+/// This neither projects a Browser cause nor chooses an HTTP status.
+pub fn internal_startup_failure_summary(failure: &StartupFailureAttachment) -> &'static str {
+    if failure
+        .project_for::<InternalTransfer, protocol::session_failure::SessionRegistrationCause>(&())
+        .is_ok()
+    {
+        "Worker startup failed while registering Session (session.record)"
+    } else {
+        "Worker startup failed"
+    }
+}
+
 /// Dispatch by the domain attested in process, not by parsing attachment fields.
 pub(crate) fn persist_binding_startup_failure<S: session_store::WorkerMetadataStore>(
     store: &S,
@@ -248,6 +262,36 @@ mod tests {
         FsWorkerStore, WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore,
         WorkerStoreError,
     };
+
+    #[test]
+    fn internal_summary_retains_only_attested_required_operation() {
+        use protocol::session_failure::{SessionPrincipal, SessionRegistrationCause};
+        let session = protocol::session_failure::session_registration_attachment(
+            SessionRegistrationCause::denied(SessionPrincipal::Subject),
+        )
+        .unwrap();
+        assert_eq!(
+            internal_startup_failure_summary(&session),
+            "Worker startup failed while registering Session (session.record)"
+        );
+        let runtime = runtime_startup_attachment(RuntimeStartupCause {
+            stage: StartupStage::Feature,
+            reason: RuntimeStartupReason::FeatureFailed,
+        })
+        .unwrap();
+        assert_eq!(
+            internal_startup_failure_summary(&runtime),
+            "Worker startup failed"
+        );
+        let corrupt = serde_json::from_value(serde_json::json!(
+            "session.record denied TEST_ONLY_CREDENTIAL /private/path raw_http_body"
+        ))
+        .unwrap();
+        assert_eq!(
+            internal_startup_failure_summary(&corrupt),
+            "Worker startup failed"
+        );
+    }
 
     struct LostSaveResponse(FsWorkerStore);
     impl WorkerMetadataStore for LostSaveResponse {

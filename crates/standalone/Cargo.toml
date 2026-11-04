@@ -28,6 +28,7 @@ uuid = { workspace = true, features = ["v7"] }
 worker.workspace = true
 
 [dev-dependencies]
+error-contract.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 tempfile.workspace = true

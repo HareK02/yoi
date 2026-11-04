@@ -32,9 +32,9 @@ impl From<RuntimeRestoreCleanupFailure> for protocol::startup_failure::StartupCl
 }
 
 impl RuntimeRestoreFailure {
-    pub(super) fn from_bootstrap(stage: RuntimeRestoreStage, error: &WorkerBootstrapError) -> Self {
-        match error {
-            WorkerBootstrapError::Worker(source) => Self::from_worker(stage, source),
+    pub(super) fn from_bootstrap(stage: RuntimeRestoreStage, error: WorkerBootstrapError) -> Self {
+        let mut failure = match &error {
+            WorkerBootstrapError::Worker(source) => Self::from_worker_ref(stage, source),
             WorkerBootstrapError::Controller { source, .. } => {
                 let mut failure = Self::started(
                     RuntimeRestoreStage::Controller,
@@ -43,7 +43,9 @@ impl RuntimeRestoreFailure {
                 failure.io_kind = Some(source.kind());
                 failure
             }
-        }
+        };
+        failure.source = Some(Arc::new(error));
+        failure
     }
 }
 
@@ -51,7 +53,7 @@ impl From<session_store::WorkerStoreError> for RuntimeRestoreFailure {
     fn from(error: session_store::WorkerStoreError) -> Self {
         Self::from_worker(
             RuntimeRestoreStage::Metadata,
-            &WorkerError::WorkerStore(error),
+            WorkerError::WorkerStore(error),
         )
     }
 }
@@ -114,7 +116,7 @@ where
             attached,
             SubjektivSessionAttributionLifecycle::NewSession,
         )
-        .map_err(|error| RuntimeRestoreFailure::from_worker(RuntimeRestoreStage::Binding, &error))
+        .map_err(|error| RuntimeRestoreFailure::from_worker(RuntimeRestoreStage::Binding, error))
 }
 
 #[cfg(test)]

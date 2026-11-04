@@ -2366,9 +2366,21 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
         assert_eq!(probe.activations.load(SeqCst), 0);
         assert_eq!(probe.publications.load(SeqCst), 0);
         assert_eq!(fixture.model.calls.load(SeqCst), model_before);
-        assert!(
-            matches!(metadata.read_by_name(&name).unwrap().unwrap().subjektiv_session_attribution,
-            Some(session_store::SubjektivSessionAttributionState::Failed { session_id: id, .. }) if id == session_id)
+        let saved_failure = metadata.read_by_name(&name).unwrap().unwrap();
+        // Trust rejection occurs before the Session domain handler. An unsigned
+        // legacy 401 attests neither a Session refusal nor absence of earlier effects.
+        assert!(matches!(saved_failure.subjektiv_session_attribution,
+            Some(session_store::SubjektivSessionAttributionState::OutcomeUnknown { session_id: id, .. }) if id == session_id));
+        let session_store::worker_metadata::StartupFailureRead::Present(
+            error_contract::DecodeFailure::Known(cause),
+        ) = saved_failure
+            .decode_startup_failure::<protocol::session_failure::SessionRegistrationCause>()
+        else {
+            panic!("recovery must retain its typed Session unknown cause")
+        };
+        assert_eq!(
+            *cause.facts().cause(),
+            protocol::session_failure::SessionRegistrationCause::outcome_unknown()
         );
         let denied = record();
         assert_eq!(

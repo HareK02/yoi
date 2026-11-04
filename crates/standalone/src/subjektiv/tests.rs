@@ -767,3 +767,142 @@ fn session_registration_uses_real_capability_and_attribution_decisions() {
         SessionRegistrationCause::denied(SessionPrincipal::Subject),
     );
 }
+
+#[derive(Clone)]
+struct RegistrationUnusedModel;
+#[async_trait::async_trait]
+impl agen::llm_client::LlmClient for RegistrationUnusedModel {
+    fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
+        Box::new(self.clone())
+    }
+    async fn stream(
+        &self,
+        _: agen::llm_client::Request,
+    ) -> Result<agen::llm_client::client::ResponseStream, agen::llm_client::ClientError> {
+        panic!("Session registration must not invoke a model")
+    }
+}
+
+#[tokio::test]
+async fn local_writer_revocation_during_registration_retains_known_cause_and_real_journal_source() {
+    use session_store::{CombinedStore, FsStore, FsWorkerStore, WorkerMetadataStore};
+    use worker::{
+        WorkerBootstrap, WorkerBootstrapLayout, WorkerFilesystemAuthority, WorkerWorkspaceContext,
+    };
+    // The direct non-Browser caller uses the real bootstrap, local capability and
+    // transactional Journal store. Only the unused model and revocation timing are substituted.
+    for existing in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+        let catalog = StandaloneSubjects::open(&root).unwrap();
+        let subject = catalog.create("registration-race", None).unwrap();
+        let id = protocol::WorkerId::now_v7();
+        let mut connection = catalog.connect(&subject.id, id).unwrap();
+        let port = connection.host.clone();
+        let name = format!("standalone-{id}");
+        let sessions = FsStore::new_with_retention(
+            root.join(id.to_string()).join("sessions"),
+            crate::store::session_retention(&root),
+        )
+        .unwrap();
+        let metadata_root = temp.path().join("metadata");
+        let metadata = FsWorkerStore::new(&metadata_root).unwrap();
+        let mut manifest = manifest::WorkerManifest::from_toml(&format!("[worker]\nname='{name}'\n[model]\nscheme='anthropic'\nmodel_id='unused'\n[engine]\n[scope]\nallow=[]")).unwrap();
+        manifest.feature.subjektiv.profile.enabled = true;
+        manifest.feature.subjektiv.profile.extraction.enabled = false;
+        let mut prepared = WorkerBootstrap::new(
+            manifest,
+            CombinedStore::new(sessions, metadata.clone()),
+            worker::PromptCatalogSource::builtins_only(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            WorkerBootstrapLayout::Direct {
+                runtime_base: temp.path().join("runtime"),
+            },
+        )
+        .with_model_client(RegistrationUnusedModel)
+        .prepare()
+        .await
+        .unwrap();
+        let worker = prepared.worker_mut();
+        worker.enable_worker_metadata_write_through().unwrap();
+        worker.bind_subjektiv_host(Some(port.clone()));
+        let session = worker.session_id();
+        let context = SubjektivHostContext {
+            worker_id: name.clone(),
+            session_id: session.to_string(),
+        };
+        if existing {
+            port.record_session(&context, true).unwrap();
+        }
+        let revoke_store = port.catalog.store.clone();
+        let writer = port.writer.clone();
+        *port.registration_before_attribution.lock().unwrap() = Some(Box::new(move || {
+            // This actual release follows the last preflight, before transactional bind.
+            revoke_store.release_journal_writer(&writer).unwrap();
+        }));
+        let error = worker
+            .finalize_subjektiv_session_attribution_retaining_startup_failure(
+                true,
+                worker::SubjektivSessionAttributionLifecycle::NewSession,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.session_registration_cause(),
+            Some(SessionRegistrationCause::binding_mismatch())
+        );
+        let mut source = Some(&error as &(dyn std::error::Error + 'static));
+        let mut journal_source = false;
+        while let Some(current) = source {
+            if let Some(journal) = current.downcast_ref::<subjektiv::journal::JournalError>() {
+                assert!(matches!(
+                    journal,
+                    subjektiv::journal::JournalError::PermissionDenied(_)
+                ));
+                journal_source = true;
+            }
+            source = current.source();
+        }
+        assert!(
+            journal_source,
+            "original store refusal must survive the Worker wrapper"
+        );
+        assert_eq!(
+            error.startup_metadata_save(),
+            Some(protocol::startup_failure::StartupPersistenceOutcome::Persisted)
+        );
+        drop(prepared);
+        drop(metadata);
+        let reopened = FsWorkerStore::new(metadata_root)
+            .unwrap()
+            .read_by_name(&name)
+            .unwrap()
+            .unwrap();
+        let session_store::worker_metadata::StartupFailureRead::Present(
+            error_contract::DecodeFailure::Known(cause),
+        ) = reopened.decode_startup_failure::<SessionRegistrationCause>()
+        else {
+            panic!("typed cause must really reopen")
+        };
+        assert_eq!(
+            *cause.facts().cause(),
+            SessionRegistrationCause::binding_mismatch()
+        );
+        assert!(
+            port.catalog
+                .store
+                .session_attribution(&session.to_string())
+                .unwrap()
+                .is_some(),
+            "committed attribution is independent from denied writer binding"
+        );
+        assert!(
+            !port
+                .catalog
+                .store
+                .journal_writer_active(&port.writer)
+                .unwrap()
+        );
+        connection.close().unwrap();
+    }
+}

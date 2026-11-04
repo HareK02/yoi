@@ -271,7 +271,9 @@ enum RuntimeRestoreCleanup {
 
 /// Diagnostics are fixed owner-selected causes, not arbitrary provider messages,
 /// paths, configuration, or credentials. Cleanup cannot overwrite the first cause.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The original in-process source is privately shared across clones; it is neither
+/// formatted into diagnostics nor included in the wire/storage projection.
+#[derive(Clone)]
 pub struct RuntimeRestoreFailure {
     pub stage: RuntimeRestoreStage,
     pub resources: RuntimeRestoreResources,
@@ -284,6 +286,7 @@ pub struct RuntimeRestoreFailure {
     secondary: Vec<protocol::startup_failure::StartupSecondaryFailure>,
     legacy_diagnostic: Option<String>,
     metadata_save: Option<protocol::startup_failure::StartupPersistenceOutcome>,
+    source: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 
 impl RuntimeRestoreFailure {
@@ -315,7 +318,13 @@ impl RuntimeRestoreFailure {
         self.io_kind
     }
 
-    fn from_worker(stage: RuntimeRestoreStage, error: &WorkerError) -> Self {
+    fn from_worker(stage: RuntimeRestoreStage, error: WorkerError) -> Self {
+        let mut failure = Self::from_worker_ref(stage, &error);
+        failure.source = Some(Arc::new(error));
+        failure
+    }
+
+    fn from_worker_ref(stage: RuntimeRestoreStage, error: &WorkerError) -> Self {
         let mut failure = Self::started(stage, restore_worker_cause(error));
         failure.primary = error
             .startup_failure_at(stage.into())
@@ -368,6 +377,7 @@ impl RuntimeRestoreFailure {
             secondary: Vec::new(),
             legacy_diagnostic: None,
             metadata_save: None,
+            source: None,
         }
     }
 
@@ -384,6 +394,7 @@ impl RuntimeRestoreFailure {
             secondary: Vec::new(),
             legacy_diagnostic: None,
             metadata_save: None,
+            source: None,
         }
     }
 
@@ -400,6 +411,7 @@ impl RuntimeRestoreFailure {
             secondary: Vec::new(),
             legacy_diagnostic: None,
             metadata_save: None,
+            source: None,
         }
     }
 
@@ -408,6 +420,25 @@ impl RuntimeRestoreFailure {
             self.cleanup,
             RuntimeRestoreCleanup::Required | RuntimeRestoreCleanup::Failed(_)
         )
+    }
+}
+
+impl std::fmt::Debug for RuntimeRestoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeRestoreFailure")
+            .field("stage", &self.stage)
+            .field("resources", &self.resources)
+            .field("cause", &self.cause)
+            .field("cleanup", &self.cleanup)
+            .field("io_kind", &self.io_kind)
+            .field("cleanup_failure", &self.cleanup_failure)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::error::Error for RuntimeRestoreFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|source| source as _)
     }
 }
 
@@ -2352,7 +2383,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             if let WorkerBootstrapError::Worker(source) = &error {
                 self.retain_spawn_construction_failure(&request.worker_ref, source);
             }
-            RuntimeRestoreFailure::from_bootstrap(RuntimeRestoreStage::Reconstruction, &error)
+            RuntimeRestoreFailure::from_bootstrap(RuntimeRestoreStage::Reconstruction, error)
         })?;
         let worker = prepared.worker_mut();
         {
@@ -2449,7 +2480,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             if let WorkerBootstrapError::Worker(source) = &error {
                 self.retain_spawn_construction_failure(&request.worker_ref, source);
             }
-            RuntimeRestoreFailure::from_bootstrap(RuntimeRestoreStage::Controller, &error)
+            RuntimeRestoreFailure::from_bootstrap(RuntimeRestoreStage::Controller, error)
         })?;
         self.failed_spawn_resources
             .lock()
@@ -2696,7 +2727,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 .await
                 .map_err(|error| {
                     self.retain_construction_failure(&request, &error);
-                    let failure = RuntimeRestoreFailure::from_worker(stage, &error);
+                    let failure = RuntimeRestoreFailure::from_worker(stage, error);
                     let cause = failure.cause;
                     preparation_failure = Some(failure);
                     cause
@@ -2972,7 +3003,7 @@ impl RuntimeRestoreCandidate for ProfileRestoreCandidate {
                     Some(source.kind()),
                 ),
             };
-            let mut failure = RuntimeRestoreFailure::from_bootstrap(stage, &error);
+            let mut failure = RuntimeRestoreFailure::from_bootstrap(stage, error);
             failure.cause = cause;
             failure.durable_effects_possible = true;
             failure.io_kind = io_kind;
@@ -3244,11 +3275,17 @@ impl ProfileRuntimeWorkerFactory {
                     WorkerBootstrapError::Worker(error) => {
                         stage = RuntimeRestoreStage::Reconstruction;
                         self.retain_construction_failure(request, &error);
-                        primary_failure = Some(RuntimeRestoreFailure::from_worker(stage, &error));
-                        restore_worker_cause(&error)
+                        let cause = restore_worker_cause(&error);
+                        primary_failure = Some(RuntimeRestoreFailure::from_worker(stage, error));
+                        cause
                     }
-                    WorkerBootstrapError::Controller { source, .. } => {
-                        io_kind = Some(source.kind());
+                    error @ WorkerBootstrapError::Controller { .. } => {
+                        let failure = RuntimeRestoreFailure::from_bootstrap(
+                            RuntimeRestoreStage::Controller,
+                            error,
+                        );
+                        io_kind = failure.io_kind;
+                        primary_failure = Some(failure);
                         "restored Worker preparation failed"
                     }
                 })?;

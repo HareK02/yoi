@@ -220,6 +220,12 @@ pub(super) fn journal_error(error: JournalError) -> SubjektivHostError {
         other => SubjektivHostError::Unavailable(other.to_string()),
     }
 }
+fn registration_reservation_error(
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> SubjektivHostError {
+    SubjektivHostError::session_registration(SessionRegistrationCause::outcome_unknown(), error)
+}
+
 fn source_error(error: session_store::StoreError) -> SubjektivHostError {
     SubjektivHostError::Unavailable(error.to_string())
 }
@@ -368,45 +374,56 @@ impl LocalSubjectHost {
     pub(super) fn reserve_journal_session(
         &self,
         context: &SubjektivHostContext,
+        attribution: &SubjectSessionAttribution,
     ) -> Result<(), SubjektivHostError> {
-        self.body(context)?;
-        if self.journal_session_erased(&context.session_id)? {
+        self.registration_authority(context)?;
+        let journal_context =
+            JournalHostContext::validated_session(&self.catalog.store, attribution.clone())
+                .map_err(registration_journal_error)?;
+        if self
+            .catalog
+            .store
+            .journal_session_erased(&journal_context)
+            .map_err(registration_journal_error)?
+        {
             return Ok(());
         }
-        let session: session_store::SessionId = context
-            .session_id
-            .parse()
-            .map_err(|_| SubjektivHostError::InvalidArgument("invalid Session".into()))?;
+        let session: session_store::SessionId = context.session_id.parse().map_err(|error| {
+            SubjektivHostError::session_registration(
+                SessionRegistrationCause::invalid_response(),
+                error,
+            )
+        })?;
         let root = self
             .catalog
             .state_root
             .join(self.worker_id.to_string())
             .join("sessions");
-        reject_symlink_components(&root)
-            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+        reject_symlink_components(&root).map_err(registration_reservation_error)?;
         let source_store = session_store::FsStore::new_with_retention(
             &root,
             crate::store::session_retention(&self.catalog.state_root),
         )
-        .map_err(source_error)?;
+        .map_err(registration_reservation_error)?;
         {
             let _guard = source_store
                 .retention()
                 .lock_live(session)
-                .map_err(source_error)?;
+                .map_err(registration_reservation_error)?;
             let path = root.join(session.to_string());
             match fs::create_dir(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let metadata = fs::symlink_metadata(&path)
-                        .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+                    let metadata =
+                        fs::symlink_metadata(&path).map_err(registration_reservation_error)?;
                     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                        return Err(SubjektivHostError::InvalidArgument(
-                            "Session retention source is not an owned directory".into(),
-                        ));
+                        return Err(registration_reservation_error(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "Session retention source is not an owned directory",
+                        )));
                     }
                 }
-                Err(error) => return Err(SubjektivHostError::Unavailable(error.to_string())),
+                Err(error) => return Err(registration_reservation_error(error)),
             }
         }
         // Establish retention at attribution, before the first Run can publish bytes. This
@@ -416,7 +433,7 @@ impl LocalSubjectHost {
                 session,
                 session_store::retention::SessionRetentionPin(session),
             )
-            .map_err(source_error)
+            .map_err(registration_reservation_error)
     }
 
     pub(super) fn admit_journal(
