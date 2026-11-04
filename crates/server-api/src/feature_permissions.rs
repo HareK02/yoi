@@ -78,6 +78,11 @@ mod tests {
             "../../feature-permissions/tests/fixtures/catalog.json"
         ))
         .unwrap();
+        let catalog: PermissionCatalogResponse = serde_json::from_slice(
+            &serde_json::to_vec(&PermissionCatalogResponse(catalog)).unwrap(),
+        )
+        .unwrap();
+        let catalog = catalog.0;
         let mut host = PermissionHost::new(catalog.workspace.clone());
         for namespace in catalog.namespaces {
             let owner = host.register_feature(namespace.feature).unwrap();
@@ -92,8 +97,12 @@ mod tests {
         let request: PermissionValidationRequest =
             serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
         let result = host.resolve(Some(&request.0.assignment));
-        let response: PermissionResolution =
-            serde_json::from_slice(&serde_json::to_vec(result.projection()).unwrap()).unwrap();
+        let response: PermissionResolutionResponse = serde_json::from_slice(
+            &serde_json::to_vec(&PermissionResolutionResponse(result.projection().clone()))
+                .unwrap(),
+        )
+        .unwrap();
+        let response = response.0;
         assert!(
             response
                 .allowed
