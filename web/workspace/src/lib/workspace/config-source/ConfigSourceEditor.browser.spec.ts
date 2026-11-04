@@ -374,7 +374,7 @@ async function prepareDraft() {
 
 const requestAt = (index: number) => JSON.parse(fetcher.mock.calls[index][1].body);
 
-function commitReceiptResponse(state = candidateState, historyHead = "head:adopted") {
+function commitReceiptResponse(state: WorkspaceConfigTreeResponse = candidateState, historyHead = "head:adopted") {
   return async (_input: string, init: RequestInit) =>
     jsonResponse(receipt(JSON.parse(String(init.body)).operation_id, state, historyHead));
 }
@@ -494,7 +494,10 @@ test("adopted reconciliation updates head and clears the legacy export for the n
   const deletion = { kind: "delete", path: "module.dcdl", expected_digest: "sha256:module" };
   toolchain.applyChanges.mockResolvedValue(tree.snapshot);
   toolchain.changesBetween.mockResolvedValue([deletion]);
-  await fireEvent.click(view.getByRole("button", { name: "Delete" }));
+  const remove = view.getByRole("button", { name: "Delete" });
+  await waitFor(() => expect(remove).toHaveProperty("disabled", false));
+  await fireEvent.click(remove);
+  await waitFor(() => expect(view.container.textContent).toContain("Delete staged locally"));
   fetcher.mockResolvedValueOnce(previewResponse(tree, "head:adopted"));
   fetcher.mockImplementationOnce(commitReceiptResponse(tree, "head:second"));
   await fireEvent.click(view.getByRole("button", { name: "Commit" }));

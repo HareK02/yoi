@@ -126,30 +126,7 @@ mod plugin_remote_controller_tests {
             crate::plugin_settings::render_value(&plugins).unwrap(),
             crate::plugin_settings::render_value(&selection).unwrap()
         );
-        let state = f
-            .api
-            .config_store
-            .load_workspace_config(TEST_WORKSPACE_ID)
-            .unwrap()
-            .unwrap();
-        let path = config_source::VirtualPath::parse("main.dcdl").unwrap();
-        let commit = ConfigCommitRequest {
-            base_digest: state.snapshot.digest.clone(),
-            entrypoints: state.contract.entrypoints.clone(),
-            changes: vec![config_source::ConfigTreeChange::Update {
-                path: path.clone(),
-                expected_digest: state.snapshot.get(&path).unwrap().content_digest.clone(),
-                content,
-            }],
-        };
-        let (status, result) = f
-            .human(
-                reqwest::Method::POST,
-                &format!("{prefix}/config/source-tree/commit"),
-                serde_json::to_value(commit).unwrap(),
-            )
-            .await;
-        assert_eq!(status, StatusCode::CREATED, "{result}");
+        super::plugin_tests::adopt_plugin_config(f.api.clone(), &f.owner, content).await;
         (installed, package.bytes)
     }
 

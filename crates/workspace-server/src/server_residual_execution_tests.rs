@@ -1316,13 +1316,28 @@ async fn drive_and_config_preflight_keep_live_authority_owned_and_report_overloa
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn ui_config_commit_publishes_after_commit_without_holding_the_sql_lane() {
+async fn owner_adoption_publishes_after_commit_without_holding_the_sql_lane() {
+    use server_api::ConfigurationAdoptionApi;
     let fixture = fixture().await;
+    // This executor fixture supplies an authenticated owner context; full cookie
+    // admission belongs to configuration_adoption_http_integration.
+    let context = server_api::ServerRequestContext {
+        actor: Some(RequestActor {
+            user_id: "fixture-user".into(),
+            account_id: format!("account-{WORKSPACE}"),
+            handle: "fixture-user".into(),
+            display_name: "Fixture user".into(),
+            auth_method: ActorAuthMethod::BrowserSession,
+        }),
+        worker_source: None,
+        runtime_source: None,
+        origin: Some("http://localhost:5173".into()),
+        transport_headers: Vec::new(),
+    };
     let current = fixture
-        .api
-        .config_store
-        .load_workspace_config(WORKSPACE)
-        .unwrap()
+        .server
+        .configuration_source(context.clone(), WORKSPACE.into())
+        .await
         .unwrap();
     let mut reply = HeldRuntimeReply::new();
     install_remote_fixture(
@@ -1331,31 +1346,29 @@ async fn ui_config_commit_publishes_after_commit_without_holding_the_sql_lane() 
         &format!("http://{}", reply.address),
         false,
     );
-    let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut commit = Box::pin(crate::db_executor::with_operation_lifetime(
-        Arc::new(CountJobLifetime(leases.clone())),
-        scoped_commit_workspace_config_tree(
-            State(fixture.api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: WORKSPACE.into(),
-            }),
-            Json(server_api::ConfigCommitRequest {
-                base_digest: current.snapshot.digest.clone(),
-                entrypoints: current
-                    .contract
-                    .entrypoints
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
-                changes: vec![server_api::ConfigTreeChange::Create {
-                    path: "notes/owned-publication.txt".into(),
-                    content_type: server_api::ConfigContentType::Text,
-                    content: "committed before prompt publication".into(),
-                }],
-            }),
-        ),
-    ));
-    assert!(futures::poll!(&mut commit).is_pending());
+    let server = fixture.server.clone();
+    let request = server_api::ConfigurationAdoptionRequest {
+        operation_id: "owned-publication".into(),
+        expected_head: current.history_head.clone(),
+        expected_catalog_digest: current.catalog_digest.clone(),
+        expected_legacy_export: current.expected_legacy_export.clone(),
+        source: server_api::ConfigCommitRequest {
+            base_digest: current.state.snapshot.digest.clone(),
+            entrypoints: current.state.contract.entrypoints.clone(),
+            changes: vec![server_api::ConfigTreeChange::Create {
+                path: "notes/owned-publication.txt".into(),
+                content_type: server_api::ConfigContentType::Text,
+                content: "committed before prompt publication".into(),
+            }],
+        },
+    };
+    let commit = tokio::spawn(async move {
+        server
+            .configuration_adopt(context, WORKSPACE.into(), request)
+            .await
+    });
+    let receipt = observed(commit).await.unwrap().unwrap();
+    assert!(receipt.source_stored && receipt.policy_committed);
     let request = observed(reply.entered.take().unwrap()).await.unwrap();
     assert!(
         request.starts_with("POST "),
@@ -1371,7 +1384,7 @@ async fn ui_config_commit_publishes_after_commit_without_holding_the_sql_lane() 
     .unwrap()
     .unwrap();
     assert_ne!(
-        state.snapshot.digest, current.snapshot.digest,
+        state.snapshot.digest, current.state.snapshot.digest,
         "publication must observe the committed tree"
     );
     assert!(
@@ -1387,12 +1400,16 @@ async fn ui_config_commit_publishes_after_commit_without_holding_the_sql_lane() 
         "control"
     );
     assert!(!reply.upstream_released.load(Ordering::SeqCst));
-    drop(commit);
-    assert_eq!(leases.load(Ordering::SeqCst), 1);
+    let admission = fixture.server.admission_for_workspace(WORKSPACE).await;
+    let mut deletion = Box::pin(admission.lock_deletion());
+    assert!(
+        futures::poll!(&mut deletion).is_pending(),
+        "publication must retain its admitted Workspace lifetime after the receipt returns"
+    );
     reply.finish();
     observed(fixture.host_executor.drain()).await.unwrap();
     observed(fixture.executor.drain()).await.unwrap();
-    assert_eq!(leases.load(Ordering::SeqCst), 0);
+    let _deletion = observed(deletion).await;
     assert_eq!(
         fixture
             .api

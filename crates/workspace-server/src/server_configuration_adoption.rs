@@ -472,6 +472,24 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                     ))
                 })
                 .map_err(transfer_error)??;
+            // Core and Feature guards are released before best-effort Runtime
+            // publication. Dispatch transfers the admitted lifetime without
+            // keeping the SQL lane occupied by an external Runtime response.
+            // Exact historical receipt replay above must not publish old state.
+            let publication_api = api.clone();
+            let state = result.state.clone();
+            let _ = api.host_executors.host().and_then(|executor| {
+                executor.dispatch(move || {
+                    if let Ok(projection) = publication_api
+                        .prompt_projection_cache
+                        .resolve(&publication_api.config.workspace_id, &state)
+                    {
+                        let _ = publication_api
+                            .runtime
+                            .observe_workspace_prompt_projection((*projection).clone());
+                    }
+                })
+            });
             Ok(receipt_to_api(result))
         })
         .await

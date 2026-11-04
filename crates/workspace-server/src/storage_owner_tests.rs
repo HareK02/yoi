@@ -42,6 +42,113 @@ fn legacy_subject(source: &Path, destination: &Path, attribution: &str) -> Strin
 }
 
 #[test]
+fn reserved_deletion_reuses_owned_storage_but_never_adopts_legacy_or_recreates_missing() {
+    use crate::workspace_deletion::WorkspaceDeletionStore;
+    for owned in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let catalog = catalog(&path);
+        let scope = FeatureStorage::for_server_database(&path)
+            .unwrap()
+            .scope("storage-workspace")
+            .unwrap();
+        let registration = SubjektivStore::register(&scope).unwrap();
+        let feature_path = temp
+            .path()
+            .join("feature-storage/storage-workspace/features/subjektiv.sqlite");
+        let identity = if owned {
+            Some(scope.open(&registration).unwrap().identity().clone())
+        } else {
+            legacy_subject(
+                &temp.path().join("source"),
+                &feature_path,
+                "storage-workspace",
+            );
+            None
+        };
+        catalog.with_conn(|conn| {
+            conn.execute_batch("INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
+                VALUES('retained-workspace','storage-owner','Retain','active','1','1');")?;
+            Ok(())
+        }).unwrap();
+        let preflight = catalog
+            .workspace_deletion_preflight("storage-owner", "storage-workspace")
+            .unwrap();
+        catalog
+            .reserve_workspace_deletion(
+                "storage-owner",
+                "storage-workspace",
+                &server_api::WorkspaceDeletionRequest {
+                    operation_id: "delete-storage".into(),
+                    expected_workspace_updated_at: preflight.expected_workspace_updated_at,
+                    confirmation: preflight.display_name,
+                },
+            )
+            .unwrap();
+        let result = catalog.adopt_workspace_feature_storage(&scope, &registration, "store_scope");
+        if let Some(identity) = identity {
+            result.unwrap();
+            assert_eq!(
+                scope
+                    .open_existing(&registration, &identity)
+                    .unwrap()
+                    .identity(),
+                &identity
+            );
+            std::fs::remove_file(&feature_path).unwrap();
+            assert!(
+                catalog
+                    .adopt_workspace_feature_storage(&scope, &registration, "store_scope")
+                    .is_err()
+            );
+            assert!(!feature_path.exists());
+        } else {
+            assert!(result.is_err());
+            let raw = Connection::open(&feature_path).unwrap();
+            let identity_count: i64 = raw
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name='__yoi_storage_identity'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(identity_count, 0, "deletion is not new adoption authority");
+        }
+    }
+}
+
+#[test]
+fn deleting_without_reservation_cannot_reuse_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("server.db");
+    let catalog = catalog(&path);
+    let scope = FeatureStorage::for_server_database(&path)
+        .unwrap()
+        .scope("storage-workspace")
+        .unwrap();
+    let registration = SubjektivStore::register(&scope).unwrap();
+    let identity = scope.open(&registration).unwrap().identity().clone();
+    catalog
+        .with_conn(|conn| {
+            conn.execute("UPDATE workspaces SET state='deleting'", [])?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        catalog
+            .adopt_workspace_feature_storage(&scope, &registration, "store_scope")
+            .is_err()
+    );
+    assert_eq!(
+        scope
+            .open_existing(&registration, &identity)
+            .unwrap()
+            .identity(),
+        &identity
+    );
+}
+
+#[test]
 fn catalog_authorized_legacy_adoption_reopens_and_preserves_domain_data() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("server.db");

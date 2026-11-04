@@ -1006,6 +1006,31 @@ impl ScopedFeatureStorage {
         )
     }
 
+    /// Validate optional storage for a lifecycle consumer without authorizing
+    /// adoption or provisioning. Existing files require completed physical
+    /// ownership; missing bound files fail closed. This is not an open permit:
+    /// subsequent database access must still validate stored identity and fences.
+    pub fn verify_owned_if_present(&self, registration: &RegisteredFeature) -> Result<()> {
+        self.manager.check_registration(registration)?;
+        if !self.manager.inner.root.try_exists()? {
+            return Ok(());
+        }
+        let lifecycle = self.manager.lifecycle(&self.scope_id);
+        let _lease = lifecycle.lock(false)?;
+        let path = self
+            .manager
+            .feature_dir(&self.scope_id)
+            .join(format!("{}.sqlite", registration.feature_id));
+        if let Some(binding) = lifecycle.lookup(&self.scope_id, &registration.feature_id)? {
+            binding.check_file(&path)?;
+        } else if path.try_exists()? {
+            return Err(FeatureStorageError::Identity(
+                "lifecycle consumer cannot adopt unowned Feature storage".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Host startup compatibility for a registered optional Feature. Does not
     /// provision missing optional storage. An existing legacy DB still requires
     /// explicit adoption authority and persisted attribution validation.

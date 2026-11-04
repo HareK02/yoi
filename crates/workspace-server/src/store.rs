@@ -2998,10 +2998,25 @@ impl SqliteWorkspaceStore {
             }
         };
         self.with_immediate_transaction(|tx| {
-            let row: Option<(String,String)> = tx.query_row(
-                "SELECT owner_account_id,created_at FROM workspaces WHERE workspace_id=?1 AND state='active'",[storage.scope_id()],
-                |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
-            let (owner,created) = row.ok_or_else(|| Error::Store("Workspace storage requires a current catalog owner".into()))?;
+            let row: Option<(String,String,String)> = tx.query_row(
+                "SELECT owner_account_id,created_at,state FROM workspaces WHERE workspace_id=?1",[storage.scope_id()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+            let (owner,created,state) = row.ok_or_else(|| Error::Store("Workspace storage requires a current catalog owner".into()))?;
+            if state == "deleting" {
+                // A retained deletion consumer can validate completed ownership,
+                // but cannot authorize new legacy adoption or replacement storage.
+                let reserved: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspace_deletion_operations WHERE workspace_id=?1 AND owner_account_id=?2 AND state!='succeeded')",
+                    params![storage.scope_id(),owner], |row| row.get(0))?;
+                if !reserved {
+                    return Err(Error::Store("Workspace storage requires a retained deletion reservation".into()));
+                }
+                storage.verify_owned_if_present(registration)?;
+                return Ok(());
+            }
+            if state != "active" {
+                return Err(Error::Store("Workspace storage adoption requires an active catalog owner".into()));
+            }
             let evidence = format!("catalog:{}:{owner}:{created}",storage.scope_id());
             let request = format!("legacy-storage:{}:{}",storage.scope_id(),registration.feature_id());
             storage.adopt_legacy_if_present(registration,&request,&evidence,|feature_tx| {
