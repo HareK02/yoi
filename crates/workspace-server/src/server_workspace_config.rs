@@ -633,9 +633,12 @@ pub(super) async fn commit(
                             &persistence_api.config.workspace_id,
                             &candidate,
                         ).map_err(|_| unknown())?;
+                        // Repository projection may already have auxiliary secret
+                        // effects. A subsequent save error cannot promise that the
+                        // whole operation had no durable effect, even on SQL rollback.
                         persistence_api.config_store.commit_evaluated_workspace_config(
                             &persistence_api.config.workspace_id, &candidate,
-                        ).map_err(pre_error)
+                        ).map_err(|_| unknown())
                     })())
                 }).map_err(|error| match error {
                     subjektiv::SubjektivError::PermissionAuthoritySealed => fail(409, "owner_adoption_required"),

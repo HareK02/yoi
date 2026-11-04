@@ -529,6 +529,7 @@ fn prepare(
         schema,
     )?;
     crate::config_source::validate_workspace_config_candidate_projections(workspace, &candidate)?;
+    crate::repository_access::validate_repository_access_in_transaction(tx, workspace, &candidate)?;
     let source = policy_config::source(&candidate.evaluation)?;
     policy_config::validate_source(host, &source, require_subject)?;
     let state = WorkspaceConfigState {

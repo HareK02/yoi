@@ -40,6 +40,9 @@
   let baseDigest = $state("");
   let editingMetadata = $state.raw<ConfigurationEditingState | null>(null);
   let editingWorkspaceId = $state("");
+  // 結果不明の依頼はeditor instanceのメモリ内だけに保持する。画面離脱や
+  // browser reloadを跨ぐ復元は保証しない。Serverのreceipt永続化とは別の限界で、
+  // その場合も結果不明を失敗とせず、元の依頼全体を使った照合が必要になる。
   let pendingAdoption = $state.raw<{
     workspaceId: string;
     request: ConfigurationAdoptionRequest;

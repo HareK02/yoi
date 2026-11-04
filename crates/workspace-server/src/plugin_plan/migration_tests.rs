@@ -41,6 +41,7 @@ fn plugin_plan_migration_marker_failure_preserves_catalog_then_retries_and_match
             ));
             expected.push((112, "Ticket Service outbox and fenced consumers".into()));
             expected.push((113, "Ticket work-decomposition parent links".into()));
+            expected.push((122, crate::config_adoption::MIGRATION_NAME.into()));
             assert_eq!(workspace_schema_migration_history(conn)?, expected);
             subject_assignment_migration::verify(conn)?;
             crate::plugin_plan::verify_plan_schema(conn)?;

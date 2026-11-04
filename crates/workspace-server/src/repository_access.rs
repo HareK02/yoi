@@ -189,24 +189,65 @@ fn project_repository_access_evaluation(
     projection_digest: &str,
     evaluation: &config_source::EvaluationResult,
 ) -> Result<RepositoryAccessProjection> {
-    let projection = evaluation.projections.first().ok_or_else(|| {
-        Error::InvalidInput("Workspace config produced no active projection".to_string())
-    })?;
-    let config: VirtualWorkspaceConfig = serde_json::from_value(projection.data_json.clone())
-        .map_err(|error| {
-            Error::InvalidInput(format!("invalid Repository access config: {error}"))
-        })?;
+    let config = repository_access_source(evaluation)?;
     if !config.repository_access.is_empty() {
         secrets.ensure_workspace_default_credential(workspace_id)?;
     }
+    project_repository_access_bindings(
+        workspace_id,
+        projection_digest,
+        config,
+        |key| store.get_repository_by_key(workspace_id, key),
+        |id| secrets.get_credential(workspace_id, id, &[]),
+        |id| secrets.get_host_trust(workspace_id, id, &[]),
+    )
+}
+
+/// Validate against the same catalog transaction that will adopt the source.
+/// This reads only public credential/trust metadata: no default key generation,
+/// unsealing, filesystem writes or second connection under the writer lock.
+/// Both preview and adoption use the owning projection's semantic checks.
+pub(crate) fn validate_repository_access_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    candidate: &EvaluatedConfigCandidate,
+) -> Result<()> {
+    project_repository_access_bindings(
+        workspace_id,
+        &candidate.evaluation.projection_digest,
+        repository_access_source(&candidate.evaluation)?,
+        |key| crate::store::read_repository_by_key(tx, workspace_id, key),
+        |id| read_credential(tx, workspace_id, id),
+        |id| read_host_trust(tx, workspace_id, id),
+    )
+    .map(|_| ())
+}
+
+fn repository_access_source(
+    evaluation: &config_source::EvaluationResult,
+) -> Result<VirtualWorkspaceConfig> {
+    let projection = evaluation.projections.first().ok_or_else(|| {
+        Error::InvalidInput("Workspace config produced no active projection".to_string())
+    })?;
+    serde_json::from_value(projection.data_json.clone())
+        .map_err(|error| Error::InvalidInput(format!("invalid Repository access config: {error}")))
+}
+
+fn project_repository_access_bindings(
+    workspace_id: &str,
+    projection_digest: &str,
+    config: VirtualWorkspaceConfig,
+    repository: impl Fn(&str) -> Result<Option<crate::store::RepositoryRecord>>,
+    credential: impl Fn(&str) -> Result<Option<RepositorySshCredential>>,
+    host_trust: impl Fn(&str) -> Result<Option<RepositorySshHostTrust>>,
+) -> Result<RepositoryAccessProjection> {
     let mut bindings = Vec::with_capacity(config.repository_access.len());
     for (repository_key, access) in config.repository_access {
         server_api::validate_repository_key(&repository_key)
             .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
         validate_identifier("credential_id", &access.ssh.credential)?;
         validate_identifier("host_trust_id", &access.ssh.host_trust)?;
-        let repository = store
-            .get_repository_by_key(workspace_id, &repository_key)?
+        let repository = repository(&repository_key)?
             .ok_or_else(|| Error::InvalidInput(format!("unknown Repository `{repository_key}`")))?;
         validate_repository_access_source(&repository_key, &repository.source)?;
         if repository.source.kind != server_api::RepositorySourceKind::Ssh {
@@ -214,28 +255,24 @@ fn project_repository_access_evaluation(
                 "Repository `{repository_key}` is not an ssh:// Repository"
             )));
         }
-        let credential = secrets
-            .get_credential(workspace_id, &access.ssh.credential, &[])?
-            .ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "unknown Repository SSH credential `{}`",
-                    access.ssh.credential
-                ))
-            })?;
+        let credential = credential(&access.ssh.credential)?.ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "unknown Repository SSH credential `{}`",
+                access.ssh.credential
+            ))
+        })?;
         if credential.status != "active" {
             return Err(Error::InvalidInput(format!(
                 "Repository SSH credential `{}` is not active",
                 access.ssh.credential
             )));
         }
-        let host_trust = secrets
-            .get_host_trust(workspace_id, &access.ssh.host_trust, &[])?
-            .ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "unknown Repository SSH host trust `{}`",
-                    access.ssh.host_trust
-                ))
-            })?;
+        let host_trust = host_trust(&access.ssh.host_trust)?.ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "unknown Repository SSH host trust `{}`",
+                access.ssh.host_trust
+            ))
+        })?;
         let (hostname, port) =
             repository_ssh_endpoint(repository_key.as_str(), &repository.source.uri)?.ok_or_else(
                 || {

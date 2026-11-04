@@ -10,9 +10,9 @@ import {
   parseConfigurationSourceResponse,
   previewConfigTree,
   reconcileConfigTree,
-} from "./api.ts";
-import type { ConfigurationAdoptionReceipt, ConfigurationAdoptionRequest, ConfigurationReconciliation } from "#lib/generated/configuration-adoption.generated.ts";
-import type { WorkspaceConfigTreeResponse } from "./types.ts";
+} from "../../src/lib/workspace/config-source/api.ts";
+import type { ConfigurationAdoptionRequest } from "#lib/generated/configuration-adoption.generated.ts";
+import type { WorkspaceConfigTreeResponse } from "../../src/lib/workspace/config-source/types.ts";
 
 const state: WorkspaceConfigTreeResponse = {
   snapshot: { digest: "sha256:content-A", entries: {} },
@@ -36,7 +36,7 @@ const request: ConfigurationAdoptionRequest = {
   expected_legacy_export: source.expected_legacy_export,
   source: { base_digest: state.snapshot.digest, changes: [], entrypoints: ["main.dcdl"] },
 };
-const receipt: ConfigurationAdoptionReceipt = {
+const receipt = {
   workspace_id: "w/one", operation_id: request.operation_id, history_head: "head:adopted",
   state, source_stored: true, policy_committed: true, runtime_application: "next_current_policy_check",
 };
@@ -117,7 +117,7 @@ Deno.test("not_observed and pending_transfer remain distinct unknown evidence, n
     { status: "not_observed" },
     { status: "pending_transfer", transfer_identity: "transfer:one", export_digest: "sha256:legacy" },
     { status: "adopted", receipt },
-  ] satisfies ConfigurationReconciliation[]) assertEquals(parseConfigurationReconciliation(evidence), evidence);
+  ]) assertEquals<unknown>(parseConfigurationReconciliation(evidence), evidence);
   for (const invalid of [
     { status: "failed" }, { status: "not_observed", receipt },
     { status: "pending_transfer", transfer_identity: "transfer:one" },

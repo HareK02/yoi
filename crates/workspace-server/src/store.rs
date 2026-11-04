@@ -3076,10 +3076,25 @@ impl SqliteWorkspaceStore {
             }
         };
         self.with_immediate_transaction(|tx| {
-            let row: Option<(String,String)> = tx.query_row(
-                "SELECT owner_account_id,created_at FROM workspaces WHERE workspace_id=?1 AND state='active'",[storage.scope_id()],
-                |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
-            let (owner,created) = row.ok_or_else(|| Error::Store("Workspace storage requires a current catalog owner".into()))?;
+            let row: Option<(String,String,String)> = tx.query_row(
+                "SELECT owner_account_id,created_at,state FROM workspaces WHERE workspace_id=?1",[storage.scope_id()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+            let (owner,created,state) = row.ok_or_else(|| Error::Store("Workspace storage requires a current catalog owner".into()))?;
+            if state == "deleting" {
+                // A retained deletion consumer can validate completed ownership,
+                // but cannot authorize new legacy adoption or replacement storage.
+                let reserved: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspace_deletion_operations WHERE workspace_id=?1 AND owner_account_id=?2 AND state!='succeeded')",
+                    params![storage.scope_id(),owner], |row| row.get(0))?;
+                if !reserved {
+                    return Err(Error::Store("Workspace storage requires a retained deletion reservation".into()));
+                }
+                storage.verify_owned_if_present(registration)?;
+                return Ok(());
+            }
+            if state != "active" {
+                return Err(Error::Store("Workspace storage adoption requires an active catalog owner".into()));
+            }
             let evidence = format!("catalog:{}:{owner}:{created}",storage.scope_id());
             let request = format!("legacy-storage:{}:{}",storage.scope_id(),registration.feature_id());
             storage.adopt_legacy_if_present(registration,&request,&evidence,|feature_tx| {
@@ -6711,19 +6726,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         workspace_id: &str,
         repository_key: &str,
     ) -> Result<Option<RepositoryRecord>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
-                          source_kind, source_uri, default_ref,
-                          source_fingerprint, observed_status, observed_at, created_at, updated_at
-                   FROM repositories
-                   WHERE workspace_id = ?1 AND repository_key = ?2"#,
-                params![workspace_id, repository_key],
-                read_repository_record,
-            )
-            .optional()
-            .map_err(Error::from)
-        })
+        self.with_conn(|conn| read_repository_by_key(conn, workspace_id, repository_key))
     }
 
     fn list_repositories(&self, workspace_id: &str) -> Result<Vec<RepositoryRecord>> {
@@ -12439,6 +12442,24 @@ fn validate_repository_record_identity(record: &RepositoryRecord) -> Result<()> 
     server_api::validate_repository_key(&record.repository_key)
         .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
     Ok(())
+}
+
+pub(crate) fn read_repository_by_key(
+    conn: &Connection,
+    workspace_id: &str,
+    repository_key: &str,
+) -> Result<Option<RepositoryRecord>> {
+    conn.query_row(
+        r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
+                  source_kind, source_uri, default_ref,
+                  source_fingerprint, observed_status, observed_at, created_at, updated_at
+           FROM repositories
+           WHERE workspace_id = ?1 AND repository_key = ?2"#,
+        params![workspace_id, repository_key],
+        read_repository_record,
+    )
+    .optional()
+    .map_err(Error::from)
 }
 
 fn read_repository_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRecord> {

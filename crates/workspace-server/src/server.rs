@@ -13242,7 +13242,9 @@ impl server_api::ServerApi for ServerApiContractService {
                         &worker,
                         &source.authentication_binding_id,
                     )?;
-                    recover_ticket_notifications(&api);
+                    // The receipt certifies result/source commit, not notification acceptance.
+                    // Do not make it wait for unrelated pending deliveries or their Runtime ACKs.
+                    drop(enqueue_ticket_notification_recovery(&api));
                     Ok(receipt)
                 })();
                 result
@@ -17332,7 +17334,7 @@ async fn apply_set_ticket_assignment(
                     // same best-effort notification completion as before offload.
                     Ok::<_, Error>((
                         assignment,
-                        enqueue_orchestrator_assignment_attention(&notification_api),
+                        enqueue_ticket_notification_recovery(&notification_api),
                     ))
                 })
                 .await?
@@ -23264,7 +23266,7 @@ fn maybe_dispatch_orchestrator_turn_end(
     });
 }
 
-fn enqueue_orchestrator_assignment_attention(
+fn enqueue_ticket_notification_recovery(
     api: &WorkspaceApi,
 ) -> Option<tokio::sync::oneshot::Receiver<()>> {
     let api = api.clone();
@@ -23277,7 +23279,7 @@ fn enqueue_orchestrator_assignment_attention(
     }) {
         Ok(()) => Some(completion),
         Err(error) => {
-            tracing::warn!(%error, "Assign notification was not admitted; input remains durable");
+            tracing::warn!(%error, "Ticket notification recovery was not admitted; source remains durable");
             None
         }
     }
@@ -70794,33 +70796,58 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
     #[tokio::test]
     async fn generated_config_source_routes_preserve_nested_entry_paths() {
         let dir = tempfile::tempdir().unwrap();
-        let app = test_app(dir.path()).await;
+        let api = test_api(dir.path()).await;
+        let owner =
+            seed_test_workspace_owner_token(api.store.as_ref(), "nested-config-owner").await;
+        let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+        catalog
+            .apis
+            .lock()
+            .await
+            .insert(TEST_WORKSPACE_ID.into(), api.clone());
+        catalog
+            .routers
+            .lock()
+            .await
+            .insert(TEST_WORKSPACE_ID.into(), build_inner_router(api));
+        let app = workspace_server_router(catalog);
         let source_tree_path = format!("/api/w/{TEST_WORKSPACE_ID}/config/source-tree");
-        let initial = get_json(app.clone(), &source_tree_path).await;
-        let digest = initial["snapshot"]["digest"].as_str().unwrap();
-
-        let committed = request_json(
+        let adoption_path = format!("/api/w/{TEST_WORKSPACE_ID}/config/adoption");
+        let initial = get_json_authenticated(app.clone(), &adoption_path, &owner).await;
+        let request = json!({
+            "operation_id": "nested-config-adoption", "expected_head": initial["history_head"],
+            "expected_catalog_digest": initial["catalog_digest"], "expected_legacy_export": initial["expected_legacy_export"],
+            "source": {
+                "base_digest": initial["state"]["snapshot"]["digest"],
+                "changes": [{ "kind": "create", "path": "notes/readme.txt", "content_type": "text", "content": "nested entry" }],
+                "entrypoints": ["main.dcdl"]
+            }
+        });
+        let preview = request_json_authenticated(
             app.clone(),
             "POST",
-            &format!("{source_tree_path}/commit"),
-            Some(json!({
-                "base_digest": digest,
-                "changes": [{
-                    "kind": "create",
-                    "path": "notes/readme.txt",
-                    "content_type": "text",
-                    "content": "nested entry"
-                }],
-                "entrypoints": ["main.dcdl"]
-            })),
-            StatusCode::CREATED,
+            &format!("{adoption_path}/preview"),
+            Some(request.clone()),
+            &owner,
+            StatusCode::OK,
         )
         .await;
-        let committed_digest = committed["snapshot"]["digest"].as_str().unwrap();
+        let committed = request_json_authenticated(
+            app.clone(),
+            "POST",
+            &format!("{adoption_path}/commit"),
+            Some(request),
+            &owner,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(committed["state"], preview["state"]);
+        let committed_digest = committed["state"]["snapshot"]["digest"].as_str().unwrap();
 
-        let config_snapshot = get_json(
+        let config_snapshot = get_json_authenticated(
             app.clone(),
             &format!("{source_tree_path}/history/{committed_digest}"),
+            &owner,
         )
         .await;
         assert_eq!(config_snapshot["digest"], committed_digest);
@@ -70829,9 +70856,10 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             "nested entry"
         );
 
-        let entry = get_json(
+        let entry = get_json_authenticated(
             app,
             &format!("{source_tree_path}/entries/notes%2Freadme.txt"),
+            &owner,
         )
         .await;
         assert_eq!(entry["path"], "notes/readme.txt");

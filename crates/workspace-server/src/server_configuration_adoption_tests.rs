@@ -356,6 +356,270 @@ mod configuration_adoption_http_integration {
     }
 
     #[tokio::test]
+    async fn owner_http_repository_validation_is_read_only_and_precedes_seal() {
+        let f = Fixture::new().await;
+        let source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Ssh,
+            uri: "ssh://git@repository.example.test:2222/team/repo.git".into(),
+        };
+        f.api
+            .store
+            .upsert_repository(&crate::store::RepositoryRecord {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                repository_id: "ssh-repository".into(),
+                repository_key: "remote".into(),
+                kind: "git".into(),
+                provider: None,
+                source_fingerprint: crate::repository_source::repository_source_fingerprint(
+                    &source,
+                ),
+                source,
+                default_ref: None,
+                observed_status: server_api::RepositoryObservedStatus::Unverified,
+                observed_at: None,
+                created_at: "1".into(),
+                updated_at: "1".into(),
+            })
+            .unwrap();
+        let mut non_ssh = f
+            .api
+            .store
+            .get_repository_by_key(TEST_WORKSPACE_ID, "remote")
+            .unwrap()
+            .unwrap();
+        non_ssh.repository_id = "https-repository".into();
+        non_ssh.repository_key = "nonssh".into();
+        non_ssh.source = server_api::RepositorySource {
+            kind: server_api::RepositorySourceKind::Https,
+            uri: "https://repository.example.test/team/repo.git".into(),
+        };
+        non_ssh.source_fingerprint =
+            crate::repository_source::repository_source_fingerprint(&non_ssh.source);
+        f.api.store.upsert_repository(&non_ssh).unwrap();
+        for id in ["deploy", "revoked"] {
+            f.api
+                .repository_secrets
+                .generate_credential(
+                    TEST_WORKSPACE_ID,
+                    GenerateRepositorySshCredentialRequest {
+                        operation_id: format!("generate-{id}"),
+                        credential_id: id.into(),
+                        name: id.into(),
+                    },
+                    &f.owner_account,
+                )
+                .unwrap();
+        }
+        f.api.config_store.with_conn(|conn| {
+            conn.execute("UPDATE repository_ssh_credentials SET status='revoked' WHERE workspace_id=?1 AND credential_id='revoked'", [TEST_WORKSPACE_ID])?;
+            Ok(())
+        }).unwrap();
+        let public_key =
+            ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[37; 32]))
+                .public_key()
+                .to_openssh()
+                .unwrap();
+        for (id, hostname, port) in [
+            ("matching", "repository.example.test", 2222),
+            ("wrong-host", "other.example.test", 2222),
+            ("wrong-port", "repository.example.test", 22),
+        ] {
+            f.api
+                .repository_secrets
+                .put_host_trust(
+                    TEST_WORKSPACE_ID,
+                    PutRepositorySshHostTrustRequest {
+                        operation_id: format!("trust-{id}"),
+                        host_trust_id: id.into(),
+                        hostname: hostname.into(),
+                        port,
+                        host_key: public_key.clone(),
+                        expected_fingerprint: None,
+                    },
+                    &f.owner_account,
+                )
+                .unwrap();
+        }
+        let secret_counts = || {
+            f.api
+                .config_store
+                .with_conn(|conn| {
+                    [
+                        "repository_ssh_credentials",
+                        "repository_ssh_credential_keys",
+                        "repository_ssh_host_trusts",
+                        "repository_ssh_host_trust_keys",
+                        "repository_secret_operations",
+                        "repository_secret_audit_events",
+                        "server_secret_objects",
+                    ]
+                    .into_iter()
+                    .map(|table| {
+                        conn.query_row(
+                            &format!("SELECT COUNT(*) FROM {table} WHERE workspace_id=?1"),
+                            [TEST_WORKSPACE_ID],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .map_err(Error::from)
+                    })
+                    .collect::<Result<Vec<_>>>()
+                })
+                .unwrap()
+        };
+        let secrets_before = secret_counts();
+        let content = |repo: &str, credential: &str, trust: &str, access: &str| {
+            format!(
+                "{{ repository_access = {{ {repo} = {{ ssh = {{ credential = {credential:?}; host_trust = {trust:?}; access = {access:?}; }}; }}; }}; }}"
+            )
+        };
+        for canonical in [false, true] {
+            let current = f.source().await;
+            assert_eq!(current.source_stored, canonical);
+            let before = f.durable();
+            for (case, repo, credential, trust, access, diagnostic) in [
+                (
+                    "mode",
+                    "remote",
+                    "deploy",
+                    "matching",
+                    "not-a-mode",
+                    "invalid Repository access config",
+                ),
+                (
+                    "repository",
+                    "absent",
+                    "deploy",
+                    "matching",
+                    "read_only",
+                    "unknown Repository",
+                ),
+                (
+                    "non-ssh",
+                    "nonssh",
+                    "deploy",
+                    "matching",
+                    "read_only",
+                    "not an ssh",
+                ),
+                (
+                    "credential",
+                    "remote",
+                    "absent",
+                    "matching",
+                    "read_only",
+                    "unknown Repository SSH credential",
+                ),
+                (
+                    "inactive",
+                    "remote",
+                    "revoked",
+                    "matching",
+                    "read_only",
+                    "is not active",
+                ),
+                (
+                    "trust",
+                    "remote",
+                    "deploy",
+                    "absent",
+                    "read_only",
+                    "unknown Repository SSH host trust",
+                ),
+                (
+                    "host",
+                    "remote",
+                    "deploy",
+                    "wrong-host",
+                    "read_only",
+                    "does not match host trust",
+                ),
+                (
+                    "port",
+                    "remote",
+                    "deploy",
+                    "wrong-port",
+                    "read_only",
+                    "does not match host trust",
+                ),
+            ] {
+                let adoption = request(
+                    &current,
+                    &format!("repository-{canonical}-{case}"),
+                    vec![update(
+                        &current,
+                        "main.dcdl",
+                        &content(repo, credential, trust, access),
+                    )],
+                );
+                for endpoint in ["/preview", "/commit"] {
+                    let rejected = f
+                        .owner_call(endpoint, &adoption, StatusCode::BAD_REQUEST)
+                        .await;
+                    assert!(
+                        rejected.to_string().contains(diagnostic),
+                        "{case} {endpoint}: {rejected}"
+                    );
+                    assert_eq!(
+                        f.durable(),
+                        before,
+                        "{case} {endpoint}: all old authorities must remain unchanged"
+                    );
+                    assert_eq!(
+                        secret_counts(),
+                        secrets_before,
+                        "validation must not generate keys or secret receipts"
+                    );
+                    if canonical {
+                        f.assert_legacy_sealed();
+                    } else {
+                        f.assert_legacy_writable();
+                    }
+                }
+            }
+            let valid = request(
+                &current,
+                &format!("valid-repository-{canonical}"),
+                vec![update(
+                    &current,
+                    "main.dcdl",
+                    &content(
+                        "remote",
+                        "deploy",
+                        "matching",
+                        if canonical { "read_write" } else { "read_only" },
+                    ),
+                )],
+            );
+            let preview = f.owner_call("/preview", &valid, StatusCode::OK).await;
+            assert_eq!(
+                f.durable(),
+                before,
+                "valid preview must remain a read, before and after cutover"
+            );
+            assert_eq!(secret_counts(), secrets_before);
+            let saved = f.commit(&valid).await;
+            assert_eq!(
+                serde_json::to_value(&saved.state).unwrap(),
+                preview["state"]
+            );
+            assert_eq!(f.source().await.state, saved.state);
+            f.assert_legacy_sealed();
+            assert_eq!(
+                secret_counts(),
+                secrets_before,
+                "adoption validates metadata without secret side effects"
+            );
+        }
+        assert!(
+            f.api
+                .repository_secrets
+                .get_credential(TEST_WORKSPACE_ID, "workspace-default", &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn owner_http_edits_migration_draft_and_adopts_source_policy_head_and_receipt() {
         let fixture = Fixture::new().await;
         let before = fixture.durable();

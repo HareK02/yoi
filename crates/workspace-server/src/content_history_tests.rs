@@ -1,6 +1,7 @@
 //! Contract fixture for the actual Server database/transaction owner and the content adapter.
 //! Existing authorization is represented by an exact-target Host decision; this is not a route
-//! or production policy cutover. Domain schema is installed only in this isolated fixture.
+//! or production policy cutover. The Server lifecycle installs the content schema;
+//! this fixture installs only its business data and exact-target Host decision.
 use config_source::{
     ConfigContentType, ConfigEntry, ConfigTreeSnapshot, SnapshotEnvironment, ToolchainContract,
     VirtualPath,
@@ -88,7 +89,6 @@ fn server_owned_transaction_adopts_sources_projection_history_and_rolls_back_fai
     let path = dir.path().join("server.sqlite");
     let db = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     db.with_immediate_transaction(|tx| {
-        tx.execute_batch(content_history_store::SCHEMA)?;
         tx.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) VALUES('history-owner','user','history-owner','Owner','1','1'); INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at) VALUES('history-ws','history-owner','History fixture','active','1','1');")?;
         Ok(())
     }).unwrap();
@@ -127,7 +127,6 @@ fn server_owned_transaction_adopts_sources_projection_history_and_rolls_back_fai
 fn ticket_snapshot_and_history_restoration_do_not_rewind_separate_business_events() {
     let db = SqliteWorkspaceStore::in_memory_for_test().unwrap();
     db.with_immediate_transaction(|tx| {
-        tx.execute_batch(content_history_store::SCHEMA)?;
         // Business state is deliberately not a field accepted by the content adapter.
         tx.execute_batch("CREATE TEMP TABLE business_events(kind TEXT,value TEXT); INSERT INTO business_events VALUES('state','closed'),('assignee','current-worker'),('relation','depends-on-current');")?;
         let s=scoped(tx);
