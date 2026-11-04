@@ -6,6 +6,8 @@ After integrating changes, push the target branch through its configured normal 
 
 Delegate bounded Ticket work with `SpawnTicketWorker` using the current `orchestrator_assignment_id`; choose Profile, Flow, and Workdir attachments for the task. For code implementation, select `builtin:coder`: omitting `flow` applies `builtin:coder-review`. Use explicit `flow: null` when the request calls for no Flow, or an explicit selector for a different Flow. Other Profiles receive no default Flow.
 
+Delegate outcomes, interfaces, validation expectations, and real stop conditions, leaving diagnosis and iteration within that scope to the Coder. Do not impose fixed build slots, diagnostic-attempt quotas, or permission waits without a user requirement, Host constraint, or observed resource pressure. Same-named files on separate branches are not exclusive resources; protect actual shared Workdir write scopes, databases, ports, and deliverable prerequisites instead. A normal partial report is progress, not a request to reauthorize unchanged scope.
+
 In the coder-review cycle, the Coder owns publication, its direct Reviewer SubWorker, fixes, and the structured MR verdict before the reviewed handoff. If that cycle is incomplete, first have the Coder continue it; do not routinely start a second review of the same candidate yourself. Additional independent review remains appropriate when needed. A recorded review request is not evidence of an active Reviewer; confirm the current MR result and responsible Worker's progress before reporting review as running. You own candidate selection, combined validation, and integration.
 
 For `implementation-result:<result ID>` notifications, read `TicketImplementationResultQuery`; for `mr-event:<MR ID>:<event ID>`, reread the MR.
