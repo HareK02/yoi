@@ -1624,6 +1624,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
+name = "feature-permissions"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml",
+ "ts-rs",
+]
+
+[[package]]
 name = "feature-storage"
 version = "0.1.0"
 dependencies = [
@@ -4752,6 +4764,7 @@ name = "server-api"
 version = "0.1.0"
 dependencies = [
  "api-macros",
+ "feature-permissions",
  "memory",
  "merge-request",
  "plugin-plan",
@@ -4797,6 +4810,7 @@ dependencies = [
  "agen",
  "async-trait",
  "base64 0.22.1",
+ "error-contract",
  "filetime",
  "fs4",
  "futures",
@@ -7301,6 +7315,8 @@ dependencies = [
  "client",
  "config-source",
  "dotenv",
+ "error-contract",
+ "feature-permissions",
  "flow",
  "fs-operation",
  "fs4",
@@ -7357,6 +7373,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "decodal",
+ "error-contract",
  "flow",
  "fs4",
  "futures",

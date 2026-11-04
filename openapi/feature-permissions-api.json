@@ -1,0 +1,653 @@
+{
+  "components": {
+    "schemas": {
+      "Diagnostic": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/DiagnosticSeverity"
+          }
+        },
+        "required": [
+          "code",
+          "severity",
+          "message"
+        ],
+        "type": "object"
+      },
+      "DiagnosticSeverity": {
+        "enum": [
+          "info",
+          "warning",
+          "error"
+        ],
+        "type": "string"
+      },
+      "NamespaceCatalog": {
+        "additionalProperties": false,
+        "properties": {
+          "declaration": {
+            "$ref": "#/components/schemas/NamespaceDeclaration"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "feature": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "feature",
+          "enabled",
+          "declaration"
+        ],
+        "type": "object"
+      },
+      "NamespaceDeclaration": {
+        "additionalProperties": false,
+        "description": "This input deliberately has no owner field. The Host supplies the registered\nidentity/namespace handle independently of guest-controlled declaration data.",
+        "properties": {
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/PermissionDefinition"
+            },
+            "type": "array"
+          },
+          "sets": {
+            "items": {
+              "$ref": "#/components/schemas/SetContribution"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "permissions",
+          "sets"
+        ],
+        "type": "object"
+      },
+      "NamespacePermissions": {
+        "additionalProperties": false,
+        "properties": {
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "keys"
+        ],
+        "type": "object"
+      },
+      "OriginStep": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "set",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "feature",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "key",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PermissionAssignment": {
+        "additionalProperties": false,
+        "description": "`None` at the consuming policy boundary means unset. An empty assignment is\nexplicit deny-all; this crate never chooses or reinstates a default.",
+        "properties": {
+          "exclusions": {
+            "items": {
+              "$ref": "#/components/schemas/PermissionReference"
+            },
+            "type": "array"
+          },
+          "grants": {
+            "items": {
+              "$ref": "#/components/schemas/PermissionReference"
+            },
+            "type": "array"
+          },
+          "revoked": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "grants",
+          "exclusions",
+          "revoked"
+        ],
+        "type": "object"
+      },
+      "PermissionCatalog": {
+        "additionalProperties": false,
+        "properties": {
+          "namespaces": {
+            "items": {
+              "$ref": "#/components/schemas/NamespaceCatalog"
+            },
+            "type": "array"
+          },
+          "workspace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace",
+          "namespaces"
+        ],
+        "type": "object"
+      },
+      "PermissionDefinition": {
+        "additionalProperties": false,
+        "properties": {
+          "children": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "description",
+          "children"
+        ],
+        "type": "object"
+      },
+      "PermissionDiagnostic": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unset",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "revoked",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unknown_set",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unknown_namespace",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unknown_key",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "disabled_feature",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "excluded",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PermissionReference": {
+        "description": "The discriminant, not an identifier's spelling, selects a reference kind.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "set",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "namespace",
+                "type": "string"
+              },
+              "value": {
+                "$ref": "#/components/schemas/NamespacePermissions"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PermissionResolution": {
+        "additionalProperties": false,
+        "description": "A management projection, not an executable credential. Only the Host's opaque\nresolution can be queried through a namespace handle.",
+        "properties": {
+          "allowed": {
+            "additionalProperties": {
+              "items": {
+                "items": {
+                  "$ref": "#/components/schemas/OriginStep"
+                },
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "type": "object"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/PermissionDiagnostic"
+            },
+            "type": "array"
+          },
+          "workspace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace",
+          "allowed",
+          "diagnostics"
+        ],
+        "type": "object"
+      },
+      "RepositoryApiError": {
+        "additionalProperties": false,
+        "description": "Error body shared by the existing repository routes and their generated adapters.",
+        "properties": {
+          "diagnostics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
+          "error": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error",
+          "message"
+        ],
+        "type": "object"
+      },
+      "SetContribution": {
+        "additionalProperties": false,
+        "properties": {
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/PermissionReference"
+            },
+            "type": "array"
+          },
+          "set": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "set",
+          "children"
+        ],
+        "type": "object"
+      },
+      "ValidatePermissionsRequest": {
+        "additionalProperties": false,
+        "description": "The management boundary uses exactly the same assignment as text/storage.\nWorkspace comes from authenticated routing, not a repeated permission field.",
+        "properties": {
+          "assignment": {
+            "$ref": "#/components/schemas/PermissionAssignment"
+          }
+        },
+        "required": [
+          "assignment"
+        ],
+        "type": "object"
+      },
+      "string": {
+        "type": "string"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "scheme": "bearer",
+        "type": "http"
+      },
+      "browserSession": {
+        "in": "cookie",
+        "name": "yoi_workspace_session",
+        "type": "apiKey"
+      }
+    }
+  },
+  "info": {
+    "title": "Feature permission declaration contract",
+    "version": "0.1.0",
+    "x-yoi-source-digest": "sha256:3c85df5880ec5b52d693ba559f02534609f0667d7f95841f6eb58a36823824cb"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/w/{workspace_id}/permission-catalog": {
+      "get": {
+        "operationId": "permission_catalog",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionCatalog"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/permissions/validate": {
+      "post": {
+        "operationId": "validate_permissions",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ValidatePermissionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionResolution"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    }
+  }
+}

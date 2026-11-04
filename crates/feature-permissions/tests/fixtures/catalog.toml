@@ -1,0 +1,35 @@
+workspace = "workspace-a"
+
+[[namespaces]]
+namespace = "ticket"
+feature = "builtin:ticket"
+enabled = true
+
+[[namespaces.declaration.permissions]]
+key = "ticket.hoge"
+description = "Root operation with explicit children"
+children = ["ticket.hoge.fuga"]
+
+[[namespaces.declaration.permissions]]
+key = "ticket.hoge.fuga"
+description = "Intermediate operation with an explicit child"
+children = ["ticket.hoge.fuga.finish"]
+
+[[namespaces.declaration.permissions]]
+key = "ticket.hoge.fuga.finish"
+description = "Leaf operation"
+children = []
+
+[[namespaces.declaration.permissions]]
+key = "ticket.hoge.unlinked"
+description = "Same prefix without an inclusion edge"
+children = []
+
+[[namespaces.declaration.sets]]
+set = "ticket"
+
+[[namespaces.declaration.sets.children]]
+kind = "namespace"
+[namespaces.declaration.sets.children.value]
+namespace = "ticket"
+keys = ["ticket.hoge"]
