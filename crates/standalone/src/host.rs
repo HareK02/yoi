@@ -495,7 +495,7 @@ impl StandaloneHost {
         if let Some(connection) = &subject {
             connection.host.recover_jobs();
         }
-        let reserved_result_jobs = jobs.reserved_result_job_ids();
+        let reserved_result_jobs = jobs.reserved_result_attempts();
         let result_jobs = jobs.clone();
         let result_recovery = tokio::spawn(async move {
             result_jobs
@@ -615,7 +615,7 @@ impl StandaloneHost {
     }
 
     pub async fn shutdown(mut self) -> Result<(), StandaloneShutdownError> {
-        self.stop_result_recovery().await;
+        let recovery_result = self.stop_result_recovery().await;
         let jobs_result = self.jobs.shutdown().await;
         let command = protocol::WorkerCommandEnvelope::new(u64::MAX);
         let _ = self.handle.send(Method::Shutdown { command }).await;
@@ -627,7 +627,7 @@ impl StandaloneHost {
             self.retain_lease();
             return Err(error);
         }
-        if jobs_result.is_err() {
+        if jobs_result.is_err() || recovery_result.is_err() {
             self.retain_lease();
             return Err(StandaloneShutdownError::JobCleanup);
         }
@@ -665,14 +665,15 @@ impl StandaloneHost {
         Ok(())
     }
 
-    async fn stop_result_recovery(&mut self) {
+    async fn stop_result_recovery(&mut self) -> Result<(), crate::jobs::JobServiceError> {
         self.jobs.close();
         if let Some(task) = self.result_recovery.take() {
-            // This joins only the dispatcher. Every admitted Worker/Host effect
-            // remains owned by jobs.shutdown; cancelling a waiter proves no cleanup.
-            task.abort();
-            let _ = task.await;
+            // Close wakes capacity/storage waiters. Join the dispatcher and retain
+            // its error; only jobs.shutdown can confirm admitted execution cleanup.
+            task.await
+                .map_err(|error| crate::jobs::JobServiceError::Cleanup(error.to_string()))??;
         }
+        Ok(())
     }
 
     fn retain_lease(&mut self) {

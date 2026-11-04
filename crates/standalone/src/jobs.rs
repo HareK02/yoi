@@ -14,6 +14,7 @@
 //! Timeout/shutdown fences unaccepted attempts before cancellation. Only owned runner shutdown
 //! plus joined/revoked Host callbacks discharge execution reservations. Clones cannot reopen
 //! the store after service closure or carry authority over to another Host.
+mod recovery;
 #[cfg(test)]
 mod tests;
 use std::collections::HashMap;
@@ -128,6 +129,10 @@ pub struct StandaloneJobs {
     domain: Arc<Mutex<Option<Arc<dyn JobDomainProvider>>>>,
     model_client: Arc<Mutex<Option<Box<dyn LlmClient>>>>,
     storage_recovered: Arc<Notify>,
+    capacity_changed: Arc<Notify>,
+    // Exact restore admissions and typed causes remain Host-owned, even if a
+    // dispatcher fails. These are identities, never copies of immutable bodies.
+    result_recovery: Arc<Mutex<HashMap<String, Arc<Mutex<Option<JobServiceError>>>>>>,
 }
 
 impl StandaloneJobs {
@@ -171,6 +176,8 @@ impl StandaloneJobs {
             domain: Arc::default(),
             model_client: Arc::default(),
             storage_recovered: Arc::default(),
+            capacity_changed: Arc::default(),
+            result_recovery: Arc::default(),
         })
     }
 
@@ -199,7 +206,9 @@ impl StandaloneJobs {
         Ok(jobs)
     }
 
-    pub(crate) fn reserved_result_job_ids(&self) -> Result<Vec<String>, JobServiceError> {
+    pub(crate) fn reserved_result_attempts(
+        &self,
+    ) -> Result<Vec<(String, String)>, JobServiceError> {
         // Retain IDs, not a second queue of immutable bodies outside the owned
         // execution barrier while awaiting an earlier Job's cleanup.
         Ok(self
@@ -210,21 +219,8 @@ impl StandaloneJobs {
                     && !saved.version_stopped
                     && saved.attempt.state == JobAttemptState::Reserved
             })
-            .map(|saved| saved.request.job_id)
+            .map(|saved| (saved.request.job_id, saved.attempt.attempt_id))
             .collect())
-    }
-
-    /// The restore caller captures IDs before returning the Host to clients, then
-    /// runs this once after binding adapters. Granted Jobs keep domain recovery.
-    pub(crate) async fn resume_reserved_result_jobs(
-        &self,
-        ids: Vec<String>,
-    ) -> Result<(), JobServiceError> {
-        for id in ids {
-            self.start(&id).await?;
-            self.wait(&id).await?;
-        }
-        Ok(())
     }
 
     /// Storage exhaustion is owned by the same execution Task, not a new pending
@@ -481,7 +477,7 @@ impl StandaloneJobs {
     }
 
     pub async fn start(&self, job_id: &str) -> Result<(), JobServiceError> {
-        self.start_with_optional_model_client(job_id, None).await
+        self.start_with_optional_model_client(job_id, None)
     }
 
     /// Injectable model transport for embedders and scripted execution tests.
@@ -496,10 +492,9 @@ impl StandaloneJobs {
         C: LlmClient + 'static,
     {
         self.start_with_optional_model_client(job_id, Some(Box::new(client)))
-            .await
     }
 
-    async fn start_with_optional_model_client(
+    fn start_with_optional_model_client(
         &self,
         job_id: &str,
         client: Option<Box<dyn LlmClient>>,
@@ -639,6 +634,7 @@ impl StandaloneJobs {
         let recovery_issue = Arc::new(Mutex::new(None));
         let task_issue = recovery_issue.clone();
         let storage_recovered = self.storage_recovered.clone();
+        let capacity_changed = self.capacity_changed.clone();
         let task = tokio::spawn(async move {
             let (sender_tx, mut sender_rx) = tokio::sync::oneshot::channel();
             let run = prepared.run_owned(attempt_id.clone(), sink, move |sender| {
@@ -715,6 +711,9 @@ impl StandaloneJobs {
             complete_tx.send_replace(Some(
                 outcome.as_ref().map(|_| ()).map_err(ToString::to_string),
             ));
+            // A wake is only an observation: recovery joins the successful task
+            // return before rechecking capacity. An error does not free its slot.
+            capacity_changed.notify_waiters();
             outcome
         });
         executions.jobs.insert(
@@ -770,6 +769,7 @@ impl StandaloneJobs {
                 .is_some_and(|run| run.attempt_id == attempt)
             {
                 executions.jobs.remove(job_id);
+                self.capacity_changed.notify_waiters();
             }
         }
         self.get(job_id)
@@ -778,6 +778,7 @@ impl StandaloneJobs {
     pub(crate) fn close(&self) {
         let mut executions = self.executions.lock().expect("Job executions poisoned");
         executions.closed = true;
+        self.capacity_changed.notify_waiters();
         for execution in executions.jobs.values() {
             execution.cancel.send_replace(true);
         }

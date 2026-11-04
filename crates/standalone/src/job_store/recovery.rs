@@ -3,6 +3,55 @@ use super::*;
 pub(super) const UPDATE_INTERRUPTION: &str = "バージョン更新による実行打切り";
 
 impl JobStore {
+    pub(crate) fn probe_reserved_result_write(
+        &mut self,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<(), JobStoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let saved = require_snapshot(&tx, job_id)?;
+        check_attempt(&saved, attempt_id)?;
+        if saved.version_stopped || saved.domain_grant.is_some() {
+            return Err(JobStoreError::AttemptMismatch);
+        }
+        // A write probe, not an execution completion or resource release receipt.
+        tx.execute(
+            "UPDATE job_attempts SET failure=failure WHERE job_id=?1 AND attempt_id=?2",
+            params![job_id, attempt_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn fail_reserved_result(
+        &mut self,
+        job_id: &str,
+        attempt_id: &str,
+        cause: &str,
+    ) -> Result<(), JobStoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let saved = require_snapshot(&tx, job_id)?;
+        check_attempt(&saved, attempt_id)?;
+        if saved.version_stopped
+            || saved.domain_grant.is_some()
+            || saved.state != JobState::Pending
+            || saved.attempt.state != JobAttemptState::Reserved
+        {
+            return Err(JobStoreError::AttemptMismatch);
+        }
+        tx.execute(
+            "INSERT INTO job_start_rejections(job_id,attempt_id,owner_id) VALUES(?1,?2,?3)",
+            params![job_id, attempt_id, self.owner_id],
+        )?;
+        set_terminal(&tx, &saved, JobAttemptState::Failed, Some(cause))?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The Host supplies the identity from its revalidated exclusive Worker lease.
     /// This binds admission, results and restart reconciliation to the same owner,
     /// rather than a fresh connection UUID that could impersonate a restart.
@@ -156,8 +205,14 @@ pub(super) fn initialize(conn: &mut Connection) -> Result<(), JobStoreError> {
                 }
                 migrate(&tx)?;
             }
+            6 => {}
             SCHEMA_VERSION => {}
             other => return Err(JobStoreError::UnsupportedSchema(other)),
+        }
+        if version <= 6 {
+            // Additive admission evidence only. Do not rerun the v6 cutover or
+            // reinterpret preexisting Failed rows as rejected-before-dispatch.
+            tx.execute_batch(START_REJECTION_SCHEMA)?;
         }
         if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
             return Err(JobStoreError::Corrupt(
@@ -241,6 +296,27 @@ fn migrate(conn: &Connection) -> Result<(), JobStoreError> {
     }
     Ok(())
 }
+
+// The insertion guard binds the rejection to the still-Reserved exact attempt.
+// Neither an absent execution row nor a Failed state can create this evidence.
+const START_REJECTION_SCHEMA: &str = "
+CREATE TABLE job_start_rejections (
+    job_id TEXT NOT NULL REFERENCES job_intents(job_id),
+    attempt_id TEXT NOT NULL PRIMARY KEY REFERENCES job_attempts(attempt_id),
+    owner_id TEXT NOT NULL
+);
+CREATE TRIGGER job_start_rejection_guard BEFORE INSERT ON job_start_rejections
+WHEN NOT EXISTS(SELECT 1 FROM job_intents i JOIN job_attempts a ON a.job_id=i.job_id AND a.number=i.current_attempt
+    WHERE i.job_id=NEW.job_id AND a.attempt_id=NEW.attempt_id AND i.state='pending' AND a.state='reserved')
+ OR EXISTS(SELECT 1 FROM job_execution_ownership WHERE attempt_id=NEW.attempt_id)
+ OR EXISTS(SELECT 1 FROM job_domain_grants WHERE job_id=NEW.job_id)
+ OR EXISTS(SELECT 1 FROM job_version_stops WHERE job_id=NEW.job_id)
+BEGIN SELECT RAISE(ABORT,'start rejection requires unstarted result-only reservation'); END;
+CREATE TRIGGER job_start_rejection_immutable BEFORE UPDATE ON job_start_rejections
+BEGIN SELECT RAISE(ABORT,'immutable Job start rejection'); END;
+CREATE TRIGGER job_start_rejection_retained BEFORE DELETE ON job_start_rejections
+BEGIN SELECT RAISE(ABORT,'retained Job start rejection'); END;
+";
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE job_version_history (

@@ -1,3 +1,6 @@
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
+
 use super::*;
 use agen::llm_client::{ClientError, Request, event::Event};
 use async_trait::async_trait;
@@ -731,7 +734,7 @@ async fn host_restart_rejects_live_lease_then_fails_only_unconfirmed_dispatch_wi
     reopened.bind_model_client(Box::new(DomainTestClient::success()));
     tokio::time::timeout(
         Duration::from_secs(5),
-        reopened.resume_reserved_result_jobs(reopened.reserved_result_job_ids().unwrap()),
+        reopened.resume_reserved_result_jobs(reopened.reserved_result_attempts().unwrap()),
     )
     .await
     .unwrap()

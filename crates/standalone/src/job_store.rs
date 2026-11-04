@@ -29,7 +29,11 @@ mod legacy_migrations;
 #[path = "job_store/recovery.rs"]
 mod recovery;
 
-const SCHEMA_VERSION: i64 = 6;
+#[cfg(test)]
+#[path = "job_store/start_rejection_tests.rs"]
+mod start_rejection_tests;
+
+const SCHEMA_VERSION: i64 = 7;
 
 /// Availability of the immutable input body, independent of execution outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +124,9 @@ pub struct JobSnapshot {
     pub acknowledged: bool,
     /// A version cutover is final even when input/checkpoint remains incomplete.
     pub version_stopped: bool,
+    /// The exact current reservation was rejected before dispatch, by this Host.
+    /// This is not a runner shutdown or cleanup receipt.
+    pub start_rejected_by: Option<String>,
     /// All historical execution owners, independent of Job outcome/checkpoint.
     pub executions: Vec<JobExecutionOwnership>,
 }
@@ -135,14 +142,16 @@ pub struct JobExecutionOwnership {
 
 impl JobSnapshot {
     /// Terminal failure/completion without the attempt's admission binding is not
-    /// an empty set of successfully joined executions. Keep that missing evidence
-    /// distinct from an unstarted reservation and from checkpoint coverage.
+    /// an empty set of successfully joined executions. Only an explicit rejection
+    /// saved while Reserved can preclude that binding; it proves no runner cleanup.
+    /// All historical admitted executions still require their own cleanup proof.
     pub fn executions_released(&self) -> bool {
         let needs_binding = matches!(
             self.attempt.state,
             JobAttemptState::Dispatched | JobAttemptState::Completed | JobAttemptState::Failed
         );
         (!needs_binding
+            || (self.attempt.state == JobAttemptState::Failed && self.start_rejected_by.is_some())
             || self
                 .executions
                 .iter()
@@ -559,6 +568,7 @@ impl JobStore {
              WHERE a.state IN ('dispatched','failed','completed')
                AND NOT EXISTS(SELECT 1 FROM job_execution_ownership e WHERE e.attempt_id=a.attempt_id)
                AND NOT EXISTS(SELECT 1 FROM job_version_stops s WHERE s.job_id=i.job_id)
+               AND NOT (a.state='failed' AND EXISTS(SELECT 1 FROM job_start_rejections r WHERE r.job_id=i.job_id AND r.attempt_id=a.attempt_id))
              LIMIT 1", [], |row|row.get(0)).optional()?;
         if let Some(attempt) = missing {
             return Err(JobStoreError::Corrupt(format!(
@@ -1040,6 +1050,7 @@ fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>,
                 state,
                 acknowledged,
                 version_stopped: conn.query_row("SELECT EXISTS(SELECT 1 FROM job_version_stops WHERE job_id=?1)", [job_id], |r|r.get(0))?,
+                start_rejected_by: conn.query_row("SELECT owner_id FROM job_start_rejections WHERE job_id=?1 AND attempt_id=?2", params![job_id,attempt_id], |r|r.get(0)).optional()?,
                 executions: {
                     let mut stmt = conn.prepare("SELECT attempt_id,owner_id,run_id,writes_revoked,cleanup_receipt FROM job_execution_ownership WHERE job_id=?1 ORDER BY rowid")?;
                     stmt.query_map([job_id], |r| Ok(JobExecutionOwnership { attempt_id:r.get(0)?,owner_id:r.get(1)?,run_id:r.get(2)?,writes_revoked:r.get(3)?,cleanup_receipt:r.get(4)? }))?.collect::<Result<Vec<_>,_>>()?
