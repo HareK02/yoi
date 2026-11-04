@@ -291,7 +291,14 @@ impl Object {
 /// Decoding is intentionally first, so unsupported formats remain diagnosable.
 pub fn verify(id: ObjectId, bytes: &[u8]) -> Result<Object, Error> {
     let object = Object::decode(bytes)?;
-    if object.id() != id {
+    // Hash the stored preimage, not a reserialization under the current writer's format.
+    let hash: [u8; 32] = Sha256::digest(bytes).into();
+    let actual = match &object {
+        Object::Blob(_) => ObjectId::Blob(BlobId(hash)),
+        Object::Tree(_) => ObjectId::Tree(TreeId(hash)),
+        Object::History(_) => ObjectId::History(HistoryId(hash)),
+    };
+    if actual != id {
         return Err(Error::HashMismatch);
     }
     Ok(object)

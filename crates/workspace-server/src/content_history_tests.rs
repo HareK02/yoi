@@ -42,7 +42,7 @@ fn sources(value: &str) -> ConfigTreeSnapshot {
         ConfigEntry::new(
             VirtualPath::parse("parts/value.dcdl").unwrap(),
             ConfigContentType::Decodal,
-            format!("// exact comment\r\n{{ title = \"{value}\"; }}\r\n"),
+            format!("# exact comment\r\n{{ title = \"{value}\"; }}\r\n"),
         )
         .unwrap(),
     ])

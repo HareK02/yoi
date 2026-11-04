@@ -364,3 +364,104 @@ fn tampered_bytes_or_unsupported_format_fail_read_and_immutable_save() {
     .unwrap();
     assert!(matches!(s.snapshot(head), Err(Error::Model(_))));
 }
+
+#[test]
+fn independent_connections_reject_stale_observer_without_replacing_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("concurrent.sqlite");
+    let mut first = Connection::open(&path).unwrap();
+    setup(&mut first);
+    let mut second = Connection::open(&path).unwrap();
+    let h = host("config");
+    let initial = {
+        let tx = first.transaction().unwrap();
+        let s = store(&tx, &h);
+        let (root, _) = candidate(&s, b"initial");
+        let head = adopt(&s, root, None, 1);
+        tx.commit().unwrap();
+        head
+    };
+    // Both clients observe the same head before either submits its edit.
+    for conn in [&mut first, &mut second] {
+        let tx = conn.transaction().unwrap();
+        assert_eq!(store(&tx, &h).head().unwrap(), Some(initial));
+        tx.commit().unwrap();
+    }
+    let winner = {
+        let tx = first.transaction().unwrap();
+        let s = store(&tx, &h);
+        let (root, _) = candidate(&s, b"winner");
+        let winner = adopt(&s, root, Some(initial), 2);
+        tx.commit().unwrap();
+        winner
+    };
+    let tx = second.transaction().unwrap();
+    let s = store(&tx, &h);
+    let (root, _) = candidate(&s, b"loser");
+    assert!(matches!(
+        s.adopt(root, Some(initial), "loser".into(), 3),
+        Err(Error::Conflict)
+    ));
+    assert_eq!(s.head().unwrap(), Some(winner));
+    tx.commit().unwrap();
+}
+
+#[test]
+fn deduplication_and_collection_preserve_other_preparations_and_all_adopted_ancestors() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    setup(&mut conn);
+    let a = host("a");
+    let b = host("b");
+    let tx = conn.transaction().unwrap();
+    let sa = store(&tx, &a);
+    let sb = store(&tx, &b);
+    let (root, blob) = candidate(&sa, b"shared");
+    let first = adopt(&sa, root, None, 1);
+    let count = || {
+        tx.query_row("SELECT count(*) FROM content_objects", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(count(), 3);
+    candidate(&sa, b"shared");
+    candidate(&sb, b"shared");
+    assert_eq!(count(), 3);
+    let (new, _) = candidate(&sa, b"new");
+    adopt(&sa, new, Some(first), 2);
+    candidate(&sa, b"unadopted");
+    let before = count();
+    sa.collect_unadopted().unwrap();
+    assert_eq!(count(), before - 2);
+    assert!(sa.snapshot(first).unwrap().contains_key(&blob));
+    sa.erase().unwrap();
+    assert_eq!(count(), 2); // B's preparation survives A's erasure.
+    let b_head = adopt(&sb, root, None, 3);
+    assert!(sb.snapshot(b_head).unwrap().contains_key(&blob));
+}
+
+#[test]
+fn revoked_authority_is_checked_again_on_existing_scoped_handle() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Revocable(AtomicBool);
+    impl Authority for Revocable {
+        fn allows(&self, _: &ScopeKey, _: Access) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let mut conn = Connection::open_in_memory().unwrap();
+    setup(&mut conn);
+    let authority = Revocable(AtomicBool::new(true));
+    let tx = conn.transaction().unwrap();
+    let s = ScopedStore::new(&tx, key("ws", "a"), &authority);
+    let (root, blob) = candidate(&s, b"protected");
+    let head = adopt(&s, root, None, 1);
+    authority.0.store(false, Ordering::SeqCst);
+    assert!(matches!(s.read(blob), Err(Error::Denied)));
+    assert!(matches!(s.snapshot(head), Err(Error::Denied)));
+    assert!(matches!(
+        s.adopt(root, Some(head), "e".into(), 2),
+        Err(Error::Denied)
+    ));
+    assert!(matches!(s.erase(), Err(Error::Denied)));
+}
