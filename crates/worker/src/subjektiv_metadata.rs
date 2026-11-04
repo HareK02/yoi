@@ -3,8 +3,7 @@
 
 use crate::metadata_lifecycle::SessionMetadataLifecycle;
 use session_store::{
-    SessionId, SubjektivSessionAttributionState, WorkerActiveSegmentRef, WorkerMetadata,
-    WorkerMetadataStore,
+    SubjektivSessionAttributionState, WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore,
 };
 
 pub(crate) struct SessionAttributionMetadata;
@@ -25,18 +24,13 @@ impl SessionMetadataLifecycle for SessionAttributionMetadata {
 
 pub(crate) fn compare_and_swap_attribution<St: WorkerMetadataStore>(
     store: &St,
-    worker_name: &str,
-    session_id: SessionId,
-    expected: Option<&SubjektivSessionAttributionState>,
+    expected: &mut session_store::worker_metadata::StartupFailureExpectation,
     replacement: SubjektivSessionAttributionState,
 ) -> Result<(), crate::WorkerError> {
     let mut matched = false;
-    store.update_by_name(worker_name, |metadata| {
-        if metadata.active.as_ref().map(|active| active.session_id) == Some(session_id)
-            && metadata.subjektiv_session_attribution.as_ref() == expected
-            && replacement.session_id() == session_id
-        {
-            metadata.subjektiv_session_attribution = Some(replacement);
+    store.update_by_name(&expected.worker_name, |metadata| {
+        if expected.matches(metadata) && replacement.session_id() == expected.session_id {
+            metadata.subjektiv_session_attribution = Some(replacement.clone());
             matched = true;
         }
     })?;
@@ -47,6 +41,8 @@ pub(crate) fn compare_and_swap_attribution<St: WorkerMetadataStore>(
                 .into(),
         });
     }
+    // Advance only after the exact owner/Session CAS returned confirmed success.
+    expected.attribution = Some(replacement);
     Ok(())
 }
 

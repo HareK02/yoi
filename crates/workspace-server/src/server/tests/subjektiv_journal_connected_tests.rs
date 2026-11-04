@@ -1002,7 +1002,10 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for RestoreAuthFactory
     async fn spawn_controller(
         &self,
         mut request: worker_runtime::execution::WorkerExecutionSpawnRequest,
-    ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
+    ) -> std::result::Result<
+        worker_runtime::worker_backend::RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
         if request.request.backend_job.is_some() {
             return self.inner.spawn_controller(request).await;
         }
@@ -1040,7 +1043,7 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for RestoreAuthFactory
     async fn preflight_restore(
         &self,
         request: &worker_runtime::execution::WorkerExecutionRestoreRequest,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), worker_runtime::worker_backend::RuntimeRestoreFailure> {
         self.inner.preflight_restore(request).await
     }
 

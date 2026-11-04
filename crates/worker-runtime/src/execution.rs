@@ -94,6 +94,17 @@ pub struct WorkerExecutionResult {
     pub submission: Option<WorkerSubmissionAck>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification: Option<WorkerNotificationAck>,
+    /// Projected primary facts. Never stop, cleanup, or retry evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_failure: Option<protocol::startup_failure::StartupFailureAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secondary_failures: Vec<protocol::startup_failure::StartupSecondaryFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_resources: Option<protocol::startup_failure::StartupResourceFacts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_failure_persistence: Option<protocol::startup_failure::StartupPersistenceOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_io_kind: Option<protocol::startup_failure::StartupIoKind>,
 }
 
 /// Backend result class for a Worker execution operation.
@@ -116,6 +127,11 @@ impl WorkerExecutionResult {
             message: None,
             submission: None,
             notification: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -141,6 +157,11 @@ impl WorkerExecutionResult {
                 disposition,
             }),
             notification: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -157,6 +178,11 @@ impl WorkerExecutionResult {
             notification: Some(WorkerNotificationAck {
                 notification_request_id: notification_request_id.into(),
             }),
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -168,6 +194,11 @@ impl WorkerExecutionResult {
             message: Some(message.into()),
             submission: None,
             notification: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -179,6 +210,11 @@ impl WorkerExecutionResult {
             message: Some(message.into()),
             submission: None,
             notification: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -190,6 +226,11 @@ impl WorkerExecutionResult {
             message: Some(message.into()),
             submission: None,
             notification: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -201,7 +242,35 @@ impl WorkerExecutionResult {
             message: Some(message.into()),
             submission: None,
             notification: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
+    }
+
+    pub fn with_startup_failure(
+        mut self,
+        failure: protocol::startup_failure::StartupFailureAttachment,
+    ) -> Self {
+        self.startup_failure = Some(failure);
+        self
+    }
+
+    pub fn startup_failure<D: error_contract::WireDetails>(
+        &self,
+    ) -> Option<error_contract::DecodeFailure<D>> {
+        self.startup_failure
+            .as_ref()
+            .map(|failure| failure.decode())
+    }
+
+    pub fn push_secondary_failure(
+        &mut self,
+        failure: protocol::startup_failure::StartupSecondaryFailure,
+    ) {
+        self.secondary_failures.push(failure);
     }
 
     pub fn is_accepted(&self) -> bool {

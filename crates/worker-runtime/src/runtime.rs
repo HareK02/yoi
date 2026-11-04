@@ -47,6 +47,9 @@ use crate::retention::{
     FsWorkerRetentionProvider, WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult,
     WorkerRetentionInventory, WorkerRetentionInventorySnapshot, WorkerRetentionProvider,
 };
+use protocol::startup_failure::{
+    StartupFailurePhase, StartupPersistenceOutcome, StartupSecondaryFailure,
+};
 use protocol::subscription::{
     EventSubscriptionSelector, SubscriptionEventPayload, SubscriptionSnapshot,
     SubscriptionValidationError, SubscriptionWorkdirId, SubscriptionWorker, SubscriptionWorkerId,
@@ -1522,10 +1525,41 @@ impl Runtime {
                 worker_state,
                 workdir_attachments,
             } => (worker_state, workdir_attachments),
-            WorkerExecutionSpawnResult::Rejected(result)
-            | WorkerExecutionSpawnResult::RolledBack(result)
-            | WorkerExecutionSpawnResult::Errored(result) => {
-                self.rollback_failed_create(&worker_ref)?;
+            WorkerExecutionSpawnResult::Rejected(mut result)
+            | WorkerExecutionSpawnResult::RolledBack(mut result)
+            | WorkerExecutionSpawnResult::Errored(mut result) => {
+                if let Err((error, phase, outcome)) =
+                    self.rollback_failed_create_with_phase(&worker_ref)
+                {
+                    tracing::error!(
+                        worker_id = %worker_ref.worker_id,
+                        ?phase,
+                        %error,
+                        "failed to roll back Worker creation"
+                    );
+                    // A later failure must not make a confirmed record deletion
+                    // indistinguishable from a failed deletion with unknown effects.
+                    if matches!(
+                        phase,
+                        StartupFailurePhase::RuntimeSnapshotSave
+                            | StartupFailurePhase::RuntimeRemovalPublish
+                    ) {
+                        result.push_secondary_failure(StartupSecondaryFailure::Persistence {
+                            phase: StartupFailurePhase::RuntimeRecordDelete,
+                            outcome: StartupPersistenceOutcome::Persisted,
+                        });
+                    }
+                    if phase == StartupFailurePhase::RuntimeRemovalPublish {
+                        result.push_secondary_failure(StartupSecondaryFailure::Persistence {
+                            phase: StartupFailurePhase::RuntimeSnapshotSave,
+                            outcome: StartupPersistenceOutcome::Persisted,
+                        });
+                    }
+                    result.push_secondary_failure(StartupSecondaryFailure::Persistence {
+                        phase,
+                        outcome,
+                    });
+                }
                 return Err(RuntimeError::WorkerExecutionRejected {
                     worker_id: worker_ref.worker_id.clone(),
                     operation: result.operation,
@@ -1535,7 +1569,7 @@ impl Runtime {
                 });
             }
             WorkerExecutionSpawnResult::ReconciliationRequired {
-                result,
+                mut result,
                 worker_state,
                 workdir_attachments,
             } => {
@@ -1548,12 +1582,33 @@ impl Runtime {
                 } else {
                     self.retain_create_reconciliation_pending(&worker_ref, workdir_attachments)
                 };
-                if let Err(error) = retain_result {
+                if let Err((phase, error)) = retain_result {
+                    let outcome = if matches!(error, RuntimeError::StoreCommitOutcomeUnknown { .. })
+                    {
+                        StartupPersistenceOutcome::OutcomeUnknown
+                    } else {
+                        StartupPersistenceOutcome::NotSaved
+                    };
+                    if phase == StartupFailurePhase::RuntimeReconciliationPublish {
+                        result.push_secondary_failure(StartupSecondaryFailure::Persistence {
+                            phase: StartupFailurePhase::RuntimeReconciliationRecordSave,
+                            outcome: StartupPersistenceOutcome::Persisted,
+                        });
+                    }
+                    result.push_secondary_failure(StartupSecondaryFailure::Persistence {
+                        phase,
+                        outcome,
+                    });
                     tracing::error!(
                         worker_id = %worker_ref.worker_id,
                         %error,
                         "failed to persist Worker create reconciliation evidence"
                     );
+                } else {
+                    result.push_secondary_failure(StartupSecondaryFailure::Persistence {
+                        phase: StartupFailurePhase::RuntimeReconciliationRecordSave,
+                        outcome: StartupPersistenceOutcome::Persisted,
+                    });
                 }
                 return Err(RuntimeError::WorkerExecutionRejected {
                     worker_id: worker_ref.worker_id.clone(),
@@ -3811,9 +3866,33 @@ impl Runtime {
     }
 
     fn rollback_failed_create(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
-        let mut state = self.lock()?;
+        self.rollback_failed_create_with_phase(worker_ref)
+            .map_err(|(error, _, _)| error)
+    }
+
+    // The legacy caller still receives its RuntimeError. Spawn failures instead
+    // retain their primary result and attach the completed/uncertain rollback phases.
+    fn rollback_failed_create_with_phase(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<(), (RuntimeError, StartupFailurePhase, StartupPersistenceOutcome)> {
+        let mut state = self.lock().map_err(|error| {
+            (
+                error,
+                StartupFailurePhase::RuntimeRecordDelete,
+                StartupPersistenceOutcome::NotSaved,
+            )
+        })?;
         if state.workers.contains_key(&worker_ref.worker_id) {
-            state.delete_worker_record(&worker_ref.worker_id)?;
+            state
+                .delete_worker_record(&worker_ref.worker_id)
+                .map_err(|error| {
+                    (
+                        error,
+                        StartupFailurePhase::RuntimeRecordDelete,
+                        StartupPersistenceOutcome::OutcomeUnknown,
+                    )
+                })?;
             let record = state
                 .workers
                 .remove(&worker_ref.worker_id)
@@ -3826,8 +3905,22 @@ impl Runtime {
             state
                 .observation_events
                 .retain(|event| event.worker_ref != *worker_ref);
-            state.persist_runtime_snapshot()?;
-            state.publish_worker_removed(worker_ref.worker_id, workspace_id.as_deref())?;
+            state.persist_runtime_snapshot().map_err(|error| {
+                (
+                    error,
+                    StartupFailurePhase::RuntimeSnapshotSave,
+                    StartupPersistenceOutcome::OutcomeUnknown,
+                )
+            })?;
+            state
+                .publish_worker_removed(worker_ref.worker_id, workspace_id.as_deref())
+                .map_err(|error| {
+                    (
+                        error,
+                        StartupFailurePhase::RuntimeRemovalPublish,
+                        StartupPersistenceOutcome::OutcomeUnknown,
+                    )
+                })?;
         }
         Ok(())
     }
@@ -5121,9 +5214,10 @@ impl Runtime {
 
         worker_state: protocol::WorkerStateSnapshot,
         workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
-    ) -> Result<(), RuntimeError> {
-        let mut state = self.lock()?;
-        let mut candidate = state.worker(worker_ref)?.clone();
+    ) -> Result<(), (StartupFailurePhase, RuntimeError)> {
+        let record_error = |error| (StartupFailurePhase::RuntimeReconciliationRecordSave, error);
+        let mut state = self.lock().map_err(record_error)?;
+        let mut candidate = state.worker(worker_ref).map_err(record_error)?.clone();
 
         candidate.restore_guard.rotate();
         candidate.execution_metadata_available = true;
@@ -5132,9 +5226,13 @@ impl Runtime {
         candidate.apply_worker_state(&worker_state);
         candidate.restore_intent = WorkerRestoreIntent::Automatic;
         candidate.workdir_attachments = workdir_attachments;
-        state.persist_worker_record(&candidate)?;
+        state
+            .persist_worker_record(&candidate)
+            .map_err(record_error)?;
         state.workers.insert(worker_ref.worker_id, candidate);
-        state.publish_worker_upsert(worker_ref.worker_id)?;
+        state
+            .publish_worker_upsert(worker_ref.worker_id)
+            .map_err(|error| (StartupFailurePhase::RuntimeReconciliationPublish, error))?;
         Ok(())
     }
 
@@ -5156,9 +5254,10 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
         workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
-    ) -> Result<(), RuntimeError> {
-        let mut state = self.lock()?;
-        let mut candidate = state.worker(worker_ref)?.clone();
+    ) -> Result<(), (StartupFailurePhase, RuntimeError)> {
+        let record_error = |error| (StartupFailurePhase::RuntimeReconciliationRecordSave, error);
+        let mut state = self.lock().map_err(record_error)?;
+        let mut candidate = state.worker(worker_ref).map_err(record_error)?.clone();
 
         candidate.restore_guard.rotate();
         candidate.execution_metadata_available = false;
@@ -5174,8 +5273,12 @@ impl Runtime {
             logical_workdir_attachments_from_statuses(&workdir_attachments, claims);
         candidate.workdir_attachments = workdir_attachments;
         state.workers.insert(worker_ref.worker_id, candidate);
-        state.persist_worker(&worker_ref.worker_id)?;
-        state.publish_worker_upsert(worker_ref.worker_id)?;
+        state
+            .persist_worker(&worker_ref.worker_id)
+            .map_err(record_error)?;
+        state
+            .publish_worker_upsert(worker_ref.worker_id)
+            .map_err(|error| (StartupFailurePhase::RuntimeReconciliationPublish, error))?;
         Ok(())
     }
 
@@ -8257,6 +8360,225 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier, Condvar, Mutex};
 
+    #[cfg(feature = "fs-store")]
+    mod create_rollback_tests {
+        //! Connect the real create/rollback path to FsRuntimeStore and reopen its disk state.
+        //! Only execution startup is a fixture. Filesystem topology faults are injected after
+        //! the initial record is durable; existing write hooks cover Worker writes, not these
+        //! delete/snapshot boundaries. Run with the normal worker-runtime library tests.
+        use super::*;
+        use error_contract::{
+            DecodeFailure, FailureFacts, InternalTransfer, OperationContext, project_failure,
+        };
+        use protocol::startup_failure::{
+            RuntimeStartupCause, StartupCleanup, StartupCleanupFailure, StartupFailureAttachment,
+            StartupResourceFacts, StartupResources, StartupStage,
+        };
+
+        #[derive(Clone, Copy)]
+        enum Fault {
+            None,
+            RecordDelete,
+            SnapshotSave,
+        }
+
+        fn primary_failure() -> WorkerExecutionResult {
+            let mut facts = FailureFacts::new(RuntimeStartupCause {
+                reason: protocol::startup_failure::RuntimeStartupReason::StartupFailed,
+                stage: StartupStage::Controller,
+            })
+            .unwrap();
+            facts
+                .with_context(OperationContext::new("worker_startup", "runtime").unwrap())
+                .unwrap();
+            let projected = project_failure::<InternalTransfer, _>(&facts, &()).unwrap();
+            let attachment = StartupFailureAttachment::from_projected(&projected).unwrap();
+            let mut result = WorkerExecutionResult::errored(
+                WorkerExecutionOperation::Spawn,
+                "primary startup failure",
+            )
+            .with_startup_failure(attachment)
+            .with_worker_state(protocol::WorkerStatus::Stopped.into());
+            result.push_secondary_failure(StartupSecondaryFailure::Cleanup {
+                failure: StartupCleanupFailure::Workdir,
+            });
+            result.startup_resources = Some(StartupResourceFacts {
+                resources: StartupResources::Unproven,
+                cleanup: StartupCleanup::Failed(StartupCleanupFailure::Workdir),
+                durable_effects_possible: true,
+            });
+            result
+        }
+
+        include!("runtime/create_reconciliation_tests.rs");
+
+        fn check_rollback(fault: Fault) {
+            let primary = primary_failure();
+            for spawn_result in [
+                WorkerExecutionSpawnResult::Rejected(primary.clone()),
+                WorkerExecutionSpawnResult::RolledBack(primary.clone()),
+                WorkerExecutionSpawnResult::Errored(primary.clone()),
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let store_root = root.path().join("runtime");
+                let options =
+                    FsRuntimeStoreOptions::new(&store_root).with_runtime_id("create-rollback");
+                let backend = Arc::new(TestExecutionBackend::default());
+                let runtime =
+                    Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone())
+                        .unwrap();
+                runtime.store_config_bundle(test_bundle()).unwrap();
+                let request = task_request("failed create rollback");
+                let worker_ref = WorkerRef::new(request.worker_id);
+                let worker_dir = store_root
+                    .join("workers")
+                    .join(request.worker_id.to_string());
+                let runtime_path = store_root.join("runtime.json");
+                let saved_snapshot = root.path().join("saved-runtime.json");
+                let record_fault_path = worker_dir.join("metadata.json");
+                *backend.spawn_result.lock().unwrap() = Some(spawn_result);
+                *backend.before_spawn_result.lock().unwrap() = Some(Box::new({
+                    let worker_dir = worker_dir.clone();
+                    let runtime_path = runtime_path.clone();
+                    let saved_snapshot = saved_snapshot.clone();
+                    let record_fault_path = record_fault_path.clone();
+                    move || {
+                        assert!(worker_dir.join("worker.json").is_file());
+                        match fault {
+                            Fault::None => {}
+                            Fault::RecordDelete => {
+                                // Reading a directory as metadata fails before aggregate removal.
+                                std::fs::create_dir(record_fault_path).unwrap();
+                            }
+                            Fault::SnapshotSave => {
+                                std::fs::rename(&runtime_path, saved_snapshot).unwrap();
+                                std::fs::create_dir(runtime_path).unwrap();
+                            }
+                        }
+                    }
+                }));
+
+                let error = runtime.create_worker(request).unwrap_err();
+                let RuntimeError::WorkerExecutionRejected {
+                    worker_id,
+                    operation,
+                    outcome,
+                    message,
+                    result,
+                } = error
+                else {
+                    panic!("rollback must not replace the primary execution result: {error:?}");
+                };
+                assert_eq!(worker_id, worker_ref.worker_id);
+                assert_eq!(operation, primary.operation);
+                assert_eq!(outcome, primary.outcome);
+                assert_eq!(message, primary.message_or_default());
+                let mut expected = primary.clone();
+                match fault {
+                    Fault::None => {}
+                    Fault::RecordDelete => {
+                        expected.push_secondary_failure(StartupSecondaryFailure::Persistence {
+                            phase: StartupFailurePhase::RuntimeRecordDelete,
+                            outcome: StartupPersistenceOutcome::OutcomeUnknown,
+                        });
+                    }
+                    Fault::SnapshotSave => {
+                        expected.push_secondary_failure(StartupSecondaryFailure::Persistence {
+                            phase: StartupFailurePhase::RuntimeRecordDelete,
+                            outcome: StartupPersistenceOutcome::Persisted,
+                        });
+                        expected.push_secondary_failure(StartupSecondaryFailure::Persistence {
+                            phase: StartupFailurePhase::RuntimeSnapshotSave,
+                            outcome: StartupPersistenceOutcome::OutcomeUnknown,
+                        });
+                    }
+                }
+                assert_eq!(
+                    result, expected,
+                    "primary facts and existing cleanup must survive"
+                );
+                let Some(DecodeFailure::Known(decoded)) =
+                    result.startup_failure::<RuntimeStartupCause>()
+                else {
+                    panic!("primary typed cause must remain decodable");
+                };
+                assert_eq!(decoded.facts().cause().stage, StartupStage::Controller);
+                assert_eq!(
+                    decoded.facts().context().operations,
+                    vec![OperationContext::new("worker_startup", "runtime").unwrap()]
+                );
+
+                let record_retained = matches!(fault, Fault::RecordDelete);
+                assert_eq!(worker_dir.join("worker.json").is_file(), record_retained);
+                assert_eq!(runtime.worker_detail(&worker_ref).is_ok(), record_retained);
+                match fault {
+                    Fault::RecordDelete => {
+                        let persisted = runtime_store(&runtime)
+                            .read_worker_record(&worker_ref)
+                            .unwrap();
+                        assert_eq!(persisted.worker_ref, worker_ref);
+                        assert!(
+                            runtime_store(&runtime)
+                                .load_runtime_state()
+                                .unwrap()
+                                .workers
+                                .contains_key(&worker_ref.worker_id)
+                        );
+                        // Remove only the injected obstruction, never the retained record.
+                        std::fs::remove_dir(record_fault_path).unwrap();
+                    }
+                    Fault::SnapshotSave => {
+                        assert!(runtime_path.is_dir());
+                        assert!(runtime_store(&runtime).load_runtime_state().is_err());
+                    }
+                    Fault::None => {
+                        assert!(
+                            !runtime_store(&runtime)
+                                .load_runtime_state()
+                                .unwrap()
+                                .workers
+                                .contains_key(&worker_ref.worker_id)
+                        );
+                    }
+                }
+                drop(runtime);
+                drop(backend);
+                if matches!(fault, Fault::SnapshotSave) {
+                    assert!(Runtime::with_fs_store(options.clone()).is_err());
+                    // Repair the injected obstruction with the last durable snapshot,
+                    // not a new snapshot synthesized from the in-memory rollback.
+                    std::fs::remove_dir(runtime_path.clone()).unwrap();
+                    std::fs::rename(saved_snapshot, runtime_path).unwrap();
+                }
+                let reopened = Runtime::with_fs_store(options).unwrap();
+                assert_eq!(reopened.worker_detail(&worker_ref).is_ok(), record_retained);
+                assert_eq!(
+                    runtime_store(&reopened)
+                        .load_runtime_state()
+                        .unwrap()
+                        .workers
+                        .contains_key(&worker_ref.worker_id),
+                    record_retained
+                );
+            }
+        }
+
+        #[test]
+        fn create_rollback_success_preserves_primary_and_existing_cleanup() {
+            check_rollback(Fault::None);
+        }
+
+        #[test]
+        fn create_rollback_record_delete_failure_preserves_primary_and_retained_record() {
+            check_rollback(Fault::RecordDelete);
+        }
+
+        #[test]
+        fn create_rollback_snapshot_failure_preserves_primary_and_confirmed_record_deletion() {
+            check_rollback(Fault::SnapshotSave);
+        }
+    }
+
     #[test]
     fn worker_create_failure_fields_only_include_sanitized_execution_detail() {
         let invalid_request = RuntimeError::InvalidRequest("private-token".to_string());
@@ -9239,6 +9561,8 @@ mod tests {
         recovery_absent: AtomicBool,
         recovery_checks: std::sync::atomic::AtomicUsize,
         spawn_result: Mutex<Option<WorkerExecutionSpawnResult>>,
+        #[cfg(feature = "fs-store")]
+        before_spawn_result: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         job_bindings: Mutex<Vec<Option<crate::catalog::BackendJobExecutionBinding>>>,
         dispatch_result: Mutex<Option<WorkerExecutionResult>>,
         stop_result: Mutex<Option<WorkerExecutionResult>>,
@@ -9446,6 +9770,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request.request.backend_job.clone());
+            #[cfg(feature = "fs-store")]
+            if let Some(before_result) = self.before_spawn_result.lock().unwrap().take() {
+                before_result();
+            }
             if let Some(result) = self.spawn_result.lock().unwrap().take() {
                 return result;
             }

@@ -114,9 +114,11 @@ pub use uploaded_file::{
     UploadedFileUploadContext,
 };
 pub use worker_metadata::{
-    CombinedStore, FsWorkerStore, SubjektivSessionAttributionState, WorkerActiveSegmentRef,
-    WorkerAggregateStore, WorkerMetadata, WorkerMetadataStore, WorkerPeer, WorkerReclaimedChild,
-    WorkerSpawnedChild, WorkerSpawnedScopeRule, WorkerStoreError, validate_worker_name,
+    CombinedStore, FsWorkerStore, SessionStartupFailure, StartupFailureBindingMismatch,
+    StartupFailureExpectation, StartupFailureRead, StartupFailureSaveResult,
+    SubjektivSessionAttributionState, WorkerActiveSegmentRef, WorkerAggregateStore, WorkerMetadata,
+    WorkerMetadataStore, WorkerPeer, WorkerReclaimedChild, WorkerSpawnedChild,
+    WorkerSpawnedScopeRule, WorkerStoreError, validate_worker_name,
 };
 pub use worker_session_store::WorkerSessionStore;
 

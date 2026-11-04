@@ -64,6 +64,19 @@ pub fn generated_protocol_types() -> String {
          // Large integer fields are JSON numbers on the wire and are emitted as TypeScript `number`.\n\n",
     );
 
+    push_decl::<crate::startup_failure::StartupFailureAttachment>(&cfg, &mut output);
+    push_decl::<crate::startup_failure::StoredStartupFailureAttachment>(&cfg, &mut output);
+    push_decl::<crate::startup_failure::StartupStage>(&cfg, &mut output);
+    push_decl::<crate::startup_failure::RuntimeStartupReason>(&cfg, &mut output);
+    push_decl::<crate::startup_failure::RuntimeStartupCause>(&cfg, &mut output);
+    push_decl::<crate::startup_failure::StartupFailurePhase>(&cfg, &mut output);
+    push_decl::<crate::startup_failure::StartupCleanupFailure>(&cfg, &mut output);
+    push_decl::<crate::startup_failure::StartupPersistenceOutcome>(&cfg, &mut output);
+    push_decl::<crate::startup_failure::StartupSecondaryFailure>(&cfg, &mut output);
+    push_decl::<crate::startup_failure::StartupResources>(&cfg, &mut output);
+    push_decl::<crate::startup_failure::StartupCleanup>(&cfg, &mut output);
+    push_decl::<crate::startup_failure::StartupResourceFacts>(&cfg, &mut output);
+    push_decl::<crate::startup_failure::StartupIoKind>(&cfg, &mut output);
     push_decl::<AlertLevel>(&cfg, &mut output);
     push_decl::<AlertPosition>(&cfg, &mut output);
     push_decl::<AlertSource>(&cfg, &mut output);

@@ -858,14 +858,19 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for DeliveryWorkerFact
     async fn spawn_controller(
         &self,
         request: delivery_execution::WorkerExecutionSpawnRequest,
-    ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
+    ) -> std::result::Result<
+        worker_runtime::worker_backend::RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
         let worker_id = request.worker_ref.worker_id.to_string();
         let manifest = Self::manifest(
             &worker_id,
             &request.request.profile,
             request.config_bundle.as_ref(),
         )?;
-        self.controller(worker_id, false, manifest).await
+        self.controller(worker_id, false, manifest)
+            .await
+            .map_err(Into::into)
     }
     async fn prepare_restore(
         &self,

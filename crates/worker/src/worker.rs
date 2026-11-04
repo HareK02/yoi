@@ -9699,6 +9699,48 @@ where
         subjektiv_attached: bool,
         lifecycle: SubjektivSessionAttributionLifecycle,
     ) -> Result<(), WorkerError> {
+        self.finalize_subjektiv_session_attribution_observed(
+            subjektiv_attached,
+            lifecycle,
+            &mut None,
+        )
+    }
+
+    /// Retain a failed startup against its constructed Session and Workspace. Only
+    /// this operation's successful CAS transitions advance the attribution expectation;
+    /// a reread never adopts a replacement owner or another operation's attribution.
+    pub fn finalize_subjektiv_session_attribution_retaining_startup_failure(
+        &self,
+        subjektiv_attached: bool,
+        lifecycle: SubjektivSessionAttributionLifecycle,
+    ) -> Result<(), WorkerError> {
+        let mut expected = None;
+        self.finalize_subjektiv_session_attribution_observed(
+            subjektiv_attached,
+            lifecycle,
+            &mut expected,
+        )
+        .map_err(|error| match expected {
+            Some(expected) => crate::startup_failure::persist_startup_failure::<
+                _,
+                protocol::startup_failure::RuntimeStartupCause,
+            >(
+                &self.store,
+                &expected,
+                error,
+                protocol::startup_failure::StartupStage::Binding,
+                &(),
+            ),
+            None => error,
+        })
+    }
+
+    fn finalize_subjektiv_session_attribution_observed(
+        &self,
+        subjektiv_attached: bool,
+        lifecycle: SubjektivSessionAttributionLifecycle,
+        observation: &mut Option<session_store::worker_metadata::StartupFailureExpectation>,
+    ) -> Result<(), WorkerError> {
         let _admission = self.segment_state.mutation_authority.enter()?;
         let worker_name = self.manifest.worker.name.as_str();
         let metadata = self.store.read_by_name(worker_name)?.ok_or_else(|| {
@@ -9725,6 +9767,31 @@ where
                 ),
             });
         }
+
+        if metadata.worker_name != worker_name
+            || metadata.workspace_id.as_deref() != self.workspace_id().map(|id| id.as_str())
+        {
+            return Err(WorkerError::SubjektivSessionAttribution {
+                state: "owner_mismatch",
+                message: "Worker metadata does not match constructed Workspace ownership".into(),
+            });
+        }
+        *observation =
+            session_store::worker_metadata::StartupFailureExpectation::from_metadata(&metadata);
+        let mut persist_attribution =
+            |previous: Option<&SubjektivSessionAttributionState>,
+             next: SubjektivSessionAttributionState| {
+                let expected = observation
+                    .as_mut()
+                    .expect("validated active Session has an expectation");
+                if expected.attribution.as_ref() != previous {
+                    return Err(WorkerError::SubjektivSessionAttribution {
+                        state: "attribution_conflict",
+                        message: "startup attribution expectation changed".into(),
+                    });
+                }
+                crate::subjektiv_metadata::compare_and_swap_attribution(&self.store, expected, next)
+            };
 
         if self
             .backend_job()
@@ -9783,7 +9850,7 @@ where
             create_if_missing,
             initial_diagnostic.to_string(),
         );
-        self.persist_subjektiv_session_attribution(
+        persist_attribution(
             metadata.subjektiv_session_attribution.as_ref(),
             pending_attribution.clone(),
         )?;
@@ -9819,7 +9886,7 @@ where
                             message.clone(),
                         )
                     };
-                    self.persist_subjektiv_session_attribution(Some(&pending_attribution), state)?;
+                    persist_attribution(Some(&pending_attribution), state)?;
                     return Err(WorkerError::SubjektivSessionAttribution {
                         state: if create_if_missing && rejected {
                             "failed"
@@ -9844,7 +9911,7 @@ where
                     let message = bounded_attribution_diagnostic(format!(
                         "Session attribution transport outcome is unknown: {error}"
                     ));
-                    self.persist_subjektiv_session_attribution(
+                    persist_attribution(
                         Some(&pending_attribution),
                         incomplete_subjektiv_attribution_state(
                             session_id,
@@ -9874,7 +9941,7 @@ where
                         diagnostic: message.clone(),
                     }
                 };
-                self.persist_subjektiv_session_attribution(Some(&pending_attribution), state)?;
+                persist_attribution(Some(&pending_attribution), state)?;
                 return Err(WorkerError::SubjektivSessionAttribution {
                     state: if create_if_missing {
                         "failed"
@@ -9891,7 +9958,7 @@ where
                         let message = bounded_attribution_diagnostic(format!(
                             "Session attribution response outcome is unknown: {error}"
                         ));
-                        self.persist_subjektiv_session_attribution(
+                        persist_attribution(
                             Some(&pending_attribution),
                             incomplete_subjektiv_attribution_state(
                                 session_id,
@@ -9914,7 +9981,7 @@ where
             let message =
                 "Session attribution response did not confirm the requested immutable identity"
                     .to_string();
-            self.persist_subjektiv_session_attribution(
+            persist_attribution(
                 Some(&pending_attribution),
                 incomplete_subjektiv_attribution_state(
                     session_id,
@@ -9927,7 +9994,7 @@ where
                 message,
             });
         }
-        self.persist_subjektiv_session_attribution(
+        persist_attribution(
             Some(&pending_attribution),
             SubjektivSessionAttributionState::Confirmed {
                 session_id,
@@ -9970,20 +10037,6 @@ where
         self.store
             .retain_session_before_publication(session_id, pin)?;
         Ok(())
-    }
-
-    fn persist_subjektiv_session_attribution(
-        &self,
-        expected: Option<&SubjektivSessionAttributionState>,
-        state: SubjektivSessionAttributionState,
-    ) -> Result<(), WorkerError> {
-        crate::subjektiv_metadata::compare_and_swap_attribution(
-            &self.store,
-            &self.manifest.worker.name,
-            self.session_id(),
-            expected,
-            state,
-        )
     }
 
     /// Build an in-process Internal Worker without machine-wide allocation or durable Worker metadata.
@@ -11457,6 +11510,16 @@ fn compact_failure_category(error: &WorkerError) -> CompactFailureCategory {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
+    /// The domain-projected primary error survives wrappers and metadata-save failures.
+    /// This attachment is not execution cleanup or lifecycle evidence.
+    #[error("{source}")]
+    StartupFailure {
+        #[source]
+        source: Box<WorkerError>,
+        failure: protocol::startup_failure::StartupFailureAttachment,
+        secondary: Vec<protocol::startup_failure::StartupSecondaryFailure>,
+        metadata_save: Option<protocol::startup_failure::StartupPersistenceOutcome>,
+    },
     /// A construction or activation step failed after acquiring resources. Retain
     /// these handles until explicit cleanup succeeds. Consuming constructors drop
     /// the Worker before returning; in-place activation leaves its owner responsible

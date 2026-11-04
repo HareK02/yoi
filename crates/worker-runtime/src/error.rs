@@ -147,3 +147,14 @@ pub enum RuntimeError {
     #[error("runtime state lock was poisoned")]
     StatePoisoned,
 }
+
+impl RuntimeError {
+    /// The original execution result, including primary facts and independent secondary
+    /// failures. Display is presentation only and must not be parsed to recover causes.
+    pub fn execution_result(&self) -> Option<&WorkerExecutionResult> {
+        match self {
+            Self::WorkerExecutionRejected { result, .. } => Some(result),
+            _ => None,
+        }
+    }
+}

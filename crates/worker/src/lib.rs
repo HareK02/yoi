@@ -34,6 +34,7 @@ mod subjektiv_metadata;
 pub use subject_release::SubjectReleaseReservation;
 pub mod skill;
 pub mod spawn;
+pub mod startup_failure;
 pub mod subjektiv;
 pub mod wip;
 
