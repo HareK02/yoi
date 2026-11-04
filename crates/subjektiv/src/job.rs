@@ -187,6 +187,13 @@ pub fn lookup_result(
             [subject_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))
         ).optional()?;
         let Some((saved_fingerprint, status, snapshot_id, reason_code)) = state else { return Ok(None) };
+        // Memory writes mark this exact input dirty before the producer can
+        // publish its terminal receipt. That is unfinished work, not failure.
+        if saved_fingerprint == fingerprint && status == "dirty"
+            && snapshot_id.is_none() && reason_code.is_none()
+        {
+            return Ok(None);
+        }
         if saved_fingerprint != fingerprint || !matches!(status.as_str(), "ready" | "failed") {
             return Err(SubjektivError::InvalidRecord("consolidation terminal outcome is stale or inconsistent".into()));
         }

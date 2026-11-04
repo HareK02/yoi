@@ -21,6 +21,8 @@ pub(super) struct RecoveryOwners {
     changed: tokio::sync::Notify,
     #[cfg(test)]
     pub(super) storage_probe_started: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(super) nonjournal_lookup_pending: tokio::sync::Notify,
 }
 
 impl RecoveryOwners {
@@ -827,6 +829,12 @@ impl WorkspaceApi {
             );
             self.schedule_backend_job_worker_cleanup(&current);
             return Ok(false);
+        }
+        #[cfg(test)]
+        if job.request.grants.subjektiv_consolidation.is_some() {
+            self.backend_job_recovery
+                .nonjournal_lookup_pending
+                .notify_waiters();
         }
         let deadline = chrono::DateTime::parse_from_rfc3339(&attempt.deadline_at)
             .map_err(|error| Error::Store(error.to_string()))?;

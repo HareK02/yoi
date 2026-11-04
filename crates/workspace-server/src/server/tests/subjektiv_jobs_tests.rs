@@ -360,6 +360,99 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
 }
 
 #[tokio::test]
+async fn dirty_consolidation_survives_owner_tick_and_recovers_same_attempt_terminal_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("dirty-recovery").unwrap())
+        .unwrap();
+    let source = memory_job_source(&api, &subject.id).await;
+    store
+        .create_memory(
+            &subject.id,
+            MemoryDraft::active(CandidateKind::Lesson, "lesson", "body", "reason", "change"),
+        )
+        .unwrap();
+    let started = start_subjektiv_staging_consolidation(
+        api.clone(),
+        &subject.id,
+        Some(source),
+        MemoryConsolidateStagingOperation { force: true },
+    )
+    .await
+    .unwrap();
+    assert_eq!(started.status, "started");
+    let job = resource(&api, &subject.id);
+    let attempt = current_attempt(&api, &job);
+    let gate = api.backend_job_recovery.dispatch_gate(&attempt.attempt_id);
+    let observed = api
+        .backend_job_recovery
+        .nonjournal_lookup_pending
+        .notified();
+    tokio::pin!(observed);
+    let generation = {
+        let _guard = gate.lock().unwrap();
+        let generation = store
+            .prepare_job_surface_generation(
+                &subject.id,
+                Some((&job.request.job_id, &attempt.attempt_id)),
+            )
+            .unwrap();
+        // Register while dispatch/recovery is excluded, then permit a real owner
+        // tick before publishing any domain receipt. No timing sleep is needed.
+        observed.as_mut().enable();
+        generation
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), observed)
+        .await
+        .expect("owner must observe the prepared, still-unpublished generation");
+    assert_eq!(
+        current_attempt(&api, &job).state,
+        BackendJobAttemptState::Dispatched
+    );
+    assert_eq!(resource(&api, &subject.id).state, BackendJobState::Pending);
+    store
+        .fail_surface_generation(&subject.id, &generation.id, "model_failure")
+        .unwrap();
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let saved = api
+                .store
+                .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
+                .unwrap()
+                .unwrap();
+            if saved.state != BackendJobState::Pending {
+                break saved;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("same accepted Job must autonomously save its domain receipt");
+    assert_eq!(completed.state, BackendJobState::Completed);
+    let saved = current_attempt(&api, &completed);
+    assert_eq!(saved.attempt_id, attempt.attempt_id);
+    assert_eq!(saved.worker, attempt.worker);
+    assert_eq!(saved.runtime_run_id, attempt.runtime_run_id);
+    assert_eq!(saved.input_digest, attempt.input_digest);
+    assert_eq!(
+        saved.result.as_ref().unwrap()["surface"]["generation_id"],
+        generation.id
+    );
+    assert_eq!(
+        saved.result.as_ref().unwrap()["surface"]["availability"],
+        "failed"
+    );
+    assert_eq!(
+        execution.take_inputs().len(),
+        1,
+        "no second model submission"
+    );
+    api.stop_backend_job_recovery().await;
+}
+
+#[tokio::test]
 async fn subjektiv_job_surface_only_requires_attempt_owned_generation_and_real_outcome() {
     let dir = tempfile::tempdir().unwrap();
     let (api, _) = test_api_with_recording_backend(dir.path()).await;

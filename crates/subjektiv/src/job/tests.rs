@@ -7,6 +7,46 @@ use memory::extract::{CandidateKind, ExtractedCandidate, StagingRecord};
 use memory::schema::SourceRef;
 
 #[test]
+fn prepared_dirty_surface_waits_for_terminal_receipt_and_rejects_stale_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = feature_storage::FeatureStorage::new(temp.path());
+    let scope = manager.scope("consolidation-recovery").unwrap();
+    let registration = SubjektivStore::register(&scope).unwrap();
+    let store = SubjektivStore::open(&scope, &registration).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("companion").unwrap())
+        .unwrap();
+    store
+        .prepare_job_surface_generation(&subject.id, Some(("old-job", "old-attempt")))
+        .unwrap();
+    store
+        .create_memory(
+            &subject.id,
+            crate::MemoryDraft::active(CandidateKind::Lesson, "lesson", "body", "reason", "change"),
+        )
+        .unwrap();
+    let prepared = store
+        .prepare_job_surface_generation(&subject.id, Some(("job", "attempt")))
+        .unwrap();
+    // A committed preparation is not a terminal receipt, even with no candidates.
+    assert!(
+        lookup_result(&store, &subject.id, &[], "job", "attempt")
+            .unwrap()
+            .is_none()
+    );
+    assert!(lookup_result(&store, &subject.id, &[], "old-job", "old-attempt").is_err());
+    store
+        .fail_surface_generation(&subject.id, &prepared.id, "model_failure")
+        .unwrap();
+    let completed = lookup_result(&store, &subject.id, &[], "job", "attempt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed["surface"]["generation_id"], prepared.id);
+    assert_eq!(completed["surface"]["availability"], "failed");
+    assert_eq!(completed["surface"]["reason_code"], "model_failure");
+}
+
+#[test]
 fn escaped_ids_use_exact_t704_complete_result_budget() {
     const MAX_RESULT_BYTES: u32 = 16 * 1024;
     let ids: Vec<_> = (0..100)
