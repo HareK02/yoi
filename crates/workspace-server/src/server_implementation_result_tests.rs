@@ -47,6 +47,111 @@ async fn assert_result_diagnostics(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn implementation_result_receipt_and_replay_do_not_wait_for_notification_acceptance() {
+    use std::time::Duration;
+
+    struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution, orchestrator, identity) = delivery_recording_fixture(dir.path()).await;
+    let ticket = delivery_ticket(&api, "Receipt is independent of notification acceptance");
+    delivery_assign(&api, &ticket.id, "blocked-result-delegation").await;
+    let coder = spawn_ticket_check_source(&api, "blocked-result-coder");
+    seed_worker_source_member(&api, &coder.runtime_id, &coder.worker_id);
+    let input = json!({"operation_key":"blocked-result", "kind":"result", "body":"Committed facts survive a blocked notification"});
+
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let release = ReleaseOnDrop(Some(release));
+    let recipient = orchestrator.worker_id.clone();
+    execution.before_input_returns(move |worker| {
+        assert_eq!(worker.worker_id.to_string(), recipient);
+        let _ = entered.send(());
+        release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    });
+    let mut report = tokio::spawn({
+        let api = api.clone();
+        let identity = identity.clone();
+        let coder = coder.clone();
+        let ticket = ticket.id.clone();
+        let input = input.clone();
+        async move { result_signed_http(&api, &identity, &coder, &ticket, &input, StatusCode::OK).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered_rx)
+        .await
+        .expect("notification reached the gated Runtime acceptance boundary")
+        .unwrap();
+    let receipt = tokio::time::timeout(Duration::from_secs(2), &mut report).await;
+    let replay = if receipt.is_ok() {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                result_signed_http(&api, &identity, &coder, &ticket.id, &input, StatusCode::OK),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    api.config_store
+        .with_conn(|conn| {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM ticket_implementation_results",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )?,
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM notification_sources WHERE kind='implementation_result'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    // Release before asserting the response result, including when testing the old coupled handler.
+    drop(release);
+    let cleanup = if receipt.is_err() {
+        Some(tokio::time::timeout(Duration::from_secs(5), report).await)
+    } else {
+        None
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        api.host_executors.host().unwrap().drain(),
+    )
+    .await
+    .expect("owned recovery drained after release")
+    .unwrap();
+    let receipt = receipt
+        .expect("committed receipt must not wait for Runtime acceptance")
+        .unwrap();
+    assert_eq!(
+        replay
+            .unwrap()
+            .expect("replay must not wait for Runtime acceptance"),
+        receipt
+    );
+    assert!(cleanup.is_none());
+    assert_result_diagnostics(&api, &orchestrator, receipt["result_id"].as_str().unwrap()).await;
+    delivery_stop(&api, &coder);
+    delivery_stop(&api, &orchestrator);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn implementation_result_signed_http_reaches_persistent_orchestrator_without_assignment_or_mr()
  {
     let dir = tempfile::tempdir().unwrap();

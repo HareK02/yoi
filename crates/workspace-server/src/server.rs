@@ -13485,7 +13485,9 @@ impl server_api::ServerApi for ServerApiContractService {
                         &worker,
                         &source.authentication_binding_id,
                     )?;
-                    recover_ticket_notifications(&api);
+                    // The receipt certifies result/source commit, not notification acceptance.
+                    // Do not make it wait for unrelated pending deliveries or their Runtime ACKs.
+                    drop(enqueue_ticket_notification_recovery(&api));
                     Ok(receipt)
                 })();
                 result
@@ -17570,7 +17572,7 @@ async fn apply_set_ticket_assignment(
                     // same best-effort notification completion as before offload.
                     Ok::<_, Error>((
                         assignment,
-                        enqueue_orchestrator_assignment_attention(&notification_api),
+                        enqueue_ticket_notification_recovery(&notification_api),
                     ))
                 })
                 .await?
@@ -23502,7 +23504,7 @@ fn maybe_dispatch_orchestrator_turn_end(
     });
 }
 
-fn enqueue_orchestrator_assignment_attention(
+fn enqueue_ticket_notification_recovery(
     api: &WorkspaceApi,
 ) -> Option<tokio::sync::oneshot::Receiver<()>> {
     let api = api.clone();
@@ -23515,7 +23517,7 @@ fn enqueue_orchestrator_assignment_attention(
     }) {
         Ok(()) => Some(completion),
         Err(error) => {
-            tracing::warn!(%error, "Assign notification was not admitted; input remains durable");
+            tracing::warn!(%error, "Ticket notification recovery was not admitted; source remains durable");
             None
         }
     }
