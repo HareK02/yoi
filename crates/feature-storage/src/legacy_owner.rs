@@ -70,6 +70,16 @@ pub(super) fn identity(path: &Path, scope: &str, feature: &str) -> Result<Option
 }
 
 pub(super) fn fenced(root: &Path, scope: &str) -> Result<bool> {
+    fenced_inner(root, scope, false)
+}
+
+// Only restore may inspect a lost live scope; it must still match snapshot
+// provenance against completed new-owner receipts before admitting any bytes.
+pub(super) fn fenced_for_restore(root: &Path, scope: &str) -> Result<bool> {
+    fenced_inner(root, scope, true)
+}
+
+fn fenced_inner(root: &Path, scope: &str, recovering_loss: bool) -> Result<bool> {
     if root
         .join(".lifecycle")
         .join(format!("{scope}.deleted"))
@@ -100,7 +110,16 @@ pub(super) fn fenced(root: &Path, scope: &str) -> Result<bool> {
     match fields[1] {
         "deleted" | "deleting" => Ok(true),
         "live" => {
-            if fs::read_to_string(root.join(scope).join(".incarnation"))? != format!("{id}\n") {
+            let marker = fs::read_to_string(root.join(scope).join(".incarnation"));
+            if recovering_loss
+                && !root.join(scope).try_exists()?
+                && marker
+                    .as_ref()
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Ok(false);
+            }
+            if marker? != format!("{id}\n") {
                 return Err(FeatureStorageError::Identity(
                     "legacy scope incarnation differs".into(),
                 ));
@@ -111,6 +130,28 @@ pub(super) fn fenced(root: &Path, scope: &str) -> Result<bool> {
             "unfinished legacy scope requires reconciliation by its owner".into(),
         )),
     }
+}
+
+/// Reconstruct only a previously retained live scope marker, never a deletion
+/// record or a new identity. Called after matching completed snapshot provenance.
+pub(super) fn restore_marker(root: &Path, scope: &str, temporary: &Path) -> Result<()> {
+    if fenced_for_restore(root, scope)? {
+        return Err(FeatureStorageError::ScopeMaintenance(scope.into()));
+    }
+    let record = match fs::read_to_string(root.join(".scope-locks").join(format!("{scope}.lock"))) {
+        Ok(record) => record,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(id) = record
+        .strip_prefix("v1 live ")
+        .and_then(|s| s.strip_suffix('\n'))
+    {
+        let marker = temporary.join(".incarnation");
+        fs::write(&marker, format!("{id}\n"))?;
+        std::fs::File::open(marker)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn verify_shape(connection: &Connection, table: &str, expected: &str) -> Result<()> {

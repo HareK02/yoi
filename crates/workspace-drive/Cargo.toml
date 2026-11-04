@@ -21,4 +21,5 @@ futures.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
+rusqlite = { workspace = true, features = ["hooks"] }
 tempfile.workspace = true

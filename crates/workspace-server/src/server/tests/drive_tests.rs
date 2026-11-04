@@ -175,7 +175,9 @@ async fn deleting_workspace_reopens_fenced_drive_and_purges_blobs_before_feature
         .open(
             &api.feature_storage,
             root.clone(),
-            config.database_path.clone(),
+            api.config_store
+                .drive_authority(&config.database_path)
+                .unwrap(),
         )
         .await
         .unwrap();

@@ -639,6 +639,16 @@ impl FeatureStorage {
         snapshot: &Path,
         source: &ScopedFeatureStorage,
     ) -> Result<()> {
+        self.restore_scope_with_copy(scope_id, snapshot, source, backup_database)
+    }
+
+    fn restore_scope_with_copy(
+        &self,
+        scope_id: &str,
+        snapshot: &Path,
+        source: &ScopedFeatureStorage,
+        mut copy: impl FnMut(&Path, &Path) -> Result<()>,
+    ) -> Result<()> {
         if source.scope_id != scope_id {
             return Err(FeatureStorageError::Identity(
                 "restore source scope differs".into(),
@@ -659,27 +669,45 @@ impl FeatureStorage {
             let target = lifecycle.lock(true)?;
             (Some(source_lifecycle.lock(false)?), target)
         };
-        if lifecycle.fenced(scope_id)? {
+        if lifecycle.fenced_for_restore(scope_id)? {
             return Err(FeatureStorageError::ScopeMaintenance(scope_id.into()));
         }
         let feature_ids = read_snapshot_manifest(snapshot, scope_id)?;
         // Hold the source erasure fence through target publication. A fresh root
         // or an old snapshot cannot erase this source-owner dependency.
-        if source_lifecycle.fenced(scope_id)? {
+        if source_lifecycle.fenced_for_restore(scope_id)? {
             return Err(FeatureStorageError::ScopeMaintenance(scope_id.into()));
         }
+        // Length-prefixed provenance avoids ambiguous request/manifest concatenation.
+        let mut evidence = String::new();
+        let mut field = |value: &str| {
+            evidence.push_str(&format!("{}:{value}", value.len()));
+        };
+        let path_key = |path: &Path| {
+            path.as_os_str()
+                .as_encoded_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        field(&path_key(&source_root));
+        field(&path_key(&fs::canonicalize(snapshot)?));
+        field(&fs::read_to_string(snapshot.join(SNAPSHOT_MANIFEST))?);
         for feature in &feature_ids {
-            source_lifecycle.verify_snapshot(
+            let (physical, request) = source_lifecycle.verify_snapshot(
                 scope_id,
                 feature,
                 &snapshot.join("features").join(format!("{feature}.sqlite")),
             )?;
+            field(feature);
+            field(&physical);
+            field(&request);
         }
         self.begin_maintenance(scope_id, true)?;
         let scope_dir = self.scope_dir(scope_id);
         let temporary = self.inner.root.join(format!(".restore-{scope_id}"));
-        let evidence = fs::canonicalize(snapshot)?.display().to_string();
         let result = (|| {
+            lifecycle.reserve_restore(scope_id, &evidence, &temporary, &scope_dir)?;
             if scope_dir.exists() {
                 // Rename/receipt response loss: only this exact saved restore
                 // may reconcile the published inode. An unrelated existing
@@ -701,6 +729,7 @@ impl FeatureStorage {
                     binding.check_database(&connection)?;
                     lifecycle.complete(&binding)?;
                 }
+                lifecycle.publish_restore(scope_id, &evidence)?;
                 return Ok(());
             }
             let temporary_features = temporary.join("features");
@@ -709,12 +738,18 @@ impl FeatureStorage {
             for feature_id in &feature_ids {
                 let target = temporary_features.join(format!("{feature_id}.sqlite"));
                 if !target.exists() {
-                    backup_database(
+                    // SQLite may create an empty destination before copying. Only
+                    // the verified-copy rename promotes it to reusable staging.
+                    let copying = temporary_features.join(format!("{feature_id}.copying"));
+                    copy(
                         &snapshot
                             .join("features")
                             .join(format!("{feature_id}.sqlite")),
-                        &target,
+                        &copying,
                     )?;
+                    source_lifecycle.verify_snapshot(scope_id, feature_id, &copying)?;
+                    fs::rename(&copying, &target)?;
+                    sync_directory(&temporary_features)?;
                 }
                 let request = format!("restore:{scope_id}:{feature_id}:{evidence}");
                 let binding = lifecycle.reserve(
@@ -723,9 +758,14 @@ impl FeatureStorage {
                 let mut connection =
                     Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
                 configure_connection(&connection)?;
+                verify_database(&connection)?;
+                if binding.check_database(&connection).is_err() {
+                    source_lifecycle.verify_snapshot(scope_id, feature_id, &target)?;
+                }
                 binding.restore_identity(&mut connection)?;
                 bindings.push(binding);
             }
+            legacy_owner::restore_marker(&self.inner.root, scope_id, &temporary)?;
             sync_directory(&temporary_features)?;
             sync_directory(&temporary)?;
             fs::rename(&temporary, &scope_dir)?;
@@ -735,6 +775,7 @@ impl FeatureStorage {
                     .complete(binding)
                     .map_err(|error| binding.unknown(error))?;
             }
+            lifecycle.publish_restore(scope_id, &evidence)?;
             Ok(())
         })();
         // Failed/pending restore is retained for exact reconciliation, not

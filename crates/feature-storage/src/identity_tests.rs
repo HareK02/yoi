@@ -670,6 +670,223 @@ fn same_owner_loss_recovery_retires_old_receipts_and_erasure_blocks_every_restor
     assert!(!fresh_root.join(SCOPE).exists());
 }
 
+#[test]
+fn review_r1_unowned_incomplete_or_foreign_staging_never_becomes_a_successful_restore() {
+    for partial in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let snapshot = temp.path().join("snapshot");
+        let (manager, registration) = registered(&source);
+        let scoped = manager.scope(SCOPE).unwrap();
+        let database = scoped.open(&registration).unwrap();
+        insert(&database, "requested-source");
+        scoped.backup(&snapshot).unwrap();
+        let staged = destination.join(format!(".restore-{SCOPE}/features/{FEATURE}.sqlite"));
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        if partial {
+            drop(Connection::open(&staged).unwrap());
+        } else {
+            let foreign = temp.path().join("foreign");
+            let (other, registration) = registered(&foreign);
+            let other_scope = other.scope(SCOPE).unwrap();
+            let other_db = other_scope.open(&registration).unwrap();
+            insert(&other_db, "wrong-source");
+            let foreign_snapshot = temp.path().join("foreign-snapshot");
+            other_scope.backup(&foreign_snapshot).unwrap();
+            fs::copy(
+                foreign_snapshot.join(format!("features/{FEATURE}.sqlite")),
+                &staged,
+            )
+            .unwrap();
+            other_scope.delete().unwrap();
+        }
+        let (target, _) = registered(&destination);
+        assert!(
+            target
+                .scope(SCOPE)
+                .unwrap()
+                .restore_from(&snapshot, &scoped)
+                .is_err(),
+            "unowned staging must not be interpreted as a completed copy"
+        );
+        assert!(!destination.join(SCOPE).exists());
+    }
+}
+
+#[test]
+fn review_r3_adopted_legacy_live_scope_recovers_from_stopped_loss_without_erasure_undo() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("storage");
+    legacy(&root, SCOPE);
+    let incarnation = Uuid::now_v7();
+    fs::create_dir_all(root.join(".scope-locks")).unwrap();
+    let record = format!("v1 live {incarnation}\n");
+    fs::write(
+        root.join(".scope-locks").join(format!("{SCOPE}.lock")),
+        &record,
+    )
+    .unwrap();
+    fs::write(
+        root.join(SCOPE).join(".incarnation"),
+        format!("{incarnation}\n"),
+    )
+    .unwrap();
+    let (manager, registration) = registered(&root);
+    let scoped = manager.scope(SCOPE).unwrap();
+    let database = scoped
+        .adopt_existing(&registration, REQUEST, EVIDENCE, validate_legacy)
+        .unwrap();
+    let old = database.identity().clone();
+    let snapshot = temp.path().join("snapshot");
+    scoped.backup(&snapshot).unwrap();
+    drop(database);
+    manager.shutdown().unwrap();
+    fs::remove_dir_all(root.join(SCOPE)).unwrap();
+    let (manager, registration) = registered(&root);
+    let scoped = manager.scope(SCOPE).unwrap();
+    scoped.restore(&snapshot).unwrap();
+    let database = scoped.open(&registration).unwrap();
+    assert_eq!(values(&database), ["preserved"]);
+    assert_ne!(database.identity(), &old);
+    assert_eq!(
+        fs::read_to_string(root.join(".scope-locks").join(format!("{SCOPE}.lock"))).unwrap(),
+        record
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(SCOPE).join(".incarnation")).unwrap(),
+        format!("{incarnation}\n")
+    );
+    drop(database);
+    scoped.delete().unwrap();
+    assert!(scoped.restore(&snapshot).is_err());
+}
+
+#[test]
+fn review_r1_interrupted_copy_keeps_exact_source_and_blocks_competing_or_erased_source_reuse() {
+    for (copied, erase_source) in [(false, false), (true, false), (true, true)] {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        let snapshot = temp.path().join("snapshot");
+        let (source, registration) = registered(&source_root);
+        let source_scope = source.scope(SCOPE).unwrap();
+        let database = source_scope.open(&registration).unwrap();
+        insert(&database, "source-A");
+        source_scope.backup(&snapshot).unwrap();
+        let target_root = temp.path().join("target");
+        let (target, registration) = registered(&target_root);
+        let error = target
+            .restore_scope_with_copy(SCOPE, &snapshot, &source_scope, |from, to| {
+                drop(Connection::open(to)?);
+                if copied {
+                    backup_database(from, to)?;
+                }
+                Err(FeatureStorageError::operation("injected copy interruption"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("injected copy interruption"));
+        assert!(!target_root.join(SCOPE).exists());
+        let stage = target_root.join(format!(".restore-{SCOPE}/features"));
+        assert!(stage.join(format!("{FEATURE}.copying")).is_file());
+        assert!(!stage.join(format!("{FEATURE}.sqlite")).exists());
+        let owner = Connection::open(target_root.join(".owner.sqlite")).unwrap();
+        let saved: (String, bool) = owner
+            .query_row(
+                "SELECT evidence,published FROM storage_restores WHERE scope=?1",
+                [SCOPE],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(!saved.1);
+        if erase_source {
+            source_scope.delete().unwrap();
+        }
+        let (other, other_registration) = registered(&temp.path().join("other"));
+        let other_scope = other.scope(SCOPE).unwrap();
+        let other_database = other_scope.open(&other_registration).unwrap();
+        insert(&other_database, "source-B");
+        let other_snapshot = temp.path().join("other-snapshot");
+        other_scope.backup(&other_snapshot).unwrap();
+        assert_identity_error(
+            target
+                .scope(SCOPE)
+                .unwrap()
+                .restore_from(&other_snapshot, &other_scope),
+        );
+        let retained: (String, bool) = owner
+            .query_row(
+                "SELECT evidence,published FROM storage_restores WHERE scope=?1",
+                [SCOPE],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, saved);
+        assert!(!target_root.join(SCOPE).exists());
+        if erase_source {
+            assert!(matches!(
+                target
+                    .scope(SCOPE)
+                    .unwrap()
+                    .restore_from(&snapshot, &source_scope),
+                Err(FeatureStorageError::ScopeMaintenance(_))
+            ));
+        } else {
+            // Restart, recopy incomplete bytes, and reconcile only the original source/request.
+            target.shutdown().unwrap();
+            let (target, registration) = registered(&target_root);
+            let scoped = target.scope(SCOPE).unwrap();
+            scoped.restore_from(&snapshot, &source_scope).unwrap();
+            scoped.restore_from(&snapshot, &source_scope).unwrap();
+            assert_eq!(values(&scoped.open(&registration).unwrap()), ["source-A"]);
+        }
+        let _ = registration;
+    }
+}
+
+#[test]
+fn review_r1_response_loss_after_publication_reconciles_the_saved_physical_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, registration) = registered(&temp.path().join("source"));
+    let source_scope = source.scope(SCOPE).unwrap();
+    let database = source_scope.open(&registration).unwrap();
+    insert(&database, "committed-copy");
+    let snapshot = temp.path().join("snapshot");
+    source_scope.backup(&snapshot).unwrap();
+    let root = temp.path().join("target");
+    let (target, registration) = registered(&root);
+    drop(
+        target
+            .scope("unrelated")
+            .unwrap()
+            .open(&registration)
+            .unwrap(),
+    );
+    let owner = Connection::open(root.join(".owner.sqlite")).unwrap();
+    owner.execute_batch("CREATE TRIGGER injected_restore_completion BEFORE UPDATE OF completed ON storage_requests WHEN NEW.kind='restore' BEGIN SELECT RAISE(ABORT,'injected restore completion'); END;").unwrap();
+    let scoped = target.scope(SCOPE).unwrap();
+    assert!(matches!(
+        scoped.restore_from(&snapshot, &source_scope),
+        Err(FeatureStorageError::OutcomeUnknown { .. })
+    ));
+    let copied = Connection::open(database_path(&root, SCOPE)).unwrap();
+    let physical: String = copied
+        .query_row("SELECT physical FROM __yoi_storage_identity", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(
+        scoped.open(&registration).is_err(),
+        "unfinished completion is not normal admission"
+    );
+    owner
+        .execute_batch("DROP TRIGGER injected_restore_completion;")
+        .unwrap();
+    scoped.restore_from(&snapshot, &source_scope).unwrap();
+    let database = scoped.open(&registration).unwrap();
+    assert_eq!(database.identity().physical, physical);
+    assert_eq!(values(&database), ["committed-copy"]);
+}
+
 struct ChildGuard(Child);
 
 impl ChildGuard {

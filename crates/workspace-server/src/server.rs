@@ -4243,7 +4243,8 @@ impl WorkspaceApi {
             .open(
                 &self.feature_storage,
                 self.config.drive_blob_root()?,
-                self.config.database_path.clone(),
+                self.config_store
+                    .drive_authority(&self.config.database_path)?,
             )
             .await
     }
@@ -4253,7 +4254,8 @@ impl WorkspaceApi {
             .fence(
                 &self.feature_storage,
                 self.config.drive_blob_root()?,
-                self.config.database_path.clone(),
+                self.config_store
+                    .drive_authority(&self.config.database_path)?,
             )
             .await
     }
@@ -4263,7 +4265,8 @@ impl WorkspaceApi {
             .purge(
                 &self.feature_storage,
                 self.config.drive_blob_root()?,
-                self.config.database_path.clone(),
+                self.config_store
+                    .drive_authority(&self.config.database_path)?,
             )
             .await
     }

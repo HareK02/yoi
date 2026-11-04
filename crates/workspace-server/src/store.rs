@@ -2906,6 +2906,28 @@ impl SqliteWorkspaceStore {
         self.db_executor.clone()
     }
 
+    pub(crate) fn drive_authority(
+        &self,
+        fixture_path: &Path,
+    ) -> Result<crate::workspace_drive_host::DriveAuthority> {
+        match &self.conn {
+            StoreConnection::Managed(database) => Ok(
+                crate::workspace_drive_host::DriveAuthority::Managed(database.clone()),
+            ),
+            #[cfg(test)]
+            StoreConnection::Fixture(_) => Ok(
+                crate::workspace_drive_host::DriveAuthority::Fixture(fixture_path.to_owned()),
+            ),
+            #[cfg(not(test))]
+            StoreConnection::Fixture(_) => {
+                let _ = fixture_path;
+                Err(Error::Store(
+                    "Drive requires a managed Server catalog".into(),
+                ))
+            }
+        }
+    }
+
     pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         match &self.conn {
             StoreConnection::Managed(database) => database.try_with_connection(f),

@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS storage_requests (
  current INTEGER NOT NULL DEFAULT 1);
 CREATE UNIQUE INDEX IF NOT EXISTS storage_current_target ON storage_requests(scope,feature) WHERE current=1;
 CREATE TABLE IF NOT EXISTS storage_deletions (scope TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS storage_restores (scope TEXT PRIMARY KEY, evidence TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0);
 ",
             )?;
         }
@@ -86,6 +87,81 @@ CREATE TABLE IF NOT EXISTS storage_deletions (scope TEXT PRIMARY KEY);
 
     pub fn fenced(&self, scope: &str) -> Result<bool> {
         if legacy_owner::fenced(&self.root, scope)? {
+            return Ok(true);
+        }
+        if !self.root.join(".owner.sqlite").try_exists()? {
+            return Ok(false);
+        }
+        Ok(self.catalog(false)?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM storage_deletions WHERE scope=?1)",
+            [scope],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Reserve the entire restore before creating staging. An unfinished copy
+    /// cannot be adopted by another source/request, even if its files look valid.
+    pub fn reserve_restore(
+        &self,
+        scope: &str,
+        evidence: &str,
+        temporary: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        let mut catalog = self.catalog(true)?;
+        let tx = catalog.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<(String, bool)> = tx
+            .query_row(
+                "SELECT evidence,published FROM storage_restores WHERE scope=?1",
+                [scope],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match previous {
+            Some((saved, _)) if saved == evidence => {}
+            Some((_, false)) => {
+                return Err(FeatureStorageError::Identity(
+                    "another restore is unfinished; reconcile its exact source/request".into(),
+                ));
+            }
+            Some((_, true)) if destination.exists() || temporary.exists() => {
+                return Err(FeatureStorageError::Identity(
+                    "another restore owns the existing destination/staging".into(),
+                ));
+            }
+            None if destination.exists() => {
+                return Err(FeatureStorageError::DestinationExists(
+                    destination.display().to_string(),
+                ));
+            }
+            None if temporary.exists() => {
+                return Err(FeatureStorageError::Identity(
+                    "unowned restore staging requires explicit reconciliation".into(),
+                ));
+            }
+            _ => {
+                tx.execute("INSERT INTO storage_restores(scope,evidence,published) VALUES(?1,?2,0) ON CONFLICT(scope) DO UPDATE SET evidence=excluded.evidence,published=0", params![scope,evidence])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn publish_restore(&self, scope: &str, evidence: &str) -> Result<()> {
+        let changed = self.catalog(false)?.execute(
+            "UPDATE storage_restores SET published=1 WHERE scope=?1 AND evidence=?2",
+            params![scope, evidence],
+        )?;
+        if changed != 1 {
+            return Err(FeatureStorageError::Identity(
+                "restore request changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn fenced_for_restore(&self, scope: &str) -> Result<bool> {
+        if legacy_owner::fenced_for_restore(&self.root, scope)? {
             return Ok(true);
         }
         if !self.root.join(".owner.sqlite").try_exists()? {
@@ -146,7 +222,12 @@ CREATE TABLE IF NOT EXISTS storage_deletions (scope TEXT PRIMARY KEY);
                 "request and Host authority evidence are required".into(),
             ));
         }
-        if self.fenced(scope)? {
+        let fenced = if kind == "restore" {
+            self.fenced_for_restore(scope)?
+        } else {
+            self.fenced(scope)?
+        };
+        if fenced {
             return Err(FeatureStorageError::ScopeMaintenance(scope.into()));
         }
         if kind != "provision" && !path.is_file() {
@@ -235,8 +316,13 @@ CREATE TABLE IF NOT EXISTS storage_deletions (scope TEXT PRIMARY KEY);
     /// Snapshot bytes are not authority. Match their saved identity to this
     /// explicitly supplied source owner's completed provenance, including an old
     /// lifecycle superseded by a prior restore. The caller holds its lifecycle lock.
-    pub fn verify_snapshot(&self, scope: &str, feature: &str, path: &Path) -> Result<()> {
-        if self.fenced(scope)? {
+    pub fn verify_snapshot(
+        &self,
+        scope: &str,
+        feature: &str,
+        path: &Path,
+    ) -> Result<(String, String)> {
+        if self.fenced_for_restore(scope)? {
             return Err(FeatureStorageError::ScopeMaintenance(scope.into()));
         }
         if !self.root.join(".owner.sqlite").is_file() {
@@ -261,7 +347,7 @@ CREATE TABLE IF NOT EXISTS storage_deletions (scope TEXT PRIMARY KEY);
                 "snapshot does not belong to the selected source owner".into(),
             ));
         }
-        Ok(())
+        Ok((physical, request))
     }
 
     pub fn request_kind(&self, request: &str) -> Result<Option<String>> {

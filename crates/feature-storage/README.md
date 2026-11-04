@@ -35,6 +35,17 @@ root is not a way to forget that fence. Cross-root locks are acquired in canonic
 root order, source shared and target exclusive; same-root recovery takes one
 exclusive lock. A restore retires, but does not remove, the previous owner
 receipt. Only the new physical identity is current, including after exact retry.
+Before creating staging, the owner reserves the complete source-root, snapshot,
+manifest and per-DB physical/request provenance. An unfinished restore cannot
+be replaced by a different source or snapshot. Copying uses a separate file;
+only a verified completed backup is renamed into reusable staging. Unowned
+staging is diagnosed, not accepted as a completed copy. Identity/completion
+response loss reconciles that exact request, including after directory publication.
+Adopted legacy-live scopes can recover after stopped, complete scope-tree loss:
+the old external record remains unchanged and its marker is reconstructed only
+after completed owner/snapshot provenance checks. Missing markers in an existing
+scope, legacy pending/deletion records and new-owner erasure fences still refuse
+normal admission; this recovery path does not clear erasure.
 A snapshot without matching source-owner evidence requires explicit, authorized
 legacy adoption with domain attribution/shape validation instead of blind restore.
 These checks cover owner-managed operations, not deliberate destruction of the

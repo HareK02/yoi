@@ -197,6 +197,7 @@ type Authorizer = dyn Fn(&Connection, bool) -> Result<()> + Send + Sync;
 pub struct Drive {
     authorizer: Option<Arc<Authorizer>>,
     database: FeatureDatabase,
+    authority_database: Option<FeatureDatabase>,
     blobs: Arc<blob::BlobStore>,
     workspace_id: String,
     _storage: ScopedFeatureStorage,
@@ -224,13 +225,42 @@ impl Drive {
         })?;
         Ok(Self {
             authorizer: None,
+            authority_database: None,
             database,
             blobs,
             workspace_id,
             _storage: storage.clone(),
         })
     }
-    /// Attaches a trusted Host's Workspace authority DB to the connection.
+    /// Attaches a managed Host catalog using its existing physical identity owner.
+    /// Each operation reacquires its lease, including operations on cached clones.
+    /// Lock order is catalog lifecycle, Drive lifecycle/connection, then SQLite
+    /// IMMEDIATE locks (including the attached catalog). The catalog connection
+    /// mutex is released before acquiring Drive locks; only its lease spans the
+    /// operation, blob I/O, and commit/rollback. Domain authorization is unchanged.
+    pub fn open_with_managed_workspace_authority(
+        storage: &ScopedFeatureStorage,
+        registration: &RegisteredFeature,
+        root: &Path,
+        authority_database: &FeatureDatabase,
+    ) -> Result<Self> {
+        let _catalog_lease = authority_database.guard(authority_database.identity())?;
+        let path: String = authority_database.try_with_connection::<_, Error>(|connection| {
+            Ok(connection.query_row(
+                "SELECT file FROM pragma_database_list WHERE name='main'",
+                [],
+                |row| row.get(0),
+            )?)
+        })?;
+        let mut drive = Self::open(storage, registration, root)?;
+        drive.attach_workspace_authority(Path::new(&path), true)?;
+        drive.authority_database = Some(authority_database.clone());
+        Ok(drive)
+    }
+
+    /// Attaches an unmanaged Host authority path. This does not verify or lease
+    /// its physical identity; managed Hosts must use
+    /// [`Self::open_with_managed_workspace_authority`] instead.
     /// IMMEDIATE transactions lock authority too, rejecting mutations through cached handles after deletion is reserved.
     /// Drive does not modify attached authority or guarantee atomic writes across DBs.
     /// Blob I/O also serializes with Host DB writes, so long operations delay other Host writes.
@@ -242,6 +272,11 @@ impl Drive {
         authority_database: &Path,
     ) -> Result<Self> {
         let drive = Self::open(storage, registration, root)?;
+        drive.attach_workspace_authority(authority_database, false)?;
+        Ok(drive)
+    }
+
+    fn attach_workspace_authority(&self, authority_database: &Path, refresh: bool) -> Result<()> {
         let path = authority_database
             .to_str()
             .ok_or_else(|| Error::Invalid("authority database path must be UTF-8".into()))?;
@@ -250,7 +285,7 @@ impl Drive {
                 "Workspace authority database is missing".into(),
             ));
         }
-        drive.database.try_with_connection::<_, Error>(|c| {
+        self.database.try_with_connection::<_, Error>(|c| {
             let existing: Option<String> = c
                 .query_row(
                     "SELECT file FROM pragma_database_list WHERE name='yoi_workspace_authority'",
@@ -262,14 +297,19 @@ impl Drive {
                 Some(old) if Path::new(&old) != authority_database => Err(Error::Invalid(
                     "Drive already bound to a different Workspace authority".into(),
                 )),
-                Some(_) => Ok(()),
-                None => {
+                Some(_) if !refresh => Ok(()),
+                existing => {
+                    // A cached primary connection may still have an attachment
+                    // from an earlier catalog handle. Rebind under the new
+                    // owner's lease rather than accepting path equality alone.
+                    if existing.is_some() {
+                        c.execute_batch("DETACH DATABASE yoi_workspace_authority")?;
+                    }
                     c.execute("ATTACH DATABASE ?1 AS yoi_workspace_authority", [path])?;
                     Ok(())
                 }
             }
-        })?;
-        Ok(drive)
+        })
     }
     /// Binds the caller's authorization callback to the handle and its clones.
     /// Runs inside every client operation transaction, not at binding, holding the authority lock through blob I/O and publication.
@@ -283,6 +323,17 @@ impl Drive {
             ..self.clone()
         }
     }
+    fn transaction<T>(&self, operation: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+        // This is outside FeatureDatabase::try_transaction: releasing the lease
+        // inside its callback would expose the commit/rollback window.
+        let _catalog_lease = self
+            .authority_database
+            .as_ref()
+            .map(|database| database.guard(database.identity()))
+            .transpose()?;
+        self.database.try_transaction(operation)
+    }
+
     fn authorize(&self, connection: &Connection, write: bool) -> Result<()> {
         match &self.authorizer {
             Some(authorizer) => authorizer(connection, write),
@@ -291,13 +342,13 @@ impl Drive {
     }
     /// Early admission check, not a lease. Subsequent operations recheck authorization in their own transactions.
     pub fn check_authorized(&self, write: bool) -> Result<()> {
-        self.database.try_transaction(|tx| {
+        self.transaction(|tx| {
             self.authorize(tx, write)?;
             accepting(tx)
         })
     }
     pub fn root(&self) -> Result<Node> {
-        self.database.try_transaction(|c| {
+        self.transaction(|c| {
             self.authorize(c, false)?;
             let id = c.query_row(
                 "SELECT id FROM drive_nodes WHERE parent_id IS NULL",
@@ -308,7 +359,7 @@ impl Drive {
         })
     }
     pub fn metadata(&self, id: NodeId) -> Result<Node> {
-        self.database.try_transaction(|c| {
+        self.transaction(|c| {
             self.authorize(c, false)?;
             node(c, id)
         })
@@ -318,7 +369,7 @@ impl Drive {
     /// Concurrent changes between pages may add, delete, or move entries.
     pub fn list(&self, parent: NodeId, after: Option<NodeId>, limit: usize) -> Result<Page> {
         validate_limit(limit, MAX_PAGE)?;
-        self.database.try_transaction(|tx| {
+        self.transaction(|tx| {
             self.authorize(tx, false)?;
             directory(tx, parent)?;
             let mut stmt = tx.prepare(
@@ -346,7 +397,7 @@ impl Drive {
     /// but their existence never authorizes an operation with a different actor/payload.
     pub fn request_status(&self, request_id: &str) -> Result<RequestStatus> {
         validate_identity(request_id, "request_id", 128)?;
-        self.database.try_transaction(|c| {
+        self.transaction(|c| {
             self.authorize(c, false)?;
             let result = c
                 .query_row(
@@ -382,7 +433,7 @@ impl Drive {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        self.database.try_transaction(|tx| {
+        self.transaction(|tx| {
             self.authorize(tx, true)?;
             if let Some((old_fingerprint,json)) = tx.query_row("SELECT fingerprint,result_json FROM drive_receipts WHERE request_id=?1",
                 [request_id], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()? {
@@ -450,7 +501,7 @@ impl Drive {
         length: usize,
     ) -> Result<ReadChunk> {
         validate_limit(length, MAX_READ_BYTES)?;
-        self.database.try_transaction(|tx| {
+        self.transaction(|tx| {
             self.authorize(tx, false)?;
             accepting(tx)?;
             let selected = node(tx, id)?;
@@ -520,7 +571,7 @@ impl Drive {
     ) -> Result<SearchPage> {
         validate_identity(query, "query", 256)?;
         validate_limit(budget, MAX_SEARCH_NODES)?;
-        self.database.try_transaction(|tx| {
+        self.transaction(|tx| {
             self.authorize(tx, false)?;
             accepting(tx)?;
             let mut stmt = tx.prepare("SELECT id FROM drive_nodes WHERE parent_id IS NOT NULL AND id>?1 ORDER BY id LIMIT ?2")?;
@@ -552,7 +603,7 @@ impl Drive {
     /// New UUIDs may sort before the cursor, so future sweeps start at the beginning.
     pub fn collect(&self, after: Option<&str>, limit: usize) -> Result<CollectionPage> {
         validate_limit(limit, MAX_PAGE)?;
-        self.database.try_transaction(|tx| {
+        self.transaction(|tx| {
             accepting(tx)?;
             let keys = self.blobs.list(after, limit + 1)?;
             let more = keys.len() > limit;
@@ -578,7 +629,7 @@ impl Drive {
     }
     /// Commits a persistent tombstone rejecting new operations. Receipt reads/replays never authorize new mutations.
     pub fn fence(&self) -> Result<()> {
-        self.database.try_transaction(|tx| {
+        self.transaction(|tx| {
             tx.execute("UPDATE drive_state SET deleting=1 WHERE singleton=1", [])?;
             Ok(())
         })
@@ -588,7 +639,7 @@ impl Drive {
     /// A Host lifecycle operation distinct from ordinary folder deletion; never processes other Workspaces' storage roots.
     pub fn purge(&self) -> Result<()> {
         self.fence()?;
-        self.database.try_transaction(|tx| {
+        self.transaction(|tx| {
             while self.blobs.cleanup_staging(MAX_PAGE)? > 0 {}
             loop {
                 let keys = self.blobs.list(None, MAX_PAGE)?;
