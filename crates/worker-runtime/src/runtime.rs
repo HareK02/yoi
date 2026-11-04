@@ -3266,6 +3266,14 @@ impl Runtime {
         let _guard = operation_lock
             .lock()
             .map_err(|_| RuntimeError::StatePoisoned)?;
+        self.execution_termination_under_lock(worker_ref)
+    }
+
+    // Caller holds the Runtime Worker operation lock, including deletion callers.
+    fn execution_termination_under_lock(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<Option<crate::execution::WorkerExecutionTermination>, RuntimeError> {
         let (backend, saved) = {
             let mut state = self.lock()?;
             state.ensure_worker_ref(worker_ref)?;
@@ -4630,7 +4638,7 @@ impl Runtime {
         if let Some(scope) = scope {
             self.ensure_worker_in_workspace(scope, worker_ref)?;
         }
-        let backend = {
+        let (backend, has_termination) = {
             let state = self.lock()?;
             state.ensure_running()?;
             state.ensure_worker_ref(worker_ref)?;
@@ -4648,9 +4656,22 @@ impl Runtime {
                     worker_ref.worker_id
                 )));
             }
-            state.execution_backend.clone()
+            (
+                state.execution_backend.clone(),
+                worker.restore_guard.execution_termination.is_some(),
+            )
         };
-        if let Some(backend) = backend {
+        if has_termination {
+            // Consume the canonical Stop's exact receipt. A new Stop could
+            // target a replacement Controller or discard a later candidate;
+            // neither is authorized by the original scope's termination.
+            if self.execution_termination_under_lock(worker_ref)?.is_none() {
+                return Err(RuntimeError::WorkerExecutionUnavailable {
+                    worker_id: worker_ref.worker_id,
+                    message: "canonical Stop receipt no longer matches the execution owner; deletion remains pending".into(),
+                });
+            }
+        } else if let Some(backend) = backend {
             let result = backend.stop_worker(worker_ref);
             if !result.is_accepted() {
                 return Err(RuntimeError::WorkerExecutionRejected {

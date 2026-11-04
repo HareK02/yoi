@@ -1246,11 +1246,18 @@ mod restore_candidate {
                 .is_some(),
             "retain the real prepared Worker's close-only resource owner"
         );
+        let stop = WorkerExecutionStopRequest {
+            worker_ref: fixture.request.worker_ref.clone(),
+            operation_id: crate::execution::WorkerLifecycleOperationId::new(),
+        };
+        let result = fixture.backend.stop_worker_operation(stop.clone());
+        assert!(result.is_accepted(), "{result:?}");
         assert!(
-            fixture
-                .backend
-                .stop_worker(&fixture.request.worker_ref)
-                .is_accepted()
+            result
+                .termination
+                .as_ref()
+                .unwrap()
+                .confirms_scope_shutdown(&stop.worker_ref, stop.operation_id)
         );
         fixture.assert_released();
 
@@ -1285,12 +1292,10 @@ mod restore_candidate {
         assert_eq!(opens.load(Ordering::SeqCst), 0);
         fixture.assert_quiet();
         assert_eq!(fixture.canonical_files(), before);
-        assert!(
-            fixture
-                .backend
-                .stop_worker(&fixture.request.worker_ref)
-                .is_accepted()
-        );
+        let replay = fixture.backend.stop_worker_operation(stop);
+        assert!(replay.is_accepted(), "{replay:?}");
+        assert_eq!(replay.termination, result.termination);
+        assert_eq!(replay.execution_id, result.execution_id);
         assert_eq!(fixture.canonical_files(), before);
     }
 

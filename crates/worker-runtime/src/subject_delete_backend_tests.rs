@@ -196,8 +196,21 @@ fn subject_delete_unregistered_profile_controller_retries_unknown_shutdown_witho
         backend.restore_worker(request.clone()),
         WorkerExecutionSpawnResult::Rejected(_)
     ));
+    let stop_operation_id = backend.admissions.lock().unwrap()[&request.worker_ref]
+        .deletion_stop_operation_id
+        .expect("the original rejected Stop keeps its identity for retry");
     backend.subject_delete_worker(&deletion).unwrap();
+    let original = backend
+        .termination_receipt(&request.worker_ref)
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.stop_operation_id, stop_operation_id);
+    assert_eq!(original.execution_id, execution.tasks.execution_id);
     backend.subject_delete_worker(&deletion).unwrap();
+    assert_eq!(
+        backend.termination_receipt(&request.worker_ref).unwrap(),
+        Some(original)
+    );
     assert!(execution.handle.protocol_is_closed());
     assert!(execution.tasks.tasks.lock().unwrap().is_empty());
     assert!(backend.workers.lock().unwrap().is_empty());
@@ -282,4 +295,112 @@ fn subject_delete_pending_restore_fences_late_controller_and_never_restarts_it()
         backend.restore_worker(request),
         WorkerExecutionSpawnResult::Rejected(_)
     ));
+}
+
+#[test]
+fn subject_delete_without_original_owner_retains_child_identity_but_never_issues_receipt() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = WorkerRuntimeExecutionBackend::new(MockFactory {
+        client: MockClient::new(vec![]),
+        runtime_base: root.path().join("must-not-launch"),
+        cwd: root.path().to_path_buf(),
+        store_dir: root.path().join("sessions"),
+        worker_metadata_dir: root.path().join("metadata"),
+        observed_cwds: Arc::default(),
+        observed_workspace_clients: Arc::default(),
+    })
+    .unwrap();
+    let worker_ref = WorkerRef::new(WorkerId::now_v7());
+    let deletion = runtime_api::SubjectDeleteWorkerRequest {
+        workspace_id: "ws-test".into(),
+        worker_id: worker_ref.worker_id,
+        create_fingerprint: "not-admitted".into(),
+        operation_id: "delete-without-owner".into(),
+    };
+    assert!(
+        backend
+            .subject_delete_worker(&deletion)
+            .unwrap_err()
+            .contains("map absence")
+    );
+    let child = backend.admissions.lock().unwrap()[&worker_ref]
+        .deletion_stop_operation_id
+        .unwrap();
+    assert!(
+        backend
+            .subject_delete_worker(&deletion)
+            .unwrap_err()
+            .contains("map absence")
+    );
+    assert_eq!(
+        backend.admissions.lock().unwrap()[&worker_ref].deletion_stop_operation_id,
+        Some(child)
+    );
+    assert!(backend.completed_stops.lock().unwrap().is_empty());
+    assert!(backend.termination_receipt(&worker_ref).unwrap().is_none());
+    assert!(!root.path().join("must-not-launch").exists());
+}
+
+#[test]
+#[cfg(feature = "fs-store")]
+fn subject_delete_consumes_prior_canonical_stop_without_retagging_original_scope() {
+    let temp = tempfile::tempdir_in(".").unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let backend = Arc::new(
+        WorkerRuntimeExecutionBackend::new(MockFactory {
+            client: MockClient::new(vec![]),
+            runtime_base: PathBuf::from(temp.path().file_name().unwrap()).join("c"),
+            cwd: root.clone(),
+            store_dir: root.join("sessions"),
+            worker_metadata_dir: root.join("metadata"),
+            observed_cwds: Arc::default(),
+            observed_workspace_clients: Arc::default(),
+        })
+        .unwrap(),
+    );
+    let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+        crate::fs_store::FsRuntimeStoreOptions::new(root.join("catalog"))
+            .with_runtime_id("delete-prior-stop"),
+        backend.clone(),
+    )
+    .unwrap();
+    runtime.store_config_bundle(test_bundle()).unwrap();
+    let scope = crate::runtime::RuntimeWorkspaceScope::new("ws-test", "server-test");
+    let mut create = create_request("prior Stop Subject deletion");
+    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+        workspace_id: scope.workspace_id.clone(),
+        language: "English".into(),
+    });
+    create.workspace_api = Some(WorkspaceApiRef {
+        workspace_id: scope.workspace_id.clone(),
+        base_url: "https://workspace.invalid".into(),
+    });
+    let worker = runtime
+        .create_worker_scoped(&scope, create.clone())
+        .unwrap();
+    runtime
+        .stop_worker_scoped(&scope, &worker.worker_ref, None)
+        .unwrap();
+    let original = runtime
+        .execution_termination(&worker.worker_ref)
+        .unwrap()
+        .unwrap();
+    let deletion = runtime_api::SubjectDeleteWorkerRequest {
+        workspace_id: scope.workspace_id.clone(),
+        worker_id: create.worker_id,
+        create_fingerprint: create.create_fingerprint,
+        operation_id: "delete-prior-stop".into(),
+    };
+    runtime
+        .subject_delete_worker_scoped(&scope, deletion.clone())
+        .unwrap();
+    backend.subject_delete_worker(&deletion).unwrap();
+    assert_eq!(
+        backend.termination_receipt(&worker.worker_ref).unwrap(),
+        Some(original.clone())
+    );
+    assert_eq!(
+        backend.admissions.lock().unwrap()[&worker.worker_ref].deletion_stop_operation_id,
+        Some(original.stop_operation_id)
+    );
 }

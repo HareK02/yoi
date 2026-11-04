@@ -253,9 +253,15 @@ mod tests {
     #[test]
     fn typed_factory_failure_survives_adapter_and_protocol_without_changing_disposition() {
         let backend = WorkerRuntimeExecutionBackend::new(TypedFailingFactory).unwrap();
-        let WorkerExecutionSpawnResult::Errored(result) = backend.spawn_worker(request()) else {
-            panic!("cause attachment must not reclassify the existing spawn result")
+        let request = request();
+        let worker_ref = request.worker_ref.clone();
+        let WorkerExecutionSpawnResult::ReconciliationRequired { result, .. } =
+            backend.spawn_worker(request)
+        else {
+            panic!("unproven resources and failed cleanup must retain the original factory owner")
         };
+        assert!(backend.pending_spawn_exists(&worker_ref).unwrap());
+        assert!(backend.termination_receipt(&worker_ref).unwrap().is_none());
         assert_primary(&result);
         let transferred: WorkerExecutionResult =
             serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap();

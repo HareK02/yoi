@@ -3903,6 +3903,9 @@ struct WorkerAdmission {
     workspace_id: Option<String>,
     create_fingerprint: String,
     deletion: Option<runtime_api::SubjectDeleteWorkerRequest>,
+    // Stable child Stop for this exact deletion. This is an operation identity,
+    // not termination proof; only the original joined owner can issue a receipt.
+    deletion_stop_operation_id: Option<crate::execution::WorkerLifecycleOperationId>,
 }
 
 /// Worker execution backend backed by real worker crate Workers.
@@ -4007,6 +4010,7 @@ where
                     workspace_id: workspace.map(str::to_string),
                     create_fingerprint: fingerprint.into(),
                     deletion: None,
+                    deletion_stop_operation_id: None,
                 },
             );
         }
@@ -5825,18 +5829,42 @@ where
         let lock = self.worker_lock(&worker)?;
         let _operation = lock.lock().map_err(|_| "worker operation lock poisoned")?;
         self.validate_subject_delete_identity(request)?;
-        self.admissions
-            .lock()
-            .map_err(|_| "worker admission lock poisoned")?
-            .insert(
-                worker.clone(),
-                WorkerAdmission {
+        let operation_id = {
+            let mut admissions = self
+                .admissions
+                .lock()
+                .map_err(|_| "worker admission lock poisoned")?;
+            let admission = admissions
+                .entry(worker.clone())
+                .or_insert_with(|| WorkerAdmission {
                     workspace_id: Some(request.workspace_id.clone()),
                     create_fingerprint: request.create_fingerprint.clone(),
-                    deletion: Some(request.clone()),
-                },
-            );
-        let result = self.stop_worker_under_lock(&worker, None);
+                    deletion: None,
+                    deletion_stop_operation_id: None,
+                });
+            admission.deletion = Some(request.clone());
+            match admission.deletion_stop_operation_id {
+                Some(operation_id) => operation_id,
+                None => {
+                    // Reuse a completed original Stop, never retag its receipt
+                    // as a newly generated deletion child. The Stop consumer
+                    // below rejects replay if any replacement owner is present.
+                    let operation_id = self
+                        .completed_stops
+                        .lock()
+                        .map_err(|_| "stop completion receipts lock poisoned")?
+                        .get(&worker)
+                        .map(|receipt| receipt.stop_operation_id)
+                        .unwrap_or_default();
+                    admission.deletion_stop_operation_id = Some(operation_id);
+                    operation_id
+                }
+            }
+        };
+        let result = self.stop_worker_operation_under_lock(WorkerExecutionStopRequest {
+            worker_ref: worker.clone(),
+            operation_id,
+        });
         if !result.is_accepted() {
             return Err(result.message_or_default());
         }
@@ -8737,12 +8765,17 @@ mod tests {
             })
             .await
             .unwrap();
-        if let Some(receiver) = controller.shutdown.lock().await.take() {
-            tokio::time::timeout(Duration::from_secs(5), receiver)
-                .await
-                .unwrap()
-                .unwrap();
-        }
+        let receiver = controller
+            .shutdown
+            .lock()
+            .await
+            .take()
+            .expect("fixture must retain the original Controller shutdown report");
+        let report = tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report.feature_failures.is_empty(), "{report:?}");
         tokio::time::timeout(Duration::from_secs(5), controller.controller_task)
             .await
             .unwrap()
@@ -9795,11 +9828,22 @@ mod tests {
                 .contains("still present"),
             "closed Controller is still residual execution"
         );
-        assert!(backend.stop_worker(&request.worker_ref).is_accepted());
+        let stop = WorkerExecutionStopRequest {
+            worker_ref: request.worker_ref.clone(),
+            operation_id: crate::execution::WorkerLifecycleOperationId::new(),
+        };
+        let original = backend.stop_worker_operation(stop.clone());
+        assert!(original.is_accepted(), "{original:?}");
+        let receipt = original.termination.as_ref().unwrap();
+        assert_eq!(receipt.execution_id, execution.tasks.execution_id);
         assert!(backend.workers.lock().unwrap().is_empty());
         backend.recover_subject_create(&recovery).unwrap();
         assert!(execution.tasks.tasks.lock().unwrap().is_empty());
-        assert!(backend.stop_worker(&request.worker_ref).is_accepted());
+        assert_eq!(backend.stop_worker_operation(stop), original);
+        assert!(
+            !backend.stop_worker(&request.worker_ref).is_accepted(),
+            "identity-less absence is not a replay"
+        );
     }
 
     #[test]
@@ -11263,6 +11307,8 @@ mod tests {
     struct PendingCreateFactory {
         started: mpsc::Sender<()>,
         dropped: mpsc::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+        inner: MockFactory,
     }
 
     struct FactoryFutureDrop(mpsc::Sender<()>);
@@ -11286,11 +11332,12 @@ mod tests {
 
         async fn spawn_controller(
             &self,
-            _request: WorkerExecutionSpawnRequest,
+            request: WorkerExecutionSpawnRequest,
         ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
             let _drop = FactoryFutureDrop(self.dropped.clone());
             self.started.send(()).unwrap();
-            std::future::pending().await
+            self.release.notified().await;
+            self.inner.spawn_controller(request).await
         }
 
         async fn restore_controller(
@@ -11303,15 +11350,26 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn create_timeout_cancels_factory_and_removes_persisted_worker() {
+    fn create_timeout_retains_factory_and_persisted_worker_until_original_controller_is_joined() {
         let root = tempfile::tempdir().unwrap();
         let runtime_store_dir = root.path().join("runtime");
         let (started_tx, started) = mpsc::channel();
         let (dropped_tx, dropped) = mpsc::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
         let backend = Arc::new(
             WorkerRuntimeExecutionBackend::new(PendingCreateFactory {
                 started: started_tx,
                 dropped: dropped_tx,
+                release: release.clone(),
+                inner: MockFactory {
+                    client: MockClient::new(vec![]),
+                    runtime_base: root.path().join("control"),
+                    cwd: root.path().to_path_buf(),
+                    store_dir: root.path().join("sessions"),
+                    worker_metadata_dir: root.path().join("metadata"),
+                    observed_cwds: Arc::default(),
+                    observed_workspace_clients: Arc::default(),
+                },
             })
             .unwrap()
             .with_spawn_restore_timeout(Duration::from_millis(20)),
@@ -11339,23 +11397,46 @@ mod tests {
             .unwrap_err();
         let error = create.join().unwrap().unwrap_err();
 
+        let worker_ref = WorkerRef::new(worker_id);
         assert!(matches!(
             delete_error,
-            crate::error::RuntimeError::WorkerNotFound { worker_id: missing } if missing == worker_id
+            crate::error::RuntimeError::InvalidRequest(_)
         ));
-        assert!(error.to_string().contains("was cancelled"));
+        assert!(error.to_string().contains("pending"), "{error}");
+        assert!(matches!(dropped.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(backend.pending_spawn_exists(&worker_ref).unwrap());
+        assert!(
+            runtime
+                .execution_termination(&worker_ref)
+                .unwrap()
+                .is_none()
+        );
+        let worker_path = runtime_store_dir
+            .join("workers")
+            .join(worker_id.to_string());
+        assert!(
+            worker_path.exists(),
+            "timeout must retain the unresolved Worker"
+        );
+        assert_eq!(runtime.list_workers().unwrap().len(), 1);
+
+        // Release the original factory, not a replacement. Stop must transfer
+        // its actual late Controller into the owned scope and join/report it.
+        release.notify_one();
+        runtime.stop_worker(&worker_ref, None).unwrap();
         dropped
             .try_recv()
-            .expect("cancelled factory future must be dropped before create returns");
-        assert!(runtime.list_workers().unwrap().is_empty());
-        assert!(backend.workers.lock().unwrap().is_empty());
-        assert!(
-            !runtime_store_dir
-                .join("workers")
-                .join(worker_id.to_string())
-                .exists(),
-            "failed create must remove its persisted Worker aggregate"
+            .expect("factory completed normally before Stop settled");
+        assert!(!backend.pending_spawn_exists(&worker_ref).unwrap());
+        let original = runtime.execution_termination(&worker_ref).unwrap().unwrap();
+        assert_eq!(
+            original.scope,
+            crate::execution::WorkerExecutionTerminationScope::Controller
         );
+        assert!(original.shutdown_command_id.is_some());
+        assert!(backend.workers.lock().unwrap().is_empty());
+        runtime.delete_worker(&worker_ref).unwrap();
+        assert!(!worker_path.exists());
     }
 
     // Generic controller tests explicitly substitute the Host's non-Subject
@@ -11922,7 +12003,13 @@ mod tests {
             &self,
             _request: WorkerExecutionSpawnRequest,
         ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
-            Err("spawn failed".into())
+            // This fixture returns before constructing a Worker, Controller or
+            // background resource. Unlike a string failure, these are known
+            // owner facts and allow only the adapter-created workdir rollback.
+            Err(RuntimeRestoreFailure::refused(
+                RuntimeRestoreStage::Preflight,
+                "spawn failed",
+            ))
         }
 
         async fn restore_controller(
@@ -14104,7 +14191,19 @@ mod tests {
             fs::read_to_string(checkout.join("README.md")).unwrap(),
             "owner recovery in progress"
         );
-        assert!(backend.stop_worker(&request.worker_ref).is_accepted());
+        let stop = WorkerExecutionStopRequest {
+            worker_ref: request.worker_ref.clone(),
+            operation_id: crate::execution::WorkerLifecycleOperationId::new(),
+        };
+        let result = backend.stop_worker_operation(stop.clone());
+        assert!(result.is_accepted(), "{result:?}");
+        assert!(
+            result
+                .termination
+                .as_ref()
+                .unwrap()
+                .confirms_scope_shutdown(&stop.worker_ref, stop.operation_id)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -14176,7 +14275,19 @@ mod tests {
                 before,
                 "damaged checkout must be retained"
             );
-            assert!(backend.stop_worker(&request.worker_ref).is_accepted());
+            let stop = WorkerExecutionStopRequest {
+                worker_ref: request.worker_ref.clone(),
+                operation_id: crate::execution::WorkerLifecycleOperationId::new(),
+            };
+            let result = backend.stop_worker_operation(stop.clone());
+            assert!(result.is_accepted(), "{result:?}");
+            assert!(
+                result
+                    .termination
+                    .as_ref()
+                    .unwrap()
+                    .confirms_scope_shutdown(&stop.worker_ref, stop.operation_id)
+            );
             println!(
                 "damage={damage}; reason={:?}; classification={:?}; cwd_bind_count={}; retained_files={}; retained_data_unchanged=true; stopped=true",
                 error.failure_reason(),
